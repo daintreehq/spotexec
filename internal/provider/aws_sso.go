@@ -198,6 +198,9 @@ func ssoToken(ctx context.Context, cacheKey, region, profile string) (string, er
 	}
 	sum := sha1.Sum([]byte(cacheKey))
 	path := filepath.Join(home, "sso", "cache", hex.EncodeToString(sum[:])+".json")
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("no cached SSO login; run `aws sso login --profile %s`", profile)
+	}
 	// Refresh tokens rotate: concurrent sx processes must not race. (The
 	// native path only runs without the AWS CLI installed.)
 	lf, err := os.OpenFile(path+".spotexec-lock", os.O_CREATE|os.O_RDWR, 0o600)
