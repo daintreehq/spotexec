@@ -170,8 +170,9 @@ func (c *awsClient) query(ctx context.Context, service, version, action string, 
 				return nil, ctx.Err()
 			}
 			lastErr = fmt.Errorf("%s %s: %w", service, action, err)
-			if strings.Contains(err.Error(), "no AWS credentials") {
-				return nil, err
+			var ce *CredentialError
+			if errors.As(err, &ce) {
+				return nil, err // retrying can't fix credentials
 			}
 			continue
 		}
@@ -229,7 +230,8 @@ func (c *awsClient) ssmGetParameter(ctx context.Context, name string) (string, e
 		if awsCode(err) != "" && classifyAWSError(err) != errRetryable {
 			return "", err
 		}
-		if strings.Contains(err.Error(), "AWS credentials") {
+		var ce *CredentialError
+		if errors.As(err, &ce) {
 			return "", err
 		}
 	}

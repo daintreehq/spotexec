@@ -206,6 +206,27 @@ When `[deps]` is configured on an `aws-spot` runner:
 - The VMs never hold AWS credentials. The CLI hands them presigned URLs that
   can only target a bucket your account owns.
 
+### Baked images (fast cold boot)
+
+`spotexec image bake <runner>` builds an AMI for a runner:
+- **On a builder VM:** it runs the runner's `bootstrap_script` and
+  `user_bootstrap_script` once on an on-demand VM, installs Docker and buildx,
+  and pre-pulls the project's container image if there is one.
+- **Sanitising:** it cleans out everything instance-specific (cloud-init
+  state, SSH host keys, the watchdog, logs).
+- **Imaging:** it stops the VM and creates the image.
+
+From then on, the fleet launches from the newest bake whose bootstrap matches
+and skips the bootstrap entirely, so a new VM is ready in roughly the bare
+boot time. The per-instance setup (idle watchdog, SSH key, timeouts) still
+runs on every VM.
+
+Changing either bootstrap script makes old bakes stop matching, so re-run
+`image bake`. Only the two newest bakes per runner are kept; older images and
+their snapshots are deleted. `spotexec image list` shows them and
+`spotexec image clear` removes them all. `ami = "base"` on a runner ignores
+bakes.
+
 ### Project containers
 
 `[container]` runs every command, and the dependency install, inside a
@@ -238,17 +259,25 @@ Docker image on the runner:
 Credentials resolve in this order:
 1. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, unless
    the runner sets `profile`
-2. `aws configure export-credentials`, which handles SSO, assume-role and
-   credential_process. When the AWS CLI is installed its answer is final: an
-   expired SSO session is reported, never silently replaced by other keys.
-3. `~/.aws/credentials`, only when the AWS CLI is not installed
+2. `aws configure export-credentials` (AWS CLI v2), which handles SSO,
+   `aws login`, assume-role and credential_process. When the AWS CLI is
+   installed its answer is final: an expired session is reported, never
+   silently replaced by other keys.
+3. Without the AWS CLI, spotexec reads `~/.aws` itself:
+   - static keys;
+   - `credential_process`;
+   - IAM Identity Center (SSO) profiles, using the token cached by
+     `aws sso login` and renewing it with its refresh token, so you only log
+     in again when the session itself expires;
+   - unexpired `aws login` sessions.
 
 The AWS CLI is optional: requests are signed by spotexec itself (there is no
 AWS SDK in the binary). Install the AWS CLI if you use SSO, `aws login` or
 assume-role profiles. Plain access keys work without it.
 
-Minimum IAM permissions (the S3 and ECR statements are only needed for the
-dependency cache and Dockerfile-built containers):
+Minimum IAM permissions. Three statements are optional: the S3 statement is
+only for the dependency cache, ECR only for Dockerfile-built containers, and
+the last one only for `spotexec image bake`.
 
 ```json
 {
@@ -273,7 +302,10 @@ dependency cache and Dockerfile-built containers):
         "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
         "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"
       ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" },
-    { "Effect": "Allow", "Action": "servicequotas:GetServiceQuota", "Resource": "*" }
+    { "Effect": "Allow", "Action": "servicequotas:GetServiceQuota", "Resource": "*" },
+    { "Effect": "Allow", "Action": [
+        "ec2:StopInstances", "ec2:CreateImage", "ec2:DeregisterImage", "ec2:DeleteSnapshot"
+      ], "Resource": "*" }
   ]
 }
 ```
@@ -299,7 +331,9 @@ spotexec exec -- <cmd>           reuse the last slot without syncing
 spotexec sync / sync-plan        pre-sync / dry-run (file count, bytes, largest files)
 spotexec pull <glob>...          copy gitignored artifacts from the last slot
 spotexec status / monitor        runners, holders, load, idle timers, burn rate
-spotexec up / down [--all]       pre-warm or terminate ephemeral runners
+spotexec up [runner] [--count N]  pre-warm fleet instances (respects max_instances)
+spotexec down [runner|--all]     terminate fleet instances (and leftover bake builders)
+spotexec image bake|list|clear   baked runner AMIs for fast cold boot
 spotexec doctor                  verify SSH, helper, config and AWS
 spotexec unlock [runner] --slot N|--all     kill a wedged run and free its slot
 spotexec prune [--older-than 7d]            remove stale dependency caches and slots
@@ -308,9 +342,12 @@ spotexec hook install [--claude] [--codex]  agent command interception
 spotexec cloud-init [runner]     print the first-boot script
 ```
 
-Useful run flags: `--timeout`, `--sync auto|in|none`, `--writeback`,
-`--runner`/`--pool`, `--exclusive`, `--pull <glob>`, `--json`/`--pretty`/`-q`,
-`--events-file`, `--no-deps`, `--fallback-local`, `-C <dir>`.
+Useful run flags:
+- `--timeout`, `--sync auto|in|none`, `--writeback`
+- `--runner`/`--pool`, `--exclusive`, `--priority N`, `--no-boot`
+- `--pull <glob>`, `--no-deps`, `--fallback-local`
+- `--json`/`--pretty`/`-q`, `--events-file`
+- `-C <dir>`
 
 Exit codes: the command's own exit code, `124` on timeout, and `125` when
 spotexec itself fails (no runner, SSH failure, sync error).
@@ -406,6 +443,16 @@ ignored outputs you want.
   case-insensitive filesystem (the macOS default), a remote `mv src Src`
   updates the files but leaves the directory named `src`. Case-only file
   renames are applied correctly.
+- **Native SSO refresh and the AWS CLI share a cache file.** Without the AWS
+  CLI installed, spotexec refreshes IAM Identity Center tokens itself, under
+  its own lock. If an AWS CLI elsewhere refreshes the same `~/.aws/sso/cache`
+  file at the same moment, for example a dev container sharing `~/.aws`, one
+  side may need `aws sso login` again.
+- **Exclusive jobs across mismatched fleets.** Demand is counted per fleet,
+  so an `--exclusive` job that could land on two fleets with different
+  `max_slots` may briefly over-launch by one instance.
+- **Scaling has no crystal ball.** An instance launched for demand that clears
+  before it boots sits idle until `idle_timeout`, then terminates itself.
 - **Each machine gets its own instances.** Instances are tagged with this
   machine's owner ID (`~/.config/spotexec/owner-id`), and a machine only ever
   discovers or terminates instances carrying its own ID. Two laptops with the

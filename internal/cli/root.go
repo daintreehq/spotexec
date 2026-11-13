@@ -28,7 +28,7 @@ var subcommands = map[string]bool{
 	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
 	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
 	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
-	"completion": true, "sim": true, "__complete": true, "__completeNoDesc": true,
+	"completion": true, "sim": true, "image": true, "__complete": true, "__completeNoDesc": true,
 }
 
 // Main is the entry point; it returns the process exit code.
@@ -121,7 +121,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(
 		cmdRun(), cmdExec(), cmdSync(), cmdSyncPlan(), cmdPull(), cmdStatus(), cmdMonitor(),
 		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdInit(), cmdHook(),
-		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(),
+		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(),
 	)
 	return root
 }

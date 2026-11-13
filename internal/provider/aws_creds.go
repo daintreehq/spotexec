@@ -21,7 +21,25 @@ type awsCredResolver struct {
 	cached  *awsCreds
 }
 
+// CredentialError marks a failure to obtain credentials: retrying the API
+// call cannot help, so callers fail fast.
+type CredentialError struct{ Err error }
+
+func (e *CredentialError) Error() string { return e.Err.Error() }
+func (e *CredentialError) Unwrap() error { return e.Err }
+
 func (r *awsCredResolver) get(ctx context.Context) (awsCreds, error) {
+	c, err := r.get1(ctx)
+	if err != nil {
+		var ce *CredentialError
+		if !errors.As(err, &ce) {
+			err = &CredentialError{err}
+		}
+	}
+	return c, err
+}
+
+func (r *awsCredResolver) get1(ctx context.Context) (awsCreds, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if c := r.cached; c != nil && (c.Expiration.IsZero() || time.Until(c.Expiration) > 5*time.Minute) {
@@ -73,17 +91,20 @@ func (r *awsCredResolver) resolve(ctx context.Context) (awsCreds, error) {
 		if err == nil {
 			return c, nil
 		}
-		return awsCreds{}, fmt.Errorf("AWS credentials for profile %q: %v. Fix: run `aws sso login%s` (or `aws configure`), or set `profile = \"...\"` on the runner", r.profileName(), err, profileFlag(r.profileName()))
+		// AWS CLI v1 or < 2.9 has no export-credentials: resolve natively.
+		if !strings.Contains(err.Error(), "Invalid choice") && !strings.Contains(err.Error(), "invalid choice") {
+			return awsCreds{}, fmt.Errorf("AWS credentials for profile %q: %v. Fix: run `aws sso login%s` (or `aws login` / `aws configure`), or set `profile = \"...\"` on the runner", r.profileName(), err, profileFlag(r.profileName()))
+		}
 	}
-	// 3. No aws CLI: static keys in the shared credentials file, then
-	// credential_process / SSO profiles from ~/.aws/config.
+	// 3. No (usable) aws CLI: static keys in the shared credentials file,
+	// then credential_process / SSO / `aws login` profiles from ~/.aws/config.
 	c, err := readSharedCredentials(r.profileName())
 	if err == nil {
 		return c, nil
 	}
 	if cc, cerr := configCredentials(ctx, r.profileName()); cerr == nil {
 		return cc, nil
-	} else if !strings.Contains(cerr.Error(), "no [") && !os.IsNotExist(cerr) {
+	} else if !errors.Is(cerr, errNoProfile) && !errors.Is(cerr, errNoCredsConfigured) && !os.IsNotExist(cerr) {
 		return awsCreds{}, cerr
 	}
 	msg := fmt.Sprintf("no AWS credentials for profile %q: %v", r.profileName(), err)

@@ -25,6 +25,7 @@ import (
 
 const (
 	tagRunner  = "spotexec-runner"
+	tagBake    = "spotexec-bake-runner"
 	tagOwner   = "spotexec-owner"
 	sgBaseName = "spotexec-ssh"
 )
@@ -421,6 +422,17 @@ func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger)
 
 // launch performs RunInstances across the configured instance types.
 func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
+	return a.launchWith(ctx, log, launchSpec{})
+}
+
+// launchSpec varies a launch: normal fleet instances (spot, from the newest
+// matching baked AMI when there is one) or an image-bake builder.
+type launchSpec struct {
+	bake    bool
+	prepull []string
+}
+
+func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (ec2Instance, error) {
 	owner, err := a.ownerTag()
 	if err != nil {
 		return ec2Instance{}, err
@@ -429,21 +441,43 @@ func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
 	if err != nil {
 		return ec2Instance{}, fmt.Errorf("spotexec SSH key: %w", err)
 	}
-	ud, err := cloudinit.Render(cloudinit.Options{
+	opts := cloudinit.Options{
 		User: a.r.User, PublicKey: pub, IdleTimeout: a.r.IdleTimeout.Duration,
 		MaxLifetime: a.r.MaxLifetime.Duration, BootstrapScript: a.r.BootstrapScript,
 		UserBootstrap: a.r.UserBootstrap, BootstrapTimeout: a.r.BootTimeout.Duration,
-	})
+	}
+	var ami, rootDev string
+	volume := a.r.VolumeGB
+	if spec.bake {
+		opts.IdleTimeout, opts.MaxLifetime = 60*time.Minute, 60*time.Minute
+		opts.BootstrapScript = a.bakeRootScript(spec.prepull)
+		opts.BootstrapTimeout = a.BakeBootstrapTimeout(len(spec.prepull) > 0)
+		opts.MaxLifetime = 2*opts.BootstrapTimeout + 30*time.Minute
+		opts.IdleTimeout = opts.MaxLifetime
+	} else if a.r.AMI == "" || a.r.AMI == "auto" {
+		// A baked image with this runner's bootstrap already applied?
+		if id, dev, size, err := a.findBake(ctx); err == nil && id != "" {
+			ami, rootDev = id, dev
+			opts.BootstrapScript, opts.UserBootstrap = "", ""
+			if size > volume {
+				volume = size // can't launch with a volume smaller than the image's snapshot
+			}
+			log("using baked image %s", id)
+		}
+	}
+	ud, err := cloudinit.Render(opts)
 	if err != nil {
 		return ec2Instance{}, err
 	}
-	ami, err := a.resolveAMI(ctx)
-	if err != nil {
-		return ec2Instance{}, err
+	if ami == "" {
+		if ami, err = a.resolveAMI(ctx); err != nil {
+			return ec2Instance{}, err
+		}
 	}
-	rootDev, err := a.rootDevice(ctx, ami)
-	if err != nil {
-		return ec2Instance{}, err
+	if rootDev == "" {
+		if rootDev, err = a.rootDevice(ctx, ami); err != nil {
+			return ec2Instance{}, err
+		}
 	}
 	sgs, err := a.securityGroups(ctx, log)
 	if err != nil {
@@ -460,9 +494,13 @@ func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
 	base.Set("MetadataOptions.HttpPutResponseHopLimit", "1")
 	base.Set("BlockDeviceMapping.1.DeviceName", rootDev)
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
-	base.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.Itoa(a.r.VolumeGB))
+	base.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.Itoa(volume))
 	base.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
 	tags := [][2]string{{tagRunner, a.r.Name}, {tagOwner, owner}, {"Name", "spotexec-" + a.r.Name}}
+	if spec.bake {
+		// Never part of the fleet: the scheduler must not place work on it.
+		tags = [][2]string{{tagBake, a.r.Name}, {tagOwner, owner}, {"Name", "spotexec-bake-" + a.r.Name}}
+	}
 	for i, rt := range []string{"instance", "volume"} {
 		pfx := "TagSpecification." + strconv.Itoa(i+1)
 		base.Set(pfx+".ResourceType", rt)
@@ -487,6 +525,9 @@ func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
 	markets := []bool{true}
 	if a.r.OnDemandFallback {
 		markets = append(markets, false)
+	}
+	if spec.bake {
+		markets = []bool{false} // on-demand: a reclaimed builder wastes the bake
 	}
 	var errs []string
 	for _, spot := range markets {
@@ -571,7 +612,7 @@ func (a *AWSSpot) amiParam() string {
 }
 
 func (a *AWSSpot) resolveAMI(ctx context.Context) (string, error) {
-	if a.r.AMI != "" {
+	if a.r.AMI != "" && a.r.AMI != "auto" && a.r.AMI != "base" {
 		return a.r.AMI, nil
 	}
 	ami, err := a.api.ssmGetParameter(ctx, a.amiParam())
@@ -736,6 +777,7 @@ func (a *AWSSpot) Down(ctx context.Context, log Logger) error {
 	if log == nil {
 		log = func(string, ...any) {}
 	}
+	a.SweepBuilders(ctx, log)
 	unlock, err := a.lockUp(ctx, log)
 	if err != nil {
 		return err
