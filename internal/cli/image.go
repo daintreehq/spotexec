@@ -75,7 +75,12 @@ func cmdImage() *cobra.Command {
 				rep.Status("bake %s: %s", r.Name, msg)
 				rep.Event("bake", map[string]any{"runner": r.Name, "message": msg})
 			}
-			a.SweepBuilders(ctx, logf)
+			unlockBake, err := a.LockBake()
+			if err != nil {
+				return err
+			}
+			defer unlockBake()
+			a.SweepBuildersLocked(ctx, logf)
 			logf("launching on-demand builder")
 			in, err := a.BakeLaunch(ctx, logf, pulls)
 			if err != nil {

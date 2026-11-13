@@ -18,6 +18,7 @@ import (
 	"github.com/spotexec/spotexec/internal/client"
 	"github.com/spotexec/spotexec/internal/cloudinit"
 	"github.com/spotexec/spotexec/internal/config"
+	"github.com/spotexec/spotexec/internal/daemon"
 	"github.com/spotexec/spotexec/internal/helper"
 	"github.com/spotexec/spotexec/internal/helperbin"
 	"github.com/spotexec/spotexec/internal/manifest"
@@ -214,6 +215,9 @@ func cmdStatus() *cobra.Command {
 				return json.NewEncoder(os.Stdout).Encode(sts)
 			}
 			printStatus(os.Stdout, sts, cfg)
+			if pid := daemon.Running(); pid != 0 {
+				fmt.Printf("\npool manager: running (pid %d) · `spotexec daemon status` for details\n", pid)
+			}
 			return nil
 		},
 	}
@@ -423,6 +427,9 @@ func cmdDown() *cobra.Command {
 					client.NewPool(r, f).Reset()
 				}
 				fmt.Printf("%s: terminated\n", r.Name)
+				if r.MinInstances > 0 && daemon.Running() != 0 {
+					fmt.Printf("%s: the pool manager will relaunch %d warm instance(s); `spotexec daemon stop` to prevent that\n", r.Name, r.MinInstances)
+				}
 			}
 			if len(errs) > 0 {
 				return errors.New(strings.Join(errs, "; "))

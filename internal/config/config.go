@@ -79,6 +79,7 @@ type Runner struct {
 
 	// fleets (aws-spot, sim)
 	MaxInstances int `toml:"max_instances"`
+	MinInstances int `toml:"min_instances"` // kept warm by `spotexec daemon` (default 0)
 
 	// sim
 	Image     string   `toml:"image"`
@@ -305,6 +306,9 @@ func (r *Runner) applyDefaults() error {
 		}
 		if r.MaxInstances < 0 {
 			return errors.New("max_instances must be >= 1")
+		}
+		if r.MinInstances < 0 || r.MinInstances > r.MaxInstances {
+			return errors.New("min_instances must be between 0 and max_instances")
 		}
 	}
 	if r.WorkRoot == "" {

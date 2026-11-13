@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -235,4 +236,19 @@ func killGroup(pgid int, grace time.Duration) {
 	for i := 0; i < 40 && groupAlive(pgid); i++ {
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// Keepalive refreshes the VM's activity clock (warm pools) and prints
+// status like `status` does.
+func Keepalive(w io.Writer, root string) error {
+	touchActivity(root)
+	return PrintStatus(w, root)
+}
+
+// Drain marks the VM draining (no new sessions; it powers off once the
+// running ones finish) and prints status. Used by the pool manager to retire
+// a warm instance ahead of max_lifetime.
+func Drain(w io.Writer, root, reason string) error {
+	markDraining(root, reason)
+	return PrintStatus(w, root)
 }

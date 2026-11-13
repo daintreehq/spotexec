@@ -51,6 +51,15 @@ func main() {
 		fail(helper.Unlock(os.Stdout, root, *token, *all))
 	case "prune":
 		fail(helper.Prune(os.Stdout, root, *olderThan, *dryRun))
+	case "drain":
+		fail(helper.Drain(os.Stdout, root, "retired by the spotexec pool manager"))
+	case "keepalive":
+		// Used by `spotexec daemon` to hold warm-pool instances past their
+		// idle timeout: refreshes the activity the idle watchdog checks.
+		if err := helper.Keepalive(os.Stdout, root); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "image-push":
 		fail(helper.ImagePush(root))
 	case "cache-put":

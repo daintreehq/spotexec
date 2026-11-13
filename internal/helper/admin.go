@@ -39,7 +39,9 @@ type Status struct {
 	MemAvailMB  int64             `json:"mem_avail_mb"`
 	UptimeS     int64             `json:"uptime_s"`
 	Draining    bool              `json:"draining"`
-	IdleS       int64             `json:"idle_s"` // seconds since last activity (-1 unknown)
+	SpotNotice  string            `json:"spot_notice,omitempty"`
+	Booting     bool              `json:"booting,omitempty"` // first-boot setup not finished
+	IdleS       int64             `json:"idle_s"`            // seconds since last activity (-1 unknown)
 	Ephemeral   bool              `json:"ephemeral"`
 	IdleTimeout string            `json:"idle_timeout,omitempty"`
 	Holders     []protocol.Holder `json:"holders"`
@@ -66,6 +68,20 @@ func GetStatus(root string) Status {
 	if b, err := os.ReadFile(filepath.Join(LifecycleDir, "idle_timeout")); err == nil {
 		st.Ephemeral = true
 		st.IdleTimeout = strings.TrimSpace(string(b))
+		if _, err := os.Stat(filepath.Join(LifecycleDir, "ready")); err != nil {
+			st.Booting = true
+		}
+		// A pending interruption drains the VM even with no session open to
+		// see it, so no new job is placed on it.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if n := SpotNotice(ctx); n != "" {
+			st.SpotNotice = n
+			if !st.Draining {
+				markDraining(root, n)
+				st.Draining = true
+			}
+		}
+		cancel()
 	}
 	if b, err := os.ReadFile("/proc/loadavg"); err == nil {
 		if f := strings.Fields(string(b)); len(f) > 0 {

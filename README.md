@@ -18,7 +18,7 @@ $ sx pnpm vitest run src/auth.test.ts
 ● 4.1s on aws#3 · pulled 2 modified files
 ```
 
-## How it works (and why there is no backend)
+## How it works (and why no backend is required)
 
 ```
 laptop                                  runner (SSH box or Spot VM)
@@ -31,8 +31,11 @@ AWS EC2 API (your credentials) ◀── sx    └ lockfile-keyed dependency cac
                                         cloud-init idle watchdog (systemd timer) ── poweroff
 ```
 
-Managing Spot instances does not need a service running anywhere. The
-responsibilities split like this:
+Managing Spot instances does not need a service running anywhere: `sx`
+works with nothing in the background. (An optional local pool manager,
+`spotexec daemon`, adds warm pools and health checks; see
+[Pool manager](#pool-manager-optional).) The responsibilities split like
+this:
 
 | Concern | Who handles it |
 | --- | --- |
@@ -50,9 +53,11 @@ Residual risk is a VM whose kernel hangs before the timer fires. The
 `max_lifetime` cap is armed twice (the timer, plus an independent
 `systemd-run` one-shot), but neither helps if cloud-init never runs.
 `spotexec status` shows anything still up (including stopped instances,
-whose disks still bill), and `spotexec down --all` ends it.
-If you want an outside backstop too, add an AWS Budgets alert, or an EventBridge
-rule that terminates `spotexec-runner`-tagged instances older than N hours.
+whose disks still bill), and `spotexec down --all` ends it. A running
+`spotexec daemon` is an outside backstop too: it terminates instances past
+`max_lifetime`. For a backstop that doesn't depend on your laptop, add an AWS
+Budgets alert, or an EventBridge rule that terminates `spotexec-runner`-tagged
+instances older than N hours.
 
 ## Install
 
@@ -142,7 +147,7 @@ image = "node:22-bookworm-slim" # pulled; or: dockerfile = ".spotexec/Dockerfile
 # user = "runner"               # default; "root" runs as root (files then belong to root)
 
 [tasks.test]
-run = "pnpm vitest run --maxWorkers=$SPOTEXEC_CPUS {args}"
+run = "pnpm vitest run --minWorkers=1 --maxWorkers=$SPOTEXEC_CPUS {args}"
 # pool = ["aws-big"]           # per-task fleet; priority = 10 queues it ahead
 [tasks.fmt]
 run = "pnpm prettier --write ."
@@ -173,7 +178,8 @@ max_instances = 3
 
 ### Scaling, queueing and CPUs
 
-Every `sx` process schedules for itself; there is no daemon:
+Every `sx` process schedules for itself (the optional pool manager only
+adds to this):
 - **Placement:** a job goes to a free slot on the oldest instance that has
   one, so newer instances drain and idle out first.
 - **Scaling out:** when every slot is busy, the job takes a ticket in a fair
@@ -189,7 +195,49 @@ Every `sx` process schedules for itself; there is no daemon:
 
 Each job gets `SPOTEXEC_CPUS`, its fair share of the instance (vCPUs ÷
 `max_slots`, or every vCPU with `--exclusive`), so test runners can size
-their worker pools, for example `--maxWorkers=$SPOTEXEC_CPUS`.
+their worker pools, for example `--maxWorkers=$SPOTEXEC_CPUS` (Jest,
+pytest-xdist's `-n $SPOTEXEC_CPUS`). Vitest 2 also needs `--minWorkers=1`,
+because its default minimum can exceed a small share and it then refuses to
+start.
+
+### Pool manager (optional)
+
+`spotexec daemon start` runs a background pool manager on your machine. It
+shares the same local state as `sx`, so it never duplicates a launch, and
+`sx` keeps working the same whether it runs or not. It adds:
+
+- **Warm pools.** It keeps `min_instances` per fleet running, so the first
+  job of the day doesn't wait for a boot. It launches them itself and keeps
+  their idle clock fresh. Shortly before `max_lifetime` it drains a warm VM,
+  so the VM finishes its jobs and powers off while a replacement boots.
+- **Faster interruption recovery.** It probes every instance every 30s. An
+  instance with a Spot interruption notice is drained, and its replacement
+  launches during the two-minute notice instead of after the VM disappears.
+- **Health checks.** An instance that stops answering for 8 minutes, or never
+  finishes first-boot setup, is terminated and replaced. Terminations are
+  retried until they take effect. If *no* instance answers, the problem is
+  probably your network, so it replaces at most one every 30 minutes.
+- **Reaping.** It terminates instances past `max_lifetime` (in case a VM's
+  watchdog failed) and leftover image-bake builders. It never touches a
+  builder whose bake is still running on this machine.
+
+Launch planning for queued jobs stays in `sx`. The daemon only adds the warm
+minimum, through the same locked ledger, so the two never double-launch.
+
+```toml
+[runners.aws]
+min_instances = 1   # kept warm while the daemon runs (default 0)
+```
+
+```
+spotexec daemon start | stop    background (log: ~/.local/state/spotexec/daemon/daemon.log)
+spotexec daemon run             foreground (for launchd/systemd, or debugging)
+spotexec daemon status [--json] instances, health, warm set, recent actions
+```
+
+Stopping the daemon stops nothing in the cloud: warm instances idle out
+after `idle_timeout` like any other. A warm instance costs its Spot price for
+as long as the daemon runs.
 
 ### Shared dependency cache
 
@@ -334,6 +382,7 @@ spotexec status / monitor        runners, holders, load, idle timers, burn rate
 spotexec up [runner] [--count N]  pre-warm fleet instances (respects max_instances)
 spotexec down [runner|--all]     terminate fleet instances (and leftover bake builders)
 spotexec image bake|list|clear   baked runner AMIs for fast cold boot
+spotexec daemon start|stop|status  optional pool manager: warm pools, health checks
 spotexec doctor                  verify SSH, helper, config and AWS
 spotexec unlock [runner] --slot N|--all     kill a wedged run and free its slot
 spotexec prune [--older-than 7d]            remove stale dependency caches and slots
@@ -465,4 +514,6 @@ ignored outputs you want.
 ```sh
 make test     # unit tests
 make e2e      # builds, starts an Ubuntu SSH container, runs scripts/e2e.sh
+scripts/e2e-pool.sh     # Spot pool scenarios on the Docker fleet simulator
+scripts/e2e-daemon.sh   # pool manager scenarios on the simulator
 ```

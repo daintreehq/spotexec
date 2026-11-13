@@ -56,6 +56,7 @@ type launchRec struct {
 	Started    time.Time `json:"started"`
 	PID        int       `json:"pid"`
 	Failed     bool      `json:"failed,omitempty"`
+	Ambiguous  time.Time `json:"ambiguous,omitempty"` // when RunInstances' outcome became unknown
 }
 
 type poolState struct {
@@ -210,7 +211,7 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 			// Usable for a while; it now counts as a normal instance. (Not at
 			// the first acquisition: its other slots are still capacity that
 			// waiting agents will take within a polling interval.)
-		case l.InstanceID == "" && !pidAlive(l.PID) && age > orphanGrace:
+		case l.InstanceID == "" && ((!pidAlive(l.PID) && age > orphanGrace) || (!l.Ambiguous.IsZero() && time.Since(l.Ambiguous) > listLagGrace)):
 			// Provisioner died before RunInstances returned; if an instance
 			// was created it will appear in listings and be counted there.
 		default:
@@ -431,6 +432,48 @@ func (p *Pool) Reserve(ctx context.Context, n int) ([]string, error) {
 	return ids, err
 }
 
+// EnsureMin reserves launches to bring the fleet up to min usable instances
+// (warm pools), computed atomically under the pool lock, so a launch planned
+// concurrently by an sx process counts. It honours launch backoff and the
+// cap on draining instances like Plan does.
+func (p *Pool) EnsureMin(ctx context.Context, min int) ([]string, error) {
+	var ids []string
+	err := p.withCtx(ctx, func(st *poolState) error {
+		if err := p.refresh(ctx, st, false); err != nil {
+			return err
+		}
+		listed := map[string]bool{}
+		usable, total := 0, 0
+		for _, in := range st.Instances {
+			listed[in.ID] = true
+			total++
+			if nt := st.Notes[in.ID]; nt == nil || !nt.Draining {
+				usable++
+			}
+		}
+		for _, l := range st.Launches {
+			if !l.Failed && (l.InstanceID == "" || !listed[l.InstanceID]) {
+				usable++
+				total++
+			}
+		}
+		if time.Now().Before(st.BackoffUntil) || total >= 2*p.R.MaxInstances {
+			return nil
+		}
+		for usable < min && usable < p.R.MaxInstances && total < 2*p.R.MaxInstances {
+			var b [6]byte
+			_, _ = rand.Read(b[:])
+			id := hex.EncodeToString(b[:])
+			st.Launches = append(st.Launches, launchRec{ID: id, Started: time.Now(), PID: os.Getpid()})
+			ids = append(ids, id)
+			usable++
+			total++
+		}
+		return nil
+	})
+	return ids, err
+}
+
 // Cancel abandons a planned launch that was never sent.
 func (p *Pool) Cancel(id string) {
 	_ = p.with(func(st *poolState) error {
@@ -468,7 +511,20 @@ func WaitLaunches(max time.Duration) {
 // Provision launches the instance planned under id and records it. It runs
 // outside the pool lock; failures free the ledger entry and back off.
 func (p *Pool) Provision(ctx context.Context, id string, log provider.Logger) (provider.Instance, error) {
-	launchesInFlight.Add(1)
+	HoldLaunch()
+	return p.ProvisionHeld(ctx, id, log)
+}
+
+// HoldLaunch registers a launch about to start (so WaitLaunches waits for
+// it) before the goroutine that runs it is even scheduled. Pair it with
+// ProvisionHeld, or ReleaseLaunch if the launch is abandoned.
+func HoldLaunch() { launchesInFlight.Add(1) }
+
+// ReleaseLaunch undoes HoldLaunch for a launch that was never sent.
+func ReleaseLaunch() { launchesInFlight.Done() }
+
+// ProvisionHeld is Provision for a caller that already called HoldLaunch.
+func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger) (provider.Instance, error) {
 	recorded := false
 	defer func() {
 		if !recorded {
@@ -483,8 +539,15 @@ func (p *Pool) Provision(ctx context.Context, id string, log provider.Logger) (p
 				// An ambiguous failure (the request may have created an
 				// instance) keeps its reservation until the ledger expires
 				// it, so it can never push the fleet past max_instances.
-				if st.Launches[i].ID == id && !ambiguous {
-					st.Launches[i].Failed = true
+				if st.Launches[i].ID == id {
+					if ambiguous {
+						// Expires after listLagGrace even if this process lives
+						// on (the pool manager): by then any instance the request
+						// created is visible in listings.
+						st.Launches[i].Ambiguous = time.Now()
+					} else {
+						st.Launches[i].Failed = true
+					}
 				}
 			}
 			st.BackoffUntil, st.LastLaunchErr = time.Now().Add(launchBackoff), firstLine(err.Error())
@@ -626,7 +689,7 @@ func (p *Pool) waiterDemand() int {
 // Snapshot returns the cached state (for status displays).
 func (p *Pool) Snapshot(ctx context.Context, force bool) (poolView, error) {
 	var v poolView
-	err := p.with(func(st *poolState) error {
+	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, force); err != nil {
 			return err
 		}
@@ -637,7 +700,17 @@ func (p *Pool) Snapshot(ctx context.Context, force bool) (poolView, error) {
 				v.Draining[id] = true
 			}
 		}
-		v.Launching = len(st.Launches)
+		// Launches not yet visible as instances (listed ones are counted
+		// in Instances already).
+		listed := map[string]bool{}
+		for _, in := range st.Instances {
+			listed[in.ID] = true
+		}
+		for _, l := range st.Launches {
+			if !l.Failed && (l.InstanceID == "" || !listed[l.InstanceID]) {
+				v.Launching++
+			}
+		}
 		v.Demand = p.waiterDemand()
 		v.LastLaunchErr = st.LastLaunchErr
 		return nil

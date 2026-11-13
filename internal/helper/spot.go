@@ -139,3 +139,31 @@ func imdsGet(ctx context.Context, c *http.Client, token *string, path string) (s
 	}
 	return strings.TrimSpace(string(b)), resp.StatusCode == 200
 }
+
+// SpotNotice checks once (no session needed) for a pending interruption:
+// the simulator file or IMDSv2 spot/instance-action. "" means none.
+func SpotNotice(ctx context.Context) string {
+	if b, err := os.ReadFile(filepath.Join(SimDir, "instance-action")); err == nil {
+		return "spot interruption notice: " + strings.TrimSpace(string(b))
+	}
+	if _, err := os.Stat(SimDir); err == nil {
+		return ""
+	}
+	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{Proxy: nil}}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPut, "http://169.254.169.254/latest/api/token", nil)
+	req.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "60")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return ""
+	}
+	token := string(b)
+	if body, ok := imdsGet(ctx, client, &token, "spot/instance-action"); ok {
+		return "EC2 spot interruption notice: " + body
+	}
+	return ""
+}

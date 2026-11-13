@@ -7,10 +7,14 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"github.com/spotexec/spotexec/internal/config"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -426,10 +430,43 @@ func (a *AWSSpot) ClearBakes(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// LockBake takes this runner's bake lock (non-blocking) for the duration of
+// a bake. A builder whose bake still holds the lock is never swept.
+func (a *AWSSpot) LockBake() (unlock func(), err error) {
+	dir := filepath.Join(config.StateDir(), "bake")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, a.r.Name+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("a bake for %s is already running on this machine", a.r.Name)
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+}
+
 // SweepBuilders terminates leftover bake builders of this runner (stopped,
-// or older than two hours): a CLI that died mid-bake must not leave one
-// billing. Called before each bake and by `spotexec down`.
+// or older than four hours) unless a bake on this machine is in progress: a
+// CLI that died mid-bake must not leave one billing. Called by `spotexec
+// down`, the pool manager, and each bake (which holds the lock: see
+// sweepBuilders).
 func (a *AWSSpot) SweepBuilders(ctx context.Context, log Logger) {
+	unlock, err := a.LockBake()
+	if err != nil {
+		return // a bake is running; its builder is not leftover
+	}
+	defer unlock()
+	a.sweepBuilders(ctx, log)
+}
+
+// SweepBuildersLocked is SweepBuilders for a caller already holding the
+// bake lock.
+func (a *AWSSpot) SweepBuildersLocked(ctx context.Context, log Logger) { a.sweepBuilders(ctx, log) }
+
+func (a *AWSSpot) sweepBuilders(ctx context.Context, log Logger) {
 	owner, err := a.ownerTag()
 	if err != nil {
 		return
@@ -452,7 +489,9 @@ func (a *AWSSpot) SweepBuilders(ctx context.Context, log Logger) {
 		return
 	}
 	for _, i := range insts {
-		if i.State == "stopped" || time.Since(i.launched()) > 2*time.Hour {
+		// Four hours is past any bake's own budget (boot, bootstrap with
+		// pre-pulls, and image creation).
+		if i.State == "stopped" || time.Since(i.launched()) > 4*time.Hour {
 			t := url.Values{}
 			t.Set("InstanceId.1", i.InstanceID)
 			if _, err := a.api.ec2(ctx, "TerminateInstances", t); err == nil && log != nil {
