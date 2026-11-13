@@ -516,6 +516,15 @@ func cmdDoctor() *cobra.Command {
 				check(r.Name+": helper session", true, fmt.Sprintf("%s/%s, %d CPUs, helper %s, %s", s.Hello.OS, s.Hello.Arch, s.Hello.CPUs, s.Hello.Version, ui.Dur(time.Since(start))))
 				s.Close()
 			}
+			warm := 0
+			for _, r := range cfg.Global.Runners {
+				warm += r.MinInstances
+			}
+			if pid := daemon.Running(); pid != 0 {
+				check("pool manager", true, fmt.Sprintf("running (pid %d)", pid))
+			} else if warm > 0 {
+				check("pool manager", false, "min_instances is set but the daemon isn't running, so nothing is kept warm (`spotexec daemon start`)")
+			}
 			if !ok {
 				return exitWith(1)
 			}

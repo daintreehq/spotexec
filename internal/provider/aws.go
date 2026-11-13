@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"os/exec"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -843,6 +844,15 @@ func (a *AWSSpot) Doctor(ctx context.Context) []Check {
 		msg := fmt.Sprintf("%.0f vCPUs for standard Spot instances in %s; this runner may use up to %d", v.Quota.Value, a.r.Region, need)
 		out = append(out, Check{Name: "spot vCPU quota", OK: v.Quota.Value >= float64(need), Msg: msg})
 	}
+	// Instances live in the runner's region, which is easy to miss when the
+	// console (or the AWS CLI default) points elsewhere.
+	where := fmt.Sprintf("instances appear in EC2 → %s; filter by tag %s=%s", a.r.Region, tagRunner, a.r.Name)
+	if out, err := exec.Command("aws", "configure", "get", "region").Output(); err == nil {
+		if def := strings.TrimSpace(string(out)); def != "" && def != a.r.Region {
+			where += fmt.Sprintf(" (your AWS CLI default region is %s; switch the console's region selector)", def)
+		}
+	}
+	out = append(out, Check{Name: "console", OK: true, Msg: where})
 	for _, t := range a.r.InstanceTypes {
 		if strings.HasPrefix(t, "t2.") || strings.HasPrefix(t, "t3.") || strings.HasPrefix(t, "t3a.") || strings.HasPrefix(t, "t4g.") {
 			out = append(out, Check{Name: "instance types", OK: true, Msg: "note: " + t + " is burstable; sustained CPU on spot t-family instances bills surplus credits. Prefer c7a/m7a/c6a."})

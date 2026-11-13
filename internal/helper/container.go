@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/spotexec/spotexec/internal/dockerignore"
 	"os"
 	"os/exec"
 	"os/user"
@@ -317,11 +318,30 @@ func (s *Session) stageContext(m protocol.Image) (string, string, func(), error)
 			return "", "", nil, err
 		}
 	}
+	// Apply .dockerignore exactly as the client did when computing the tag,
+	// so the image depends only on what was hashed.
+	var rules []byte
+	for _, cand := range dockerignore.Source(m.Dockerfile, ctxRel) {
+		if _, ok := s.stored[cand]; ok {
+			if p, err := fsid.SafeJoin(s.workspace, cand); err == nil {
+				rules, _ = os.ReadFile(p)
+			}
+			break
+		}
+	}
+	ign, err := dockerignore.New(rules)
+	if err != nil {
+		cleanup()
+		return "", "", nil, fmt.Errorf("parsing .dockerignore: %w", err)
+	}
 	for rel := range s.stored {
 		if ctxRel != "" && rel != ctxRel && !strings.HasPrefix(rel, ctxRel+"/") {
 			continue
 		}
 		inner := strings.TrimPrefix(strings.TrimPrefix(rel, ctxRel), "/")
+		if ign.Excluded(inner) {
+			continue
+		}
 		src, err := fsid.SafeJoin(s.workspace, rel)
 		if err != nil {
 			continue

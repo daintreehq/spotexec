@@ -285,7 +285,11 @@ Docker image on the runner:
   networking, so `SPOTEXEC_PORT_BASE` still works.
 - With `image =`, the image is pulled. With `dockerfile =`, it is built on
   the runner and tagged by the content of the Dockerfile and its build
-  context.
+  context (`context =`, default: the Dockerfile's directory).
+- `.dockerignore` applies as in `docker build`: `<Dockerfile>.dockerignore`
+  wins over `<context>/.dockerignore`. Ignored files are neither sent nor
+  hashed, so with `context = "."` and a `.dockerignore` that keeps only
+  manifests, editing source never triggers a rebuild.
 - For `dockerfile =` on AWS, the built image is pushed to a private ECR
   repository (`spotexec/<repo-id>`, keeping the newest 10), so every other VM
   pulls it instead of rebuilding.

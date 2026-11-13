@@ -22,31 +22,65 @@ func TestImageTagScopesAndPlatform(t *testing.T) {
 		{Path: ".spotexec/setup.sh", ID: "s1", Mode: 0o100755},
 		{Path: "src/app.ts", ID: "a1", Mode: 0o100644},
 	}
-	t1, err := imageTag(mf(base...), ".spotexec/Dockerfile", "", "linux/amd64")
+	t1, err := imageTag(mf(base...), ".spotexec/Dockerfile", "", "linux/amd64", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// A source change outside the build context must not change the tag.
 	changed := append([]protocol.Entry{}, base...)
 	changed[2].ID = "a2"
-	if t2, _ := imageTag(mf(changed...), ".spotexec/Dockerfile", "", "linux/amd64"); t2 != t1 {
+	if t2, _ := imageTag(mf(changed...), ".spotexec/Dockerfile", "", "linux/amd64", nil); t2 != t1 {
 		t.Fatal("tag changed for a file outside the context")
 	}
 	// A file inside the context must.
 	changed = append([]protocol.Entry{}, base...)
 	changed[1].ID = "s2"
-	if t2, _ := imageTag(mf(changed...), ".spotexec/Dockerfile", "", "linux/amd64"); t2 == t1 {
+	if t2, _ := imageTag(mf(changed...), ".spotexec/Dockerfile", "", "linux/amd64", nil); t2 == t1 {
 		t.Fatal("tag unchanged for a context file change")
 	}
 	// Architectures never share a tag.
-	if t3, _ := imageTag(mf(base...), ".spotexec/Dockerfile", "", "linux/arm64"); t3 == t1 {
+	if t3, _ := imageTag(mf(base...), ".spotexec/Dockerfile", "", "linux/arm64", nil); t3 == t1 {
 		t.Fatal("amd64 and arm64 share a tag")
 	}
 	// Explicit repo-root context includes everything.
-	r1, _ := imageTag(mf(base...), ".spotexec/Dockerfile", ".", "linux/amd64")
+	r1, _ := imageTag(mf(base...), ".spotexec/Dockerfile", ".", "linux/amd64", nil)
 	changed = append([]protocol.Entry{}, base...)
 	changed[2].ID = "a2"
-	if r2, _ := imageTag(mf(changed...), ".spotexec/Dockerfile", ".", "linux/amd64"); r2 == r1 {
+	if r2, _ := imageTag(mf(changed...), ".spotexec/Dockerfile", ".", "linux/amd64", nil); r2 == r1 {
 		t.Fatal("repo-root context should include src/")
+	}
+}
+
+func TestImageTagHonoursDockerignore(t *testing.T) {
+	base := []protocol.Entry{
+		{Path: "Dockerfile", ID: "df1", Mode: 0o100644},
+		{Path: ".dockerignore", ID: "ig1", Mode: 0o100644},
+		{Path: "package.json", ID: "p1", Mode: 0o100644},
+		{Path: "src/app.ts", ID: "a1", Mode: 0o100644},
+	}
+	rules := map[string][]byte{".dockerignore": []byte("*\n!package.json\n!Dockerfile\n")}
+	read := func(rel string) ([]byte, error) { return rules[rel], nil }
+	t1, err := imageTag(mf(base...), "Dockerfile", ".", "linux/amd64", read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := append([]protocol.Entry{}, base...)
+	changed[3].ID = "a2"
+	if t2, _ := imageTag(mf(changed...), "Dockerfile", ".", "linux/amd64", read); t2 != t1 {
+		t.Fatal("an ignored file changed the tag")
+	}
+	changed = append([]protocol.Entry{}, base...)
+	changed[2].ID = "p2"
+	if t2, _ := imageTag(mf(changed...), "Dockerfile", ".", "linux/amd64", read); t2 == t1 {
+		t.Fatal("a kept file did not change the tag")
+	}
+	// A Dockerfile-specific ignore file wins over the context's.
+	base = append(base, protocol.Entry{Path: "Dockerfile.dockerignore", ID: "dig", Mode: 0o100644})
+	rules["Dockerfile.dockerignore"] = []byte("src\n")
+	t3, _ := imageTag(mf(base...), "Dockerfile", ".", "linux/amd64", read)
+	changed = append([]protocol.Entry{}, base...)
+	changed[3].ID = "a2"
+	if t4, _ := imageTag(mf(changed...), "Dockerfile", ".", "linux/amd64", read); t4 != t3 {
+		t.Fatal("Dockerfile.dockerignore not preferred")
 	}
 }

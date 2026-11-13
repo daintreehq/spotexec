@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/spotexec/spotexec/internal/dockerignore"
 	"io"
 	"io/fs"
 	"os"
@@ -757,9 +758,10 @@ func markLost(cfg *config.Config, runner, id string) {
 
 // imageTag hashes the runner platform, the Dockerfile, a companion
 // <Dockerfile>.dockerignore, and every synced file in the build context
-// (with any corrections from the upload), so a built image is reused until
-// one of them changes, and never across CPU architectures.
-func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string) (string, error) {
+// that .dockerignore keeps (with any corrections from the upload), so a
+// built image is reused until one of them changes, and never across CPU
+// architectures. read loads a synced file's content (the ignore rules).
+func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read func(rel string) ([]byte, error)) (string, error) {
 	if m == nil {
 		return "", errors.New("container.dockerfile needs a synced workspace (not --sync none)")
 	}
@@ -779,9 +781,29 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string) (stri
 	if ign, ok := m.ByPath[dockerfile+".dockerignore"]; ok {
 		fmt.Fprintf(h, "dockerignore\x00%s\x00", ign.ID)
 	}
+	// The same rules file the helper stages with (see stageContext).
+	var rules []byte
+	for _, cand := range dockerignore.Source(dockerfile, buildCtx) {
+		if _, ok := m.ByPath[cand]; ok && read != nil {
+			b, err := read(cand)
+			if err != nil {
+				return "", fmt.Errorf("reading %s: %w", cand, err)
+			}
+			rules = b
+			break
+		}
+	}
+	ign, err := dockerignore.New(rules)
+	if err != nil {
+		return "", fmt.Errorf("parsing .dockerignore: %w", err)
+	}
 	paths := make([]string, 0, len(m.ByPath))
 	for p := range m.ByPath {
 		if buildCtx == "" || p == buildCtx || strings.HasPrefix(p, buildCtx+"/") {
+			inner := strings.TrimPrefix(strings.TrimPrefix(p, buildCtx), "/")
+			if ign.Excluded(inner) {
+				continue
+			}
 			paths = append(paths, p)
 		}
 	}
@@ -809,7 +831,9 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 		}
 		req.Ref = lr.Image
 	} else {
-		tag, err := imageTag(m, c.Dockerfile, c.Context, s.Hello.OS+"/"+s.Hello.Arch)
+		tag, err := imageTag(m, c.Dockerfile, c.Context, s.Hello.OS+"/"+s.Hello.Arch, func(rel string) ([]byte, error) {
+			return os.ReadFile(filepath.Join(ws.Root, filepath.FromSlash(rel)))
+		})
 		if err != nil {
 			return "", "", err
 		}
