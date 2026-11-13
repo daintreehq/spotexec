@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -41,6 +42,7 @@ type runFlags struct {
 	noBoot        bool
 	dir           string
 	noRetry       bool
+	priority      int
 }
 
 func (f *runFlags) register(fs *pflag.FlagSet) {
@@ -61,7 +63,8 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.BoolVar(&f.fallbackLocal, "fallback-local", false, "run locally if no runner is available")
 	fs.BoolVar(&f.noBoot, "no-boot", false, "never provision ephemeral runners for this command")
 	fs.StringVarP(&f.dir, "dir", "C", "", "run as if started in this directory")
-	fs.BoolVar(&f.noRetry, "no-retry", false, "do not retry once after a spot interruption")
+	fs.BoolVar(&f.noRetry, "no-retry", false, "do not replay the run if its runner is lost (spot reclaim)")
+	fs.IntVar(&f.priority, "priority", 0, "queue priority when every slot is busy (higher runs first)")
 }
 
 func (f *runFlags) reporter() (ui.Reporter, error) {
@@ -93,6 +96,11 @@ func (f *runFlags) applyEnv() {
 	if os.Getenv("SPOTEXEC_JSON") == "1" {
 		f.json = true
 	}
+	if f.priority == 0 {
+		if n, err := strconv.Atoi(os.Getenv("SPOTEXEC_PRIORITY")); err == nil {
+			f.priority = n
+		}
+	}
 }
 
 // loaded is everything a run needs.
@@ -118,7 +126,11 @@ func load(dir string) (*loaded, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &loaded{cfg: &config.Config{Global: g, Project: p}, ws: ws}, nil
+	cfg := &config.Config{Global: g, Project: p}
+	if err := cfg.MergeProjectRunners(); err != nil {
+		return nil, err
+	}
+	return &loaded{cfg: cfg, ws: ws}, nil
 }
 
 // buildCommand turns argv into a remote shell line. A single argument is
@@ -181,6 +193,7 @@ type runSpec struct {
 	sync       string
 	exclusive  bool
 	pool       []string
+	priority   int
 	preferLast bool
 	syncOnly   bool
 }
@@ -193,7 +206,10 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 		Pool: f.pool, Exclusive: f.exclusive || s.exclusive, Pull: f.pull, NoDeps: f.noDeps,
 		ForceLargeSync: f.forceLarge, Stdout: stdout, Stderr: stderr, Rep: rep, Interrupt: intr,
 		Label: s.label, RetryPreempt: !f.noRetry, NoBoot: f.noBoot,
-		PreferLast: s.preferLast, SyncOnly: s.syncOnly,
+		PreferLast: s.preferLast, SyncOnly: s.syncOnly, Priority: s.priority,
+	}
+	if f.priority != 0 {
+		o.Priority = f.priority
 	}
 	if s.timeout > 0 {
 		o.Timeout = s.timeout
@@ -330,7 +346,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	defer client.WaitLaunches(90 * time.Second)
 	if len(t.Parallel) == 0 {
 		cmd := buildTaskLine(l, t.Run, args)
-		return f.execute(l, runSpec{label: name, command: cmd, display: name + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool})
+		return f.execute(l, runSpec{label: name, command: cmd, display: name + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool, priority: t.Priority})
 	}
 	f.applyEnv()
 	rep, err := f.reporter()
@@ -367,7 +383,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			sr := &taskReporter{Reporter: rep, task: sub}
 			prefix := fmt.Sprintf("[%s] ", sub)
 			cmd := buildTaskLine(l, st.Run, nil)
-			spec := runSpec{label: sub, command: cmd, display: sub + ": " + cmd, timeout: st.Timeout.Duration, sync: st.Sync, exclusive: st.Exclusive, pool: st.Pool}
+			spec := runSpec{label: sub, command: cmd, display: sub + ": " + cmd, timeout: st.Timeout.Duration, sync: st.Sync, exclusive: st.Exclusive, pool: st.Pool, priority: st.Priority}
 			o := f.options(l, spec, sr, intrs[i], ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu))
 			res, err := client.Run(ctx, l.cfg, l.ws, o)
 			code := res.ExitCode

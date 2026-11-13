@@ -38,8 +38,9 @@ const (
 
 // Runner is one entry under [runners.<name>].
 type Runner struct {
-	Name string `toml:"-"`
-	Type string `toml:"type"`
+	Name    string `toml:"-"`
+	Type    string `toml:"type"`
+	Extends string `toml:"extends"` // project runners: inherit a global runner, then override
 
 	// Common
 	MaxSlots        int      `toml:"max_slots"`
@@ -74,6 +75,7 @@ type Runner struct {
 	VolumeGB         int      `toml:"volume_gb"`
 	User             string   `toml:"user"`
 	OnDemandFallback bool     `toml:"on_demand_fallback"`
+	CacheBucket      string   `toml:"cache_bucket"` // shared dependency cache: "auto" (default), a bucket name, or "off"
 
 	// fleets (aws-spot, sim)
 	MaxInstances int `toml:"max_instances"`
@@ -123,7 +125,22 @@ type Task struct {
 	Exclusive bool     `toml:"exclusive"`
 	Sync      string   `toml:"sync"`
 	Pool      []string `toml:"pool"`
+	Priority  int      `toml:"priority"`
 }
+
+// Container is [container]: run every command (and the dependency install)
+// inside this image on the runner.
+type Container struct {
+	Image      string   `toml:"image"`      // pull this image (e.g. "node:22-bookworm")
+	Dockerfile string   `toml:"dockerfile"` // or build this Dockerfile (repo-relative)
+	Context    string   `toml:"context"`    // build context (default: the Dockerfile's directory)
+	Options    []string `toml:"options"`    // extra `docker run` arguments
+	User       string   `toml:"user"`       // "runner" (default: files stay owned by the runner user) or "root"
+	Timeout    Duration `toml:"timeout"`    // pull/build limit (default 20m)
+}
+
+// Enabled reports whether a container is configured.
+func (c Container) Enabled() bool { return c.Image != "" || c.Dockerfile != "" }
 
 // Hook is [hook]: tunes the agent command-interception hook.
 type Hook struct {
@@ -145,9 +162,14 @@ type Project struct {
 	Pool         []string          `toml:"pool"`
 	Sync         Sync              `toml:"sync"`
 	Deps         Deps              `toml:"deps"`
+	Container    Container         `toml:"container"`
 	Tasks        map[string]*Task  `toml:"tasks"`
 	Hook         Hook              `toml:"hook"`
-	Path         string            `toml:"-"`
+	// Runners defined (or extended) by the project; merged over the global
+	// runners by Config.MergeProjectRunners.
+	Runners map[string]toml.Primitive `toml:"runners"`
+	Path    string                    `toml:"-"`
+	md      toml.MetaData
 }
 
 // Config is the merged view used by commands.
@@ -222,7 +244,7 @@ func LoadGlobal() (*Global, error) {
 func (r *Runner) applyDefaults() error {
 	switch r.Type {
 	case TypeSSH:
-		if r.Host != "" {
+		if r.Host != "" && (len(r.Hosts) == 0 || r.Hosts[0] != r.Host) {
 			r.Hosts = append([]string{r.Host}, r.Hosts...)
 		}
 		if len(r.Hosts) == 0 {
@@ -248,13 +270,13 @@ func (r *Runner) applyDefaults() error {
 			r.SSHCIDR = "0.0.0.0/0"
 		}
 		if r.IdleTimeout.Duration == 0 {
-			r.IdleTimeout.Duration = 5 * time.Minute
+			r.IdleTimeout.Duration = 10 * time.Minute
 		}
 		if r.MaxLifetime.Duration == 0 {
 			r.MaxLifetime.Duration = 12 * time.Hour
 		}
 		if r.BootTimeout.Duration == 0 {
-			r.BootTimeout.Duration = 10 * time.Minute
+			r.BootTimeout.Duration = 15 * time.Minute
 		}
 	case TypeSim:
 		if r.Image == "" {
@@ -264,7 +286,7 @@ func (r *Runner) applyDefaults() error {
 			r.User = "dev"
 		}
 		if r.IdleTimeout.Duration == 0 {
-			r.IdleTimeout.Duration = 5 * time.Minute
+			r.IdleTimeout.Duration = 10 * time.Minute
 		}
 		if r.MaxLifetime.Duration == 0 {
 			r.MaxLifetime.Duration = 2 * time.Hour
@@ -331,9 +353,17 @@ func LoadProject(path string) (*Project, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
-		if und := md.Undecoded(); len(und) > 0 {
+		var und []toml.Key
+		for _, k := range md.Undecoded() {
+			if len(k) > 0 && k[0] == "runners" {
+				continue // decoded later, by MergeProjectRunners
+			}
+			und = append(und, k)
+		}
+		if len(und) > 0 {
 			return nil, fmt.Errorf("%s: unknown keys: %v", path, und)
 		}
+		p.md = md
 	}
 	p.applyDefaults()
 	if err := p.validate(); err != nil {
@@ -364,6 +394,9 @@ func (p *Project) applyDefaults() {
 	if p.Deps.Timeout.Duration == 0 {
 		p.Deps.Timeout.Duration = 20 * time.Minute
 	}
+	if p.Container.Timeout.Duration == 0 {
+		p.Container.Timeout.Duration = 20 * time.Minute
+	}
 	if p.Tasks == nil {
 		p.Tasks = map[string]*Task{}
 	}
@@ -378,6 +411,12 @@ func (p *Project) validate() error {
 	}
 	if !oneOf(p.Deps.Hydrate, "auto", "reflink", "copy", "hardlink") {
 		return fmt.Errorf("deps.hydrate must be auto, reflink, copy or hardlink (got %q)", p.Deps.Hydrate)
+	}
+	if p.Container.Image != "" && p.Container.Dockerfile != "" {
+		return errors.New("container: set image or dockerfile, not both")
+	}
+	if p.Container.User != "" && p.Container.User != "runner" && p.Container.User != "root" {
+		return errors.New(`container.user must be "runner" or "root"`)
 	}
 	if p.Deps.Install != "" && len(p.Deps.CacheDirs) == 0 {
 		return errors.New("deps.install requires deps.cache_dirs")
@@ -397,6 +436,53 @@ func (p *Project) validate() error {
 		}
 		if t.Sync != "" && !oneOf(t.Sync, "auto", "in", "none") {
 			return fmt.Errorf("task %q: sync must be auto, in or none", name)
+		}
+	}
+	return nil
+}
+
+// MergeProjectRunners decodes runners declared in .spotexec.toml and adds
+// them to the global set (a project runner with the same name as a global
+// one overrides it). `extends = "name"` starts from a copy of a global
+// runner, so a project can keep your account/region settings and change only
+// sizes, slots or bootstrap.
+func (c *Config) MergeProjectRunners() error {
+	p := c.Project
+	if p == nil || len(p.Runners) == 0 {
+		return nil
+	}
+	for name, prim := range p.Runners {
+		var probe Runner
+		if err := p.md.PrimitiveDecode(prim, &probe); err != nil {
+			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
+		}
+		base := Runner{}
+		from := probe.Extends
+		if from == "" {
+			from = name
+		}
+		if g, ok := c.Global.Runners[from]; ok {
+			base = *g
+			base.Hosts = append([]string(nil), g.Hosts...)
+			base.InstanceTypes = append([]string(nil), g.InstanceTypes...)
+		} else if probe.Extends != "" {
+			return fmt.Errorf("%s: runner %q extends unknown runner %q", p.Path, name, probe.Extends)
+		}
+		if p.md.IsDefined("runners", name, "instance_types") && !p.md.IsDefined("runners", name, "arch") {
+			base.Arch = "" // re-derive from the new instance types
+		}
+		if err := p.md.PrimitiveDecode(prim, &base); err != nil {
+			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
+		}
+		base.Name, base.Extends = name, ""
+		if err := base.applyDefaults(); err != nil {
+			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
+		}
+		c.Global.Runners[name] = &base
+	}
+	for _, n := range p.Pool {
+		if _, ok := c.Global.Runners[n]; !ok {
+			return fmt.Errorf("%s: pool references unknown runner %q", p.Path, n)
 		}
 	}
 	return nil

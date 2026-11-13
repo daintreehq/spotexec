@@ -26,7 +26,12 @@ import (
 	"github.com/spotexec/spotexec/internal/ui"
 )
 
+// loadGlobal loads the runner set: global runners plus any declared by the
+// project in the current directory.
 func loadGlobal() (*config.Config, error) {
+	if l, err := load(""); err == nil {
+		return l.cfg, nil
+	}
 	g, err := config.LoadGlobal()
 	if err != nil {
 		return nil, err
@@ -413,6 +418,9 @@ func cmdDown() *cobra.Command {
 				if err := p.Down(cmd.Context(), func(f string, a ...any) { fmt.Fprintf(os.Stderr, "%s: %s\n", r.Name, fmt.Sprintf(f, a...)) }); err != nil {
 					errs = append(errs, fmt.Sprintf("%s: %v", r.Name, err))
 					continue
+				}
+				if f, ok := p.(provider.Fleet); ok {
+					client.NewPool(r, f).Reset()
 				}
 				fmt.Printf("%s: terminated\n", r.Name)
 			}

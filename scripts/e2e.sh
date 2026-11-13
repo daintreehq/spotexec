@@ -104,7 +104,7 @@ check "SYNC_CONFLICT reported" "grep -q SYNC_CONFLICT $WORK/conf.err"
 
 echo "== concurrency (max_slots=3, 4 jobs)"
 for i in 1 2 3 4; do "$SX" --json "sleep 1.5; echo slot=\$SPOTEXEC_SLOT" >"$WORK/p$i.out" 2>"$WORK/p$i.err" & done; wait
-check "three run at once, the fourth queues" "cat $WORK/p*.err | grep -c '\"queued\"' | grep -qx 1"
+check "three run at once, the fourth queues" "cat $WORK/p*.err | grep -c '\"event\":\"queued\"' | grep -qx 1"
 check "all four succeed" "[ \$(cat $WORK/p*.out | grep -c slot=) = 4 ]"
 
 echo "== deps cache"
@@ -130,7 +130,7 @@ sed -i.bak 's/^install = "npm ci"/install = "npm ci --no-audit"/' .spotexec.toml
 check "two slots on a cold cache: one builds, the other hydrates" "grep -q '\"built\":true' $WORK/v2.err && grep -q '\"hydrated\":true' $WORK/v2.err && [ \$(grep -c '\"exit_code\":0' $WORK/v2.err) -ge 3 ]"
 ("$SX" -q 'sleep 3' &) ; sleep 1
 "$SX" --json --exclusive 'echo excl' >"$WORK/x.out" 2>"$WORK/x.err" || true
-check "--exclusive waits for running jobs" "grep -q excl $WORK/x.out && grep -q '\"waited_ms\":[1-9]' $WORK/x.err"
+check "--exclusive waits for running jobs" "grep -q excl $WORK/x.out && grep -q '\"event\":\"queued\"' $WORK/x.err"
 
 echo "== pull, exec, status, unlock"
 "$SX" -q 'mkdir -p coverage && echo report > coverage/index.html'

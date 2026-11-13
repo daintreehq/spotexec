@@ -103,6 +103,11 @@ func canonicalQuery(raw string) string {
 		return ""
 	}
 	parts := strings.Split(raw, "&")
+	for i, p := range parts {
+		if !strings.Contains(p, "=") {
+			parts[i] = p + "=" // valueless subresources (?lifecycle) sign as "lifecycle="
+		}
+	}
 	sort.Strings(parts)
 	return strings.Join(parts, "&")
 }

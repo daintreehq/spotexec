@@ -215,6 +215,12 @@ func (s *Session) dispatch(env protocol.Envelope) error {
 			return err
 		}
 		return s.fetch(f)
+	case protocol.TypeImage:
+		var m protocol.Image
+		if err := env.Unmarshal(&m); err != nil {
+			return err
+		}
+		return s.image(m)
 	case protocol.TypePull:
 		var p protocol.Pull
 		if err := env.Unmarshal(&p); err != nil {

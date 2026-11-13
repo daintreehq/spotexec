@@ -240,7 +240,17 @@ func (s *Session) exec(e protocol.Exec) error {
 	if grace <= 0 {
 		grace = 5 * time.Second
 	}
-	pr := s.runProc(script, dir, env, timeout, grace, e.SpotWatch)
+	runEnv := env
+	if e.Container != nil {
+		// Inside the project container: runner PATH setup doesn't apply.
+		host, _, cleanup, err := s.containerScript(e.Container, e.Shell, dir, env)
+		if err != nil {
+			return perr(protocol.CodeImageFailed, "%v", err)
+		}
+		defer cleanup()
+		script, runEnv = host, nil
+	}
+	pr := s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch)
 	res := protocol.Result{
 		ExitCode: pr.code, Signal: pr.signal, TimedOut: pr.timedOut, Canceled: pr.canceled,
 		Interrupted: pr.spotIntr || s.interrupted.Load(), DurationMS: time.Since(start).Milliseconds(),

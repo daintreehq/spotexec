@@ -26,10 +26,25 @@ max_instances = 3
 max_slots = 2
 idle_timeout = "20s"
 boot_delay = "2s"
+priority = 10
+[runners.${RUNNER}b]
+type = "sim"
+max_instances = 1
+max_slots = 4
+idle_timeout = "20s"
+boot_delay = "2s"
+priority = 20
 EOF
 
 count() { docker ps -q --filter "label=spotexec-runner=$RUNNER" | wc -l | tr -d ' '; }
-cleanup() { docker ps -q --filter "label=spotexec-runner=$RUNNER" | xargs -r docker rm -f >/dev/null 2>&1; }
+countb() { docker ps -q --filter "label=spotexec-runner=${RUNNER}b" | wc -l | tr -d ' '; }
+cleanup() {
+  # One filter per command: Docker ANDs repeated label filters.
+  for r in "$RUNNER" "${RUNNER}b"; do
+    docker ps -q --filter "label=spotexec-runner=$r" | xargs -r docker rm -f >/dev/null 2>&1
+  done
+  return 0
+}
 trap cleanup EXIT
 
 REPO="$WORK/repo"
@@ -64,7 +79,8 @@ for _ in $(seq 1 20); do [ "$(count)" = 0 ] && break; sleep 2; done
 check "pool scaled to zero" "[ \$(count) = 0 ]"
 
 echo "== spot interruption mid-run: job replayed on a replacement"
-"$SX" --json 'sleep 12; echo finished attempt=$SPOTEXEC_ATTEMPT run=$SPOTEXEC_RUN_ID' >"$WORK/i.out" 2>"$WORK/i.err" &
+t0=$(date +%s)
+"$SX" --json 'sleep 12; echo finished attempt=$SPOTEXEC_ATTEMPT run=$SPOTEXEC_RUN_ID' 2>&1 >"$WORK/i.out" | while IFS= read -r l; do echo "$(( $(date +%s)-t0 ))s $l"; done >"$WORK/i.err" &
 P=$!
 for _ in $(seq 1 40); do grep -q '"exec"' "$WORK/i.err" 2>/dev/null && break; sleep 0.5; done
 sleep 1
@@ -85,20 +101,17 @@ wait $P; code=$?
 check "finished on the doomed instance without replay" "[ $code = 0 ] && grep -q 'quick attempt=1' $WORK/q.out && ! grep -q RUNNER_LOST $WORK/q.err"
 wait
 
-echo "== rebalance recommendation: drain, then leave when empty"
+echo "== rebalance recommendation is advisory (real EC2 sends it at boot)"
 "$SX" -q true
 ID=$(docker ps --filter "label=spotexec-runner=$RUNNER" --format '{{.Names}}' | head -1)
-"$SX" --json 'sleep 6; echo drained-ok' >"$WORK/r.out" 2>"$WORK/r.err" &
+"$SX" --json 'sleep 4; echo still-ok' >"$WORK/r.out" 2>"$WORK/r.err" &
 P=$!
-sleep 2
+sleep 1
 "$SX" sim rebalance "$RUNNER" "$ID" >/dev/null
-sleep 4
-"$SX" --json 'echo elsewhere' >"$WORK/r2.out" 2>"$WORK/r2.err"
-check "new work avoids the draining instance" "grep -q elsewhere $WORK/r2.out && ! grep -q \"$ID\" <(grep '\"placed\"' $WORK/r2.err)"
 wait $P
-check "running job on the draining instance finished" "grep -q drained-ok $WORK/r.out"
-for _ in $(seq 1 15); do docker ps --format '{{.Names}}' | grep -q "^$ID\$" || break; sleep 1; done
-check "draining instance terminated as soon as it was empty" "! docker ps --format '{{.Names}}' | grep -q '^$ID\$'"
+check "rebalance reported to the client" "grep -q spot_rebalance $WORK/r.err && grep -q still-ok $WORK/r.out"
+sleep 5
+check "rebalance does not drain or terminate the instance" "docker ps --format '{{.Names}}' | grep -q '^$ID\$' && ! docker exec $ID test -e /var/tmp/spotexec/draining"
 
 echo "== thundering herd from cold (12 agents at once)"
 cleanup; sleep 1
@@ -106,6 +119,53 @@ rm -rf "$SPOTEXEC_STATE_DIR/runners/$RUNNER/pool.json"
 for i in $(seq 1 12); do "$SX" --json "sleep 3; echo herd$i" >"$WORK/h$i.out" 2>"$WORK/h$i.err" & done; wait
 check "all twelve agents completed" "[ \$(cat $WORK/h*.out | grep -c '^herd') = 12 ]"
 check "launched at most max_instances" "[ \$(cat $WORK/h*.err | grep -c scale_out) -le 3 ] && [ \$(count) -le 3 ]"
+
+echo "== fair queue: 30 agents on 6 slots, and a late high-priority agent jumps ahead"
+cleanup; sleep 1
+"$SX" up "$RUNNER" --count 3 >/dev/null 2>&1
+for i in $(seq 1 30); do "$SX" --json "sleep 3; echo q$i" >"$WORK/q$i.out" 2>"$WORK/q$i.err" & sleep 0.1; done
+sleep 2
+t0=$(date +%s)
+"$SX" --json --priority 10 'echo vip' >"$WORK/vip.out" 2>"$WORK/vip.err"
+vip=$(( $(date +%s) - t0 ))
+wait
+check "all thirty queued agents completed" "[ \$(cat $WORK/q*.out | grep -cE '^q[0-9]+$') = 30 ]"
+check "queue positions were reported" "grep -q queue_position $WORK/q30.err"
+check "high-priority agent ran within ~2 job waves (${vip}s)" "grep -q vip $WORK/vip.out && [ $vip -le 9 ]"
+check "late arrivals did not overtake: agent 30 was queued behind others" "grep -q '\"position\":[2-9][0-9]*' $WORK/q30.err"
+
+echo "== overflow into a second, lower-priority fleet (10 agents: 3x2 slots + 1x4 slots)"
+cleanup; sleep 1
+for i in $(seq 1 10); do SPOTEXEC_POOL="$RUNNER,${RUNNER}b" "$SX" --json "sleep 5; echo over$i" >"$WORK/o$i.out" 2>"$WORK/o$i.err" & done; wait
+check "all ten agents completed" "[ \$(cat $WORK/o*.out | grep -c '^over') = 10 ]"
+check "primary fleet filled to max (3)" "[ \$(count) = 3 ]"
+check "overflow fleet launched exactly one" "[ \$(countb) = 1 ]"
+
+echo "== shared dependency cache: a fresh instance restores instead of installing"
+cleanup; sleep 1
+DREPO="$WORK/depsrepo"
+mkdir -p "$DREPO" && cd "$DREPO" && git init -q && git config user.email t@t && git config user.name t
+echo "lock-v1" > deps.lock
+cat > .spotexec.toml <<'EOF2'
+version = 1
+[deps]
+lockfiles = ["deps.lock"]
+install = "mkdir -p vendor && echo installed-on-$(hostname) > vendor/marker && sleep 4"
+cache_dirs = ["vendor"]
+EOF2
+git add -A && git commit -qm deps
+"$SX" --json 'cat vendor/marker' >"$WORK/d1.out" 2>"$WORK/d1.err"
+check "first instance installs and starts an upload" "grep -q '\"built\":true' $WORK/d1.err && grep -q '\"uploading\":true' $WORK/d1.err"
+FIRST=$(cat $WORK/d1.out)
+sleep 4   # let the background upload finish
+cleanup; sleep 1
+"$SX" --json 'cat vendor/marker' >"$WORK/d2.out" 2>"$WORK/d2.err"
+check "fresh instance restored deps from the shared cache" "grep -q '\"restored\":true' $WORK/d2.err && ! grep -q '\"built\":true' $WORK/d2.err"
+check "restored files are the cached ones" "[ \"\$(cat $WORK/d2.out)\" = \"$FIRST\" ]"
+echo "lock-v2" > deps.lock
+"$SX" --json 'cat vendor/marker' >"$WORK/d3.out" 2>"$WORK/d3.err"
+check "a lockfile change misses the cache and reinstalls" "grep -q '\"built\":true' $WORK/d3.err"
+cd "$REPO"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

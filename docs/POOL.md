@@ -58,9 +58,10 @@ A draining VM with no sessions shuts down at once, without waiting for
 
 The helper polls IMDSv2 every 5s for the whole session:
 
-- `events/recommendations/rebalance` (an early warning): the helper marks the
-  VM **draining**. Running jobs finish, no new jobs are accepted, and the
-  watchdog shuts it down once it is empty.
+- `events/recommendations/rebalance` (an early, advisory warning): recorded
+  and reported as a `spot_rebalance` event only. Real EC2 often sends one
+  the moment an instance boots in a capacity pool at elevated risk, so
+  draining on it would make the fleet churn.
 - `spot/instance-action` (about 2 minutes' notice): the helper marks the VM
   draining and sends `spot_interruption` to the CLI.
 
@@ -89,7 +90,7 @@ on the local machine:
 | Boot | The same cloud-init user-data. `systemctl` is stubbed and the watchdog runs in a loop every 2s; `boot_delay` adds launch latency. |
 | Self-termination | The watchdog's self-destruct kills PID 1, so the container exits and is removed (`--rm`) |
 | Spot notice | `spotexec sim interrupt` writes `/var/tmp/spotexec/sim/instance-action` (the helper checks it before IMDS), then kills the container after `--after` (default 10s) |
-| Rebalance | `spotexec sim rebalance` writes `/var/tmp/spotexec/sim/rebalance` |
+| Rebalance | `spotexec sim rebalance` writes `/var/tmp/spotexec/sim/rebalance` (advisory only) |
 
 `scripts/e2e-pool.sh` drives the scenarios below against the simulator:
 - scale out to `max_instances`;

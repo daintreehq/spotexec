@@ -26,13 +26,14 @@ import (
 
 // Options for rendering.
 type Options struct {
-	User            string        // login user that receives the SSH key
-	PublicKey       string        // authorized_keys line
-	IdleTimeout     time.Duration // shut down after this much inactivity
-	MaxLifetime     time.Duration // hard cap regardless of activity
-	SelfDestruct    string        // shell command; default "systemctl poweroff"
-	BootstrapScript string        // runs as root after the watchdog is armed
-	UserBootstrap   string        // runs as User (login shell) after BootstrapScript
+	User             string        // login user that receives the SSH key
+	PublicKey        string        // authorized_keys line
+	IdleTimeout      time.Duration // shut down after this much inactivity
+	MaxLifetime      time.Duration // hard cap regardless of activity
+	SelfDestruct     string        // shell command; default "systemctl poweroff"
+	BootstrapScript  string        // runs as root after the watchdog is armed
+	BootstrapTimeout time.Duration // per bootstrap script (default 15m)
+	UserBootstrap    string        // runs as User (login shell) after BootstrapScript
 }
 
 var tmpl = template.Must(template.New("ud").Parse(`#!/bin/bash
@@ -110,9 +111,17 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now spotexec-watchdog.timer
 # Independent backstop in case the timer unit is ever broken.
-systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} /bin/sh -c 'touch /var/tmp/spotexec/draining; {{.SelfDestruct}}' >/dev/null 2>&1 || true
+systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} /bin/sh -c 'touch /var/tmp/spotexec/draining; {{.SelfDestruct}}; sleep 120; poweroff -f' >/dev/null 2>&1 || true
 
 # ---- 2. SSH access for the spotexec-managed key ----
+# Many agents may connect at once; the default MaxStartups (10:30:100) would
+# drop some handshakes.
+if [ -d /etc/ssh/sshd_config.d ]; then
+  # ClientAlive: a vanished client (laptop asleep) is dropped in ~90s, so its
+  # session stops holding the lifecycle lock and the idle clock can run.
+  printf 'MaxStartups 100:30:200\nClientAliveInterval 30\nClientAliveCountMax 3\n' > /etc/ssh/sshd_config.d/60-spotexec.conf
+  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
+fi
 U={{.User}}
 H=$(getent passwd "$U" | cut -d: -f6)
 if [ -n "$H" ]; then
@@ -139,7 +148,7 @@ cat > "$D/bootstrap-root.sh" <<'BOOTSTRAP_ROOT'
 {{.BootstrapScript}}
 BOOTSTRAP_ROOT
 umask 022
-bash -e "$D/bootstrap-root.sh" >>/var/log/spotexec-bootstrap.log 2>&1 8<&- || status=$?
+DEBIAN_FRONTEND=noninteractive timeout -k 30 {{.BootSecs}} bash -e "$D/bootstrap-root.sh" </dev/null >>/var/log/spotexec-bootstrap.log 2>&1 8<&- || status=$?
 {{- end}}
 {{- if .UserBootstrap}}
 umask 077
@@ -149,7 +158,7 @@ BOOTSTRAP_USER
 umask 022
 chown "$U" "$D/bootstrap-user.sh"
 if [ "$status" -eq 0 ]; then
-  sudo -u "$U" -H bash -le "$D/bootstrap-user.sh" >>/var/log/spotexec-bootstrap.log 2>&1 8<&- || status=$?
+  timeout -k 30 {{.BootSecs}} sudo -u "$U" -H bash -le "$D/bootstrap-user.sh" </dev/null >>/var/log/spotexec-bootstrap.log 2>&1 8<&- || status=$?
 fi
 {{- end}}
 chmod 0644 /var/log/spotexec-bootstrap.log 2>/dev/null || true
@@ -180,8 +189,12 @@ func Render(o Options) (string, error) {
 			return "", fmt.Errorf("bootstrap script may not contain heredoc terminators")
 		}
 	}
+	if o.BootstrapTimeout <= 0 {
+		o.BootstrapTimeout = 15 * time.Minute
+	}
 	data := map[string]any{
-		"User": o.User, "PublicKey": o.PublicKey, "SelfDestruct": o.SelfDestruct,
+		"BootSecs": int(o.BootstrapTimeout.Seconds()),
+		"User":     o.User, "PublicKey": o.PublicKey, "SelfDestruct": o.SelfDestruct,
 		"IdleSecs": int(o.IdleTimeout.Seconds()), "MaxSecs": int(o.MaxLifetime.Seconds()),
 		"IdleText": o.IdleTimeout.String(), "MaxText": o.MaxLifetime.String(),
 		"BootstrapScript": strings.TrimSpace(o.BootstrapScript), "UserBootstrap": strings.TrimSpace(o.UserBootstrap),

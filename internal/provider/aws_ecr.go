@@ -1,0 +1,110 @@
+package provider
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/spotexec/spotexec/internal/protocol"
+)
+
+// ImageRegistry is implemented by providers that can store built project
+// images, so a Dockerfile is built once and other runners pull it.
+type ImageRegistry interface {
+	RegistryFor(ctx context.Context, repoID string) (*protocol.RegistryAuth, error)
+}
+
+// RegistryFor returns a short-lived ECR login for the repository
+// spotexec/<repo-id>, creating it (keeping the newest 10 images) on first
+// use. The token goes to the runner for one pull/push and is never stored
+// in its default docker config.
+func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.RegistryAuth, error) {
+	name := "spotexec/" + strings.ToLower(repoID)
+	marker := filepath.Join(a.dir, "ecr-"+strings.ReplaceAll(name, "/", "_"))
+	uri := ""
+	if b, err := os.ReadFile(marker); err == nil {
+		uri = strings.TrimSpace(string(b))
+	}
+	if uri == "" {
+		var desc struct {
+			Repositories []struct {
+				URI string `json:"repositoryUri"`
+			} `json:"repositories"`
+		}
+		err := a.ecr(ctx, "DescribeRepositories", map[string]any{"repositoryNames": []string{name}}, &desc)
+		switch {
+		case err == nil && len(desc.Repositories) > 0:
+			uri = desc.Repositories[0].URI
+		case err == nil || strings.Contains(err.Error(), "RepositoryNotFoundException"):
+			var created struct {
+				Repository struct {
+					URI string `json:"repositoryUri"`
+				} `json:"repository"`
+			}
+			if err := a.ecr(ctx, "CreateRepository", map[string]any{
+				"repositoryName": name, "imageTagMutability": "MUTABLE",
+				"tags": []map[string]string{{"Key": tagRunner, "Value": a.r.Name}},
+			}, &created); err != nil && !strings.Contains(err.Error(), "RepositoryAlreadyExistsException") {
+				return nil, fmt.Errorf("creating ECR repository %s: %w", name, err)
+			}
+			uri = created.Repository.URI
+			policy := `{"rules":[{"rulePriority":1,"description":"keep the newest 10 spotexec images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}`
+			_ = a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": policy}, nil)
+			if uri == "" {
+				return a.RegistryFor(ctx, repoID) // created concurrently: describe again
+			}
+		default:
+			return nil, fmt.Errorf("ECR: %w", err)
+		}
+		_ = os.MkdirAll(a.dir, 0o700)
+		_ = os.WriteFile(marker, []byte(uri+"\n"), 0o600)
+	}
+	var tok struct {
+		Data []struct {
+			Token    string `json:"authorizationToken"`
+			Endpoint string `json:"proxyEndpoint"`
+		} `json:"authorizationData"`
+	}
+	if err := a.ecr(ctx, "GetAuthorizationToken", map[string]any{}, &tok); err != nil {
+		return nil, fmt.Errorf("ECR login: %w", err)
+	}
+	if len(tok.Data) == 0 {
+		return nil, fmt.Errorf("ECR login: no authorization data")
+	}
+	raw, err := base64.StdEncoding.DecodeString(tok.Data[0].Token)
+	if err != nil {
+		return nil, err
+	}
+	user, pass, ok := strings.Cut(string(raw), ":")
+	if !ok {
+		return nil, fmt.Errorf("ECR login: malformed token")
+	}
+	server := strings.TrimPrefix(tok.Data[0].Endpoint, "https://")
+	return &protocol.RegistryAuth{Server: server, Repo: uri, User: user, Password: pass}, nil
+}
+
+// ecr calls an ECR JSON 1.1 action.
+func (a *AWSSpot) ecr(ctx context.Context, action string, in any, out any) error {
+	body, _ := json.Marshal(in)
+	status, b, err := a.api.do(ctx, "ecr", "application/x-amz-json-1.1",
+		map[string]string{"X-Amz-Target": "AmazonEC2ContainerRegistry_V20150921." + action}, body)
+	if err != nil {
+		return err
+	}
+	if status/100 != 2 {
+		var e struct {
+			Type    string `json:"__type"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(b, &e)
+		return fmt.Errorf("%s: %s %s", action, e.Type, e.Message)
+	}
+	if out != nil {
+		return json.Unmarshal(b, out)
+	}
+	return nil
+}

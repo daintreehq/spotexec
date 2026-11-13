@@ -65,6 +65,7 @@ printf '%s' "$USER_DATA_B64" | base64 -d > /tmp/user-data.sh
 # Like cloud-init, user-data runs while the watchdog timer is already ticking.
 PATH=/tmp/fakebin:$PATH bash /tmp/user-data.sh >/var/log/spotexec-userdata.log 2>&1 &
 mkdir -p /var/tmp/spotexec/sim && chmod 1777 /var/tmp/spotexec/sim  # marks the simulator (no IMDS)
+chmod 1777 /simcache 2>/dev/null || true  # shared "S3" for the dependency cache
 while true; do
   sleep 2 & wait $!
   [ -x /usr/local/sbin/spotexec-watchdog ] && /usr/local/sbin/spotexec-watchdog
@@ -184,6 +185,7 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 	ud, err := cloudinit.Render(cloudinit.Options{
 		User: s.r.User, PublicKey: pub, IdleTimeout: s.r.IdleTimeout.Duration, MaxLifetime: s.r.MaxLifetime.Duration,
 		SelfDestruct: "kill -TERM 1", BootstrapScript: s.r.BootstrapScript, UserBootstrap: s.r.UserBootstrap,
+		BootstrapTimeout: s.r.BootTimeout.Duration,
 	})
 	if err != nil {
 		return Instance{}, err
@@ -196,6 +198,7 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 		"--label", "spotexec-launched="+strconv.FormatInt(time.Now().UnixMilli(), 10),
 		"-e", "BOOT_DELAY="+strconv.FormatFloat(s.r.BootDelay.Seconds(), 'f', 1, 64),
 		"-e", "USER_DATA_B64="+base64.StdEncoding.EncodeToString([]byte(ud)),
+		"-v", "spotexec-simcache:/simcache",
 		"-p", "127.0.0.1::22", s.r.Image)
 	if err != nil {
 		return Instance{}, err
@@ -347,6 +350,16 @@ func (s *Sim) Rebalance(ctx context.Context, id string) error {
 	_, err := docker(ctx, "exec", id, "sh", "-c",
 		`mkdir -p /var/tmp/spotexec/sim && printf '{"noticeTime":"now"}' > /var/tmp/spotexec/sim/rebalance`)
 	return err
+}
+
+// CacheURLs implements DepsCache with a Docker volume shared by every
+// simulated instance (stands in for the S3 bucket).
+func (s *Sim) CacheURLs(ctx context.Context, repoID, key string) (string, string, error) {
+	if s.r.CacheBucket == "off" {
+		return "", "", nil
+	}
+	u := "file:///simcache/" + repoID + "/" + key + ".tar"
+	return u, u, nil
 }
 
 // ErrNoInstance is returned when an instance id is not part of the fleet.

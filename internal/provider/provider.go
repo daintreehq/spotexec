@@ -4,6 +4,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -102,6 +103,10 @@ type Fleet interface {
 	// Terminate ends one specific instance (only if it is ours).
 	Terminate(ctx context.Context, instanceID string) error
 }
+
+// ErrLaunchAmbiguous wraps a launch failure after which an instance may
+// nevertheless exist (e.g. the RunInstances response was lost).
+var ErrLaunchAmbiguous = errors.New("launch outcome unknown")
 
 // Terminator is implemented by providers that can end one specific instance.
 type Terminator interface {

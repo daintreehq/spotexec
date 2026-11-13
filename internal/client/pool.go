@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -39,11 +40,14 @@ const (
 )
 
 type note struct {
+	Failures     int       `json:"failures,omitempty"`
 	Draining     bool      `json:"draining,omitempty"`
 	SuspectUntil time.Time `json:"suspect_until,omitempty"`
 	BusyUntil    time.Time `json:"busy_until,omitempty"`
 	LastUsed     time.Time `json:"last_used,omitempty"`
 	Ready        bool      `json:"ready,omitempty"`
+	ReadyAt      time.Time `json:"ready_at,omitempty"`
+	SawFull      bool      `json:"saw_full,omitempty"` // observed with every slot taken
 }
 
 type launchRec struct {
@@ -101,8 +105,9 @@ func (p *Pool) withCtx(ctx context.Context, fn func(st *poolState) error) error 
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	st := &poolState{Notes: map[string]*note{}}
-	if b, err := os.ReadFile(filepath.Join(p.dir, "pool.json")); err == nil {
-		_ = json.Unmarshal(b, st)
+	orig, _ := os.ReadFile(filepath.Join(p.dir, "pool.json"))
+	if len(orig) > 0 {
+		_ = json.Unmarshal(orig, st)
 		if st.Notes == nil {
 			st.Notes = map[string]*note{}
 		}
@@ -111,11 +116,34 @@ func (p *Pool) withCtx(ctx context.Context, fn func(st *poolState) error) error 
 		return err
 	}
 	b, _ := json.MarshalIndent(st, "", "  ")
+	if bytes.Equal(b, orig) {
+		return nil // unchanged: skip the write (lots of read-only callers)
+	}
 	tmp := filepath.Join(p.dir, "pool.json.tmp"+strconv.Itoa(os.Getpid()))
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(p.dir, "pool.json"))
+}
+
+// readyGrace: how long after an instance is first seen ready its launch
+// still counts as pending capacity.
+const readyGrace = 20 * time.Second
+
+func (n *note) markReady(now time.Time) {
+	if !n.Ready {
+		n.Ready, n.ReadyAt = true, now
+	}
+}
+
+func readyFor(n *note) time.Duration {
+	if n == nil || !n.Ready {
+		return 0
+	}
+	if n.ReadyAt.IsZero() {
+		return readyGrace + time.Second
+	}
+	return time.Since(n.ReadyAt)
 }
 
 func (st *poolState) note(id string) *note {
@@ -138,7 +166,22 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	defer cancel()
 	insts, err := p.Fleet.List(lctx)
 	if err != nil {
+		if !st.ListedAt.IsZero() {
+			// Serve the cached view and back off, rather than letting every
+			// waiting agent retry the API (throttling) or give up.
+			st.ListedAt = time.Now().Add(-listTTL + 5*time.Second)
+			return nil
+		}
 		return err
+	}
+	seenBefore := map[string]bool{}
+	for _, in := range st.Instances {
+		seenBefore[in.ID] = true
+	}
+	for id, n := range st.Notes {
+		if n.Ready {
+			seenBefore[id] = true
+		}
 	}
 	st.Instances, st.ListedAt = insts, time.Now()
 	live := map[string]bool{}
@@ -157,10 +200,16 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 		case l.Failed:
 		case age > p.R.BootTimeout.Duration+time.Minute:
 			// Never became usable: give up counting it as pending capacity.
-		case l.InstanceID != "" && !live[l.InstanceID] && age > listLagGrace:
-			// Launched but gone (reclaimed while booting).
-		case l.InstanceID != "" && st.Notes[l.InstanceID] != nil && st.Notes[l.InstanceID].Ready:
-			// Became usable; it now counts as a normal instance.
+		case l.InstanceID != "" && !live[l.InstanceID] && (age > listLagGrace || seenBefore[l.InstanceID]):
+			// Launched but gone: reclaimed while booting, or it already
+			// served and has since terminated (not listing lag).
+		case l.InstanceID != "" && st.Notes[l.InstanceID] != nil && st.Notes[l.InstanceID].Draining:
+			// Draining: no longer pending capacity.
+		case l.InstanceID != "" && st.Notes[l.InstanceID] != nil && st.Notes[l.InstanceID].Ready &&
+			(st.Notes[l.InstanceID].SawFull || readyFor(st.Notes[l.InstanceID]) > readyGrace):
+			// Usable for a while; it now counts as a normal instance. (Not at
+			// the first acquisition: its other slots are still capacity that
+			// waiting agents will take within a polling interval.)
 		case l.InstanceID == "" && !pidAlive(l.PID) && age > orphanGrace:
 			// Provisioner died before RunInstances returned; if an instance
 			// was created it will appear in listings and be counted there.
@@ -180,19 +229,23 @@ func pidAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-// Candidates returns running instances worth probing, most recently used
-// first (packing work onto busy instances lets the rest idle out).
-func (p *Pool) Candidates(ctx context.Context, exclude map[string]bool) ([]provider.Instance, error) {
-	var out []provider.Instance
-	err := p.withCtx(ctx, func(st *poolState) error {
+// Candidates returns running instances worth probing, oldest first:
+// packing work onto the oldest instances deterministically lets the newest
+// ones go idle and terminate (scale-in). usable is the number of running,
+// non-draining instances (the size of the probe window).
+func (p *Pool) Candidates(ctx context.Context, exclude map[string]bool) (out []provider.Instance, usable int, err error) {
+	err = p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
 			return err
 		}
 		now := time.Now()
 		for _, in := range st.Instances {
 			n := st.Notes[in.ID]
-			if in.State != provider.StateRunning || exclude[in.ID] {
+			if in.State != provider.StateRunning || in.Target.Host == "" || exclude[in.ID] {
 				continue
+			}
+			if n == nil || !n.Draining {
+				usable++
 			}
 			if n != nil && (n.Draining || now.Before(n.SuspectUntil) || now.Before(n.BusyUntil)) {
 				continue
@@ -200,22 +253,14 @@ func (p *Pool) Candidates(ctx context.Context, exclude map[string]bool) ([]provi
 			out = append(out, in)
 		}
 		sort.SliceStable(out, func(i, j int) bool {
-			a, b := st.Notes[out[i].ID], st.Notes[out[j].ID]
-			var ta, tb time.Time
-			if a != nil {
-				ta = a.LastUsed
+			if !out[i].LaunchedAt.Equal(out[j].LaunchedAt) {
+				return out[i].LaunchedAt.Before(out[j].LaunchedAt)
 			}
-			if b != nil {
-				tb = b.LastUsed
-			}
-			if !ta.Equal(tb) {
-				return ta.After(tb)
-			}
-			return out[i].LaunchedAt.Before(out[j].LaunchedAt)
+			return out[i].ID < out[j].ID
 		})
 		return nil
 	})
-	return out, err
+	return out, usable, err
 }
 
 // Outcome of probing an instance.
@@ -236,9 +281,12 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 		now := time.Now()
 		switch o {
 		case OutAcquired:
-			n.Ready, n.LastUsed, n.SuspectUntil = true, now, time.Time{}
+			n.markReady(now)
+			n.LastUsed, n.SuspectUntil, n.Failures = now, time.Time{}, 0
 		case OutBusy:
-			n.Ready, n.BusyUntil, n.SuspectUntil = true, now.Add(busyHintFor), time.Time{}
+			n.markReady(now)
+			n.SawFull = true
+			n.BusyUntil, n.SuspectUntil, n.Failures = now.Add(busyHintFor), time.Time{}, 0
 		case OutDraining:
 			n.Draining = true
 		case OutBooting:
@@ -247,7 +295,8 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 			// A young instance is probably still booting sshd; an older one is
 			// suspect (but still counts toward capacity: unreachable is not
 			// absent).
-			if time.Since(launchedAt) < p.R.BootTimeout.Duration {
+			n.Failures++
+			if time.Since(launchedAt) < p.R.BootTimeout.Duration || n.Failures < 2 {
 				n.BusyUntil = now.Add(3 * time.Second)
 			} else {
 				n.SuspectUntil = now.Add(suspectFor)
@@ -269,15 +318,16 @@ type LaunchDecision struct {
 }
 
 // Plan decides, under the pool lock, whether this process should launch one
-// more instance: only if waiting demand exceeds the capacity already being
-// launched and the fleet is below max_instances.
-func (p *Pool) Plan(ctx context.Context) (LaunchDecision, error) {
+// more instance: only if waiting demand (minus `covered`, the capacity that
+// higher-priority fleets are already launching) exceeds the capacity this
+// fleet is launching, and the fleet is below max_instances.
+func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
 			return err
 		}
-		d.Demand = p.waiterDemand()
+		d.Demand = p.waiterDemand() - covered
 		listed := map[string]bool{}
 		usable, total := 0, 0
 		for _, in := range st.Instances {
@@ -288,7 +338,19 @@ func (p *Pool) Plan(ctx context.Context) (LaunchDecision, error) {
 			}
 		}
 		slots := p.SlotsPerInstance()
+		inLedger := map[string]bool{}
 		for _, l := range st.Launches {
+			if l.Failed {
+				continue
+			}
+			if l.InstanceID != "" {
+				inLedger[l.InstanceID] = true
+				if n := st.Notes[l.InstanceID]; n != nil && (n.Draining || (n.Ready && (n.SawFull || readyFor(n) > readyGrace))) {
+					// Dying, or already serving (full, or ready a while):
+					// not capacity a waiting agent can count on.
+					continue
+				}
+			}
 			if l.InstanceID == "" || !listed[l.InstanceID] {
 				usable++
 				total++
@@ -296,8 +358,24 @@ func (p *Pool) Plan(ctx context.Context) (LaunchDecision, error) {
 			d.Pending++
 			d.Capacity += slots
 		}
+		// Instances still booting (not yet seen ready) are pending capacity
+		// too, even if their launcher's ledger entry was lost.
+		for _, in := range st.Instances {
+			n := st.Notes[in.ID]
+			// Only never-ready instances count here: a ready one is already
+			// serving (its launch-grace capacity, if any, is in the ledger).
+			if inLedger[in.ID] || (n != nil && (n.Ready || n.Draining)) {
+				continue
+			}
+			if time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
+				d.Pending++
+				d.Capacity += slots
+			}
+		}
 		d.Live = usable
 		switch {
+		case d.Demand <= 0:
+			d.Reason = "demand covered by higher-priority runners"
 		case d.Demand <= d.Capacity:
 			d.Reason = "waiting for instances being launched"
 		case usable >= p.R.MaxInstances:
@@ -336,7 +414,7 @@ func (p *Pool) Reserve(ctx context.Context, n int) ([]string, error) {
 			}
 		}
 		for _, l := range st.Launches {
-			if l.InstanceID == "" || !listed[l.InstanceID] {
+			if !l.Failed && (l.InstanceID == "" || !listed[l.InstanceID]) {
 				usable++
 			}
 		}
@@ -351,6 +429,26 @@ func (p *Pool) Reserve(ctx context.Context, n int) ([]string, error) {
 		return nil
 	})
 	return ids, err
+}
+
+// Cancel abandons a planned launch that was never sent.
+func (p *Pool) Cancel(id string) {
+	_ = p.with(func(st *poolState) error {
+		for i := range st.Launches {
+			if st.Launches[i].ID == id && st.Launches[i].InstanceID == "" {
+				st.Launches[i].Failed = true
+			}
+		}
+		return nil
+	})
+}
+
+// Reset forgets all local pool state (after `spotexec down`).
+func (p *Pool) Reset() {
+	_ = p.with(func(st *poolState) error {
+		*st = poolState{Notes: map[string]*note{}}
+		return nil
+	})
 }
 
 // launchesInFlight tracks Provision calls until RunInstances has returned
@@ -379,13 +477,18 @@ func (p *Pool) Provision(ctx context.Context, id string, log provider.Logger) (p
 	}()
 	in, err := p.Fleet.Launch(ctx, log)
 	if err != nil {
+		ambiguous := errors.Is(err, provider.ErrLaunchAmbiguous)
 		_ = p.with(func(st *poolState) error {
 			for i := range st.Launches {
-				if st.Launches[i].ID == id {
+				// An ambiguous failure (the request may have created an
+				// instance) keeps its reservation until the ledger expires
+				// it, so it can never push the fleet past max_instances.
+				if st.Launches[i].ID == id && !ambiguous {
 					st.Launches[i].Failed = true
 				}
 			}
 			st.BackoffUntil, st.LastLaunchErr = time.Now().Add(launchBackoff), firstLine(err.Error())
+			st.ListedAt = time.Time{}
 			return nil
 		})
 		return in, err
@@ -401,7 +504,20 @@ func (p *Pool) Provision(ctx context.Context, id string, log provider.Logger) (p
 	})
 	recorded = true
 	launchesInFlight.Done()
-	return p.Fleet.WaitRunning(ctx, in.ID, log)
+	ran, err := p.Fleet.WaitRunning(ctx, in.ID, log)
+	if err != nil && ctx.Err() == nil {
+		// Reclaimed or broken while booting: stop counting it as capacity.
+		_ = p.with(func(st *poolState) error {
+			for i := range st.Launches {
+				if st.Launches[i].ID == id {
+					st.Launches[i].Failed = true
+				}
+			}
+			st.ListedAt = time.Time{}
+			return nil
+		})
+	}
+	return ran, err
 }
 
 func firstLine(s string) string {
@@ -455,6 +571,14 @@ func (p *Pool) register(weight int) (*Waiter, error) {
 	return &Waiter{f: f, path: path}, nil
 }
 
+// Touch refreshes the waiter's heartbeat (stopped processes stop counting).
+func (w *Waiter) Touch() {
+	if w != nil && w.f != nil {
+		now := time.Now()
+		_ = os.Chtimes(w.path, now, now)
+	}
+}
+
 // Done withdraws the waiter.
 func (w *Waiter) Done() {
 	if w == nil || w.f == nil {
@@ -483,9 +607,14 @@ func (p *Pool) waiterDemand() int {
 			f.Close()
 			continue
 		}
-		b, _ := os.ReadFile(path)
+		fi, ferr := f.Stat()
+		b := make([]byte, 32)
+		n, _ := f.ReadAt(b, 0)
 		f.Close()
-		w, err := strconv.Atoi(strings.TrimSpace(string(b)))
+		if ferr == nil && time.Since(fi.ModTime()) > staleAfter {
+			continue // holder stopped (SIGSTOP): not current demand
+		}
+		w, err := strconv.Atoi(strings.TrimSpace(string(b[:n])))
 		if err != nil || w < 1 {
 			w = 1
 		}

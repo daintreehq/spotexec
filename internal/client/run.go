@@ -5,18 +5,22 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spotexec/spotexec/internal/config"
+	"github.com/spotexec/spotexec/internal/depskey"
 	"github.com/spotexec/spotexec/internal/manifest"
 	"github.com/spotexec/spotexec/internal/protocol"
 	"github.com/spotexec/spotexec/internal/provider"
@@ -61,6 +65,7 @@ type Options struct {
 	RetryPreempt   bool
 	NoBoot         bool
 	SyncOnly       bool // stop after sync + deps (spotexec sync)
+	Priority       int  // queue priority when every slot is busy (higher first)
 }
 
 // Result of a run.
@@ -120,6 +125,7 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		o.Rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "lost": lost})
 		if lost != "static" {
 			att.exclude[lost] = true
+			markLost(cfg, res.Runner, lost)
 		}
 		att.n++
 	}
@@ -179,7 +185,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if m != nil {
 		base.Fingerprint = m.Fingerprint
 	}
-	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude}
+	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority}
 	var lease *Lease
 	if o.PreferLast {
 		// exec runs without syncing, so it must land in exactly the slot that
@@ -221,8 +227,12 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	r := lease.Runner
 	res.Runner, res.Slot = r.Name, lease.Acq.Token
 	sess := lease.Sess
+	var noticed atomic.Bool // a reclamation notice arrived before exec
 	sess.OnEvent = func(ev protocol.Event) {
 		o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
+		if ev.Name == "spot_interruption" {
+			noticed.Store(true)
+		}
 	}
 	remoteWS := lease.Acq.Workspace
 	saveLastRun(ws, LastRun{Runner: r.Name, InstanceID: lease.InstanceID, Slot: lease.Acq.Slot, Target: lease.Target, WorkRoot: r.WorkRoot, RemoteWS: remoteWS})
@@ -245,9 +255,19 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}
 
-	// 4. Dependencies.
+	// 4. Project container image.
+	var crun *protocol.ContainerRun
+	if p.Container.Enabled() {
+		ref, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
+		if err != nil {
+			return res, infra(err), lostRunner(lease, err)
+		}
+		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root"}
+	}
+
+	// 5. Dependencies.
 	if p.Deps.Install != "" && !o.NoDeps && o.Sync != "none" {
-		if err := runDeps(ctx, sess, p, r, o, label); err != nil {
+		if err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun); err != nil {
 			return res, infra(err), lostRunner(lease, err)
 		}
 	}
@@ -260,12 +280,16 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	// 5. Execute.
 	env := map[string]string{
-		"SPOTEXEC":             "1",
-		"SPOTEXEC_SLOT":        fmt.Sprint(lease.Acq.Token),
-		"SPOTEXEC_PORT_BASE":   fmt.Sprint(20000 + lease.Acq.Token*1000),
-		"SPOTEXEC_RUNNER":      r.Name,
-		"SPOTEXEC_RUN_ID":      runID,
-		"SPOTEXEC_ATTEMPT":     fmt.Sprint(att.n),
+		"SPOTEXEC":           "1",
+		"SPOTEXEC_SLOT":      fmt.Sprint(lease.Acq.Token),
+		"SPOTEXEC_PORT_BASE": fmt.Sprint(20000 + lease.Acq.Token*1000),
+		"SPOTEXEC_RUNNER":    r.Name,
+		"SPOTEXEC_RUN_ID":    runID,
+		"SPOTEXEC_ATTEMPT":   fmt.Sprint(att.n),
+		// CPUs this job may use: its fair share of the machine, or all of
+		// it for --exclusive. Use it for test-runner worker counts.
+		"SPOTEXEC_CPUS":        fmt.Sprint(cpuShare(sess.Hello.CPUs, lease.Acq.MaxSlots, o.Exclusive)),
+		"SPOTEXEC_SLOTS":       fmt.Sprint(lease.Acq.MaxSlots),
 		"COMPOSE_PROJECT_NAME": fmt.Sprintf("sx_%s_s%02d", strings.ToLower(strings.ReplaceAll(ws.RepoName, ".", "_")), lease.Acq.Token),
 		"CI":                   "true",
 	}
@@ -287,12 +311,21 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		Shell: o.Command, Cwd: ws.Cwd, Env: env, Setup: r.RemotePathSetup,
 		TimeoutMS: o.Timeout.Milliseconds(), GraceMS: o.Grace.Milliseconds(),
 		Snapshot: o.Sync != "none", Skip: skip, SpotWatch: r.Type == config.TypeAWSSpot,
+		Container: crun,
 	}
 	o.Rep.Status("%s · running %s", label, o.Display)
 	o.Rep.Event("exec", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": o.Display, "cwd": ws.Cwd})
 	stopWatch.Do(func() { close(execStarted) })
 	if ctx.Err() != nil {
 		return res, infra(ctx.Err()), ""
+	}
+	// The VM announced its reclamation while we were syncing: don't start
+	// the command on it; replay the run elsewhere.
+	if noticed.Load() && lease.InstanceID != "" {
+		if f, ok := lease.Provider.(provider.Fleet); ok {
+			NewPool(r, f).Observe(lease.InstanceID, OutDraining, time.Time{})
+		}
+		return res, infra(fmt.Errorf("%s announced a spot interruption before the command started", lease.InstanceID)), lease.InstanceID
 	}
 	if err := sess.Conn.Send(protocol.TypeExec, ex); err != nil {
 		return res, infra(err), lostRunner(lease, err)
@@ -504,7 +537,7 @@ func addLocalTar(tw *tar.Writer, full, name string) error {
 	return err
 }
 
-func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string) error {
+func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun) error {
 	lockfiles := p.Deps.Lockfiles
 	if len(lockfiles) == 0 {
 		return errors.New("deps.install is set but deps.lockfiles is empty")
@@ -520,10 +553,32 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	for k, v := range p.Env {
 		env[k] = v
 	}
-	if err := s.Conn.Send(protocol.TypeDeps, protocol.Deps{
+	req := protocol.Deps{
 		Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Hydrate: p.Deps.Hydrate,
 		Setup: r.RemotePathSetup, Env: env, TimeoutMS: p.Deps.Timeout.Milliseconds(),
-	}); err != nil {
+		Toolchain: depskey.Toolchain(r.Type, r.AMI, r.Arch, r.Image, r.BootstrapScript, r.UserBootstrap, r.RemotePathSetup),
+		Container: crun,
+	}
+	image := ""
+	if crun != nil {
+		image = crun.Image
+	}
+	// Shared cache: sign URLs for the key the runner will compute. Any
+	// failure just means installing without the cache.
+	if dc, ok := lease.Provider.(provider.DepsCache); ok {
+		key, err := depskey.Key(ws.Root, depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Image: image, Toolchain: req.Toolchain, OS: s.Hello.OS, Arch: s.Hello.Arch})
+		if err == nil {
+			cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			get, put, err := dc.CacheURLs(cctx, ws.RepoID, key)
+			cancel()
+			if err != nil {
+				o.Rep.Warn("DEPS_CACHE", "shared dependency cache unavailable: %v", err)
+			} else if get != "" {
+				req.CacheKey, req.CacheGet, req.CachePut = key, get, put
+			}
+		}
+	}
+	if err := s.Conn.Send(protocol.TypeDeps, req); err != nil {
 		return err
 	}
 	errW := &ui.ClearingWriter{W: o.Stderr, R: o.Rep}
@@ -551,7 +606,11 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 			if ev.Name == "deps_install" {
 				o.Rep.Status("%s · installing dependencies (%s)", label, ev.Message)
 			}
-			o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
+			if s.OnEvent != nil {
+				s.OnEvent(ev) // records interruption notices for the pre-exec check
+			} else {
+				o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
+			}
 			continue
 		case protocol.TypeError:
 			var em protocol.ErrorMsg
@@ -560,7 +619,8 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 		case protocol.TypeDepsResult:
 			var dr protocol.DepsResult
 			_ = env.Unmarshal(&dr)
-			o.Rep.Event("deps", map[string]any{"key": dr.Key, "built": dr.Built, "hydrated": dr.Hydrated, "method": dr.Method, "duration_ms": time.Since(t).Milliseconds()})
+			o.Rep.Event("deps", map[string]any{"key": dr.Key, "built": dr.Built, "restored": dr.Restored, "uploading": dr.Uploaded,
+				"hydrated": dr.Hydrated, "method": dr.Method, "duration_ms": time.Since(t).Milliseconds()})
 			return nil
 		default:
 			return fmt.Errorf("protocol: unexpected %q during deps", env.Type)
@@ -652,6 +712,127 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot 
 				err := env.Unmarshal(&res)
 				return res, err
 			}
+		}
+	}
+}
+
+// cpuShare is the number of CPUs one job should use on a host.
+func cpuShare(cpus, slots int, exclusive bool) int {
+	if cpus < 1 {
+		return 1
+	}
+	if exclusive || slots < 1 {
+		return cpus
+	}
+	return max(1, cpus/slots)
+}
+
+// markLost records a fleet instance that dropped mid-run as draining, so the
+// pool stops counting it toward max_instances and may launch a replacement.
+func markLost(cfg *config.Config, runner, id string) {
+	r, ok := cfg.Global.Runners[runner]
+	if !ok {
+		return
+	}
+	p, err := provider.New(r)
+	if err != nil {
+		return
+	}
+	if f, ok := p.(provider.Fleet); ok {
+		NewPool(r, f).Observe(id, OutDraining, time.Time{})
+	}
+}
+
+// imageTag hashes the Dockerfile and every synced file in its build context,
+// so a built image is reused until either changes.
+func imageTag(m *manifest.Manifest, dockerfile, buildCtx string) (string, error) {
+	if m == nil {
+		return "", errors.New("container.dockerfile needs a synced workspace (not --sync none)")
+	}
+	df, ok := m.ByPath[dockerfile]
+	if !ok {
+		return "", fmt.Errorf("container.dockerfile %q is not in the synced working set", dockerfile)
+	}
+	if buildCtx == "" {
+		buildCtx = path.Dir(dockerfile)
+	}
+	buildCtx = strings.Trim(path.Clean(buildCtx), "/")
+	h := sha256.New()
+	fmt.Fprintf(h, "dockerfile\x00%s\x00%s\x00ctx\x00%s\x00", dockerfile, df.ID, buildCtx)
+	for _, e := range m.Entries { // sorted
+		if buildCtx == "." || buildCtx == "" || e.Path == buildCtx || strings.HasPrefix(e.Path, buildCtx+"/") {
+			fmt.Fprintf(h, "%s\x00%o\x00%s\n", e.Path, e.Mode, e.ID)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// prepareImage makes the project's container image available on the runner
+// (pull, or build once per content hash, shared through the provider's
+// registry when it has one) and returns the local reference to run.
+func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, o Options, label string, ws *Workspace, lease *Lease, m *manifest.Manifest) (string, error) {
+	c := p.Container
+	req := protocol.Image{TimeoutMS: c.Timeout.Milliseconds()}
+	if c.Image != "" {
+		req.Ref = c.Image
+	} else {
+		tag, err := imageTag(m, c.Dockerfile, c.Context)
+		if err != nil {
+			return "", err
+		}
+		req.Dockerfile, req.Context, req.Tag = c.Dockerfile, c.Context, tag
+		if reg, ok := lease.Provider.(provider.ImageRegistry); ok {
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			auth, err := reg.RegistryFor(cctx, ws.RepoID)
+			cancel()
+			if err != nil {
+				o.Rep.Warn("IMAGE_REGISTRY", "image registry unavailable (building on this runner only): %v", err)
+			} else {
+				req.Registry = auth
+			}
+		}
+	}
+	o.Rep.Status("%s · preparing container image", label)
+	t := time.Now()
+	if err := s.Conn.Send(protocol.TypeImage, req); err != nil {
+		return "", err
+	}
+	errW := &ui.ClearingWriter{W: o.Stderr, R: o.Rep}
+	for {
+		f, err := s.Next(ctx)
+		if err != nil {
+			return "", err
+		}
+		switch f.Kind {
+		case protocol.KindStdout, protocol.KindStderr:
+			errW.Write(f.Data) // pull/build output goes to stderr
+			continue
+		}
+		env, err := protocol.Decode(f)
+		if err != nil {
+			return "", err
+		}
+		switch env.Type {
+		case protocol.TypeStarted:
+		case protocol.TypeEvent:
+			var ev protocol.Event
+			_ = env.Unmarshal(&ev)
+			o.Rep.Status("%s · %s %s", label, strings.ReplaceAll(ev.Name, "_", " "), ev.Message)
+			if s.OnEvent != nil {
+				s.OnEvent(ev)
+			}
+		case protocol.TypeError:
+			var em protocol.ErrorMsg
+			_ = env.Unmarshal(&em)
+			return "", fmt.Errorf("container image: %s", em.Message)
+		case protocol.TypeImageResult:
+			var r protocol.ImageResult
+			_ = env.Unmarshal(&r)
+			o.Rep.Event("image", map[string]any{"image": r.Image, "pulled": r.Pulled, "built": r.Built, "pushing": r.Pushing,
+				"installed_docker": r.InstalledDocker, "duration_ms": time.Since(t).Milliseconds()})
+			return r.Image, nil
+		default:
+			return "", fmt.Errorf("protocol: unexpected %q while preparing the image", env.Type)
 		}
 	}
 }

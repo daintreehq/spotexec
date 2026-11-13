@@ -2,28 +2,30 @@ package protocol
 
 // Message type names.
 const (
-	TypeHello      = "hello"
-	TypeHelloOK    = "hello_ok"
-	TypeAcquire    = "acquire"
-	TypeWaiting    = "waiting"
-	TypeAcquired   = "acquired"
-	TypeBusy       = "busy"
-	TypeManifest   = "manifest"
-	TypeNeed       = "need"
-	TypeSynced     = "synced"
-	TypeDeps       = "deps"
-	TypeDepsResult = "deps_result"
-	TypeExec       = "exec"
-	TypeStarted    = "started"
-	TypeResult     = "result"
-	TypeCancel     = "cancel"
-	TypeFetch      = "fetch"
-	TypeFetched    = "fetched"
-	TypePull       = "pull"
-	TypeHeartbeat  = "hb"
-	TypeEvent      = "event"
-	TypeError      = "error"
-	TypeBye        = "bye"
+	TypeHello       = "hello"
+	TypeHelloOK     = "hello_ok"
+	TypeAcquire     = "acquire"
+	TypeWaiting     = "waiting"
+	TypeAcquired    = "acquired"
+	TypeBusy        = "busy"
+	TypeManifest    = "manifest"
+	TypeNeed        = "need"
+	TypeSynced      = "synced"
+	TypeDeps        = "deps"
+	TypeDepsResult  = "deps_result"
+	TypeExec        = "exec"
+	TypeStarted     = "started"
+	TypeResult      = "result"
+	TypeCancel      = "cancel"
+	TypeFetch       = "fetch"
+	TypeFetched     = "fetched"
+	TypePull        = "pull"
+	TypeHeartbeat   = "hb"
+	TypeEvent       = "event"
+	TypeError       = "error"
+	TypeBye         = "bye"
+	TypeImage       = "image"
+	TypeImageResult = "image_result"
 )
 
 // Error codes carried by ErrorMsg.Code.
@@ -35,6 +37,7 @@ const (
 	CodeInternal     = "INTERNAL"
 	CodeSyncFailed   = "SYNC_FAILED"
 	CodeDepsFailed   = "DEPS_FAILED"
+	CodeImageFailed  = "IMAGE_FAILED"
 )
 
 // ErrorMsg is sent by the helper for any failed request.
@@ -149,6 +152,43 @@ type Synced struct {
 	Corrected []Entry `json:"corrected,omitempty"`
 }
 
+// ContainerRun says how to run a command inside the project's container.
+type ContainerRun struct {
+	Image   string   `json:"image"`             // local image reference to run
+	Options []string `json:"options,omitempty"` // extra `docker run` arguments
+	Root    bool     `json:"root,omitempty"`    // run as root instead of the runner user
+}
+
+// RegistryAuth is a short-lived login for the image registry (ECR).
+type RegistryAuth struct {
+	Server   string `json:"server"`
+	Repo     string `json:"repo"` // e.g. 123.dkr.ecr.us-east-2.amazonaws.com/spotexec/repo-abc
+	User     string `json:"user"`
+	Password string `json:"password"`
+}
+
+// Image prepares the project's container image on the runner: pull Ref, or
+// build Dockerfile (from the synced workspace) tagged Tag, reusing a copy
+// from Registry when another runner already built it.
+type Image struct {
+	Ref        string        `json:"ref,omitempty"`
+	Dockerfile string        `json:"dockerfile,omitempty"`
+	Context    string        `json:"context,omitempty"`
+	Tag        string        `json:"tag,omitempty"`
+	Registry   *RegistryAuth `json:"registry,omitempty"`
+	TimeoutMS  int64         `json:"timeout_ms"`
+}
+
+// ImageResult reports the local image reference to run.
+type ImageResult struct {
+	Image           string `json:"image"`
+	Pulled          bool   `json:"pulled"`
+	Built           bool   `json:"built"`
+	Pushing         bool   `json:"pushing"`
+	InstalledDocker bool   `json:"installed_docker"`
+	MS              int64  `json:"ms"`
+}
+
 // Deps asks for lockfile-keyed dependency hydration.
 type Deps struct {
 	Lockfiles []string          `json:"lockfiles"`
@@ -158,12 +198,22 @@ type Deps struct {
 	Setup     string            `json:"setup"`
 	Env       map[string]string `json:"env"`
 	TimeoutMS int64             `json:"timeout_ms"`
+	// Shared cache (optional): URLs (https presigned, or file:// in the
+	// simulator) for this dependency key, computed by the client. The helper
+	// only uses them if its own key matches CacheKey.
+	Container *ContainerRun `json:"container,omitempty"`
+	CacheKey  string        `json:"cache_key,omitempty"`
+	Toolchain string        `json:"toolchain,omitempty"` // part of the key (see depskey.Toolchain)
+	CacheGet  string        `json:"cache_get,omitempty"`
+	CachePut  string        `json:"cache_put,omitempty"`
 }
 
 // DepsResult reports hydration.
 type DepsResult struct {
 	Key      string `json:"key"`
 	Built    bool   `json:"built"`
+	Restored bool   `json:"restored"`  // fetched from the shared cache instead of installing
+	Uploaded bool   `json:"uploading"` // a background upload to the shared cache started
 	Hydrated bool   `json:"hydrated"`
 	Method   string `json:"method"`
 	MS       int64  `json:"ms"`
@@ -180,6 +230,7 @@ type Exec struct {
 	Snapshot  bool              `json:"snapshot"` // compute mutations
 	Skip      []string          `json:"skip"`     // dir names/paths skipped by the post-run walk
 	SpotWatch bool              `json:"spot_watch"`
+	Container *ContainerRun     `json:"container,omitempty"`
 }
 
 // Started confirms the child was spawned.

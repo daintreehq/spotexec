@@ -371,3 +371,45 @@ func hasSuffixPath(stack, want []string) bool {
 	}
 	return true
 }
+
+// hasSSHIngress reports whether a DescribeSecurityGroups response grants
+// inbound tcp/22 from cidr within a single permission (egress rules are a
+// separate element and never count).
+func hasSSHIngress(b []byte, cidr string) bool {
+	var v struct {
+		Groups []struct {
+			Perms []struct {
+				Proto string `xml:"ipProtocol"`
+				From  int    `xml:"fromPort"`
+				To    int    `xml:"toPort"`
+				V4    []struct {
+					CIDR string `xml:"cidrIp"`
+				} `xml:"ipRanges>item"`
+				V6 []struct {
+					CIDR string `xml:"cidrIpv6"`
+				} `xml:"ipv6Ranges>item"`
+			} `xml:"ipPermissions>item"`
+		} `xml:"securityGroupInfo>item"`
+	}
+	if xml.Unmarshal(b, &v) != nil {
+		return false
+	}
+	for _, g := range v.Groups {
+		for _, p := range g.Perms {
+			if !(p.Proto == "tcp" || p.Proto == "-1") || (p.Proto == "tcp" && (p.From > 22 || p.To < 22)) {
+				continue
+			}
+			for _, r := range p.V4 {
+				if r.CIDR == cidr {
+					return true
+				}
+			}
+			for _, r := range p.V6 {
+				if r.CIDR == cidr {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}

@@ -24,6 +24,8 @@ func main() {
 	all := fs.Bool("all", false, "unlock all")
 	olderThan := fs.Duration("older-than", 7*24*time.Hour, "prune age")
 	dryRun := fs.Bool("dry-run", false, "prune dry run")
+	src := fs.String("src", "", "cache-put: directory to archive")
+	lockPath := fs.String("lock", "", "cache-put: dependency key lock to hold shared")
 	_ = fs.Parse(os.Args[2:])
 	root, err := helper.ExpandRoot(*workRoot)
 	if err != nil {
@@ -49,6 +51,10 @@ func main() {
 		fail(helper.Unlock(os.Stdout, root, *token, *all))
 	case "prune":
 		fail(helper.Prune(os.Stdout, root, *olderThan, *dryRun))
+	case "image-push":
+		fail(helper.ImagePush(root))
+	case "cache-put":
+		fail(helper.CachePut(root, *src, *lockPath))
 	case "version":
 		fmt.Println(helper.Version)
 	default:

@@ -42,6 +42,7 @@ type AcquireRequest struct {
 	PreferSlot   int
 	Rep          ui.Reporter
 	NoBoot       bool            // never launch fleet instances
+	Priority     int             // queue priority (higher first)
 	Exclude      map[string]bool // fleet instance IDs to avoid (e.g. one being reclaimed)
 }
 
@@ -67,11 +68,14 @@ type member struct {
 // Acquire finds a free slot anywhere in the pool, scaling fleets out as
 // needed (docs/POOL.md):
 //
-//  1. probe static runners and running fleet instances without blocking
-//     (busiest-first, so idle instances can scale in);
-//  2. if everything is full, register as a waiter and launch another fleet
-//     instance when waiting demand exceeds the capacity already launching;
-//  3. poll (with jitter) until a slot frees up or queue_timeout passes.
+//  1. if nobody is queued, probe static runners and running fleet instances
+//     without blocking (oldest instance first, so idle ones can scale in);
+//  2. otherwise (or if everything is full) take a ticket in the pool's fair
+//     queue (priority, then arrival) and signal demand to every fleet;
+//  3. fleets launch instances while waiting demand exceeds the capacity
+//     already launching, lower-priority fleets covering only the remainder;
+//  4. only tickets near the head of the queue probe for slots, every
+//     1.2-2.5s, until one frees up or queue_timeout passes.
 func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 	queue := req.QueueTimeout
 	if queue <= 0 {
@@ -93,53 +97,142 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		}
 		members = append(members, m)
 	}
+	q := QueueFor(req.Pool)
+	var ticket *Ticket
+	defer func() { ticket.Leave() }()
 	waiters := map[string]*Waiter{}
 	defer func() {
 		for _, w := range waiters {
 			w.Done()
 		}
 	}()
+	join := func() error {
+		if ticket != nil {
+			return nil
+		}
+		t, err := q.Join(req.Priority, req.Base.Exclusive, req.Base.Client.Command)
+		if err != nil {
+			return err
+		}
+		ticket = t
+		return nil
+	}
+	// Everyone takes a ticket before probing: newcomers never overtake
+	// waiting agents, and a burst of arrivals doesn't stampede SSH.
+	if err := join(); err != nil {
+		return nil, err
+	}
 	provisioning := map[string]bool{}
 	var lastHolders []protocol.Holder
+	lastPos := -1
 	queued := false
 	for round := 0; ; round++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		// May this process probe now? Without a ticket (nobody waiting): yes.
+		// With one: only within the first `window` tickets, where window is
+		// the number of slots that could free up, and never past an
+		// exclusive ticket ahead of us.
+		window := 0
+		fleetCands := map[*member][]provider.Instance{}
 		reachable := 0
 		roundErrs := []string{}
 		for _, m := range members {
 			if m.pool == nil {
-				lease, holders, err := m.probeStatic(ctx, req)
-				if lease != nil {
-					return lease, nil
-				}
-				if err != nil {
-					roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
-					continue
-				}
-				reachable++
-				lastHolders = holders
+				window += slotsOf(m.r)
 				continue
 			}
-			cands, err := m.pool.Candidates(ctx, req.Exclude)
+			cands, usable, err := m.pool.Candidates(ctx, req.Exclude)
 			if err != nil {
 				roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
 				continue
 			}
-			reachable++ // a fleet can always grow (or is growing)
-			for _, in := range cands {
-				lease, holders, out := m.probeInstance(ctx, req, in)
-				m.pool.Observe(in.ID, out, in.LaunchedAt)
-				if lease != nil {
-					return lease, nil
+			if !req.NoBoot || usable > 0 {
+				reachable++ // a fleet can always grow (or is growing)
+			}
+			fleetCands[m] = cands
+			window += usable * m.pool.SlotsPerInstance()
+		}
+		mayProbe := true
+		var qs QueueState
+		for _, w := range waiters {
+			w.Touch()
+		}
+		if ticket != nil {
+			qs = q.State(ticket)
+			mayProbe = qs.Position < max(1, window) && (!qs.ExclusiveHead || qs.Position == 0)
+			if req.Base.Exclusive {
+				mayProbe = qs.Position == 0 // a whole machine: only from the head
+			}
+			if qs.Position != lastPos {
+				lastPos = qs.Position
+				req.Rep.Event("queue_position", map[string]any{"position": qs.Position + 1, "queued": qs.Total, "priority": req.Priority})
+			}
+		}
+		if mayProbe {
+			for _, m := range members {
+				if m.pool == nil && req.Base.Exclusive && len(members) == 1 && ticket != nil && qs.Position == 0 && m.ready {
+					// Head of the queue for a whole static machine: wait in its
+					// helper, which holds the host gate against newcomers from
+					// other machines or queues until we get it.
+					rq := req
+					rq.QueueTimeout = time.Until(deadline)
+					if rq.QueueTimeout > 0 {
+						lease, _, err := tryAcquire(ctx, rq, m.r, m.p, m.t, true)
+						if err == nil {
+							return lease, nil
+						}
+						roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
+						continue
+					}
 				}
-				if out == OutBusy {
+				if m.pool == nil {
+					lease, holders, err := m.probeStatic(ctx, req)
+					if lease != nil {
+						return lease, nil
+					}
+					if err != nil {
+						roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
+						continue
+					}
+					reachable++
 					lastHolders = holders
+					continue
+				}
+				for _, in := range fleetCands[m] {
+					lease, holders, out := m.probeInstance(ctx, req, in)
+					if !(out == OutBusy && req.Base.Exclusive) {
+						// An exclusive probe finding a partly busy instance must
+						// not hide its free slots from everyone else.
+						m.pool.Observe(in.ID, out, in.LaunchedAt)
+					}
+					if lease != nil {
+						return lease, nil
+					}
+					if out == OutBusy {
+						lastHolders = holders
+					}
+					// Root and user bootstrap each get boot_timeout.
+					if out == OutBooting && time.Since(in.LaunchedAt) > 2*m.r.BootTimeout.Duration+2*time.Minute {
+						// First-boot setup never finished (hung bootstrap):
+						// the VM can't serve and may never idle out.
+						m.pool.Observe(in.ID, OutDraining, in.LaunchedAt)
+						req.Rep.Warn("BOOT_STUCK", "%s: %s never finished first-boot setup; terminating it", m.r.Name, in.ID)
+						go func(id string) { _ = m.pool.Fleet.Terminate(context.WithoutCancel(ctx), id) }(in.ID)
+					}
+				}
+			}
+		} else {
+			for _, m := range members {
+				if m.pool == nil && m.ready {
+					reachable++
 				}
 			}
 		}
-		if reachable == 0 {
+		// Only actual probe failures prove unavailability; a round where we
+		// were not admitted to probe says nothing.
+		if reachable == 0 && mayProbe {
 			errs = append(errs, roundErrs...)
 			return nil, fmt.Errorf("no runner available:\n  %s", strings.Join(errs, "\n  "))
 		}
@@ -147,26 +240,19 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			queued = true
 			req.Rep.Event("queued", map[string]any{"holders": len(lastHolders)})
 		}
-		// No fleet to grow: queue inside the first reachable static runner's
-		// helper instead of polling (FIFO-ish fairness, and --exclusive takes
-		// the host gate without being starved by newcomers).
-		if !hasFleet(members) && len(members) == 1 && members[0].ready {
-			m := members[0]
-			left := time.Until(deadline)
-			if left <= 0 {
-				return nil, fmt.Errorf("%s: no free slot within %s", protocol.CodeQueueTimeout, queue)
-			}
-			req.Rep.Status("all slots busy on %s (%s); queued", m.r.Name, describeHolders(lastHolders))
-			rq := req
-			rq.QueueTimeout = left
-			lease, _, err := tryAcquire(ctx, rq, m.r, m.p, m.t, true)
-			return lease, err
+		if err := join(); err != nil {
+			return nil, err
 		}
-		// Everything is full: signal demand and grow the first fleet that can.
+		// Everything is full: signal demand and grow fleets in priority order,
+		// each covering only what the fleets before it are not launching.
 		status := ""
+		covered := 0
 		for _, m := range members {
 			if m.pool == nil {
 				continue
+			}
+			if req.NoBoot {
+				continue // can't grow: don't signal demand others would launch for
 			}
 			if waiters[m.r.Name] == nil {
 				weight := 1
@@ -182,7 +268,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			if req.NoBoot {
 				continue
 			}
-			d, err := m.pool.Plan(ctx)
+			d, err := m.pool.Plan(ctx, covered)
 			if err != nil {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
@@ -192,24 +278,32 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				req.Rep.Event("scale_out", map[string]any{"runner": m.r.Name, "launch_id": d.ID, "demand": d.Demand, "instances": d.Live})
 				go m.provision(ctx, d.ID, req.Rep)
 			}
-			if status == "" && (d.Pending > 0 || d.Launch) {
-				status = fmt.Sprintf("%d slot(s) wanted on %s; %d instance(s) starting", d.Demand, m.r.Name, d.Pending)
-			} else if status == "" {
+			covered += d.Capacity
+			if d.Pending > 0 || d.Launch {
+				if status != "" {
+					status += "; "
+				}
+				status += fmt.Sprintf("%d instance(s) starting on %s", d.Pending, m.r.Name)
+			} else if status == "" && d.Demand > 0 {
 				status = fmt.Sprintf("%s: %s", m.r.Name, d.Reason)
-			}
-			if d.Launch || d.Pending > 0 {
-				break // growing this fleet covers the demand; don't grow lower-priority ones too
 			}
 		}
 		if status == "" {
 			status = "all slots busy (" + describeHolders(lastHolders) + ")"
 		}
-		req.Rep.Status("queued %s · %s", ui.Dur(time.Since(start)), status)
+		pos := ""
+		if ticket != nil {
+			pos = fmt.Sprintf("#%d of %d · ", qs.Position+1, qs.Total)
+		}
+		req.Rep.Status("queued %s%s · %s", pos, ui.Dur(time.Since(start)), status)
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("%s: no free slot within %s (%s)", protocol.CodeQueueTimeout, queue, status)
 		}
-		// Jittered poll interval: spreads probes from many waiting agents.
-		sleep := 1200*time.Millisecond + time.Duration(rand.IntN(1300))*time.Millisecond
+		// Poll interval grows with queue position: the head probes most
+		// often, so slots go to earlier (or higher-priority) tickets first.
+		// Jitter spreads probes from many agents.
+		sleep := 500*time.Millisecond + time.Duration(min(qs.Position, 10))*200*time.Millisecond +
+			time.Duration(rand.IntN(400))*time.Millisecond
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -218,13 +312,11 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 	}
 }
 
-func hasFleet(ms []*member) bool {
-	for _, m := range ms {
-		if m.pool != nil {
-			return true
-		}
+func slotsOf(r *config.Runner) int {
+	if r.MaxSlots > 0 {
+		return r.MaxSlots
 	}
-	return false
+	return 4
 }
 
 func (m *member) probeStatic(ctx context.Context, req AcquireRequest) (*Lease, []protocol.Holder, error) {
@@ -268,6 +360,10 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provi
 func (m *member) provision(ctx context.Context, id string, rep ui.Reporter) {
 	logf := func(format string, args ...any) {
 		rep.Event("provision", map[string]any{"runner": m.r.Name, "launch_id": id, "message": fmt.Sprintf(format, args...)})
+	}
+	if ctx.Err() != nil {
+		m.pool.Cancel(id) // interrupted before the launch request: don't send it
+		return
 	}
 	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.r.BootTimeout.Duration+time.Minute)
 	defer cancel()

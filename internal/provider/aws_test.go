@@ -178,3 +178,28 @@ func TestParseCredentials(t *testing.T) {
 		t.Fatal("expected error for missing profile")
 	}
 }
+
+func TestHasSSHIngressIgnoresEgress(t *testing.T) {
+	body := []byte(`<DescribeSecurityGroupsResponse><securityGroupInfo><item><groupId>sg-1</groupId>
+<ipPermissions><item><ipProtocol>tcp</ipProtocol><fromPort>22</fromPort><toPort>22</toPort>
+<ipRanges><item><cidrIp>203.0.113.4/32</cidrIp></item></ipRanges></item></ipPermissions>
+<ipPermissionsEgress><item><ipProtocol>-1</ipProtocol><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges></item></ipPermissionsEgress>
+</item></securityGroupInfo></DescribeSecurityGroupsResponse>`)
+	if hasSSHIngress(body, "0.0.0.0/0") {
+		t.Fatal("egress 0.0.0.0/0 must not count as SSH ingress")
+	}
+	if !hasSSHIngress(body, "203.0.113.4/32") {
+		t.Fatal("expected ingress match")
+	}
+}
+
+// AWS docs example: "Authenticating Requests: Using Query Parameters".
+func TestPresignS3DocsVector(t *testing.T) {
+	c := awsCreds{AccessKeyID: "AKIAIOSFODNN7EXAMPLE", SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}
+	now := time.Date(2013, 5, 24, 0, 0, 0, 0, time.UTC)
+	u := presignS3Host(c, "us-east-1", "examplebucket.s3.amazonaws.com", "test.txt", "GET", 86400*time.Second, now)
+	want := "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+	if !strings.Contains(u, "X-Amz-Signature="+want) {
+		t.Fatalf("signature mismatch:\n%s", u)
+	}
+}

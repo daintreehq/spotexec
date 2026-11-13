@@ -1,11 +1,11 @@
 package helper
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -13,27 +13,19 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spotexec/spotexec/internal/depskey"
 	"github.com/spotexec/spotexec/internal/fsid"
 	"github.com/spotexec/spotexec/internal/protocol"
 )
 
-// depsKey hashes lockfile contents + install command + platform.
+// depsKey hashes lockfile contents + install command + platform (the same
+// function the client uses to sign cache URLs).
 func depsKey(ws string, d protocol.Deps) (string, error) {
-	h := sha256.New()
-	fmt.Fprintf(h, "%s/%s\x00%s\x00%s\x00", runtime.GOOS, runtime.GOARCH, d.Install, strings.Join(d.CacheDirs, ","))
-	for _, lf := range d.Lockfiles {
-		rel, err := fsid.CleanRel(lf)
-		if err != nil {
-			return "", err
-		}
-		b, err := os.ReadFile(filepath.Join(ws, rel))
-		if err != nil {
-			return "", fmt.Errorf("lockfile %s: %w", lf, err)
-		}
-		fmt.Fprintf(h, "%s\x00%d\x00", lf, len(b))
-		h.Write(b)
+	image := ""
+	if d.Container != nil {
+		image = d.Container.Image
 	}
-	return hex.EncodeToString(h.Sum(nil))[:24], nil
+	return depskey.Key(ws, depskey.Spec{Lockfiles: d.Lockfiles, Install: d.Install, CacheDirs: d.CacheDirs, Image: image, Toolchain: d.Toolchain, OS: runtime.GOOS, Arch: runtime.GOARCH})
 }
 
 // expandCacheDirs resolves cache_dirs globs (e.g. "packages/*/node_modules")
@@ -114,6 +106,16 @@ func (s *Session) deps(d protocol.Deps) error {
 			if _, err := os.Stat(ready); err == nil {
 				return nil // another slot built it while we waited
 			}
+			// A fresh VM: try the shared cache before installing.
+			if d.CacheGet != "" && d.CacheKey == key {
+				_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_cache", Message: "checking shared cache"})
+				if ok, err := cacheRestore(context.Background(), s.layout.Root, d.CacheGet, cacheRoot); err == nil && ok {
+					res.Restored = true
+					return nil
+				} else if err != nil {
+					_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_cache_error", Message: err.Error()})
+				}
+			}
 			// The install runs arbitrary package scripts in the workspace:
 			// invalidate the fingerprint and dependency key first.
 			s.state.Fingerprint, s.state.DepsKey = "", ""
@@ -124,6 +126,13 @@ func (s *Session) deps(d protocol.Deps) error {
 				return err
 			}
 			res.Built = true
+			if d.CachePut != "" && d.CacheKey == key {
+				if err := startCacheUpload(s.layout.Root, cacheRoot, cacheRoot+".lock", d.CachePut); err == nil {
+					res.Uploaded = true
+				} else {
+					_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_cache_error", Message: err.Error()})
+				}
+			}
 			return nil
 		}()
 		if err != nil {
@@ -179,6 +188,14 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		env[k] = v
 	}
 	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: d.Install})
+	if d.Container != nil {
+		host, _, cleanup, err := s.containerScript(d.Container, d.Install, s.workspace, env)
+		if err != nil {
+			return perr(protocol.CodeDepsFailed, "%v", err)
+		}
+		defer cleanup()
+		script, env = host, nil
+	}
 	pr := s.runProc(script, s.workspace, env, time.Duration(d.TimeoutMS)*time.Millisecond, 5*time.Second, false)
 	if pr.startErr != nil || pr.code != 0 {
 		msg := fmt.Sprintf("install command exited %d", pr.code)
@@ -229,21 +246,35 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 		if rel == "" {
 			continue
 		}
-		r, err := fsid.CleanRel(rel)
+		// The marker may come from a shared archive: only ever touch paths
+		// that match the configured cache_dirs, and never through symlinks.
+		if !matchesCacheDirs(rel, d.CacheDirs) {
+			return "", fmt.Errorf("dependency cache lists %q, which is not one of cache_dirs", rel)
+		}
+		src, err := fsid.SafeJoin(cacheRoot, rel)
 		if err != nil {
 			return "", err
 		}
-		dst := filepath.Join(s.workspace, r)
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		dst, err := fsid.PrepareParent(s.workspace, rel)
+		if err != nil {
 			return "", err
 		}
-		m, err := cloneTree(filepath.Join(cacheRoot, r), dst, d.Hydrate)
+		m, err := cloneTree(src, dst, d.Hydrate)
 		if err != nil {
 			return "", err
 		}
 		method = m
 	}
 	return method, nil
+}
+
+func matchesCacheDirs(rel string, patterns []string) bool {
+	for _, p := range patterns {
+		if ok, _ := path.Match(strings.Trim(p, "/"), rel); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // cloneTree copies src to dst preferring copy-on-write. Hardlinks are used

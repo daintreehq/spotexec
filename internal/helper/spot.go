@@ -22,9 +22,11 @@ type notice struct {
 }
 
 // watchNotices runs for the life of a session holding a slot on a Spot
-// runner. A rebalance recommendation marks the VM draining (running work
-// finishes, nothing new is admitted); an interruption notice does the same
-// and tells the client, which warms replacement capacity.
+// runner. An interruption notice marks the VM draining (running work
+// finishes, nothing new is admitted) and tells the client, which warms
+// replacement capacity. A rebalance recommendation is only advisory: EC2
+// often sends it at boot for capacity pools with elevated risk, so draining
+// on it would make the fleet churn. It is recorded and reported, nothing more.
 func (s *Session) watchNotices() {
 	ch := make(chan notice, 2)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -33,11 +35,13 @@ func (s *Session) watchNotices() {
 	for {
 		select {
 		case n := <-ch:
-			markDraining(s.layout.Root, n.msg)
 			name := "spot_rebalance"
 			if n.kind == "interruption" {
 				name = "spot_interruption"
 				s.interrupted.Store(true)
+				markDraining(s.layout.Root, n.msg)
+			} else {
+				_ = os.WriteFile(filepath.Join(s.layout.Root, "rebalance"), []byte(n.msg+"\n"), 0o644)
 			}
 			_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: name, Message: n.msg})
 			if n.kind == "interruption" {
@@ -101,12 +105,12 @@ func pollNotices(ctx context.Context, out chan<- notice) {
 				wait, backoff = backoff, min(backoff*2, 60*time.Second)
 			} else {
 				backoff = 3 * time.Second
-				if body, ok := imdsGet(ctx, client, token, "spot/instance-action"); ok {
+				if body, ok := imdsGet(ctx, client, &token, "spot/instance-action"); ok {
 					out <- notice{"interruption", "EC2 spot interruption notice: " + body}
 					return
 				}
 				if !rebalanced {
-					if body, ok := imdsGet(ctx, client, token, "events/recommendations/rebalance"); ok {
+					if body, ok := imdsGet(ctx, client, &token, "events/recommendations/rebalance"); ok {
 						rebalanced = true
 						out <- notice{"rebalance", "EC2 rebalance recommendation: " + body}
 					}
@@ -121,14 +125,17 @@ func pollNotices(ctx context.Context, out chan<- notice) {
 	}
 }
 
-func imdsGet(ctx context.Context, c *http.Client, token, path string) (string, bool) {
+func imdsGet(ctx context.Context, c *http.Client, token *string, path string) (string, bool) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://169.254.169.254/latest/meta-data/"+path, nil)
-	req.Header.Set("X-aws-ec2-metadata-token", token)
+	req.Header.Set("X-aws-ec2-metadata-token", *token)
 	resp, err := c.Do(req)
 	if err != nil {
 		return "", false
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == 401 {
+		*token = "" // expired or invalid: fetch a new one next round
+	}
 	return strings.TrimSpace(string(b)), resp.StatusCode == 200
 }

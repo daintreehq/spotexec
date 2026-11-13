@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -54,6 +55,8 @@ func NewAWSSpot(r *config.Runner) (Provider, error) {
 			region: r.Region,
 			creds:  &awsCredResolver{profile: r.Profile},
 			http:   &http.Client{Timeout: 60 * time.Second},
+			// ECR's API host is api.ecr.<region>, not ecr.<region>.
+			endpoints: map[string]string{"ecr": "https://api.ecr." + r.Region + ".amazonaws.com/"},
 		},
 	}, nil
 }
@@ -167,6 +170,8 @@ func (a *AWSSpot) describe(ctx context.Context, states ...string) ([]ec2Instance
 		for i, s := range states {
 			p.Set("Filter.3.Value."+strconv.Itoa(i+1), s)
 		}
+		// Paginated calls are throttled in a far more generous bucket.
+		p.Set("MaxResults", "100")
 		if token != "" {
 			p.Set("NextToken", token)
 		}
@@ -380,7 +385,11 @@ func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger)
 			return Info{}, fmt.Errorf("instance %s entered state %q while booting (spot capacity reclaimed?)", inst.InstanceID, inst.State)
 		}
 		if logged != inst.State {
-			log("waiting for %s (%s, %s)", inst.InstanceID, inst.InstanceType, inst.State)
+			if inst.InstanceType != "" {
+				log("waiting for %s (%s, %s)", inst.InstanceID, inst.InstanceType, inst.State)
+			} else {
+				log("waiting for %s (%s)", inst.InstanceID, inst.State)
+			}
 			logged = inst.State
 		}
 		if time.Now().After(deadline) {
@@ -423,7 +432,7 @@ func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
 	ud, err := cloudinit.Render(cloudinit.Options{
 		User: a.r.User, PublicKey: pub, IdleTimeout: a.r.IdleTimeout.Duration,
 		MaxLifetime: a.r.MaxLifetime.Duration, BootstrapScript: a.r.BootstrapScript,
-		UserBootstrap: a.r.UserBootstrap,
+		UserBootstrap: a.r.UserBootstrap, BootstrapTimeout: a.r.BootTimeout.Duration,
 	})
 	if err != nil {
 		return ec2Instance{}, err
@@ -491,7 +500,7 @@ func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
 				log("launched %s %s instance %s in %s", kind, itype, inst.InstanceID, a.r.Region)
 				return inst, nil
 			}
-			if classifyAWSError(err) != errNextType {
+			if errors.Is(err, ErrLaunchAmbiguous) || classifyAWSError(err) != errNextType {
 				return ec2Instance{}, fmt.Errorf("launch %s: %w", itype, err)
 			}
 			log("skipping %s: %v", itype, err)
@@ -548,6 +557,12 @@ func (a *AWSSpot) runOne(ctx context.Context, base url.Values, itype string, spo
 		}
 		break
 	}
+	if awsCode(lastErr) == "" && lastErr != nil {
+		// Includes cancellation after the request was sent.
+		// No API verdict (network error after retries): the request may
+		// have created an instance.
+		return ec2Instance{}, fmt.Errorf("%w: %v", ErrLaunchAmbiguous, lastErr)
+	}
 	return ec2Instance{}, lastErr
 }
 
@@ -599,6 +614,7 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 	if err != nil {
 		return nil, err
 	}
+	body := ""
 	find := func() (string, error) {
 		p := url.Values{}
 		p.Set("Filter.1.Name", "group-name")
@@ -609,11 +625,16 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 		if err != nil {
 			return "", err
 		}
+		body = string(b)
 		return xmlFirst(b, "securityGroupInfo>item>groupId"), nil
 	}
 	id, err := find()
 	if err != nil {
 		return nil, err
+	}
+	// Existing group that already allows SSH from our CIDR: no mutating call.
+	if id != "" && hasSSHIngress([]byte(body), a.r.SSHCIDR) {
+		return []string{id}, nil
 	}
 	if id == "" {
 		p := url.Values{}
@@ -771,5 +792,37 @@ func (a *AWSSpot) Doctor(ctx context.Context) []Check {
 		}
 		out = append(out, Check{Name: "network", OK: true, Msg: msg})
 	}
+	// New accounts start with a small Spot vCPU quota (often 5 vCPUs).
+	qb, _ := json.Marshal(map[string]string{"ServiceCode": "ec2", "QuotaCode": "L-34B43A08"})
+	if status, b, err := a.api.do(ctx, "servicequotas", "application/x-amz-json-1.1", map[string]string{"X-Amz-Target": "ServiceQuotasV20190624.GetServiceQuota"}, qb); err == nil && status == 200 {
+		var v struct{ Quota struct{ Value float64 } }
+		_ = json.Unmarshal(b, &v)
+		need := a.r.MaxInstances * vcpusOf(a.r.InstanceTypes[0])
+		msg := fmt.Sprintf("%.0f vCPUs for standard Spot instances in %s; this runner may use up to %d", v.Quota.Value, a.r.Region, need)
+		out = append(out, Check{Name: "spot vCPU quota", OK: v.Quota.Value >= float64(need), Msg: msg})
+	}
+	for _, t := range a.r.InstanceTypes {
+		if strings.HasPrefix(t, "t2.") || strings.HasPrefix(t, "t3.") || strings.HasPrefix(t, "t3a.") || strings.HasPrefix(t, "t4g.") {
+			out = append(out, Check{Name: "instance types", OK: true, Msg: "note: " + t + " is burstable; sustained CPU on spot t-family instances bills surplus credits. Prefer c7a/m7a/c6a."})
+			break
+		}
+	}
 	return out
+}
+
+// vcpusOf estimates vCPUs from an EC2 size suffix (large=2, xlarge=4, NxNlarge=4N).
+func vcpusOf(t string) int {
+	_, size, _ := strings.Cut(t, ".")
+	switch size {
+	case "nano", "micro", "small":
+		return 2
+	case "medium", "large":
+		return 2
+	case "xlarge":
+		return 4
+	}
+	if n, err := strconv.Atoi(strings.TrimSuffix(size, "xlarge")); err == nil {
+		return 4 * n
+	}
+	return 4
 }
