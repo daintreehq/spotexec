@@ -68,3 +68,8 @@ AGENTS.local.md
 
 # Daintree
 .daintree/*.local.json
+
+# Build output
+/bin/
+/dist/
+internal/helperbin/dist/*.gz

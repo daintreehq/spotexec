@@ -1,0 +1,280 @@
+package helper
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/spotexec/spotexec/internal/fsid"
+	"github.com/spotexec/spotexec/internal/protocol"
+)
+
+// depsKey hashes lockfile contents + install command + platform.
+func depsKey(ws string, d protocol.Deps) (string, error) {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s/%s\x00%s\x00%s\x00", runtime.GOOS, runtime.GOARCH, d.Install, strings.Join(d.CacheDirs, ","))
+	for _, lf := range d.Lockfiles {
+		rel, err := fsid.CleanRel(lf)
+		if err != nil {
+			return "", err
+		}
+		b, err := os.ReadFile(filepath.Join(ws, rel))
+		if err != nil {
+			return "", fmt.Errorf("lockfile %s: %w", lf, err)
+		}
+		fmt.Fprintf(h, "%s\x00%d\x00", lf, len(b))
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:24], nil
+}
+
+// expandCacheDirs resolves cache_dirs globs (e.g. "packages/*/node_modules")
+// to existing relative directories under base.
+func expandCacheDirs(base string, patterns []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range patterns {
+		p = strings.Trim(p, "/")
+		matches, _ := filepath.Glob(filepath.Join(base, filepath.FromSlash(p)))
+		for _, m := range matches {
+			rel, err := filepath.Rel(base, m)
+			if err != nil {
+				continue
+			}
+			rel = filepath.ToSlash(rel)
+			if _, err := fsid.SafeJoin(base, rel); err != nil {
+				continue // reached through a symlink: not ours to touch
+			}
+			if fi, err := os.Lstat(m); err == nil && fi.IsDir() {
+				if !seen[rel] {
+					seen[rel] = true
+					out = append(out, rel)
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *Session) deps(d protocol.Deps) error {
+	if s.slotLock == nil {
+		return perr(protocol.CodeBadRequest, "acquire required before deps")
+	}
+	start := time.Now()
+	for _, p := range d.CacheDirs {
+		if _, err := fsid.CleanRel(strings.NewReplacer("*", "x", "?", "x", "[", "x", "]", "x").Replace(strings.Trim(p, "/"))); err != nil {
+			return perr(protocol.CodeBadRequest, "invalid cache_dirs entry %q", p)
+		}
+	}
+	key, err := depsKey(s.workspace, d)
+	if err != nil {
+		return perr(protocol.CodeDepsFailed, "%v", err)
+	}
+	res := protocol.DepsResult{Key: key}
+	cacheRoot := filepath.Join(s.layout.Deps(s.repoID), key)
+	ready := filepath.Join(cacheRoot, ".ready")
+
+	if s.state.DepsKey == key && len(expandCacheDirs(s.workspace, d.CacheDirs)) > 0 {
+		_ = os.Chtimes(ready, time.Now(), time.Now())
+		res.MS = time.Since(start).Milliseconds()
+		return s.c.Send(protocol.TypeDepsResult, res)
+	}
+
+	if _, err := os.Stat(ready); err != nil {
+		// Build once per key under an exclusive lock; other slots wait.
+		lockPath := cacheRoot + ".lock"
+		var l *flock
+		for {
+			var ok bool
+			l, ok, err = tryLock(lockPath)
+			if err != nil {
+				return err
+			}
+			if ok {
+				break
+			}
+			if s.clientGone() {
+				return perr(protocol.CodeDepsFailed, "client went away while waiting for dependency build")
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		err := func() error {
+			// Released before hydrating: the hydration below takes the same
+			// lock shared, and flock would deadlock against our own EX lock.
+			defer l.Unlock()
+			if _, err := os.Stat(ready); err == nil {
+				return nil // another slot built it while we waited
+			}
+			// The install runs arbitrary package scripts in the workspace:
+			// invalidate the fingerprint and dependency key first.
+			s.state.Fingerprint, s.state.DepsKey = "", ""
+			if err := saveSlotState(s.slotDir, s.state); err != nil {
+				return err
+			}
+			if err := s.buildDeps(d, key, cacheRoot); err != nil {
+				return err
+			}
+			res.Built = true
+			return nil
+		}()
+		if err != nil {
+			return err
+		}
+	}
+	if !res.Built {
+		// Hold the key lock shared while copying out of the cache so prune
+		// (which needs it exclusively) cannot delete it mid-copy.
+		lf, err := openLockFile(cacheRoot + ".lock")
+		if err != nil {
+			return err
+		}
+		defer lf.Close()
+		for syscall.Flock(int(lf.Fd()), syscall.LOCK_SH|syscall.LOCK_NB) != nil {
+			if s.clientGone() {
+				return perr(protocol.CodeDepsFailed, "client went away while waiting for dependency cache")
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		if _, err := os.Stat(ready); err != nil {
+			return perr(protocol.CodeDepsFailed, "dependency cache %s disappeared; retry", key)
+		}
+		s.state.DepsKey = ""
+		if err := saveSlotState(s.slotDir, s.state); err != nil {
+			return err
+		}
+		method, err := s.hydrate(d, cacheRoot)
+		if err != nil {
+			return perr(protocol.CodeDepsFailed, "hydrate: %v", err)
+		}
+		res.Hydrated, res.Method = true, method
+	}
+	_ = os.Chtimes(ready, time.Now(), time.Now())
+	s.state.DepsKey = key
+	if err := saveSlotState(s.slotDir, s.state); err != nil {
+		return err
+	}
+	res.MS = time.Since(start).Milliseconds()
+	return s.c.Send(protocol.TypeDepsResult, res)
+}
+
+// buildDeps runs the install command in the slot workspace (which has the
+// full repo context the package manager needs), then snapshots the resulting
+// cache dirs into the shared, immutable cache.
+func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
+	script := d.Install
+	if strings.TrimSpace(d.Setup) != "" {
+		script = d.Setup + "\n" + script
+	}
+	env := map[string]string{"CI": "true"}
+	for k, v := range d.Env {
+		env[k] = v
+	}
+	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: d.Install})
+	pr := s.runProc(script, s.workspace, env, time.Duration(d.TimeoutMS)*time.Millisecond, 5*time.Second, false)
+	if pr.startErr != nil || pr.code != 0 {
+		msg := fmt.Sprintf("install command exited %d", pr.code)
+		if pr.startErr != nil {
+			msg = pr.startErr.Error()
+		}
+		if pr.timedOut {
+			msg = "install command timed out"
+		}
+		return perr(protocol.CodeDepsFailed, "%s", msg)
+	}
+	dirs := expandCacheDirs(s.workspace, d.CacheDirs)
+	tmp := fmt.Sprintf("%s.tmp-%d", cacheRoot, os.Getpid())
+	_ = os.RemoveAll(tmp)
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		return err
+	}
+	for _, rel := range dirs {
+		dst := filepath.Join(tmp, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		if _, err := cloneTree(filepath.Join(s.workspace, filepath.FromSlash(rel)), dst, "auto"); err != nil {
+			_ = os.RemoveAll(tmp)
+			return perr(protocol.CodeDepsFailed, "snapshot %s: %v", rel, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(tmp, ".ready"), []byte(strings.Join(dirs, "\n")), 0o644); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(cacheRoot)
+	return os.Rename(tmp, cacheRoot)
+}
+
+// hydrate replaces the slot's cache dirs with clones from the shared cache.
+func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(cacheRoot, ".ready"))
+	if err != nil {
+		return "", err
+	}
+	for _, rel := range expandCacheDirs(s.workspace, d.CacheDirs) {
+		if err := os.RemoveAll(filepath.Join(s.workspace, filepath.FromSlash(rel))); err != nil {
+			return "", err
+		}
+	}
+	method := "none"
+	for _, rel := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if rel == "" {
+			continue
+		}
+		r, err := fsid.CleanRel(rel)
+		if err != nil {
+			return "", err
+		}
+		dst := filepath.Join(s.workspace, r)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return "", err
+		}
+		m, err := cloneTree(filepath.Join(cacheRoot, r), dst, d.Hydrate)
+		if err != nil {
+			return "", err
+		}
+		method = m
+	}
+	return method, nil
+}
+
+// cloneTree copies src to dst preferring copy-on-write. Hardlinks are used
+// only when explicitly requested: they share inodes, so a test writing into
+// node_modules would corrupt the cache for every slot.
+func cloneTree(src, dst, mode string) (string, error) {
+	try := func(args ...string) error {
+		out, err := exec.Command("cp", append(args, src, dst)...).CombinedOutput()
+		if err != nil {
+			_ = os.RemoveAll(dst)
+			return fmt.Errorf("cp %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	reflink := []string{"-a", "--reflink=always"}
+	if runtime.GOOS == "darwin" {
+		reflink = []string{"-c", "-R", "-p"}
+	}
+	switch mode {
+	case "hardlink":
+		return "hardlink", try("-a", "-l")
+	case "copy":
+		return "copy", try("-a")
+	case "reflink":
+		return "reflink", try(reflink...)
+	}
+	if err := try(reflink...); err == nil {
+		return "reflink", nil
+	}
+	if runtime.GOOS == "darwin" {
+		return "copy", try("-R", "-p")
+	}
+	return "copy", try("-a")
+}

@@ -1,0 +1,127 @@
+// Package client orchestrates a spotexec run: pick a runner, acquire a slot,
+// sync the worktree, hydrate dependencies, execute, and write back mutations.
+package client
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/spotexec/spotexec/internal/config"
+	"github.com/spotexec/spotexec/internal/manifest"
+	"github.com/spotexec/spotexec/internal/provider"
+)
+
+// Workspace identifies the local worktree being run from.
+type Workspace struct {
+	Root        string // canonical worktree root
+	Git         bool
+	GitDir      string // per-worktree git dir (conflicts live here)
+	RepoID      string // shared across worktrees of the same repo
+	RepoName    string
+	WorktreeKey string // unique per host+worktree
+	Cwd         string // cwd relative to Root ("." at root)
+}
+
+var nonAlnum = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// Resolve finds the workspace for dir.
+func Resolve(dir string) (*Workspace, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = r
+	}
+	root, isGit := manifest.Root(abs)
+	w := &Workspace{Root: root, Git: isGit}
+	rel, err := filepath.Rel(root, abs)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		rel = "."
+	}
+	w.Cwd = filepath.ToSlash(rel)
+	ident := root
+	name := filepath.Base(root)
+	if isGit {
+		w.GitDir, _ = manifest.GitDir(root)
+		if out, err := exec.Command("git", "-C", root, "config", "--get", "remote.origin.url").Output(); err == nil {
+			if u := normalizeRemote(strings.TrimSpace(string(out))); u != "" {
+				ident = u
+				name = filepath.Base(u)
+			}
+		} else if out, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output(); err == nil {
+			// No origin: worktrees of one repo share the common git dir.
+			cd := strings.TrimSpace(string(out))
+			if !filepath.IsAbs(cd) {
+				cd = filepath.Join(root, cd)
+			}
+			ident = filepath.Clean(cd)
+			name = filepath.Base(filepath.Dir(ident))
+		}
+	}
+	name = strings.Trim(nonAlnum.ReplaceAllString(name, "-"), "-.")
+	if name == "" {
+		name = "repo"
+	}
+	if len(name) > 40 {
+		name = name[:40]
+	}
+	w.RepoName = name
+	h := sha256.Sum256([]byte(ident))
+	w.RepoID = name + "-" + hex.EncodeToString(h[:])[:8]
+	host, _ := os.Hostname()
+	k := sha256.Sum256([]byte(host + "\x00" + root))
+	w.WorktreeKey = hex.EncodeToString(k[:])[:8]
+	return w, nil
+}
+
+// normalizeRemote strips scheme, credentials and .git so https and ssh
+// remotes of the same repository map to one ID.
+func normalizeRemote(u string) string {
+	u = strings.TrimSuffix(strings.TrimSuffix(u, "/"), ".git")
+	if i := strings.Index(u, "://"); i >= 0 {
+		u = u[i+3:]
+	}
+	if i := strings.LastIndex(u, "@"); i >= 0 {
+		u = u[i+1:]
+	}
+	u = strings.Replace(u, ":", "/", 1)
+	return strings.ToLower(u)
+}
+
+// LastRun records where this worktree last ran (for exec/pull).
+type LastRun struct {
+	Runner     string          `json:"runner"`
+	InstanceID string          `json:"instance_id,omitempty"`
+	Slot       int             `json:"slot"`
+	Target     provider.Target `json:"target"`
+	WorkRoot   string          `json:"work_root"`
+	RemoteWS   string          `json:"remote_workspace"`
+}
+
+func lastRunPath(w *Workspace) string {
+	return filepath.Join(config.StateDir(), "worktrees", w.WorktreeKey+".json")
+}
+
+// LoadLastRun reads the last-run record.
+func LoadLastRun(w *Workspace) (*LastRun, error) {
+	b, err := os.ReadFile(lastRunPath(w))
+	if err != nil {
+		return nil, err
+	}
+	var lr LastRun
+	return &lr, json.Unmarshal(b, &lr)
+}
+
+func saveLastRun(w *Workspace, lr LastRun) {
+	p := lastRunPath(w)
+	_ = os.MkdirAll(filepath.Dir(p), 0o755)
+	b, _ := json.Marshal(lr)
+	_ = os.WriteFile(p, b, 0o644)
+}

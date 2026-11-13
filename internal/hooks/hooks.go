@@ -1,0 +1,351 @@
+// Package hooks implements deterministic agent command interception: a
+// Claude Code PreToolUse hook that wraps heavy commands (tests, type checks,
+// formatters) with `spotexec run --`, and an AGENTS.md snippet for other
+// harnesses.
+package hooks
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+
+	"github.com/spotexec/spotexec/internal/config"
+)
+
+// DefaultPatterns match command segments worth offloading.
+var DefaultPatterns = []string{
+	`^(npx |pnpm (exec |dlx )?|yarn (run )?|bunx |bun x |npm exec )?(vitest|jest|mocha|ava|tsc|prettier|eslint|biome|playwright test|nx (run-many|affected|test))\b`,
+	`^(pnpm|npm|yarn|bun) (run )?(test|tests|test:[\w:-]+|lint|lint:[\w:-]+|typecheck|type-check|tsc|check|format|fmt|build|verify|ci)\b`,
+	`^(npm|pnpm|yarn|bun) t\b`,
+	`^(python3? -m )?pytest\b`,
+	`^(uv run|poetry run|pipenv run) (pytest|ruff|mypy|pyright|black)\b`,
+	`^(ruff|mypy|pyright|black|tox|nox)\b`,
+	`^cargo (test|nextest|clippy|build|check|fmt)\b`,
+	`^go (test|vet|build)\b`,
+	`^(make|just) (test|check|lint|build|ci)\b`,
+	`^(bundle exec )?(rspec|rake test|rails test)\b`,
+	`^(mvn|\./mvnw|gradle|\./gradlew) `,
+}
+
+// DefaultExclude keeps watch modes, dev servers and anything already wrapped
+// local.
+var DefaultExclude = []string{
+	`--watch\b`, `\bwatch\b`, `\bdev\b`, `\bserve\b`, `--ui\b`, `\b(sx|spotexec)\b`,
+}
+
+var (
+	cdSeg  = regexp.MustCompile(`^cd\s+\S+$`)
+	envSeg = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+`)
+)
+
+// Decider decides which commands to offload.
+type Decider struct {
+	include []*regexp.Regexp
+	exclude []*regexp.Regexp
+}
+
+// NewDecider compiles defaults plus user patterns.
+func NewDecider(h config.Hook) (*Decider, error) {
+	d := &Decider{}
+	for _, p := range append(append([]string{}, DefaultPatterns...), h.Patterns...) {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("hook pattern %q: %w", p, err)
+		}
+		d.include = append(d.include, re)
+	}
+	for _, p := range append(append([]string{}, DefaultExclude...), h.Exclude...) {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("hook exclude %q: %w", p, err)
+		}
+		d.exclude = append(d.exclude, re)
+	}
+	return d, nil
+}
+
+// ShouldOffload reports whether a Bash command line should run remotely.
+// Every `&&`/`;`-separated segment must be either a heavy command or a
+// harmless prefix (cd, env assignment); pipes, redirects into files,
+// subshells, background jobs and anything else keep the command local.
+func (d *Decider) ShouldOffload(command string) bool {
+	c := strings.TrimSpace(command)
+	if c == "" || strings.ContainsAny(c, "|<>`$(){}\n&") && !onlyAndAnd(c) {
+		return false
+	}
+	for _, re := range d.exclude {
+		if re.MatchString(c) {
+			return false
+		}
+	}
+	heavy := false
+	for _, seg := range splitSegments(c) {
+		seg = strings.TrimSpace(envSeg.ReplaceAllString(strings.TrimSpace(seg), ""))
+		if seg == "" {
+			continue
+		}
+		if cdSeg.MatchString(seg) {
+			continue
+		}
+		matched := false
+		for _, re := range d.include {
+			if re.MatchString(seg) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+		heavy = true
+	}
+	return heavy
+}
+
+// onlyAndAnd allows '&' only as part of "&&" (and no other metacharacters).
+func onlyAndAnd(c string) bool {
+	if strings.ContainsAny(c, "|<>`$(){}\n") {
+		return false
+	}
+	return !strings.Contains(strings.ReplaceAll(c, "&&", ""), "&")
+}
+
+func splitSegments(c string) []string {
+	c = strings.ReplaceAll(c, "&&", "\x00")
+	c = strings.ReplaceAll(c, ";", "\x00")
+	return strings.Split(c, "\x00")
+}
+
+// Wrap returns the offloaded form of command.
+func Wrap(bin, command string) string {
+	return bin + " run -- " + shellQuote(command)
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// claudeInput is the PreToolUse stdin payload (fields we use).
+type claudeInput struct {
+	ToolName  string         `json:"tool_name"`
+	ToolInput map[string]any `json:"tool_input"`
+	Cwd       string         `json:"cwd"`
+	Extra     map[string]any `json:"-"`
+}
+
+// HandleClaude processes one PreToolUse event. It never fails the tool call:
+// on any problem it prints nothing and exits 0, leaving the command as is.
+func HandleClaude(in io.Reader, out io.Writer, bin string) {
+	var ev claudeInput
+	if err := json.NewDecoder(in).Decode(&ev); err != nil || ev.ToolName != "Bash" {
+		return
+	}
+	cmd, _ := ev.ToolInput["command"].(string)
+	if cmd == "" {
+		return
+	}
+	if bg, _ := ev.ToolInput["run_in_background"].(bool); bg {
+		return // long-lived background jobs stay local
+	}
+	dir := ev.Cwd
+	if dir == "" {
+		dir, _ = os.Getwd()
+	}
+	h, ok := projectHook(dir)
+	if !ok || h.Disabled {
+		return
+	}
+	d, err := NewDecider(h)
+	if err != nil || !d.ShouldOffload(cmd) {
+		return
+	}
+	if h.WhenLoadAbove > 0 {
+		if l, err := LoadPerCPU(); err != nil || l < h.WhenLoadAbove {
+			return
+		}
+	}
+	wrapped := Wrap(bin, cmd)
+	if h.Mode == "block" {
+		writeJSON(out, map[string]any{"hookSpecificOutput": map[string]any{
+			"hookEventName":            "PreToolUse",
+			"permissionDecision":       "deny",
+			"permissionDecisionReason": "This project offloads heavy commands to remote runners. Re-run it as: " + wrapped,
+		}})
+		return
+	}
+	newInput := map[string]any{}
+	for k, v := range ev.ToolInput {
+		newInput[k] = v
+	}
+	newInput["command"] = wrapped
+	writeJSON(out, map[string]any{"hookSpecificOutput": map[string]any{
+		"hookEventName": "PreToolUse",
+		"updatedInput":  newInput,
+	}})
+}
+
+func writeJSON(w io.Writer, v any) {
+	b, _ := json.Marshal(v)
+	w.Write(append(b, '\n'))
+}
+
+// projectHook loads [hook] for the project containing dir. Offloading only
+// happens in projects that opted in with a .spotexec.toml.
+func projectHook(dir string) (config.Hook, bool) {
+	root := dir
+	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
+		root = strings.TrimSpace(string(out))
+	}
+	p := config.FindProject(dir, root)
+	if p == "" {
+		return config.Hook{}, false
+	}
+	proj, err := config.LoadProject(p)
+	if err != nil {
+		return config.Hook{}, false
+	}
+	return proj.Hook, true
+}
+
+// LoadPerCPU returns the 1-minute load average divided by CPU count.
+func LoadPerCPU() (float64, error) {
+	var l float64
+	switch runtime.GOOS {
+	case "linux":
+		b, err := os.ReadFile("/proc/loadavg")
+		if err != nil {
+			return 0, err
+		}
+		l, err = strconv.ParseFloat(strings.Fields(string(b))[0], 64)
+		if err != nil {
+			return 0, err
+		}
+	default:
+		out, err := exec.Command("sysctl", "-n", "vm.loadavg").Output()
+		if err != nil {
+			return 0, err
+		}
+		f := strings.Fields(strings.Trim(strings.TrimSpace(string(out)), "{}"))
+		if len(f) == 0 {
+			return 0, errors.New("unexpected vm.loadavg")
+		}
+		l, err = strconv.ParseFloat(f[0], 64)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return l / float64(runtime.NumCPU()), nil
+}
+
+// InstallClaude adds the PreToolUse hook to a Claude Code settings file,
+// preserving everything else. It is idempotent.
+func InstallClaude(settingsPath, hookCmd string) (bool, error) {
+	settings := map[string]any{}
+	if b, err := os.ReadFile(settingsPath); err == nil && len(strings.TrimSpace(string(b))) > 0 {
+		if err := json.Unmarshal(b, &settings); err != nil {
+			return false, fmt.Errorf("%s is not valid JSON: %w", settingsPath, err)
+		}
+	}
+	hooks, _ := settings["hooks"].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+	}
+	pre, _ := hooks["PreToolUse"].([]any)
+	for _, e := range pre {
+		em, _ := e.(map[string]any)
+		hs, _ := em["hooks"].([]any)
+		for _, h := range hs {
+			hm, _ := h.(map[string]any)
+			if c, _ := hm["command"].(string); strings.Contains(c, "hook claude") && strings.Contains(c, "spotexec") || strings.HasSuffix(c, "sx hook claude") {
+				return false, nil
+			}
+		}
+	}
+	pre = append(pre, map[string]any{
+		"matcher": "Bash",
+		"hooks":   []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}},
+	})
+	hooks["PreToolUse"] = pre
+	settings["hooks"] = hooks
+	b, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		return false, err
+	}
+	return true, os.WriteFile(settingsPath, append(b, '\n'), 0o644)
+}
+
+// UninstallClaude removes spotexec hook entries.
+func UninstallClaude(settingsPath string) (bool, error) {
+	b, err := os.ReadFile(settingsPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	settings := map[string]any{}
+	if err := json.Unmarshal(b, &settings); err != nil {
+		return false, err
+	}
+	hooks, _ := settings["hooks"].(map[string]any)
+	pre, _ := hooks["PreToolUse"].([]any)
+	var kept []any
+	removed := false
+	for _, e := range pre {
+		em, _ := e.(map[string]any)
+		hs, _ := em["hooks"].([]any)
+		var keepHooks []any
+		for _, h := range hs {
+			hm, _ := h.(map[string]any)
+			if c, _ := hm["command"].(string); strings.Contains(c, "hook claude") {
+				removed = true
+				continue
+			}
+			keepHooks = append(keepHooks, h)
+		}
+		if len(keepHooks) > 0 {
+			em["hooks"] = keepHooks
+			kept = append(kept, em)
+		}
+	}
+	if !removed {
+		return false, nil
+	}
+	if len(kept) == 0 {
+		delete(hooks, "PreToolUse")
+	} else {
+		hooks["PreToolUse"] = kept
+	}
+	if len(hooks) == 0 {
+		delete(settings, "hooks")
+	}
+	out, _ := json.MarshalIndent(settings, "", "  ")
+	return true, os.WriteFile(settingsPath, append(out, '\n'), 0o644)
+}
+
+// AgentsSnippet is guidance for harnesses without hooks.
+const AgentsSnippet = `## Running tests, type checks and formatters
+
+This repository offloads heavy commands to remote runners with spotexec.
+Prefix test suites, type checkers, linters, formatters and builds with ` + "`sx`" + `
+(or ` + "`spotexec run --`" + `), for example:
+
+    sx pnpm test
+    sx pnpm tsc --noEmit
+    sx pnpm prettier --write .
+
+Files changed remotely (formatting, snapshot updates, codegen) are written back
+to this worktree automatically. Keep fast, interactive commands local (git,
+ls, rg, editors, dev servers). Named tasks: ` + "`sx tasks`" + `.
+`

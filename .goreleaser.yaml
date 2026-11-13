@@ -1,0 +1,41 @@
+version: 2
+project_name: spotexec
+
+before:
+  hooks:
+    # Cross-compile the remote helper for every runner platform and embed it.
+    - make helpers VERSION={{ .Version }}
+
+builds:
+  - id: spotexec
+    main: ./cmd/spotexec
+    binary: spotexec
+    env: [CGO_ENABLED=0]
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/spotexec/spotexec/internal/cli.Version={{ .Version }}
+      - -X github.com/spotexec/spotexec/internal/helper.Version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+brews:
+  - name: spotexec
+    repository:
+      owner: spotexec
+      name: homebrew-tap
+    homepage: https://github.com/spotexec/spotexec
+    description: Offload tests and builds from local worktrees to remote and AWS Spot runners
+    license: MIT
+    install: |
+      bin.install "spotexec"
+      bin.install_symlink "spotexec" => "sx"
+    test: |
+      system "#{bin}/spotexec", "version"
