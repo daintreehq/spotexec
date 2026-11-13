@@ -16,44 +16,51 @@ import (
 	"github.com/spotexec/spotexec/internal/hooks"
 )
 
-const globalTemplate = `# spotexec global runner config. Docs: spotexec --help
+const globalTemplate = `# spotexec global runner config (personal; never committed). See README.
 version = 1
 
-# Runners are tried in priority order (lowest first). Ephemeral runners boot
-# on demand when every static runner is busy or unreachable.
-default_pool = ["homelab", "aws"]
+# Runners are tried in priority order (lowest first). A fleet grows (up to
+# max_instances) when every slot is busy, and each VM terminates itself
+# after idle_timeout.
+default_pool = ["aws"]
 
 # Never silently fall back to running on this laptop.
 local_fallback = false
 
-[runners.homelab]
-type = "ssh"
-# Tried in parallel; the first address wins if it answers within 500ms.
-hosts = ["me@192.168.1.50", "me@homelab.tailnet.ts.net"]
-max_slots = 4          # concurrent jobs (default: CPUs / 4)
-priority = 10
-# remote_path_setup = 'export PATH="$HOME/.local/share/mise/shims:$PATH"'
-
 [runners.aws]
 type = "aws-spot"
-region = "us-east-1"
-# profile = "default"                     # AWS CLI profile (SSO works)
-instance_types = ["c7a.4xlarge", "c6a.4xlarge", "m7a.4xlarge"]  # tried in order
-# max_price = "0.40"                      # USD/hour cap (default: on-demand price)
-max_slots = 8
+region = "{{REGION}}"
+# profile = "default"          # AWS CLI profile (SSO and aws login work)
+instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]  # 8 vCPUs; tried in order on capacity errors
+max_slots = 4                  # concurrent jobs per VM (SPOTEXEC_CPUS = 2 each)
+max_instances = 4              # fleet ceiling
 priority = 20
-idle_timeout = "10m"   # the VM powers itself off (= terminates) after this much idle time (15m suits long agent pauses)
-max_instances = 4      # fleet ceiling
-max_lifetime = "12h"   # hard cap regardless of activity
-hourly_cost = 0.25     # for 'spotexec monitor' burn estimates
+idle_timeout = "10m"           # the VM terminates itself after this much idle time (15m suits long agent pauses)
+max_lifetime = "12h"           # hard cap regardless of activity
+hourly_cost = 0.12             # for 'spotexec monitor' burn estimates
+# max_price = "0.40"           # USD/hour cap (default: the on-demand price)
+# on_demand_fallback = true
+# cache_bucket = "auto"        # shared dependency cache in S3: auto | <bucket> | off
 bootstrap_script = """
 apt-get update -o DPkg::Lock::Timeout=300
-apt-get install -y -o DPkg::Lock::Timeout=300 git curl unzip build-essential
+apt-get install -y -o DPkg::Lock::Timeout=300 git curl unzip build-essential zstd docker.io docker-buildx
+usermod -aG docker ubuntu
 """
-user_bootstrap_script = """
-curl -fsSL https://mise.run | sh
-"""
-remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"'
+# user_bootstrap_script = """
+# curl -fsSL https://mise.run | sh
+# """
+# remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"'
+#
+# Then run "spotexec image bake aws" once: new VMs boot from the baked image
+# and skip this bootstrap (much faster cold starts).
+
+# A machine you already have (LAN / Tailscale), tried before the cloud:
+# [runners.homelab]
+# type = "ssh"
+# hosts = ["me@192.168.1.50", "me@homelab.tailnet.ts.net"]  # dialed in parallel; the first wins within 500ms
+# max_slots = 4
+# priority = 10
+# (then: default_pool = ["homelab", "aws"])
 `
 
 func cmdInit() *cobra.Command {
@@ -70,10 +77,11 @@ func cmdInit() *cobra.Command {
 				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 					return err
 				}
-				if err := os.WriteFile(p, []byte(globalTemplate), 0o644); err != nil {
+				region := detectRegion()
+				if err := os.WriteFile(p, []byte(strings.ReplaceAll(globalTemplate, "{{REGION}}", region)), 0o644); err != nil {
 					return err
 				}
-				fmt.Printf("wrote %s; edit the runners, then run `spotexec doctor`\n", p)
+				fmt.Printf("wrote %s (region %s)\nnext: `spotexec doctor`, then `spotexec init` in a repo, then `sx <command>`\n", p, region)
 				return nil
 			}
 			wd, _ := os.Getwd()
@@ -346,4 +354,20 @@ func transportQuote(s string) string {
 		return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 	}
 	return s
+}
+
+// detectRegion picks the AWS region for a new config: AWS_REGION,
+// AWS_DEFAULT_REGION, the AWS CLI's configured region, or us-east-1.
+func detectRegion() string {
+	for _, k := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	if out, err := exec.Command("aws", "configure", "get", "region").Output(); err == nil {
+		if r := strings.TrimSpace(string(out)); r != "" {
+			return r
+		}
+	}
+	return "us-east-1"
 }
