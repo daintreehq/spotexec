@@ -75,10 +75,16 @@ func (r *awsCredResolver) resolve(ctx context.Context) (awsCreds, error) {
 		}
 		return awsCreds{}, fmt.Errorf("AWS credentials for profile %q: %v. Fix: run `aws sso login%s` (or `aws configure`), or set `profile = \"...\"` on the runner", r.profileName(), err, profileFlag(r.profileName()))
 	}
-	// 3. No aws CLI: static keys in the shared credentials file.
+	// 3. No aws CLI: static keys in the shared credentials file, then
+	// credential_process / SSO profiles from ~/.aws/config.
 	c, err := readSharedCredentials(r.profileName())
 	if err == nil {
 		return c, nil
+	}
+	if cc, cerr := configCredentials(ctx, r.profileName()); cerr == nil {
+		return cc, nil
+	} else if !strings.Contains(cerr.Error(), "no [") && !os.IsNotExist(cerr) {
+		return awsCreds{}, cerr
 	}
 	msg := fmt.Sprintf("no AWS credentials for profile %q: %v", r.profileName(), err)
 	return awsCreds{}, errors.New(msg + ". Fix: export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, run `aws sso login" +

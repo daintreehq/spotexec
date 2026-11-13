@@ -182,6 +182,7 @@ type Image struct {
 // ImageResult reports the local image reference to run.
 type ImageResult struct {
 	Image           string `json:"image"`
+	ImageID         string `json:"image_id,omitempty"` // immutable identity (keys dependency caches)
 	Pulled          bool   `json:"pulled"`
 	Built           bool   `json:"built"`
 	Pushing         bool   `json:"pushing"`
@@ -202,6 +203,7 @@ type Deps struct {
 	// simulator) for this dependency key, computed by the client. The helper
 	// only uses them if its own key matches CacheKey.
 	Container *ContainerRun `json:"container,omitempty"`
+	ImageID   string        `json:"image_id,omitempty"` // container image identity for the cache key
 	CacheKey  string        `json:"cache_key,omitempty"`
 	Toolchain string        `json:"toolchain,omitempty"` // part of the key (see depskey.Toolchain)
 	CacheGet  string        `json:"cache_get,omitempty"`

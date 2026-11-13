@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +47,7 @@ type Session struct {
 	exiting     atomic.Bool
 	child       atomic.Int64 // running command's process group, if any
 	gate        *flock
+	containers  sync.Map    // running container name -> dockerRunner
 	interrupted atomic.Bool // a spot interruption notice arrived
 	watching    bool
 }
@@ -168,6 +170,7 @@ func (s *Session) lastResort() {
 			if s.workspace != "" {
 				reapWorkspace(s.workspace, 2*time.Second)
 			}
+			s.removeContainers(false)
 			os.Exit(4)
 		}
 	}

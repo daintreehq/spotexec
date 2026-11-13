@@ -21,8 +21,8 @@ import (
 // depsKey hashes lockfile contents + install command + platform (the same
 // function the client uses to sign cache URLs).
 func depsKey(ws string, d protocol.Deps) (string, error) {
-	image := ""
-	if d.Container != nil {
+	image := d.ImageID
+	if image == "" && d.Container != nil {
 		image = d.Container.Image
 	}
 	return depskey.Key(ws, depskey.Spec{Lockfiles: d.Lockfiles, Install: d.Install, CacheDirs: d.CacheDirs, Image: image, Toolchain: d.Toolchain, OS: runtime.GOOS, Arch: runtime.GOARCH})
@@ -188,15 +188,18 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		env[k] = v
 	}
 	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: d.Install})
+	cleanup := func() error { return nil }
 	if d.Container != nil {
-		host, _, cleanup, err := s.containerScript(d.Container, d.Install, s.workspace, env)
+		host, hostEnv, c, err := s.containerScript(d.Container, d.Install, s.workspace, env)
 		if err != nil {
 			return perr(protocol.CodeDepsFailed, "%v", err)
 		}
-		defer cleanup()
-		script, env = host, nil
+		script, env, cleanup = host, hostEnv, c
 	}
 	pr := s.runProc(script, s.workspace, env, time.Duration(d.TimeoutMS)*time.Millisecond, 5*time.Second, false)
+	if err := cleanup(); err != nil {
+		return perr(protocol.CodeDepsFailed, "%v", err)
+	}
 	if pr.startErr != nil || pr.code != 0 {
 		msg := fmt.Sprintf("install command exited %d", pr.code)
 		if pr.startErr != nil {

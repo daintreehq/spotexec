@@ -3,6 +3,7 @@ package helper
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -200,6 +201,12 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 		if groupAlive(prev.ChildPGID) && groupInDir(prev.ChildPGID, s.workspace) {
 			killGroup(prev.ChildPGID, 2*time.Second)
 		}
+	}
+	// Containers a previous (dead) helper left in this slot must not keep
+	// writing into the workspace.
+	if _, err := exec.LookPath("docker"); err == nil {
+		s.repoID = a.RepoID
+		s.removeContainers(true)
 	}
 	holder.Token = s.tokenIdxAt(0)
 	s.writeHolder(holder)

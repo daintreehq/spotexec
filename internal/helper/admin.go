@@ -2,6 +2,7 @@ package helper
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -212,6 +213,15 @@ func Prune(w io.Writer, root string, maxAge time.Duration, dryRun bool) error {
 			}
 			lk.Unlock()
 			freed++
+		}
+	}
+	if d, err := probeDocker(context.Background()); err == nil && !dryRun {
+		hours := strconv.Itoa(int(maxAge.Hours()))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		out, _ := runShell(ctx, d.cmd("image prune -af --filter until="+hours+"h")+" ; "+d.cmd("builder prune -f --filter until="+hours+"h"))
+		cancel()
+		if t := strings.TrimSpace(string(out)); t != "" {
+			fmt.Fprintf(w, "docker: %s\n", firstLines(t, 2))
 		}
 	}
 	fmt.Fprintf(w, "%d item(s) %s\n", freed, map[bool]string{true: "would be removed", false: "removed"}[dryRun])

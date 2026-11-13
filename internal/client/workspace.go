@@ -99,6 +99,7 @@ func normalizeRemote(u string) string {
 type LastRun struct {
 	Runner     string          `json:"runner"`
 	InstanceID string          `json:"instance_id,omitempty"`
+	Image      string          `json:"image,omitempty"` // last container image prepared for this worktree
 	Slot       int             `json:"slot"`
 	Target     provider.Target `json:"target"`
 	WorkRoot   string          `json:"work_root"`

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -235,7 +236,11 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}
 	remoteWS := lease.Acq.Workspace
-	saveLastRun(ws, LastRun{Runner: r.Name, InstanceID: lease.InstanceID, Slot: lease.Acq.Slot, Target: lease.Target, WorkRoot: r.WorkRoot, RemoteWS: remoteWS})
+	prevImage := ""
+	if prev, err := LoadLastRun(ws); err == nil {
+		prevImage = prev.Image // keep the last prepared image for `sx exec`
+	}
+	saveLastRun(ws, LastRun{Image: prevImage, Runner: r.Name, InstanceID: lease.InstanceID, Slot: lease.Acq.Slot, Target: lease.Target, WorkRoot: r.WorkRoot, RemoteWS: remoteWS})
 	label := fmt.Sprintf("%s#%d", r.Name, lease.Acq.Token)
 
 	// 3. Forward sync.
@@ -257,17 +262,23 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	// 4. Project container image.
 	var crun *protocol.ContainerRun
+	imageID := ""
 	if p.Container.Enabled() {
-		ref, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
+		ref, id, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
 		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
 		}
 		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root"}
+		imageID = id
+		if lr, err := LoadLastRun(ws); err == nil {
+			lr.Image = ref
+			saveLastRun(ws, *lr)
+		}
 	}
 
 	// 5. Dependencies.
 	if p.Deps.Install != "" && !o.NoDeps && o.Sync != "none" {
-		if err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun); err != nil {
+		if err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun, imageID); err != nil {
 			return res, infra(err), lostRunner(lease, err)
 		}
 	}
@@ -537,7 +548,7 @@ func addLocalTar(tw *tar.Writer, full, name string) error {
 	return err
 }
 
-func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun) error {
+func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string) error {
 	lockfiles := p.Deps.Lockfiles
 	if len(lockfiles) == 0 {
 		return errors.New("deps.install is set but deps.lockfiles is empty")
@@ -556,11 +567,12 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	req := protocol.Deps{
 		Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Hydrate: p.Deps.Hydrate,
 		Setup: r.RemotePathSetup, Env: env, TimeoutMS: p.Deps.Timeout.Milliseconds(),
-		Toolchain: depskey.Toolchain(r.Type, r.AMI, r.Arch, r.Image, r.BootstrapScript, r.UserBootstrap, r.RemotePathSetup),
+		Toolchain: toolchainFor(r, crun),
 		Container: crun,
+		ImageID:   imageID,
 	}
-	image := ""
-	if crun != nil {
+	image := imageID
+	if image == "" && crun != nil {
 		image = crun.Image
 	}
 	// Shared cache: sign URLs for the key the runner will compute. Any
@@ -743,9 +755,11 @@ func markLost(cfg *config.Config, runner, id string) {
 	}
 }
 
-// imageTag hashes the Dockerfile and every synced file in its build context,
-// so a built image is reused until either changes.
-func imageTag(m *manifest.Manifest, dockerfile, buildCtx string) (string, error) {
+// imageTag hashes the runner platform, the Dockerfile, a companion
+// <Dockerfile>.dockerignore, and every synced file in the build context
+// (with any corrections from the upload), so a built image is reused until
+// one of them changes, and never across CPU architectures.
+func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string) (string, error) {
 	if m == nil {
 		return "", errors.New("container.dockerfile needs a synced workspace (not --sync none)")
 	}
@@ -757,12 +771,24 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx string) (string, error)
 		buildCtx = path.Dir(dockerfile)
 	}
 	buildCtx = strings.Trim(path.Clean(buildCtx), "/")
+	if buildCtx == "." {
+		buildCtx = ""
+	}
 	h := sha256.New()
-	fmt.Fprintf(h, "dockerfile\x00%s\x00%s\x00ctx\x00%s\x00", dockerfile, df.ID, buildCtx)
-	for _, e := range m.Entries { // sorted
-		if buildCtx == "." || buildCtx == "" || e.Path == buildCtx || strings.HasPrefix(e.Path, buildCtx+"/") {
-			fmt.Fprintf(h, "%s\x00%o\x00%s\n", e.Path, e.Mode, e.ID)
+	fmt.Fprintf(h, "platform\x00%s\x00dockerfile\x00%s\x00%s\x00ctx\x00%s\x00", platform, dockerfile, df.ID, buildCtx)
+	if ign, ok := m.ByPath[dockerfile+".dockerignore"]; ok {
+		fmt.Fprintf(h, "dockerignore\x00%s\x00", ign.ID)
+	}
+	paths := make([]string, 0, len(m.ByPath))
+	for p := range m.ByPath {
+		if buildCtx == "" || p == buildCtx || strings.HasPrefix(p, buildCtx+"/") {
+			paths = append(paths, p)
 		}
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		e := m.ByPath[p]
+		fmt.Fprintf(h, "%s\x00%o\x00%s\n", e.Path, e.Mode, e.ID)
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
@@ -770,15 +796,22 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx string) (string, error)
 // prepareImage makes the project's container image available on the runner
 // (pull, or build once per content hash, shared through the provider's
 // registry when it has one) and returns the local reference to run.
-func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, o Options, label string, ws *Workspace, lease *Lease, m *manifest.Manifest) (string, error) {
+func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, o Options, label string, ws *Workspace, lease *Lease, m *manifest.Manifest) (string, string, error) {
 	c := p.Container
 	req := protocol.Image{TimeoutMS: c.Timeout.Milliseconds()}
 	if c.Image != "" {
 		req.Ref = c.Image
+	} else if m == nil {
+		// exec (no sync): reuse the image this worktree last built here.
+		lr, err := LoadLastRun(ws)
+		if err != nil || lr.Image == "" {
+			return "", "", errors.New("no previously built container image for this worktree; use `spotexec run` first")
+		}
+		req.Ref = lr.Image
 	} else {
-		tag, err := imageTag(m, c.Dockerfile, c.Context)
+		tag, err := imageTag(m, c.Dockerfile, c.Context, s.Hello.OS+"/"+s.Hello.Arch)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		req.Dockerfile, req.Context, req.Tag = c.Dockerfile, c.Context, tag
 		if reg, ok := lease.Provider.(provider.ImageRegistry); ok {
@@ -795,13 +828,13 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 	o.Rep.Status("%s · preparing container image", label)
 	t := time.Now()
 	if err := s.Conn.Send(protocol.TypeImage, req); err != nil {
-		return "", err
+		return "", "", err
 	}
 	errW := &ui.ClearingWriter{W: o.Stderr, R: o.Rep}
 	for {
 		f, err := s.Next(ctx)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		switch f.Kind {
 		case protocol.KindStdout, protocol.KindStderr:
@@ -810,7 +843,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 		}
 		env, err := protocol.Decode(f)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		switch env.Type {
 		case protocol.TypeStarted:
@@ -824,15 +857,26 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 		case protocol.TypeError:
 			var em protocol.ErrorMsg
 			_ = env.Unmarshal(&em)
-			return "", fmt.Errorf("container image: %s", em.Message)
+			return "", "", fmt.Errorf("container image: %s", em.Message)
 		case protocol.TypeImageResult:
 			var r protocol.ImageResult
 			_ = env.Unmarshal(&r)
-			o.Rep.Event("image", map[string]any{"image": r.Image, "pulled": r.Pulled, "built": r.Built, "pushing": r.Pushing,
+			o.Rep.Event("image", map[string]any{"image": r.Image, "image_id": r.ImageID, "pulled": r.Pulled, "built": r.Built, "pushing": r.Pushing,
 				"installed_docker": r.InstalledDocker, "duration_ms": time.Since(t).Milliseconds()})
-			return r.Image, nil
+			return r.Image, r.ImageID, nil
 		default:
-			return "", fmt.Errorf("protocol: unexpected %q while preparing the image", env.Type)
+			return "", "", fmt.Errorf("protocol: unexpected %q while preparing the image", env.Type)
 		}
 	}
+}
+
+// toolchainFor fingerprints what the dependency install depends on besides
+// the lockfile. Inside a container that is the image (already in the key by
+// its immutable ID), so caches are shared across fleets with different host
+// setups; on the host it is the runner's AMI, bootstrap and PATH setup.
+func toolchainFor(r *config.Runner, crun *protocol.ContainerRun) string {
+	if crun != nil {
+		return "container"
+	}
+	return depskey.Toolchain(r.Type, r.AMI, r.Arch, r.Image, r.BootstrapScript, r.UserBootstrap, r.RemotePathSetup)
 }

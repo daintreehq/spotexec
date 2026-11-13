@@ -241,16 +241,21 @@ func (s *Session) exec(e protocol.Exec) error {
 		grace = 5 * time.Second
 	}
 	runEnv := env
+	cleanup := func() error { return nil }
 	if e.Container != nil {
 		// Inside the project container: runner PATH setup doesn't apply.
-		host, _, cleanup, err := s.containerScript(e.Container, e.Shell, dir, env)
+		host, hostEnv, c, err := s.containerScript(e.Container, e.Shell, dir, env)
 		if err != nil {
 			return perr(protocol.CodeImageFailed, "%v", err)
 		}
-		defer cleanup()
-		script, runEnv = host, nil
+		script, runEnv, cleanup = host, hostEnv, c
 	}
 	pr := s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch)
+	// The container must be gone before we snapshot the workspace: a
+	// container we can't remove could still be writing into it.
+	if err := cleanup(); err != nil {
+		return perr(protocol.CodeImageFailed, "%v; refusing to collect results from a workspace it may still be modifying", err)
+	}
 	res := protocol.Result{
 		ExitCode: pr.code, Signal: pr.signal, TimedOut: pr.timedOut, Canceled: pr.canceled,
 		Interrupted: pr.spotIntr || s.interrupted.Load(), DurationMS: time.Since(start).Milliseconds(),

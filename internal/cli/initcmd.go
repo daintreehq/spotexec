@@ -42,7 +42,8 @@ instance_types = ["c7a.4xlarge", "c6a.4xlarge", "m7a.4xlarge"]  # tried in order
 # max_price = "0.40"                      # USD/hour cap (default: on-demand price)
 max_slots = 8
 priority = 20
-idle_timeout = "20m"   # the VM powers itself off (= terminates) after this much idle time
+idle_timeout = "10m"   # the VM powers itself off (= terminates) after this much idle time (15m suits long agent pauses)
+max_instances = 4      # fleet ceiling
 max_lifetime = "12h"   # hard cap regardless of activity
 hourly_cost = 0.25     # for 'spotexec monitor' burn estimates
 bootstrap_script = """

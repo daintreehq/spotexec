@@ -98,11 +98,13 @@ profile = "dev"                       # optional; SSO / assume-role work via the
 instance_types = ["c7a.4xlarge", "c6a.4xlarge", "m7a.4xlarge"]  # tried in order on capacity errors
 # max_price = "0.40"                  # default: capped at the on-demand price
 # on_demand_fallback = true
-max_slots = 8
+max_slots = 8                         # concurrent jobs per instance
+max_instances = 4                     # fleet ceiling (default 4)
 priority = 20
-idle_timeout = "20m"
+idle_timeout = "10m"                  # default 10m; 15m suits long agent think-gaps
 max_lifetime = "12h"
 volume_gb = 64
+# cache_bucket = "auto"               # shared dependency cache: auto | <bucket name> | off
 hourly_cost = 0.25                    # for `spotexec monitor`
 # ssh_cidr = "203.0.113.4/32"         # default 0.0.0.0/0 (key-only auth); narrow it if your IP is stable
 # subnet_id = "subnet-…"; security_group_ids = ["sg-…"]; ami = "ami-…"; arch = "arm64"
@@ -134,8 +136,14 @@ install = "pnpm install --frozen-lockfile"
 cache_dirs = ["node_modules", "packages/*/node_modules"]
 hydrate = "auto"               # reflink, falling back to copy; "hardlink" is opt-in (shares inodes)
 
+[container]                    # optional: run everything in this image on the runner
+image = "node:22-bookworm-slim" # pulled; or: dockerfile = ".spotexec/Dockerfile"
+# options = ["--shm-size=1g"]   # extra `docker run` arguments
+# user = "runner"               # default; "root" runs as root (files then belong to root)
+
 [tasks.test]
-run = "pnpm vitest run {args}"
+run = "pnpm vitest run --maxWorkers=$SPOTEXEC_CPUS {args}"
+# pool = ["aws-big"]           # per-task fleet; priority = 10 queues it ahead
 [tasks.fmt]
 run = "pnpm prettier --write ."
 [tasks.verify]
@@ -144,8 +152,86 @@ fail_fast = false
 ```
 
 Precedence: CLI flags, then `SPOTEXEC_*` env (`SPOTEXEC_TIMEOUT`, `SPOTEXEC_SYNC`,
-`SPOTEXEC_RUNNER`, `SPOTEXEC_POOL`, `SPOTEXEC_JSON`, `SPOTEXEC_AGENT`), then
-`.spotexec.toml`, then the global config, then defaults.
+`SPOTEXEC_RUNNER`, `SPOTEXEC_POOL`, `SPOTEXEC_PRIORITY`, `SPOTEXEC_JSON`,
+`SPOTEXEC_AGENT`), then `.spotexec.toml`, then the global config, then defaults.
+
+### Project-defined fleets
+
+A project can declare its own runners in `.spotexec.toml`. `extends` starts
+from one of your personal runners, so the account, region and credentials
+stay yours and the project only changes what it cares about:
+
+```toml
+pool = ["ci-big"]
+
+[runners.ci-big]
+extends = "aws"                # your runner from ~/.config/spotexec/config.toml
+instance_types = ["c7a.2xlarge", "m7a.2xlarge"]
+max_slots = 2                  # 4 vCPUs per job
+max_instances = 3
+```
+
+### Scaling, queueing and CPUs
+
+Every `sx` process schedules for itself; there is no daemon:
+- **Placement:** a job goes to a free slot on the oldest instance that has
+  one, so newer instances drain and idle out first.
+- **Scaling out:** when every slot is busy, the job takes a ticket in a fair
+  local queue (priority, then arrival) and the fleet launches more instances,
+  up to `max_instances`, while waiting demand exceeds the capacity already
+  starting.
+- **Overflow:** lower-priority fleets only launch for demand the
+  higher-priority ones can't cover.
+- **Visibility:** waiting jobs report their position (`queue_position`
+  events, and `queued #3 of 9` in the spinner).
+- **Priority:** use `--priority N` (or `priority` on a task) to jump the
+  queue.
+
+Each job gets `SPOTEXEC_CPUS`, its fair share of the instance (vCPUs ÷
+`max_slots`, or every vCPU with `--exclusive`), so test runners can size
+their worker pools, for example `--maxWorkers=$SPOTEXEC_CPUS`.
+
+### Shared dependency cache
+
+When `[deps]` is configured on an `aws-spot` runner:
+- The first VM to install a given dependency set uploads it as one
+  compressed archive to a private S3 bucket in your account. The bucket is
+  named `spotexec-cache-<account>-<region>`, is created on first use with
+  public access blocked, and expires objects after 14 days.
+- The archive's key covers the lockfiles, the install command, the
+  cache dirs, the container image and the runner toolchain, so native
+  modules never cross Node or OS versions.
+- Any later VM downloads and unpacks the archive instead of installing:
+  `node_modules` restores in under a second.
+- The VMs never hold AWS credentials. The CLI hands them presigned URLs that
+  can only target a bucket your account owns.
+
+### Project containers
+
+`[container]` runs every command, and the dependency install, inside a
+Docker image on the runner:
+- The workspace is mounted at the same path, so write-back, path rewriting
+  and snapshots work unchanged.
+- Commands run as the runner user, so files stay correctly owned, with host
+  networking, so `SPOTEXEC_PORT_BASE` still works.
+- With `image =`, the image is pulled. With `dockerfile =`, it is built on
+  the runner and tagged by the content of the Dockerfile and its build
+  context.
+- For `dockerfile =` on AWS, the built image is pushed to a private ECR
+  repository (`spotexec/<repo-id>`, keeping the newest 10), so every other VM
+  pulls it instead of rebuilding.
+- Docker (with buildx) is installed on the runner automatically if missing,
+  and the runner user is added to the `docker` group. To skip that step on
+  each new VM, put `apt-get install -y docker.io docker-buildx && usermod -aG
+  docker ubuntu` in `bootstrap_script`.
+- Docker always runs as the runner user, never through sudo, so Ctrl-C and
+  timeouts can always stop a container. Containers are removed before
+  write-back snapshots and when a slot is reused.
+- The dependency cache is keyed by the image's immutable ID, so a moving tag
+  like `node:22` never restores modules built against an older image.
+- **Trust:** `.spotexec.toml` is trusted code. `container.options` (for
+  example `--privileged -v /:/host`) give a project root on the runner, which
+  matters for shared `ssh` runners. Ephemeral VMs belong to you alone.
 
 ## AWS setup
 
@@ -157,7 +243,12 @@ Credentials resolve in this order:
    expired SSO session is reported, never silently replaced by other keys.
 3. `~/.aws/credentials`, only when the AWS CLI is not installed
 
-There is no AWS SDK in the binary. Minimum IAM permissions:
+The AWS CLI is optional: requests are signed by spotexec itself (there is no
+AWS SDK in the binary). Install the AWS CLI if you use SSO, `aws login` or
+assume-role profiles. Plain access keys work without it.
+
+Minimum IAM permissions (the S3 and ECR statements are only needed for the
+dependency cache and Dockerfile-built containers):
 
 ```json
 {
@@ -171,7 +262,18 @@ There is no AWS SDK in the binary. Minimum IAM permissions:
     { "Effect": "Allow", "Action": "ssm:GetParameter",
       "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/*" },
     { "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
-      "Condition": { "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } } }
+      "Condition": { "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } } },
+    { "Effect": "Allow", "Action": [
+        "s3:CreateBucket", "s3:PutLifecycleConfiguration", "s3:ListBucket",
+        "s3:GetObject", "s3:PutObject"
+      ], "Resource": ["arn:aws:s3:::spotexec-cache-*", "arn:aws:s3:::spotexec-cache-*/*"] },
+    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
+    { "Effect": "Allow", "Action": [
+        "ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy",
+        "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"
+      ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" },
+    { "Effect": "Allow", "Action": "servicequotas:GetServiceQuota", "Resource": "*" }
   ]
 }
 ```

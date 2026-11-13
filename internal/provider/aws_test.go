@@ -2,9 +2,11 @@ package provider
 
 import (
 	"bufio"
+	"context"
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -201,5 +203,29 @@ func TestPresignS3DocsVector(t *testing.T) {
 	want := "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
 	if !strings.Contains(u, "X-Amz-Signature="+want) {
 		t.Fatalf("signature mismatch:\n%s", u)
+	}
+}
+
+func TestConfigCredentialProcess(t *testing.T) {
+	dir := t.TempDir()
+	cfg := dir + "/config"
+	os.WriteFile(cfg, []byte(`[profile proc]
+credential_process = printf '{"Version":1,"AccessKeyId":"AKIDPROC","SecretAccessKey":"sek","SessionToken":"tok","Expiration":"2099-01-01T00:00:00Z"}'
+[profile ssoonly]
+sso_session = corp
+sso_account_id = 123456789012
+sso_role_name = Dev
+[sso-session corp]
+sso_region = us-east-1
+sso_start_url = https://example.awsapps.com/start
+`), 0o644)
+	t.Setenv("AWS_CONFIG_FILE", cfg)
+	t.Setenv("HOME", dir)
+	c, err := configCredentials(context.Background(), "proc")
+	if err != nil || c.AccessKeyID != "AKIDPROC" || c.SessionToken != "tok" || c.Expiration.Year() != 2099 {
+		t.Fatalf("credential_process: %+v %v", c, err)
+	}
+	if _, err := configCredentials(context.Background(), "ssoonly"); err == nil || !strings.Contains(err.Error(), "aws sso login") {
+		t.Fatalf("expected an `aws sso login` hint without a cached token, got %v", err)
 	}
 }

@@ -23,8 +23,8 @@ type ImageRegistry interface {
 // use. The token goes to the runner for one pull/push and is never stored
 // in its default docker config.
 func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.RegistryAuth, error) {
-	name := "spotexec/" + strings.ToLower(repoID)
-	marker := filepath.Join(a.dir, "ecr-"+strings.ReplaceAll(name, "/", "_"))
+	name := "spotexec/" + ecrName(repoID)
+	marker := filepath.Join(a.dir, "ecr-"+a.r.Region+"-"+a.r.Profile+"-"+strings.ReplaceAll(name, "/", "_"))
 	uri := ""
 	if b, err := os.ReadFile(marker); err == nil {
 		uri = strings.TrimSpace(string(b))
@@ -53,7 +53,9 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 			}
 			uri = created.Repository.URI
 			policy := `{"rules":[{"rulePriority":1,"description":"keep the newest 10 spotexec images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}`
-			_ = a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": policy}, nil)
+			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": policy}, nil); err != nil {
+				return nil, fmt.Errorf("ECR lifecycle policy for %s: %w", name, err)
+			}
 			if uri == "" {
 				return a.RegistryFor(ctx, repoID) // created concurrently: describe again
 			}
@@ -84,6 +86,10 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 		return nil, fmt.Errorf("ECR login: malformed token")
 	}
 	server := strings.TrimPrefix(tok.Data[0].Endpoint, "https://")
+	if !strings.HasPrefix(uri, server+"/") {
+		_ = os.Remove(marker) // stale record (other account/region): re-describe next time
+		return nil, fmt.Errorf("ECR repository %s is not in registry %s", uri, server)
+	}
 	return &protocol.RegistryAuth{Server: server, Repo: uri, User: user, Password: pass}, nil
 }
 
@@ -107,4 +113,20 @@ func (a *AWSSpot) ecr(ctx context.Context, action string, in any, out any) error
 		return json.Unmarshal(b, out)
 	}
 	return nil
+}
+
+// ecrName makes a repo id a valid ECR repository component.
+func ecrName(repoID string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(repoID) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+			dash = false
+		} else if !dash && b.Len() > 0 {
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
