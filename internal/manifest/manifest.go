@@ -94,8 +94,12 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 			return nil, err
 		}
 		trustIndex := !hasWorktreeFilters(o.Root, staged)
-		if v, _ := git(ctx, o.Root, "config", "--get", "core.autocrlf"); strings.TrimSpace(string(v)) == "true" {
-			trustIndex = false // checkout rewrites line endings
+		// With autocrlf (true or input) git reports a CRLF worktree file as
+		// clean while its index ID describes the LF-normalised blob, so the
+		// ID would not match the bytes we sync: hash the worktree instead.
+		switch v, _ := git(ctx, o.Root, "config", "--get", "core.autocrlf"); strings.ToLower(strings.TrimSpace(string(v))) {
+		case "true", "input":
+			trustIndex = false
 		}
 		// assume-unchanged / skip-worktree entries are invisible to git
 		// status even when edited: never trust their index IDs.
