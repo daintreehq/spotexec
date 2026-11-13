@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/spotexec/spotexec/internal/dockerignore"
+	"github.com/spotexec/spotexec/internal/fsid"
 	"io"
 	"io/fs"
 	"os"
@@ -784,14 +785,28 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read 
 	// The same rules file the helper stages with (see stageContext).
 	var rules []byte
 	for _, cand := range dockerignore.Source(dockerfile, buildCtx) {
-		if _, ok := m.ByPath[cand]; ok && read != nil {
-			b, err := read(cand)
-			if err != nil {
-				return "", fmt.Errorf("reading %s: %w", cand, err)
-			}
-			rules = b
-			break
+		e, ok := m.ByPath[cand]
+		if !ok {
+			continue
 		}
+		if e.Mode == fsid.ModeSymlink {
+			// It could resolve differently on the runner than here.
+			return "", fmt.Errorf("%s is a symlink; make it a regular file", cand)
+		}
+		if read == nil {
+			return "", fmt.Errorf("cannot read %s", cand)
+		}
+		b, err := read(cand)
+		if err != nil {
+			return "", fmt.Errorf("reading %s: %w", cand, err)
+		}
+		// The rules must be exactly what was synced (the helper stages with
+		// that copy), or the tag would not describe the built image.
+		if fsid.Bytes(b) != e.ID {
+			return "", fmt.Errorf("%s changed after it was synced; run again", cand)
+		}
+		rules = b
+		break
 	}
 	ign, err := dockerignore.New(rules)
 	if err != nil {

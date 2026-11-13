@@ -25,3 +25,15 @@ func TestExcluded(t *testing.T) {
 		t.Error("empty rules excluded a path")
 	}
 }
+
+// BuildKit walks directories carrying parent results: a repeated pattern for
+// an already-excluded parent doesn't re-exclude a re-included child.
+func TestWalkSemantics(t *testing.T) {
+	m, _ := New([]byte("foo\n!foo/bar\nfoo\n"))
+	if m.Excluded("foo/bar") {
+		t.Error("foo/bar should be kept, as in a BuildKit walk")
+	}
+	if !m.Excluded("foo/baz") {
+		t.Error("foo/baz should be excluded")
+	}
+}

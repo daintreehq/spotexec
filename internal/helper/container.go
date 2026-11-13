@@ -323,8 +323,17 @@ func (s *Session) stageContext(m protocol.Image) (string, string, func(), error)
 	var rules []byte
 	for _, cand := range dockerignore.Source(m.Dockerfile, ctxRel) {
 		if _, ok := s.stored[cand]; ok {
-			if p, err := fsid.SafeJoin(s.workspace, cand); err == nil {
-				rules, _ = os.ReadFile(p)
+			p, err := fsid.SafeJoin(s.workspace, cand)
+			if err == nil {
+				if fi, lerr := os.Lstat(p); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+					err = fmt.Errorf("%s is a symlink", cand)
+				} else {
+					rules, err = os.ReadFile(p)
+				}
+			}
+			if err != nil {
+				cleanup()
+				return "", "", nil, fmt.Errorf("reading %s: %w", cand, err)
 			}
 			break
 		}

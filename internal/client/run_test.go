@@ -3,6 +3,8 @@ package client
 import (
 	"testing"
 
+	"github.com/spotexec/spotexec/internal/fsid"
+
 	"github.com/spotexec/spotexec/internal/manifest"
 	"github.com/spotexec/spotexec/internal/protocol"
 )
@@ -60,6 +62,7 @@ func TestImageTagHonoursDockerignore(t *testing.T) {
 	}
 	rules := map[string][]byte{".dockerignore": []byte("*\n!package.json\n!Dockerfile\n")}
 	read := func(rel string) ([]byte, error) { return rules[rel], nil }
+	base[1].ID = fsid.Bytes(rules[".dockerignore"])
 	t1, err := imageTag(mf(base...), "Dockerfile", ".", "linux/amd64", read)
 	if err != nil {
 		t.Fatal(err)
@@ -75,12 +78,28 @@ func TestImageTagHonoursDockerignore(t *testing.T) {
 		t.Fatal("a kept file did not change the tag")
 	}
 	// A Dockerfile-specific ignore file wins over the context's.
-	base = append(base, protocol.Entry{Path: "Dockerfile.dockerignore", ID: "dig", Mode: 0o100644})
 	rules["Dockerfile.dockerignore"] = []byte("src\n")
+	base = append(base, protocol.Entry{Path: "Dockerfile.dockerignore", ID: fsid.Bytes(rules["Dockerfile.dockerignore"]), Mode: 0o100644})
 	t3, _ := imageTag(mf(base...), "Dockerfile", ".", "linux/amd64", read)
 	changed = append([]protocol.Entry{}, base...)
 	changed[3].ID = "a2"
 	if t4, _ := imageTag(mf(changed...), "Dockerfile", ".", "linux/amd64", read); t4 != t3 {
 		t.Fatal("Dockerfile.dockerignore not preferred")
+	}
+}
+
+func TestImageTagRejectsUnsyncedOrSymlinkedRules(t *testing.T) {
+	ents := []protocol.Entry{
+		{Path: "Dockerfile", ID: "df1", Mode: 0o100644},
+		{Path: ".dockerignore", ID: fsid.Bytes([]byte("src\n")), Mode: 0o100644},
+	}
+	edited := func(string) ([]byte, error) { return []byte("src\npayload\n"), nil }
+	if _, err := imageTag(mf(ents...), "Dockerfile", ".", "linux/amd64", edited); err == nil {
+		t.Fatal("rules edited after sync were accepted")
+	}
+	ents[1].Mode = fsid.ModeSymlink
+	same := func(string) ([]byte, error) { return []byte("src\n"), nil }
+	if _, err := imageTag(mf(ents...), "Dockerfile", ".", "linux/amd64", same); err == nil {
+		t.Fatal("symlinked rules were accepted")
 	}
 }

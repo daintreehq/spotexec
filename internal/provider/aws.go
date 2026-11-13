@@ -1,7 +1,6 @@
 package provider
 
 import (
-	"os/exec"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"

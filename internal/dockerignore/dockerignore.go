@@ -6,6 +6,8 @@ package dockerignore
 import (
 	"bytes"
 	"path"
+	"strings"
+	"sync"
 
 	"github.com/moby/patternmatcher"
 	"github.com/moby/patternmatcher/ignorefile"
@@ -22,9 +24,14 @@ func Source(dockerfile, ctx string) []string {
 	return []string{dockerfile + ".dockerignore", root}
 }
 
-// Matcher reports whether a context-relative path is excluded.
+// Matcher reports whether a context-relative path is excluded. It matches
+// directory by directory, carrying each parent's results down, which is how
+// BuildKit walks a context (and differs from a flat match when a later
+// pattern repeats an already-excluded parent).
 type Matcher struct {
-	pm *patternmatcher.PatternMatcher
+	pm   *patternmatcher.PatternMatcher
+	mu   sync.Mutex
+	dirs map[string]patternmatcher.MatchInfo
 }
 
 // New parses .dockerignore content (nil or empty: nothing excluded).
@@ -40,7 +47,7 @@ func New(content []byte) (*Matcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Matcher{pm: pm}, nil
+	return &Matcher{pm: pm, dirs: map[string]patternmatcher.MatchInfo{}}, nil
 }
 
 // Excluded reports whether rel (relative to the build context) is left out
@@ -50,6 +57,27 @@ func (m *Matcher) Excluded(rel string) bool {
 	if m == nil || m.pm == nil || rel == ".dockerignore" {
 		return false
 	}
-	ok, err := m.pm.MatchesOrParentMatches(rel)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	parent := patternmatcher.MatchInfo{}
+	if dir := path.Dir(rel); dir != "." {
+		parent = m.dirInfo(dir)
+	}
+	ok, _, err := m.pm.MatchesUsingParentResults(rel, parent)
 	return err == nil && ok
+}
+
+// dirInfo returns the memoised match results for a directory, computed from
+// its parent's as in a top-down walk.
+func (m *Matcher) dirInfo(dir string) patternmatcher.MatchInfo {
+	if mi, ok := m.dirs[dir]; ok {
+		return mi
+	}
+	parent := patternmatcher.MatchInfo{}
+	if i := strings.LastIndex(dir, "/"); i >= 0 {
+		parent = m.dirInfo(dir[:i])
+	}
+	_, mi, _ := m.pm.MatchesUsingParentResults(dir, parent)
+	m.dirs[dir] = mi
+	return mi
 }
