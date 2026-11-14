@@ -15,6 +15,10 @@ sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
 
 Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)).
 
+## Same machine, next command
+
+Each `sx` may land on a different VM. When an agent needs the machine it just used (it installed a package there, or wants to look at files a failed run left behind), it adds `-s` (`--same-slot`): `sx -s pnpm test`. See [coming back to the same machine](running.md#coming-back-to-the-same-machine). The `AGENTS.md` snippet from `hook install --codex` tells agents this.
+
 ## Machine-readable events
 
 With `--json`, `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1`, lifecycle events go to stderr as NDJSON instead; `--events-file PATH` appends them to a file in any mode:

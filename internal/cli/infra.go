@@ -494,7 +494,9 @@ func cmdDoctor() *cobra.Command {
 				return exitWith(1)
 			}
 			check("global config", true, cfg.Global.Path)
-			if l, err := load(""); err == nil {
+			if l, err := load(""); err == nil && !l.ws.Marked {
+				check("project", true, "none here (cd into a Git worktree, or run `spotexec init` to mark a directory)")
+			} else if err == nil {
 				src := "(defaults; no .spotexec.toml)"
 				if l.cfg.Project.Path != "" {
 					src = l.cfg.Project.Path
