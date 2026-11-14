@@ -94,6 +94,8 @@ The manifest records the Git blob ID of every synced file: the **baseline**. Aft
 
 Deletions apply deepest-first, then writes. New files only come back if Git wouldn't ignore them, so `dist/`, `target/` and `node_modules` never travel back. A runner can never write into `.git`, under any spelling.
 
+A new file the run created that doesn't come back (`--writeback never`, `--sync in`, a failed `on-success` run, a `--sync none` run, a dropped connection) stays in the slot until the next run that syncs into it, which removes it. Until then `spotexec exec` and `sx -s --sync none` can still look at it. Ignored outputs and `cache_dirs` are kept, like any build cache.
+
 To get **ignored outputs** back (coverage reports, build output), use one of:
 - `--pull coverage/` on a run (globs are single-level: `--pull 'packages/*/coverage'`, and `**` is not recursive);
 - `pull_artifacts` in `.spotexec.toml`;

@@ -92,9 +92,10 @@ func localVersion(root, rel string) (version, error) {
 // someone edited the file locally during the run: keep it and stash the
 // remote version under <git-dir>/spotexec/conflicts/<run-id>/.
 //
+// ignored is which created files are ignored here, if already known.
 // proceed, when set, is asked once everything is fetched and before anything
 // is applied: false applies nothing.
-func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string, proceed func() bool) (WritebackResult, error) {
+func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string, ignored map[string]bool, proceed func() bool) (WritebackResult, error) {
 	var wb WritebackResult
 	// Created (non-manifest) files only come back if not ignored locally.
 	// The runner's report is not trusted: changed or deleted paths must be
@@ -129,9 +130,11 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	for _, c := range created {
 		createdPaths = append(createdPaths, c.Path)
 	}
-	ignored, err := m.CheckIgnored(ctx, createdPaths)
-	if err != nil {
-		return wb, err
+	if ignored == nil {
+		var err error
+		if ignored, err = m.CheckIgnored(ctx, createdPaths); err != nil {
+			return wb, err
+		}
 	}
 	remote := map[string]version{}
 	var fetch, accept []string

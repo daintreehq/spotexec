@@ -86,6 +86,49 @@ check "gitignored output not written back" "test ! -e dist/out.js"
 run true
 check "after write-back the slot needs no transfer" "ev '\"sync_in\".*\"bytes\":0' | grep -q ."
 
+echo "== created files that aren't written back"
+run --writeback never 'echo x > extra.txt; mkdir -p dist; echo k > dist/keep.js' || true
+check "--writeback never leaves the created file remote only" "test ! -e extra.txt"
+"$SX" exec 'cat extra.txt' >"$WORK/x1.out" 2>&1 || true
+check "exec (no sync) still sees it" "grep -qx x $WORK/x1.out"
+"$SX" -s --sync none 'cat extra.txt' >"$WORK/x2.out" 2>&1 || true
+check "--same-slot --sync none still sees it" "grep -qx x $WORK/x2.out"
+run 'test -e extra.txt && echo leaked || echo clean; cat dist/keep.js' || true
+check "the next synced run removes it, without the fingerprint shortcut" "grep -qx clean $WORK/last.out && ! ev fingerprint_hit | grep -q ."
+check "ignored build outputs survive the cleanup" "grep -qx k $WORK/last.out"
+run --writeback on-success 'echo y > extra2.txt; exit 3' || true
+check "a failing on-success run writes nothing back" "test ! -e extra2.txt"
+run 'test -e extra2.txt && echo leaked || echo clean' || true
+check "the next synced run removes its created file" "grep -qx clean $WORK/last.out"
+"$SX" -q -s --sync none 'echo n > nosync.txt' || true
+"$SX" -q --sync in 'echo i > syncin.txt' || true
+check "--sync in leaves the created file remote only" "test ! -e syncin.txt"
+run 'for f in nosync.txt syncin.txt; do test -e $f && echo leaked-$f; done; echo checked' || true
+check "files created by --sync none and --sync in runs are removed by the next synced run" "grep -qx checked $WORK/last.out && ! grep -q leaked $WORK/last.out"
+"$SX" -q 'echo d > died.txt; echo created; sleep 30' >"$WORK/died.out" 2>/dev/null &
+P=$!
+for _ in $(seq 1 50); do grep -q created "$WORK/died.out" 2>/dev/null && break; sleep 0.2; done
+docker exec "$NAME" sh -c 'find /home/dev/.cache/spotexec -name died.txt | grep -q .' && remote=1 || remote=0
+docker exec "$NAME" pkill -KILL -f 'spotexec-helper.* rpc' && killed=1 || killed=0
+wait $P || true
+run 'test -e died.txt && echo leaked || echo clean' || true
+check "a file created by a run whose helper died is removed by the next synced run" "[ $remote = 1 ] && [ $killed = 1 ] && grep -qx clean $WORK/last.out"
+run 'mkdir -p dist; echo o > dist/only.js' || true
+run true
+check "a run that only creates ignored outputs keeps the fingerprint shortcut" "ev fingerprint_hit | grep -q ."
+# Another worktree of the same repository landing in that slot.
+git worktree add -q "$WORK/wt2" 2>/dev/null
+git worktree add -q "$WORK/wt3" 2>/dev/null
+run --writeback never 'echo z > leak.txt' || true
+S0=$(grep slot_acquired "$WORK/last.err" | grep -o '"workspace_slot":[0-9]*' | tail -1)
+(cd "$WORK/wt3" && "$SX" -q 'sleep 6' & cd "$WORK/wt3" && "$SX" -q 'sleep 6' & wait) &
+WP=$!
+sleep 2
+(cd "$WORK/wt2" && "$SX" --json 'test -e leak.txt && echo leaked || echo clean') >"$WORK/wt2.out" 2>"$WORK/wt2.err" || true
+wait $WP
+check "another worktree reusing the slot doesn't see the file" "[ -n '$S0' ] && grep slot_acquired $WORK/wt2.err | grep -q '$S0' && grep -qx clean $WORK/wt2.out"
+git worktree remove --force "$WORK/wt2"; git worktree remove --force "$WORK/wt3"
+
 echo "== exit codes, timeout, cancel"
 "$SX" --json 'exit 7' >/dev/null 2>&1 && code=0 || code=$?
 check "exit code passes through" "[ $code = 7 ]"

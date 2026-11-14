@@ -105,7 +105,10 @@ func (s *Session) takeSnapshot(skip []string) snapshot {
 // diff computes the mutation batch between pre and post snapshots. Manifest
 // files are compared by content ID against the verified baseline, so a tool
 // that rewrites identical bytes produces no mutation.
-func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []string, created []protocol.Entry, truncated bool, unverified []string) {
+//
+// overflow lists the created paths beyond MaxCreated (not reported, but
+// still tracked for cleanup).
+func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []string, created []protocol.Entry, truncated bool, unverified, overflow []string) {
 	for rel, st := range s.stored {
 		if post.unknown[rel] {
 			unverified = append(unverified, rel)
@@ -148,12 +151,13 @@ func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []
 		if p, ok := pre.sig[rel]; ok && p == sg {
 			continue // untouched non-manifest file (e.g. old build output)
 		}
-		if len(created) >= MaxCreated {
-			truncated = true
-			break
-		}
 		full, err := fsid.SafeJoin(s.workspace, rel) // also rejects names a client can't use
 		if err != nil {
+			continue
+		}
+		if len(created) >= MaxCreated {
+			truncated = true
+			overflow = append(overflow, rel)
 			continue
 		}
 		id, mode, size, err := fsid.Path(full)

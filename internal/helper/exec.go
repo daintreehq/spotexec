@@ -335,6 +335,9 @@ func (s *Session) exec(e protocol.Exec) error {
 	// Any interrupted run leaves the workspace in an unknown state.
 	fp := s.state.Fingerprint
 	s.state.Fingerprint = ""
+	// Until the run's created files are collected, a helper that dies
+	// leaves them unknown: the next acquire sweeps the workspace for them.
+	s.state.Sweep, s.state.SweepSkip = e.Snapshot, e.Skip
 	if err := saveSlotState(s.slotDir, s.state); err != nil {
 		return fmt.Errorf("marking slot dirty before exec: %w", err)
 	}
@@ -391,8 +394,11 @@ func (s *Session) exec(e protocol.Exec) error {
 	if e.Snapshot && !shutdown {
 		t := time.Now()
 		post := s.takeSnapshot(e.Skip)
-		res.Changed, res.Deleted, res.Created, res.Truncated, res.Unverified = s.diff(pre, post)
+		var overflow []string
+		res.Changed, res.Deleted, res.Created, res.Truncated, res.Unverified, overflow = s.diff(pre, post)
 		res.SnapshotMS = time.Since(t).Milliseconds()
+		s.state.Pending = s.pendingAfter(res.Created, res.Unverified, overflow)
+		s.state.Sweep, s.state.SweepSkip = false, nil
 		if err := s.saveStored(); err != nil {
 			return err
 		}

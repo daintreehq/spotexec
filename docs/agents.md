@@ -17,7 +17,7 @@ Exit codes are the command's own; `125` means spotexec itself failed (see [Exit 
 
 ## Same machine, next command
 
-Each `sx` may land on a different VM. When an agent needs the machine it just used (it installed a package there, or wants to look at files a failed run left behind), it adds `-s` (`--same-slot`): `sx -s pnpm test`. See [coming back to the same machine](running.md#coming-back-to-the-same-machine). The `AGENTS.md` snippet from `hook install --codex` tells agents this.
+Each `sx` may land on a different VM. When an agent needs the machine it just used (it installed a package there), it adds `-s` (`--same-slot`): `sx -s pnpm test`. To look at files a failed run left in the slot without syncing (a synced run removes files that weren't written back), use `sx -s --sync none 'cat out.log'` or `spotexec exec`. See [coming back to the same machine](running.md#coming-back-to-the-same-machine). The `AGENTS.md` snippet from `hook install --codex` tells agents this.
 
 ## Machine-readable events
 

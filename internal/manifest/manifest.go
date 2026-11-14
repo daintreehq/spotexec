@@ -463,7 +463,9 @@ func (m *Manifest) CheckIgnored(ctx context.Context, paths []string) (map[string
 			ign[p] = true
 			continue
 		}
-		in.WriteString(p)
+		// "./" keeps a name like ":(literal)x" from being read as pathspec
+		// magic; git echoes the path as given.
+		in.WriteString("./" + p)
 		in.WriteByte(0)
 	}
 	cmd := exec.CommandContext(ctx, "git", "-C", m.Root, "check-ignore", "--no-index", "-z", "--stdin")
@@ -477,7 +479,7 @@ func (m *Manifest) CheckIgnored(ctx context.Context, paths []string) (map[string
 	}
 	for _, p := range bytes.Split(out, []byte{0}) {
 		if len(p) > 0 {
-			ign[string(p)] = true
+			ign[strings.TrimPrefix(string(p), "./")] = true
 		}
 	}
 	return ign, nil

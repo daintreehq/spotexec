@@ -266,7 +266,11 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	s.writeHolder(holder)
 	s.acq = a
 	s.state = loadSlotState(s.slotDir)
-	match := a.Fingerprint != "" && s.state.Fingerprint == a.Fingerprint
+	if s.state.Sweep {
+		s.sweepPending()
+	}
+	// Files left pending by earlier runs must be cleaned up by a sync.
+	match := a.Fingerprint != "" && s.state.Fingerprint == a.Fingerprint && len(s.state.Pending) == 0
 	prevKey := s.state.WorktreeKey
 	if !a.KeepOwner {
 		s.state.WorktreeKey = a.WorktreeKey
@@ -289,6 +293,7 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	return s.c.Send(protocol.TypeAcquired, protocol.Acquired{
 		Token: holder.Token, Slot: holder.Slot, Workspace: s.workspace,
 		FingerprintMatch: match, WaitedMS: time.Since(start).Milliseconds(), MaxSlots: max, PrevWorktreeKey: prevKey,
+		Pending: s.state.Pending,
 	})
 }
 

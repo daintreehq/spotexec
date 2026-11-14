@@ -19,6 +19,7 @@ const (
 	TypeCancel      = "cancel"
 	TypeFetch       = "fetch"
 	TypeFetched     = "fetched"
+	TypeSettle      = "settle"
 	TypePull        = "pull"
 	TypeHeartbeat   = "hb"
 	TypeEvent       = "event"
@@ -116,6 +117,10 @@ type Acquired struct {
 	PrevWorktreeKey  string `json:"prev_worktree_key"` // who last synced this slot
 	WaitedMS         int64  `json:"waited_ms"`
 	MaxSlots         int    `json:"max_slots"`
+	// Pending lists files earlier runs created in this slot that were never
+	// written back (nor found to be ignored): the next sync removes the ones
+	// the client doesn't ignore (Manifest.Remove).
+	Pending []string `json:"pending,omitempty"`
 }
 
 // Busy is returned when Wait=false and nothing is free.
@@ -137,6 +142,9 @@ type Manifest struct {
 	Fingerprint string   `json:"fingerprint"`
 	Entries     []Entry  `json:"entries"`
 	Protect     []string `json:"protect"` // dirs never pruned (cache_dirs)
+	// Remove: Acquired.Pending files to delete (not ignored by the client).
+	// The rest of the pending list is kept and forgotten.
+	Remove []string `json:"remove,omitempty"`
 }
 
 // Need lists the paths the helper is missing. The CLI follows with a tar blob.
@@ -236,7 +244,7 @@ type Exec struct {
 	Setup     string            `json:"setup"` // remote_path_setup prefix
 	TimeoutMS int64             `json:"timeout_ms"`
 	GraceMS   int64             `json:"grace_ms"`
-	Snapshot  bool              `json:"snapshot"` // compute mutations
+	Snapshot  bool              `json:"snapshot"` // compute mutations (and track created files)
 	Skip      []string          `json:"skip"`     // dir names/paths skipped by the post-run walk
 	SpotWatch bool              `json:"spot_watch"`
 	Container *ContainerRun     `json:"container,omitempty"`
@@ -272,6 +280,13 @@ type Result struct {
 type Fetch struct {
 	Paths  []string `json:"paths"`
 	Accept []string `json:"accept"`
+}
+
+// Settle tells the helper which files the run created are ignored by the
+// client (build outputs): they stay in the slot and are no longer pending.
+// There is no reply.
+type Settle struct {
+	Ignored []string `json:"ignored"`
 }
 
 // Pull asks for gitignored artifacts by glob (relative to the workspace).

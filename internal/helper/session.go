@@ -285,6 +285,13 @@ func (s *Session) dispatch(env protocol.Envelope) error {
 			return err
 		}
 		return s.pull(p)
+	case protocol.TypeSettle:
+		var st protocol.Settle
+		if err := env.Unmarshal(&st); err != nil {
+			return nil // no reply is expected: never answer with an error
+		}
+		s.settle(st)
+		return nil
 	case protocol.TypeCancel:
 		return nil // nothing running
 	case protocol.TypeBye:

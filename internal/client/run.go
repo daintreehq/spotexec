@@ -303,7 +303,11 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		} else {
 			t := time.Now()
 			o.Rep.Status("%s · syncing %d files", label, len(m.Entries))
-			syn, err := syncIn(ctx, sess, m, p.Deps.CacheDirs, o)
+			stray, err := strayFiles(ctx, ws, m, lease.Acq.Pending)
+			if err != nil {
+				return res, infra(fmt.Errorf("checking files earlier runs left in %s: %w", label, err)), ""
+			}
+			syn, err := syncIn(ctx, sess, m, p.Deps.CacheDirs, stray, o)
 			if err != nil {
 				return res, infra(fmt.Errorf("sync to %s: %w", r.Name, err)), lostRunner(lease, err)
 			}
@@ -377,7 +381,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	ex := protocol.Exec{
 		Shell: o.Command, Cwd: ws.Cwd, Env: env, Setup: r.RemotePathSetup,
 		TimeoutMS: o.Timeout.Milliseconds(), GraceMS: o.Grace.Milliseconds(),
-		Snapshot: o.Sync != "none", Skip: skip, SpotWatch: r.Type == config.TypeAWSSpot,
+		// Always snapshotted, so the helper knows which files even an
+		// unsynced run created (removed by the next run that syncs here).
+		Snapshot: true, Skip: skip, SpotWatch: r.Type == config.TypeAWSSpot,
 		Container: crun,
 	}
 	o.Rep.Status("%s · running %s", label, o.Display)
@@ -462,7 +468,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// canceled ctx must not prevent writing back what the command changed.
 	post, cancelPost := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancelPost()
-	if len(result.Unverified) > 0 {
+	// Created files that are ignored here are build outputs the slot keeps;
+	// the rest stay pending until written back or removed by the next sync.
+	var ignoredCreated map[string]bool
+	if m != nil && len(result.Created) > 0 {
+		ignoredCreated = settleCreated(post, sess, m, result.Created)
+	}
+	if m != nil && len(result.Unverified) > 0 {
 		o.Rep.Warn("UNVERIFIED", "%d file(s) could not be read on the runner after the run and were not written back: %s", len(result.Unverified), strings.Join(firstN(result.Unverified, 5), ", "))
 	}
 	if result.TimedOut {
@@ -479,7 +491,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if o.Writeback == "on-success" {
 			proceed = func() bool { return ctx.Err() == nil }
 		}
-		wb, err := writeback(post, sess, ws, m, result, runID, proceed)
+		wb, err := writeback(post, sess, ws, m, result, runID, ignoredCreated, proceed)
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
@@ -614,10 +626,79 @@ func newRunID() string {
 	return time.Now().UTC().Format("20060102-150405") + "-" + hex.EncodeToString(b)
 }
 
+// strayFiles picks, from the files earlier runs created in the slot and never
+// wrote back, the ones the next sync must remove: everything this worktree
+// doesn't ignore (ignored build outputs stay, like dependency caches).
+func strayFiles(ctx context.Context, ws *Workspace, m *manifest.Manifest, pending []string) ([]string, error) {
+	var stray, check []string
+	for _, p := range pending {
+		if _, ok := m.ByPath[p]; ok {
+			continue // synced over by this run
+		}
+		// Never a file of ours: an invalid or reserved path, or one under a
+		// synced file or a local symlink or file (git can't judge those).
+		if _, err := fsid.SafeJoin(ws.Root, p); err != nil || reservedPath(p, ws.Git) || underSyncedFile(m, p) {
+			stray = append(stray, p)
+			continue
+		}
+		check = append(check, p)
+	}
+	if len(check) == 0 {
+		return stray, nil
+	}
+	ign, err := m.CheckIgnored(ctx, check)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range check {
+		if !ign[p] {
+			stray = append(stray, p)
+		}
+	}
+	return stray, nil
+}
+
+// underSyncedFile reports whether a parent of p is a synced file or symlink.
+func underSyncedFile(m *manifest.Manifest, p string) bool {
+	for d := path.Dir(p); d != "." && d != "/" && d != ""; d = path.Dir(d) {
+		if _, ok := m.ByPath[d]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// settleCreated tells the helper which files the run created are ignored
+// here, and returns that set (nil if it couldn't be determined: write-back
+// then checks again and reports the error).
+func settleCreated(ctx context.Context, s *transport.Session, m *manifest.Manifest, created []protocol.Entry) map[string]bool {
+	paths := make([]string, 0, len(created))
+	for _, c := range created {
+		if _, err := fsid.CleanRel(c.Path); err == nil {
+			paths = append(paths, c.Path)
+		}
+	}
+	ign, err := m.CheckIgnored(ctx, paths)
+	if err != nil {
+		return nil
+	}
+	var keep []string
+	for _, p := range paths {
+		if ign[p] {
+			keep = append(keep, p)
+		}
+	}
+	if len(keep) > 0 {
+		_ = s.Conn.Send(protocol.TypeSettle, protocol.Settle{Ignored: keep})
+	}
+	return ign
+}
+
 // syncIn sends the manifest and streams whatever the helper reports missing.
-func syncIn(ctx context.Context, s *transport.Session, m *manifest.Manifest, protect []string, o Options) (protocol.Synced, error) {
+// remove lists files earlier runs left in the slot that must go.
+func syncIn(ctx context.Context, s *transport.Session, m *manifest.Manifest, protect, remove []string, o Options) (protocol.Synced, error) {
 	var syn protocol.Synced
-	if err := s.Conn.Send(protocol.TypeManifest, protocol.Manifest{Fingerprint: m.Fingerprint, Entries: m.Entries, Protect: protect}); err != nil {
+	if err := s.Conn.Send(protocol.TypeManifest, protocol.Manifest{Fingerprint: m.Fingerprint, Entries: m.Entries, Protect: protect, Remove: remove}); err != nil {
 		return syn, err
 	}
 	env, err := s.Expect(ctx, protocol.TypeNeed)
