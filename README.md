@@ -109,7 +109,7 @@ aws login              # or: aws sso login, aws configure
 spotexec setup
 ```
 
-Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
+Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. Finally it offers to bake an image, so new VMs skip their bootstrap. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
 
 **An SSH machine you already own**, such as a Linux box or a spare Mac. Key login must already work. Put it in `~/.config/spotexec/config.toml`:
 
@@ -151,7 +151,7 @@ spotexec status                # what's running where, and idle timers
 
 Files the command changes come back. Ignored outputs such as coverage reports need `pull_artifacts` in `.spotexec.toml`, or a flag like `--pull coverage/`; see [write-back and artifacts](docs/running.md#write-back-and-artifacts).
 
-The first AWS run boots a VM, which takes about a minute plus your bootstrap. Later runs reuse it until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time.
+The first AWS run boots a VM, which takes about a minute plus your bootstrap. Later runs reuse it until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
 
 ## With coding agents
 

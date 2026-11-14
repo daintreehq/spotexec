@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -23,5 +25,21 @@ func TestPrintBakesShowsBaseAgeAndStaleness(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("image list output lacks %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestInterruptedKeepsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sshErr := errors.New("sanitize: exit status 255: Connection closed")
+	if got := interrupted(ctx, sshErr); got != sshErr {
+		t.Fatalf("not interrupted: error changed to %v", got)
+	}
+	cancel()
+	got := interrupted(ctx, sshErr)
+	if !errors.Is(got, context.Canceled) || !strings.Contains(got.Error(), "sanitize") {
+		t.Fatalf("an interrupted bake must report cancellation and the failed step: %v", got)
+	}
+	if interrupted(ctx, nil) != nil {
+		t.Fatal("success stays success")
 	}
 }

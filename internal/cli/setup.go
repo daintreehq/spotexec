@@ -24,7 +24,7 @@ import (
 
 func cmdSetup() *cobra.Command {
 	var profile, adminProfile, user, install string
-	var yes, rotate, skipAWS, printPolicy, noVPC, noHooks, all, list bool
+	var yes, rotate, skipAWS, printPolicy, noVPC, noHooks, all, list, bake bool
 	var revoke string
 	c := &cobra.Command{
 		Use:   "setup [host...]",
@@ -42,6 +42,10 @@ func cmdSetup() *cobra.Command {
    Each gets spotexec installed (Homebrew when it has it, otherwise the
    release binary in ~/.local/bin), a copy of this runner config, and its
    own IAM user and key, created with your AWS sign-in on this machine.
+
+4. For AWS runners without a current baked image, offers to bake one
+   (about 10-15 minutes), so new VMs skip their bootstrap. --yes skips the
+   offer; --bake bakes without asking.
 
 Safe to re-run: it refreshes the user's policy (for new spotexec versions)
 and keeps a working key. --rotate replaces the key.
@@ -198,7 +202,19 @@ and keeps a working key. --rotate replaces the key.
 					return err
 				}
 			}
-			printSetupNext()
+			// AWS runners may exist even when --skip-aws left credentials
+			// alone: they still boot cold, and --bake still applies.
+			awsConfigured := hasAWS
+			if g, err := config.LoadGlobal(); err == nil && len(awsRunners(g)) > 0 {
+				awsConfigured = true
+			}
+			if hasAWS || (bake && awsConfigured) {
+				interactive := ui.IsTerminal(os.Stdin) && ui.IsTerminal(os.Stdout)
+				if err := offerBake(cmd.Context(), os.Stdout, bufio.NewReader(os.Stdin), bake, yes, interactive); err != nil {
+					return err
+				}
+			}
+			printSetupNext(awsConfigured)
 			return nil
 		},
 	}
@@ -215,14 +231,18 @@ and keeps a working key. --rotate replaces the key.
 	c.Flags().BoolVar(&noVPC, "no-vpc", false, "don't create a default VPC when the region has none")
 	c.Flags().StringVar(&install, "install", "auto", "how to install spotexec on other machines: auto, brew, release, copy (this binary) or none")
 	c.Flags().BoolVar(&printPolicy, "print-policy", false, "print the IAM policy spotexec needs and exit")
+	c.Flags().BoolVar(&bake, "bake", false, "bake runner images at the end without asking (setup otherwise offers it, except with --yes)")
 	return c
 }
 
-func printSetupNext() {
+func printSetupNext(aws bool) {
 	if os.Getenv("SPOTEXEC_SETUP_NESTED") != "" {
 		return // run by another machine's setup, which says what's next
 	}
 	fmt.Println("\nNext: `cd` into a project, run `spotexec init`, then `sx <command>` (`spotexec doctor` checks everything).")
+	if aws {
+		fmt.Println("Before a demo, do one warm-up `sx` run: the first boots a VM (a minute or more, plus the bootstrap unless the image is baked), and later runs reuse it until it has been idle for idle_timeout.")
+	}
 }
 
 // awsRunners returns the AWS runners, default pool first.

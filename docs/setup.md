@@ -34,6 +34,7 @@ spotexec setup
    With runners in several regions, the network and quota checks cover each region.
 3. **The Claude Code hook.** If Claude Code is on this machine, setup offers to install its hook for all your projects, so agents' heavy commands run on your runners (see [coding agents](agents.md#claude-code-hook)). The hook only acts in projects with a `.spotexec.toml`. `--no-hooks` skips this.
 4. **Other machines.** In a terminal, setup then lists the machines it can find and asks which ones to set up too; see [More machines](#more-machines).
+5. **A baked image.** If an AWS runner has no current [baked image](environments.md#baked-images) (none yet, or a stale one), setup offers to bake one. Without it, every new VM spends a minute or more installing its bootstrap (apt packages, Docker) before the first command runs. Baking takes about 10 to 15 minutes plus your bootstrap, on a short-lived on-demand VM, and every machine sharing the runner config then boots from it. `--yes` skips the offer unless you also pass `--bake`, which bakes without asking. You can always run `spotexec image bake` later.
 
 From then on spotexec uses its own key. Your `aws login` or SSO session can expire without it noticing, so you sign in again only to change the setup.
 
@@ -58,6 +59,8 @@ Continue? [Y/n]
 ```
 
 Next, in each repository: `spotexec init`, then `sx <command>`. `spotexec doctor` checks everything end to end.
+
+Before a demo, do one warm-up `sx` run. The first run boots a VM, which takes a minute or more (plus the bootstrap unless the image is baked); later runs reuse it until it has been idle for `idle_timeout`.
 
 ## Choosing runners
 
@@ -194,7 +197,8 @@ To keep no key on disk, skip the AWS step (`spotexec setup --skip-aws`) and sign
 | `--list` | List every machine's IAM user, key, last use and VMs, and exit. |
 | `--revoke HOST` | Delete a machine's IAM user and keys and terminate its VMs, and exit. |
 | `--no-hooks` | Don't install the Claude Code hook. |
-| `--yes`, `-y` | Don't ask for confirmation, and don't offer to set up other machines. |
+| `--yes`, `-y` | Don't ask for confirmation, and don't offer to set up other machines or bake an image. |
+| `--bake` | Bake an image for AWS runners without a current one, without asking (also with `--skip-aws`). A failed bake fails setup. |
 | `--install auto\|brew\|release\|copy\|none` | How to install spotexec on other machines (default `auto`: Homebrew if it's there, else the release binary). |
 | `--admin-profile NAME` | The AWS profile to create users with (default: `AWS_PROFILE`, then `default`). |
 | `--profile NAME` | The AWS profile to save the key as (default `spotexec`). |
