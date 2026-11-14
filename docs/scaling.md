@@ -16,6 +16,7 @@ Every `sx` process schedules for itself, against shared local state:
   pytest -n $SPOTEXEC_CPUS
   go test -p $SPOTEXEC_CPUS ./...
   ```
+- **Sharding.** A suite too big for one slot can run as a [sharded task](configuration.md#tasks): `shards = 8` queues eight parts at once, so the fleet scales out for them like any other demand, and each part runs its `--shard={shard}/{shards}` slice.
 
 ### Several machines, one Spot quota
 

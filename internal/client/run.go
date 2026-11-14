@@ -75,6 +75,9 @@ type Options struct {
 	SyncOnly       bool // stop after sync + deps (spotexec sync)
 	WaitPush       bool // push a freshly built image before returning (container build)
 	Priority       int  // queue priority when every slot is busy (higher first)
+	// Env is set for the command over the project's env (a shard's
+	// SPOTEXEC_SHARD and SPOTEXEC_SHARDS).
+	Env map[string]string
 }
 
 // Result of a run.
@@ -377,6 +380,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}
 	for k, v := range p.Env {
+		env[k] = v
+	}
+	for k, v := range o.Env {
 		env[k] = v
 	}
 	skip := append([]string{}, manifest.HeavyDirs...)

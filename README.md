@@ -147,6 +147,7 @@ sx pnpm tsc --noEmit           # type checks
 sx pnpm prettier --write .     # formatted files land in your worktree
 sx test --reporter=dot         # a task from .spotexec.toml, extra args
 sx verify                      # a parallel task fanned out over slots
+sx test-all                    # a sharded task: one test suite split across the fleet
 spotexec status                # what's running where, and idle timers
 ```
 

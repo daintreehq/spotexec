@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -152,6 +153,79 @@ func TestParallelTasksFallBackLocally(t *testing.T) {
 	code, stderr = runMain(t, "sx", "-C", dir, "--queue-timeout", "5s", "v")
 	if code != client.ExitInfra || !strings.Contains(stderr, "sx: l · ") || !strings.Contains(stderr, "exit 125") || strings.Contains(stderr, "#0") {
 		t.Errorf("without fallback: exit %d, stderr %q", code, stderr)
+	}
+}
+
+func TestShardedTaskFansOut(t *testing.T) {
+	dir := project(t, `[tasks.unit]
+run = "echo $SPOTEXEC_SHARD/$SPOTEXEC_SHARDS {args} > s{shard}of{shards}.out; [ {shard} != 2 ] || exit 3"
+shards = 3
+[tasks.lint]
+run = "echo $SPOTEXEC_SHARD > lint.out"
+[tasks.all]
+parallel = ["unit", "lint"]
+`)
+	// A runner that refuses connections at once.
+	cfg := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfg, []byte("version = 1\n[runners.a]\ntype = \"ssh\"\nhosts = [\"nobody@127.0.0.1\"]\nssh_options = [\"Port=1\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTEXEC_CONFIG", cfg)
+	t.Setenv("HOME", t.TempDir())
+	// Every shard runs, with its number and the extra arguments; the
+	// failing one sets the exit code.
+	code, stderr := runMain(t, "sx", "-C", dir, "--fallback-local", "--queue-timeout", "5s", "unit", "a b")
+	if code != 3 {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	for i := 1; i <= 3; i++ {
+		b, err := os.ReadFile(filepath.Join(dir, "s"+strconv.Itoa(i)+"of3.out"))
+		if want := strconv.Itoa(i) + "/3 a b\n"; err != nil || string(b) != want {
+			t.Errorf("shard %d: %q, %v (stderr %q)", i, b, err, stderr)
+		}
+	}
+	for _, want := range []string{"sx: unit 1/3 · ", "sx: unit 2/3 · ", "sx: unit 3/3 · ", "locally · exit 3\n"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr lacks %q: %q", want, stderr)
+		}
+	}
+	// NDJSON tells the shards apart, and the result names the shard count.
+	code, stderr = runMain(t, "sx", "-C", dir, "--json", "--fallback-local", "--queue-timeout", "5s", "unit")
+	if code != 3 {
+		t.Fatalf("--json: exit %d, stderr %q", code, stderr)
+	}
+	shards := map[float64]bool{}
+	var result map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("not NDJSON: %q", line)
+		}
+		if ev["event"] == "result" && ev["shard"] == nil {
+			result = ev
+		} else if ev["task"] == "unit" && ev["shards"] == float64(3) {
+			shards[ev["shard"].(float64)] = true
+		}
+	}
+	if len(shards) != 3 || result == nil || result["task"] != "unit" || result["shards"] != float64(3) || result["exit_code"] != float64(3) {
+		t.Errorf("shards %v, result %v (stderr %q)", shards, result, stderr)
+	}
+	// Named in a parallel task, a sharded task fans out in place.
+	os.Remove(filepath.Join(dir, "s1of3.out"))
+	code, stderr = runMain(t, "sx", "-C", dir, "--fallback-local", "--queue-timeout", "5s", "all")
+	if code != 3 || !strings.Contains(stderr, "sx: lint · ") || !strings.Contains(stderr, "sx: unit 3/3 · ") {
+		t.Errorf("parallel: exit %d, stderr %q", code, stderr)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "s1of3.out")); err != nil || string(b) != "1/3\n" {
+		t.Errorf("parallel shard 1: %q, %v", b, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "lint.out")); err != nil || string(b) != "\n" {
+		t.Errorf("an unsharded part got a shard number: %q, %v", b, err)
+	}
+	// Parts run on several slots at once: --same-slot can't apply.
+	code, stderr = runMain(t, "sx", "-C", dir, "--same-slot", "unit")
+	if code != client.ExitInfra || !strings.Contains(stderr, "unit: it's a sharded task, whose 3 shards") {
+		t.Errorf("--same-slot: exit %d, stderr %q", code, stderr)
 	}
 }
 
