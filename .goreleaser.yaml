@@ -71,8 +71,8 @@ brews:
     commit_author:
       name: spotexec-release
       email: spotexec-release@users.noreply.github.com
-    dependencies:
-      - name: git
+    # No `depends_on "git"`: spotexec runs inside Git worktrees, so git is
+    # already there, and on Linuxbrew it would pull in ~30 packages.
     install: |
       bin.install "spotexec"
       bin.install_symlink "spotexec" => "sx"
