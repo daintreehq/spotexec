@@ -15,6 +15,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/daintreehq/spotexec/internal/depskey"
 	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
@@ -645,6 +646,9 @@ func (p *Project) validate() error {
 	}
 	if p.Deps.Install != "" && len(p.Deps.Lockfiles) == 0 {
 		return errors.New("deps.install requires deps.lockfiles (the cache key)")
+	}
+	if _, _, err := depskey.Expand(p.Deps.Lockfiles, nil); err != nil {
+		return err // a malformed or escaping pattern; literal paths are checked when read
 	}
 	if !oneOf(p.Sync.Source, "", "git", "directory") {
 		return fmt.Errorf("sync.source must be git or directory (got %q)", p.Sync.Source)

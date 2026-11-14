@@ -292,3 +292,21 @@ run = "eslint ."
 		t.Errorf("one shard: %v", err)
 	}
 }
+
+func TestDepsLockfilePatternsValidated(t *testing.T) {
+	for lockfiles, ok := range map[string]bool{
+		`["package-lock.json"]`:                                   true,
+		`["package-lock.json", "packages/*/package.json"]`:        true,
+		`["electron/native/*/src/**", "scripts/patch[A-Z]*.cjs"]`: true,
+		`["../*.lock"]`: false,
+		`["docs/[a"]`:   false,
+		`[".git/*"]`:    false,
+	} {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		os.WriteFile(pp, []byte("[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = "+lockfiles+"\n"), 0o644)
+		_, err := LoadProject(pp)
+		if (err == nil) != ok {
+			t.Errorf("%s: err = %v, want ok=%v", lockfiles, err, ok)
+		}
+	}
+}

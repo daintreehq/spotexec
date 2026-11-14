@@ -288,3 +288,53 @@ func TestRunRefusesHome(t *testing.T) {
 		t.Fatalf("git home: want a refusal, got %v", err)
 	}
 }
+
+// Lockfile patterns match only what is synced to the slot: never an
+// excluded file, a dependency tree, or a symlink (whose target the runner
+// may not have, or which could point outside the worktree).
+func TestDepsLockfilesMatchSyncedFilesOnly(t *testing.T) {
+	root := t.TempDir()
+	for p, c := range map[string]string{
+		"package-lock.json":                      "lock",
+		"packages/a/package.json":                "a",
+		"packages/secret/package.json":           "excluded",
+		"node_modules/x/package.json":            "dep",
+		"packages/b/node_modules/y/package.json": "dep",
+		"outside/package.json":                   "outside",
+	} {
+		full := filepath.Join(root, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(root, "outside"), filepath.Join(root, "packages", "linkdir")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../outside/package.json", filepath.Join(root, "packages", "a", "linked.json")); err != nil {
+		t.Fatal(err)
+	}
+	p := &config.Project{}
+	p.Sync.Source = "directory"
+	p.Sync.Exclude = []string{"packages/secret/"}
+	m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.ByPath["packages/a/linked.json"]; !ok {
+		t.Fatal("fixture: the symlink should be synced (as a link)")
+	}
+	got, unmatched, err := DepsLockfiles(m, []string{"package-lock.json", "**/package.json", "packages/a/*.json", "vendor/*.lock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"outside/package.json", "package-lock.json", "packages/a/package.json"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if len(unmatched) != 1 || unmatched[0] != "vendor/*.lock" {
+		t.Fatalf("unmatched %v", unmatched)
+	}
+}

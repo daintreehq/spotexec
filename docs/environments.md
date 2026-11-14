@@ -62,11 +62,27 @@ dockerfile = ".spotexec/Dockerfile"   # built on the runner; or:
 ## Dependency cache
 
 With `[deps]` configured, each slot's `cache_dirs` are restored from a cache keyed by:
-- the lockfile contents and the install command;
+- the contents of the `lockfiles` and the install command;
 - the cache dirs;
 - the runner's OS and architecture;
 - in a [project container](#project-containers), the image's immutable ID;
 - otherwise, the runner's configured AMI, bootstrap scripts and `remote_path_setup`.
+
+`lockfiles` may hold globs, so the key can cover everything an install depends on, not just the package manager's lockfile, much like `hashFiles()` in a GitHub Actions cache key: workspace manifests, postinstall scripts and native addon sources.
+
+```toml
+[deps]
+lockfiles = [
+  "package-lock.json",
+  "packages/*/package.json",
+  "scripts/patchNodePty*.cjs",
+  "electron/native/*/binding.gyp",
+  "electron/native/*/package.json",
+  "electron/native/*/src/**",
+]
+```
+
+Patterns are expanded on your machine against the synced files (so they never match ignored files, `cache_dirs` contents or symlinks), and the runner hashes exactly that list. `**` is recursive here, unlike in `--pull`. A pattern matching nothing only warns. See [`[deps]`](configuration.md#dependencies) for the full rules, and `spotexec sync-plan` for the list a run would key on.
 
 `spotexec init` lists the root `node_modules` and each workspace's in `cache_dirs`, from package.json `workspaces` (npm, Yarn, Bun) or pnpm-workspace.yaml `packages`: the workspace glob `packages/*` becomes `packages/*/node_modules`. `cache_dirs` globs match one directory per `*`, so a workspace pattern they can't express (`**`, `{a,b}`) is left out, and init names it for you to add by hand. Update `cache_dirs` when the workspaces change.
 
