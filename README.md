@@ -1,4 +1,9 @@
-# spotexec
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo/spotexec-dark.svg">
+    <img src="docs/assets/logo/spotexec.svg" alt="spotexec" width="300">
+  </picture>
+</h1>
 
 **[spotexec.com](https://spotexec.com)** · [Documentation](#documentation) · [Releases](https://github.com/daintreehq/spotexec/releases)
 
