@@ -41,6 +41,7 @@ type fakeIAM struct {
 	denyCreate  bool
 	propagation map[string]int // new key -> rejections left
 	noVPC       bool
+	sgs         map[string]map[string]string // security group id -> tags; "name"/"desc" override spotexec's
 }
 
 func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
@@ -99,6 +100,35 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 			return
 		}
 		switch action {
+		case "DescribeSecurityGroups":
+			if v.Get("Filter.1.Name") != "group-name" || v.Get("Filter.1.Value.1") != "spotexec-ssh" || v.Get("Filter.1.Value.2") != "spotexec-ssh-*" {
+				t.Errorf("DescribeSecurityGroups filter %v", v)
+			}
+			var b strings.Builder
+			for id, tags := range f.sgs {
+				name, desc := "spotexec-ssh", "spotexec runners: SSH ingress"
+				if tags["name"] != "" {
+					name, desc = tags["name"], tags["desc"]
+				}
+				fmt.Fprintf(&b, `<item><groupId>%s</groupId><groupName>%s</groupName><groupDescription>%s</groupDescription><tagSet>`, id, name, desc)
+				for k, val := range tags {
+					if k == "name" || k == "desc" {
+						continue
+					}
+					fmt.Fprintf(&b, `<item><key>%s</key><value>%s</value></item>`, k, val)
+				}
+				b.WriteString(`</tagSet></item>`)
+			}
+			fmt.Fprintf(w, `<DescribeSecurityGroupsResponse><securityGroupInfo>%s</securityGroupInfo></DescribeSecurityGroupsResponse>`, b.String())
+		case "CreateTags":
+			tags := f.sgs[v.Get("ResourceId.1")]
+			if tags == nil || v.Get("ResourceId.2") != "" {
+				t.Errorf("CreateTags %v", v)
+				iamErr(400, "InvalidID")
+				return
+			}
+			tags[v.Get("Tag.1.Key")] = v.Get("Tag.1.Value")
+			fmt.Fprint(w, `<CreateTagsResponse><return>true</return></CreateTagsResponse>`)
 		case "CreateDefaultVpc":
 			f.noVPC = false
 			fmt.Fprint(w, `<CreateDefaultVpcResponse><vpc><vpcId>vpc-new</vpcId></vpc></CreateDefaultVpcResponse>`)
@@ -479,6 +509,27 @@ func TestINIHeaderComments(t *testing.T) {
 	}
 	if vals, err := readINI(cfg, "profile other"); err != nil || vals["region"] != "r" || vals["sso_session"] != "" {
 		t.Fatalf("readINI: %v %v", vals, err)
+	}
+}
+
+// Security groups from before spotexec tagged them at creation get the
+// owner tag on the next setup, so the scoped policy still lets the key
+// add rules to them; tagged ones are left alone.
+func TestAWSUserSetupTagsOldSecurityGroups(t *testing.T) {
+	f := &fakeIAM{sgs: map[string]map[string]string{
+		"sg-old":   {"Name": "spotexec-ssh"},
+		"sg-cidr":  {"name": "spotexec-ssh-0a1b2c3d", "desc": "spotexec runners: SSH ingress"},
+		"sg-new":   {tagOwner: "someone-else"},
+		"sg-prod":  {"name": "spotexec-ssh-production", "desc": "spotexec runners: SSH ingress"},
+		"sg-other": {"name": "spotexec-ssh", "desc": "hand-made"},
+	}}
+	s, _, _ := newSetupEnv(t, f)
+	if _, err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.sgs["sg-old"][tagOwner] != testMachine || f.sgs["sg-old"]["Name"] != "spotexec-ssh" || f.sgs["sg-cidr"][tagOwner] != testMachine ||
+		f.sgs["sg-new"][tagOwner] != "someone-else" || f.sgs["sg-prod"][tagOwner] != "" || f.sgs["sg-other"][tagOwner] != "" || f.count("CreateTags") != 2 {
+		t.Fatalf("groups %v, calls %v", f.sgs, f.calls)
 	}
 }
 

@@ -22,14 +22,35 @@ const iamAPIVersion = "2010-05-08"
 // SpotexecPolicy is the least-privilege IAM policy spotexec needs. The
 // docs/aws.md "Grant permissions" section shows the same document (a test
 // keeps them in step).
+//
+// Reads are unconditional. Everything that changes an existing EC2
+// resource needs it to carry the spotexec-owner tag, and tags can only be
+// applied while spotexec's own Run/CreateImage/CreateSecurityGroup calls
+// create a resource, so the key can't tag its way into anything else.
+// RunInstances and CreateImage are authorised per resource type: the new
+// instance and volumes must be requested with the tag, the source instance
+// of an image must already carry it. Inline user policies are capped at
+// 2,048 characters (TestPolicyFitsInline).
 const SpotexecPolicy = `{
   "Version": "2012-10-17",
   "Statement": [
     { "Effect": "Allow", "Action": [
-        "ec2:RunInstances", "ec2:CreateTags", "ec2:DescribeInstances", "ec2:TerminateInstances",
-        "ec2:DescribeImages", "ec2:DescribeVpcs", "ec2:DescribeSubnets",
-        "ec2:DescribeSecurityGroups", "ec2:CreateSecurityGroup", "ec2:AuthorizeSecurityGroupIngress"
+        "ec2:Describe*", "ec2:CreateSecurityGroup", "ecr:GetAuthorizationToken", "servicequotas:GetServiceQuota"
       ], "Resource": "*" },
+    { "Effect": "Allow", "Action": "ec2:RunInstances",
+      "NotResource": ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"] },
+    { "Effect": "Allow", "Action": "ec2:RunInstances",
+      "Resource": ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"],
+      "Condition": { "Null": { "aws:RequestTag/spotexec-owner": "false" } } },
+    { "Effect": "Allow", "Action": "ec2:CreateTags", "Resource": "*",
+      "Condition": { "StringEquals": { "ec2:CreateAction": ["RunInstances", "CreateSecurityGroup", "CreateImage"] } } },
+    { "Effect": "Allow", "Action": [
+        "ec2:TerminateInstances", "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:StopInstances", "ec2:CreateImage", "ec2:DeregisterImage", "ec2:DeleteSnapshot"
+      ], "Resource": "*", "Condition": { "Null": { "aws:ResourceTag/spotexec-owner": "false" } } },
+    { "Effect": "Allow", "Action": ["ec2:AuthorizeSecurityGroupIngress", "ec2:CreateImage"], "Resource": [
+        "arn:aws:ec2:*:*:security-group-rule/*", "arn:aws:ec2:*::image/*", "arn:aws:ec2:*::snapshot/*"
+      ] },
     { "Effect": "Allow", "Action": "ssm:GetParameter",
       "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/*" },
     { "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
@@ -38,16 +59,11 @@ const SpotexecPolicy = `{
         "s3:CreateBucket", "s3:PutLifecycleConfiguration", "s3:ListBucket",
         "s3:GetObject", "s3:PutObject"
       ], "Resource": ["arn:aws:s3:::spotexec-cache-*", "arn:aws:s3:::spotexec-cache-*/*"] },
-    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
     { "Effect": "Allow", "Action": [
         "ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy",
         "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
         "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"
-      ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" },
-    { "Effect": "Allow", "Action": "servicequotas:GetServiceQuota", "Resource": "*" },
-    { "Effect": "Allow", "Action": [
-        "ec2:StopInstances", "ec2:CreateImage", "ec2:DeregisterImage", "ec2:DeleteSnapshot"
-      ], "Resource": "*" }
+      ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" }
   ]
 }`
 
@@ -289,6 +305,7 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		return nil, iamHint(fmt.Errorf("attaching the spotexec policy: %w", err))
 	}
 	s.logf("attached the spotexec policy")
+	s.tagOldSecurityGroups(ctx, admin.creds, machine)
 
 	// 3. The Spot service-linked role (a one-time account prerequisite).
 	if _, err := admin.query(ctx, "iam", iamAPIVersion, "CreateServiceLinkedRole", url.Values{"AWSServiceName": {"spot.amazonaws.com"}}); err == nil {
@@ -382,6 +399,41 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 	}
 	s.quota(ctx, newKey, res)
 	return res, nil
+}
+
+// tagOldSecurityGroups gives spotexec security groups made before they were
+// tagged at creation (exactly spotexec's name pattern and description) the
+// spotexec-owner tag, which the policy now requires
+// before the machine key may add an ingress rule (best effort).
+func (s *AWSUserSetup) tagOldSecurityGroups(ctx context.Context, creds *awsCredResolver, machine string) {
+	seen := map[string]bool{}
+	for _, region := range append(append([]string{s.Region}, s.QuotaRegions...), s.VPCRegions...) {
+		if seen[region] {
+			continue
+		}
+		seen[region] = true
+		c := s.client(region, creds)
+		b, err := c.ec2(ctx, "DescribeSecurityGroups", spotexecSGFilter())
+		if err != nil {
+			s.logf("warning: couldn't list spotexec's security groups in %s: %v", region, err)
+			continue
+		}
+		groups, _, err := parseSecurityGroups(b)
+		if err != nil {
+			continue
+		}
+		for _, g := range groups {
+			if g.tag(tagOwner) != "" || !g.madeBySpotexec() {
+				continue
+			}
+			if _, err := c.ec2(ctx, "CreateTags", url.Values{"ResourceId.1": {g.ID},
+				"Tag.1.Key": {tagOwner}, "Tag.1.Value": {machine}}); err != nil {
+				s.logf("warning: couldn't tag security group %s (%s) in %s: %v", g.Name, g.ID, region, err)
+				continue
+			}
+			s.logf("tagged security group %s (%s) in %s as spotexec's", g.Name, g.ID, region)
+		}
+	}
 }
 
 func (s *AWSUserSetup) poll(ctx context.Context, limit time.Duration, f func() error) error {

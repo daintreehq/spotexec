@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -701,10 +703,21 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 		return []string{id}, nil
 	}
 	if id == "" {
+		owner, err := a.ownerTag()
+		if err != nil {
+			return nil, err
+		}
 		p := url.Values{}
 		p.Set("GroupName", sgName)
-		p.Set("GroupDescription", "spotexec runners: SSH ingress")
+		p.Set("GroupDescription", sgDescription)
 		p.Set("VpcId", vpc)
+		// Tagged at creation: the IAM policy only lets spotexec's key change
+		// resources that carry spotexec-owner, and only tag them as they're made.
+		p.Set("TagSpecification.1.ResourceType", "security-group")
+		for i, t := range [][2]string{{tagOwner, owner}, {"Name", sgName}} {
+			p.Set("TagSpecification.1.Tag."+strconv.Itoa(i+1)+".Key", t[0])
+			p.Set("TagSpecification.1.Tag."+strconv.Itoa(i+1)+".Value", t[1])
+		}
 		b, err := a.api.ec2(ctx, "CreateSecurityGroup", p)
 		switch {
 		case err == nil:
@@ -732,9 +745,64 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 		p.Set("IpPermissions.1.IpRanges.1.CidrIp", a.r.SSHCIDR)
 	}
 	if _, err := a.api.ec2(ctx, "AuthorizeSecurityGroupIngress", p); err != nil && awsCode(err) != "InvalidPermission.Duplicate" {
+		if c := awsCode(err); (c == "UnauthorizedOperation" || c == "AccessDenied") && body != "" && !sgTagged([]byte(body)) {
+			return nil, fmt.Errorf("authorize SSH ingress on %s: %w\nsecurity group %s was made by an older spotexec and lacks the %s tag spotexec's IAM policy now requires: run `spotexec setup` once (it tags it), or delete the group", id, err, sgName, tagOwner)
+		}
 		return nil, fmt.Errorf("authorize SSH ingress on %s: %w", id, err)
 	}
 	return []string{id}, nil
+}
+
+// ec2SecurityGroup is one DescribeSecurityGroups item.
+type ec2SecurityGroup struct {
+	ID          string   `xml:"groupId"`
+	Name        string   `xml:"groupName"`
+	Description string   `xml:"groupDescription"`
+	VPC         string   `xml:"vpcId"`
+	Tags        []ec2Tag `xml:"tagSet>item"`
+}
+
+const sgDescription = "spotexec runners: SSH ingress"
+
+var sgNameRE = regexp.MustCompile(`^` + sgBaseName + `(-[0-9a-f]{8})?$`)
+
+// madeBySpotexec reports whether the group has exactly the name and
+// description securityGroups gives the groups it creates, so a group that
+// merely starts with "spotexec-ssh" is never adopted.
+func (g ec2SecurityGroup) madeBySpotexec() bool {
+	return sgNameRE.MatchString(g.Name) && g.Description == sgDescription
+}
+
+func (g ec2SecurityGroup) tag(k string) string {
+	for _, t := range g.Tags {
+		if t.Key == k {
+			return t.Value
+		}
+	}
+	return ""
+}
+
+func parseSecurityGroups(b []byte) ([]ec2SecurityGroup, string, error) {
+	var v struct {
+		Groups []ec2SecurityGroup `xml:"securityGroupInfo>item"`
+		Next   string             `xml:"nextToken"`
+	}
+	if err := xml.Unmarshal(b, &v); err != nil {
+		return nil, "", fmt.Errorf("parse DescribeSecurityGroups: %w", err)
+	}
+	return v.Groups, v.Next, nil
+}
+
+// sgTagged reports whether the (first) group in a DescribeSecurityGroups
+// response carries spotexec's owner tag.
+func sgTagged(b []byte) bool {
+	gs, _, err := parseSecurityGroups(b)
+	return err == nil && len(gs) > 0 && gs[0].tag(tagOwner) != ""
+}
+
+// spotexecSGFilter selects spotexec's own security groups by name.
+func spotexecSGFilter() url.Values {
+	return url.Values{"Filter.1.Name": {"group-name"}, "Filter.1.Value.1": {sgBaseName}, "Filter.1.Value.2": {sgBaseName + "-*"}}
 }
 
 // vpcID returns the configured subnet's VPC, or the default VPC.

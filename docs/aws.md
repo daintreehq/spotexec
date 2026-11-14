@@ -64,23 +64,41 @@ Credentials resolve in this order:
 
 ## 3. Grant permissions
 
-`spotexec setup` attaches this policy to the user it creates. To grant it yourself, attach it to the identity you signed in with; `spotexec setup --print-policy > spotexec-policy.json` saves it. The first three statements are required.
+`spotexec setup` attaches this policy to the user it creates. To grant it yourself, attach it to the identity you signed in with; `spotexec setup --print-policy > spotexec-policy.json` saves it.
 
-The other five are optional:
-- S3, for the [dependency cache](environments.md#dependency-cache) (without it, set `cache_bucket = "off"` on the runner);
-- the two ECR statements, for Dockerfile-built [containers](environments.md#project-containers);
-- `servicequotas:GetServiceQuota`, for `doctor`'s quota check;
-- the last statement, for [image baking](environments.md#baked-images).
+The policy is scoped to what spotexec creates:
+- Reads (`ec2:Describe*`) are unconditional.
+- Every EC2 call that changes an existing resource (terminating or stopping an instance, imaging it, deregistering an AMI, deleting a snapshot, adding a rule to a security group) only works on resources tagged `spotexec-owner`.
+- Tags can only be applied while spotexec creates the resource (`ec2:CreateAction`), so the key can't tag an unrelated instance to get around the conditions. `RunInstances` is allowed only when the new instance and its volumes are requested with the `spotexec-owner` tag; the image, subnet and security groups it launches with needn't be spotexec's.
+- S3 and ECR access is limited to `spotexec-cache-*` buckets and `spotexec/*` repositories.
+
+So a leaked key can launch tagged VMs and manage spotexec's own resources, but can't terminate, image or open up anything else in the account.
+
+The S3 statement (the [dependency cache](environments.md#dependency-cache); without it, set `cache_bucket = "off"` on the runner) and the ECR statements (Dockerfile-built [containers](environments.md#project-containers)) are optional. Everything else is needed to launch and clean up VMs and to [bake images](environments.md#baked-images).
+
+The policy is attached inline, and an IAM user's inline policies are limited to 2,048 characters, which is why some statements group several actions. Re-running `spotexec setup` replaces the policy with the current version's. It also tags any `spotexec-ssh*` security group an older spotexec made without the tag. Until then, a VM can still launch into such a group if it already allows SSH from `ssh_cidr`, but spotexec can't add a rule to it.
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     { "Effect": "Allow", "Action": [
-        "ec2:RunInstances", "ec2:CreateTags", "ec2:DescribeInstances", "ec2:TerminateInstances",
-        "ec2:DescribeImages", "ec2:DescribeVpcs", "ec2:DescribeSubnets",
-        "ec2:DescribeSecurityGroups", "ec2:CreateSecurityGroup", "ec2:AuthorizeSecurityGroupIngress"
+        "ec2:Describe*", "ec2:CreateSecurityGroup", "ecr:GetAuthorizationToken", "servicequotas:GetServiceQuota"
       ], "Resource": "*" },
+    { "Effect": "Allow", "Action": "ec2:RunInstances",
+      "NotResource": ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"] },
+    { "Effect": "Allow", "Action": "ec2:RunInstances",
+      "Resource": ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"],
+      "Condition": { "Null": { "aws:RequestTag/spotexec-owner": "false" } } },
+    { "Effect": "Allow", "Action": "ec2:CreateTags", "Resource": "*",
+      "Condition": { "StringEquals": { "ec2:CreateAction": ["RunInstances", "CreateSecurityGroup", "CreateImage"] } } },
+    { "Effect": "Allow", "Action": [
+        "ec2:TerminateInstances", "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:StopInstances", "ec2:CreateImage", "ec2:DeregisterImage", "ec2:DeleteSnapshot"
+      ], "Resource": "*", "Condition": { "Null": { "aws:ResourceTag/spotexec-owner": "false" } } },
+    { "Effect": "Allow", "Action": ["ec2:AuthorizeSecurityGroupIngress", "ec2:CreateImage"], "Resource": [
+        "arn:aws:ec2:*:*:security-group-rule/*", "arn:aws:ec2:*::image/*", "arn:aws:ec2:*::snapshot/*"
+      ] },
     { "Effect": "Allow", "Action": "ssm:GetParameter",
       "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/*" },
     { "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
@@ -89,16 +107,11 @@ The other five are optional:
         "s3:CreateBucket", "s3:PutLifecycleConfiguration", "s3:ListBucket",
         "s3:GetObject", "s3:PutObject"
       ], "Resource": ["arn:aws:s3:::spotexec-cache-*", "arn:aws:s3:::spotexec-cache-*/*"] },
-    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
     { "Effect": "Allow", "Action": [
         "ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy",
         "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
         "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"
-      ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" },
-    { "Effect": "Allow", "Action": "servicequotas:GetServiceQuota", "Resource": "*" },
-    { "Effect": "Allow", "Action": [
-        "ec2:StopInstances", "ec2:CreateImage", "ec2:DeregisterImage", "ec2:DeleteSnapshot"
-      ], "Resource": "*" }
+      ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" }
   ]
 }
 ```
@@ -131,12 +144,12 @@ The `region` in your `~/.aws/config` profile is **not** used at run time, so set
 
 Pick the region that is:
 - **Closest to you.** Every run makes several SSH round trips (handshake, sync, streaming output, write-back). A nearby region keeps small commands under a second of overhead.
-- **Stocked with your instance types.** These lookups aren't in the spotexec policy, so run them from an admin session. For example, check that the region offers `c7a.xlarge`:
+- **Stocked with your instance types.** The spotexec policy allows these read-only `Describe*` lookups (add `--profile spotexec`). For example, check that the region offers `c7a.xlarge`:
   ```sh
   aws ec2 describe-instance-type-offerings --region us-east-2 \
     --filters Name=instance-type,Values=c7a.large,c7a.xlarge --query 'InstanceTypeOfferings[].InstanceType'
   ```
-- **Cheap and roomy for Spot.** Compare current prices, and ask AWS how likely a request is to be filled (scores 1–10):
+- **Cheap and roomy for Spot.** Compare current prices, and ask AWS how likely a request is to be filled (scores 1–10; `get-spot-placement-scores` isn't in the spotexec policy, so run it from an admin session):
   ```sh
   aws ec2 describe-spot-price-history --region us-east-2 --instance-types c7a.xlarge \
     --product-descriptions Linux/UNIX --start-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -253,7 +266,7 @@ If `up` fails, the error says why: a credential problem names the login command 
 | IAM user `spotexec-<hostname>` (path `/spotexec/`) with an inline `spotexec` policy and one access key | `spotexec setup` | Delete the user in IAM; also remove the `[spotexec]` profile from `~/.aws/credentials`. |
 | The region's default VPC | `spotexec setup`, only if the region had none | It's AWS's standard network and costs nothing; keep it. |
 | Spot instances tagged `spotexec-runner` / `spotexec-owner` | On demand | They terminate themselves; `spotexec down` terminates them now. |
-| Security group `spotexec-ssh` (`spotexec-ssh-<hash>` for a custom `ssh_cidr`, one per VPC) | First launch without `security_group_ids` | Delete by hand if you stop using spotexec. |
+| Security group `spotexec-ssh` (`spotexec-ssh-<hash>` for a custom `ssh_cidr`, one per VPC), tagged `spotexec-owner` | First launch without `security_group_ids` | Delete by hand if you stop using spotexec. |
 | S3 bucket `spotexec-cache-<account>-<region>` | First run with `[deps]` (unless `cache_bucket = "off"`) | Objects expire after 14 days. |
 | ECR repositories `spotexec/<repo-id>` | First Dockerfile build | Keeps the newest 10 images. |
 | AMIs and snapshots | `spotexec image bake` | `spotexec image clear`. |
