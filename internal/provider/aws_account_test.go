@@ -33,6 +33,7 @@ type fakeAccount struct {
 	stsFail      map[string]bool                          // GetCallerIdentity fails in these regions
 	notFoundOnce map[string]bool                          // the first DescribeInstances by id says NotFound
 	users        map[string]map[string]string             // IAM user -> tags (all under /spotexec/)
+	userPaths    map[string]string                        // IAM user -> path, when not /spotexec/
 	keys         map[string][2]string                     // access key -> user, status
 	log          []string                                 // IAM and EC2 mutations, in order
 	late         map[string][]fakeAcctInstance            // region -> instances that appear from the third listing on
@@ -40,15 +41,20 @@ type fakeAccount struct {
 	listings     map[string]int                           // key+region -> DescribeInstances listings so far
 	stuck        bool                                     // terminating instances never finish
 	filters      url.Values
+	// extra serves anything else first (S3, ECR, more EC2); true = handled.
+	extra func(w http.ResponseWriter, r *http.Request, key, region, service string, body []byte) bool
 }
 
 func (f *fakeAccount) install(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		m := regexp.MustCompile(`Credential=([^/]+)/[^/]+/([^/]+)/`).FindStringSubmatch(r.Header.Get("Authorization"))
+		m := regexp.MustCompile(`Credential=([^/]+)/[^/]+/([^/]+)/([^/]+)/`).FindStringSubmatch(r.Header.Get("Authorization"))
 		key, region := m[1], m[2]
 		body, _ := io.ReadAll(r.Body)
+		if _, ok := f.accounts[key]; ok && f.extra != nil && f.extra(w, r, key, region, m[3], body) {
+			return
+		}
 		v, _ := url.ParseQuery(string(body))
 		fail := func(code string) {
 			w.WriteHeader(400)
@@ -79,7 +85,11 @@ func (f *fakeAccount) install(t *testing.T) {
 			for k, val := range tags {
 				fmt.Fprintf(&b, `<member><Key>%s</Key><Value>%s</Value></member>`, k, val)
 			}
-			fmt.Fprintf(w, `<GetUserResponse><GetUserResult><User><Arn>arn:aws:iam::%s:user/spotexec/%s</Arn><Tags>%s</Tags></User></GetUserResult></GetUserResponse>`, acct, iamUser, b.String())
+			path := "/spotexec/"
+			if pp := f.userPaths[iamUser]; pp != "" {
+				path = pp
+			}
+			fmt.Fprintf(w, `<GetUserResponse><GetUserResult><User><Arn>arn:aws:iam::%s:user%s%s</Arn><Tags>%s</Tags></User></GetUserResult></GetUserResponse>`, acct, path, iamUser, b.String())
 		case "ListAccessKeys":
 			var b strings.Builder
 			for id, k := range f.keys {
@@ -100,6 +110,16 @@ func (f *fakeAccount) install(t *testing.T) {
 		case "DeleteUserPolicy":
 			f.log = append(f.log, "DeleteUserPolicy "+iamUser)
 			fmt.Fprint(w, `<DeleteUserPolicyResponse/>`)
+		case "ListUsers":
+			var b strings.Builder
+			for name := range f.users {
+				path := "/spotexec/"
+				if pp := f.userPaths[name]; pp != "" {
+					path = pp
+				}
+				fmt.Fprintf(&b, `<member><UserName>%s</UserName><Path>%s</Path></member>`, name, path)
+			}
+			fmt.Fprintf(w, `<ListUsersResponse><ListUsersResult><Users>%s</Users><IsTruncated>false</IsTruncated></ListUsersResult></ListUsersResponse>`, b.String())
 		case "DeleteUser":
 			delete(f.users, iamUser)
 			f.log = append(f.log, "DeleteUser "+iamUser)
@@ -109,7 +129,11 @@ func (f *fakeAccount) install(t *testing.T) {
 				fail("RegionDisabledException")
 				return
 			}
-			fmt.Fprintf(w, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>%s</Account><Arn>arn:aws:iam::%s:user/x</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>`, acct, acct)
+			who := "x"
+			if key == "AK-spotexec" {
+				who = "spotexec/spotexec-mac" // a machine's own key
+			}
+			fmt.Fprintf(w, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>%s</Account><Arn>arn:aws:iam::%s:user/%s</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>`, acct, acct, who)
 		case "DescribeInstances":
 			listing := v.Get("InstanceId.1") == ""
 			if listing {
@@ -129,8 +153,8 @@ func (f *fakeAccount) install(t *testing.T) {
 					f.instances[key][region][i].state = "terminated"
 					continue
 				}
-				if listing && in.state == "terminated" {
-					continue
+				if listing && in.state == "terminated" || listing && in.tags[tagRunner] == "" && in.tags[tagBake] == "" {
+					continue // (the tag-key filter)
 				}
 				if id := v.Get("InstanceId.1"); id == "" || id == in.id {
 					b.WriteString(item(in))
@@ -175,13 +199,16 @@ func (f *fakeAccount) install(t *testing.T) {
 		f.listings = map[string]int{}
 	}
 	oldEP, oldRes, oldWait, oldSettle, oldQuiet := accountEndpoints, accountResolver, revokeWait, revokeSettle, revokeQuiet
+	oldTWait, oldTPoll := teardownWait, teardownPoll
 	revokeWait, revokeSettle, revokeQuiet = 2*time.Second, time.Millisecond, 20*time.Millisecond
-	accountEndpoints = map[string]string{"ec2": srv.URL, "sts": srv.URL, "iam": srv.URL}
+	teardownWait, teardownPoll = 2*time.Second, time.Millisecond
+	accountEndpoints = map[string]string{"ec2": srv.URL, "sts": srv.URL, "iam": srv.URL, "ecr": srv.URL, "s3": srv.URL}
 	accountResolver = func(profile string) *awsCredResolver {
 		return staticResolver(awsCreds{AccessKeyID: "AK-" + profile, SecretAccessKey: "s"})
 	}
 	t.Cleanup(func() {
 		accountEndpoints, accountResolver, revokeWait, revokeSettle, revokeQuiet = oldEP, oldRes, oldWait, oldSettle, oldQuiet
+		teardownWait, teardownPoll = oldTWait, oldTPoll
 	})
 	dir := t.TempDir()
 	t.Setenv("SPOTEXEC_CONFIG_DIR", dir)

@@ -25,6 +25,7 @@ spotexec image list [runner]                 baked AMIs from every machine: base
 spotexec image clear [runner] [--all]        delete this machine's and this bootstrap's bakes (--all: every machine's)
 spotexec setup [host...] [--all] [--bake]    set up this machine (config, AWS user and key, hooks), then others over SSH; offer a bake
 spotexec setup --list | --revoke HOST        every machine's IAM user and VMs; revoke one
+spotexec teardown [--dry-run] [--region R]   remove everything spotexec created in the AWS account (admin)
 spotexec doctor [runner...]                  verify config, SSH, helper, credentials, network, quota
 spotexec unlock [runner[/id]] (--slot N | --all)
 spotexec prune [runner[/id]...] [--older-than 7d] [--dry-run]

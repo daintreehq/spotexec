@@ -1043,20 +1043,7 @@ func RevokeMachine(ctx context.Context, adminProfile, user string, regions []str
 		return fmt.Errorf("%w; IAM user %s was kept (its keys are deactivated) so its VMs can still be found: fix this and run `spotexec setup --revoke %s` again", err, user, user)
 	}
 
-	for _, k := range keys {
-		if err := deleteAccessKey(ctx, admin, user, k.ID); err != nil {
-			return err
-		}
-		log("deleted access key %s", k.ID)
-	}
-	if _, err := admin.query(ctx, "iam", iamAPIVersion, "DeleteUserPolicy", url.Values{"UserName": {user}, "PolicyName": {"spotexec"}}); err != nil && awsCode(err) != "NoSuchEntity" {
-		return iamHint(fmt.Errorf("deleting %s's policy: %w", user, err))
-	}
-	if _, err := admin.query(ctx, "iam", iamAPIVersion, "DeleteUser", url.Values{"UserName": {user}}); err != nil {
-		return iamHint(fmt.Errorf("deleting IAM user %s: %w", user, err))
-	}
-	log("deleted IAM user %s", user)
-	return nil
+	return deleteIAMUser(ctx, admin, user, log)
 }
 
 // How long revoking waits for a machine's VMs to be gone, how often it
@@ -1068,8 +1055,8 @@ var (
 	revokeQuiet  = 30 * time.Second
 )
 
-// stopMachineVMs terminates every spotexec instance owned by machine m and
-// waits until none is left: the search must stay empty for revokeQuiet
+// stopMachineVMs terminates every spotexec instance owned by machine m
+// (any machine's when m is "") and waits until none is left: the search must stay empty for revokeQuiet
 // (so a launch the machine's key got in just before it was deactivated
 // still turns up), and every instance it asked to terminate must be seen
 // terminated, not merely missing from a listing.
@@ -1082,7 +1069,7 @@ func stopMachineVMs(ctx context.Context, adminProfile, m string, regions []strin
 		var errs, left []string
 		listed := map[string]bool{}
 		for _, in := range search.Instances {
-			if in.Owner != m {
+			if m != "" && in.Owner != m {
 				continue
 			}
 			listed[in.ID] = true
