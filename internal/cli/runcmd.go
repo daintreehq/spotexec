@@ -336,6 +336,9 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	if len(res.Conflicts) > 0 {
 		summary += fmt.Sprintf(" · %d conflict%s", len(res.Conflicts), plural(len(res.Conflicts)))
 	}
+	if s.syncOnly && res.Image != "" {
+		summary += " · image " + res.Image
+	}
 	if res.ExitCode != 0 {
 		summary += fmt.Sprintf(" · exit %d", res.ExitCode)
 	}

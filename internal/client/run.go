@@ -87,6 +87,7 @@ type Result struct {
 	Pulled    int      `json:"pulled"`
 	Synced    int      `json:"synced_files"`
 	SyncBytes int64    `json:"synced_bytes"`
+	Image     string   `json:"image,omitempty"` // the project container image used
 }
 
 // InfraError marks failures of spotexec itself (exit 125).
@@ -290,6 +291,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root"}
 		imageID = id
 		lastRun.Image = ref
+		res.Image = ref
 	}
 	recordLastRun()
 
@@ -814,6 +816,11 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read 
 	}
 	df, ok := m.ByPath[dockerfile]
 	if !ok {
+		if read != nil {
+			if _, err := read(dockerfile); err == nil {
+				return "", fmt.Errorf("container.dockerfile %q exists but is not synced: it is gitignored, excluded, or untracked in a directory spotexec only syncs once Git tracks it (such as .spotexec/); run `git add %s`", dockerfile, dockerfile)
+			}
+		}
 		return "", fmt.Errorf("container.dockerfile %q is not in the synced working set", dockerfile)
 	}
 	if df.Mode == fsid.ModeSymlink {

@@ -523,7 +523,7 @@ var ReservedTaskNames = map[string]bool{
 	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
 	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
 	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
-	"completion": true, "sim": true, "image": true, "daemon": true,
+	"completion": true, "sim": true, "image": true, "daemon": true, "container": true,
 }
 
 // globalOnlyKeys are runner settings a project (.spotexec.toml) may not set.
