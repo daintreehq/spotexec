@@ -297,11 +297,14 @@ func cmdHook() *cobra.Command {
 					fmt.Printf("%s: %s\n", p, map[bool]string{true: "removed spotexec hook", false: "no spotexec hook found"}[ok])
 				} else {
 					hookCmd := transportQuote(hookBinary()) + " hook claude"
+					legacy := hooks.HasLegacyClaude(p)
 					ok, err := hooks.InstallClaude(p, hookCmd)
 					if err != nil {
 						return err
 					}
-					if ok {
+					if ok && legacy {
+						fmt.Printf("updated the PreToolUse hook in %s to call spotexec (sx only runs commands)\n", p)
+					} else if ok {
 						fmt.Printf("installed PreToolUse hook in %s\n", p)
 					} else {
 						fmt.Printf("hook already present in %s\n", p)
@@ -354,9 +357,7 @@ func cmdHook() *cobra.Command {
 		Use:    "claude",
 		Short:  "PreToolUse hook handler (reads the event JSON on stdin)",
 		Hidden: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			hooks.HandleClaude(os.Stdin, os.Stdout, transportQuote(hookBinary()))
-		},
+		Run:    func(*cobra.Command, []string) { claudeHook() },
 	}
 	check := &cobra.Command{
 		Use:                "check <command>",
@@ -399,6 +400,11 @@ func cmdHook() *cobra.Command {
 	}
 	c.AddCommand(install, handler, check)
 	return c
+}
+
+// claudeHook handles one Claude Code PreToolUse event on stdin.
+func claudeHook() {
+	hooks.HandleClaude(os.Stdin, os.Stdout, transportQuote(hookBinary()))
 }
 
 func transportQuote(s string) string {

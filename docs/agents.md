@@ -57,4 +57,6 @@ The `[hook]` table tunes it:
 - `mode = "block"` denies the command with instructions, instead of rewriting it;
 - `disabled = true` turns it off.
 
+A hook that v0.2.0 installed as `sx hook claude` still works the same way; `spotexec setup` and `spotexec hook install` rewrite it in place to call `spotexec`.
+
 `spotexec hook install --codex` appends an `AGENTS.md` section for Codex and other harnesses without hooks. `--uninstall` removes either one.

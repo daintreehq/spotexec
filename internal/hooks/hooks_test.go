@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -127,5 +128,117 @@ func TestCdsInside(t *testing.T) {
 		if got := cdsInside(cmd, root); got != want {
 			t.Errorf("cdsInside(%q) = %v, want %v", cmd, got, want)
 		}
+	}
+}
+
+func TestHookForm(t *testing.T) {
+	for cmd, want := range map[string]int{
+		"spotexec hook claude":                      hookCurrent,
+		"/opt/homebrew/bin/spotexec hook claude":    hookCurrent,
+		"'/Users/me/my tools/spotexec' hook claude": hookCurrent,
+		"sx hook claude":                            hookLegacy,
+		"/opt/homebrew/bin/sx hook claude":          hookLegacy,
+		"'/Users/me/my tools/sx' hook claude":       hookLegacy,
+		"/Users/me/spotexec/bin/sx hook claude":     hookLegacy,
+		"my-sx hook claude":                         hookNone,
+		"other-tool check":                          hookNone,
+	} {
+		if got := hookForm(cmd); got != want {
+			t.Errorf("hookForm(%q) = %d, want %d", cmd, got, want)
+		}
+	}
+}
+
+func TestInstallRewritesLegacySxHook(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "settings.json")
+	os.WriteFile(p, []byte(`{
+  "model": "x",
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Edit", "hooks": [{"type": "command", "command": "lint-on-edit"}]},
+      {"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "audit-bash"},
+        {"type": "command", "command": "/opt/homebrew/bin/sx hook claude", "timeout": 10}
+      ]}
+    ],
+    "Stop": [{"hooks": [{"type": "command", "command": "notify"}]}]
+  }
+}`), 0o644)
+	if !HasClaude(p) || !HasLegacyClaude(p) {
+		t.Fatal("legacy hook not recognised")
+	}
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || !ok {
+		t.Fatal("legacy hook not rewritten", ok, err)
+	}
+	if HasLegacyClaude(p) || !HasClaude(p) {
+		t.Fatal("legacy hook still present after install")
+	}
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || ok {
+		t.Fatal("second install should be a no-op", ok, err)
+	}
+	b, _ := os.ReadFile(p)
+	var s struct {
+		Model string `json:"model"`
+		Hooks map[string][]struct {
+			Matcher string           `json:"matcher"`
+			Hooks   []map[string]any `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(b, &s); err != nil {
+		t.Fatal(err)
+	}
+	pre := s.Hooks["PreToolUse"]
+	if s.Model != "x" || len(s.Hooks["Stop"]) != 1 || len(pre) != 2 || pre[0].Hooks[0]["command"] != "lint-on-edit" {
+		t.Fatalf("lost existing settings:\n%s", b)
+	}
+	bash := pre[1].Hooks
+	if pre[1].Matcher != "Bash" || len(bash) != 2 || bash[0]["command"] != "audit-bash" ||
+		bash[1]["command"] != "spotexec hook claude" || bash[1]["timeout"] != float64(10) {
+		t.Fatalf("legacy entry not rewritten in place:\n%s", b)
+	}
+}
+
+func TestInstallDropsLegacyBesideCurrent(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "settings.json")
+	os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[
+	  {"matcher":"Bash","hooks":[{"type":"command","command":"spotexec hook claude"},{"type":"command","command":"sx hook claude"}]}
+	]}}`), 0o644)
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	b, _ := os.ReadFile(p)
+	if strings.Count(string(b), "hook claude") != 1 || strings.Contains(string(b), "sx hook") {
+		t.Fatalf("want one spotexec entry, got:\n%s", b)
+	}
+}
+
+// Legacy entries are rewritten where they are: a spotexec hook under another
+// matcher must not cost the Bash entry its hook.
+func TestInstallRewritesEachLegacyEntry(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "settings.json")
+	os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[
+	  {"matcher":"Edit","hooks":[{"type":"command","command":"spotexec hook claude"}]},
+	  {"matcher":"Bash","hooks":[{"type":"command","command":"sx hook claude"}]},
+	  {"matcher":"Bash","hooks":[{"type":"command","command":"audit && sx hook claude"}]}
+	]}}`), 0o644)
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	b, _ := os.ReadFile(p)
+	var s struct {
+		Hooks struct {
+			Pre []struct {
+				Matcher string `json:"matcher"`
+				Hooks   []struct {
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"PreToolUse"`
+		} `json:"hooks"`
+	}
+	json.Unmarshal(b, &s)
+	pre := s.Hooks.Pre
+	if len(pre) != 3 || pre[1].Matcher != "Bash" || len(pre[1].Hooks) != 1 || pre[1].Hooks[0].Command != "spotexec hook claude" ||
+		pre[2].Hooks[0].Command != "audit && sx hook claude" {
+		t.Fatalf("got:\n%s", b)
 	}
 }

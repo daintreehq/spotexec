@@ -398,33 +398,90 @@ func LoadPerCPU() (float64, error) {
 	return l / float64(runtime.NumCPU()), nil
 }
 
-// HasClaude reports whether a Claude Code settings file has the hook.
-func HasClaude(settingsPath string) bool {
-	b, err := os.ReadFile(settingsPath)
-	if err != nil {
-		return false
+// Hook command forms in a Claude Code settings file.
+const (
+	hookNone    = iota
+	hookCurrent // calls spotexec
+	hookLegacy  // calls sx, as v0.2.0 could install it
+)
+
+// hookForm classifies a PreToolUse hook command.
+func hookForm(cmd string) int {
+	cmd = strings.TrimSpace(cmd)
+	if bin, ok := strings.CutSuffix(cmd, " hook claude"); ok {
+		bin = strings.TrimSpace(bin)
+		// Only the single executable the installer wrote: a compound line
+		// (`audit && sx hook claude`) is the user's own and not ours to rewrite.
+		quoted := len(bin) >= 2 && (bin[0] == '\'' || bin[0] == '"') && bin[len(bin)-1] == bin[0]
+		if quoted {
+			bin = strings.ReplaceAll(bin[1:len(bin)-1], `'\''`, "'")
+		}
+		if (quoted || !strings.ContainsAny(bin, " \t;&|()<>$`'\"\\")) && filepath.Base(bin) == "sx" {
+			return hookLegacy
+		}
 	}
-	var settings map[string]any
-	if json.Unmarshal(b, &settings) != nil {
-		return false
+	if strings.Contains(cmd, "hook claude") && strings.Contains(cmd, "spotexec") {
+		return hookCurrent
 	}
+	return hookNone
+}
+
+// claudeHooks returns the hook objects of every PreToolUse entry.
+func claudeHooks(settings map[string]any) []map[string]any {
 	hooks, _ := settings["hooks"].(map[string]any)
 	pre, _ := hooks["PreToolUse"].([]any)
+	var out []map[string]any
 	for _, e := range pre {
 		em, _ := e.(map[string]any)
 		hs, _ := em["hooks"].([]any)
 		for _, h := range hs {
-			hm, _ := h.(map[string]any)
-			if c, _ := hm["command"].(string); strings.Contains(c, "hook claude") && strings.Contains(c, "spotexec") || strings.HasSuffix(c, "sx hook claude") {
-				return true
+			if hm, ok := h.(map[string]any); ok {
+				out = append(out, hm)
 			}
+		}
+	}
+	return out
+}
+
+func readSettings(settingsPath string) (map[string]any, bool) {
+	b, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return nil, false
+	}
+	var settings map[string]any
+	if json.Unmarshal(b, &settings) != nil {
+		return nil, false
+	}
+	return settings, true
+}
+
+func hasForm(settingsPath string, form int) bool {
+	settings, ok := readSettings(settingsPath)
+	if !ok {
+		return false
+	}
+	for _, hm := range claudeHooks(settings) {
+		if c, _ := hm["command"].(string); hookForm(c) == form {
+			return true
 		}
 	}
 	return false
 }
 
+// HasClaude reports whether a Claude Code settings file has the hook, in
+// either form (a legacy `sx hook claude` entry still works).
+func HasClaude(settingsPath string) bool {
+	return hasForm(settingsPath, hookCurrent) || hasForm(settingsPath, hookLegacy)
+}
+
+// HasLegacyClaude reports whether a Claude Code settings file has a hook
+// that calls `sx hook claude`, which InstallClaude rewrites to spotexec.
+func HasLegacyClaude(settingsPath string) bool { return hasForm(settingsPath, hookLegacy) }
+
 // InstallClaude adds the PreToolUse hook to a Claude Code settings file,
-// preserving everything else. It is idempotent.
+// preserving everything else. It is idempotent. A legacy `sx hook claude`
+// entry is rewritten in place to hookCmd (or dropped, when a spotexec entry
+// is already there). It reports whether the file changed.
 func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 	settings := map[string]any{}
 	if b, err := os.ReadFile(settingsPath); err == nil && len(strings.TrimSpace(string(b))) > 0 {
@@ -437,20 +494,46 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 		hooks = map[string]any{}
 	}
 	pre, _ := hooks["PreToolUse"].([]any)
+	current, changed := false, false
 	for _, e := range pre {
 		em, _ := e.(map[string]any)
 		hs, _ := em["hooks"].([]any)
+		// Each legacy command is rewritten in place, keeping its matcher and
+		// options, unless its own entry already calls spotexec.
+		has := false
 		for _, h := range hs {
 			hm, _ := h.(map[string]any)
-			if c, _ := hm["command"].(string); strings.Contains(c, "hook claude") && strings.Contains(c, "spotexec") || strings.HasSuffix(c, "sx hook claude") {
-				return false, nil
+			if c, _ := hm["command"].(string); hookForm(c) == hookCurrent {
+				has, current = true, true
 			}
 		}
+		var keepHooks []any
+		for _, h := range hs {
+			hm, _ := h.(map[string]any)
+			if c, _ := hm["command"].(string); hookForm(c) == hookLegacy {
+				changed, current = true, true
+				if has {
+					continue
+				}
+				hm["command"] = hookCmd
+				has = true
+			}
+			keepHooks = append(keepHooks, h)
+		}
+		if len(keepHooks) != len(hs) {
+			em["hooks"] = keepHooks
+		}
 	}
-	pre = append(pre, map[string]any{
-		"matcher": "Bash",
-		"hooks":   []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}},
-	})
+	if !current {
+		pre = append(pre, map[string]any{
+			"matcher": "Bash",
+			"hooks":   []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}},
+		})
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
 	hooks["PreToolUse"] = pre
 	settings["hooks"] = hooks
 	b, err := json.MarshalIndent(settings, "", "  ")

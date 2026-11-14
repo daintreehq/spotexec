@@ -234,6 +234,12 @@ func cmdTasks() *cobra.Command {
 
 // sxMain is `sx [flags] <command...>` / `sx <task> [args...]`.
 func sxMain(args []string) int {
+	// v0.2.0 could install the Claude Code hook as `sx hook claude`. That
+	// line is the hook handler, never a command to run remotely.
+	if len(args) == 2 && args[0] == "hook" && args[1] == "claude" {
+		claudeHook()
+		return 0
+	}
 	var f runFlags
 	fs := pflag.NewFlagSet("sx", pflag.ContinueOnError)
 	fs.SetInterspersed(false)

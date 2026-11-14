@@ -388,6 +388,15 @@ func setRunnerProfileText(text string, runners []string, profile string) (string
 func setupClaudeHook(yes, skip bool) bool {
 	home, _ := os.UserHomeDir()
 	p := filepath.Join(home, ".claude", "settings.json")
+	if !skip && hooks.HasLegacyClaude(p) {
+		// Installed by v0.2.0 as `sx hook claude`; sx only runs commands now.
+		if _, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
+			fmt.Printf("! couldn't update the Claude Code hook: %v\n", err)
+		} else {
+			fmt.Printf("✓ updated the Claude Code hook in %s to call spotexec\n", p)
+			return true
+		}
+	}
 	if hooks.HasClaude(p) {
 		fmt.Printf("✓ Claude Code hook in %s\n", p)
 		return true
