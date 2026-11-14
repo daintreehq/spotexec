@@ -108,10 +108,16 @@ and keeps a working key. --rotate replaces the key.
 				}
 				// Every region the runners use: each needs a network and quota.
 				var regions, vpcRegions []string
+				homeOff := false // the first runner's home region isn't enabled
 				need := map[string]int{}
 				ownNet := map[string]bool{}
 				for _, r := range aws {
 					if r.AnyRegion() {
+						if r == aws[0] {
+							if all, err := provider.EnabledRegions(cmd.Context(), adminProfile, r.Region); err == nil && !slices.Contains(all, region) {
+								homeOff = true // check the new key where it can work (below)
+							}
+						}
 						// Every enabled region: launches skip regions that
 						// lack a default VPC or quota, so none is prepared.
 						fmt.Printf("  %s launches in any enabled region; regions without a default VPC or Spot quota are skipped automatically\n", r.Name)
@@ -120,6 +126,17 @@ and keeps a working key. --rotate replaces the key.
 					rs := []string{r.Region}
 					if r.MultiRegion() {
 						rs = r.Regions
+						if all, err := provider.EnabledRegions(cmd.Context(), adminProfile, r.Region, r.Regions...); err == nil {
+							rs = provider.FilterEnabled(r.Regions, all)
+							for _, rg := range r.Regions {
+								if !slices.Contains(rs, rg) {
+									fmt.Printf("  %s isn't enabled in this AWS account, so %s's launches skip it (enable it in the AWS console under Account > AWS Regions)\n", rg, r.Name)
+								}
+							}
+							if r == aws[0] && !slices.Contains(rs, region) {
+								homeOff = true // check the new key where it can work (below)
+							}
+						}
 					}
 					for _, rg := range rs {
 						if _, seen := need[rg]; !seen {
@@ -128,6 +145,14 @@ and keeps a working key. --rotate replaces the key.
 						// The whole fleet may land in any one of them.
 						need[rg] += r.MaxInstances * provider.VCPUsOf(r.InstanceTypes[0])
 						ownNet[rg] = ownNet[rg] || r.SubnetID != ""
+					}
+				}
+				if homeOff {
+					switch {
+					case len(regions) > 0:
+						region = regions[0]
+					default:
+						region = "us-east-1" // no account can disable it
 					}
 				}
 				for _, rg := range regions {
@@ -618,15 +643,24 @@ func awsRegions(ctx context.Context, adminProfile string) ([]string, error) {
 		}
 	}
 	for _, r := range awsRunners(g) {
-		add(r.Region)
-		add(r.Regions...)
 		add(provider.KnownRegions(r)...)
-		if r.AnyRegion() {
-			all, err := provider.EnabledRegions(ctx, adminProfile, r.Region)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("runner %s uses every region, but the account's regions couldn't be listed: %w", r.Name, err))
-			}
+		if !r.MultiRegion() {
+			add(r.Region)
+			continue
+		}
+		all, err := provider.EnabledRegions(ctx, adminProfile, r.Region, r.Regions...)
+		switch {
+		case err != nil && r.AnyRegion():
+			add(r.Region)
+			errs = append(errs, fmt.Errorf("runner %s uses every region, but the account's regions couldn't be listed: %w", r.Name, err))
+		case err != nil:
+			add(r.Regions...) // can't tell which are enabled
+		case r.AnyRegion():
 			add(all...)
+		default:
+			// Listed regions the account hasn't enabled can't hold VMs
+			// (and some never answer).
+			add(provider.FilterEnabled(r.Regions, all)...)
 		}
 	}
 	// "all" is not a region.

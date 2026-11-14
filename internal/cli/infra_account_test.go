@@ -3,6 +3,9 @@ package cli
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -54,7 +57,7 @@ func TestAccountScopesMultiRegion(t *testing.T) {
 	old := enabledRegions
 	t.Cleanup(func() { enabledRegions = old })
 	var fail error
-	enabledRegions = func(_ context.Context, profile, home string) ([]string, error) {
+	enabledRegions = func(_ context.Context, profile, home string, _ ...string) ([]string, error) {
 		if fail != nil {
 			return nil, fail
 		}
@@ -139,4 +142,51 @@ func TestDownAccount(t *testing.T) {
 			t.Fatalf("terminated %v", *term)
 		}
 	})
+}
+
+// An explicit region list is searched only where the account has the
+// region enabled (the rest can't hold VMs and some never answer), except
+// a region this machine's placement state says may still hold VMs; when
+// the enabled regions can't be read, the list is searched as configured.
+func TestAccountScopesFiltersNotEnabled(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	old := enabledRegions
+	t.Cleanup(func() { enabledRegions = old })
+	var fail error
+	enabledRegions = func(_ context.Context, _, _ string, _ ...string) ([]string, error) {
+		if fail != nil {
+			return nil, fail
+		}
+		return []string{"eu-north-1", "us-east-1"}, nil
+	}
+	cfg := accountCfg()
+	m := &config.Runner{Name: "m", Type: config.TypeAWSSpot, Region: "me-south-1", Regions: []string{"me-south-1", "eu-north-1", "ap-south-2"}, Profile: "a"}
+	cfg.Global.Runners = map[string]*config.Runner{"m": m}
+	scopes := func() string {
+		sc, _ := accountScopes(context.Background(), cfg)
+		var got []string
+		for _, s := range sc {
+			got = append(got, s.Region)
+		}
+		sort.Strings(got)
+		return strings.Join(got, ",")
+	}
+	if got := scopes(); got != "eu-north-1" {
+		t.Fatalf("scopes %s, want only the enabled eu-north-1", got)
+	}
+	// A region the placement state remembers is searched regardless.
+	dir := provider.RunnerStateDir("m")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "placement.json"), []byte(`{"active":{"ap-south-2":"2099-01-01T00:00:00Z"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := scopes(); got != "ap-south-2,eu-north-1" {
+		t.Fatalf("scopes %s, want the remembered ap-south-2 kept", got)
+	}
+	fail = errors.New("throttled")
+	if got := scopes(); got != "ap-south-2,eu-north-1,me-south-1" {
+		t.Fatalf("scopes %s, want the list as configured", got)
+	}
 }

@@ -118,6 +118,12 @@ type Daemon struct {
 	started time.Time
 	actions []string
 	log     func(string, ...any)
+	// installing: instance IDs whose helper is being uploaded in the
+	// background (a first contact over a slow link outlasts a probe round).
+	installing sync.Map
+	// installed: instance IDs whose helper this daemon installed (in case
+	// the local install markers couldn't be written).
+	installed sync.Map
 }
 
 // guard serialises Lock and Running, so Running's probe of daemon.lock never
@@ -600,9 +606,17 @@ func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instan
 		wg.Add(1)
 		go func(in provider.Instance) {
 			defer wg.Done()
+			c := transport.New(in.Target, fl.r.WorkRoot)
+			if _, done := d.installed.Load(in.ID); !done && !c.HelperInstalled() {
+				// A first contact uploads the helper, which over a slow link
+				// can outlast this round: install it in the background (once
+				// per VM) and probe once it's there, so a slow upload neither
+				// restarts every round nor holds up the round's other work.
+				d.installHelper(ctx, c, in.ID)
+				return
+			}
 			pctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 			defer cancel()
-			c := transport.New(in.Target, fl.r.WorkRoot)
 			if err := c.EnsureMaster(pctx); err != nil {
 				return
 			}
@@ -688,4 +702,23 @@ func (d *Daemon) countFailure(fl *fleet, id string) {
 		fl.counted[id] = true
 	}
 	fl.failures = append(fl.failures, time.Now())
+}
+
+// installHelper uploads the helper to a VM in the background, unless an
+// upload to it is already under way.
+func (d *Daemon) installHelper(ctx context.Context, c *transport.Client, id string) {
+	if _, busy := d.installing.LoadOrStore(id, true); busy {
+		return
+	}
+	go func() {
+		defer d.installing.Delete(id)
+		ictx, cancel := context.WithTimeout(ctx, 25*time.Second+transport.HelperUploadBudget)
+		defer cancel()
+		if err := c.EnsureMaster(ictx); err != nil {
+			return
+		}
+		if _, err := c.EnsureHelper(ictx, false); err == nil {
+			d.installed.Store(id, true)
+		}
+	}()
 }

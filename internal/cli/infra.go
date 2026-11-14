@@ -1008,17 +1008,23 @@ func accountScopes(ctx context.Context, cfg *config.Config) ([]provider.AccountS
 		// its region, its list of regions (or, for "all", every region
 		// enabled in the account), and any its placement state records.
 		regions := append([]string{r.Region}, r.Regions...)
-		regions = append(regions, provider.KnownRegions(r)...)
-		if r.AnyRegion() {
-			all, err := enabledRegions(ctx, r.Profile, r.Region)
-			if err != nil {
+		if r.MultiRegion() {
+			all, err := enabledRegions(ctx, r.Profile, r.Region, r.Regions...)
+			switch {
+			case err != nil && r.AnyRegion():
 				failed = append(failed, provider.AccountScopeError{
 					AccountScope: provider.AccountScope{Region: config.AllRegions, Profile: r.Profile},
 					Err:          fmt.Sprintf("runner %s uses every region, but the account's regions couldn't be listed: %v", r.Name, err),
 				})
+			case err == nil && r.AnyRegion():
+				regions = all
+			case err == nil:
+				// Listed regions the account hasn't enabled can't hold VMs
+				// (and some never answer).
+				regions = provider.FilterEnabled(r.Regions, all)
 			}
-			regions = append(regions, all...)
 		}
+		regions = append(regions, provider.KnownRegions(r)...)
 		for _, rg := range regions {
 			sc := provider.AccountScope{Region: rg, Profile: r.Profile}
 			if rg == "" || rg == config.AllRegions || seen[sc] {

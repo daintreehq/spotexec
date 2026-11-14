@@ -277,6 +277,9 @@ func (r *Runner) applyDefaults() error {
 		if r.Region == "" {
 			r.Region = firstNonEmpty(os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"), "us-east-1")
 		}
+		if strings.HasPrefix(r.Region, "cn-") {
+			return fmt.Errorf("region %q: the AWS China regions aren't supported", r.Region)
+		}
 		if len(r.InstanceTypes) == 0 {
 			r.InstanceTypes = []string{"c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"} // the starter template's 8-vCPU types
 		}
@@ -410,8 +413,21 @@ func (r *Runner) normalizeRegions() error {
 			return fmt.Errorf("regions: invalid region %q", rg)
 		case seen[rg]:
 			return fmt.Errorf("regions: %q is listed twice", rg)
+		case strings.HasPrefix(rg, "cn-"):
+			return fmt.Errorf("regions: %q: the AWS China regions aren't supported", rg)
 		}
 		seen[rg] = true
+	}
+	// One set of credentials works in one partition: GovCloud regions can't
+	// share a list with the others.
+	gov := 0
+	for _, rg := range r.Regions {
+		if strings.HasPrefix(rg, "us-gov-") {
+			gov++
+		}
+	}
+	if gov > 0 && gov < len(r.Regions) {
+		return errors.New("regions: GovCloud (us-gov-*) and other regions can't be mixed: they need separate AWS accounts; define a runner for each")
 	}
 	if len(r.Regions) == 1 && r.Regions[0] != AllRegions {
 		if r.Region != "" && r.Region != r.Regions[0] {

@@ -422,6 +422,40 @@ func (c *Client) runWithin(ctx context.Context, d time.Duration, remoteCmd strin
 
 // EnsureHelper makes sure the right helper is installed and returns the
 // remote command prefix that invokes it.
+// HelperUploadBudget is the extra time a first contact gets to upload the
+// helper (a few MB): over a slow link that alone can take most of a short
+// probe deadline, and an upload cut short is started over from nothing.
+const HelperUploadBudget = 2 * time.Minute
+
+// HelperInstalled reports whether this exact helper was installed on the
+// target before (so connecting needs no upload). It makes no remote call.
+func (c *Client) HelperInstalled() bool {
+	_, ok := c.installedHash()
+	return ok
+}
+
+// installedHash is the hash of the helper the markers say is installed, if
+// this binary still embeds exactly that helper. One read of each marker:
+// another process may rewrite or remove them at any time.
+func (c *Client) installedHash() (string, bool) {
+	b, err := os.ReadFile(markerPathAny(c))
+	if err != nil {
+		return "", false
+	}
+	f := strings.Fields(string(b))
+	if len(f) != 3 {
+		return "", false
+	}
+	_, cur, err := helperbin.Get(f[0], f[1])
+	if err != nil || cur != f[2] {
+		return "", false
+	}
+	if _, err := os.Stat(markerPath(c, cur)); err != nil {
+		return "", false
+	}
+	return cur, true
+}
+
 func (c *Client) EnsureHelper(ctx context.Context, force bool) (string, error) {
 	return c.ensureHelper(ctx, force, probeTimeout)
 }
@@ -434,15 +468,8 @@ func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Durati
 	// is only trusted if this binary still embeds that exact helper, so an
 	// upgraded CLI reinstalls instead of driving a stale helper.
 	if !force {
-		if b, err := os.ReadFile(markerPathAny(c)); err == nil {
-			f := strings.Fields(string(b))
-			if len(f) == 3 {
-				if _, cur, err := helperbin.Get(f[0], f[1]); err == nil && cur == f[2] {
-					if _, err := os.Stat(markerPath(c, cur)); err == nil {
-						return c.helperPath(cur), nil
-					}
-				}
-			}
+		if hash, ok := c.installedHash(); ok {
+			return c.helperPath(hash), nil
 		}
 	}
 	// The first command through the master doubles as a liveness probe: a
@@ -469,7 +496,11 @@ func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Durati
 	}
 	if strings.TrimSpace(string(check)) != "present" {
 		dir := RemoteRoot(c.WorkRoot) + "/bin"
-		script := fmt.Sprintf(`set -e; mkdir -p %[1]s; t=%[1]s/.upload.$$; gzip -dc > "$t"; chmod 755 "$t"; mv -f "$t" %[2]s; find %[1]s -maxdepth 1 -name 'spotexec-helper-*' ! -name %[3]s -mmin +1440 -exec rm -f {} + 2>/dev/null || true`, dir, path, ShellQuote(filepath.Base(path)))
+		// An upload is activity (at its start and end): an ephemeral VM's
+		// idle watchdog must not stop a VM still being readied over a slow
+		// link. The upload is bounded by the probe's HelperUploadBudget,
+		// well under any idle_timeout.
+		script := fmt.Sprintf(`set -e; a=/var/tmp/spotexec/activity; [ -w "$a" ] && touch "$a" || true; mkdir -p %[1]s; t=%[1]s/.upload.$$; gzip -dc > "$t"; chmod 755 "$t"; mv -f "$t" %[2]s; [ -w "$a" ] && touch "$a" || true; find %[1]s -maxdepth 1 -name 'spotexec-helper-*' ! -name %[3]s -mmin +1440 -exec rm -f {} + 2>/dev/null || true`, dir, path, ShellQuote(filepath.Base(path)))
 		if _, err := c.runWithin(ctx, uploadTimeout, script, bytes.NewReader(gz)); err != nil {
 			return "", fmt.Errorf("uploading helper: %w", err)
 		}

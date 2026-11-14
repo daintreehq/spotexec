@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -194,6 +195,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			if !req.NoBoot || usable > 0 {
 				reachable++ // a fleet can always grow (or is growing)
 			}
+			readyFirst(cands, m.r.WorkRoot)
 			if req.PreferInstance != "" {
 				for i, in := range cands {
 					if in.ID == req.PreferInstance && i > 0 {
@@ -253,7 +255,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					continue
 				}
 				for _, in := range fleetCands[m] {
-					lease, holders, out := m.probeInstance(ctx, req, in)
+					lease, holders, out := m.probeInstance(ctx, req, in, deadline)
 					if !(out == OutBusy && req.Base.Exclusive) {
 						// An exclusive probe finding a partly busy instance must
 						// not hide its free slots from everyone else.
@@ -448,10 +450,35 @@ func (m *member) probeStatic(ctx context.Context, req AcquireRequest) (*Lease, [
 	return lease, holders, err
 }
 
-func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provider.Instance) (*Lease, []protocol.Holder, Outcome) {
+// helperInstalled reports whether this machine installed the helper on t
+// (tests substitute it).
+var helperInstalled = func(t provider.Target, workRoot string) bool {
+	return transport.New(t, workRoot).HelperInstalled()
+}
+
+// readyFirst orders a fleet's candidates so VMs this machine already
+// reached (the helper is installed) come first: a first contact uploads the
+// helper, which can take a while, and a ready VM shouldn't wait on it.
+func readyFirst(cands []provider.Instance, workRoot string) {
+	ready := make(map[string]bool, len(cands))
+	for _, in := range cands {
+		ready[in.ID] = helperInstalled(in.Target, workRoot)
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return ready[cands[i].ID] && !ready[cands[j].ID] })
+}
+
+func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provider.Instance, until time.Time) (*Lease, []protocol.Holder, Outcome) {
 	// Room for Open to find a dead reused master (5s), dial afresh (up to
 	// 10s) and still handshake: a reconnect must not read as unreachable.
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// The first contact also uploads the helper (a few MB): over a slow
+	// link that alone can take most of 30s, and an upload cut short is
+	// started over from nothing, so give it room to finish.
+	d := 30 * time.Second
+	if !helperInstalled(in.Target, m.r.WorkRoot) {
+		// Never past the queue deadline, though, beyond the usual 30s.
+		d = max(d, min(d+transport.HelperUploadBudget, time.Until(until)))
+	}
+	cctx, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
 	lease, holders, err := tryAcquire(cctx, req, m.r, m.p, in.Target, false)
 	if m.boot != nil && m.boot.id == in.ID && !isCode(err, protocol.CodeBooting) {
