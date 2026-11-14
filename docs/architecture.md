@@ -51,6 +51,7 @@ The trust boundaries, from the inside out:
   - for a pull, it must match a pattern you asked for.
 - **A cloned repository can't change how you connect.** `.spotexec.toml` can't set hosts, SSH options, keys, AWS profile, region, network or bucket. Project runners must extend one of your own runners.
 - **Project config is still code for the runner.** Bootstrap scripts, tasks and `container.options` (for example `--privileged`) run with the runner user's rights on the runner. On a VM of your own, that only matters to you. On a **shared `ssh` runner**, treat `.spotexec.toml` like a CI config: review it before running untrusted repos.
+- **`git_seed` sends HEAD, not your repository.** With `[sync] git_seed`, the runner gets HEAD's commit object, its trees and the HEAD versions of files you changed (never those of excluded files), and nothing else from `.git`: no other history, refs, config, hooks or remotes. The CLI sends only objects of that set, whatever the runner asks for. The seeded `.git` is never scanned for changes or written back.
 - **Secrets stay out of process listings.** Forwarded environment values go to the runner in a `0600` file, not on the command line.
 - **Slots are private.** The work root is `0700`. Lifecycle state files are writable only by the runner user's group.
 - **The runner is trusted with your worktree.** Write-back is how formatters and codegen deliver their results, so a compromised runner can still change synced files and create new non-ignored ones, such as a `Makefile` or editor task config. Review `git status` after runs on machines you don't control.
@@ -64,6 +65,7 @@ The trust boundaries, from the inside out:
 - **Scaling can't predict demand.** A VM launched for demand that clears before it boots sits idle until `idle_timeout`, then terminates itself.
 - **Exclusive jobs across mismatched fleets.** Demand is counted per fleet, so an `--exclusive` job that could land on two fleets with different `max_slots` may briefly over-launch by one instance.
 - **Shared SSO cache.** Without the AWS CLI, spotexec refreshes IAM Identity Center tokens itself. If an AWS CLI elsewhere (say, a dev container sharing `~/.aws`) refreshes the same token at the same moment, one side may need `aws sso login` again.
+- **`git_seed` is a one-commit repository.** History, other branches and upstreams are not there, nor the contents of unchanged files, so `git blame`, `git stash`, `git commit` and comparisons against another branch fail on the runner. Nothing is staged there. Your local Git config doesn't travel, so files it changes the meaning of (Git LFS, `core.autocrlf`, `core.filemode = false`, `core.symlinks = false`) can show as modified there, as can a staged change to a file you then marked assume-unchanged or skip-worktree. Submodules always look clean. SHA-256 repositories aren't supported.
 - **Providers are `ssh` and `aws-spot`.** The provider interface is ready for more.
 
 ## Design decisions
@@ -73,4 +75,4 @@ The trust boundaries, from the inside out:
 - **Git blob IDs (SHA-1), not a faster hash.** Clean tracked files reuse the index's IDs and are never read.
 - **The watchdog is shell plus systemd,** installed by cloud-init before anything else runs. It exists before spotexec ever connects, and needs nothing from it.
 - **Hardlink hydration is opt-in.** Shared inodes let one slot corrupt another's dependencies.
-- **Not built yet:** `git_seed`, PTY allocation, parsed test-failure summaries.
+- **Not built yet:** PTY allocation, parsed test-failure summaries.

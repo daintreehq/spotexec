@@ -139,6 +139,14 @@ type SlotState struct {
 	// VenvsRelocated: the cache dirs' virtualenvs point at this slot
 	// (see relocateVenvs); false for slots hydrated by older helpers.
 	VenvsRelocated bool `json:"venvs_relocated,omitempty"`
+	// GitOwned: the workspace holds a .git spotexec seeded ([sync]
+	// git_seed), complete or not. GitSeed is the key of the complete seed
+	// ("" while it is being built), GitIndex its index's signature and
+	// GitIndexDigest its entries' digest then.
+	GitOwned       bool     `json:"git_owned,omitempty"`
+	GitSeed        string   `json:"git_seed,omitempty"`
+	GitIndex       *statSig `json:"git_index,omitempty"`
+	GitIndexDigest string   `json:"git_index_digest,omitempty"`
 }
 
 func readJSON(path string, v any) error {

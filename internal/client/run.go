@@ -321,6 +321,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			o.Rep.Event("sync_in", map[string]any{"mode": "delta", "files": syn.Written, "deleted": syn.Deleted, "bytes": syn.Bytes, "duration_ms": time.Since(t).Milliseconds()})
 			o.Rep.Status("%s · synced %d files (%s) in %s", label, syn.Written, ui.Bytes(syn.Bytes), ui.Dur(time.Since(t)))
 		}
+		// Before the image and dependencies, so install scripts see it too.
+		if err := seedGit(ctx, sess, m, p.Sync.GitSeed, o, label); err != nil {
+			return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, err)), lostRunner(lease, err)
+		}
 	}
 
 	// 4. Project container image.

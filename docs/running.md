@@ -75,6 +75,20 @@ Plus anything in `env_allow` (copied from your environment) and `env` (fixed val
 
 On `aws-spot` VMs, `localhost` resolves to both `127.0.0.1` and `::1`, as on macOS and GitHub's hosted runners. Stock Ubuntu maps it to `127.0.0.1` only, which breaks a test that binds a server to `::1` and dials `localhost`. Project containers share the VM's `/etc/hosts`. `ssh` runners are your own machines, and spotexec leaves their `/etc/hosts` alone.
 
+## Git on the runner
+
+The workspace on the runner has no `.git`, so by default anything that asks Git about the checkout fails there while it works locally and in CI: a build stamping the commit SHA, a tool finding the repository root with `git rev-parse --show-toplevel`, a test recording `git status`. Set `git_seed = true` under `[sync]` and, before dependencies install and the command runs, the slot gets a small real repository:
+
+- HEAD is your local HEAD commit, on your branch (or detached, or an unborn branch, as locally). `git rev-parse HEAD`, `git rev-parse --abbrev-ref HEAD`, `git log -1` and `git describe --always` answer as they do locally, and `git rev-parse --show-toplevel` names the workspace (printed as your local path).
+- `git status` and `git diff --name-only HEAD` list the same modified, deleted, added and untracked files as locally, relative to HEAD. The runner's index is built from HEAD, so nothing is staged there: a change you staged shows as unstaged, a new file you staged as intent-to-add (` A`), and a file you only untracked (`git rm --cached`) as unchanged. Tracked files that aren't synced (excluded, or submodules) don't show up as deleted.
+- `git diff` works for the files you changed: their HEAD versions travel along (up to 16 MiB each).
+
+Only HEAD's commit and trees leave your machine, plus the HEAD versions of files you changed, never of excluded files: no other history, branches, tags, config, hooks, remotes or credentials. So it's a one-commit shallow repository, and anything past HEAD doesn't work: `HEAD~1`, `git blame`, `git describe` without `--always`, `@{upstream}`, or `--since main`-style modes that compare against another branch. Objects for unchanged files aren't there either, so `git stash`, `git commit`, `git archive` and `git show HEAD:<file>` for an unchanged file fail.
+
+Nothing a command does in `.git` comes back: the post-run scan skips it and write-back never touches your `.git`. The next run puts the seed back, dropping any commits, refs, config or hooks a command added. When HEAD and your changes are the same as last run, that's one round trip; a new HEAD sends only the trees and blobs the slot doesn't have. Turning `git_seed` off removes the seeded `.git` on the next synced run.
+
+The runner itself needs `git` installed, even when commands run in a project container. Without it, or for a project synced as a plain directory (`sync.source = "directory"`), spotexec warns (`GIT_SEED_UNAVAILABLE` or `GIT_SEED_FAILED`) and runs the command without a `.git`. A [project container](environments.md#project-containers) sees the same `.git` in the bind-mounted workspace; with `container.user = "root"`, spotexec passes `safe.directory` for the workspace through `GIT_CONFIG_*` (unless the project sets those itself), since Git otherwise refuses a repository another user owns. Older Git releases only read `safe.directory` from system or global config; if Git in your image still reports "dubious ownership", add `RUN git config --system --add safe.directory '*'` to the Dockerfile.
+
 ## Exit codes
 
 | Code | Meaning |

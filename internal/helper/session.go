@@ -294,6 +294,15 @@ func (s *Session) dispatch(env protocol.Envelope) error {
 		}
 		s.settle(st)
 		return nil
+	case protocol.TypeGitSeed:
+		var g protocol.GitSeed
+		if err := env.Unmarshal(&g); err != nil {
+			return err
+		}
+		return s.gitSeed(g)
+	case protocol.TypeGitDrop:
+		s.dropGitSeed() // no reply is expected
+		return nil
 	case protocol.TypeCancel:
 		return nil // nothing running
 	case protocol.TypeBye:

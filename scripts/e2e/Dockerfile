@@ -3,7 +3,7 @@
 FROM ubuntu:24.04
 # fishy and cshy log in with non-POSIX shells, as some homelab users do.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      openssh-server ca-certificates nodejs npm python3 fish tcsh && \
+      openssh-server ca-certificates git nodejs npm python3 fish tcsh && \
     rm -rf /var/lib/apt/lists/* && mkdir -p /run/sshd && \
     useradd -m -s /bin/bash dev && useradd -m -s /usr/bin/fish fishy && useradd -m -s /usr/bin/tcsh cshy
 COPY id_ed25519.pub /tmp/key.pub
