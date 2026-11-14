@@ -13,11 +13,16 @@ import (
 
 // fakeFleet is an in-memory Fleet.
 type fakeFleet struct {
-	r     *config.Runner
-	mu    sync.Mutex
-	insts []provider.Instance
-	n     int
-	fail  error
+	r       *config.Runner
+	mu      sync.Mutex
+	insts   []provider.Instance
+	n       int
+	fail    error
+	termErr error
+	// slowRunning: WaitRunning blocks until its context ends.
+	slowRunning bool
+	// goneOnWait: WaitRunning reports the instance gone (reclaimed).
+	goneOnWait bool
 }
 
 func (f *fakeFleet) Runner() *config.Runner                        { return f.r }
@@ -42,12 +47,19 @@ func (f *fakeFleet) Launch(context.Context, provider.Logger) (provider.Instance,
 		return provider.Instance{}, f.fail
 	}
 	f.n++
-	in := provider.Instance{ID: "i-" + string(rune('a'+f.n)), State: provider.StateRunning, LaunchedAt: time.Now()}
+	in := provider.Instance{ID: "i-" + string(rune('a'+f.n)), State: provider.StateRunning, LaunchedAt: time.Now(), Target: provider.Target{Host: "192.0.2.1"}}
 	f.insts = append(f.insts, in)
 	return in, nil
 }
 
-func (f *fakeFleet) WaitRunning(_ context.Context, id string, _ provider.Logger) (provider.Instance, error) {
+func (f *fakeFleet) WaitRunning(ctx context.Context, id string, _ provider.Logger) (provider.Instance, error) {
+	if f.slowRunning {
+		<-ctx.Done()
+		return provider.Instance{}, ctx.Err()
+	}
+	if f.goneOnWait {
+		return provider.Instance{}, errors.New("instance reclaimed while booting")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, in := range f.insts {
@@ -61,6 +73,9 @@ func (f *fakeFleet) WaitRunning(_ context.Context, id string, _ provider.Logger)
 func (f *fakeFleet) Terminate(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.termErr != nil {
+		return f.termErr
+	}
 	for i, in := range f.insts {
 		if in.ID == id {
 			f.insts = append(f.insts[:i], f.insts[i+1:]...)

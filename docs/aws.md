@@ -244,7 +244,7 @@ spotexec image bake aws2       # optional: snapshot the bootstrap for ~bare-boot
 spotexec down aws2             # or simply let it idle out
 ```
 
-If `up` fails, the error says why: a credential problem names the login command to run, a capacity error names the instance type, and a bootstrap failure prints the end of the bootstrap log.
+If `up` fails, the error says why: a credential problem names the login command to run, a capacity error names the instance type, and a bootstrap failure prints the end of the bootstrap log. A VM that `up` launched but couldn't get ready (or that you interrupted with Ctrl-C) is terminated rather than left to idle out; after a bootstrap failure, runs stop launching new VMs of that runner for an hour, or until you fix the script and run `spotexec down aws2`. A VM that did finish booting is left running for other runs (it idles out as usual).
 
 ## What gets created in your account
 

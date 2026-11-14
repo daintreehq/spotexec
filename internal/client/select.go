@@ -589,7 +589,7 @@ func WaitReady(ctx context.Context, r *config.Runner, t provider.Target, rep ui.
 				rep.Status("%s: running first-boot setup %s", r.Name, ui.Dur(time.Since(start)))
 			default:
 				tail, _ := c.Run(ctx, "tail -n 20 /var/log/spotexec-bootstrap.log 2>/dev/null", nil)
-				return fmt.Errorf("%s: bootstrap_script exited %s; last log lines:\n%s", r.Name, s, strings.TrimSpace(string(tail)))
+				return &bootstrapError{fmt.Sprintf("%s: bootstrap_script exited %s; last log lines:\n%s", r.Name, s, strings.TrimSpace(string(tail)))}
 			}
 		} else {
 			last = err

@@ -364,31 +364,55 @@ func cmdUp() *cobra.Command {
 				err error
 			}
 			ch := make(chan res, count)
+			done := make(chan struct{})
+			defer close(done)
+			go func() {
+				select {
+				case <-ctx.Done():
+					rep.Warn("INTERRUPTED", "terminating the instance(s) being launched")
+				case <-done:
+				}
+			}()
 			for _, id := range ids {
 				go func() {
-					in, err := pool.Provision(ctx, id, func(f string, a ...any) {
+					// A VM that never gets ready (or is interrupted with
+					// Ctrl-C) is terminated and recorded as a failed boot.
+					in, err := pool.Prewarm(ctx, id, func(f string, a ...any) {
 						rep.Event("provision", map[string]any{"runner": r.Name, "message": fmt.Sprintf(f, a...)})
+					}, func(ctx context.Context, in provider.Instance) error {
+						return client.WaitReady(ctx, r, in.Target, rep, r.BootTimeout.Duration)
+					}, func(ctx context.Context, in provider.Instance) bool {
+						return client.BootFinished(ctx, r, in.Target)
 					})
 					if err == nil {
-						err = client.WaitReady(ctx, r, in.Target, rep, r.BootTimeout.Duration)
-					}
-					if err == nil {
-						_, err = transport.New(in.Target, r.WorkRoot).EnsureHelper(ctx, false)
+						// Ready, so other runs may already use it: a failed
+						// helper install leaves it to idle out.
+						if _, herr := transport.New(in.Target, r.WorkRoot).EnsureHelper(ctx, false); herr != nil {
+							err = fmt.Errorf("%s: installing the helper: %w (the VM is ready and ends itself after idle_timeout)", in.ID, herr)
+						}
 					}
 					ch <- res{in, err}
 				}()
 			}
 			var errs []string
+			bootFailed := false
 			for i := 0; i < count; i++ {
 				x := <-ch
 				if x.err != nil {
 					errs = append(errs, x.err.Error())
+					bootFailed = bootFailed || errors.Is(x.err, client.ErrBootstrapFailed)
 					continue
 				}
 				rep.Event("instance_ready", map[string]any{"runner": r.Name, "instance_id": x.in.ID, "host": x.in.Target.String()})
 			}
 			if len(errs) > 0 {
 				rep.Clear()
+				if ctx.Err() != nil {
+					return fmt.Errorf("interrupted: %s", strings.Join(errs, "; "))
+				}
+				if bootFailed {
+					errs = append(errs, fmt.Sprintf("fix bootstrap_script, then run `spotexec down %s` (until then, or for an hour, runs won't launch new VMs)", r.Name))
+				}
 				return errors.New(strings.Join(errs, "; "))
 			}
 			rep.Done(fmt.Sprintf("%s: %d instance(s) ready (each terminates after %s idle)", r.Name, count, r.IdleTimeout.Duration), true)

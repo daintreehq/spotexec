@@ -38,9 +38,10 @@ EOF
 
 count() { docker ps -q --filter "label=spotexec-runner=$RUNNER" | wc -l | tr -d ' '; }
 countb() { docker ps -q --filter "label=spotexec-runner=${RUNNER}b" | wc -l | tr -d ' '; }
+countx() { docker ps -q --filter "label=spotexec-runner=${RUNNER}x" | wc -l | tr -d ' '; }
 cleanup() {
   # One filter per command: Docker ANDs repeated label filters.
-  for r in "$RUNNER" "${RUNNER}b"; do
+  for r in "$RUNNER" "${RUNNER}b" "${RUNNER}x"; do
     docker ps -q --filter "label=spotexec-runner=$r" | xargs -r docker rm -f >/dev/null 2>&1
   done
   return 0
@@ -166,6 +167,30 @@ echo "lock-v2" > deps.lock
 "$SX" --json 'cat vendor/marker' >"$WORK/d3.out" 2>"$WORK/d3.err"
 check "a lockfile change misses the cache and reinstalls" "grep -q '\"built\":true' $WORK/d3.err"
 cd "$REPO"
+
+echo "== spotexec up ends a VM that fails to get ready"
+cleanup; sleep 1
+cat >> "$SPOTEXEC_CONFIG_DIR/config.toml" <<EOF
+[runners.${RUNNER}x]
+type = "sim"
+max_instances = 1
+idle_timeout = "10m"
+boot_delay = "1s"
+bootstrap_script = "exit 3"
+EOF
+"$SX" up "${RUNNER}x" >"$WORK/upx.out" 2>"$WORK/upx.err"; rc=$?
+check "up fails on a broken bootstrap_script" "[ $rc != 0 ] && grep -q 'bootstrap_script exited 3' $WORK/upx.err"
+check "the broken VM was terminated" "[ \$(countx) = 0 ]"
+SPOTEXEC_POOL="${RUNNER}x" "$SX" --json --queue-timeout 5s 'echo should-not-run' >"$WORK/upx2.out" 2>"$WORK/upx2.err"
+check "the failed boot is recorded: no relaunch of the broken setup" "[ \$(countx) = 0 ] && ! grep -q should-not-run $WORK/upx2.out"
+"$SX" down "${RUNNER}x" >/dev/null 2>&1
+sed -i.bak 's/bootstrap_script = "exit 3"/bootstrap_script = "sleep 120"/' "$SPOTEXEC_CONFIG_DIR/config.toml"
+"$SX" up "${RUNNER}x" >"$WORK/upi.out" 2>"$WORK/upi.err" & UP=$!
+for _ in $(seq 1 60); do [ "$(countx)" = 1 ] && break; sleep 0.5; done
+sleep 2
+kill -INT $UP; wait $UP; rc=$?
+check "Ctrl-C during boot fails up" "[ $rc != 0 ]"
+check "Ctrl-C during boot terminates the VM" "[ \$(countx) = 0 ]"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

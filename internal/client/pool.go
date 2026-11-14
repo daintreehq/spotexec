@@ -630,6 +630,13 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 			st.ListedAt = staleListing(st.ListedAt)
 			return nil
 		})
+		if terr != nil {
+			err = fmt.Errorf("%w; terminating %s also failed: %v (run `spotexec down %s`)", err, in.ID, terr, p.R.Name)
+		}
+	}
+	if err != nil {
+		// The launched instance, so a caller can still find (or end) it.
+		return in, err
 	}
 	return ran, err
 }
