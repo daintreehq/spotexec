@@ -482,7 +482,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	}
 
 	// 7. Leftover image-bake builders (skipped while a bake runs here).
-	if a, ok := fl.f.(*provider.AWSSpot); ok && time.Since(fl.lastSwp) > sweepEvery {
+	if a, ok := fl.f.(interface {
+		SweepBuilders(context.Context, provider.Logger)
+	}); ok && time.Since(fl.lastSwp) > sweepEvery {
 		fl.lastSwp = time.Now()
 		a.SweepBuilders(ctx, func(f string, args ...any) { d.action("%s: %s", r.Name, fmt.Sprintf(f, args...)) })
 	}

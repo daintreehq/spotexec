@@ -34,7 +34,7 @@ var subcommands = map[string]bool{
 	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
 	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
 	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
-	"completion": true, "sim": true, "image": true, "daemon": true, "container": true, "setup": true, "teardown": true, "__complete": true, "__completeNoDesc": true,
+	"completion": true, "sim": true, "image": true, "prices": true, "daemon": true, "container": true, "setup": true, "teardown": true, "__complete": true, "__completeNoDesc": true,
 }
 
 // Main is the entry point for `spotexec`; it returns the process exit code.
@@ -142,7 +142,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(
 		cmdRun(), cmdExec(), cmdSync(), cmdSyncPlan(), cmdPull(), cmdStatus(), cmdMonitor(),
 		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdInit(), cmdHook(),
-		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdDaemon(), cmdContainer(), cmdSetup(), cmdTeardown(),
+		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdPrices(), cmdDaemon(), cmdContainer(), cmdSetup(), cmdTeardown(),
 	)
 	root.SetVersionTemplate("spotexec {{.Version}}\n") // as `spotexec version` and `sx --version`
 	addSxCompletion(root)

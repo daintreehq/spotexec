@@ -67,6 +67,7 @@ type Runner struct {
 
 	// aws-spot
 	Region           string   `toml:"region"`
+	Regions          []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
 	Profile          string   `toml:"profile"`
 	InstanceTypes    []string `toml:"instance_types"`
 	MaxPrice         string   `toml:"max_price"`
@@ -87,6 +88,18 @@ type Runner struct {
 	// sim
 	Image     string   `toml:"image"`
 	BootDelay Duration `toml:"boot_delay"`
+}
+
+// AllRegions is the regions value meaning every enabled region.
+const AllRegions = "all"
+
+// MultiRegion reports whether an aws-spot runner places instances across
+// several regions (regions = [...] with more than one, or ["all"]).
+func (r *Runner) MultiRegion() bool { return r.Type == TypeAWSSpot && len(r.Regions) > 0 }
+
+// AnyRegion reports whether the runner may launch in every enabled region.
+func (r *Runner) AnyRegion() bool {
+	return r.MultiRegion() && len(r.Regions) == 1 && r.Regions[0] == AllRegions
 }
 
 // Ephemeral reports whether the runner is provisioned on demand.
@@ -233,6 +246,9 @@ func LoadGlobal() (*Global, error) {
 	}
 	for name, r := range g.Runners {
 		r.Name = name
+		if md.IsDefined("runners", name, "region") && md.IsDefined("runners", name, "regions") {
+			return nil, fmt.Errorf("%s: runner %q: set region or regions, not both", g.Path, name)
+		}
 		if err := r.applyDefaults(); err != nil {
 			return nil, fmt.Errorf("%s: runner %q: %w", g.Path, name, err)
 		}
@@ -255,6 +271,9 @@ func (r *Runner) applyDefaults() error {
 			return errors.New("ssh runner needs host or hosts")
 		}
 	case TypeAWSSpot:
+		if err := r.normalizeRegions(); err != nil {
+			return err
+		}
 		if r.Region == "" {
 			r.Region = firstNonEmpty(os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"), "us-east-1")
 		}
@@ -372,6 +391,56 @@ func (r *Runner) validate() error {
 	return nil
 }
 
+// normalizeRegions validates regions and folds a single concrete region
+// into region (so it behaves exactly like a single-region runner). For
+// several regions, region becomes the home region: the first listed, or
+// for "all" the environment default, used for account-wide lookups.
+func (r *Runner) normalizeRegions() error {
+	if len(r.Regions) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, rg := range r.Regions {
+		switch {
+		case rg == AllRegions:
+			if len(r.Regions) > 1 {
+				return errors.New(`regions: "all" can't be combined with named regions`)
+			}
+		case !regionRe.MatchString(rg):
+			return fmt.Errorf("regions: invalid region %q", rg)
+		case seen[rg]:
+			return fmt.Errorf("regions: %q is listed twice", rg)
+		}
+		seen[rg] = true
+	}
+	if len(r.Regions) == 1 && r.Regions[0] != AllRegions {
+		if r.Region != "" && r.Region != r.Regions[0] {
+			return errors.New("set region or regions, not both")
+		}
+		r.Region, r.Regions = r.Regions[0], nil
+		return nil
+	}
+	// Network and image IDs only exist in one region: a multi-region runner
+	// uses each region's default VPC, its own security group and the
+	// region's Ubuntu image (or bake).
+	if r.SubnetID != "" {
+		return errors.New("subnet_id is specific to one region; remove it to use several regions (each region's default VPC is used)")
+	}
+	if len(r.SecurityGroupIDs) > 0 {
+		return errors.New("security_group_ids are specific to one region; remove them to use several regions (spotexec manages a group per region)")
+	}
+	if r.AMI != "" && r.AMI != "auto" && r.AMI != "base" {
+		return fmt.Errorf("ami %q is specific to one region; use \"auto\" or \"base\" with several regions", r.AMI)
+	}
+	if b := r.CacheBucket; b != "" && b != "auto" && b != "off" {
+		return fmt.Errorf("cache_bucket %q lives in one region; use \"auto\" (a bucket per region) or \"off\" with several regions", b)
+	}
+	if r.Region == "" && r.Regions[0] != AllRegions {
+		r.Region = r.Regions[0]
+	}
+	return nil
+}
+
 // archForInstanceType guesses the CPU architecture of an EC2 instance type:
 // Graviton families carry a "g" after the generation digit (c7g, m7gd, t4g).
 func archForInstanceType(t string) string {
@@ -390,6 +459,9 @@ func archForInstanceType(t string) string {
 	}
 	return "amd64"
 }
+
+// ValidRegion reports whether s looks like an AWS region name.
+func ValidRegion(s string) bool { return regionRe.MatchString(s) }
 
 // ArchForInstanceType is exported for providers.
 func ArchForInstanceType(t string) string { return archForInstanceType(t) }
@@ -574,7 +646,7 @@ func (p *Project) validate() error {
 var globalOnlyKeys = []string{
 	"type", "host", "hosts", "ssh_options", "identity_file", "work_root",
 	"profile", "region", "subnet_id", "security_group_ids", "ssh_cidr",
-	"user", "cache_bucket",
+	"user", "cache_bucket", "regions",
 }
 
 var (
@@ -638,6 +710,7 @@ func (c *Config) MergeProjectRunners() error {
 		base.InstanceTypes = append([]string(nil), g.InstanceTypes...)
 		base.SSHOptions = append([]string(nil), g.SSHOptions...)
 		base.SecurityGroupIDs = append([]string(nil), g.SecurityGroupIDs...)
+		base.Regions = append([]string(nil), g.Regions...)
 		if p.md.IsDefined("runners", name, "instance_types") && !p.md.IsDefined("runners", name, "arch") {
 			base.Arch = "" // re-derive from the new instance types
 		}

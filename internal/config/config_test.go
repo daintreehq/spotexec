@@ -150,3 +150,91 @@ func TestNeverProjectByIdentity(t *testing.T) {
 		t.Errorf("NeverProject(%s) = false on a case-insensitive disk", upper)
 	}
 }
+
+func loadGlobalText(t *testing.T, body string) (*Global, error) {
+	t.Helper()
+	gp := filepath.Join(t.TempDir(), "global.toml")
+	if err := os.WriteFile(gp, []byte("version = 1\n"+body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTEXEC_CONFIG", gp)
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	return LoadGlobal()
+}
+
+func TestRegions(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregions = [\"all\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := g.Runners["aws"]
+	if !r.MultiRegion() || !r.AnyRegion() || r.Region != "us-east-1" {
+		t.Fatalf("all: %+v", r)
+	}
+	g, err = loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregions = [\"eu-north-1\", \"us-east-2\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := g.Runners["aws"]; !r.MultiRegion() || r.AnyRegion() || r.Region != "eu-north-1" {
+		t.Fatalf("list: %+v", r)
+	}
+	// One region is just a single-region runner.
+	g, err = loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregions = [\"eu-north-1\"]\nsubnet_id = \"subnet-1\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := g.Runners["aws"]; r.MultiRegion() || r.Region != "eu-north-1" {
+		t.Fatalf("single: %+v", r)
+	}
+	for _, ok := range []string{"ami = \"auto\"", "ami = \"base\"", "cache_bucket = \"auto\"", "cache_bucket = \"off\""} {
+		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregions = [\"all\"]\n"+ok+"\n"); err != nil {
+			t.Errorf("%s with regions: %v", ok, err)
+		}
+	}
+	for name, body := range map[string]string{
+		"region and regions": "region = \"us-east-1\"\nregions = [\"us-east-1\", \"us-east-2\"]\n",
+		"all plus a region":  "regions = [\"all\", \"us-east-1\"]\n",
+		"invalid region":     "regions = [\"us-east-1\", \"mars\"]\n",
+		"duplicate":          "regions = [\"us-east-1\", \"us-east-1\"]\n",
+		"subnet":             "regions = [\"all\"]\nsubnet_id = \"subnet-1\"\n",
+		"security groups":    "regions = [\"all\"]\nsecurity_group_ids = [\"sg-1\"]\n",
+		"ami id":             "regions = [\"us-east-1\", \"us-east-2\"]\nami = \"ami-123\"\n",
+		"named cache bucket": "regions = [\"all\"]\ncache_bucket = \"my-bucket\"\n",
+	} {
+		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\n"+body); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestProjectCannotSetRegions(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregions = [\"eu-north-1\", \"us-east-2\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte("version = 1\n[runners.aws2]\nextends = \"aws\"\nregions = [\"all\"]\n"), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Config{Global: g, Project: p}).MergeProjectRunners(); err == nil || !strings.Contains(err.Error(), `"regions" can only be set in the global config`) {
+		t.Fatalf("a repository must not widen where code runs: %v", err)
+	}
+	// Extending a multi-region runner keeps its regions.
+	os.WriteFile(pp, []byte("version = 1\n[runners.big]\nextends = \"aws\"\nmax_slots = 1\n"), 0o644)
+	p, _ = LoadProject(pp)
+	c := &Config{Global: g, Project: p}
+	if err := c.MergeProjectRunners(); err != nil {
+		t.Fatal(err)
+	}
+	r := c.Global.Runners["big"]
+	if !r.MultiRegion() || strings.Join(r.Regions, ",") != "eu-north-1,us-east-2" || r.Region != "eu-north-1" || r.MaxSlots != 1 {
+		t.Fatalf("extended: %+v", r)
+	}
+	r.Regions[0] = "changed"
+	if g.Runners["aws"].Regions[0] != "eu-north-1" {
+		t.Fatal("extending must copy the region list")
+	}
+}

@@ -293,6 +293,7 @@ type ec2Instance struct {
 	IPAddress    string   `xml:"ipAddress"`
 	State        string   `xml:"instanceState>name"`
 	Lifecycle    string   `xml:"instanceLifecycle"`
+	Zone         string   `xml:"placement>availabilityZone"`
 	Tags         []ec2Tag `xml:"tagSet>item"`
 }
 

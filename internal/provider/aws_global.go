@@ -1,0 +1,1192 @@
+package provider
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/daintreehq/spotexec/internal/config"
+)
+
+const (
+	priceTTL      = 15 * time.Minute // Spot prices reused for new placements
+	regionsTTL    = 24 * time.Hour   // the account's enabled regions
+	maxAttempts   = 12               // candidate launches tried per Launch
+	regionWorkers = 6                // regions queried at once
+	poolCoolMin   = time.Minute      // first cooldown of a capacity-starved zone/type
+	poolCoolMax   = 10 * time.Minute
+	regionCool    = 10 * time.Minute // a region that failed for quota or setup reasons
+)
+
+// AWSGlobal is one logical aws-spot fleet spread over several regions
+// (regions = [...] or ["all"]). Each region is served by an ordinary
+// regional AWSSpot; AWSGlobal decides where new instances go (the cheapest
+// current Spot price among the runner's instance types, falling back down
+// the ranking on capacity or quota errors) and routes per-instance
+// operations to the region that holds the instance. max_instances is
+// enforced by the client pool across all regions together.
+//
+// Local state (placement.json, guarded by placement.lock) remembers which
+// regions may hold instances, so listings only query those, plus cached
+// prices, enabled regions and capacity cooldowns.
+type AWSGlobal struct {
+	r     *config.Runner
+	creds *awsCredResolver
+	dir   string
+
+	mu       sync.Mutex
+	regional map[string]*AWSSpot
+
+	// legacy: a single-region runner that still has instances in regions
+	// it used before (its config moved from regions to region). Launches
+	// behave exactly as for a single-region runner; listings and teardown
+	// still cover the old regions until they are empty.
+	legacy bool
+
+	// tests
+	endpoints func(region string) map[string]string
+	now       func() time.Time
+}
+
+// NewAWSGlobal constructs a multi-region provider.
+func NewAWSGlobal(r *config.Runner) (Provider, error) {
+	if err := checkAWSRunner(r); err != nil {
+		return nil, err
+	}
+	return &AWSGlobal{r: r, creds: &awsCredResolver{profile: r.Profile}, dir: RunnerStateDir(r.Name), regional: map[string]*AWSSpot{}}, nil
+}
+
+// heldElsewhere reports whether a single-region runner's placement state
+// (left from when it used several regions) says it may still have
+// instances in another region.
+func heldElsewhere(r *config.Runner) bool {
+	b, err := os.ReadFile(filepath.Join(RunnerStateDir(r.Name), "placement.json"))
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist) // unreadable: keep looking everywhere
+	}
+	var st placementState
+	if json.Unmarshal(b, &st) != nil {
+		return true
+	}
+	for rg := range st.Active {
+		if rg != r.Region {
+			return true
+		}
+	}
+	return false
+}
+
+// KnownRegions lists the regions a runner's local placement state says
+// may hold its instances (no API calls).
+func KnownRegions(r *config.Runner) []string {
+	b, err := os.ReadFile(filepath.Join(RunnerStateDir(r.Name), "placement.json"))
+	if err != nil {
+		return nil
+	}
+	var st placementState
+	_ = json.Unmarshal(b, &st)
+	var out []string
+	for rg := range st.Active {
+		out = append(out, rg)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// EnabledRegions lists the account's enabled regions using profile's
+// credentials, asking from home.
+func EnabledRegions(ctx context.Context, profile, home string) ([]string, error) {
+	a := newAWSSpot(&config.Runner{Region: home}, &awsCredResolver{profile: profile})
+	return a.enabledRegions(ctx)
+}
+
+// forgetDiscovery is called when a runner is used in plain single-region
+// mode, which launches without recording anything here: if it goes back to
+// several regions, its first listing must look everywhere again.
+func forgetDiscovery(r *config.Runner) {
+	dir := RunnerStateDir(r.Name)
+	b, err := os.ReadFile(filepath.Join(dir, "placement.json"))
+	if err != nil {
+		return
+	}
+	var st placementState
+	if json.Unmarshal(b, &st) != nil || !st.Discovered {
+		return
+	}
+	g := &AWSGlobal{r: r, dir: dir}
+	_ = g.withState(func(st *placementState) { st.Discovered = false })
+}
+
+// RegionalAWS returns a provider for one region of an aws-spot runner,
+// whatever regions it is configured for (e.g. to clear images left in a
+// region it no longer uses).
+func RegionalAWS(r *config.Runner, region string) (*AWSSpot, error) {
+	if err := checkAWSRunner(r); err != nil {
+		return nil, err
+	}
+	rc := *r
+	rc.Region, rc.Regions = region, nil
+	return newAWSSpot(&rc, &awsCredResolver{profile: r.Profile}), nil
+}
+
+// newLegacyAWSGlobal serves a single-region runner that still has instances
+// in regions it used before: launches as before, in r.Region only, while
+// listings and teardown also cover the old regions until they are empty.
+func newLegacyAWSGlobal(r *config.Runner) (Provider, error) {
+	rc := *r
+	rc.Regions = []string{r.Region}
+	p, err := NewAWSGlobal(&rc)
+	if err != nil {
+		return nil, err
+	}
+	p.(*AWSGlobal).legacy = true
+	return p, nil
+}
+
+func (g *AWSGlobal) Runner() *config.Runner { return g.r }
+
+func (g *AWSGlobal) clock() time.Time {
+	if g.now != nil {
+		return g.now()
+	}
+	return time.Now()
+}
+
+// Regional returns the provider for one region of this runner.
+func (g *AWSGlobal) Regional(region string) *AWSSpot {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if a := g.regional[region]; a != nil {
+		return a
+	}
+	rc := *g.r
+	rc.Region, rc.Regions = region, nil
+	a := newAWSSpot(&rc, g.creds)
+	a.placed = !g.legacy
+	if g.endpoints != nil {
+		a.api.endpoints = g.endpoints(region)
+	}
+	g.regional[region] = a
+	return a
+}
+
+// Use returns the provider for region and records that the region may now
+// hold this runner's instances (e.g. an image-bake builder).
+func (g *AWSGlobal) Use(region string) (*AWSSpot, error) {
+	return g.Regional(region), g.markActive(region, g.holdUntil(g.clock()))
+}
+
+// home is the region used for account-wide lookups (DescribeRegions).
+func (g *AWSGlobal) home() *AWSSpot { return g.Regional(g.r.Region) }
+
+// Where describes the regions the runner may use, for messages.
+func (g *AWSGlobal) Where() string {
+	if g.legacy {
+		return g.r.Region
+	}
+	if g.r.AnyRegion() {
+		return "all enabled regions"
+	}
+	return strings.Join(g.r.Regions, ", ")
+}
+
+// ---- local placement state ----
+
+type placedAt struct {
+	Region string    `json:"region"`
+	Until  time.Time `json:"until"`
+}
+
+type cooldown struct {
+	Until time.Time     `json:"until"`
+	Step  time.Duration `json:"step"`
+	Why   string        `json:"why,omitempty"`
+	Setup bool          `json:"setup,omitempty"` // region-wide and not Spot-specific: no on-demand there either
+}
+
+type placementState struct {
+	Regions   []string          `json:"regions,omitempty"` // enabled regions (regions = ["all"])
+	RegionsAt time.Time         `json:"regions_at,omitempty"`
+	Prices    []SpotPrice       `json:"prices,omitempty"`
+	PricedAt  time.Time         `json:"priced_at,omitempty"`
+	PricedFor string            `json:"priced_for,omitempty"`
+	Unpriced  map[string]string `json:"unpriced,omitempty"` // region -> why it has no price
+	// Active: region -> may hold our instances until. An expired entry is
+	// only dropped once a listing of that region finds nothing, so a VM
+	// whose watchdog failed is never forgotten.
+	Active   map[string]time.Time `json:"active,omitempty"`
+	Where    map[string]placedAt  `json:"where,omitempty"`    // instance ID -> region (a routing cache)
+	Cooldown map[string]cooldown  `json:"cooldown,omitempty"` // "region", "zone:<zone>" or "region/zone/type"
+	// Discovered: every managed region has been listed once. Until then
+	// (first use, an upgrade from single-region, a lost state file) listings
+	// cover them all rather than trusting Active.
+	Discovered bool `json:"discovered,omitempty"`
+}
+
+// withState runs fn on placement.json under placement.lock and saves it.
+// Never call the cloud inside fn.
+func (g *AWSGlobal) withState(fn func(st *placementState)) error {
+	if err := os.MkdirAll(g.dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(g.dir, "placement.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	path := filepath.Join(g.dir, "placement.json")
+	st := &placementState{}
+	b, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		// Unreadable state is an error, never an empty fleet: it records
+		// where billable instances may be.
+		if err := json.Unmarshal(b, st); err != nil {
+			return fmt.Errorf("%s is corrupt (%v); delete it to rediscover instances in every region", path, err)
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+	}
+	if st.Active == nil {
+		st.Active = map[string]time.Time{}
+	}
+	if st.Where == nil {
+		st.Where = map[string]placedAt{}
+	}
+	if st.Cooldown == nil {
+		st.Cooldown = map[string]cooldown{}
+	}
+	fn(st)
+	now := g.clock()
+	for k, v := range st.Where {
+		if now.After(v.Until) {
+			delete(st.Where, k)
+		}
+	}
+	for k, v := range st.Cooldown {
+		if now.After(v.Until.Add(poolCoolMax)) {
+			delete(st.Cooldown, k) // forget the backoff step too, eventually
+		}
+	}
+	b, _ = json.MarshalIndent(st, "", "  ")
+	tmp := path + ".tmp" + fmt.Sprint(os.Getpid())
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// holdUntil is how long a region may hold an instance launched now: its
+// watchdog stops it by max_lifetime.
+func (g *AWSGlobal) holdUntil(from time.Time) time.Time {
+	return from.Add(g.r.MaxLifetime.Duration + time.Hour)
+}
+
+// markActive records that region may hold instances until at least until.
+// A launch must not be sent if this fails.
+func (g *AWSGlobal) markActive(region string, until time.Time) error {
+	return g.withState(func(st *placementState) {
+		if until.After(st.Active[region]) {
+			st.Active[region] = until
+		}
+	})
+}
+
+func (g *AWSGlobal) remember(ins []Instance) error {
+	if len(ins) == 0 {
+		return nil
+	}
+	return g.withState(func(st *placementState) {
+		for _, in := range ins {
+			launched := in.LaunchedAt
+			if launched.IsZero() {
+				launched = g.clock()
+			}
+			// A VM still alive past its lifetime (a failed watchdog) stays
+			// tracked while it is seen.
+			until := g.holdUntil(launched)
+			if seen := g.clock().Add(time.Hour); seen.After(until) {
+				until = seen
+			}
+			st.Where[in.ID] = placedAt{Region: in.Region, Until: until}
+			if until.After(st.Active[in.Region]) {
+				st.Active[in.Region] = until
+			}
+		}
+	})
+}
+
+// activeRegions are the regions that may hold this runner's instances.
+func (g *AWSGlobal) activeRegions() ([]string, error) {
+	var out []string
+	err := g.withState(func(st *placementState) {
+		for r := range st.Active {
+			out = append(out, r)
+		}
+	})
+	sort.Strings(out)
+	return out, err
+}
+
+// PlacementRegions are the regions new instances may go to.
+func (g *AWSGlobal) PlacementRegions(ctx context.Context) ([]string, error) {
+	if g.legacy {
+		return []string{g.r.Region}, nil
+	}
+	if !g.r.AnyRegion() {
+		return append([]string(nil), g.r.Regions...), nil
+	}
+	var cached []string
+	_ = g.withState(func(st *placementState) {
+		if g.clock().Sub(st.RegionsAt) < regionsTTL {
+			cached = append(cached, st.Regions...)
+		}
+	})
+	if len(cached) > 0 {
+		return cached, nil
+	}
+	regions, err := g.home().enabledRegions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list enabled regions (from %s): %w%s", g.r.Region, err, permHint(err))
+	}
+	_ = g.withState(func(st *placementState) { st.Regions, st.RegionsAt = regions, g.clock() })
+	return regions, nil
+}
+
+// managedRegions are the placement regions plus any region that may still
+// hold an instance (e.g. one since removed from the config).
+func (g *AWSGlobal) managedRegions(ctx context.Context) ([]string, error) {
+	pr, err := g.PlacementRegions(ctx)
+	ar, aerr := g.activeRegions()
+	return union(pr, ar), errors.Join(err, aerr)
+}
+
+func union(a, b []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range append(append([]string(nil), a...), b...) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// eachRegion runs fn for every region, a few at a time, and returns the
+// failures by region.
+func eachRegion(ctx context.Context, regions []string, fn func(ctx context.Context, region string) error) map[string]error {
+	var mu sync.Mutex
+	errs := map[string]error{}
+	sem := make(chan struct{}, regionWorkers)
+	var wg sync.WaitGroup
+	for _, rg := range regions {
+		wg.Add(1)
+		go func(rg string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				mu.Lock()
+				errs[rg] = ctx.Err()
+				mu.Unlock()
+				return
+			}
+			defer func() { <-sem }()
+			if err := fn(ctx, rg); err != nil {
+				mu.Lock()
+				errs[rg] = err
+				mu.Unlock()
+			}
+		}(rg)
+	}
+	wg.Wait()
+	return errs
+}
+
+// joinRegionErrors folds per-region failures into one error, keeping a
+// credential failure findable with errors.As.
+func joinRegionErrors(errs map[string]error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	var keys []string
+	for k := range errs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var list []error
+	for _, k := range keys {
+		list = append(list, fmt.Errorf("%s: %w", k, errs[k]))
+	}
+	return errors.Join(list...)
+}
+
+func credentialFailure(errs map[string]error) error {
+	for _, err := range errs {
+		var ce *CredentialError
+		if errors.As(err, &ce) {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---- prices ----
+
+// PriceTable is the ranked Spot prices of a runner's instance types.
+type PriceTable struct {
+	Prices   []SpotPrice       `json:"prices"` // cheapest first
+	At       time.Time         `json:"at"`     // when they were fetched
+	Regions  []string          `json:"regions"`
+	Unpriced map[string]string `json:"unpriced,omitempty"` // region -> why it has no price
+	Cached   bool              `json:"cached"`
+}
+
+func (g *AWSGlobal) priceKey(regions []string) string {
+	return g.r.Profile + "|" + strings.Join(g.r.InstanceTypes, ",") + "|" + strings.Join(regions, ",")
+}
+
+// Prices returns the current Spot prices across the placement regions,
+// from a cache younger than 15 minutes unless refresh is set. Regions that
+// could not be priced are listed in Unpriced, never treated as cheap.
+func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error) {
+	regions, err := g.PlacementRegions(ctx)
+	if err != nil {
+		return PriceTable{}, err
+	}
+	key := g.priceKey(regions)
+	var t PriceTable
+	if !refresh {
+		_ = g.withState(func(st *placementState) {
+			if st.PricedFor == key && g.clock().Sub(st.PricedAt) < priceTTL && len(st.Prices) > 0 {
+				t = PriceTable{Prices: st.Prices, At: st.PricedAt, Regions: regions, Unpriced: st.Unpriced, Cached: true}
+			}
+		})
+		if t.Cached {
+			return t, nil
+		}
+	}
+	now := g.clock()
+	var mu sync.Mutex
+	var all []SpotPrice
+	errs := eachRegion(ctx, regions, func(ctx context.Context, rg string) error {
+		ps, err := g.Regional(rg).spotPrices(ctx, g.r.InstanceTypes, now)
+		if err != nil {
+			return err
+		}
+		if len(ps) == 0 {
+			return errors.New("none of instance_types is offered as Spot here")
+		}
+		mu.Lock()
+		all = append(all, ps...)
+		mu.Unlock()
+		return nil
+	})
+	if err := credentialFailure(errs); err != nil {
+		return PriceTable{}, err
+	}
+	if ctx.Err() != nil {
+		return PriceTable{}, ctx.Err()
+	}
+	rankPrices(all)
+	t = PriceTable{Prices: all, At: now, Regions: regions, Unpriced: map[string]string{}}
+	for rg, err := range errs {
+		t.Unpriced[rg] = firstLineOf([]byte(err.Error()))
+	}
+	if len(all) == 0 {
+		err := fmt.Errorf("no Spot price for %s in %s: %s", strings.Join(g.r.InstanceTypes, ", "), g.Where(), summarize(t.Unpriced, 3))
+		return t, fmt.Errorf("%w%s", err, permHint(err))
+	}
+	_ = g.withState(func(st *placementState) {
+		st.Prices, st.PricedAt, st.PricedFor, st.Unpriced = all, now, key, t.Unpriced
+	})
+	return t, nil
+}
+
+// summarize lists up to n "region: reason" entries.
+func summarize(m map[string]string, n int) string {
+	var keys []string
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var parts []string
+	for i, k := range keys {
+		if i == n {
+			parts = append(parts, fmt.Sprintf("and %d more", len(keys)-n))
+			break
+		}
+		parts = append(parts, k+": "+m[k])
+	}
+	return strings.Join(parts, "; ")
+}
+
+func poolKey(p SpotPrice) string { return p.Region + "/" + p.Zone + "/" + p.Type }
+
+// CoolingDown reports why a price's zone/type or region is skipped for
+// now ("" when it is not).
+func (g *AWSGlobal) coolingDown(st *placementState, p SpotPrice, now time.Time) string {
+	if c, ok := st.Cooldown[p.Region]; ok && now.Before(c.Until) {
+		return c.Why
+	}
+	if c, ok := st.Cooldown["zone:"+p.Zone]; ok && now.Before(c.Until) {
+		return c.Why
+	}
+	if c, ok := st.Cooldown[poolKey(p)]; ok && now.Before(c.Until) {
+		return c.Why
+	}
+	return ""
+}
+
+// Cooldowns returns why each listed price is currently skipped.
+func (g *AWSGlobal) Cooldowns(ps []SpotPrice) map[string]string {
+	out := map[string]string{}
+	now := g.clock()
+	_ = g.withState(func(st *placementState) {
+		for _, p := range ps {
+			if why := g.coolingDown(st, p, now); why != "" {
+				out[poolKey(p)] = why
+			}
+		}
+	})
+	return out
+}
+
+func (g *AWSGlobal) coolPool(p SpotPrice, why string) {
+	_ = g.withState(func(st *placementState) {
+		c := st.Cooldown[poolKey(p)]
+		step := poolCoolMin
+		if c.Step > 0 {
+			step = min(2*c.Step, poolCoolMax)
+		}
+		st.Cooldown[poolKey(p)] = cooldown{Until: g.clock().Add(step), Step: step, Why: why}
+	})
+}
+
+// coolZone skips every type in one availability zone for a while.
+func (g *AWSGlobal) coolZone(zone, why string) {
+	_ = g.withState(func(st *placementState) {
+		st.Cooldown["zone:"+zone] = cooldown{Until: g.clock().Add(regionCool), Step: regionCool, Why: why}
+	})
+}
+
+func (g *AWSGlobal) coolRegion(region, why string, setup bool) {
+	_ = g.withState(func(st *placementState) {
+		st.Cooldown[region] = cooldown{Until: g.clock().Add(regionCool), Step: regionCool, Why: why, Setup: setup}
+	})
+}
+
+// brokenRegions are regions cooling down for reasons on-demand shares.
+func (g *AWSGlobal) brokenRegions() map[string]bool {
+	out := map[string]bool{}
+	now := g.clock()
+	_ = g.withState(func(st *placementState) {
+		for k, c := range st.Cooldown {
+			if c.Setup && now.Before(c.Until) {
+				out[k] = true
+			}
+		}
+	})
+	return out
+}
+
+func (g *AWSGlobal) clearCool(p SpotPrice) {
+	_ = g.withState(func(st *placementState) { delete(st.Cooldown, poolKey(p)) })
+}
+
+// regionWide reports AWS errors that will repeat for every type and zone of
+// the region (quota, opt-in, permissions scoped by region).
+func regionWide(code string) bool {
+	switch code {
+	case "VcpuLimitExceeded", "MaxSpotInstanceCountExceeded", "InstanceLimitExceeded",
+		"OptInRequired", "UnauthorizedOperation", "PendingVerification", "Blocked":
+		return true
+	}
+	return false
+}
+
+// spotOnly reports region-wide errors that concern Spot alone: on-demand
+// may still launch there.
+func spotOnly(code string) bool {
+	return code == "MaxSpotInstanceCountExceeded" || code == "VcpuLimitExceeded"
+}
+
+// zoneWide reports errors confined to one zone's subnet.
+func zoneWide(code string) bool {
+	return code == "InsufficientFreeAddressesInSubnet"
+}
+
+// ---- Fleet ----
+
+// List returns live instances in every region that may hold them. If any
+// such region can't be listed the whole listing fails, so the pool keeps
+// its last view instead of believing those instances gone.
+func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
+	var regions []string
+	discovered := false
+	if err := g.withState(func(st *placementState) {
+		discovered = st.Discovered
+		for r := range st.Active {
+			regions = append(regions, r)
+		}
+	}); err != nil {
+		return nil, err
+	}
+	if g.legacy {
+		regions = union(regions, []string{g.r.Region})
+	}
+	if !discovered {
+		// No record yet of where instances may be: look everywhere once.
+		all, err := g.managedRegions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		regions = union(regions, all)
+	}
+	var mu sync.Mutex
+	var out []Instance
+	empty := map[string]bool{}
+	errs := eachRegion(ctx, regions, func(ctx context.Context, rg string) error {
+		ins, err := g.Regional(rg).List(ctx)
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		out = append(out, ins...)
+		if len(ins) == 0 {
+			empty[rg] = true
+		}
+		mu.Unlock()
+		return nil
+	})
+	if len(errs) > 0 {
+		return nil, joinRegionErrors(errs)
+	}
+	if err := g.remember(out); err != nil {
+		return nil, err
+	}
+	// The listing above has only schedulable VMs. Before forgetting a
+	// region (or, while discovering, passing over one), make sure it holds
+	// nothing else that bills: stopped fleet VMs or bake builders.
+	now := g.clock()
+	var check []string
+	if err := g.withState(func(st *placementState) {
+		for rg := range empty {
+			until, ok := st.Active[rg]
+			if (ok && now.After(until)) || (!ok && !discovered) {
+				check = append(check, rg)
+			}
+		}
+	}); err != nil {
+		return nil, err
+	}
+	held := map[string]bool{}
+	for _, rg := range check {
+		if n, err := g.Regional(rg).leftovers(ctx); err != nil || n > 0 {
+			delete(empty, rg)
+			held[rg] = true
+		}
+	}
+	if err := g.withState(func(st *placementState) {
+		for rg := range held {
+			if _, ok := st.Active[rg]; !ok {
+				st.Active[rg] = now.Add(time.Hour) // listed again, then dropped once clear
+			}
+		}
+		st.Discovered = true
+		for rg := range empty {
+			// Confirmed empty and past the time anything launched there
+			// could live: stop listing it.
+			if until, ok := st.Active[rg]; ok && now.After(until) {
+				delete(st.Active, rg)
+			}
+		}
+	}); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := stateRank(string(out[i].State)), stateRank(string(out[j].State))
+		if ri != rj {
+			return ri < rj
+		}
+		return out[i].LaunchedAt.After(out[j].LaunchedAt)
+	})
+	return out, nil
+}
+
+// Launch starts one instance at the cheapest Spot price it can get.
+func (g *AWSGlobal) Launch(ctx context.Context, log Logger) (Instance, error) {
+	if log == nil {
+		log = func(string, ...any) {}
+	}
+	// One provisioning lock for the runner (all regions share its state
+	// directory), shared with Down.
+	unlock, err := g.home().lockUp(ctx, nil)
+	if err != nil {
+		return Instance{}, err
+	}
+	defer unlock()
+	return g.launch(ctx, log)
+}
+
+func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
+	if g.legacy {
+		a := g.home()
+		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{
+			beforeSend: func() error { return g.markActive(a.r.Region, g.holdUntil(g.clock())) }})
+		if err != nil {
+			return Instance{}, err
+		}
+		in := a.instance(inst)
+		_ = g.remember([]Instance{in})
+		return in, nil
+	}
+	t, err := g.Prices(ctx, false)
+	if err != nil {
+		return Instance{}, err
+	}
+	cool := g.Cooldowns(t.Prices)
+	// An explicit max_price is AWS's cap on the Spot bid: options already
+	// above it would only be refused.
+	maxPrice := 0.0
+	if g.r.MaxPrice != "" {
+		maxPrice, _ = strconv.ParseFloat(g.r.MaxPrice, 64)
+	}
+	skipRegion := map[string]string{}
+	skipZone := map[string]bool{}
+	broken := g.brokenRegions() // regions whose setup failed (no on-demand there either)
+	var tried []string
+	attempts := 0
+	for rank, c := range t.Prices {
+		if attempts == maxAttempts {
+			break
+		}
+		if skipRegion[c.Region] != "" || skipZone[c.Zone] || cool[poolKey(c)] != "" || (maxPrice > 0 && c.USD() > maxPrice) {
+			continue
+		}
+		a := g.Regional(c.Region)
+		attempts++
+		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{itype: c.Type, zone: c.Zone,
+			// Just before the request: an instance it creates must be found
+			// by listings even if the response is lost.
+			beforeSend: func() error { return g.markActive(c.Region, g.holdUntil(g.clock())) }})
+		if err == nil {
+			g.clearCool(c)
+			in := a.instance(inst)
+			if in.Zone == "" {
+				in.Zone = c.Zone
+			}
+			_ = g.remember([]Instance{in})
+			log("launched spot %s instance %s in %s at $%s/h (%s)", c.Type, in.ID, c.Zone, c.Price, priceNote(t, rank))
+			return in, nil
+		}
+		var ce *CredentialError
+		var re *regionError
+		var ze *zoneError
+		var qe *QuotaError // the pre-launch check: no room in this region's Spot quota
+		code := awsCode(err)
+		switch {
+		case errors.Is(err, ErrLaunchAmbiguous), errors.As(err, &ce):
+			// The instance may exist in this region: never launch a
+			// replacement elsewhere on a guess. (Checked before
+			// cancellation, which can make a sent request ambiguous.)
+			return Instance{}, fmt.Errorf("%s: %w", c.Region, err)
+		case ctx.Err() != nil:
+			return Instance{}, ctx.Err()
+		case errors.As(err, &ze), zoneWide(code):
+			why := firstLineOf([]byte(err.Error()))
+			skipZone[c.Zone] = true
+			g.coolZone(c.Zone, why)
+			log("skipping %s: %s", c.Zone, why)
+			if code == "" {
+				attempts-- // nothing was sent
+				code = "no default subnet"
+			}
+		case errors.As(err, &re), errors.As(err, &qe), regionWide(code):
+			why := firstLineOf([]byte(firstLineOfErr(err))) // a quota error goes on to say how to raise it
+			skipRegion[c.Region] = why
+			broken[c.Region] = qe == nil && !spotOnly(code) // on-demand may still launch past a Spot quota
+			g.coolRegion(c.Region, why, broken[c.Region])
+			log("skipping %s: %s", c.Region, why)
+			if re != nil || qe != nil {
+				attempts-- // failed before any launch request
+			}
+			if qe != nil {
+				code = "Spot vCPU quota"
+			}
+		case classifyAWSError(err) == errNextType:
+			g.coolPool(c, code)
+			log("skipping %s in %s: %s", c.Type, c.Zone, code)
+		default:
+			// The same request would fail everywhere (bad bootstrap, image,
+			// parameters): don't burn through every region.
+			return Instance{}, fmt.Errorf("%s: %w", c.Region, err)
+		}
+		tried = append(tried, c.Type+"@"+c.Zone+": "+code)
+	}
+	if g.r.OnDemandFallback {
+		var regions []string
+		for _, c := range t.Prices {
+			if !broken[c.Region] && !contains(regions, c.Region) {
+				regions = append(regions, c.Region)
+			}
+		}
+		for _, rg := range regions[:min(len(regions), 2)] {
+			log("no spot capacity; falling back to on-demand in %s", rg)
+			a := g.Regional(rg)
+			inst, err := a.launchOrUnbaked(ctx, log, launchSpec{onDemand: true,
+				beforeSend: func() error { return g.markActive(rg, g.holdUntil(g.clock())) }})
+			if err == nil {
+				in := a.instance(inst)
+				_ = g.remember([]Instance{in})
+				return in, nil
+			}
+			var ce *CredentialError
+			if errors.Is(err, ErrLaunchAmbiguous) || errors.As(err, &ce) || ctx.Err() != nil {
+				return Instance{}, fmt.Errorf("%s: %w", rg, err)
+			}
+			tried = append(tried, rg+" on-demand: "+firstLineOf([]byte(err.Error())))
+		}
+	}
+	if len(tried) == 0 && maxPrice > 0 && t.Prices[0].USD() > maxPrice {
+		return Instance{}, fmt.Errorf("every Spot price in %s is above max_price %s (cheapest: $%s/h for %s in %s)", g.Where(), g.r.MaxPrice, t.Prices[0].Price, t.Prices[0].Type, t.Prices[0].Zone)
+	}
+	if len(tried) == 0 {
+		return Instance{}, fmt.Errorf("every Spot option in %s is cooling down after recent capacity or quota failures; retry in a few minutes (`spotexec prices %s` shows them)", g.Where(), g.r.Name)
+	}
+	return Instance{}, fmt.Errorf("no Spot capacity in the %d cheapest options (%s); add instance_types, or set on_demand_fallback = true", len(tried), strings.Join(tried, ", "))
+}
+
+func priceNote(t PriceTable, rank int) string {
+	where := plural(len(t.Prices), "option") + " in " + plural(len(t.Regions)-len(t.Unpriced), "region")
+	if rank == 0 {
+		return "cheapest of " + where
+	}
+	return fmt.Sprintf("#%d by price of %s; cheaper ones failed or are cooling down", rank+1, where)
+}
+
+func plural(n int, s string) string {
+	if n == 1 {
+		return "1 " + s
+	}
+	return fmt.Sprintf("%d %ss", n, s)
+}
+
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// regionOf finds the region holding instance id: from local state, else by
+// asking each region that could hold it.
+func (g *AWSGlobal) regionOf(ctx context.Context, id string) (string, error) {
+	var rg string
+	serr := g.withState(func(st *placementState) { rg = st.Where[id].Region })
+	if rg != "" {
+		return rg, nil
+	}
+	regions, merr := g.managedRegions(ctx)
+	if merr != nil && len(regions) == 0 {
+		return "", merr
+	}
+	var mu sync.Mutex
+	found := ""
+	var at time.Time
+	errs := eachRegion(ctx, regions, func(ctx context.Context, r string) error {
+		b, err := g.Regional(r).api.ec2(ctx, "DescribeInstances", url.Values{"InstanceId.1": {id}})
+		if err != nil {
+			if awsCode(err) == "InvalidInstanceID.NotFound" || awsCode(err) == "InvalidInstanceID.Malformed" {
+				return nil
+			}
+			return err
+		}
+		ins, _, err := parseDescribeInstances(b)
+		if err == nil && len(ins) > 0 {
+			mu.Lock()
+			found, at = r, ins[0].launched()
+			mu.Unlock()
+		}
+		return err
+	})
+	if found != "" {
+		_ = g.remember([]Instance{{ID: id, Region: found, LaunchedAt: at}})
+		return found, nil
+	}
+	if err := credentialFailure(errs); err != nil {
+		return "", err
+	}
+	if len(errs) > 0 {
+		return "", fmt.Errorf("can't find instance %s: %w", id, joinRegionErrors(errs))
+	}
+	if err := errors.Join(serr, merr); err != nil {
+		// The search may have missed regions only the state knows about.
+		return "", fmt.Errorf("can't find instance %s: %w", id, err)
+	}
+	return "", fmt.Errorf("instance %s is not in any of %s's regions", id, g.r.Name)
+}
+
+// For returns the regional provider holding instance id.
+func (g *AWSGlobal) For(ctx context.Context, id string) (Provider, error) {
+	rg, err := g.regionOf(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return g.Regional(rg), nil
+}
+
+// WaitRunning waits for an instance in whichever region holds it.
+func (g *AWSGlobal) WaitRunning(ctx context.Context, id string, log Logger) (Instance, error) {
+	rg, err := g.regionOf(ctx, id)
+	if err != nil {
+		return Instance{}, err
+	}
+	return g.Regional(rg).WaitRunning(ctx, id, log)
+}
+
+// Terminate ends one instance (only if it carries our tags).
+func (g *AWSGlobal) Terminate(ctx context.Context, id string) error {
+	rg, err := g.regionOf(ctx, id)
+	if err != nil {
+		return err
+	}
+	return g.Regional(rg).Terminate(ctx, id)
+}
+
+// ---- Provider ----
+
+// Status reports the best-placed instance across the active regions.
+func (g *AWSGlobal) Status(ctx context.Context) (Info, error) {
+	regions, err := g.activeRegions()
+	if err != nil {
+		return Info{State: StateUnknown, Region: g.Where(), Detail: err.Error()}, err
+	}
+	if len(regions) == 0 {
+		return Info{State: StateAbsent, Region: g.Where()}, nil
+	}
+	var mu sync.Mutex
+	var infos []Info
+	errs := eachRegion(ctx, regions, func(ctx context.Context, rg string) error {
+		info, err := g.Regional(rg).Status(ctx)
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		infos = append(infos, info)
+		mu.Unlock()
+		return nil
+	})
+	rank := func(s State) int {
+		switch s {
+		case StateRunning:
+			return 0
+		case StatePending:
+			return 1
+		case StateStopping:
+			return 2
+		}
+		return 3
+	}
+	sort.SliceStable(infos, func(i, j int) bool { return rank(infos[i].State) < rank(infos[j].State) })
+	if len(errs) > 0 {
+		err := joinRegionErrors(errs)
+		if len(infos) == 0 || infos[0].State == StateAbsent {
+			return Info{State: StateUnknown, Region: g.Where(), Detail: err.Error()}, err
+		}
+	}
+	if len(infos) == 0 || infos[0].State == StateAbsent {
+		return Info{State: StateAbsent, Region: g.Where()}, nil
+	}
+	return infos[0], nil
+}
+
+// Up returns a running instance, launching one where Spot is cheapest if
+// there is none (spotexec up).
+func (g *AWSGlobal) Up(ctx context.Context, log Logger) (Info, error) {
+	if log == nil {
+		log = func(string, ...any) {}
+	}
+	unlock, err := g.home().lockUp(ctx, log)
+	if err != nil {
+		return Info{}, err
+	}
+	defer unlock()
+	ins, err := g.List(ctx)
+	if err != nil {
+		return Info{}, err
+	}
+	if len(ins) > 0 {
+		return g.Regional(ins[0].Region).waitRunning(ctx, ec2Instance{InstanceID: ins[0].ID, State: string(ins[0].State)}, log)
+	}
+	in, err := g.launch(ctx, log)
+	if err != nil {
+		return Info{}, err
+	}
+	info, err := g.Regional(in.Region).waitRunning(ctx, ec2Instance{InstanceID: in.ID, State: "pending", InstanceType: in.Type}, log)
+	info.Launched = true
+	if info.InstanceID == "" {
+		info.InstanceID = in.ID
+	}
+	return info, err
+}
+
+// Down terminates this runner's instances in every region it uses or may
+// still hold instances in.
+func (g *AWSGlobal) Down(ctx context.Context, log Logger) error {
+	if log == nil {
+		log = func(string, ...any) {}
+	}
+	regions, _ := g.managedRegions(ctx)
+	g.sweepBuilders(ctx, regions, log)
+	unlock, err := g.home().lockUp(ctx, log)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	// Again under the lock: a launch that held it may have just added a
+	// region.
+	regions, rerr := g.managedRegions(ctx)
+	var mu sync.Mutex
+	total := 0
+	errs := eachRegion(ctx, regions, func(ctx context.Context, rg string) error {
+		n, err := g.Regional(rg).downLocked(ctx, func(f string, a ...any) {
+			if !strings.HasPrefix(f, "no running instances") {
+				log(f+" in %s", append(a, rg)...)
+			}
+		})
+		mu.Lock()
+		total += n
+		mu.Unlock()
+		return err
+	})
+	if total == 0 && len(errs) == 0 {
+		log("no running instances for %s in %d region(s)", g.r.Name, len(regions))
+	}
+	if rerr != nil {
+		errs[g.r.Region] = rerr
+	}
+	return joinRegionErrors(errs)
+}
+
+// SweepBuilders ends leftover image-bake builders in the regions that may
+// hold them (the pool manager calls this periodically).
+func (g *AWSGlobal) SweepBuilders(ctx context.Context, log Logger) {
+	regions, _ := g.activeRegions()
+	g.sweepBuilders(ctx, regions, log)
+}
+
+func (g *AWSGlobal) sweepBuilders(ctx context.Context, regions []string, log Logger) {
+	unlock, err := g.home().LockBake()
+	if err != nil {
+		return // a bake is running here; its builder is not leftover
+	}
+	defer unlock()
+	eachRegion(ctx, regions, func(ctx context.Context, rg string) error {
+		g.Regional(rg).sweepBuilders(ctx, log)
+		return nil
+	})
+}
+
+// RegionalProviders returns a provider for every region this runner uses
+// or may hold instances in (for account-wide listings).
+func (g *AWSGlobal) RegionalProviders(ctx context.Context) ([]*AWSSpot, error) {
+	regions, err := g.managedRegions(ctx)
+	out := make([]*AWSSpot, 0, len(regions))
+	for _, rg := range regions {
+		out = append(out, g.Regional(rg))
+	}
+	return out, err
+}
+
+// Forget is a no-op: instance state lives in the cloud.
+func (g *AWSGlobal) Forget() {}
+
+// Doctor checks credentials, prices across the regions, and the quota and
+// network of the cheapest few regions.
+func (g *AWSGlobal) Doctor(ctx context.Context) []Check {
+	var out []Check
+	h := g.home()
+	creds, err := g.creds.get(ctx)
+	if err != nil {
+		return append(out, Check{Name: "aws credentials", Msg: err.Error()})
+	}
+	out = append(out, Check{Name: "aws credentials", OK: true, Msg: creds.Source})
+	if b, err := h.api.query(ctx, "sts", stsAPIVersion, "GetCallerIdentity", nil); err != nil {
+		out = append(out, Check{Name: "aws identity", Msg: err.Error()})
+	} else {
+		out = append(out, Check{Name: "aws identity", OK: true,
+			Msg: "account " + xmlFirst(b, "GetCallerIdentityResult>Account") + " · " + xmlFirst(b, "GetCallerIdentityResult>Arn")})
+	}
+	regions, err := g.PlacementRegions(ctx)
+	if err != nil {
+		return append(out, Check{Name: "regions", Msg: err.Error()})
+	}
+	out = append(out, Check{Name: "regions", OK: true, Msg: fmt.Sprintf("%d: %s", len(regions), strings.Join(regions, ", "))})
+	t, err := g.Prices(ctx, true)
+	if err != nil {
+		return append(out, Check{Name: "spot prices", Msg: err.Error()})
+	}
+	best := t.Prices[0]
+	out = append(out, Check{Name: "spot prices", OK: true, Msg: fmt.Sprintf("cheapest now: %s in %s at $%s/h (%d options in %d regions; `spotexec prices %s` lists them)",
+		best.Type, best.Zone, best.Price, len(t.Prices), len(regions)-len(t.Unpriced), g.r.Name)})
+	if len(t.Unpriced) > 0 {
+		out = append(out, Check{Name: "unpriced regions", OK: true, Msg: "not used: " + summarize(t.Unpriced, 4)})
+	}
+	// Quota and network matter where launches will actually go: the
+	// cheapest few regions. A region the account has never used often
+	// has a tiny Spot quota.
+	var top []string
+	for _, p := range t.Prices {
+		if !contains(top, p.Region) {
+			top = append(top, p.Region)
+		}
+		if len(top) == 3 {
+			break
+		}
+	}
+	need := vcpusOf(best.Type)
+	for _, rg := range top {
+		a := g.Regional(rg)
+		if vpc, err := a.vpcID(ctx); err != nil {
+			msg := err.Error()
+			if strings.HasPrefix(msg, "no default VPC") {
+				msg = "launches skip this region: " + msg
+			}
+			out = append(out, Check{Name: "network " + rg, Msg: msg})
+		} else {
+			out = append(out, Check{Name: "network " + rg, OK: true, Msg: "default VPC " + vpc})
+		}
+		if q, err := a.spotQuota(ctx); err == nil {
+			out = append(out, Check{Name: "spot vCPU quota " + rg, OK: q >= need,
+				Msg: fmt.Sprintf("%d vCPUs (one %s needs %d; the fleet may use up to %d across all regions)", q, best.Type, need, g.r.MaxInstances*need)})
+		}
+	}
+	out = append(out, Check{Name: "console", OK: true, Msg: fmt.Sprintf("instances can appear in any of these regions; filter by tag %s=%s (`spotexec status` shows each one's region)", tagRunner, g.r.Name)})
+	return out
+}
+
+func permHint(err error) string {
+	if awsCode(err) == "UnauthorizedOperation" || strings.Contains(err.Error(), "UnauthorizedOperation") {
+		return " (multi-region placement needs ec2:DescribeRegions and ec2:DescribeSpotPriceHistory: re-run `spotexec setup` to update the policy)"
+	}
+	return ""
+}

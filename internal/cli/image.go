@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -22,7 +23,11 @@ import (
 // cmdImage manages baked runner images (AMIs) for aws-spot fleets.
 func cmdImage() *cobra.Command {
 	c := &cobra.Command{Use: "image", Short: "Bake runner images (AMIs) so new VMs skip their bootstrap"}
-	pick := func(args []string) (*config.Runner, *provider.AWSSpot, error) {
+	var region string
+	// pickAll returns the runner and its regional providers: one for a
+	// single-region runner, or for a multi-region one the --region given,
+	// else (when all is set) every region it uses.
+	pickAll := func(ctx context.Context, args []string, all bool) (*config.Runner, []*provider.AWSSpot, error) {
 		cfg, err := loadGlobal()
 		if err != nil {
 			return nil, nil, err
@@ -36,15 +41,62 @@ func cmdImage() *cobra.Command {
 		if err != nil {
 			return nil, nil, err
 		}
+		if region == "" && !all && !r.MultiRegion() {
+			region = r.Region // a single-region runner bakes in its region, even while it still tidies up others
+		}
+		if region != "" && !config.ValidRegion(region) {
+			return nil, nil, fmt.Errorf("invalid region %q", region)
+		}
+		if region != "" && all {
+			// Listing and clearing may target any region, including one the
+			// runner no longer uses (its images still bill).
+			a, err := provider.RegionalAWS(r, region)
+			if err != nil {
+				return nil, nil, err
+			}
+			return r, []*provider.AWSSpot{a}, nil
+		}
 		p, err := provider.New(r)
 		if err != nil {
 			return nil, nil, err
 		}
-		a, ok := p.(*provider.AWSSpot)
-		if !ok {
-			return nil, nil, fmt.Errorf("runner %s is not an aws-spot runner", r.Name)
+		switch a := p.(type) {
+		case *provider.AWSSpot:
+			if region != "" && region != r.Region {
+				return nil, nil, fmt.Errorf("runner %s only uses %s", r.Name, r.Region)
+			}
+			return r, []*provider.AWSSpot{a}, nil
+		case *provider.AWSGlobal:
+			if region != "" {
+				regions, err := a.PlacementRegions(ctx)
+				if err != nil {
+					return nil, nil, err
+				}
+				if !slices.Contains(regions, region) {
+					return nil, nil, fmt.Errorf("runner %s doesn't launch in %s (its regions: %s)", r.Name, region, strings.Join(regions, ", "))
+				}
+				// A bake is per region; mark it as used so listings and the
+				// pool manager look there for builders.
+				reg, err := a.Use(region)
+				if err != nil {
+					return nil, nil, err
+				}
+				return r, []*provider.AWSSpot{reg}, nil
+			}
+			if !all {
+				return nil, nil, fmt.Errorf("runner %s spans several regions and images are per region: pass --region (`spotexec prices %s` shows where launches go)", r.Name, r.Name)
+			}
+			as, err := a.RegionalProviders(ctx)
+			return r, as, err
 		}
-		return r, a, nil
+		return nil, nil, fmt.Errorf("runner %s is not an aws-spot runner", r.Name)
+	}
+	pick := func(args []string) (*config.Runner, *provider.AWSSpot, error) {
+		r, as, err := pickAll(context.Background(), args, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		return r, as[0], nil
 	}
 	var pulls []string
 	bake := &cobra.Command{
@@ -84,20 +136,32 @@ func cmdImage() *cobra.Command {
 		Short: "List a runner's baked images, from every machine in the account",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, a, err := pick(args)
-			if err != nil {
+			r, as, err := pickAll(cmd.Context(), args, true)
+			if err != nil && len(as) == 0 {
 				return err
 			}
-			bakes, err := a.Bakes(cmd.Context())
-			if err != nil {
-				return err
+			total := 0
+			for _, a := range as {
+				bakes, err := a.Bakes(cmd.Context())
+				if err != nil {
+					return err
+				}
+				if len(bakes) == 0 {
+					continue
+				}
+				if total > 0 {
+					fmt.Println()
+				}
+				if len(as) > 1 {
+					fmt.Printf("%s:\n", a.Runner().Region)
+				}
+				printBakes(os.Stdout, r.Name, bakes, time.Now())
+				total += len(bakes)
 			}
-			if len(bakes) == 0 {
-				fmt.Printf("%s: no baked images (bootstrap hash %s); run `spotexec image bake %s`\n", r.Name, a.BakeHash(), r.Name)
-				return nil
+			if total == 0 {
+				fmt.Printf("%s: no baked images (bootstrap hash %s); run `spotexec image bake %s`\n", r.Name, as[0].BakeHash(), r.Name)
 			}
-			printBakes(os.Stdout, r.Name, bakes, time.Now())
-			return nil
+			return err
 		},
 	}
 	var clearAll bool
@@ -110,19 +174,28 @@ other machines made for a different bootstrap are kept (--all removes them
 too). A bake a VM is booting from right now is never removed.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, a, err := pick(args)
-			if err != nil {
+			_, as, err := pickAll(cmd.Context(), args, true)
+			if err != nil && len(as) == 0 {
 				return err
 			}
-			res, err := a.ClearBakes(cmd.Context(), clearAll)
-			fmt.Printf("removed %d baked image(s)\n", res.Removed)
-			for _, k := range res.Kept {
-				fmt.Printf("  kept %s\n", k)
+			removed := 0
+			for _, a := range as {
+				res, cerr := a.ClearBakes(cmd.Context(), clearAll)
+				removed += res.Removed
+				for _, k := range res.Kept {
+					if len(as) > 1 {
+						k = a.Runner().Region + ": " + k
+					}
+					fmt.Printf("  kept %s\n", k)
+				}
+				err = errors.Join(err, cerr)
 			}
+			fmt.Printf("removed %d baked image(s)\n", removed)
 			return err
 		},
 	}
 	clear.Flags().BoolVar(&clearAll, "all", false, "also remove bakes other machines made for a different bootstrap")
+	c.PersistentFlags().StringVar(&region, "region", "", "region to bake in, list or clear (multi-region runners)")
 	c.AddCommand(bake, list, clear)
 	return c
 }
