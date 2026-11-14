@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 )
 
@@ -195,10 +196,47 @@ func (st *poolState) note(id string) *note {
 	return n
 }
 
+// LifetimeDrainAhead is how long before a VM's max_lifetime it stops
+// taking new runs (and drains), so the hard poweroff at max_lifetime never
+// interrupts a run that started after that point: 15 minutes, or a quarter
+// of a shorter max_lifetime.
+// (The VM's helper enforces the same cutoff when a run reaches it.)
+func LifetimeDrainAhead(r *config.Runner) time.Duration {
+	lt := r.MaxLifetime.Duration
+	if lt <= 0 {
+		lt = 12 * time.Hour // cloud-init's default
+	}
+	return protocol.LifetimeDrainAhead(lt)
+}
+
+// NearLifetime reports whether an instance is within LifetimeDrainAhead of
+// its max_lifetime.
+func NearLifetime(r *config.Runner, in provider.Instance) bool {
+	lt := r.MaxLifetime.Duration
+	if lt <= 0 {
+		lt = 12 * time.Hour
+	}
+	return !in.LaunchedAt.IsZero() && time.Since(in.LaunchedAt) > lt-LifetimeDrainAhead(r)
+}
+
+// drainAging marks instances near max_lifetime draining: no new runs are
+// placed on them, and they stop counting as capacity, so a replacement is
+// launched for waiting demand (or the warm pool). Every sx process and the
+// daemon do this, so it holds whether or not the daemon runs.
+func (p *Pool) drainAging(st *poolState) {
+	for _, in := range st.Instances {
+		if NearLifetime(p.R, in) {
+			st.note(in.ID).Draining = true
+		}
+	}
+}
+
 // refresh re-lists the fleet when the cached listing is stale (or force),
-// reconciling notes and the launch ledger. Called with the lock held, so one
-// process refreshes while the others wait and reuse its result.
+// reconciling notes and the launch ledger, and drains instances near
+// max_lifetime. Called with the lock held, so one process refreshes while
+// the others wait and reuse its result.
 func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
+	defer p.drainAging(st)
 	if !force && time.Since(st.ListedAt) < listTTL {
 		return nil
 	}

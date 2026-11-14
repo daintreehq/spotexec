@@ -35,6 +35,15 @@ max_slots = 4
 idle_timeout = "20s"
 boot_delay = "2s"
 priority = 20
+[runners.${RUNNER}l]
+type = "sim"
+max_instances = 2
+max_slots = 2
+idle_timeout = "60s"
+max_lifetime = "60s"
+boot_timeout = "20s"
+boot_delay = "1s"
+priority = 40
 EOF
 
 count() { docker ps -q --filter "label=spotexec-runner=$RUNNER" | wc -l | tr -d ' '; }
@@ -42,7 +51,7 @@ countb() { docker ps -q --filter "label=spotexec-runner=${RUNNER}b" | wc -l | tr
 countx() { docker ps -q --filter "label=spotexec-runner=${RUNNER}x" | wc -l | tr -d ' '; }
 cleanup() {
   # One filter per command: Docker ANDs repeated label filters.
-  for r in "$RUNNER" "${RUNNER}b" "${RUNNER}x"; do
+  for r in "$RUNNER" "${RUNNER}b" "${RUNNER}x" "${RUNNER}l"; do
     docker ps -q --filter "label=spotexec-runner=$r" | xargs -r docker rm -f >/dev/null 2>&1
   done
   return 0
@@ -209,6 +218,19 @@ sleep 2
 kill -INT $UP; wait $UP; rc=$?
 check "Ctrl-C during boot fails up" "[ $rc != 0 ]"
 check "Ctrl-C during boot terminates the VM" "[ \$(countx) = 0 ]"
+
+echo "== a VM near max_lifetime takes no new runs (60s lifetime: none in the last 15s)"
+cleanup; sleep 1
+placed() { grep '"placed"' "$1" | sed 's/.*instance_id":"\([^"]*\)".*/\1/' | tail -1; }
+SPOTEXEC_POOL=${RUNNER}l "$SX" --json 'echo first' >"$WORK/l1.out" 2>"$WORK/l1.err"
+L1=$(placed "$WORK/l1.err")
+born=$(docker inspect -f '{{index .Config.Labels "spotexec-launched"}}' "$L1" 2>/dev/null || echo 0)
+while [ $(( $(date +%s) - born/1000 )) -lt 47 ]; do sleep 1; done
+SPOTEXEC_POOL=${RUNNER}l "$SX" --json --same-slot 'echo same' >"$WORK/l2.out" 2>"$WORK/l2.err"; code=$?
+check "the VM's helper refuses a run to its slot near max_lifetime" "[ $code = 125 ] && ! grep -q same $WORK/l2.out && grep -q max_lifetime $WORK/l2.err"
+SPOTEXEC_POOL=${RUNNER}l "$SX" --json 'echo second' >"$WORK/l3.out" 2>"$WORK/l3.err"
+L3=$(placed "$WORK/l3.err")
+check "a new run goes to a fresh VM, not the ageing one" "grep -q second $WORK/l3.out && [ -n \"$L3\" ] && [ \"$L3\" != \"$L1\" ]"
 
 echo "== Spot vCPU quota (a simulated VM counts 4 vCPUs)"
 cleanup; sleep 1

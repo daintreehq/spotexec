@@ -59,6 +59,7 @@ touch "$D/lifecycle.lock" "$D/activity"
 chmod 0644 "$D/lifecycle.lock"
 chmod 0644 "$D/activity"
 echo "{{.IdleText}}" > "$D/idle_timeout"
+echo "{{.MaxSecs}}" > "$D/max_lifetime"   # the helper stops taking new runs shortly before it
 rm -f "$D/draining" "$D/ready"
 
 # ---- 1. Idle watchdog (armed before anything else can fail) ----

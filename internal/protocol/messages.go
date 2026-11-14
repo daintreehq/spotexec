@@ -1,5 +1,7 @@
 package protocol
 
+import "time"
+
 // Message type names.
 const (
 	TypeHello       = "hello"
@@ -95,6 +97,16 @@ type Acquire struct {
 	OnlySlot    bool       `json:"only_slot,omitempty"`  // wait for PreferSlot rather than take another
 	KeepOwner   bool       `json:"keep_owner,omitempty"` // don't claim the slot (exec/pull)
 	SpotWatch   bool       `json:"spot_watch,omitempty"` // watch for spot interruption / rebalance notices
+	// ReadOnly: nothing will run, only files are copied (pull), so a VM near
+	// its max_lifetime may still serve it.
+	ReadOnly bool `json:"read_only,omitempty"`
+}
+
+// LifetimeDrainAhead is how long before an ephemeral VM's max_lifetime it
+// stops taking new runs, so the hard poweroff never cuts short a run that
+// started after that point: 15 minutes, or a quarter of a shorter lifetime.
+func LifetimeDrainAhead(maxLifetime time.Duration) time.Duration {
+	return min(15*time.Minute, maxLifetime/4)
 }
 
 // Holder describes a held token, for waiting/busy/status displays.

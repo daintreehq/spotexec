@@ -60,7 +60,13 @@ session holds the lifecycle lock. Because instances launch with
 instance.
 
 A draining VM with no sessions shuts down at once, without waiting for
-`idle_timeout`. `max_lifetime` is a hard cap.
+`idle_timeout`. `max_lifetime` is a hard cap. So it never cuts a run short
+that started late, a VM stops taking new runs 15 minutes before it (a
+quarter of a shorter `max_lifetime`): every `sx` marks it draining in
+`pool.json`, so it no longer counts as capacity and waiting jobs get a
+replacement, and the VM's helper refuses new runs from then on (including
+`--same-slot` and `exec`; `pull` still works). This holds with or without
+the pool manager.
 
 ## Interruptions
 

@@ -90,7 +90,7 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `max_instances` | `4` | Fleet ceiling. |
 | `min_instances` | `0` | Warm floor, kept only while the [pool manager](scaling.md#pool-manager-optional) runs. |
 | `idle_timeout` | `10m` | The VM powers off after this long with no work. |
-| `max_lifetime` | `12h` | Hard cap, regardless of activity. Must exceed `boot_timeout`. |
+| `max_lifetime` | `12h` | Hard cap, regardless of activity. Must exceed `boot_timeout`. New runs stop going to a VM 15 minutes before it (a quarter of a shorter lifetime). |
 | `boot_timeout` | `15m` | Longest wait for first-boot setup; a VM that takes longer is terminated. |
 | `bootstrap_script` | (none) | Runs as root on first boot, after the watchdog is armed. Bounded by `boot_timeout`. |
 | `user_bootstrap_script` | (none) | Then runs as the login user, in a login shell. |

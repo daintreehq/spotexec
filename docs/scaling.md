@@ -7,6 +7,7 @@ Every `sx` process schedules for itself, against shared local state:
 - **Queueing.** When every slot is busy, the job takes a ticket in a fair local queue: priority first, then arrival. Spinners show `queued #3 of 9`, and agents get `queue_position` events.
 - **Scaling out.** A queued job registers demand, and the fleet launches while waiting demand exceeds the capacity already booting, up to `max_instances`. Lower-priority fleets only launch for demand the higher-priority ones can't cover. A failed launch backs the fleet off for 20s. A launch the account's vCPU quota refuses is different: the fleet stops launching and runs queue for its running VMs until one ends (or five minutes pass), and with no VM running the run fails at once with the command to raise the quota.
 - **Scaling in.** Each VM powers itself off after `idle_timeout`. Nothing has to tell it to.
+- **Retiring.** A VM stops taking new runs 15 minutes before its `max_lifetime` (a quarter of a shorter one), so the hard cap never interrupts a run that started after that point. Runs already on it carry on; longer ones can still meet the cap.
 - **CPU sizing.** Point your test runner at `$SPOTEXEC_CPUS` and it uses its fair share of the VM:
 
   ```sh
@@ -41,7 +42,7 @@ spotexec daemon run        # foreground, for launchd/systemd or debugging
 
 What it adds:
 
-- **Warm pools.** It keeps `min_instances` per fleet running and keeps their idle clocks fresh, so the first job of the day doesn't wait for a boot. About 15 minutes before a warm VM's `max_lifetime`, it drains that VM and boots its replacement, so jobs never meet the hard cap.
+- **Warm pools.** It keeps `min_instances` per fleet running and keeps their idle clocks fresh, so the first job of the day doesn't wait for a boot. About 25 minutes before a warm VM's `max_lifetime`, it drains that VM and boots its replacement, one VM at a time, so warm capacity stays up.
 - **Faster interruption recovery.** It probes every instance every 30s. A VM with a Spot notice is drained, and its replacement launches during the 2-minute notice, not after the VM is gone.
 - **Health replacement.** A VM that stops answering for 8 minutes, or never finishes first-boot setup, is terminated and replaced. If *no* VM answers, the problem is probably your network, so it replaces at most one every 30 minutes. A fleet whose new VMs fail to come up three times in an hour is paused for an hour.
 - **Reaping.** It terminates VMs past `max_lifetime` (in case a watchdog failed), VMs stuck without an address, and leftover image-bake builders.

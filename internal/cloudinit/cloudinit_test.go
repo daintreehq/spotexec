@@ -20,7 +20,7 @@ func TestRenderIsValidBash(t *testing.T) {
 	if out, err := exec.Command("bash", "-n", p).CombinedOutput(); err != nil {
 		t.Fatalf("bash -n: %v: %s", err, out)
 	}
-	for _, want := range []string{"IDLE=600", "MAXLIFE=7200", "timeout -k 30 60", "ClientAliveInterval 30", "flock -n -x 9",
+	for _, want := range []string{"IDLE=600", "MAXLIFE=7200", `echo "7200" > "$D/max_lifetime"`, "timeout -k 30 60", "ClientAliveInterval 30", "flock -n -x 9",
 		"'AuthenticationMethods publickey'", "'PasswordAuthentication no'", "R=no RT=no", "'GSSAPIAuthentication no'", `"AllowUsers $U"`, "sshd_config.d/00-spotexec.conf"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("user-data missing %q", want)

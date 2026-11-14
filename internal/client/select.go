@@ -671,7 +671,8 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 	}
 	req := AcquireRequest{
 		Base: protocol.Acquire{RepoID: ws.RepoID, WorktreeKey: ws.WorktreeKey, Fingerprint: fingerprint, Exclusive: exclusive, KeepOwner: !syncing,
-			Client: protocol.ClientInfo{Host: host, PID: os.Getpid(), Worktree: ws.Root, Command: display}},
+			ReadOnly: display == PullDisplay, // still allowed on a VM near max_lifetime
+			Client:   protocol.ClientInfo{Host: host, PID: os.Getpid(), Worktree: ws.Root, Command: display}},
 		QueueTimeout: queue, PreferSlot: lr.Slot, OnlySlot: true, Rep: rep,
 	}
 	lease, _, err := tryAcquire(ctx, req, r, p, lr.Target, true)
@@ -689,6 +690,10 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 	}
 	return lease, nil
 }
+
+// PullDisplay is AcquireSlot's display for `spotexec pull`, which only
+// copies files back.
+const PullDisplay = "(pull)"
 
 // ErrSlotGone means the slot a worktree last used no longer exists.
 var ErrSlotGone = errors.New("the slot is gone")

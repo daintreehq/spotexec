@@ -65,6 +65,9 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	if draining(s.layout.Root) {
 		return perr(protocol.CodeDraining, "runner is draining (shutting down or spot interruption)")
 	}
+	if err := lifetimeGate(a); err != nil {
+		return err
+	}
 	// Ephemeral runners: hold the lifecycle lock shared so the idle watchdog
 	// (which needs it exclusively) cannot shut the VM down under us.
 	if _, err := os.Stat(LifecycleLock); err == nil {
@@ -172,6 +175,9 @@ capacity:
 		}
 		if draining(s.layout.Root) {
 			return perr(protocol.CodeDraining, "runner is draining")
+		}
+		if err := lifetimeGate(a); err != nil {
+			return err
 		}
 		if s.clientGone() {
 			return perr(protocol.CodeInternal, "client went away while queued")
@@ -296,6 +302,9 @@ capacity:
 	if draining(s.layout.Root) {
 		return perr(protocol.CodeDraining, "runner is draining")
 	}
+	if err := lifetimeGate(a); err != nil { // the cutoff may have passed while waiting
+		return err
+	}
 	root := s.layout.Root
 	s.owned.Store(&root)
 	return s.c.Send(protocol.TypeAcquired, protocol.Acquired{
@@ -396,6 +405,9 @@ func (s *Session) waitForSlot(a protocol.Acquire, w *slotWaiter, h protocol.Hold
 		}
 		if draining(s.layout.Root) {
 			return false, perr(protocol.CodeDraining, "runner is draining")
+		}
+		if err := lifetimeGate(a); err != nil {
+			return false, err
 		}
 		if s.clientGone() {
 			return false, perr(protocol.CodeInternal, "client went away while queued")
@@ -516,4 +528,39 @@ func heldFile(path string) bool {
 	}
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	return false
+}
+
+// lifetimeGate refuses a run on a VM near its max_lifetime: the hard
+// poweroff would cut it short. Copying files back (pull) is still allowed.
+func lifetimeGate(a protocol.Acquire) error {
+	if left, near := nearMaxLifetime(); near && !a.ReadOnly {
+		return perr(protocol.CodeDraining, "runner is %s from its max_lifetime, so it takes no new runs", left.Round(time.Second))
+	}
+	return nil
+}
+
+// nearMaxLifetime reports whether this ephemeral VM is within
+// protocol.LifetimeDrainAhead of its max_lifetime (cloud-init records both
+// its birth and its lifetime), and how long it has left.
+func nearMaxLifetime() (time.Duration, bool) {
+	return lifetimeLeft(LifecycleDir, time.Now())
+}
+
+func lifetimeLeft(dir string, now time.Time) (time.Duration, bool) {
+	read := func(name string) (int64, bool) {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return 0, false
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+		return n, err == nil && n > 0
+	}
+	created, ok1 := read("created_at")
+	secs, ok2 := read("max_lifetime")
+	if !ok1 || !ok2 {
+		return 0, false // a static runner, or a VM from an older spotexec
+	}
+	lt := time.Duration(secs) * time.Second
+	left := time.Unix(created, 0).Add(lt).Sub(now)
+	return left, left < protocol.LifetimeDrainAhead(lt)
 }

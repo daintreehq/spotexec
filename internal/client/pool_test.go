@@ -192,3 +192,42 @@ func TestAmbiguousLaunchExpiresWhileProcessLives(t *testing.T) {
 		t.Fatalf("ambiguous reservation never expired: reserved %d", len(ids))
 	}
 }
+
+// A VM close to max_lifetime takes no new runs and stops counting as
+// capacity, so waiting demand and the warm pool get a replacement: the hard
+// poweroff never meets a run that started after the drain point.
+func TestNearLifetimeInstancesDrain(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 4)
+	p.R.MaxLifetime.Duration = 12 * time.Hour
+	host := provider.Target{Host: "127.0.0.1", Port: 1}
+	old := provider.Instance{ID: "i-old", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-12*time.Hour + 10*time.Minute)}
+	young := provider.Instance{ID: "i-young", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Hour)}
+	f.insts = []provider.Instance{old, young}
+
+	cands, usable, err := p.Candidates(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].ID != "i-young" || usable != 1 {
+		t.Fatalf("candidates %v usable %d: the ageing VM must not take new runs", cands, usable)
+	}
+	// The oldest-first order would otherwise have picked it first.
+	if ids, _ := p.EnsureMin(ctx, 2); len(ids) != 1 {
+		t.Fatalf("ageing VM not replaced in the warm pool: reserved %d", len(ids))
+	}
+
+	// Short lifetimes drain a quarter ahead.
+	r := &config.Runner{}
+	r.MaxLifetime.Duration = time.Hour
+	if d := LifetimeDrainAhead(r); d != 15*time.Minute {
+		t.Fatalf("drain ahead %s", d)
+	}
+	r.MaxLifetime.Duration = 80 * time.Second
+	if d := LifetimeDrainAhead(r); d != 20*time.Second {
+		t.Fatalf("drain ahead %s", d)
+	}
+	if !NearLifetime(r, provider.Instance{LaunchedAt: time.Now().Add(-61 * time.Second)}) || NearLifetime(r, provider.Instance{LaunchedAt: time.Now().Add(-59 * time.Second)}) {
+		t.Fatal("NearLifetime boundary")
+	}
+}
