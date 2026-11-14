@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strings"
@@ -69,29 +70,37 @@ and keeps a working key. --rotate replaces the key.
 					}
 					return false, nil
 				}
-				if user == "" {
-					user = defaultIAMUser()
-				}
 				region := aws[0].Region
 				names := make([]string, len(aws))
 				for i, r := range aws {
 					names[i] = r.Name
 				}
-				checkVPC := true
+				// Every region the runners use: each needs a network and quota.
+				var regions, vpcRegions []string
+				need := map[string]int{}
+				ownNet := map[string]bool{}
 				for _, r := range aws {
-					if r.Region == region && r.SubnetID != "" {
-						checkVPC = false
+					if _, seen := need[r.Region]; !seen {
+						regions = append(regions, r.Region)
+					}
+					need[r.Region] += r.MaxInstances * provider.VCPUsOf(r.InstanceTypes[0])
+					ownNet[r.Region] = ownNet[r.Region] || r.SubnetID != ""
+				}
+				for _, rg := range regions {
+					if !ownNet[rg] && !noVPC {
+						vpcRegions = append(vpcRegions, rg)
 					}
 				}
 				s := &provider.AWSUserSetup{
-					AdminProfile: adminProfile, Profile: profile, UserName: user, Region: region, Rotate: rotate, CheckVPC: checkVPC && !noVPC,
+					AdminProfile: adminProfile, Profile: profile, UserName: user, DefaultName: defaultIAMUser(), Region: region, Rotate: rotate,
+					VPCRegions: vpcRegions, QuotaRegions: regions,
 					Log: func(f string, a ...any) { fmt.Printf("  "+f+"\n", a...) },
 					Confirm: func(plan provider.AWSSetupPlan) bool {
 						fmt.Printf("\nSigned in to AWS account %s as %s. This will:\n", plan.Account, plan.AdminARN)
-						if plan.CreateVPC {
-							fmt.Printf("  • create the default VPC in %s, which has none (AWS's standard network; free; --no-vpc skips this)\n", region)
+						for _, rg := range plan.CreateVPCIn {
+							fmt.Printf("  • create the default VPC in %s, which has none (AWS's standard network; free; --no-vpc skips this)\n", rg)
 						}
-						fmt.Printf("  • create (or update) IAM user %s with only spotexec's permissions (see `spotexec setup --print-policy`)\n", user)
+						fmt.Printf("  • create (or update) IAM user %s with only spotexec's permissions (see `spotexec setup --print-policy`)\n", plan.UserName)
 						fmt.Printf("  • save an access key for it as AWS profile %q in ~/.aws/credentials (if it hasn't one already)\n", profile)
 						fmt.Printf("  • set profile = %q on runner(s) %s\n", profile, strings.Join(names, ", "))
 						if yes {
@@ -107,7 +116,7 @@ and keeps a working key. --rotate replaces the key.
 						return a == "" || a == "y" || a == "yes"
 					},
 				}
-				fmt.Printf("Setting up AWS access for %s (region %s)…\n", strings.Join(names, ", "), region)
+				fmt.Printf("Setting up AWS access for %s (%s)…\n", strings.Join(names, ", "), strings.Join(regions, ", "))
 				res, err := s.Run(cmd.Context())
 				if errors.Is(err, provider.ErrSetupDeclined) {
 					return false, exitWith(1)
@@ -124,8 +133,8 @@ and keeps a working key. --rotate replaces the key.
 				for _, k := range res.KeysDeleted {
 					fmt.Printf("  deleted the user's old access key %s\n", k)
 				}
-				if res.NoVPC {
-					fmt.Printf("! %s has no default VPC: set subnet_id on the runner (see https://github.com/daintreehq/spotexec/blob/main/docs/aws.md#6-check-the-network)\n", region)
+				for _, rg := range res.NoVPC {
+					fmt.Printf("! %s has no default VPC: set subnet_id on its runners (see https://github.com/daintreehq/spotexec/blob/main/docs/aws.md#6-check-the-network)\n", rg)
 				}
 				if res.PolicyStale {
 					fmt.Println("  (not signed in as an administrator, so the user's policy wasn't refreshed; that's only needed after upgrading spotexec)")
@@ -137,18 +146,15 @@ and keeps a working key. --rotate replaces the key.
 				if len(changed) > 0 {
 					fmt.Printf("✓ set profile = %q on %s in %s\n", profile, strings.Join(changed, ", "), g.Path)
 				}
-				if res.QuotaVCPUs >= 0 {
-					need := 0
-					for _, r := range aws {
-						if r.Region == region {
-							need += r.MaxInstances * provider.VCPUsOf(r.InstanceTypes[0])
-						}
-					}
-					if res.QuotaVCPUs < float64(need) {
-						fmt.Printf("! Spot vCPU quota in %s is %.0f, but your runners may use up to %d. Until it's raised, fewer VMs run at once.\n", region, res.QuotaVCPUs, need)
-						fmt.Printf("  Request more (as an administrator): aws service-quotas request-service-quota-increase --region %s --service-code ec2 --quota-code L-34B43A08 --desired-value %d\n", region, need)
-					} else {
-						fmt.Printf("✓ Spot vCPU quota in %s: %.0f (runners need up to %d)\n", region, res.QuotaVCPUs, need)
+				for _, rg := range regions {
+					q, ok := res.Quotas[rg]
+					switch {
+					case !ok:
+					case q < float64(need[rg]):
+						fmt.Printf("! Spot vCPU quota in %s is %.0f, but your runners there may use up to %d. Until it's raised, fewer VMs run at once.\n", rg, q, need[rg])
+						fmt.Printf("  Request more (as an administrator): aws service-quotas request-service-quota-increase --region %s --service-code ec2 --quota-code L-34B43A08 --desired-value %d\n", rg, need[rg])
+					default:
+						fmt.Printf("✓ Spot vCPU quota in %s: %.0f (runners need up to %d)\n", rg, q, need[rg])
 					}
 				}
 				return true, nil
@@ -222,6 +228,11 @@ func awsRunners(g *config.Global) []*config.Runner {
 
 func defaultIAMUser() string {
 	h, _ := os.Hostname()
+	// macOS's LocalHostName is stable; os.Hostname can pick up a
+	// DHCP/VPN-assigned name or a Bonjour "-2" suffix.
+	if b, err := exec.Command("scutil", "--get", "LocalHostName").Output(); err == nil && strings.TrimSpace(string(b)) != "" {
+		h = strings.TrimSpace(string(b))
+	}
 	h = strings.ToLower(strings.TrimSuffix(strings.Split(h, ".")[0], "-"))
 	h = regexp.MustCompile(`[^a-z0-9-]+`).ReplaceAllString(h, "-")
 	h = strings.Trim(h, "-")

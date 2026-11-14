@@ -11,17 +11,30 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
+const testMachine = "aaaaaaaa-1111-4222-8333-444444444444"
+
+type fakeUser struct {
+	path string
+	tags map[string]string
+}
+
+type fakeKey struct {
+	user    string
+	created string
+}
+
 // fakeIAM serves the STS, IAM, EC2 and Service Quotas calls setup makes.
 type fakeIAM struct {
 	mu          sync.Mutex
-	userPath    string            // path of the existing user ("" = no user)
-	keys        map[string]string // key id -> create date
+	users       map[string]*fakeUser
+	keys        map[string]fakeKey
 	created     int
 	calls       []string
 	denyCreate  bool
@@ -43,100 +56,123 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 		v, _ := url.ParseQuery(string(body))
 		action := v.Get("Action")
 		f.calls = append(f.calls, action)
-		if n := f.propagation[key]; n > 0 {
-			f.propagation[key] = n - 1
-			w.WriteHeader(403)
-			fmt.Fprint(w, `<ErrorResponse><Error><Code>InvalidClientTokenId</Code><Message>not yet</Message></Error></ErrorResponse>`)
-			return
-		}
-		isAdmin := key == "AKIADMIN"
-		if !isAdmin && f.keys[key] == "" {
-			w.WriteHeader(403)
-			fmt.Fprint(w, `<ErrorResponse><Error><Code>InvalidClientTokenId</Code><Message>bad key</Message></Error></ErrorResponse>`)
-			return
-		}
 		iamErr := func(status int, code string) {
 			w.WriteHeader(status)
 			fmt.Fprintf(w, `<ErrorResponse><Error><Code>%s</Code><Message>%s</Message></Error></ErrorResponse>`, code, code)
 		}
-		arn := func(path, user string) string { return "arn:aws:iam::111122223333:user" + path + user }
+		if n := f.propagation[key]; n > 0 {
+			f.propagation[key] = n - 1
+			iamErr(403, "InvalidClientTokenId")
+			return
+		}
+		isAdmin := key == "AKIADMIN"
+		if !isAdmin && f.keys[key].user == "" {
+			iamErr(403, "InvalidClientTokenId")
+			return
+		}
+		arn := func(name string) string {
+			return "arn:aws:iam::111122223333:user" + f.users[name].path + name
+		}
+		user := func() *fakeUser { return f.users[v.Get("UserName")] }
 		switch action {
 		case "GetCallerIdentity":
 			a := "arn:aws:iam::111122223333:root"
 			if !isAdmin {
-				a = arn(f.userPath, "spotexec-test")
+				a = arn(f.keys[key].user)
 			}
 			fmt.Fprintf(w, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>111122223333</Account><Arn>%s</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>`, a)
+			return
 		case "DescribeInstances":
 			fmt.Fprint(w, `<DescribeInstancesResponse><reservationSet/></DescribeInstancesResponse>`)
+			return
 		case "DescribeVpcs":
 			if f.noVPC {
 				fmt.Fprint(w, `<DescribeVpcsResponse><vpcSet/></DescribeVpcsResponse>`)
 			} else {
 				fmt.Fprint(w, `<DescribeVpcsResponse><vpcSet><item><vpcId>vpc-default</vpcId></item></vpcSet></DescribeVpcsResponse>`)
 			}
+			return
+		}
+		if !isAdmin {
+			iamErr(403, "AccessDenied")
+			return
+		}
+		switch action {
 		case "CreateDefaultVpc":
-			if !isAdmin {
-				iamErr(403, "UnauthorizedOperation")
-				return
-			}
 			f.noVPC = false
 			fmt.Fprint(w, `<CreateDefaultVpcResponse><vpc><vpcId>vpc-new</vpcId></vpc></CreateDefaultVpcResponse>`)
-		default:
-			if !isAdmin {
+		case "CreateUser":
+			if f.denyCreate {
 				iamErr(403, "AccessDenied")
 				return
 			}
-			switch action {
-			case "CreateUser":
-				if f.denyCreate {
-					iamErr(403, "AccessDenied")
-					return
-				}
-				if f.userPath != "" {
-					iamErr(409, "EntityAlreadyExists")
-					return
-				}
-				if v.Get("Path") != "/spotexec/" || v.Get("Tags.member.1.Key") != "spotexec-managed" {
-					t.Errorf("CreateUser params: %v", v)
-				}
-				f.userPath = v.Get("Path")
-				fmt.Fprintf(w, `<CreateUserResponse><CreateUserResult><User><Arn>%s</Arn></User></CreateUserResult></CreateUserResponse>`, arn(f.userPath, v.Get("UserName")))
-			case "GetUser":
-				fmt.Fprintf(w, `<GetUserResponse><GetUserResult><User><Arn>%s</Arn></User></GetUserResult></GetUserResponse>`, arn(f.userPath, v.Get("UserName")))
-			case "PutUserPolicy":
-				var doc map[string]any
-				if err := json.Unmarshal([]byte(v.Get("PolicyDocument")), &doc); err != nil || v.Get("PolicyName") != "spotexec" {
-					t.Errorf("PutUserPolicy: %v %v", v.Get("PolicyName"), err)
-				}
-				fmt.Fprint(w, `<PutUserPolicyResponse/>`)
-			case "CreateServiceLinkedRole":
-				iamErr(400, "InvalidInput") // message lacks "has been taken": logged as a warning
-			case "ListAccessKeys":
-				var b strings.Builder
-				for id, d := range f.keys {
-					fmt.Fprintf(&b, `<member><AccessKeyId>%s</AccessKeyId><CreateDate>%s</CreateDate></member>`, id, d)
-				}
-				fmt.Fprintf(w, `<ListAccessKeysResponse><ListAccessKeysResult><AccessKeyMetadata>%s</AccessKeyMetadata></ListAccessKeysResult></ListAccessKeysResponse>`, b.String())
-			case "CreateAccessKey":
-				if len(f.keys) >= 2 {
-					iamErr(409, "LimitExceeded")
-					return
-				}
-				f.created++
-				id := fmt.Sprintf("AKNEW%d", f.created)
-				f.keys[id] = time.Now().UTC().Format(time.RFC3339Nano)
-				f.propagation[id] = 2
-				fmt.Fprintf(w, `<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey><AccessKeyId>%s</AccessKeyId><SecretAccessKey>secret-%s</SecretAccessKey></AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>`, id, id)
-			case "DeleteAccessKey":
-				delete(f.keys, v.Get("AccessKeyId"))
-				fmt.Fprint(w, `<DeleteAccessKeyResponse/>`)
-			default:
-				t.Errorf("unexpected action %s", action)
-				iamErr(400, "InvalidAction")
+			if user() != nil {
+				iamErr(409, "EntityAlreadyExists")
+				return
 			}
+			u := &fakeUser{path: v.Get("Path"), tags: map[string]string{}}
+			for i := 1; v.Get(fmt.Sprintf("Tags.member.%d.Key", i)) != ""; i++ {
+				u.tags[v.Get(fmt.Sprintf("Tags.member.%d.Key", i))] = v.Get(fmt.Sprintf("Tags.member.%d.Value", i))
+			}
+			f.users[v.Get("UserName")] = u
+			fmt.Fprintf(w, `<CreateUserResponse><CreateUserResult><User><Arn>%s</Arn></User></CreateUserResult></CreateUserResponse>`, arn(v.Get("UserName")))
+		case "GetUser":
+			var tags strings.Builder
+			for k, val := range user().tags {
+				fmt.Fprintf(&tags, `<member><Key>%s</Key><Value>%s</Value></member>`, k, val)
+			}
+			fmt.Fprintf(w, `<GetUserResponse><GetUserResult><User><Arn>%s</Arn><Tags>%s</Tags></User></GetUserResult></GetUserResponse>`, arn(v.Get("UserName")), tags.String())
+		case "TagUser":
+			user().tags[v.Get("Tags.member.1.Key")] = v.Get("Tags.member.1.Value")
+			fmt.Fprint(w, `<TagUserResponse/>`)
+		case "PutUserPolicy":
+			var doc map[string]any
+			if err := json.Unmarshal([]byte(v.Get("PolicyDocument")), &doc); err != nil || v.Get("PolicyName") != "spotexec" {
+				t.Errorf("PutUserPolicy: %v %v", v.Get("PolicyName"), err)
+			}
+			fmt.Fprint(w, `<PutUserPolicyResponse/>`)
+		case "CreateServiceLinkedRole":
+			iamErr(400, "InvalidInput") // message lacks "has been taken": logged as a warning
+		case "ListAccessKeys":
+			var b strings.Builder
+			for id, k := range f.keys {
+				if k.user == v.Get("UserName") {
+					fmt.Fprintf(&b, `<member><AccessKeyId>%s</AccessKeyId><CreateDate>%s</CreateDate></member>`, id, k.created)
+				}
+			}
+			fmt.Fprintf(w, `<ListAccessKeysResponse><ListAccessKeysResult><AccessKeyMetadata>%s</AccessKeyMetadata></ListAccessKeysResult></ListAccessKeysResponse>`, b.String())
+		case "CreateAccessKey":
+			if len(f.keysOf(v.Get("UserName"))) >= 2 {
+				iamErr(409, "LimitExceeded")
+				return
+			}
+			f.created++
+			id := fmt.Sprintf("AKNEW%d", f.created)
+			f.keys[id] = fakeKey{user: v.Get("UserName"), created: time.Now().UTC().Format(time.RFC3339Nano)}
+			f.propagation[id] = 2
+			fmt.Fprintf(w, `<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey><AccessKeyId>%s</AccessKeyId><SecretAccessKey>secret-%s</SecretAccessKey></AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>`, id, id)
+		case "DeleteAccessKey":
+			if f.keys[v.Get("AccessKeyId")].user != v.Get("UserName") {
+				t.Errorf("DeleteAccessKey %s of the wrong user", v.Get("AccessKeyId"))
+			}
+			delete(f.keys, v.Get("AccessKeyId"))
+			fmt.Fprint(w, `<DeleteAccessKeyResponse/>`)
+		default:
+			t.Errorf("unexpected action %s", action)
+			iamErr(400, "InvalidAction")
 		}
 	}
+}
+
+func (f *fakeIAM) keysOf(user string) []string {
+	var out []string
+	for id, k := range f.keys {
+		if k.user == user {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (f *fakeIAM) count(action string) int {
@@ -153,8 +189,11 @@ func (f *fakeIAM) count(action string) int {
 
 func newSetupEnv(t *testing.T, f *fakeIAM) (*AWSUserSetup, string, string) {
 	t.Helper()
+	if f.users == nil {
+		f.users = map[string]*fakeUser{}
+	}
 	if f.keys == nil {
-		f.keys = map[string]string{}
+		f.keys = map[string]fakeKey{}
 	}
 	f.propagation = map[string]int{}
 	srv := httptest.NewServer(f.handler(t))
@@ -169,7 +208,7 @@ func newSetupEnv(t *testing.T, f *fakeIAM) (*AWSUserSetup, string, string) {
 	t.Setenv("AWS_PROFILE", "")
 	ep := map[string]string{"iam": srv.URL, "sts": srv.URL, "ec2": srv.URL, "servicequotas": srv.URL}
 	s := &AWSUserSetup{
-		Profile: "spotexec", UserName: "spotexec-test", Region: "us-east-2",
+		Profile: "spotexec", DefaultName: "spotexec-test", MachineID: testMachine, Region: "us-east-2",
 		Log: t.Logf, endpoints: ep, pollEvery: time.Millisecond,
 		resolveProfile: func(_ context.Context, p string) (awsCreds, error) { return readSharedCredentials(p) },
 	}
@@ -179,18 +218,24 @@ func newSetupEnv(t *testing.T, f *fakeIAM) (*AWSUserSetup, string, string) {
 func TestAWSUserSetupFresh(t *testing.T) {
 	f := &fakeIAM{noVPC: true}
 	s, creds, cfg := newSetupEnv(t, f)
-	s.CheckVPC = true
+	s.VPCRegions = []string{"us-east-2"}
 	if err := os.WriteFile(creds, []byte("# mine\n[default]\naws_access_key_id = AKOTHER\naws_secret_access_key = x\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	confirmed := false
-	s.Confirm = func(p AWSSetupPlan) bool { confirmed = p.Account == "111122223333" && p.CreateVPC; return true }
+	s.Confirm = func(p AWSSetupPlan) bool {
+		confirmed = p.Account == "111122223333" && len(p.CreateVPCIn) == 1 && p.UserName == "spotexec-test"
+		return true
+	}
 	res, err := s.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !confirmed || res.CreatedVPC != "vpc-new" || !res.KeyCreated || res.AccessKeyID != "AKNEW1" || res.UserARN != "arn:aws:iam::111122223333:user/spotexec/spotexec-test" || res.QuotaVCPUs != 16 {
+	if !confirmed || res.CreatedVPCs["us-east-2"] != "vpc-new" || !res.KeyCreated || res.AccessKeyID != "AKNEW1" || res.UserARN != "arn:aws:iam::111122223333:user/spotexec/spotexec-test" || res.Quotas["us-east-2"] != 16 {
 		t.Fatalf("result %+v", res)
+	}
+	if f.users["spotexec-test"].tags[tagMachine] != testMachine {
+		t.Fatalf("user tags %v", f.users["spotexec-test"].tags)
 	}
 	b, _ := os.ReadFile(creds)
 	want := "# mine\n[default]\naws_access_key_id = AKOTHER\naws_secret_access_key = x\n\n[spotexec]\naws_access_key_id = AKNEW1\naws_secret_access_key = secret-AKNEW1\n"
@@ -209,7 +254,7 @@ func TestAWSUserSetupFresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.AlreadyReady || res.KeyCreated || res.PolicyStale || res.CreatedVPC != "" || f.count("CreateDefaultVpc") != 1 || f.count("PutUserPolicy") != 2 || f.count("CreateAccessKey") != 1 {
+	if !res.AlreadyReady || res.KeyCreated || res.PolicyStale || len(res.CreatedVPCs) != 0 || f.count("CreateDefaultVpc") != 1 || f.count("PutUserPolicy") != 2 || f.count("CreateAccessKey") != 1 {
 		t.Fatalf("re-run: %+v, calls %v", res, f.calls)
 	}
 
@@ -222,22 +267,75 @@ func TestAWSUserSetupFresh(t *testing.T) {
 }
 
 func TestAWSUserSetupRotateMakesRoom(t *testing.T) {
-	f := &fakeIAM{userPath: "/spotexec/", keys: map[string]string{
-		"AKOLD1": "2025-01-01T00:00:00Z", "AKOLD2": "2025-06-01T00:00:00Z",
-	}}
+	f := &fakeIAM{
+		users: map[string]*fakeUser{"spotexec-test": {path: "/spotexec/", tags: map[string]string{tagMachine: testMachine}}},
+		keys: map[string]fakeKey{
+			"AKOLD1": {"spotexec-test", "2025-01-01T00:00:00Z"}, "AKOLD2": {"spotexec-test", "2025-06-01T00:00:00Z"},
+		},
+	}
 	s, _, _ := newSetupEnv(t, f)
 	res, err := s.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Both slots were taken: the oldest went first, the other after the new key worked.
-	if strings.Join(res.KeysDeleted, ",") != "AKOLD1,AKOLD2" || len(f.keys) != 1 || f.keys["AKNEW1"] == "" {
+	if strings.Join(res.KeysDeleted, ",") != "AKOLD1,AKOLD2" || strings.Join(f.keysOf("spotexec-test"), ",") != "AKNEW1" {
 		t.Fatalf("deleted %v, keys %v", res.KeysDeleted, f.keys)
 	}
-
-	res, err = (func() (*AWSUserSetupResult, error) { s.Rotate = true; return s.Run(context.Background()) })()
+	s.Rotate = true
+	res, err = s.Run(context.Background())
 	if err != nil || res.AccessKeyID != "AKNEW2" || strings.Join(res.KeysDeleted, ",") != "AKNEW1" {
 		t.Fatalf("rotate: %+v %v", res, err)
+	}
+}
+
+// Two machines with the same hostname must never share (or delete each
+// other's) keys.
+func TestAWSUserSetupHostnameCollision(t *testing.T) {
+	for name, tags := range map[string]map[string]string{
+		"other machine": {tagMachine: "bbbbbbbb-2222-4333-8444-555555555555"},
+		"unlabelled":    {"spotexec-managed": "true"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeIAM{
+				users: map[string]*fakeUser{"spotexec-test": {path: "/spotexec/", tags: tags}},
+				keys:  map[string]fakeKey{"AKTHEIRS": {"spotexec-test", "2025-01-01T00:00:00Z"}},
+			}
+			s, _, _ := newSetupEnv(t, f)
+			res, err := s.Run(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasSuffix(res.UserARN, "/spotexec/spotexec-test-aaaaaa") || len(res.KeysDeleted) != 0 || f.keys["AKTHEIRS"].user == "" {
+				t.Fatalf("result %+v, keys %v", res, f.keys)
+			}
+		})
+	}
+	t.Run("explicit name", func(t *testing.T) {
+		f := &fakeIAM{users: map[string]*fakeUser{"spotexec-test": {path: "/spotexec/", tags: map[string]string{tagMachine: "other", "spotexec-host": "studio-09"}}}}
+		s, _, _ := newSetupEnv(t, f)
+		s.UserName = "spotexec-test"
+		if _, err := s.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "belongs to another machine (host studio-09)") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+// A machine whose hostname changed keeps the user its profile signs in as,
+// and an unlabelled one from an older spotexec gets labelled.
+func TestAWSUserSetupKeepsProfileUser(t *testing.T) {
+	f := &fakeIAM{
+		users: map[string]*fakeUser{"spotexec-oldname": {path: "/spotexec/", tags: map[string]string{"spotexec-managed": "true"}}},
+		keys:  map[string]fakeKey{"AKMINE": {"spotexec-oldname", "2025-01-01T00:00:00Z"}},
+	}
+	s, creds, _ := newSetupEnv(t, f)
+	os.WriteFile(creds, []byte("[spotexec]\naws_access_key_id = AKMINE\naws_secret_access_key = x\n"), 0o600)
+	res, err := s.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.AlreadyReady || !strings.HasSuffix(res.UserARN, "/spotexec-oldname") || f.users["spotexec-test"] != nil || f.users["spotexec-oldname"].tags[tagMachine] != testMachine {
+		t.Fatalf("result %+v, users %v", res, f.users)
 	}
 }
 
@@ -250,7 +348,7 @@ func TestAWSUserSetupRefusals(t *testing.T) {
 		}
 	})
 	t.Run("user not made by spotexec", func(t *testing.T) {
-		s, _, _ := newSetupEnv(t, &fakeIAM{userPath: "/"})
+		s, _, _ := newSetupEnv(t, &fakeIAM{users: map[string]*fakeUser{"spotexec-test": {path: "/", tags: map[string]string{}}}})
 		_, err := s.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "wasn't created by spotexec") {
 			t.Fatalf("err = %v", err)
