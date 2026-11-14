@@ -16,7 +16,8 @@ import (
 	"github.com/daintreehq/spotexec/internal/hooks"
 )
 
-const globalTemplate = `# spotexec global runner config (personal; never committed). See README.
+const globalTemplate = `# spotexec global runner config (personal; never committed).
+# Reference: https://github.com/daintreehq/spotexec/blob/main/docs/configuration.md
 version = 1
 
 # Runners are tried in priority order (lowest first). A fleet grows (up to

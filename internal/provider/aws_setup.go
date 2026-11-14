@@ -20,7 +20,7 @@ import (
 const iamAPIVersion = "2010-05-08"
 
 // SpotexecPolicy is the least-privilege IAM policy spotexec needs. The
-// README's "Grant permissions" section shows the same document (a test
+// docs/aws.md "Grant permissions" section shows the same document (a test
 // keeps them in step).
 const SpotexecPolicy = `{
   "Version": "2012-10-17",
@@ -381,7 +381,7 @@ func deleteAccessKey(ctx context.Context, c *awsClient, user, id string) error {
 
 func iamHint(err error) error {
 	if c := awsCode(err); c == "AccessDenied" || c == "AccessDeniedException" {
-		return fmt.Errorf("%w\nthis AWS identity can't manage IAM users: sign in as an administrator (or pass --admin-profile), or follow the manual steps in the README's AWS setup", err)
+		return fmt.Errorf("%w\nthis AWS identity can't manage IAM users: sign in as an administrator (or pass --admin-profile), or follow the manual steps in https://github.com/daintreehq/spotexec/blob/main/docs/aws.md", err)
 	}
 	return err
 }
@@ -573,4 +573,20 @@ func upsertINISection(path, section string, set [][2]string, drop []string) erro
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// AdminSession returns the current AWS sign-in for profile ("" = the
+// default chain) and who it is, so setup can run on another machine with
+// it. The credentials are usually short-lived session credentials.
+func AdminSession(ctx context.Context, profile string) (env []string, arn string, err error) {
+	r := &awsCredResolver{profile: profile}
+	c, err := r.get(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	cl := (&AWSUserSetup{}).client("us-east-1", staticResolver(c))
+	if _, arn, err = callerIdentity(ctx, cl); err != nil {
+		return nil, "", err
+	}
+	return []string{c.AccessKeyID, c.SecretAccessKey, c.SessionToken}, arn, nil
 }

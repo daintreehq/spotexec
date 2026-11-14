@@ -301,18 +301,18 @@ func TestUpsertINISection(t *testing.T) {
 	}
 }
 
-// The README shows the policy for manual setup; it must match what
+// docs/aws.md shows the policy for manual setup; it must match what
 // `spotexec setup` attaches.
 func TestPolicyMatchesREADME(t *testing.T) {
-	b, err := os.ReadFile("../../README.md")
+	b, err := os.ReadFile("../../docs/aws.md")
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := regexp.MustCompile("(?s)```json\n(\\{\n  \"Version\": \"2012-10-17\".*?\n\\})\n```").FindSubmatch(b)
 	if m == nil {
-		t.Fatal("policy JSON block not found in README.md")
+		t.Fatal("policy JSON block not found in docs/aws.md")
 	}
 	if compactJSON(string(m[1])) != compactJSON(SpotexecPolicy) {
-		t.Fatal("README.md policy differs from SpotexecPolicy")
+		t.Fatal("docs/aws.md policy differs from SpotexecPolicy")
 	}
 }

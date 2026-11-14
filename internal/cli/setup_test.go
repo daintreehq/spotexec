@@ -91,3 +91,18 @@ func TestDefaultIAMUser(t *testing.T) {
 		t.Fatalf("defaultIAMUser() = %q", u)
 	}
 }
+
+func TestParseHostChoice(t *testing.T) {
+	found := []string{"studio-01.local", "studio-02.local", "mini-01.local"}
+	for in, want := range map[string]string{
+		"":                       "",
+		"1 3":                    "studio-01.local,mini-01.local",
+		"all":                    "studio-01.local,studio-02.local,mini-01.local",
+		"2, box.example.com 2 9": "studio-02.local,box.example.com",
+		"me@studio-04.local\n":   "me@studio-04.local",
+	} {
+		if got := strings.Join(parseHostChoice(in, found), ","); got != want {
+			t.Errorf("parseHostChoice(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
