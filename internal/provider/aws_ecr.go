@@ -29,7 +29,7 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 	uri := ""
 	// The cached URI saves two API calls per image, but expires: a deleted
 	// repository must be recreated, or every push would fail.
-	if fi, err := os.Stat(marker); err == nil && time.Since(fi.ModTime()) < time.Hour {
+	if fi, err := os.Stat(marker); err == nil && time.Since(fi.ModTime()) < 10*time.Minute {
 		if b, err := os.ReadFile(marker); err == nil {
 			uri = strings.TrimSpace(string(b))
 		}

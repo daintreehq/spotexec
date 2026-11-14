@@ -215,7 +215,29 @@ func (s *Session) image(m protocol.Image) error {
 		}
 		local := "spotexec-local/" + imageName(s.repoID) + ":" + m.Tag
 		res.Image = local
+		// container build: an image already here (built by an earlier run
+		// whose push may have failed) is still pushed, so the registry has it.
+		pushExisting := func() error {
+			if !m.WaitPush || m.Registry == nil {
+				return nil
+			}
+			cfgDir, err := dockerLogin(ctx, d, m.Registry)
+			if err != nil {
+				return perr(protocol.CodeImageFailed, "registry login: %v", err)
+			}
+			defer os.RemoveAll(cfgDir)
+			remote := m.Registry.Repo + ":" + m.Tag
+			_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_push", Message: remote})
+			if err := stream(d.cmd("tag "+shq(local)+" "+shq(remote)) + " && " + d.cmd("--config "+shq(cfgDir)+" push -q "+shq(remote))); err != nil {
+				return perr(protocol.CodeImageFailed, "could not push %s to %s: %v", m.Dockerfile, remote, err)
+			}
+			res.Pushed = true
+			return nil
+		}
 		if exists(local) {
+			if err := pushExisting(); err != nil {
+				return err
+			}
 			break
 		}
 		// One build per tag per runner; other slots wait for it.
@@ -225,6 +247,9 @@ func (s *Session) image(m protocol.Image) error {
 		}
 		defer lk.Unlock()
 		if exists(local) {
+			if err := pushExisting(); err != nil {
+				return err
+			}
 			break
 		}
 		cfgDir := ""
