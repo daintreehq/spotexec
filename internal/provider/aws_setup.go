@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -92,6 +93,7 @@ type AWSUserSetup struct {
 	endpoints      map[string]string // tests
 	resolveProfile func(ctx context.Context, profile string) (awsCreds, error)
 	pollEvery      time.Duration
+	verifyFor      time.Duration // how long a new key may take to work (default 90s)
 }
 
 // AWSSetupPlan is what setup is about to do, for confirmation.
@@ -166,12 +168,28 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 	if err := checkProfileIsPlain(res.ConfigFile, s.Profile); err != nil {
 		return nil, err
 	}
+	// One setup at a time: two concurrent rotations could each delete the
+	// key the other just saved.
+	unlock, err := s.lock(res.CredsFile)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	// Does the profile already hold a working key for a spotexec user? Then
 	// keep that user, even if this machine's hostname has changed since.
 	var existing *awsCreds
 	profAcct, profARN := "", "" // who the profile signs in as, when it works
+	localKey := ""              // the key the profile holds now, working or not
+	// Known even when the profile can't be resolved right now: static keys
+	// in the credentials file, else in the config file.
+	if c, err := readSharedCredentials(s.Profile); err == nil {
+		localKey = c.AccessKeyID
+	} else if vals, err := readINISection(res.ConfigFile, configSection(s.Profile)); err == nil {
+		localKey = vals["aws_access_key_id"]
+	}
 	if c, err := s.resolveProfile(ctx, s.Profile); err == nil {
+		localKey = c.AccessKeyID
 		acct, arn, err := callerIdentity(ctx, s.client(s.Region, staticResolver(c)))
 		if err != nil && !keyRejected(err) {
 			// The key may well work: without knowing its account, replacing
@@ -381,12 +399,18 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		return nil, fmt.Errorf("IAM user %s already has two access keys and isn't labelled as this machine's, so setup won't delete one; delete one in the IAM console or pass a different --user", name)
 	}
 	if len(keys) >= 2 {
-		old := keys[0] // oldest
+		// Never the key the profile uses: if creating, saving or verifying
+		// its replacement fails, the machine must still have a working key.
+		victim := roomKey(keys, localKey)
+		if victim < 0 {
+			return nil, fmt.Errorf("IAM user %s has no access key setup can delete to make room (the profile uses %s); delete one in the IAM console", name, localKey)
+		}
+		old := keys[victim]
 		if err := deleteAccessKey(ctx, admin, name, old.ID); err != nil {
 			return nil, err
 		}
 		res.KeysDeleted = append(res.KeysDeleted, old.ID)
-		keys = keys[1:]
+		keys = append(keys[:victim:victim], keys[victim+1:]...)
 	}
 	b, err := admin.query(ctx, "iam", iamAPIVersion, "CreateAccessKey", url.Values{"UserName": {name}})
 	if err != nil {
@@ -403,7 +427,27 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 	res.AccessKeyID, res.KeyCreated = newKey.AccessKeyID, true
 	s.logf("created access key %s", newKey.AccessKeyID)
 
-	// 5. Save it as the profile.
+	// 5. Wait for IAM to propagate the key and policy before saving it, so
+	// the profile keeps its current key if the new one never works.
+	c := s.client(s.Region, staticResolver(newKey))
+	if s.verifyFor == 0 {
+		s.verifyFor = 90 * time.Second
+	}
+	if err := s.poll(ctx, s.verifyFor, func() error {
+		if _, _, err := callerIdentity(ctx, c); err != nil {
+			return err
+		}
+		_, err := c.ec2(ctx, "DescribeInstances", url.Values{"MaxResults": {"5"}})
+		return err
+	}); err != nil {
+		if derr := deleteAccessKey(context.WithoutCancel(ctx), admin, name, newKey.AccessKeyID); derr == nil {
+			res.KeysDeleted = append(res.KeysDeleted, newKey.AccessKeyID)
+		}
+		return nil, fmt.Errorf("the new key %s doesn't work yet, so profile %s was left as it was: %w", newKey.AccessKeyID, s.Profile, err)
+	}
+
+	// 6. Save it as the profile, and check that the profile resolves to it
+	// (nothing in ~/.aws shadows it).
 	if err := upsertINISection(res.CredsFile, s.Profile, [][2]string{
 		{"aws_access_key_id", newKey.AccessKeyID}, {"aws_secret_access_key", newKey.SecretAccessKey},
 	}, []string{"aws_session_token"}); err != nil {
@@ -413,19 +457,6 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		return nil, fmt.Errorf("writing %s: %w", res.ConfigFile, err)
 	}
 	s.logf("saved it as AWS profile %s (%s)", s.Profile, res.CredsFile)
-
-	// 6. Wait for IAM to propagate the key and policy, then check that the
-	// profile resolves to this key (nothing in ~/.aws shadows it).
-	c := s.client(s.Region, staticResolver(newKey))
-	if err := s.poll(ctx, 90*time.Second, func() error {
-		if _, _, err := callerIdentity(ctx, c); err != nil {
-			return err
-		}
-		_, err := c.ec2(ctx, "DescribeInstances", url.Values{"MaxResults": {"5"}})
-		return err
-	}); err != nil {
-		return nil, fmt.Errorf("the new key doesn't work yet: %w", err)
-	}
 	if got, err := s.resolveProfile(ctx, s.Profile); err != nil {
 		return nil, fmt.Errorf("profile %s doesn't resolve after writing it: %w", s.Profile, err)
 	} else if got.AccessKeyID != newKey.AccessKeyID {
@@ -484,6 +515,29 @@ func (s *AWSUserSetup) tagOldSecurityGroups(ctx context.Context, creds *awsCredR
 			s.logf("tagged security group %s (%s) in %s as spotexec's", g.Name, g.ID, region)
 		}
 	}
+}
+
+// lock serialises setups that write the same credentials file.
+func (s *AWSUserSetup) lock(credsFile string) (func(), error) {
+	if real, err := filepath.EvalSymlinks(credsFile); err == nil {
+		credsFile = real // the file upsertINISection writes
+	}
+	dir := filepath.Dir(credsFile)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, ".spotexec-setup.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		s.logf("waiting for another spotexec setup on this machine to finish")
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
 func (s *AWSUserSetup) poll(ctx context.Context, limit time.Duration, f func() error) error {
@@ -566,6 +620,22 @@ func listAccessKeys(ctx context.Context, c *awsClient, user string) ([]accessKey
 	}
 	sort.Slice(v.Keys, func(i, j int) bool { return v.Keys[i].Created < v.Keys[j].Created })
 	return v.Keys, nil
+}
+
+// roomKey picks the key to delete to make room for a new one: never the
+// one in local use, an inactive key first, else the oldest (keys are
+// oldest first). -1 when there is none.
+func roomKey(keys []accessKey, local string) int {
+	pick := -1
+	for i, k := range keys {
+		if k.ID == local {
+			continue
+		}
+		if pick < 0 || (k.Status == "Inactive" && keys[pick].Status != "Inactive") {
+			pick = i
+		}
+	}
+	return pick
 }
 
 func deleteAccessKey(ctx context.Context, c *awsClient, user, id string) error {

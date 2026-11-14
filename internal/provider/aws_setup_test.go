@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,6 +40,8 @@ type fakeIAM struct {
 	created     int
 	calls       []string
 	denyCreate  bool
+	denyKey     bool           // CreateAccessKey fails
+	neverWorks  bool           // new keys are never accepted
 	propagation map[string]int // new key -> rejections left
 	noVPC       bool
 	foreign     map[string]string            // key -> ARN it signs in as, in another account
@@ -201,10 +204,17 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 				iamErr(409, "LimitExceeded")
 				return
 			}
+			if f.denyKey {
+				iamErr(400, "ServiceFailure")
+				return
+			}
 			f.created++
 			id := fmt.Sprintf("AKNEW%d", f.created)
 			f.keys[id] = fakeKey{user: v.Get("UserName"), created: time.Now().UTC().Format(time.RFC3339Nano)}
 			f.propagation[id] = 2
+			if f.neverWorks {
+				f.propagation[id] = 1 << 30
+			}
 			fmt.Fprintf(w, `<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey><AccessKeyId>%s</AccessKeyId><SecretAccessKey>secret-%s</SecretAccessKey></AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>`, id, id)
 		case "DeleteAccessKey":
 			if f.keys[v.Get("AccessKeyId")].user != v.Get("UserName") {
@@ -341,6 +351,118 @@ func TestAWSUserSetupRotateMakesRoom(t *testing.T) {
 	res, err = s.Run(context.Background())
 	if err != nil || res.AccessKeyID != "AKNEW2" || strings.Join(res.KeysDeleted, ",") != "AKNEW1" {
 		t.Fatalf("rotate: %+v %v", res, err)
+	}
+}
+
+// With both key slots used, rotation makes room by deleting the key the
+// profile doesn't use (even when it's the newer one), and retires the
+// profile's old key only once the replacement works.
+func TestAWSUserSetupRotateKeepsLocalKey(t *testing.T) {
+	newEnv := func(t *testing.T) (*fakeIAM, *AWSUserSetup, string) {
+		f := &fakeIAM{
+			users: map[string]*fakeUser{"spotexec-test": {path: "/spotexec/", tags: map[string]string{tagMachine: testMachine}}},
+			keys: map[string]fakeKey{
+				"AKLOCAL": {"spotexec-test", "2025-01-01T00:00:00Z"}, "AKLEFTOVER": {"spotexec-test", "2025-06-01T00:00:00Z"},
+			},
+		}
+		s, creds, _ := newSetupEnv(t, f)
+		os.WriteFile(creds, []byte("[spotexec]\naws_access_key_id = AKLOCAL\naws_secret_access_key = x\n"), 0o600)
+		s.Rotate = true
+		return f, s, creds
+	}
+	t.Run("success", func(t *testing.T) {
+		f, s, _ := newEnv(t)
+		res, err := s.Run(context.Background())
+		if err != nil || strings.Join(res.KeysDeleted, ",") != "AKLEFTOVER,AKLOCAL" || strings.Join(f.keysOf("spotexec-test"), ",") != "AKNEW1" {
+			t.Fatalf("result %+v %v, keys %v", res, err, f.keys)
+		}
+	})
+	t.Run("replacement never works", func(t *testing.T) {
+		f, s, creds := newEnv(t)
+		f.neverWorks, s.verifyFor = true, 50*time.Millisecond
+		if _, err := s.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "was left as it was") {
+			t.Fatalf("err = %v", err)
+		}
+		if b, _ := os.ReadFile(creds); !strings.Contains(string(b), "AKLOCAL") || f.keys["AKLOCAL"].user == "" {
+			t.Fatalf("credentials:\n%s\nkeys %v", b, f.keys)
+		}
+		if strings.Join(f.keysOf("spotexec-test"), ",") != "AKLOCAL" {
+			t.Fatalf("the failed key wasn't cleaned up: %v", f.keys)
+		}
+	})
+	for _, where := range []string{"credentials", "config"} {
+		t.Run("profile doesn't resolve, key in "+where, func(t *testing.T) {
+			// The key in the credentials or config file is still protected.
+			f, s, creds := newEnv(t)
+			if where == "config" {
+				os.Remove(creds)
+				os.WriteFile(os.Getenv("AWS_CONFIG_FILE"), []byte("[profile spotexec]\naws_access_key_id = AKLOCAL\naws_secret_access_key = x\n"), 0o600)
+			}
+			f.denyKey = true
+			s.resolveProfile = func(context.Context, string) (awsCreds, error) { return awsCreds{}, errors.New("aws: exit status 255") }
+			if _, err := s.Run(context.Background()); err == nil {
+				t.Fatal("expected an error")
+			}
+			if f.keys["AKLOCAL"].user == "" || f.keys["AKLEFTOVER"].user != "" {
+				t.Fatalf("keys %v", f.keys)
+			}
+		})
+	}
+	t.Run("replacement fails", func(t *testing.T) {
+		f, s, creds := newEnv(t)
+		f.denyKey = true
+		if _, err := s.Run(context.Background()); err == nil {
+			t.Fatal("expected an error")
+		}
+		if f.keys["AKLOCAL"].user == "" {
+			t.Fatalf("the working key was deleted: %v", f.keys)
+		}
+		if b, _ := os.ReadFile(creds); !strings.Contains(string(b), "AKLOCAL") {
+			t.Fatalf("credentials:\n%s", b)
+		}
+	})
+}
+
+func TestAWSUserSetupLock(t *testing.T) {
+	s := &AWSUserSetup{}
+	creds := filepath.Join(t.TempDir(), "credentials")
+	os.WriteFile(creds, nil, 0o600)
+	link := filepath.Join(t.TempDir(), "credentials") // a symlinked dotfile in another directory
+	if err := os.Symlink(creds, link); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := s.lock(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan func(), 1)
+	go func() {
+		u, _ := s.lock(creds)
+		got <- u
+	}()
+	select {
+	case <-got:
+		t.Fatal("a second setup didn't wait")
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case u := <-got:
+		u()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second setup never got the lock")
+	}
+}
+
+func TestRoomKey(t *testing.T) {
+	keys := []accessKey{{ID: "A", Status: "Active"}, {ID: "B", Status: "Inactive"}, {ID: "C", Status: "Active"}}
+	for local, want := range map[string]int{"": 1, "B": 0, "A": 1} {
+		if got := roomKey(keys, local); got != want {
+			t.Errorf("roomKey(local %q) = %d, want %d", local, got, want)
+		}
+	}
+	if roomKey(keys[:1], "A") != -1 {
+		t.Error("the only key is local: nothing to delete")
 	}
 }
 

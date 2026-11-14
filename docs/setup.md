@@ -165,7 +165,7 @@ spotexec down -A --machine studio-02    # stop one machine's VMs (asks first)
 
 **Upgrading spotexec.** A new version may need more permissions. Run `spotexec setup` while signed in as an administrator to refresh the policy of this machine's user; run it with your other hosts to update theirs. Without an admin session, setup still checks the key and says the policy wasn't refreshed.
 
-**Rotating the key.** `spotexec setup --rotate` creates a new key, verifies it, saves it, then deletes the old one.
+**Rotating the key.** `spotexec setup --rotate` creates a new key, verifies it, saves it, then deletes the old one. If the user already has two keys (IAM's limit), it first deletes the one this machine's profile doesn't use, so a failed rotation never leaves the machine without a working key.
 
 ### Revoking a machine
 
