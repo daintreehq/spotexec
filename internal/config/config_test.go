@@ -72,3 +72,22 @@ func TestEmbeddedArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestTasksMayShareSubcommandNames(t *testing.T) {
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte(`
+[tasks.sync]
+run = "pnpm sync"
+[tasks.status]
+run = "git status"
+[tasks.run]
+parallel = ["sync", "status"]
+`), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Tasks) != 3 {
+		t.Fatalf("tasks: %v", p.TaskNames())
+	}
+}

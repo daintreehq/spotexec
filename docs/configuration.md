@@ -155,7 +155,7 @@ when_load_above = 0.6          # agents offload only when the laptop is busy
 | `timeout`, `sync`, `exclusive` | Per-task overrides of the run flags. |
 | `pool`, `priority` | Send this task to a different fleet, or move it ahead in the queue. |
 
-Task names can't shadow subcommands (`run`, `status`, `sync`…). `spotexec tasks` lists them.
+`sx <task>` runs any task, even one named like a spotexec subcommand: `sx sync` runs a task called `sync`. Only `spotexec <task>` gives subcommands precedence, so `spotexec sync` still means the subcommand. `spotexec tasks` lists them.
 
 ## Project-defined fleets
 

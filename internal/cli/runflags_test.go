@@ -250,3 +250,13 @@ func TestHelpFormsStillWork(t *testing.T) {
 		}
 	}
 }
+
+func TestSxRunsTasksNamedLikeSubcommands(t *testing.T) {
+	dir := project(t, "[tasks.lint]\nrun = \"true\"\n[tasks.sync]\nrun = \"true\"\n[tasks.status]\nparallel = [\"lint\", \"sync\"]\n")
+	// The parallel task refuses extra arguments: proof that sx dispatched
+	// to the task rather than to anything else called status.
+	code, stderr := runMain(t, "sx", "-C", dir, "status", "x")
+	if code != client.ExitInfra || !strings.Contains(stderr, "status is a parallel task") {
+		t.Errorf("sx status x: exit %d, stderr %q", code, stderr)
+	}
+}

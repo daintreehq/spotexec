@@ -495,9 +495,6 @@ func (p *Project) validate() error {
 		if t.Run != "" && embeddedArgs(t.Run) {
 			return fmt.Errorf("task %q: use {args} as a separate word (or \"{args}\"), not inside a quoted string: extra arguments are passed as \"$@\"", name)
 		}
-		if ReservedTaskNames[name] {
-			return fmt.Errorf("task %q has the name of a spotexec command, so `sx %s` would never run it: rename it", name, name)
-		}
 		if (t.Run == "") == (len(t.Parallel) == 0) {
 			return fmt.Errorf("task %q must set exactly one of run or parallel", name)
 		}
@@ -515,15 +512,6 @@ func (p *Project) validate() error {
 		}
 	}
 	return nil
-}
-
-// ReservedTaskNames are spotexec subcommands: a task with one of these names
-// could never be run with `sx <name>`.
-var ReservedTaskNames = map[string]bool{
-	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
-	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
-	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
-	"completion": true, "sim": true, "image": true, "daemon": true, "container": true, "setup": true,
 }
 
 // globalOnlyKeys are runner settings a project (.spotexec.toml) may not set.
