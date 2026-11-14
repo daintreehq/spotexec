@@ -105,9 +105,23 @@ func KnownRegions(r *config.Runner) []string {
 
 // EnabledRegions lists the account's enabled regions using profile's
 // credentials, asking from home.
-func EnabledRegions(ctx context.Context, profile, home string) ([]string, error) {
-	a := newAWSSpot(&config.Runner{Region: home}, &awsCredResolver{profile: profile})
-	return a.enabledRegions(ctx)
+// It also asks from us-east-1 and the regions in also when home doesn't
+// answer (it may not be enabled itself).
+func EnabledRegions(ctx context.Context, profile, home string, also ...string) ([]string, error) {
+	creds := &awsCredResolver{profile: profile}
+	regional := func(rg string) *AWSSpot { return newAWSSpot(&config.Runner{Region: rg}, creds) }
+	return enabledRegionsVia(ctx, regional, discoveryHomes(home, also))
+}
+
+// FilterEnabled keeps the regions in want that are in enabled.
+func FilterEnabled(want, enabled []string) []string {
+	var out []string
+	for _, rg := range want {
+		if contains(enabled, rg) {
+			out = append(out, rg)
+		}
+	}
+	return out
 }
 
 // forgetDiscovery is called when a runner is used in plain single-region
@@ -120,11 +134,13 @@ func forgetDiscovery(r *config.Runner) {
 		return
 	}
 	var st placementState
-	if json.Unmarshal(b, &st) != nil || !st.Discovered {
+	if json.Unmarshal(b, &st) != nil || (!st.Discovered && st.RegionsAt.IsZero()) {
 		return
 	}
 	g := &AWSGlobal{r: r, dir: dir}
-	_ = g.withState(func(st *placementState) { st.Discovered = false })
+	// The enabled regions too: the region list filtered through them must
+	// not hide one used meanwhile.
+	_ = g.withState(func(st *placementState) { st.Discovered, st.RegionsAt = false, time.Time{} })
 }
 
 // RegionalAWS returns a provider for one region of an aws-spot runner,
@@ -212,6 +228,37 @@ type cooldown struct {
 	Step  time.Duration `json:"step"`
 	Why   string        `json:"why,omitempty"`
 	Setup bool          `json:"setup,omitempty"` // region-wide and not Spot-specific: no on-demand there either
+	// Transient: preparing a launch there failed for a reason that may
+	// clear (throttling, a network error), not how the region is set up.
+	Transient bool `json:"transient,omitempty"`
+}
+
+// quotaSkip is a quota refusal seen during one launch: the region has no
+// room for a VM of vcpus or more under that quota group (vcpus 0: a count
+// limit, every type). Smaller types, and types under another quota, may
+// still fit. It lasts for that launch only: across launches the client
+// pool holds launches back until a VM ends (and frees quota) or a few
+// minutes pass, which a longer local skip would override.
+type quotaSkip struct {
+	vcpus int
+	group string
+}
+
+func (q quotaSkip) covers(itype string) bool {
+	return q.vcpus == 0 || (quotaGroup(itype) == q.group && vcpusOf(itype) >= q.vcpus)
+}
+
+// quotaGroup names the vCPU quota an instance type's Spot launches count
+// against: the standard quota, or (approximately) one per other family.
+func quotaGroup(itype string) string {
+	if c := quotaCodeFor(itype, true); c != "" {
+		return c
+	}
+	fam, _, _ := strings.Cut(itype, ".")
+	if i := strings.IndexAny(fam, "0123456789"); i > 0 {
+		fam = fam[:i] // g5 -> g, inf2 -> inf
+	}
+	return "family:" + fam
 }
 
 type placementState struct {
@@ -347,9 +394,24 @@ func (g *AWSGlobal) PlacementRegions(ctx context.Context) ([]string, error) {
 	if g.legacy {
 		return []string{g.r.Region}, nil
 	}
+	enabled, err := g.enabledRegions(ctx)
 	if !g.r.AnyRegion() {
-		return append([]string(nil), g.r.Regions...), nil
+		if err != nil {
+			// Can't tell which are enabled: use the list as configured.
+			return append([]string(nil), g.r.Regions...), nil
+		}
+		return FilterEnabled(g.r.Regions, enabled), nil
 	}
+	return enabled, err
+}
+
+// enabledRegionsTimeout bounds one DescribeRegions attempt: some regions
+// that aren't enabled never answer, so asking from one would otherwise
+// stall until the HTTP client gives up.
+var enabledRegionsTimeout = 10 * time.Second
+
+// enabledRegions lists the account's enabled regions, cached for a day.
+func (g *AWSGlobal) enabledRegions(ctx context.Context) ([]string, error) {
 	var cached []string
 	_ = g.withState(func(st *placementState) {
 		if g.clock().Sub(st.RegionsAt) < regionsTTL {
@@ -359,13 +421,84 @@ func (g *AWSGlobal) PlacementRegions(ctx context.Context) ([]string, error) {
 	if len(cached) > 0 {
 		return cached, nil
 	}
-	regions, err := g.home().enabledRegions(ctx)
+	regions, err := enabledRegionsVia(ctx, g.Regional, discoveryHomes(g.r.Region, g.r.Regions))
 	if err != nil {
-		return nil, fmt.Errorf("list enabled regions (from %s): %w%s", g.r.Region, err, permHint(err))
+		return nil, err
 	}
 	_ = g.withState(func(st *placementState) { st.Regions, st.RegionsAt = regions, g.clock() })
 	return regions, nil
 }
+
+// discoveryHomes are the regions to ask for the account's enabled regions,
+// in order: the home region, then us-east-1 (which no account can disable;
+// not for GovCloud, a separate partition), then the other listed regions in
+// case us-east-1 is denied by policy. At most four.
+func discoveryHomes(home string, listed []string) []string {
+	var out []string
+	add := func(rg string) {
+		if rg != "" && rg != config.AllRegions && !contains(out, rg) && len(out) < 4 {
+			out = append(out, rg)
+		}
+	}
+	add(home)
+	if !strings.HasPrefix(home, "us-gov-") {
+		add("us-east-1")
+	}
+	for _, rg := range listed {
+		add(rg)
+	}
+	return out
+}
+
+// enabledRegionsVia asks each home in turn. A region that isn't enabled
+// answers AuthFailure (a *CredentialError) or not at all, so neither stops
+// the search; only every home failing does.
+func enabledRegionsVia(ctx context.Context, regional func(string) *AWSSpot, homes []string) ([]string, error) {
+	var errs []error
+	for _, home := range homes {
+		actx, cancel := context.WithTimeout(ctx, enabledRegionsTimeout)
+		regions, err := regional(home).enabledRegions(actx)
+		cancel()
+		if err == nil {
+			return regions, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		errs = append(errs, fmt.Errorf("from %s: %w", home, err))
+	}
+	err := errors.Join(errs...)
+	return nil, fmt.Errorf("list enabled regions: %w%s", err, permHint(err))
+}
+
+// notEnabled lists configured regions the account hasn't enabled (or that
+// don't exist), which placement leaves out.
+func (g *AWSGlobal) notEnabled(placement []string) []string {
+	if g.legacy || g.r.AnyRegion() {
+		return nil
+	}
+	var out []string
+	for _, rg := range g.r.Regions {
+		if !contains(placement, rg) {
+			out = append(out, rg)
+		}
+	}
+	return out
+}
+
+const noneOfferedWhy = "none of instance_types is offered as Spot here"
+
+// shortOfCapacity reports the refusals that mean AWS has no Spot capacity
+// for that type and zone right now (not a price cap or an unsupported type).
+func shortOfCapacity(code string) bool {
+	switch code {
+	case "InsufficientInstanceCapacity", "InsufficientCapacity", "InsufficientHostCapacity":
+		return true
+	}
+	return false
+}
+
+const notEnabledWhy = "not enabled in this AWS account (or not a region): enable it in the AWS console under Account > AWS Regions, or remove it from regions"
 
 // managedRegions are the placement regions plus any region that may still
 // hold an instance (e.g. one since removed from the config).
@@ -437,6 +570,17 @@ func joinRegionErrors(errs map[string]error) error {
 	return errors.Join(list...)
 }
 
+func credentialFailures(errs map[string]error) int {
+	n := 0
+	for _, err := range errs {
+		var ce *CredentialError
+		if errors.As(err, &ce) {
+			n++
+		}
+	}
+	return n
+}
+
 func credentialFailure(errs map[string]error) error {
 	for _, err := range errs {
 		var ce *CredentialError
@@ -466,16 +610,21 @@ func (g *AWSGlobal) priceKey(regions []string) string {
 // from a cache younger than 15 minutes unless refresh is set. Regions that
 // could not be priced are listed in Unpriced, never treated as cheap.
 func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error) {
+	if refresh {
+		// Also recheck which regions are enabled: one may just have been.
+		_ = g.withState(func(st *placementState) { st.RegionsAt = time.Time{} })
+	}
 	regions, err := g.PlacementRegions(ctx)
 	if err != nil {
 		return PriceTable{}, err
 	}
-	key := g.priceKey(regions)
+	off := g.notEnabled(regions)
+	key := g.priceKey(regions) + "|off:" + strings.Join(off, ",")
 	var t PriceTable
 	if !refresh {
 		_ = g.withState(func(st *placementState) {
 			if st.PricedFor == key && g.clock().Sub(st.PricedAt) < priceTTL && len(st.Prices) > 0 {
-				t = PriceTable{Prices: st.Prices, At: st.PricedAt, Regions: regions, Unpriced: st.Unpriced, Cached: true}
+				t = PriceTable{Prices: st.Prices, At: st.PricedAt, Regions: union(regions, off), Unpriced: st.Unpriced, Cached: true}
 			}
 		})
 		if t.Cached {
@@ -491,23 +640,28 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 			return err
 		}
 		if len(ps) == 0 {
-			return errors.New("none of instance_types is offered as Spot here")
+			return errors.New(noneOfferedWhy)
 		}
 		mu.Lock()
 		all = append(all, ps...)
 		mu.Unlock()
 		return nil
 	})
-	if err := credentialFailure(errs); err != nil {
+	// A region that isn't enabled answers AuthFailure too: credentials are
+	// only to blame when every region rejected them.
+	if err := credentialFailure(errs); err != nil && credentialFailures(errs) == len(regions) {
 		return PriceTable{}, err
 	}
 	if ctx.Err() != nil {
 		return PriceTable{}, ctx.Err()
 	}
 	rankPrices(all)
-	t = PriceTable{Prices: all, At: now, Regions: regions, Unpriced: map[string]string{}}
+	t = PriceTable{Prices: all, At: now, Regions: union(regions, off), Unpriced: map[string]string{}}
 	for rg, err := range errs {
 		t.Unpriced[rg] = firstLineOf([]byte(err.Error()))
+	}
+	for _, rg := range off {
+		t.Unpriced[rg] = notEnabledWhy
 	}
 	if len(all) == 0 {
 		err := fmt.Errorf("no Spot price for %s in %s: %s", strings.Join(g.r.InstanceTypes, ", "), g.Where(), summarize(t.Unpriced, 3))
@@ -541,27 +695,36 @@ func poolKey(p SpotPrice) string { return p.Region + "/" + p.Zone + "/" + p.Type
 
 // CoolingDown reports why a price's zone/type or region is skipped for
 // now ("" when it is not).
-func (g *AWSGlobal) coolingDown(st *placementState, p SpotPrice, now time.Time) string {
+func (g *AWSGlobal) coolingDown(st *placementState, p SpotPrice, now time.Time) (cooldown, bool) {
 	if c, ok := st.Cooldown[p.Region]; ok && now.Before(c.Until) {
-		return c.Why
+		return c, true
 	}
 	if c, ok := st.Cooldown["zone:"+p.Zone]; ok && now.Before(c.Until) {
-		return c.Why
+		return c, true
 	}
 	if c, ok := st.Cooldown[poolKey(p)]; ok && now.Before(c.Until) {
-		return c.Why
+		return c, true
 	}
-	return ""
+	return cooldown{}, false
 }
 
 // Cooldowns returns why each listed price is currently skipped.
 func (g *AWSGlobal) Cooldowns(ps []SpotPrice) map[string]string {
 	out := map[string]string{}
+	for k, c := range g.cooldowns(ps) {
+		out[k] = c.Why
+	}
+	return out
+}
+
+// cooldowns returns the cooldown each listed price is currently skipped for.
+func (g *AWSGlobal) cooldowns(ps []SpotPrice) map[string]cooldown {
+	out := map[string]cooldown{}
 	now := g.clock()
 	_ = g.withState(func(st *placementState) {
 		for _, p := range ps {
-			if why := g.coolingDown(st, p, now); why != "" {
-				out[poolKey(p)] = why
+			if c, ok := g.coolingDown(st, p, now); ok {
+				out[poolKey(p)] = c
 			}
 		}
 	})
@@ -580,16 +743,31 @@ func (g *AWSGlobal) coolPool(p SpotPrice, why string) {
 }
 
 // coolZone skips every type in one availability zone for a while.
-func (g *AWSGlobal) coolZone(zone, why string) {
+func (g *AWSGlobal) coolZone(zone, why string, setup bool) {
 	_ = g.withState(func(st *placementState) {
-		st.Cooldown["zone:"+zone] = cooldown{Until: g.clock().Add(regionCool), Step: regionCool, Why: why}
+		st.Cooldown["zone:"+zone] = cooldown{Until: g.clock().Add(regionCool), Step: regionCool, Why: why, Setup: setup}
 	})
 }
 
 func (g *AWSGlobal) coolRegion(region, why string, setup bool) {
-	_ = g.withState(func(st *placementState) {
-		st.Cooldown[region] = cooldown{Until: g.clock().Add(regionCool), Step: regionCool, Why: why, Setup: setup}
-	})
+	g.coolRegionAs(region, cooldown{Why: why, Setup: setup})
+}
+
+func (g *AWSGlobal) coolRegionAs(region string, c cooldown) {
+	c.Until, c.Step = g.clock().Add(regionCool), regionCool
+	_ = g.withState(func(st *placementState) { st.Cooldown[region] = c })
+}
+
+// setupFailure reports region failures that come from how the account or
+// region is set up (no default VPC, opt-in, permissions): they won't clear
+// by themselves, unlike throttling or a network error while preparing.
+func setupFailure(err error) bool {
+	if regionWide(awsCode(err)) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no default VPC") || strings.Contains(msg, "UnauthorizedOperation") ||
+		strings.Contains(msg, "AccessDenied") || strings.Contains(msg, "OptInRequired")
 }
 
 // brokenRegions are regions cooling down for reasons on-demand shares.
@@ -761,7 +939,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	if err != nil {
 		return Instance{}, err
 	}
-	cool := g.Cooldowns(t.Prices)
+	cool := g.cooldowns(t.Prices)
 	// An explicit max_price is AWS's cap on the Spot bid: options already
 	// above it would only be refused.
 	maxPrice := 0.0
@@ -769,16 +947,47 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		maxPrice, _ = strconv.ParseFloat(g.r.MaxPrice, 64)
 	}
 	skipRegion := map[string]string{}
+	skipQuota := map[string][]quotaSkip{} // region -> what its quota refused during this launch
 	skipZone := map[string]bool{}
 	broken := g.brokenRegions() // regions whose setup failed (no on-demand there either)
 	var tried []string
+	// When quota is all that stopped every option (others can't work as
+	// configured: no network there, or above max_price), the error is a
+	// *QuotaError, so the client pool holds launches until a VM ends or a
+	// few minutes pass instead of retrying, and the pool manager doesn't
+	// count it against the fleet's health.
+	var quota *QuotaError    // the cheapest option's quota refusal
+	otherFailure := false    // something that may clear by itself: options left untried
+	var capacity []SpotPrice // options refused for capacity (may return, unless quota covers them too)
+	quotaSkipped := func(c SpotPrice) bool {
+		for _, q := range skipQuota[c.Region] {
+			if q.covers(c.Type) {
+				return true
+			}
+		}
+		return false
+	}
 	attempts := 0
 	for rank, c := range t.Prices {
-		if attempts == maxAttempts {
-			break
-		}
-		if skipRegion[c.Region] != "" || skipZone[c.Zone] || cool[poolKey(c)] != "" || (maxPrice > 0 && c.USD() > maxPrice) {
+		if skipRegion[c.Region] != "" || skipZone[c.Zone] || quotaSkipped(c) || (maxPrice > 0 && c.USD() > maxPrice) {
 			continue
+		}
+		if cd, ok := cool[poolKey(c)]; ok {
+			switch {
+			case cd.Transient:
+				otherFailure = true // may have cleared since
+			case cd.Setup: // no network there as set up: neutral
+			case strings.Contains(cd.Why, "InsufficientFreeAddressesInSubnet"):
+				otherFailure = true // the zone's subnet is full, for every size
+			case shortOfCapacity(cd.Why):
+				capacity = append(capacity, c)
+			}
+			// Unsupported here, or refused at max_price: neutral.
+			continue
+		}
+		if attempts == maxAttempts {
+			otherFailure = true
+			break
 		}
 		a := g.Regional(c.Region)
 		attempts++
@@ -812,27 +1021,67 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		case errors.As(err, &ze), zoneWide(code):
 			why := firstLineOf([]byte(err.Error()))
 			skipZone[c.Zone] = true
-			g.coolZone(c.Zone, why)
+			setup := ze != nil // no default subnet there: the network as set up
+			g.coolZone(c.Zone, why, setup)
 			log("skipping %s: %s", c.Zone, why)
+			if !setup {
+				otherFailure = true // no free addresses: may clear, for every size
+			}
 			if code == "" {
 				attempts-- // nothing was sent
 				code = "no default subnet"
 			}
-		case errors.As(err, &re), errors.As(err, &qe), regionWide(code):
+		case errors.As(err, &qe), classifyAWSError(err) == errQuota:
+			// No room in this region's quota for this size: smaller types,
+			// and types under another quota, may still fit here.
 			why := firstLineOf([]byte(firstLineOfErr(err))) // a quota error goes on to say how to raise it
-			skipRegion[c.Region] = why
-			broken[c.Region] = qe == nil && !spotOnly(code) // on-demand may still launch past a Spot quota
-			g.coolRegion(c.Region, why, broken[c.Region])
-			log("skipping %s: %s", c.Region, why)
-			if re != nil || qe != nil {
-				attempts-- // failed before any launch request
-			}
-			if qe != nil {
+			q := quotaSkip{vcpus: vcpusOf(c.Type), group: quotaGroup(c.Type)}
+			switch {
+			case qe != nil:
+				q.vcpus = qe.VCPUs
+				attempts-- // the pre-launch check: nothing was sent
 				code = "Spot vCPU quota"
+			case code == "InstanceLimitExceeded":
+				// A count limit on instances: no type fits, and on-demand
+				// is refused there too.
+				q.vcpus = 0
+				broken[c.Region] = true
+			}
+			skipQuota[c.Region] = append(skipQuota[c.Region], q)
+			if quota == nil {
+				quota = qe
+				if quota == nil {
+					quota = &QuotaError{Region: c.Region, Spot: true, VCPUs: vcpusOf(c.Type), Detail: code}
+					if q.vcpus > 0 { // a vCPU quota (not an instance count limit): say which
+						quota.Code = quotaCodeFor(c.Type, true)
+					}
+				}
+			}
+			if q.vcpus > 0 {
+				log("skipping %d-vCPU and larger types in %s: %s", q.vcpus, c.Region, why)
+			} else {
+				log("skipping %s: %s", c.Region, why)
+			}
+		case errors.As(err, &re), regionWide(code):
+			why := firstLineOf([]byte(firstLineOfErr(err)))
+			skipRegion[c.Region] = why
+			broken[c.Region] = true // no on-demand there either, this launch
+			if setupFailure(err) {
+				g.coolRegion(c.Region, why, true)
+			} else {
+				otherFailure = true // a transient failure: not a quota verdict
+				g.coolRegionAs(c.Region, cooldown{Why: why, Transient: true})
+			}
+			log("skipping %s: %s", c.Region, why)
+			if re != nil {
+				attempts-- // failed before any launch request
 			}
 		case classifyAWSError(err) == errNextType:
 			g.coolPool(c, code)
 			log("skipping %s in %s: %s", c.Type, c.Zone, code)
+			if shortOfCapacity(code) {
+				capacity = append(capacity, c) // (not Unsupported or a max price: those won't change)
+			}
 		default:
 			// The same request would fail everywhere (bad bootstrap, image,
 			// parameters): don't burn through every region.
@@ -840,12 +1089,29 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		}
 		tried = append(tried, c.Type+"@"+c.Zone+": "+code)
 	}
+	// A region that couldn't be priced just now (a timeout, throttling)
+	// might have had room.
+	for _, why := range t.Unpriced {
+		if why != notEnabledWhy && why != noneOfferedWhy {
+			otherFailure = true
+		}
+	}
+	// A capacity refusal counts against "quota only" unless its region's
+	// quota refused that size too (it couldn't have launched anyway).
+	for _, c := range capacity {
+		if !quotaSkipped(c) {
+			otherFailure = true
+		}
+	}
 	if g.r.OnDemandFallback {
 		var regions []string
 		for _, c := range t.Prices {
 			if !broken[c.Region] && !contains(regions, c.Region) {
 				regions = append(regions, c.Region)
 			}
+		}
+		if len(regions) > 2 {
+			otherFailure = true // regions left untried: not a quota verdict
 		}
 		for _, rg := range regions[:min(len(regions), 2)] {
 			log("no spot capacity; falling back to on-demand in %s", rg)
@@ -861,8 +1127,26 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			if errors.Is(err, ErrLaunchAmbiguous) || errors.As(err, &ce) || ctx.Err() != nil {
 				return Instance{}, fmt.Errorf("%s: %w", rg, err)
 			}
+			var oq *QuotaError
+			if !errors.As(err, &oq) {
+				otherFailure = true
+			} else if quota == nil {
+				quota = oq
+			}
 			tried = append(tried, rg+" on-demand: "+firstLineOf([]byte(err.Error())))
 		}
+	}
+	if quota != nil && !otherFailure {
+		if quota.Code != "" && quota.Usage == nil && quota.Desired == 0 {
+			// Suggest a quota above the current one, as a single region does.
+			if q, err := g.Regional(quota.Region).quotaValue(ctx, quota.Code); err == nil {
+				quota.Desired = q + quota.VCPUs
+			}
+		}
+		if len(tried) > 1 {
+			return Instance{}, fmt.Errorf("no option in %s could launch (%s); quota stopped the cheapest: %w", g.Where(), strings.Join(tried, ", "), quota)
+		}
+		return Instance{}, quota
 	}
 	if len(tried) == 0 && maxPrice > 0 && t.Prices[0].USD() > maxPrice {
 		return Instance{}, fmt.Errorf("every Spot price in %s is above max_price %s (cheapest: $%s/h for %s in %s)", g.Where(), g.r.MaxPrice, t.Prices[0].Price, t.Prices[0].Type, t.Prices[0].Zone)
@@ -1130,24 +1414,34 @@ func (g *AWSGlobal) Doctor(ctx context.Context) []Check {
 		return append(out, Check{Name: "aws credentials", Msg: err.Error()})
 	}
 	out = append(out, Check{Name: "aws credentials", OK: true, Msg: creds.Source})
+	regions, rerr := g.PlacementRegions(ctx)
+	if len(regions) > 0 {
+		h = g.Regional(regions[0]) // the home region may not be enabled
+	}
 	if b, err := h.api.query(ctx, "sts", stsAPIVersion, "GetCallerIdentity", nil); err != nil {
 		out = append(out, Check{Name: "aws identity", Msg: err.Error()})
 	} else {
 		out = append(out, Check{Name: "aws identity", OK: true,
 			Msg: "account " + xmlFirst(b, "GetCallerIdentityResult>Account") + " · " + xmlFirst(b, "GetCallerIdentityResult>Arn")})
 	}
-	regions, err := g.PlacementRegions(ctx)
-	if err != nil {
-		return append(out, Check{Name: "regions", Msg: err.Error()})
+	if rerr != nil {
+		return append(out, Check{Name: "regions", Msg: rerr.Error()})
 	}
-	out = append(out, Check{Name: "regions", OK: true, Msg: fmt.Sprintf("%d: %s", len(regions), strings.Join(regions, ", "))})
+	msg := fmt.Sprintf("%d: %s", len(regions), strings.Join(regions, ", "))
+	if off := g.notEnabled(regions); len(off) > 0 {
+		msg += fmt.Sprintf(" (left out, not enabled in this account: %s)", strings.Join(off, ", "))
+	}
+	out = append(out, Check{Name: "regions", OK: len(regions) > 0, Msg: msg})
+	if len(regions) == 0 {
+		return out
+	}
 	t, err := g.Prices(ctx, true)
 	if err != nil {
 		return append(out, Check{Name: "spot prices", Msg: err.Error()})
 	}
 	best := t.Prices[0]
 	out = append(out, Check{Name: "spot prices", OK: true, Msg: fmt.Sprintf("cheapest now: %s in %s at $%s/h (%d options in %d regions; `spotexec prices %s` lists them)",
-		best.Type, best.Zone, best.Price, len(t.Prices), len(regions)-len(t.Unpriced), g.r.Name)})
+		best.Type, best.Zone, best.Price, len(t.Prices), len(t.Regions)-len(t.Unpriced), g.r.Name)})
 	if len(t.Unpriced) > 0 {
 		out = append(out, Check{Name: "unpriced regions", OK: true, Msg: "not used: " + summarize(t.Unpriced, 4)})
 	}

@@ -140,6 +140,10 @@ func cmdImage() *cobra.Command {
 			if err != nil && len(as) == 0 {
 				return err
 			}
+			if len(as) == 0 {
+				fmt.Printf("%s: no regions to look in (none of its regions is enabled in this AWS account)\n", r.Name)
+				return nil
+			}
 			total := 0
 			for _, a := range as {
 				bakes, err := a.Bakes(cmd.Context())

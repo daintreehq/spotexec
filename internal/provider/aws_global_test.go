@@ -34,6 +34,10 @@ type fakeRegionsEC2 struct {
 	builders   map[string]bool              // regions holding a bake builder
 	instances  map[string]map[string]string // region -> id -> type
 	quota      map[string]int               // region -> standard Spot vCPU quota (unset: GetServiceQuota fails)
+	dead       map[string]bool              // regions whose endpoint never answers (not enabled); set before use
+	deny       map[string]bool              // regions answering AuthFailure to everything (not enabled); set before use
+	noRegions  bool                         // DescribeRegions is denied everywhere
+	priceErr   map[string]string            // region -> error code DescribeSpotPriceHistory answers
 	calls      []string                     // "region Action [detail]"
 	next       int
 }
@@ -70,6 +74,20 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		region, service, _ := strings.Cut(strings.Trim(r.URL.Path, "/"), "/")
 		body, _ := io.ReadAll(r.Body)
+		if f.dead[region] {
+			f.mu.Lock()
+			f.log(region, "dead")
+			f.mu.Unlock()
+			<-r.Context().Done()
+			return
+		}
+		if f.deny[region] {
+			f.mu.Lock()
+			f.log(region, "denied")
+			f.mu.Unlock()
+			ec2Err(w, 401, "AuthFailure")
+			return
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if service == "servicequotas" {
@@ -92,13 +110,22 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 		switch act {
 		case "DescribeRegions":
 			f.log(region, act)
+			if f.noRegions {
+				ec2Err(w, 403, "UnauthorizedOperation")
+				return
+			}
 			fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo>
 <item><regionName>r-one-1</regionName><optInStatus>opt-in-not-required</optInStatus></item>
 <item><regionName>r-two-1</regionName><optInStatus>opted-in</optInStatus></item>
+<item><regionName>r-three-1</regionName><optInStatus>opt-in-not-required</optInStatus></item>
 <item><regionName>r-off-1</regionName><optInStatus>not-opted-in</optInStatus></item>
 </regionInfo></DescribeRegionsResponse>`)
 		case "DescribeSpotPriceHistory":
 			f.log(region, act)
+			if code := f.priceErr[region]; code != "" {
+				ec2Err(w, 403, code)
+				return
+			}
 			fmt.Fprint(w, `<DescribeSpotPriceHistoryResponse><spotPriceHistorySet>`)
 			for _, row := range f.prices[region] {
 				fmt.Fprintf(w, `<item><instanceType>%s</instanceType><productDescription>Linux/UNIX</productDescription><spotPrice>%s</spotPrice><timestamp>2026-11-14T00:00:00.000Z</timestamp><availabilityZone>%s</availabilityZone></item>`, row[1], row[2], row[0])
@@ -285,16 +312,17 @@ func TestGlobalLaunchCheapestWithFallback(t *testing.T) {
 	if got := active(t, g); got != "r-one-1,r-three-1" {
 		t.Fatalf("active regions %s", got)
 	}
-	// Cooldowns stop the next launch retrying the failures: it goes
-	// straight to the next-cheapest pool that hasn't failed.
+	// The capacity cooldown stops the next launch retrying r-one-1a; the
+	// quota refusal is asked again (a VM may have ended since), then it
+	// goes to the pool that worked.
 	f.mu.Lock()
 	f.calls = nil
 	f.mu.Unlock()
 	if _, err := g.Launch(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
 	}
-	if runs := f.callsOf("RunInstances"); len(runs) != 1 || runs[0] != "r-one-1 RunInstances c6a.2xlarge subnet-r-one-1b" {
-		t.Fatalf("second launch should go straight to the pool that worked: %v", runs)
+	if runs := f.callsOf("RunInstances"); strings.Join(runs, "\n") != "r-three-1 RunInstances c7a.2xlarge subnet-r-three-1a\nr-one-1 RunInstances c6a.2xlarge subnet-r-one-1b" {
+		t.Fatalf("second launch: %v", runs)
 	}
 	// Prices came from the cache the second time.
 	if n := len(f.callsOf("DescribeSpotPriceHistory")); n != 0 {
@@ -352,7 +380,7 @@ func TestGlobalAllRegionsSkipsNotOptedIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(tbl.Regions, ","); got != "r-one-1,r-two-1" {
+	if got := strings.Join(tbl.Regions, ","); got != "r-one-1,r-three-1,r-two-1" {
 		t.Fatalf("regions %s", got)
 	}
 	if tbl.Prices[0].Region != "r-two-1" {

@@ -201,6 +201,9 @@ func TestRegions(t *testing.T) {
 		"security groups":    "regions = [\"all\"]\nsecurity_group_ids = [\"sg-1\"]\n",
 		"ami id":             "regions = [\"us-east-1\", \"us-east-2\"]\nami = \"ami-123\"\n",
 		"named cache bucket": "regions = [\"all\"]\ncache_bucket = \"my-bucket\"\n",
+		"china region":       "region = \"cn-north-1\"\n",
+		"china in a list":    "regions = [\"us-east-1\", \"cn-northwest-1\"]\n",
+		"govcloud mixed":     "regions = [\"us-east-1\", \"us-gov-west-1\"]\n",
 	} {
 		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\n"+body); err == nil {
 			t.Errorf("%s: accepted", name)

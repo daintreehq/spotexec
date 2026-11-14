@@ -2,12 +2,14 @@ package transport
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/helperbin"
 	"github.com/daintreehq/spotexec/internal/provider"
 )
 
@@ -136,4 +138,31 @@ func TestPosixCommandUnderLoginShells(t *testing.T) {
 		}
 	}
 	t.Logf("login shells tried: %v", shells)
+}
+
+// HelperInstalled is the install markers' fast path: true only for the
+// helper this binary embeds, recorded for this exact connection.
+func TestHelperInstalled(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c := New(sshRunnerTarget(t, "Port=2222"), "~/.cache/spotexec")
+	if c.HelperInstalled() {
+		t.Fatal("installed with no markers")
+	}
+	_, hash, err := helperbin.Get("linux", "amd64")
+	if err != nil {
+		t.Skip("no embedded helper in this build:", err)
+	}
+	os.MkdirAll(filepath.Dir(markerPathAny(c)), 0o755)
+	os.WriteFile(markerPathAny(c), []byte("linux amd64 "+hash), 0o644)
+	if c.HelperInstalled() {
+		t.Fatal("installed without the per-hash marker")
+	}
+	os.WriteFile(markerPath(c, hash), []byte("x"), 0o644)
+	if !c.HelperInstalled() {
+		t.Fatal("not installed with both markers")
+	}
+	os.WriteFile(markerPathAny(c), []byte("linux amd64 stale"), 0o644)
+	if c.HelperInstalled() {
+		t.Fatal("a stale helper hash counts as installed")
+	}
 }
