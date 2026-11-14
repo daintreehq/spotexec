@@ -138,6 +138,7 @@ writeback = "always"           # always | on-success | never (eslint --fix exits
 exclude = [".env*", "*.pem"]   # on top of .gitignore and .spotexecignore
 pull_artifacts = ["coverage/"] # gitignored outputs copied back after every run
 # source = "git"               # git | directory (default: git when in a worktree)
+# git_seed = true              # a one-commit .git on the runner: HEAD, branch, git status (see below)
 
 [deps]
 lockfiles = ["pnpm-lock.yaml", "packages/*/package.json"]   # the cache key; globs allowed
@@ -162,6 +163,8 @@ fail_fast = false
 [hook]
 when_load_above = 0.6          # agents offload only when the laptop is busy
 ```
+
+`git_seed` gives the slot a minimal `.git` before the command runs (off by default), so tools that ask Git about the checkout, such as a build stamping the commit SHA or a test recording `git status`, answer as they do locally. See [Git on the runner](running.md#git-on-the-runner) for what it holds and what it can't do.
 
 ### Dependencies
 

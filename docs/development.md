@@ -33,4 +33,5 @@ The code is organized as:
 | `internal/cloudinit` | First-boot user-data: watchdog, key, bootstrap. |
 | `internal/daemon` | The optional pool manager. |
 | `internal/manifest`, `internal/ignore`, `internal/dockerignore`, `internal/fsid`, `internal/depskey` | Worktree manifests, ignore semantics, safe path handling, dependency cache keys. |
+| `internal/gitseed` | What `[sync] git_seed` sends: HEAD's commit and trees, and the HEAD versions of changed files. |
 | `internal/config`, `internal/hooks`, `internal/ui` | Config, agent hooks, output. |

@@ -29,6 +29,10 @@ const (
 	TypeBye         = "bye"
 	TypeImage       = "image"
 	TypeImageResult = "image_result"
+	TypeGitSeed     = "git_seed"
+	TypeGitNeed     = "git_need"
+	TypeGitSeeded   = "git_seeded"
+	TypeGitDrop     = "git_drop" // no body, no reply: remove a .git an earlier seed left in the slot
 )
 
 // MaxSlots caps slots per machine, explicit (max_slots) or automatic
@@ -312,6 +316,47 @@ type Settle struct {
 // Pull asks for gitignored artifacts by glob (relative to the workspace).
 type Pull struct {
 	Patterns []string `json:"patterns"`
+}
+
+// GitSeed asks the helper to give the slot workspace a minimal .git
+// ([sync] git_seed) after the forward sync: the HEAD commit as a shallow
+// root, its trees, the HEAD blobs of files changed locally, HEAD and the
+// branch ref, and an index built from HEAD. The helper answers GitNeed
+// (the CLI follows with a tar blob of those objects when any are missing),
+// then GitSeeded. Nothing else of the local repository is sent.
+type GitSeed struct {
+	// Key identifies the requested state: when it matches what the slot
+	// holds and nothing in .git was touched since, nothing is redone.
+	Key  string `json:"key"`
+	Head string `json:"head,omitempty"` // HEAD commit; empty on an unborn branch
+	Ref  string `json:"ref,omitempty"`  // refs/heads/<branch>; empty when detached
+	// Objects lists every object ID the seed holds (anything else in the
+	// slot's object store is removed).
+	Objects []string `json:"objects,omitempty"`
+	// SkipWorktree: paths in HEAD that weren't synced (excluded files,
+	// submodules) or that git status hides locally, so they don't show up
+	// as deleted or changed on the runner.
+	SkipWorktree []string `json:"skip_worktree,omitempty"`
+	// IntentToAdd: synced files staged locally that HEAD doesn't have.
+	IntentToAdd []string `json:"intent_to_add,omitempty"`
+}
+
+// GitNeed lists the objects the slot is missing. When non-empty, the CLI
+// follows with a gzip'd tar blob holding one "<type>/<id>" entry each, with
+// the object's raw content.
+type GitNeed struct {
+	IDs []string `json:"ids"`
+}
+
+// GitSeeded reports the seed. Warning is set when the slot was left
+// without a .git (git missing on the runner, or seeding failed); the run
+// goes on either way.
+type GitSeeded struct {
+	Reseeded bool   `json:"reseeded"`
+	Objects  int    `json:"objects"`
+	Bytes    int64  `json:"bytes"`
+	Warning  string `json:"warning,omitempty"`
+	MS       int64  `json:"ms"`
 }
 
 // Cancel asks the helper to terminate the running command.

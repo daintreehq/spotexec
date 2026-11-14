@@ -243,6 +243,27 @@ docker exec "$NAME" sh -c "rm -rf /home/dev/.cache/spotexec/repos/pyrepo-*/slots
 check "...and keeps working once the building slot is gone" "[ -n '$VENV_SLOT' ] && grep -q venv-here $WORK/last.out && ! ev '\"built\":true' | grep -q ."
 cd "$REPO"
 
+echo "== git_seed"
+GREPO="$WORK/gitrepo"
+mkdir -p "$GREPO/src" && cd "$GREPO"
+git init -q -b feature/seeded && git config user.email t@t && git config user.name t
+printf 'a\n' > src/a.txt; printf 'b\n' > src/b.txt; printf 'gone\n' > gone.txt; printf 'TOKEN=1\n' > secret.env
+printf 'version = 1\n[sync]\ngit_seed = true\nexclude = ["*.env"]\n' > .spotexec.toml
+git add -A && git commit -qm "the seeded commit"
+printf 'b2\n' > src/b.txt; rm gone.txt; printf 'n\n' > new.txt
+GIT_PROBE='git rev-parse HEAD --abbrev-ref HEAD; git log -1 --format=%s; git status --porcelain; git diff --stat | tail -1'
+{ git rev-parse HEAD --abbrev-ref HEAD; git log -1 --format=%s; git status --porcelain; git diff --stat | tail -1; } > "$WORK/git.local"
+run "$GIT_PROBE" || true
+check "git_seed: HEAD, branch, log, status and diff match the local worktree" "diff -u $WORK/git.local $WORK/last.out"
+run 'git tag runner-tag; printf "[alias]\n x = status\n" >> .git/config; echo from-runner > src/a.txt' || true
+check "git_seed: a command's changes to .git never come back" "! git rev-parse -q --verify runner-tag >/dev/null && ! grep -q alias .git/config && grep -qx from-runner src/a.txt"
+git checkout -q src/a.txt
+run "$GIT_PROBE" || true
+check "git_seed: the next run restores the seed" "diff -u $WORK/git.local $WORK/last.out && ev '\"git_seed\".*\"reseeded\":true' | grep -q ."
+run "$GIT_PROBE" || true
+check "git_seed: an unchanged seed costs nothing" "diff -u $WORK/git.local $WORK/last.out && ev '\"git_seed\".*\"reseeded\":false' | grep -q ."
+cd "$REPO"
+
 ("$SX" -q 'sleep 3' &) ; sleep 1
 "$SX" --json --exclusive 'echo excl' >"$WORK/x.out" 2>"$WORK/x.err" || true
 check "--exclusive waits for running jobs" "grep -q excl $WORK/x.out && grep -q '\"event\":\"queued\"' $WORK/x.err"

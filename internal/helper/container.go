@@ -656,6 +656,9 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	// redirect `docker run` itself): single-line values via a 0600
 	// env-file, multi-line values as quoted -e KEY=value arguments.
 	envPath := filepath.Join(runDir, id+".env")
+	if run.Root && s.state.GitOwned {
+		env = withSafeDirectory(env, s.workspace)
+	}
 	var envb strings.Builder
 	var multi []string
 	keys := make([]string, 0, len(env))
