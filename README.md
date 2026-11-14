@@ -51,24 +51,39 @@ $ sx pnpm vitest run -u src/auth.test.ts
 
 ## Install
 
-You need **Go 1.26+** to build. On your machine, **`git`** and **OpenSSH** (`ssh`, which `spotexec` uses with ControlMaster) must be on `PATH`.
+**Homebrew** (macOS and Linux):
+
+```sh
+brew install daintreehq/tap/spotexec     # installs spotexec, the sx alias and shell completions
+spotexec version
+```
+
+**Debian / Ubuntu, Fedora / RHEL, Alpine:** download the `.deb`, `.rpm` or `.apk` for your architecture from the [latest release](https://github.com/daintreehq/spotexec/releases/latest), then:
+
+```sh
+sudo apt install ./spotexec_*_linux_amd64.deb   # or: sudo dnf install ./spotexec_*.rpm · sudo apk add --allow-untrusted ./spotexec_*.apk
+```
+
+**Any other system:** the release also has plain `.tar.gz` archives for macOS and Linux on amd64 and arm64. Each one holds a single `spotexec` binary; put it on your `PATH` and link `sx` to it.
+
+**From source** (Go 1.26+):
 
 ```sh
 git clone https://github.com/daintreehq/spotexec.git && cd spotexec
 mkdir -p "$(go env GOPATH)/bin"   # make sure it exists and is on your PATH
 make install        # builds bin/spotexec and the bin/sx symlink, installs both into $(go env GOPATH)/bin
-spotexec version
-spotexec completion zsh > "${fpath[1]}/_spotexec"   # optional: shell completion (bash, zsh, fish, powershell)
 ```
 
-`make build` cross-compiles the remote helper for linux and darwin (amd64 and arm64), gzips it, and embeds it in the `spotexec` binary. Nothing needs to be preinstalled on a runner: on first contact the helper uploads itself to `~/.cache/spotexec/bin/` on the runner.
+`go install` isn't supported: the build cross-compiles the remote helper for Linux and macOS (amd64 and arm64) and embeds it in the `spotexec` binary, which `make build` and the release builds do. Nothing needs to be preinstalled on a runner: on first contact the helper uploads itself to `~/.cache/spotexec/bin/` there.
+
+Your machine needs **`git`** and **OpenSSH** (`ssh`, used with ControlMaster) on `PATH`.
 
 A runner needs:
 - an SSH server, `bash` and `gzip`;
 - Linux or macOS, on amd64 or arm64;
 - Docker only if you use [project containers](#project-containers). On AWS, Docker is installed for you.
 
-The AWS CLI v2 is **optional**: `spotexec` signs AWS requests itself (there is no AWS SDK in the binary). Install the CLI if you sign in with SSO, `aws login`, assume-role or `credential_process`. See [Credentials](#3-sign-in).
+The AWS CLI v2 is **optional**: `spotexec` signs AWS requests itself (there is no AWS SDK in the binary). Install the CLI if you sign in with SSO, `aws login`, assume-role or `credential_process`. See [Credentials](#2-sign-in).
 
 `sx` is a symlink to `spotexec`. `sx <command>` is shorthand for `spotexec run -- <command>`.
 
@@ -87,7 +102,7 @@ spotexec init --global      # writes an example ~/.config/spotexec/config.toml
 
 Edit it so `default_pool` lists only runners you actually have. The template includes an `aws` runner.
 
-**Option A: an SSH machine you already own.** Non-interactive key login must already work, and the host key must be in `~/.ssh/known_hosts`, because spotexec runs `ssh -o BatchMode=yes`. Check with `ssh -o BatchMode=yes me@192.168.1.50 true`. Your toolchain (`pnpm`, `go`, `cargo`, …) must be on `PATH` in a *login* shell (`~/.profile`, not `~/.bashrc`), via `remote_path_setup`, or come from a [project container](#project-containers).
+**Option A: an SSH machine you already own.** Non-interactive key login must already work, and the host key must be in `~/.ssh/known_hosts`, because spotexec runs `ssh -o BatchMode=yes`. Check with `ssh -o BatchMode=yes me@192.168.1.50 true`. Commands run under `bash` with a login profile (`~/.bash_profile`, falling back to `~/.profile`; not `~/.bashrc` or `~/.zprofile`), so your toolchain (`pnpm`, `go`, `cargo`, …) must be on `PATH` there, set by `remote_path_setup`, or come from a [project container](#project-containers).
 
 ```toml
 version = 1
@@ -143,9 +158,9 @@ The first AWS run boots a VM, which takes about a minute plus your bootstrap. La
 This is the full path from an AWS account to a working Spot fleet. It takes about ten minutes, plus however long a quota increase takes if your account needs one.
 
 1. [Install the AWS CLI](#1-install-the-aws-cli)
-2. [Choose a region](#2-choose-a-region)
-3. [Sign in](#3-sign-in)
-4. [Grant permissions](#4-grant-permissions)
+2. [Sign in](#2-sign-in)
+3. [Grant permissions](#3-grant-permissions)
+4. [Choose a region](#4-choose-a-region)
 5. [Check your Spot vCPU quota](#5-check-your-spot-vcpu-quota)
 6. [Check the network](#6-check-the-network)
 7. [Configure the runner](#7-configure-the-runner)
@@ -157,48 +172,10 @@ spotexec signs its own AWS requests, so plain access keys work without the CLI. 
 
 ```sh
 brew install awscli        # macOS; other platforms: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
-aws --version              # aws-cli/2.x
+aws --version              # aws-cli/2.9 or later (2.32+ for `aws login`)
 ```
 
-### 2. Choose a region
-
-A runner's region comes from, in order:
-1. its `region` key;
-2. `AWS_REGION`;
-3. `AWS_DEFAULT_REGION`;
-4. `us-east-1`.
-
-The `region` in your `~/.aws/config` profile is **not** used, so set `region` on the runner explicitly.
-
-Pick the region that is:
-- **Closest to you.** Every run makes several SSH round trips (handshake, sync, streaming output, write-back). A nearby region keeps small commands under a second of overhead.
-- **Stocked with your instance types.** For example, check that it offers `c7a.xlarge`:
-  ```sh
-  aws ec2 describe-instance-type-offerings --region us-east-2 \
-    --filters Name=instance-type,Values=c7a.large,c7a.xlarge --query 'InstanceTypeOfferings[].InstanceType'
-  ```
-- **Cheap and roomy for Spot.** Compare current prices, and ask AWS how likely a request is to be filled (scores 1–10):
-  ```sh
-  aws ec2 describe-spot-price-history --region us-east-2 --instance-types c7a.xlarge \
-    --product-descriptions Linux/UNIX --start-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --query 'SpotPriceHistory[].[AvailabilityZone,SpotPrice]' --output table
-  aws ec2 get-spot-placement-scores --region us-east-2 --instance-types c7a.xlarge c6a.xlarge \
-    --target-capacity 4 --region-names us-east-1 us-east-2 us-west-2
-  ```
-
-Everything spotexec creates is per region:
-- the Spot quota;
-- the S3 dependency cache;
-- baked AMIs;
-- the security group.
-
-Moving a runner to another region therefore starts with a cold cache, and you'll need to run `image bake` again.
-
-The EC2 console is regional too. If you don't see your instances, switch the console's region selector; `spotexec doctor` prints the region and tag to look for.
-
-To span regions, define one runner per region and order them with `priority`, so the second only takes overflow.
-
-### 3. Sign in
+### 2. Sign in
 
 Choose **one** of these. Name the profile whatever you like; the examples use `spotexec`.
 
@@ -209,13 +186,13 @@ aws configure sso --profile spotexec   # start URL, SSO region, account, permiss
 aws sso login --profile spotexec       # again whenever the session expires
 ```
 
-**B. `aws login`.** This uses your AWS Management Console sign-in, through a recent AWS CLI v2.
+**B. `aws login`.** This uses your AWS Management Console sign-in as an IAM user or role (not IAM Identity Center). It needs AWS CLI 2.32 or later. IAM users and roles also need the AWS managed policy `SignInLocalDevelopmentAccess` alongside the spotexec policy; see the [`aws login` reference](https://docs.aws.amazon.com/cli/latest/reference/login/).
 
 ```sh
 aws login --profile spotexec
 ```
 
-**C. IAM user access keys.** The simplest option for a personal account. Use a dedicated user with only the [policy below](#4-grant-permissions), not your root user.
+**C. IAM user access keys.** The simplest option for a personal account. Use a dedicated user with only the [policy below](#3-grant-permissions), not your root user. Create the user and key from an admin session (or in the IAM console):
 
 ```sh
 aws iam create-user --user-name spotexec
@@ -238,7 +215,7 @@ Credentials resolve in this order:
 
    Assume-role profiles, and refreshing an `aws login` session, need the AWS CLI.
 
-### 4. Grant permissions
+### 3. Grant permissions
 
 Attach this policy to the identity you signed in with. Save it as `spotexec-policy.json`. The first three statements are required.
 
@@ -295,6 +272,44 @@ For IAM Identity Center, add the JSON as an inline policy on the permission set 
 aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
 ```
 
+### 4. Choose a region
+
+A runner's region comes from, in order:
+1. its `region` key;
+2. `AWS_REGION`;
+3. `AWS_DEFAULT_REGION`;
+4. `us-east-1`.
+
+The `region` in your `~/.aws/config` profile is **not** used, so set `region` on the runner explicitly.
+
+Pick the region that is:
+- **Closest to you.** Every run makes several SSH round trips (handshake, sync, streaming output, write-back). A nearby region keeps small commands under a second of overhead.
+- **Stocked with your instance types.** These lookups aren't in the spotexec policy, so run them from an admin session. For example, check that the region offers `c7a.xlarge`:
+  ```sh
+  aws ec2 describe-instance-type-offerings --region us-east-2 \
+    --filters Name=instance-type,Values=c7a.large,c7a.xlarge --query 'InstanceTypeOfferings[].InstanceType'
+  ```
+- **Cheap and roomy for Spot.** Compare current prices, and ask AWS how likely a request is to be filled (scores 1–10):
+  ```sh
+  aws ec2 describe-spot-price-history --region us-east-2 --instance-types c7a.xlarge \
+    --product-descriptions Linux/UNIX --start-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --query 'SpotPriceHistory[].[AvailabilityZone,SpotPrice]' --output table
+  aws ec2 get-spot-placement-scores --region us-east-2 --instance-types c7a.xlarge c6a.xlarge \
+    --target-capacity 4 --region-names us-east-1 us-east-2 us-west-2
+  ```
+
+Everything spotexec creates is per region:
+- the Spot quota;
+- the S3 dependency cache;
+- baked AMIs;
+- the security group.
+
+Moving a runner to another region therefore starts with a cold cache, and you'll need to run `image bake` again.
+
+The EC2 console is regional too. If you don't see your instances, switch the console's region selector; `spotexec doctor` prints the region and tag to look for.
+
+To span regions, define one runner per region and order them with `priority`, so the second only takes overflow.
+
 ### 5. Check your Spot vCPU quota
 
 Spot capacity is limited by a per-region vCPU quota, *All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests* (`L-34B43A08`). New accounts often start very low, sometimes 5 vCPUs, which is not enough for even two 4-vCPU VMs.
@@ -302,8 +317,9 @@ Spot capacity is limited by a per-region vCPU quota, *All Standard (A, C, D, H, 
 You need at least `max_instances × vCPUs per instance`, summed over every fleet in the region. For example, 4 × `c7a.xlarge` needs 16 vCPUs. `spotexec doctor` shows the current value and what the runner may use. To check or raise it:
 
 ```sh
-aws service-quotas get-service-quota --region us-east-2 --service-code ec2 --quota-code L-34B43A08 \
-  --query Quota.Value
+aws service-quotas get-service-quota --profile spotexec --region us-east-2 \
+  --service-code ec2 --quota-code L-34B43A08 --query Quota.Value
+# Requesting an increase needs an admin session (it isn't in the spotexec policy):
 aws service-quotas request-service-quota-increase --region us-east-2 \
   --service-code ec2 --quota-code L-34B43A08 --desired-value 64
 ```
@@ -320,7 +336,7 @@ By default nothing needs setting up. spotexec launches into the region's **defau
 
 Your machine must be able to make outbound SSH connections (TCP 22) to EC2 public addresses. Some corporate networks block this.
 
-If the region has no default VPC (deleted, or blocked by your organization), set `subnet_id` to a **public** subnet: one whose route table sends `0.0.0.0/0` to an internet gateway. spotexec then creates its security group in that subnet's VPC, or uses `security_group_ids` if you set them. Those groups must allow inbound TCP 22 from your address.
+If the region has no default VPC (deleted, or blocked by your organization), set `subnet_id` to a **public** subnet: one whose route table sends `0.0.0.0/0` to an internet gateway. spotexec then creates its security group in that subnet's VPC, or uses `security_group_ids` if you set them. Those groups must allow inbound TCP 22 from your address, and outbound HTTP/HTTPS for packages, the S3 cache and ECR.
 
 ### 7. Configure the runner
 
@@ -375,6 +391,7 @@ The VMs run **Ubuntu 24.04** (login user `ubuntu`), resolved fresh from Canonica
 spotexec doctor aws2           # credentials, identity, AMI, network, quota, console region
 spotexec up aws2               # boots one VM and waits until its bootstrap has finished
 spotexec status                # the VM, its slots and its idle timer
+cd ~/code/my-app && spotexec init   # spotexec only syncs Git repos or directories with .spotexec.toml
 sx -r aws2 uname -a            # a first remote command
 spotexec image bake aws2       # optional: snapshot the bootstrap for ~bare-boot cold starts
 spotexec down aws2             # or simply let it idle out
@@ -387,7 +404,7 @@ If `up` fails, the error says why: a credential problem names the login command 
 | Resource | When | Cleanup |
 | --- | --- | --- |
 | Spot instances tagged `spotexec-runner` / `spotexec-owner` | On demand | They terminate themselves; `spotexec down` terminates them now. |
-| Security group `spotexec-ssh` (one per `ssh_cidr`) | First launch without `security_group_ids` | Delete by hand if you stop using spotexec. |
+| Security group `spotexec-ssh` (`spotexec-ssh-<hash>` for a custom `ssh_cidr`, one per VPC) | First launch without `security_group_ids` | Delete by hand if you stop using spotexec. |
 | S3 bucket `spotexec-cache-<account>-<region>` | First run with `[deps]` (unless `cache_bucket = "off"`) | Objects expire after 14 days. |
 | ECR repositories `spotexec/<repo-id>` | First Dockerfile build | Keeps the newest 10 images. |
 | AMIs and snapshots | `spotexec image bake` | `spotexec image clear`. |
@@ -400,7 +417,7 @@ The fleet shuts itself down without your laptop. One case is not covered: a VM w
 - an **AWS Budgets** alert;
 - an **EventBridge** rule that terminates `spotexec-runner`-tagged instances older than N hours.
 
-`spotexec status` lists pending and running instances. `spotexec doctor` also flags stopped ones, whose volumes still bill, and `spotexec down` terminates those too.
+`spotexec status` lists pending and running instances only. Stopped instances (whose volumes still bill) don't appear there; `spotexec down` terminates them along with the rest.
 
 ## Running commands
 
@@ -412,6 +429,8 @@ spotexec exec -- <command>            # reuse the last slot, without syncing
 ```
 
 `sx` stops reading its own flags at the first word that isn't one, so `sx pnpm vitest run --watch=false` passes everything after `pnpm` through unchanged. Several arguments are shell-quoted one by one. A single argument runs as a shell line, as in `sx 'pnpm lint && pnpm test'`. Absolute paths under your worktree are mapped to the remote workspace.
+
+The synced project is the enclosing Git worktree, or the nearest directory with a `.spotexec.toml`. Anywhere else, spotexec refuses to sync: it won't upload, say, your home directory with `~/.aws` and `~/.ssh` in it. Run `spotexec init` to mark a non-Git directory as a project, or use `--sync none`.
 
 ### Run flags
 
@@ -629,9 +648,9 @@ Changing either bootstrap script, `arch` or `user` makes old bakes stop matching
 ### Scaffold, edit, build
 
 ```sh
-spotexec container init              # writes .spotexec/Dockerfile and adds [container] to .spotexec.toml
+spotexec container init              # writes .spotexec/Dockerfile and adds [container] to .spotexec.toml (creating it if needed)
 $EDITOR .spotexec/Dockerfile         # add the system packages and tools your commands need
-spotexec container build -r aws      # build it on a runner now; on AWS it is pushed to ECR
+spotexec container build -r aws      # build it on a runner now; on AWS, push it to ECR
 sx pnpm test                         # every command now runs in the image
 ```
 
@@ -644,18 +663,18 @@ sx pnpm test                         # every command now runs in the image
 | Python with uv | `ghcr.io/astral-sh/uv:python<x.y>-bookworm`, with the version from `.python-version` |
 | Python | `python:<x.y>-bookworm` |
 | Go | `golang:<x.y>-bookworm`, with the version from `go.mod` |
-| Rust | `rust:<version>-bookworm`, with the version from `rust-toolchain(.toml)`, plus clippy and rustfmt |
-| Maven / Gradle | `eclipse-temurin:21-jdk` |
+| Rust | `rust:<version>-bookworm`, with a numeric version from `rust-toolchain(.toml)` (otherwise `1`), plus clippy and rustfmt |
+| Maven / Gradle | `eclipse-temurin:21-jdk`, plus `maven` when there's no `./mvnw` (Gradle projects use `./gradlew`) |
 | Anything else | `ubuntu:24.04` with build-essential |
 
 `init` also stages the Dockerfile with `git add`. Untracked files under `.spotexec/` aren't synced, and the runner builds from the synced copy. Commit the file with the project; once Git tracks it, your edits sync like any other file. `--path` writes it elsewhere, and `--force` overwrites an existing one.
 
-`container build` syncs the worktree, then builds the image on the chosen runner, or pulls it for `image =`. On AWS it pushes the result to a private ECR repository, `spotexec/<repo-id>`, which keeps the newest 10 images. It skips the dependency install, and it reports Dockerfile errors straight away. Without `container build`, the first `sx` command builds the image the same way. Every later VM pulls the image from ECR instead of rebuilding it.
+`container build` syncs the worktree, then builds the image on the chosen runner, or pulls it for `image =`. On AWS it pushes the result to a private ECR repository, `spotexec/<repo-id>`, which keeps the newest 10 images, and waits for the push to finish. It skips the dependency install, and it reports build and push errors straight away. Without `container build`, the first `sx` command builds the image the same way, but pushes it in the background, holding the VM up until the push is done. Every later VM pulls the image from ECR instead of rebuilding it.
 
 ### Writing the Dockerfile
 
 - **Don't copy your source in.** The worktree is mounted at the same path at run time, and dependencies (`node_modules`, `.venv`, …) come from the [dependency cache](#dependency-cache). Install tools, not code.
-- **Commands run as the runner's non-root user,** with `HOME=/home/spotexec`, a per-slot directory that persists between runs. Install toolchains system-wide, not under `/root`. Point tool caches at `$HOME` so they survive between runs; the Go and Rust scaffolds already do this.
+- **Commands run as the runner's non-root user,** with `HOME=/home/spotexec`, a per-slot directory mounted at run time that persists between runs. Install toolchains system-wide (for example under `/usr/local`), never under `/root` or `/home/spotexec`: anything built into `/home/spotexec` is hidden by the mount. Point tool caches at `$HOME` so they survive between runs; the Go and Rust scaffolds already do this.
 - **Use the image's own `ENV`.** Inside the container, the runner's login profile and `remote_path_setup` don't apply. The image needs `/bin/sh`, and bash is used when present.
 - **Rebuilds are content-addressed.** The image is tagged by the content of the Dockerfile and its build context (default: the Dockerfile's directory). It is rebuilt only when those change. `.dockerignore` applies exactly as in `docker build`: `<Dockerfile>.dockerignore` wins over `<context>/.dockerignore`, and ignored files are neither sent nor hashed. With `context = "."` and an ignore file that keeps only manifests, editing source never triggers a rebuild.
 

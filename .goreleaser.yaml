@@ -16,26 +16,66 @@ builds:
     flags: [-trimpath]
     ldflags:
       - -s -w
-      - -X github.com/spotexec/spotexec/internal/cli.Version={{ .Version }}
-      - -X github.com/spotexec/spotexec/internal/helper.Version={{ .Version }}
+      - -X github.com/daintreehq/spotexec/internal/cli.Version={{ .Version }}
+      - -X github.com/daintreehq/spotexec/internal/helper.Version={{ .Version }}
 
 archives:
   - formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
 
 checksum:
   name_template: checksums.txt
 
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^chore:"]
+
+# Linux packages (apt / dnf / apk), attached to each GitHub release.
+nfpms:
+  - id: packages
+    package_name: spotexec
+    file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    homepage: https://github.com/daintreehq/spotexec
+    maintainer: Greg Priday
+    description: Offload tests and builds from local worktrees to remote and AWS Spot runners
+    license: MIT
+    formats: [deb, rpm, apk]
+    dependencies: [git, openssh-client]
+    overrides:
+      rpm:
+        dependencies: [git, openssh-clients]
+      apk:
+        dependencies: [git, openssh-client]
+    contents:
+      - src: /usr/bin/spotexec
+        dst: /usr/bin/sx
+        type: symlink
+
+# Homebrew formula (macOS and Linux) in daintreehq/homebrew-tap, pushed with
+# a deploy key that can write to that repository only.
 brews:
   - name: spotexec
     repository:
-      owner: spotexec
+      owner: daintreehq
       name: homebrew-tap
-    homepage: https://github.com/spotexec/spotexec
+      branch: main
+      git:
+        url: git@github.com:daintreehq/homebrew-tap.git
+        private_key: "{{ .Env.HOMEBREW_TAP_DEPLOY_KEY }}"
+    directory: Formula
+    homepage: https://github.com/daintreehq/spotexec
     description: Offload tests and builds from local worktrees to remote and AWS Spot runners
     license: MIT
+    commit_author:
+      name: spotexec-release
+      email: spotexec-release@users.noreply.github.com
+    dependencies:
+      - name: git
     install: |
       bin.install "spotexec"
       bin.install_symlink "spotexec" => "sx"
+      generate_completions_from_executable(bin/"spotexec", "completion")
     test: |
       system "#{bin}/spotexec", "version"
