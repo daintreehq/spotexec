@@ -201,3 +201,160 @@ func TestDoctorContainer(t *testing.T) {
 		}
 	}
 }
+
+// Workspace node_modules are cache_dirs too, from each package manager's
+// own workspace declaration; otherwise a run restored from the cache is
+// missing them.
+func TestDetectProjectWorkspaceCacheDirs(t *testing.T) {
+	cases := []struct {
+		name    string
+		files   map[string]string
+		dirs    string
+		noteHas string
+	}{
+		{
+			name:  "npm array",
+			files: map[string]string{"package.json": `{"workspaces": ["packages/*", "./tools/cli/", "packages/*", "!packages/legacy", "."]}`, "package-lock.json": ""},
+			dirs:  `cache_dirs = ["node_modules", "packages/*/node_modules", "tools/cli/node_modules"]`, noteHas: "npm workspaces",
+		},
+		{
+			name:  "npm without workspaces",
+			files: map[string]string{"package.json": `{"name": "app"}`, "package-lock.json": ""},
+			dirs:  `cache_dirs = ["node_modules"]`,
+		},
+		{
+			name:  "npm malformed package.json",
+			files: map[string]string{"package.json": `{"workspaces": [`, "package-lock.json": ""},
+			dirs:  `cache_dirs = ["node_modules"]`, noteHas: "package.json didn't parse",
+		},
+		{
+			name:  "npm workspaces of the wrong type",
+			files: map[string]string{"package.json": `{"workspaces": "packages/*"}`, "package-lock.json": ""},
+			dirs:  `cache_dirs = ["node_modules"]`,
+		},
+		{
+			name:  "yarn classic object form",
+			files: map[string]string{"package.json": `{"workspaces": {"packages": ["packages/*", "apps/web"], "nohoist": ["**/react-native"]}}`, "yarn.lock": ""},
+			dirs:  `cache_dirs = ["node_modules", "packages/*/node_modules", "apps/web/node_modules"]`, noteHas: "yarn workspaces",
+		},
+		{
+			name:  "yarn berry array",
+			files: map[string]string{"package.json": `{"packageManager": "yarn@4.5.1", "workspaces": ["packages/*"]}`, "yarn.lock": "", ".yarnrc.yml": "nodeLinker: node-modules\n"},
+			dirs:  `cache_dirs = ["node_modules", "packages/*/node_modules"]`, noteHas: "yarn workspaces",
+		},
+		{
+			name:  "bun object form",
+			files: map[string]string{"package.json": `{"workspaces": {"packages": ["packages/*"], "catalog": {"react": "^19"}}}`, "bun.lock": ""},
+			dirs:  `cache_dirs = ["node_modules", "packages/*/node_modules"]`, noteHas: "bun workspaces",
+		},
+		{
+			name:  "unsupported globs become a note",
+			files: map[string]string{"package.json": `{"workspaces": ["libs/**", "{a,b}/*", "../shared", "packages/*"]}`, "package-lock.json": ""},
+			dirs:  `cache_dirs = ["node_modules", "packages/*/node_modules"]`, noteHas: `"libs/**", "{a,b}/*", "../shared"`,
+		},
+		{
+			name: "pnpm block list",
+			files: map[string]string{"package.json": `{"workspaces": ["ignored/*"]}`, "pnpm-lock.yaml": "", "pnpm-workspace.yaml": `# workspace
+packages:
+  - 'packages/*'   # libraries
+  - "apps/*"
+
+  - tools/cli
+  - '!**/test/**'
+onlyBuiltDependencies:
+  - esbuild
+`},
+			dirs: `cache_dirs = ["node_modules", "packages/*/node_modules", "apps/*/node_modules", "tools/cli/node_modules"]`, noteHas: "pnpm-workspace.yaml packages",
+		},
+		{
+			name:  "pnpm flow list",
+			files: map[string]string{"pnpm-lock.yaml": "", "pnpm-workspace.yaml": "packages: ['libs/*', \"web\"] # all\n"},
+			dirs:  `cache_dirs = ["node_modules", "libs/*/node_modules", "web/node_modules"]`, noteHas: "pnpm workspaces",
+		},
+		{
+			name:  "pnpm workspace file without packages",
+			files: map[string]string{"pnpm-lock.yaml": "", "pnpm-workspace.yaml": "onlyBuiltDependencies:\n  - esbuild\n"},
+			dirs:  `cache_dirs = ["node_modules"]`,
+		},
+		{
+			name:  "pnpm unreadable packages keeps the guess",
+			files: map[string]string{"pnpm-lock.yaml": "", "pnpm-workspace.yaml": "packages: &pkgs\n  - packages/*\n"},
+			dirs:  `cache_dirs = ["node_modules", "packages/*/node_modules", "apps/*/node_modules"]`, noteHas: "adjust deps.cache_dirs",
+		},
+		{
+			name:  "pnpm without a workspace file",
+			files: map[string]string{"package.json": `{"workspaces": ["packages/*"]}`, "pnpm-lock.yaml": ""},
+			dirs:  `cache_dirs = ["node_modules"]`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			root := t.TempDir()
+			for name, body := range c.files {
+				os.WriteFile(filepath.Join(root, name), []byte(body), 0o644)
+			}
+			body, notes := detectProject(root)
+			if !strings.Contains(body, c.dirs+"\n") {
+				t.Fatalf("want %s in:\n%s", c.dirs, body)
+			}
+			joined := strings.Join(notes, "\n")
+			if c.noteHas != "" && !strings.Contains(joined, c.noteHas) {
+				t.Errorf("want a note containing %s, got:\n%s", c.noteHas, joined)
+			}
+			if c.noteHas == "" && strings.Contains(joined, "cache_dirs") {
+				t.Errorf("unexpected cache_dirs note:\n%s", joined)
+			}
+			p := filepath.Join(root, ".spotexec.toml")
+			os.WriteFile(p, []byte(body), 0o644)
+			if _, err := config.LoadProject(p); err != nil {
+				t.Errorf("written config doesn't load: %v\n%s", err, body)
+			}
+		})
+	}
+}
+
+// What init emits must expand the way the helper expands cache_dirs: one
+// directory per *.
+func TestWorkspaceNodeModulesExpand(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"node_modules", "packages/a/node_modules", "packages/b/node_modules", "packages/c"} {
+		os.MkdirAll(filepath.Join(root, d), 0o755)
+	}
+	dirs, skipped := workspaceNodeModules([]string{"packages/*"})
+	if len(skipped) != 0 {
+		t.Fatalf("skipped %v", skipped)
+	}
+	var got []string
+	for _, p := range dirs {
+		m, _ := filepath.Glob(filepath.Join(root, filepath.FromSlash(p)))
+		for _, x := range m {
+			rel, _ := filepath.Rel(root, x)
+			got = append(got, filepath.ToSlash(rel))
+		}
+	}
+	if want := "node_modules packages/a/node_modules packages/b/node_modules"; strings.Join(got, " ") != want {
+		t.Fatalf("got %v, want %s", got, want)
+	}
+}
+
+func TestPnpmWorkspacePackages(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"packages:\n- a/*\n- 'it''s/*'\n- \"q\\\"d\"\nother: 1\n", `a/*|it's/*|q"d`, true},
+		{"packages:\r\n  - x # c\r\n", "x", true},
+		{"packages: []\n", "", true},
+		{"packages: [a, 'b' c]\n", "", false},
+		{"packages:\n  - |\n    a\n", "", false},
+		{"packages: a\n", "", false},
+		{"catalog:\n  packages: 1\n", "", true},
+	}
+	for _, c := range cases {
+		got, ok := pnpmWorkspacePackages(c.in)
+		if ok != c.ok || strings.Join(got, "|") != c.want {
+			t.Errorf("%q: got %q %v, want %q %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
