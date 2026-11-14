@@ -109,7 +109,7 @@ aws login              # or: aws sso login, aws configure
 spotexec setup
 ```
 
-Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. The fleet uses 8-vCPU VMs; on a new account whose quota can't fit one (often 5 vCPUs), setup switches it to 4-vCPU VMs and prints the command to raise the quota. Finally it offers to bake an image, so new VMs skip their bootstrap. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
+Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. The fleet uses 8-vCPU VMs, each launched on whichever of its instance types and zones has the cheapest Spot price at the time (or [any current type of that size](docs/aws.md#describe-the-vm-instead-of-naming-types), with `vcpus`); on a new account whose quota can't fit one (often 5 vCPUs), setup switches it to 4-vCPU VMs and prints the command to raise the quota. Finally it offers to bake an image, so new VMs skip their bootstrap. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
 
 **An SSH machine you already own**, such as a Linux box or a spare Mac. Key login must already work. Put it in `~/.config/spotexec/config.toml`:
 

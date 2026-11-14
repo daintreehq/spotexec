@@ -101,8 +101,13 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `region` | `AWS_REGION`, `AWS_DEFAULT_REGION`, else `us-east-1` | EC2 region. |
 | `regions` | (unset) | Launch in several regions instead: a list, or `["all"]` for every region enabled in the account. Each new VM goes wherever Spot is cheapest right now. Not with `region`, `subnet_id`, `security_group_ids`, an `ami-…` ID or a named `cache_bucket`. A list of one region is the same as `region`. See [Let spotexec pick the region](aws.md#let-spotexec-pick-the-region). |
 | `profile` | (env / default) | AWS profile to use. |
-| `instance_types` | `c7a.2xlarge`, `m7a.2xlarge`, `c6a.2xlarge` (8 vCPUs, as in the starter config) | Tried in order on capacity errors (with `regions`: cheapest first, across every region). All must share one architecture. |
-| `arch` | from the first instance type | `amd64` or `arm64` (Graviton). |
+| `instance_types` | `c7a.2xlarge`, `m7a.2xlarge`, `c6a.2xlarge` (8 vCPUs, as in the starter config), none with `vcpus` | The types VMs may use. Each VM goes to the cheapest current Spot price among them and every zone (with `regions`, every region), moving down the ranking on capacity errors; equal prices go to the type listed first. All must share one architecture. With `vcpus`, entries may be patterns (`"m*"`, `"c7a.*"`) and only narrow the matching types. See [Launch on the cheapest instance](aws.md#launch-on-the-cheapest-instance). |
+| `vcpus` | (unset) | Instead of naming types: every current instance type in the region with exactly this many vCPUs (and `min_memory_gib`, `arch`) is a candidate, and the cheapest launches. Exact, so every VM gets the same slots. See [Describe the VM instead of naming types](aws.md#describe-the-vm-instead-of-naming-types). |
+| `min_memory_gib` | `0` | With `vcpus`: the least memory a type may have. |
+| `min_generation` | `6` | With `vcpus`: the oldest instance generation used (m6a: 6). `7` keeps to the newest. |
+| `exclude_instance_types` | (none) | With `vcpus`: types or patterns never to use, such as `["m6i.*", "*n.*"]`. |
+| `launch_order` | `cheapest` | `listed` tries `instance_types` in the listed order (each in its cheapest zone first) instead of cheapest first. |
+| `arch` | from the first instance type that isn't a pattern, else `amd64` | `amd64` or `arm64` (Graviton). |
 | `max_instances` | `4` | Fleet ceiling. |
 | `min_instances` | `0` | Warm floor, kept only while the [pool manager](scaling.md#pool-manager-optional) runs. |
 | `idle_timeout` | `10m` | The VM powers off after this long with no work. |
@@ -111,7 +116,7 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `bootstrap_script` | (none) | Runs as root on first boot, after the watchdog is armed. Bounded by `boot_timeout`. |
 | `user_bootstrap_script` | (none) | Then runs as the login user, in a login shell. |
 | `max_price` | the on-demand price | Spot bid cap in USD per hour, as a string (`"0.40"`). |
-| `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available. |
+| `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available, trying the types in their Spot-price order. |
 | `volume_gb` | `64` | Root gp3 volume (at least 8). |
 | `ami` | `auto` | `auto` uses the newest matching bake, else Ubuntu 24.04. `base` ignores bakes. An `ami-…` ID pins one image. |
 | `user` | `ubuntu` | Login user of the AMI. |
@@ -223,5 +228,17 @@ max_instances = 3
 ```
 
 A project runner **must** build on one of your global runners: name it with `extends`, or reuse its name to override it. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts.
+
+A project can also size its VMs by requirements. A suite that needs more memory per job than your runner's types have, for example:
+
+```toml
+[runners.ci-mem]
+extends = "aws"
+vcpus = 8
+min_memory_gib = 32            # whichever 8-vCPU type with 32 GiB or more is cheapest now
+max_slots = 2
+```
+
+Setting `vcpus` (or another requirement key) without `instance_types` drops the inherited `instance_types`, and setting `instance_types` alone drops inherited requirements: the project's way of choosing types replaces yours. Set both to narrow the requirements with patterns.
 
 How you connect and which account and network are used stay in your global config. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `regions`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, or open a port. See [Security model](architecture.md#security-model).

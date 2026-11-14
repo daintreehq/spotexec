@@ -170,6 +170,41 @@ Moving a runner to another region therefore starts with a cold cache, and you'll
 
 The EC2 console is regional too. If you don't see your instances, switch the console's region selector; `spotexec doctor` prints the region and tag to look for.
 
+### Launch on the cheapest instance
+
+Each time the fleet needs a new VM, spotexec compares the current Linux Spot price of every instance type the runner may use in every availability zone of its region, and launches the cheapest. If AWS refuses it for capacity, it moves on to the next-cheapest option, and that zone and type are skipped for a minute (longer if it keeps failing). A pinned `subnet_id` fixes the zone, so only that zone's prices count; otherwise each launch goes to the default VPC's subnet in the chosen zone. `max_price` still caps the bid, and options above it are skipped. Prices are cached for 15 minutes; `spotexec prices <runner>` shows the ranking and marks where the next VM will go, and `spotexec doctor` names it.
+
+Equal prices go to the type listed first in `instance_types`. To keep the listed order as a preference instead (say, a faster type first and a cheaper one only as a fallback), set `launch_order = "listed"`: each type is then tried in its cheapest zone first, before the next type. If prices can't be read (an older IAM policy without `ec2:Describe*`), a single-region runner with a fixed `instance_types` list tries them in the listed order as it used to (with `regions`, or `vcpus`, the launch fails instead); re-run `spotexec setup` to update the policy.
+
+With `on_demand_fallback`, on-demand is the last resort, after every Spot option. spotexec doesn't look up on-demand prices (that needs the AWS Pricing API, another permission and endpoint), so it tries the types in their Spot-price order, a fair stand-in: within one size, on-demand and Spot prices tend to rank the same way.
+
+#### Describe the VM instead of naming types
+
+Rather than picking instance types by hand, give the size and let spotexec consider every current instance type in the region that fits:
+
+```toml
+[runners.aws]
+type = "aws-spot"
+region = "us-east-1"
+vcpus = 8              # exactly 8 vCPUs per VM
+min_memory_gib = 32    # at least 32 GiB
+max_slots = 4
+```
+
+spotexec lists the region's instance types once a day (EC2 `DescribeInstanceTypes`, cached in the runner's state directory) and keeps those that:
+- have exactly `vcpus` vCPUs, the runner's `arch` (default `amd64`) and at least `min_memory_gib`;
+- are current generation, and at least generation `min_generation` (default 6: m5, c5 and r5 are still "current" to AWS, but markedly slower per vCPU, and often the cheapest);
+- can run as Spot, aren't burstable (`t*`), bare metal or Flex (`m7i-flex` and the like don't sustain full CPU), and have no GPU or other accelerator;
+- count against the standard Spot vCPU quota (A, C, D, H, I, M, R, T, Z families), so the whole fleet fits one quota.
+
+Every type left is ranked by its current Spot price, as above. Types with local NVMe storage (`m6id`, `c7gd`) stay in: spotexec doesn't use the disk, but they're more capacity to draw on and are only chosen when they're the cheapest.
+
+To narrow the choice, list patterns in `instance_types` (only types matching one are used, so `["m*", "r*"]` leaves out compute-optimized types), or leave some out with `exclude_instance_types = ["m6i.*", "*n.*"]`. `*` matches any run of characters. Set `min_generation = 7` for the newest generations only (on AMD, that is also one physical core per vCPU).
+
+Why an exact vCPU count, not a range: slots and `$SPOTEXEC_CPUS` come from the vCPUs, so with one count every VM in the fleet gets the same slots and the same CPU share per job, whatever type it lands on. Memory varies (each VM has at least `min_memory_gib`), and only ever upwards. Ranked by price per VM, a range would almost always pick its smallest size anyway. For two sizes, define two runners.
+
+All the types share the runner's `arch`, because the Ubuntu image, a baked AMI and project containers are built for one architecture. For Graviton, set `arch = "arm64"`.
+
 ### Let spotexec pick the region
 
 Instead of `region`, a runner can list several regions, or allow them all:
@@ -183,7 +218,7 @@ instance_types = ["c7a.2xlarge", "c6a.2xlarge", "m7a.2xlarge"]
 max_instances = 4          # across all regions together
 ```
 
-Each time the fleet needs a new VM, spotexec compares the current Linux Spot price of every listed instance type in every availability zone of those regions and launches the cheapest. If AWS refuses it, spotexec moves on to the next-cheapest option:
+Each time the fleet needs a new VM, spotexec compares the current Linux Spot price of every instance type the runner may use (listed, or [described by size](#describe-the-vm-instead-of-naming-types)) in every availability zone of those regions and launches the cheapest. If AWS refuses it, spotexec moves on to the next-cheapest option:
 - **No capacity** for that type in that zone: skipped for a minute, then longer if it keeps failing.
 - **Quota exhausted**: that instance size and larger are skipped in that region; smaller types, and types under another quota, can still launch there. When quota is all that stopped every option, spotexec says so and holds new launches for a few minutes, or until one of the fleet's VMs ends, instead of retrying.
 - **Region not usable** (no default VPC, launches blocked by permissions): the whole region is skipped for 10 minutes.
@@ -197,7 +232,7 @@ What changes with several regions:
 - **Quota.** Each region has its own Spot vCPU quota, and a region the account has never used is often at 5 vCPUs. A launch there fails over to the next region. `spotexec doctor` checks the cheapest few regions.
 - **Network and images.** spotexec uses each region's default VPC and its own security group there, and the region's Ubuntu image, or a bake if you made one there (`spotexec image bake <runner> --region <r>`). That is why `subnet_id`, `security_group_ids` and `ami-…` IDs aren't allowed with `regions`. (A list of one region is just `region`, and those settings work as usual.) A region without a default VPC is skipped; `spotexec setup` creates one for each listed region (not for `"all"`).
 - **Caches.** The S3 dependency cache (`cache_bucket = "auto"`: a bucket per region) and ECR images are per region, so the first run in a new region starts cold. A named `cache_bucket` lives in one region, so it isn't allowed with `regions`.
-- **Permissions.** Comparing prices needs `ec2:DescribeRegions` and `ec2:DescribeSpotPriceHistory`, which the policy's `ec2:Describe*` covers. If your IAM user's policy predates that, re-run `spotexec setup` to update it.
+- **Permissions.** Comparing prices needs `ec2:DescribeRegions` and `ec2:DescribeSpotPriceHistory`, and `vcpus` needs `ec2:DescribeInstanceTypes`, all covered by the policy's `ec2:Describe*`. If your IAM user's policy predates that, re-run `spotexec setup` to update it.
 
 `spotexec status` shows each VM's region. `spotexec down` terminates VMs in every region the runner uses, including regions since removed from the config. Going back to a single `region` is safe too: until the VMs in the other regions are gone, spotexec still lists and terminates them, while new VMs launch only in that region. spotexec records where it launched in `placement.json` in the runner's state directory. If that file is lost, the next listing checks every region the runner is configured for once; VMs in a region no longer in the config are then left to their own idle shutdown and `max_lifetime`.
 
@@ -339,7 +374,7 @@ The fleet shuts itself down without your laptop. One case is not covered: a VM w
 
 ## The life of a Spot VM
 
-1. **Launch.** A one-time Spot request is made at a price capped by `max_price` (default: the on-demand price), with IMDSv2 required and a public IPv4 address. Capacity errors move on to the next instance type; with `on_demand_fallback`, the last resort is on-demand.
+1. **Launch.** A one-time Spot request is made for the cheapest current Spot price among the runner's instance types and zones (see [Launch on the cheapest instance](#launch-on-the-cheapest-instance)), at a price capped by `max_price` (default: the on-demand price), with IMDSv2 required and a public IPv4 address. Capacity errors move on to the next-cheapest option; with `on_demand_fallback`, the last resort is on-demand.
 2. **Arm.** The user-data script's first action installs the idle watchdog (a systemd timer) plus an independent `max_lifetime` backstop. Only then does it authorize the SSH key, map `localhost` to `::1` as well as `127.0.0.1`, and run your bootstrap scripts. `spotexec cloud-init <runner>` prints the exact script.
 3. **Bootstrap.** Your scripts run under the lifecycle lock, so a long setup can't be mistaken for idleness. If one fails, the VM is marked failed: it refuses work and returns `BOOTSTRAP_FAILED` with the tail of `/var/log/spotexec-bootstrap.log`. The fleet then stops launching for an hour instead of burning money on a broken script.
 4. **Serve.** Jobs acquire slots, and every session refreshes the activity clock.

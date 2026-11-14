@@ -502,7 +502,7 @@ func TestLaunchFallsBackWhenBakeIsGone(t *testing.T) {
 	f.images = []*fakeImage{ubuntuImg("ami-b2", now.Add(-48*time.Hour)), bakeImg("ami-bake", "owner-other", a.BakeHash(), "ami-b2", now.Add(-time.Hour))}
 	// Another machine's `image clear` deregisters it after it was picked.
 	f.gone = map[string]bool{"ami-bake": true}
-	inst, err := a.launch(context.Background(), t.Logf)
+	inst, err := a.launchOrUnbaked(context.Background(), t.Logf, launchSpec{})
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
@@ -524,7 +524,7 @@ func TestLaunchPinnedAMINoFallback(t *testing.T) {
 	a.r.AMI = "ami-pinned"
 	f.images = []*fakeImage{ubuntuImg("ami-pinned", time.Now())}
 	f.gone = map[string]bool{"ami-pinned": true}
-	if _, err := a.launch(context.Background(), t.Logf); err == nil || len(f.runs) != 1 {
+	if _, err := a.launchOrUnbaked(context.Background(), t.Logf, launchSpec{}); err == nil || len(f.runs) != 1 {
 		t.Fatalf("a pinned AMI that is gone must fail, not fall back: %v (%d requests)", err, len(f.runs))
 	}
 }

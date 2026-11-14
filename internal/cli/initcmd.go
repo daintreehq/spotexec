@@ -37,7 +37,10 @@ local_fallback = false
 type = "aws-spot"
 region = "{{REGION}}"
 # profile = "default"          # AWS CLI profile (SSO and aws login work)
-instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]  # 8 vCPUs; tried in order on capacity errors
+instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]  # 8 vCPUs; each VM gets the cheapest with Spot capacity
+# Or let spotexec pick from every current type of this size (instead of instance_types):
+# vcpus = 8                    # exact, so every VM gets the same slots
+# min_memory_gib = 16
 max_slots = 4                  # concurrent jobs per VM (SPOTEXEC_CPUS = 2 each)
 max_instances = 4              # fleet ceiling
 priority = 20

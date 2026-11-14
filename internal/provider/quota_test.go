@@ -38,7 +38,7 @@ func tries(codes map[string]string, calls *[]string) func(string, bool) (ec2Inst
 func TestLaunchAcrossQuotaRefusal(t *testing.T) {
 	a := quotaRunner("c7a.2xlarge", "m7a.2xlarge", "c7a.xlarge")
 	var calls []string
-	_, err := a.launchAcross([]bool{true}, func(string, ...any) {}, tries(map[string]string{
+	_, err := a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, tries(map[string]string{
 		"c7a.2xlarge": "MaxSpotInstanceCountExceeded",
 		"m7a.2xlarge": "InsufficientInstanceCapacity",
 		"c7a.xlarge":  "MaxSpotInstanceCountExceeded",
@@ -67,7 +67,7 @@ func TestLaunchAcrossSmallerTypeShortOfCapacityIsNotQuota(t *testing.T) {
 	// capacity: it may launch later, so this is not a quota refusal.
 	a := quotaRunner("c7a.4xlarge", "c7a.xlarge")
 	var calls []string
-	_, err := a.launchAcross([]bool{true}, func(string, ...any) {}, tries(map[string]string{
+	_, err := a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, tries(map[string]string{
 		"c7a.4xlarge": "MaxSpotInstanceCountExceeded",
 		"c7a.xlarge":  "InsufficientInstanceCapacity",
 	}, &calls))
@@ -78,7 +78,7 @@ func TestLaunchAcrossSmallerTypeShortOfCapacityIsNotQuota(t *testing.T) {
 	// A type that can never launch here doesn't count against the quota
 	// verdict.
 	a = quotaRunner("c7a.2xlarge", "x9z.large")
-	_, err = a.launchAcross([]bool{true}, func(string, ...any) {}, tries(map[string]string{
+	_, err = a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, tries(map[string]string{
 		"c7a.2xlarge": "MaxSpotInstanceCountExceeded",
 		"x9z.large":   "Unsupported",
 	}, &calls))
@@ -90,7 +90,7 @@ func TestLaunchAcrossSmallerTypeShortOfCapacityIsNotQuota(t *testing.T) {
 func TestLaunchAcrossCapacityIsNotQuota(t *testing.T) {
 	a := quotaRunner("c7a.2xlarge", "m7a.2xlarge")
 	var calls []string
-	_, err := a.launchAcross([]bool{true}, func(string, ...any) {}, tries(map[string]string{
+	_, err := a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, tries(map[string]string{
 		"c7a.2xlarge": "InsufficientInstanceCapacity",
 		"m7a.2xlarge": "InsufficientInstanceCapacity",
 	}, &calls))
@@ -104,7 +104,7 @@ func TestLaunchAcrossOnDemandFallbackAfterQuota(t *testing.T) {
 	a := quotaRunner("c7a.2xlarge")
 	a.r.OnDemandFallback = true
 	var calls []string
-	inst, err := a.launchAcross([]bool{true, false}, func(string, ...any) {}, tries(map[string]string{
+	inst, err := a.launchAcross([]bool{true, false}, a.r.InstanceTypes, func(string, ...any) {}, tries(map[string]string{
 		"c7a.2xlarge": "MaxSpotInstanceCountExceeded",
 	}, &calls))
 	if err != nil || inst.InstanceID == "" {
@@ -112,7 +112,7 @@ func TestLaunchAcrossOnDemandFallbackAfterQuota(t *testing.T) {
 	}
 	// On-demand short of capacity: no longer purely a quota problem.
 	calls = nil
-	_, err = a.launchAcross([]bool{true, false}, func(string, ...any) {}, tries(map[string]string{
+	_, err = a.launchAcross([]bool{true, false}, a.r.InstanceTypes, func(string, ...any) {}, tries(map[string]string{
 		"c7a.2xlarge":    "MaxSpotInstanceCountExceeded",
 		"c7a.2xlarge/od": "InsufficientInstanceCapacity",
 	}, &calls))
@@ -121,7 +121,7 @@ func TestLaunchAcrossOnDemandFallbackAfterQuota(t *testing.T) {
 		t.Fatalf("mixed refusal reported as %v", err)
 	}
 	// Both quotas full: the Spot one is reported.
-	_, err = a.launchAcross([]bool{true, false}, func(string, ...any) {}, tries(map[string]string{
+	_, err = a.launchAcross([]bool{true, false}, a.r.InstanceTypes, func(string, ...any) {}, tries(map[string]string{
 		"c7a.2xlarge":    "MaxSpotInstanceCountExceeded",
 		"c7a.2xlarge/od": "VcpuLimitExceeded",
 	}, &calls))
@@ -204,7 +204,7 @@ func TestLaunchAcrossCapacityUnderAnotherQuota(t *testing.T) {
 	// may launch later, whatever the standard quota says.
 	a := quotaRunner("c7a.xlarge", "g5.xlarge")
 	var calls []string
-	_, err := a.launchAcross([]bool{true}, func(string, ...any) {}, tries(map[string]string{
+	_, err := a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, tries(map[string]string{
 		"c7a.xlarge": "MaxSpotInstanceCountExceeded",
 		"g5.xlarge":  "InsufficientInstanceCapacity",
 	}, &calls))
@@ -214,7 +214,7 @@ func TestLaunchAcrossCapacityUnderAnotherQuota(t *testing.T) {
 	}
 	// Graviton mediums have one vCPU, smaller than a large.
 	a = quotaRunner("c6g.large", "c6g.medium")
-	_, err = a.launchAcross([]bool{true}, func(string, ...any) {}, tries(map[string]string{
+	_, err = a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, tries(map[string]string{
 		"c6g.large":  "MaxSpotInstanceCountExceeded",
 		"c6g.medium": "InsufficientInstanceCapacity",
 	}, &calls))
@@ -336,26 +336,26 @@ func TestLaunchAdmitsEachCandidate(t *testing.T) {
 	u := QuotaUsage{Region: "us-east-2", Quota: 32, Used: 24, Mine: 16, Machines: map[string]int{"studio-01": 8}}
 	a := quotaRunner("c7a.2xlarge", "c7a.large")
 	var calls []string
-	inst, err := a.launchAcross([]bool{true}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	inst, err := a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
 	if err != nil || inst.InstanceID != "i-c7a.large" || strings.Join(calls, ",") != "c7a.large" {
 		t.Fatalf("launched %q (calls %v, %v); want only the 2-vCPU type", inst.InstanceID, calls, err)
 	}
 	u = QuotaUsage{Region: "us-east-2", Quota: 16, Used: 16, Mine: 16}
 	a = quotaRunner("c7a.xlarge", "g5.xlarge")
 	calls = nil
-	inst, err = a.launchAcross([]bool{true}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	inst, err = a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
 	if err != nil || inst.InstanceID != "i-g5.xlarge" {
 		t.Fatalf("G type under its own quota not tried: %v %v", calls, err)
 	}
 	a = quotaRunner("c7a.xlarge")
 	a.r.OnDemandFallback = true
 	calls = nil
-	inst, err = a.launchAcross([]bool{true, false}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	inst, err = a.launchAcross([]bool{true, false}, a.r.InstanceTypes, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
 	if err != nil || strings.Join(calls, ",") != "c7a.xlarge/od" {
 		t.Fatalf("on-demand fallback: %v %v", calls, err)
 	}
 	a.r.OnDemandFallback = false
-	_, err = a.launchAcross([]bool{true}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	_, err = a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
 	var qe *QuotaError
 	if !errors.As(err, &qe) || qe.Usage == nil || !strings.Contains(err.Error(), "16 of 16 vCPUs in use: 16 by this machine") {
 		t.Fatalf("want the checked quota error with its usage, got %v", err)
@@ -377,7 +377,7 @@ func TestCheckedQuotaKeepsItsDesiredValue(t *testing.T) {
 	u := QuotaUsage{Region: "us-east-2", Quota: 64, Used: 64, Mine: 8, Machines: map[string]int{"studio-01": 56}}
 	a := quotaRunner("c7a.2xlarge")
 	var calls []string
-	_, err := a.launchAcross([]bool{true}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	_, err := a.launchAcross([]bool{true}, a.r.InstanceTypes, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
 	var qe *QuotaError
 	if !errors.As(err, &qe) || qe.Desired != 88 || !strings.Contains(err.Error(), "--desired-value 88") {
 		t.Fatalf("want desired 88 (56 others + 32 fleet), got %v", err)
