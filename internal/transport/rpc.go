@@ -22,6 +22,7 @@ type Session struct {
 	Hello   protocol.HelloOK
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
+	stdout  io.Closer
 	stderr  *lockedBuf
 	frames  chan protocol.Frame
 	errMu   sync.Mutex
@@ -31,6 +32,8 @@ type Session struct {
 	stopped sync.Once
 	once    sync.Once
 	seen    atomic.Int64
+	silent  atomic.Bool   // the watchdog gave up on the helper
+	limit   time.Duration // SilenceLimit when the session opened
 	// OnEvent receives helper events that arrive while waiting for replies.
 	OnEvent func(protocol.Event)
 }
@@ -128,8 +131,11 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cmd: cmd, stdin: stdin, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{})}
+	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{})}
 	cmd.Stderr = s.stderr
+	// A master holding a stuck channel keeps the stderr pipe open after the
+	// client is gone: don't let that hold up Wait (and so Dead) for long.
+	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
@@ -137,6 +143,8 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	s.seen.Store(time.Now().UnixNano())
 	go s.readLoop()
 	go s.heartbeat()
+	s.limit = SilenceLimit
+	go s.watchdog()
 	if err := s.Conn.Send(protocol.TypeHello, protocol.Hello{Proto: protocol.Version, Version: helper.Version, WorkRoot: c.WorkRoot}); err != nil {
 		s.Close()
 		return nil, s.wrap(err)
@@ -244,6 +252,38 @@ func (e *helperStartError) Error() string {
 	return fmt.Sprintf("helper did not start (exit %d): %s", e.code, e.stderr)
 }
 
+// SilenceLimit is how long a session may hear nothing from the helper. The
+// helper sends a heartbeat every 20s whatever it is doing (queueing for a
+// slot, syncing, installing, running), so silence well beyond that means it
+// or the link is wedged, even if SSH keepalives still pass.
+var SilenceLimit = 75 * time.Second
+
+// errSilent is the session error once the watchdog has given up on it.
+var errSilent = errors.New("runner stopped responding")
+
+// watchdog ends a session whose helper has gone silent, in any phase: the
+// pending read (or write) then fails as a lost connection instead of
+// waiting forever.
+func (s *Session) watchdog() {
+	t := time.NewTicker(min(5*time.Second, s.limit/4))
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-s.closing:
+			return
+		case <-t.C:
+			if time.Since(s.LastSeen()) > s.limit {
+				s.setErr(fmt.Errorf("%w (nothing for %s)", errSilent, s.limit))
+				s.silent.Store(true)
+				s.Abort()
+				return
+			}
+		}
+	}
+}
+
 func (s *Session) heartbeat() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
@@ -288,7 +328,11 @@ func (s *Session) Next(ctx context.Context) (protocol.Frame, error) {
 			if errors.Is(err, io.EOF) || err == nil {
 				err = io.ErrUnexpectedEOF
 			}
-			return protocol.Frame{}, &ConnError{Target: "helper", Msg: "connection to runner lost", Err: s.wrap(err)}
+			msg := "connection to runner lost"
+			if errors.Is(err, errSilent) {
+				msg = err.Error()
+			}
+			return protocol.Frame{}, &ConnError{Target: "helper", Msg: msg, Err: s.wrap(err)}
 		}
 		return f, nil
 	case <-ctx.Done():
@@ -366,8 +410,12 @@ func (s *Session) Blob(ctx context.Context) *protocol.BlobReader {
 	}}
 }
 
-// Dead reports whether the SSH channel has closed.
+// Dead reports whether the SSH channel has closed (or the helper went
+// silent and the session was ended).
 func (s *Session) Dead() bool {
+	if s.silent.Load() {
+		return true
+	}
 	select {
 	case <-s.done:
 		return true
@@ -410,10 +458,16 @@ func (s *Session) Abort() {
 	s.kill()
 }
 
+// kill ends the ssh client and closes our ends of its pipes. A session on a
+// ControlMaster handed its descriptors to the master, which keeps them open
+// while the channel is stuck: closing ours is what ends a pending read or
+// write here.
 func (s *Session) kill() {
 	if s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
+	_ = s.stdin.Close()
+	_ = s.stdout.Close()
 }
 
 // Stderr returns captured remote stderr (helper diagnostics).

@@ -520,6 +520,10 @@ func describeHolders(h []protocol.Holder) string {
 	return strings.Join(parts, ", ")
 }
 
+// queueGrace is how long past the queue deadline tryAcquire waits for the
+// helper's own verdict.
+var queueGrace = time.Minute
+
 func tryAcquire(ctx context.Context, req AcquireRequest, r *config.Runner, p provider.Provider, t provider.Target, wait bool) (*Lease, []protocol.Holder, error) {
 	start := time.Now()
 	c, s, err := Connect(ctx, r, t)
@@ -538,8 +542,21 @@ func tryAcquire(ctx context.Context, req AcquireRequest, r *config.Runner, p pro
 		s.Close()
 		return nil, nil, err
 	}
+	// The helper enforces the queue deadline; this backstop (with room for
+	// its reply) covers a helper that heartbeats but never answers.
+	qctx := ctx
+	if wait && req.QueueTimeout > 0 {
+		var cancel context.CancelFunc
+		qctx, cancel = context.WithTimeout(ctx, req.QueueTimeout+queueGrace)
+		defer cancel()
+	}
 	for {
-		env, err := s.Expect(ctx, protocol.TypeAcquired, protocol.TypeBusy, protocol.TypeWaiting)
+		env, err := s.Expect(qctx, protocol.TypeAcquired, protocol.TypeBusy, protocol.TypeWaiting)
+		if err != nil && qctx.Err() != nil && ctx.Err() == nil {
+			s.Abort()
+			return nil, nil, &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeQueueTimeout,
+				Message: fmt.Sprintf("no slot on %s within %s (the runner never answered)", r.Name, req.QueueTimeout.Round(time.Second))}}
+		}
 		if err != nil {
 			s.Close()
 			return nil, nil, err

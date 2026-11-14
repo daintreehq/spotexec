@@ -31,6 +31,9 @@ const ControlPersist = "15m"
 // to the local master process, so this is generous.
 const muxTimeout = 5 * time.Second
 
+// dialTimeout bounds starting a control master.
+const dialTimeout = time.Minute
+
 // Client runs commands on one target.
 type Client struct {
 	T        provider.Target
@@ -250,7 +253,11 @@ func (c *Client) ensureMaster(ctx context.Context) (int, bool, error) {
 	defer os.Remove(errf.Name())
 	defer errf.Close()
 	args := append(c.baseArgs("auto"), "-f", "-N", "--", c.T.Host)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
+	// ConnectTimeout covers connecting; this also bounds a server that
+	// accepts but never finishes the handshake.
+	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(dctx, "ssh", args...)
 	cmd.Stdout = nil
 	cmd.Stderr = errf
 	if err := cmd.Run(); err != nil {
@@ -394,8 +401,24 @@ func markerPath(c *Client, hash string) string {
 }
 
 // probeTimeout bounds the first remote command of a helper install, which
-// may dial a new connection (ConnectTimeout=10 by default).
-var probeTimeout = 20 * time.Second
+// may dial a new connection (ConnectTimeout=10 by default), and the check
+// after it; uploadTimeout bounds the upload (a few MB).
+var (
+	probeTimeout  = 20 * time.Second
+	uploadTimeout = 5 * time.Minute
+)
+
+// runWithin is Run bounded by d: running out of time (while ctx itself is
+// still live) is a connection failure, since nothing got through.
+func (c *Client) runWithin(ctx context.Context, d time.Duration, remoteCmd string, stdin io.Reader) ([]byte, error) {
+	rctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	out, err := c.Run(rctx, remoteCmd, stdin)
+	if err != nil && errors.Is(rctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		return out, &ConnError{Target: c.T.String(), Msg: "no answer from the runner", Err: context.DeadlineExceeded}
+	}
+	return out, err
+}
 
 // EnsureHelper makes sure the right helper is installed and returns the
 // remote command prefix that invokes it.
@@ -424,14 +447,8 @@ func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Durati
 	}
 	// The first command through the master doubles as a liveness probe: a
 	// dead connection must fail (and be replaced by Open) rather than hang.
-	pctx, cancel := context.WithTimeout(ctx, probe)
-	out, err := c.Run(pctx, "uname -sm", nil)
-	timedOut := errors.Is(pctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
-	cancel()
+	out, err := c.runWithin(ctx, probe, "uname -sm", nil)
 	if err != nil {
-		if timedOut {
-			return "", &ConnError{Target: c.T.String(), Msg: "no answer from the runner", Err: context.DeadlineExceeded}
-		}
 		return "", err
 	}
 	plat, err := parseUname(string(out))
@@ -445,7 +462,7 @@ func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Durati
 	path := c.helperPath(hash)
 	check := []byte("")
 	if !force { // a forced reinstall re-uploads even over a present (but broken) binary
-		check, err = c.Run(ctx, "test -x "+path+" && echo present || true", nil)
+		check, err = c.runWithin(ctx, probe, "test -x "+path+" && echo present || true", nil)
 	}
 	if err != nil {
 		return "", err
@@ -453,7 +470,7 @@ func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Durati
 	if strings.TrimSpace(string(check)) != "present" {
 		dir := RemoteRoot(c.WorkRoot) + "/bin"
 		script := fmt.Sprintf(`set -e; mkdir -p %[1]s; t=%[1]s/.upload.$$; gzip -dc > "$t"; chmod 755 "$t"; mv -f "$t" %[2]s; find %[1]s -maxdepth 1 -name 'spotexec-helper-*' ! -name %[3]s -mmin +1440 -exec rm -f {} + 2>/dev/null || true`, dir, path, ShellQuote(filepath.Base(path)))
-		if _, err := c.Run(ctx, script, bytes.NewReader(gz)); err != nil {
+		if _, err := c.runWithin(ctx, uploadTimeout, script, bytes.NewReader(gz)); err != nil {
 			return "", fmt.Errorf("uploading helper: %w", err)
 		}
 	}
