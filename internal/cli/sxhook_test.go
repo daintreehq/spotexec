@@ -18,6 +18,13 @@ func TestSxHookClaudeIsTheHookHandler(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("SPOTEXEC_CONFIG_DIR", filepath.Join(home, "spotexec"))
 	t.Setenv("SPOTEXEC_CONFIG", filepath.Join(home, "spotexec", "config.toml"))
+	os.MkdirAll(filepath.Join(home, "spotexec"), 0o755)
+	if err := os.WriteFile(filepath.Join(home, "spotexec", "config.toml"), []byte("version = 1\n[runners.box]\ntype = \"ssh\"\nhost = \"me@box\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTEXEC_STATE_DIR", filepath.Join(home, "state"))
+	t.Setenv("SPOTEXEC_POOL", "")
+	t.Setenv("SPOTEXEC_RUNNER", "")
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, ".spotexec.toml"), []byte("version = 1\n"), 0o644); err != nil {
 		t.Fatal(err)

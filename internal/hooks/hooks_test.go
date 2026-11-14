@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -133,36 +135,124 @@ echo "status=$? pwd=${PWD##*/}"; ls -R`
 	}
 }
 
-func TestHandleClaudeRewrites(t *testing.T) {
+// isolate points spotexec's config and state at a temp dir, optionally with
+// one SSH runner configured.
+func isolate(t *testing.T, runner bool) {
+	t.Helper()
+	d := t.TempDir()
+	t.Setenv("SPOTEXEC_CONFIG", filepath.Join(d, "config.toml"))
+	t.Setenv("SPOTEXEC_STATE_DIR", filepath.Join(d, "state"))
+	t.Setenv("SPOTEXEC_POOL", "")
+	t.Setenv("SPOTEXEC_RUNNER", "")
+	t.Setenv("BASH_MAX_TIMEOUT_MS", "")
+	if runner {
+		if err := os.WriteFile(filepath.Join(d, "config.toml"), []byte("version = 1\n[runners.box]\ntype = \"ssh\"\nhost = \"me@box\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+type hookOut struct {
+	System string `json:"systemMessage"`
+	H      struct {
+		Event   string         `json:"hookEventName"`
+		Updated map[string]any `json:"updatedInput"`
+		Context string         `json:"additionalContext"`
+		Reason  string         `json:"permissionDecisionReason"`
+	} `json:"hookSpecificOutput"`
+}
+
+func runHook(t *testing.T, ev map[string]any) (hookOut, string) {
+	t.Helper()
+	in, _ := json.Marshal(ev)
+	var out bytes.Buffer
+	HandleClaude(bytes.NewReader(in), &out, "spotexec")
+	var res hookOut
+	if out.Len() > 0 {
+		if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+			t.Fatalf("bad output %q: %v", out.String(), err)
+		}
+	}
+	return res, out.String()
+}
+
+func projectDir(t *testing.T, toml string) string {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, ".spotexec.toml"), []byte("version = 1\n"), 0o644)
-	in, _ := json.Marshal(map[string]any{
+	os.WriteFile(filepath.Join(dir, ".spotexec.toml"), []byte("version = 1\n"+toml), 0o644)
+	return dir
+}
+
+func TestHandleClaudeRewrites(t *testing.T) {
+	isolate(t, true)
+	dir := projectDir(t, "")
+	res, raw := runHook(t, map[string]any{
 		"tool_name": "Bash", "cwd": dir,
 		"tool_input": map[string]any{"command": "pnpm test", "description": "run tests", "timeout": 120000},
 	})
-	var out bytes.Buffer
-	HandleClaude(bytes.NewReader(in), &out, "spotexec")
-	var res struct {
-		H struct {
-			Event   string         `json:"hookEventName"`
-			Updated map[string]any `json:"updatedInput"`
-		} `json:"hookSpecificOutput"`
+	if res.H.Event != "PreToolUse" || res.H.Updated["command"] != "spotexec run -- 'pnpm test'" || res.H.Updated["description"] != "run tests" {
+		t.Fatalf("unexpected rewrite: %s", raw)
 	}
-	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
-		t.Fatalf("bad output %q: %v", out.String(), err)
+	// The agent's own timeout stands.
+	if res.H.Updated["timeout"] != float64(120000) {
+		t.Fatalf("agent's timeout overridden: %s", raw)
 	}
-	if res.H.Updated["command"] != "spotexec run -- 'pnpm test'" || res.H.Updated["description"] != "run tests" {
-		t.Fatalf("unexpected rewrite: %+v", res.H.Updated)
+}
+
+// Without a timeout, a cold start (boot, bootstrap, dependencies) would hit
+// Claude Code's 2-minute default and kill the run.
+func TestHandleClaudeSetsTimeout(t *testing.T) {
+	isolate(t, true)
+	dir := projectDir(t, "")
+	ev := map[string]any{"tool_name": "Bash", "cwd": dir, "tool_input": map[string]any{"command": "pnpm test 2>&1 | tail -50"}}
+	res, raw := runHook(t, ev)
+	if res.H.Updated["timeout"] != float64(BashTimeoutMS) || res.H.Updated["command"] != "spotexec run -- 'pnpm test 2>&1' | tail -50" {
+		t.Fatalf("got %s", raw)
+	}
+	// A raised ceiling is used in full.
+	t.Setenv("BASH_MAX_TIMEOUT_MS", "1800000")
+	if res, raw = runHook(t, ev); res.H.Updated["timeout"] != float64(1800000) {
+		t.Fatalf("got %s", raw)
+	}
+	// Block mode tells the agent to set it.
+	dir = projectDir(t, "[hook]\nmode = \"block\"\n")
+	ev["cwd"] = dir
+	if res, raw = runHook(t, ev); !strings.Contains(res.H.Reason, "timeout of 1800000 ms") || res.H.Updated != nil {
+		t.Fatalf("got %s", raw)
+	}
+}
+
+// A hook installed before `spotexec setup` keeps commands local, and says so
+// once a session to both the user (systemMessage) and the agent
+// (additionalContext), without failing or changing the tool call.
+func TestHandleClaudeNoRunnersStaysLocalAndSaysSoOnce(t *testing.T) {
+	isolate(t, false)
+	dir := projectDir(t, "")
+	ev := map[string]any{"session_id": "s1", "tool_name": "Bash", "cwd": dir, "tool_input": map[string]any{"command": "pnpm test"}}
+	res, raw := runHook(t, ev)
+	if res.H.Updated != nil || res.H.Event != "PreToolUse" ||
+		!strings.Contains(res.System, "running on this machine") || !strings.Contains(res.System, "spotexec setup") ||
+		!strings.Contains(res.H.Context, "no usable runners") || strings.Contains(raw, "permissionDecision") {
+		t.Fatalf("got %s", raw)
+	}
+	if _, raw = runHook(t, ev); raw != "" {
+		t.Fatalf("notice repeated in the same session: %s", raw)
+	}
+	ev["session_id"] = "s2"
+	if res, _ = runHook(t, ev); res.System == "" {
+		t.Fatal("a new session should hear it once too")
+	}
+	// Non-heavy commands never trigger it.
+	ev["session_id"], ev["tool_input"] = "s3", map[string]any{"command": "git status"}
+	if _, raw = runHook(t, ev); raw != "" {
+		t.Fatalf("got %s", raw)
 	}
 }
 
 func TestHandleClaudeNoProjectNoOp(t *testing.T) {
+	isolate(t, false)
 	dir := t.TempDir()
-	in, _ := json.Marshal(map[string]any{"tool_name": "Bash", "cwd": dir, "tool_input": map[string]any{"command": "pnpm test"}})
-	var out bytes.Buffer
-	HandleClaude(bytes.NewReader(in), &out, "spotexec")
-	if out.Len() != 0 {
-		t.Fatalf("expected no output outside opted-in projects, got %q", out.String())
+	if _, raw := runHook(t, map[string]any{"tool_name": "Bash", "cwd": dir, "tool_input": map[string]any{"command": "pnpm test"}}); raw != "" {
+		t.Fatalf("expected no output outside opted-in projects, got %q", raw)
 	}
 }
 
@@ -316,5 +406,75 @@ func TestInstallRewritesEachLegacyEntry(t *testing.T) {
 	if len(pre) != 3 || pre[1].Matcher != "Bash" || len(pre[1].Hooks) != 1 || pre[1].Hooks[0].Command != "spotexec hook claude" ||
 		pre[2].Hooks[0].Command != "audit && sx hook claude" {
 		t.Fatalf("got:\n%s", b)
+	}
+}
+
+// The runner check follows spotexec run's own resolution: SPOTEXEC_RUNNER
+// wins over the pool, and the config is the one spotexec will load after the
+// line's leading cds.
+func TestUsableRunnersMatchesRun(t *testing.T) {
+	isolate(t, true)
+	dir := projectDir(t, "")
+	ev := map[string]any{"session_id": "r", "tool_name": "Bash", "cwd": dir, "tool_input": map[string]any{"command": "pnpm test"}}
+	t.Setenv("SPOTEXEC_POOL", "missing")
+	t.Setenv("SPOTEXEC_RUNNER", "box")
+	if res, raw := runHook(t, ev); res.H.Updated == nil {
+		t.Fatalf("SPOTEXEC_RUNNER=box should offload: %s", raw)
+	}
+	t.Setenv("SPOTEXEC_POOL", "")
+	t.Setenv("SPOTEXEC_RUNNER", "missing")
+	if res, raw := runHook(t, ev); res.H.Updated != nil || res.System == "" {
+		t.Fatalf("unknown SPOTEXEC_RUNNER should stay local: %s", raw)
+	}
+	t.Setenv("SPOTEXEC_RUNNER", "")
+
+	// The repository root's config names a runner this machine lacks; api's
+	// own config doesn't, and `cd api && …` runs spotexec from api.
+	root := projectDir(t, "pool = [\"gone\"]\n")
+	os.MkdirAll(filepath.Join(root, "api"), 0o755)
+	os.WriteFile(filepath.Join(root, "api", ".spotexec.toml"), []byte("version = 1\n"), 0o644)
+	ev["cwd"], ev["session_id"] = root, "n1"
+	ev["tool_input"] = map[string]any{"command": "cd api && pnpm test"}
+	if res, raw := runHook(t, ev); res.H.Updated["command"] != "cd api && spotexec run -- 'pnpm test'" {
+		t.Fatalf("got %s", raw)
+	}
+	ev["tool_input"] = map[string]any{"command": "pnpm test"}
+	if res, raw := runHook(t, ev); res.H.Updated != nil || res.System == "" {
+		t.Fatalf("root config has no usable runner: %s", raw)
+	}
+	// A nested repository without a .spotexec.toml runs with the defaults.
+	lib := filepath.Join(root, "vendor", "lib")
+	os.MkdirAll(lib, 0o755)
+	if out, err := exec.Command("git", "-C", lib, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init: %v %s", err, out)
+	}
+	ev["tool_input"] = map[string]any{"command": "cd vendor/lib && pnpm test"}
+	if res, raw := runHook(t, ev); res.H.Updated == nil {
+		t.Fatalf("nested repo uses default config: %s", raw)
+	}
+	// A broken config there is reported, not replaced by the parent's.
+	os.WriteFile(filepath.Join(lib, ".spotexec.toml"), []byte("version = \n"), 0o644)
+	if err := RunnersFor("cd vendor/lib && pnpm test", root, nil); err == nil || !strings.Contains(err.Error(), "vendor/lib") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Parallel tool calls of one session hear the notice once between them.
+func TestFirstNoticeOncePerSessionConcurrently(t *testing.T) {
+	isolate(t, false)
+	var wg sync.WaitGroup
+	var n atomic.Int32
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if firstNotice("same") {
+				n.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if n.Load() != 1 {
+		t.Fatalf("notice given %d times", n.Load())
 	}
 }

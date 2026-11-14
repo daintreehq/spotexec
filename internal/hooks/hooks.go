@@ -5,6 +5,8 @@
 package hooks
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
 )
@@ -377,10 +380,23 @@ func shellQuote(s string) string {
 
 // claudeInput is the PreToolUse stdin payload (fields we use).
 type claudeInput struct {
+	SessionID string         `json:"session_id"`
 	ToolName  string         `json:"tool_name"`
 	ToolInput map[string]any `json:"tool_input"`
 	Cwd       string         `json:"cwd"`
-	Extra     map[string]any `json:"-"`
+}
+
+// BashTimeoutMS is the Bash tool timeout an offloaded command gets when the
+// agent set none: Claude Code's default is 2 minutes, too short for booting
+// a Spot VM, installing dependencies and then running. It is Claude Code's
+// default ceiling (BASH_MAX_TIMEOUT_MS raises it, and so does this).
+const BashTimeoutMS = 600000
+
+func bashTimeout() int {
+	if n, err := strconv.Atoi(os.Getenv("BASH_MAX_TIMEOUT_MS")); err == nil && n > BashTimeoutMS {
+		return n
+	}
+	return BashTimeoutMS
 }
 
 // HandleClaude processes one PreToolUse event. It never fails the tool call:
@@ -401,10 +417,11 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 	if dir == "" {
 		dir, _ = os.Getwd()
 	}
-	h, ok := projectHook(dir)
-	if !ok || h.Disabled {
+	proj, ok := project(dir)
+	if !ok || proj.Hook.Disabled {
 		return
 	}
+	h := proj.Hook
 	d, err := NewDecider(h)
 	if err != nil || !d.ShouldOffload(cmd) {
 		return
@@ -418,12 +435,27 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 			return
 		}
 	}
+	if err := RunnersFor(cmd, dir, proj); err != nil {
+		// Offloading would only fail: run it here, and say so once a
+		// session (a hook installed before `spotexec setup` would otherwise
+		// keep a first demo silently local).
+		if firstNotice(ev.SessionID) {
+			writeJSON(out, map[string]any{
+				"systemMessage": "spotexec: heavy commands are running on this machine: " + err.Error(),
+				"hookSpecificOutput": map[string]any{
+					"hookEventName":     "PreToolUse",
+					"additionalContext": "spotexec kept this command on this machine instead of offloading it, because it has no usable runners (" + err.Error() + "). Heavy commands keep running locally until that is fixed.",
+				},
+			})
+		}
+		return
+	}
 	wrapped := Wrap(bin, cmd)
 	if h.Mode == "block" {
 		writeJSON(out, map[string]any{"hookSpecificOutput": map[string]any{
 			"hookEventName":            "PreToolUse",
 			"permissionDecision":       "deny",
-			"permissionDecisionReason": "This project offloads heavy commands to remote runners. Re-run it as: " + wrapped + " (or prefix SPOTEXEC_LOCAL=1 if it must run on this machine, e.g. it needs local services)",
+			"permissionDecisionReason": fmt.Sprintf("This project offloads heavy commands to remote runners. Re-run it as: %s with a Bash timeout of %d ms, since a cold start can take minutes (or prefix SPOTEXEC_LOCAL=1 if it must run on this machine, e.g. it needs local services)", wrapped, bashTimeout()),
 		}})
 		return
 	}
@@ -432,10 +464,77 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 		newInput[k] = v
 	}
 	newInput["command"] = wrapped
+	if t, _ := newInput["timeout"].(float64); t <= 0 {
+		newInput["timeout"] = bashTimeout()
+	}
 	writeJSON(out, map[string]any{"hookSpecificOutput": map[string]any{
 		"hookEventName": "PreToolUse",
 		"updatedInput":  newInput,
 	}})
+}
+
+// RunnersFor is UsableRunners for the config the wrapped command line will
+// load: spotexec starts after the line's leading cds, which run locally.
+func RunnersFor(command, dir string, proj *config.Project) error {
+	if rd := wrapDir(command, dir); rd != dir {
+		// As spotexec run there resolves it: defaults when that worktree
+		// has no .spotexec.toml.
+		p, err := config.LoadProject(config.FindProject(rd, gitRoot(rd)))
+		if err != nil {
+			return err
+		}
+		proj = p
+	}
+	return UsableRunners(proj)
+}
+
+// UsableRunners reports why a run in this project would have no runner to
+// go to (none configured, an unknown pool entry, a broken config), or nil.
+func UsableRunners(proj *config.Project) error {
+	g, err := config.LoadGlobal()
+	if err != nil {
+		return err
+	}
+	cfg := &config.Config{Global: g, Project: proj}
+	if err := cfg.MergeProjectRunners(); err != nil {
+		return err
+	}
+	var override []string // as spotexec run resolves it
+	if r := os.Getenv("SPOTEXEC_RUNNER"); r != "" {
+		override = []string{r}
+	}
+	_, err = cfg.Pool(override)
+	return err
+}
+
+// firstNotice reports whether this session hasn't had the "staying local"
+// notice yet, and records that it has. Without a session id it is once a day.
+func firstNotice(session string) bool {
+	if session == "" {
+		session = time.Now().Format("2006-01-02")
+	}
+	sum := sha256.Sum256([]byte(session))
+	dir := filepath.Join(config.StateDir(), "hook-notices")
+	p := filepath.Join(dir, hex.EncodeToString(sum[:8]))
+	if os.MkdirAll(dir, 0o700) == nil {
+		// Claimed atomically: parallel tool calls of one session race here.
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			return false
+		}
+		if err == nil {
+			f.Close()
+		}
+		// Forget sessions older than a week.
+		if ents, err := os.ReadDir(dir); err == nil {
+			for _, e := range ents {
+				if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > 7*24*time.Hour {
+					os.Remove(filepath.Join(dir, e.Name()))
+				}
+			}
+		}
+	}
+	return true
 }
 
 // CdsInside reports whether every `cd` stays in the repository (see cdsInside).
@@ -460,23 +559,8 @@ func cdsInside(command, dir string) bool {
 		if !cdSeg.MatchString(seg) {
 			continue
 		}
-		target := strings.TrimSpace(strings.TrimPrefix(seg, "cd"))
-		// Unwrap one level of matching quotes; anything still quoted or
-		// escaped is too clever to reason about: keep it local.
-		if len(target) >= 2 && (target[0] == '"' || target[0] == '\'') && target[len(target)-1] == target[0] {
-			target = target[1 : len(target)-1]
-		}
-		if target == "" || strings.ContainsAny(target, "'\"\\$`") || strings.HasPrefix(target, "~") || strings.HasPrefix(target, "-") {
-			return false
-		}
-		if !filepath.IsAbs(target) {
-			target = filepath.Join(cur, target)
-		}
-		target = filepath.Clean(target)
-		if r, err := filepath.EvalSymlinks(target); err == nil {
-			target = r
-		}
-		if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+		target, ok := cdTarget(seg, cur)
+		if !ok || target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
 			return false
 		}
 		cur = target
@@ -484,27 +568,72 @@ func cdsInside(command, dir string) bool {
 	return true
 }
 
+// cdTarget resolves the directory a `cd` segment changes to from cur. ok is
+// false for targets too clever to reason about.
+func cdTarget(seg, cur string) (string, bool) {
+	target := strings.TrimSpace(strings.TrimPrefix(seg, "cd"))
+	// Unwrap one level of matching quotes; anything still quoted or
+	// escaped is too clever to reason about: keep it local.
+	if len(target) >= 2 && (target[0] == '"' || target[0] == '\'') && target[len(target)-1] == target[0] {
+		target = target[1 : len(target)-1]
+	}
+	if target == "" || strings.ContainsAny(target, "'\"\\$`") || strings.HasPrefix(target, "~") || strings.HasPrefix(target, "-") {
+		return "", false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(cur, target)
+	}
+	target = filepath.Clean(target)
+	if r, err := filepath.EvalSymlinks(target); err == nil {
+		target = r
+	}
+	return target, true
+}
+
+// wrapDir is the directory Wrap starts spotexec in: dir after the line's
+// leading cds.
+func wrapDir(command, dir string) string {
+	head, _, ok := splitFilters(command)
+	if !ok {
+		return dir
+	}
+	segs, _ := splitList(head)
+	cur := dir
+	for i := 0; i < len(segs)-1 && isCd(segs[i]); i++ {
+		t, ok := cdTarget(strings.TrimSpace(envSeg.ReplaceAllString(segs[i], "")), cur)
+		if !ok {
+			return dir
+		}
+		cur = t
+	}
+	return cur
+}
+
 func writeJSON(w io.Writer, v any) {
 	b, _ := json.Marshal(v)
 	w.Write(append(b, '\n'))
 }
 
-// projectHook loads [hook] for the project containing dir. Offloading only
-// happens in projects that opted in with a .spotexec.toml.
-func projectHook(dir string) (config.Hook, bool) {
-	root := dir
-	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
-		root = strings.TrimSpace(string(out))
-	}
-	p := config.FindProject(dir, root)
+// project loads the .spotexec.toml for the project containing dir.
+// Offloading only happens in projects that opted in with one.
+func project(dir string) (*config.Project, bool) {
+	p := config.FindProject(dir, gitRoot(dir))
 	if p == "" {
-		return config.Hook{}, false
+		return nil, false
 	}
 	proj, err := config.LoadProject(p)
 	if err != nil {
-		return config.Hook{}, false
+		return nil, false
 	}
-	return proj.Hook, true
+	return proj, true
+}
+
+// gitRoot is the worktree containing dir, or dir outside git.
+func gitRoot(dir string) string {
+	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	return dir
 }
 
 // LoadPerCPU returns the 1-minute load average divided by CPU count.

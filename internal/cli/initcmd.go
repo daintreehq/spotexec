@@ -378,6 +378,7 @@ func cmdHook() *cobra.Command {
 				return err
 			}
 			line := strings.Join(args, " ")
+			runnersErr := hooks.RunnersFor(line, wd, l.cfg.Project)
 			// The same decision the hook makes (project opt-in, disabled,
 			// cd outside the repository).
 			switch {
@@ -391,6 +392,8 @@ func cmdHook() *cobra.Command {
 				fmt.Println("local (cd leaves the repository)")
 			case l.cfg.Project.Hook.WhenLoadAbove > 0 && belowLoad(l.cfg.Project.Hook.WhenLoadAbove):
 				fmt.Printf("local (load per CPU is below when_load_above = %.2f)\n", l.cfg.Project.Hook.WhenLoadAbove)
+			case runnersErr != nil:
+				fmt.Printf("local (no usable runners: %v)\n", runnersErr)
 			default:
 				fmt.Println("offload:", hooks.Wrap("spotexec", line))
 				return nil
