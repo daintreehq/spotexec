@@ -17,6 +17,7 @@ The **`sim` provider** runs a Spot fleet as Docker containers on your machine, s
 - Each instance is a container running sshd and booting the same cloud-init user-data.
 - `spotexec sim interrupt` delivers an interruption notice; `spotexec sim rebalance` sends a rebalance recommendation.
 - `spotexec sim build` builds the simulator image.
+- `SPOTEXEC_SIM_QUOTA=<vCPUs>` simulates the account's Spot vCPU quota: each simulated instance counts 4 vCPUs, across every runner and owner labelled with the same `SPOTEXEC_SIM_ACCOUNT` (default `local`).
 - Setting `SPOTEXEC_DAEMON_FAST=1` shrinks the pool manager's timings for tests.
 - With a plain `go build` (no embedded helpers), `SPOTEXEC_HELPER_DIR` points at a directory of helper binaries.
 

@@ -186,6 +186,8 @@ aws service-quotas request-service-quota-increase --region us-east-2 \
   --service-code ec2 --quota-code L-34B43A08 --desired-value 64
 ```
 
+When the quota refuses a launch (`MaxSpotInstanceCountExceeded`), spotexec doesn't treat it as a capacity shortage and retry. Runs queue for the fleet's running VMs, and new launches wait until one of them ends or five minutes pass. With no VM running and no other runner in the pool, `sx` fails at once (exit 125) with the region, the vCPUs a launch needs and the increase command. It never falls back to on-demand unless you set `on_demand_fallback`.
+
 Small increases are usually approved within minutes to hours. Two features use on-demand instances, which count against the separate on-demand quota (`L-1216C47A`):
 - `on_demand_fallback`;
 - the `image bake` builder.

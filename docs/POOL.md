@@ -42,6 +42,11 @@ takes part in scheduling, and every VM shuts itself down.
      reservation; an ambiguous launch (the request may have created an
      instance) keeps its reservation until listings can show it.
    - A failed launch backs the fleet off for 20s.
+   - A launch refused by the account's vCPU quota (not a capacity shortage)
+     holds further launches until one of the fleet's VMs ends or five
+     minutes pass, so queued jobs wait for the running VMs. With no VM
+     running and no static runner in the pool, the job fails at once with
+     the quota increase command.
 4. **Wait.** Tickets near the head of the queue probe instances about every
    0.5-2.5s (the head most often) until a slot frees or `queue_timeout`
    expires.

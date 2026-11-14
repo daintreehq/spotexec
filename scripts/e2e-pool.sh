@@ -17,6 +17,7 @@ check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 export SPOTEXEC_CONFIG_DIR="$WORK/cfg" SPOTEXEC_STATE_DIR="$WORK/state"
 mkdir -p "$SPOTEXEC_CONFIG_DIR"
 RUNNER=pool$$
+export SPOTEXEC_SIM_ACCOUNT=$RUNNER   # simulated quotas count this suite's VMs only
 cat > "$SPOTEXEC_CONFIG_DIR/config.toml" <<EOF
 version = 1
 default_pool = ["$RUNNER"]
@@ -208,6 +209,20 @@ sleep 2
 kill -INT $UP; wait $UP; rc=$?
 check "Ctrl-C during boot fails up" "[ $rc != 0 ]"
 check "Ctrl-C during boot terminates the VM" "[ \$(countx) = 0 ]"
+
+echo "== Spot vCPU quota (a simulated VM counts 4 vCPUs)"
+cleanup; sleep 1
+rm -rf "$SPOTEXEC_STATE_DIR/runners/$RUNNER/pool.json"
+t0=$(date +%s)
+SPOTEXEC_SIM_QUOTA=0 "$SX" 'echo never' >"$WORK/qz.out" 2>"$WORK/qz.err"; code=$?
+took=$(( $(date +%s) - t0 ))
+check "no VM and no quota: fails at once with exit 125 (${took}s)" "[ $code = 125 ] && [ $took -le 20 ] && ! grep -q never $WORK/qz.out"
+check "the error names the region, the vCPUs and the increase command" "grep -q 'quota in sim' $WORK/qz.err && grep -q 'needs 4 vCPUs' $WORK/qz.err && grep -q 'request-service-quota-increase --region sim --service-code ec2 --quota-code L-34B43A08' $WORK/qz.err"
+rm -rf "$SPOTEXEC_STATE_DIR/runners/$RUNNER/pool.json"
+for i in 1 2 3 4 5; do SPOTEXEC_SIM_QUOTA=4 "$SX" --json "sleep 3; echo quota$i" >"$WORK/qq$i.out" 2>"$WORK/qq$i.err" & done; wait
+check "room for one VM: all five jobs queue for it and succeed" "[ \$(cat $WORK/qq*.out | grep -c '^quota') = 5 ]"
+check "only one VM ran" "[ \$(count) = 1 ]"
+check "launches stop after the quota refusal (no retry loop)" "[ \$(cat $WORK/qq*.err | grep -c LAUNCH_FAILED) -le 2 ]"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

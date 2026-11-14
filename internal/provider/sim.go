@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/cloudinit"
@@ -169,10 +170,63 @@ func mappedPort(ports string) int {
 	return 0
 }
 
+// simVCPUs is what one simulated instance counts against a simulated quota.
+const simVCPUs = 4
+
+// simAccount is the simulated AWS account (SPOTEXEC_SIM_ACCOUNT): every
+// container is labelled with it, and a simulated quota counts the containers
+// of every runner and owner in the account, as EC2 does.
+func simAccount() string {
+	if a := os.Getenv("SPOTEXEC_SIM_ACCOUNT"); a != "" {
+		return a
+	}
+	return "local"
+}
+
+// simQuota is the simulated Spot vCPU quota (SPOTEXEC_SIM_QUOTA; -1 when
+// unlimited, the default).
+func simQuota() int {
+	n, err := strconv.Atoi(os.Getenv("SPOTEXEC_SIM_QUOTA"))
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
+// accountVCPUs counts the vCPUs live in the simulated account.
+func (s *Sim) accountVCPUs(ctx context.Context) (int, error) {
+	out, err := docker(ctx, "ps", "-q", "--filter", "label=spotexec-sim-account="+simAccount())
+	if err != nil {
+		return 0, err
+	}
+	return simVCPUs * len(strings.Fields(string(out))), nil
+}
+
 // Launch starts one simulated instance.
 func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 	if err := s.EnsureImage(ctx); err != nil {
 		return Instance{}, err
+	}
+	if q := simQuota(); q >= 0 {
+		// Counting and launching are one step, as in EC2.
+		lf, err := os.OpenFile(filepath.Join(os.TempDir(), "spotexec-sim-"+simAccount()+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return Instance{}, err
+		}
+		defer lf.Close()
+		if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
+			return Instance{}, err
+		}
+		defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+		used, err := s.accountVCPUs(ctx)
+		if err != nil {
+			return Instance{}, err
+		}
+		if used+simVCPUs > q {
+			// What EC2's MaxSpotInstanceCountExceeded becomes.
+			return Instance{}, &QuotaError{Region: "sim", Spot: true, Code: QuotaCodeSpotStandard, VCPUs: simVCPUs,
+				Desired: max(simVCPUs, s.r.MaxInstances*simVCPUs), Detail: "sim: MaxSpotInstanceCountExceeded"}
+		}
 	}
 	owner, err := s.ownerTag()
 	if err != nil {
@@ -194,7 +248,7 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 	_, _ = rand.Read(b[:])
 	name := "sx-" + s.r.Name + "-" + hex.EncodeToString(b[:])
 	_, err = docker(ctx, "run", "-d", "--rm", "--name", name,
-		"--label", "spotexec-runner="+s.r.Name, "--label", "spotexec-owner="+owner,
+		"--label", "spotexec-runner="+s.r.Name, "--label", "spotexec-owner="+owner, "--label", "spotexec-sim-account="+simAccount(),
 		"--label", "spotexec-launched="+strconv.FormatInt(time.Now().UnixMilli(), 10),
 		"-e", "BOOT_DELAY="+strconv.FormatFloat(s.r.BootDelay.Seconds(), 'f', 1, 64),
 		"-e", "USER_DATA_B64="+base64.StdEncoding.EncodeToString([]byte(ud)),

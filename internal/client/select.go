@@ -62,8 +62,12 @@ func Connect(ctx context.Context, r *config.Runner, t provider.Target) (*transpo
 	return c, s, nil
 }
 
+// newProvider builds a pool member's provider (tests substitute fakes).
+var newProvider = provider.New
+
 type member struct {
 	fatal error // a problem no other instance of this runner would avoid
+	down  bool  // a static runner whose last probe failed
 	r     *config.Runner
 	p     provider.Provider
 	pool  *Pool // nil for static runners
@@ -93,7 +97,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 	var members []*member
 	var errs []string
 	for _, r := range req.Pool {
-		p, err := provider.New(r)
+		p, err := newProvider(r)
 		if err != nil {
 			errs = append(errs, err.Error())
 			continue
@@ -101,6 +105,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		m := &member{r: r, p: p}
 		if f, ok := p.(provider.Fleet); ok {
 			m.pool = NewPool(r, f)
+			m.pool.since = start
 		}
 		members = append(members, m)
 	}
@@ -172,6 +177,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		window := 0
 		fleetCands := map[*member][]provider.Instance{}
 		reachable := 0
+		staticUp := 0 // static runners not known to be down (busy counts as up)
 		roundErrs := []string{}
 		for _, m := range members {
 			if m.pool == nil {
@@ -235,6 +241,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					if lease != nil {
 						return lease, nil
 					}
+					m.down = err != nil
 					if err != nil {
 						roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
 						continue
@@ -303,7 +310,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		status := ""
 		covered := 0
 		blocked, fleets := 0, 0
-		var bootErr error
+		var blockErr error
 		for _, m := range members {
 			if m.pool == nil {
 				continue
@@ -333,9 +340,15 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
 			}
-			if id := m.pool.BootFailure(); id != "" && d.Live == 0 && d.Pending == 0 {
-				blocked++
-				bootErr = fmt.Errorf("%s: bootstrap_script failed on %s, so no new VMs are launched for an hour: fix bootstrap_script (the VM's /var/log/spotexec-bootstrap.log has the output), then `spotexec down %s` to clear it", m.r.Name, id, m.r.Name)
+			if d.Live == 0 && d.Pending == 0 {
+				// No VM to wait for, and none will be launched.
+				if id := m.pool.BootFailure(); id != "" {
+					blocked++
+					blockErr = fmt.Errorf("%s: bootstrap_script failed on %s, so no new VMs are launched for an hour: fix bootstrap_script (the VM's /var/log/spotexec-bootstrap.log has the output), then `spotexec down %s` to clear it", m.r.Name, id, m.r.Name)
+				} else if d.QuotaErr != "" {
+					blocked++
+					blockErr = fmt.Errorf("%s: %s", m.r.Name, d.QuotaErr)
+				}
 			}
 			if d.Launch && !provisioning[d.ID] {
 				provisioning[d.ID] = true
@@ -355,10 +368,17 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %s", m.r.Name, d.Reason)
 			}
 		}
-		// Nothing can ever serve this request: every runner is a fleet whose
-		// setup just failed (static runners would still be worth waiting for).
-		if bootErr != nil && blocked == fleets && fleets == len(members) {
-			return nil, bootErr
+		for _, m := range members {
+			if m.pool == nil && !m.down {
+				staticUp++ // answered, or not probed yet (not at the queue's head)
+			}
+		}
+		// Nothing can serve this request: every fleet can't launch (its
+		// setup just failed, or the account's vCPU quota is full) and has no
+		// VM to wait for, and no static runner answers. A static runner
+		// that answers, even fully busy, is still worth waiting for.
+		if blockErr != nil && blocked == fleets && staticUp == 0 {
+			return nil, blockErr
 		}
 		if status == "" {
 			status = "all slots busy (" + describeHolders(lastHolders) + ")"

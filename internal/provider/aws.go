@@ -554,10 +554,58 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	if spec.bake {
 		markets = []bool{false} // on-demand: a reclaimed builder wastes the bake
 	}
+	inst, err := a.launchAcross(markets, log, func(itype string, spot bool) (ec2Instance, error) {
+		return a.runOne(ctx, base, itype, spot, log)
+	})
+	var qe *QuotaError
+	if errors.As(err, &qe) && qe.Code != "" {
+		// Suggest a quota above the current one: other runners or machines
+		// may be what fills it.
+		if q, qerr := a.quotaValue(ctx, qe.Code); qerr == nil {
+			qe.Desired = max(qe.Desired, q+qe.VCPUs)
+		}
+	}
+	return inst, err
+}
+
+// quotaLookupTimeout bounds a Service Quotas read: it only adds detail.
+var quotaLookupTimeout = 5 * time.Second
+
+// quotaValue reads a vCPU quota for the runner's region from Service Quotas.
+func (a *AWSSpot) quotaValue(ctx context.Context, code string) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, quotaLookupTimeout)
+	defer cancel()
+	qb, _ := json.Marshal(map[string]string{"ServiceCode": "ec2", "QuotaCode": code})
+	status, b, err := a.api.do(ctx, "servicequotas", "application/x-amz-json-1.1", map[string]string{"X-Amz-Target": "ServiceQuotasV20190624.GetServiceQuota"}, qb)
+	if err != nil {
+		return 0, err
+	}
+	if status != 200 {
+		return 0, fmt.Errorf("GetServiceQuota: HTTP %d: %s", status, strings.TrimSpace(string(b)))
+	}
+	var v struct{ Quota struct{ Value float64 } }
+	if err := json.Unmarshal(b, &v); err != nil {
+		return 0, err
+	}
+	return int(v.Quota.Value), nil
+}
+
+// launchAcross tries each market (spot, then on-demand when allowed) and
+// each instance type in turn until one launches. Capacity and price
+// rejections move on to the next type, and so do quota rejections (a
+// smaller type may still fit). When the quota is what stopped every market
+// tried (no type smaller than the smallest refused one fell short only on
+// capacity), the error is a *QuotaError, so callers stop waiting for
+// capacity that the quota won't allow.
+func (a *AWSSpot) launchAcross(markets []bool, log Logger, try func(itype string, spot bool) (ec2Instance, error)) (ec2Instance, error) {
 	var errs []string
+	var quota *QuotaError
+	quotaEveryMarket := true
 	for _, spot := range markets {
+		var mq *QuotaError        // this market's quota refusal (smallest launch)
+		short := map[string]int{} // smallest type refused for capacity or price, by quota
 		for _, itype := range a.r.InstanceTypes {
-			inst, err := a.runOne(ctx, base, itype, spot, log)
+			inst, err := try(itype, spot)
 			if err == nil {
 				kind := "spot"
 				if !spot {
@@ -566,17 +614,60 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 				log("launched %s %s instance %s in %s", kind, itype, inst.InstanceID, a.r.Region)
 				return inst, nil
 			}
-			if errors.Is(err, ErrLaunchAmbiguous) || classifyAWSError(err) != errNextType {
+			class := classifyAWSError(err)
+			if errors.Is(err, ErrLaunchAmbiguous) || (class != errNextType && class != errQuota) {
 				return ec2Instance{}, fmt.Errorf("launch %s: %w", itype, err)
 			}
 			log("skipping %s: %v", itype, err)
 			errs = append(errs, itype+": "+awsCode(err))
+			switch {
+			case class == errQuota && (mq == nil || vcpusOf(itype) < mq.VCPUs):
+				mq = &QuotaError{Region: a.r.Region, Spot: spot, Code: quotaCodeFor(itype, spot), VCPUs: vcpusOf(itype)}
+			case class == errNextType && capacityCode(awsCode(err)):
+				if c := quotaCodeFor(itype, spot); short[c] == 0 || vcpusOf(itype) < short[c] {
+					short[c] = vcpusOf(itype)
+				}
+			}
+		}
+		if mq != nil {
+			for code, n := range short {
+				if code != mq.Code || code == "" || n < mq.VCPUs {
+					// A type under another quota, or a smaller one, may
+					// launch once capacity returns.
+					mq = nil
+					break
+				}
+			}
+		}
+		if mq == nil {
+			quotaEveryMarket = false
+		} else if quota == nil {
+			quota = mq // the Spot quota is the one to report when both refused
 		}
 		if spot && a.r.OnDemandFallback {
-			log("no spot capacity; falling back to on-demand")
+			if mq != nil {
+				log("spot vCPU quota reached; falling back to on-demand")
+			} else {
+				log("no spot capacity; falling back to on-demand")
+			}
 		}
 	}
+	if quota != nil && quotaEveryMarket {
+		quota.Detail = strings.Join(errs, ", ")
+		quota.Desired = max(quota.VCPUs, a.r.MaxInstances*vcpusOf(a.r.InstanceTypes[0]))
+		return ec2Instance{}, quota
+	}
 	return ec2Instance{}, fmt.Errorf("no instance type could be launched in %s (%s); add more instance_types, raise max_price, or set on_demand_fallback = true", a.r.Region, strings.Join(errs, ", "))
+}
+
+// capacityCode reports refusals that pass with time (capacity, price), as
+// opposed to types that can never launch here.
+func capacityCode(code string) bool {
+	switch code {
+	case "InsufficientInstanceCapacity", "InsufficientCapacity", "InsufficientHostCapacity", "SpotMaxPriceTooLow":
+		return true
+	}
+	return false
 }
 
 // runOne calls RunInstances for one instance type. The ClientToken makes the
@@ -955,7 +1046,12 @@ func vcpusOf(t string) int {
 	switch size {
 	case "nano", "micro", "small":
 		return 2
-	case "medium", "large":
+	case "medium":
+		if strings.HasPrefix(t, "t") {
+			return 2 // burstable mediums; the others (Graviton, a1) have 1
+		}
+		return 1
+	case "large":
 		return 2
 	case "xlarge":
 		return 4
