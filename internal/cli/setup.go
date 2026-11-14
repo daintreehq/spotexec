@@ -64,6 +64,10 @@ and keeps a working key. --rotate replaces the key.
 			if revoke != "" {
 				return revokeMachine(cmd.Context(), adminProfile, revoke, yes)
 			}
+			// Before changing anything here.
+			if err := checkSSHHosts(args); err != nil {
+				return err
+			}
 			setupLocal := func() (bool, error) {
 				p := config.GlobalPath()
 				if _, err := os.Stat(p); err != nil {

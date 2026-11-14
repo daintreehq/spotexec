@@ -104,7 +104,7 @@ Name the machines, and setup runs on each of them after this one:
 spotexec setup studio-01.local studio-02.local me@build-box
 ```
 
-Or run `spotexec setup` on its own in a terminal and pick from the machines it finds: the ones set up from here before, Macs with Remote Login on your network (Bonjour, or avahi on Linux), and the `Host` entries in `~/.ssh/config`.
+Or run `spotexec setup` on its own in a terminal and pick from the machines it finds: the ones set up from here before, Macs with Remote Login on your network (Bonjour, or avahi on Linux), and the `Host` entries in `~/.ssh/config`. Names that start with `-` or contain spaces or control characters are refused (and left out of the list), so nothing on the network can pass options to `ssh`.
 
 ```console
 Set up other machines too? spotexec installs itself there over SSH, copies this config, and gives each machine its own AWS key.

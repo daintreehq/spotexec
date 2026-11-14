@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 
@@ -51,10 +52,38 @@ const remotePath = `PATH="/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linu
 
 func shq(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
+// checkSSHHost rejects a destination that ssh could read as an option, or
+// that can't be one host: setup takes hosts from the command line,
+// ~/.ssh/config and Bonjour, which anything on the local network can answer.
+func checkSSHHost(h string) error {
+	if h == "" {
+		return errors.New("empty host name")
+	}
+	if strings.HasPrefix(h, "-") {
+		return fmt.Errorf("invalid host %q: it starts with '-'", h)
+	}
+	for _, c := range h {
+		if unicode.IsSpace(c) || unicode.IsControl(c) {
+			return fmt.Errorf("invalid host %q: it contains whitespace or control characters", h)
+		}
+	}
+	return nil
+}
+
+func checkSSHHosts(hosts []string) error {
+	for _, h := range hosts {
+		if err := checkSSHHost(h); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *remoteSetup) sshArgs(script string) []string {
+	// "--" ends option parsing, so the host is never read as an option.
 	return []string{
 		"-o", "ControlMaster=auto", "-o", "ControlPath=" + filepath.Join(r.ctlDir, "%C"), "-o", "ControlPersist=120",
-		"-o", "ConnectTimeout=15", r.host, "/bin/sh -c " + shq(remotePath+script),
+		"-o", "ConnectTimeout=15", "--", r.host, "/bin/sh -c " + shq(remotePath+script),
 	}
 }
 
@@ -339,12 +368,15 @@ func firstLine(s string) string {
 }
 
 func (r *remoteSetup) close() {
-	_ = exec.Command("ssh", "-o", "ControlPath="+filepath.Join(r.ctlDir, "%C"), "-O", "exit", r.host).Run()
+	_ = exec.Command("ssh", "-o", "ControlPath="+filepath.Join(r.ctlDir, "%C"), "-O", "exit", "--", r.host).Run()
 }
 
 // setupHosts sets up the hosts, four at a time, printing each one's output
 // as a block when it finishes, and records them in the machine list.
 func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
+	if err := checkSSHHosts(hosts); err != nil {
+		return err
+	}
 	// /tmp, not $TMPDIR: a socket path must stay under ~104 bytes.
 	dir, err := os.MkdirTemp("/tmp", "sx-")
 	if err != nil {
@@ -475,17 +507,8 @@ func forgetMachine(match func(host string) bool) []string {
 func discoverHosts(ctx context.Context) []string {
 	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	seen := map[string]bool{}
-	var out []string
-	add := func(h string) {
-		h = strings.TrimSuffix(strings.TrimSpace(h), ".")
-		k := strings.ToLower(h)
-		if h == "" || seen[k] || isSelf(k) {
-			return
-		}
-		seen[k] = true
-		out = append(out, h)
-	}
+	var l hostList
+	add := l.add
 	for _, m := range loadMachines() {
 		add(m.Host) // set up before: listed first
 	}
@@ -507,7 +530,28 @@ func discoverHosts(ctx context.Context) []string {
 	for _, h := range sshConfigHosts() {
 		add(h)
 	}
-	return out
+	return l.hosts
+}
+
+// hostList collects discovered hosts once each, dropping this machine and
+// names that aren't safe to hand to ssh (a Bonjour answer can be anything).
+type hostList struct {
+	seen  map[string]bool
+	hosts []string
+}
+
+func (l *hostList) add(h string) {
+	// Checked as given: a name padded with whitespace is not trusted either.
+	h = strings.TrimSuffix(h, ".")
+	k := strings.ToLower(h)
+	if checkSSHHost(h) != nil || l.seen[k] || isSelf(k) {
+		return
+	}
+	if l.seen == nil {
+		l.seen = map[string]bool{}
+	}
+	l.seen[k] = true
+	l.hosts = append(l.hosts, h)
 }
 
 var dnssdAdd = regexp.MustCompile(`\sAdd\s+\d+\s+\d+\s+\S+\s+_ssh\._tcp\.\s+(.+)$`)

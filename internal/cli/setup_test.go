@@ -106,3 +106,37 @@ func TestParseHostChoice(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckSSHHost(t *testing.T) {
+	for _, h := range []string{"studio-01.local", "me@build-box", "first.last@host.local", "10.0.0.5", "builder", "[::1]"} {
+		if err := checkSSHHost(h); err != nil {
+			t.Errorf("checkSSHHost(%q) = %v", h, err)
+		}
+	}
+	for _, h := range []string{"", "-oProxyCommand=touch /tmp/x", "-v", "a b", "a\tb", "host\n", "a\x00b", "a\x1bb", "a b"} {
+		if err := checkSSHHost(h); err == nil {
+			t.Errorf("checkSSHHost(%q) accepted", h)
+		}
+	}
+	if err := checkSSHHosts([]string{"ok", "-oProxyCommand=x"}); err == nil || !strings.Contains(err.Error(), "-oProxyCommand") {
+		t.Errorf("checkSSHHosts = %v", err)
+	}
+}
+
+func TestSSHArgsEndOptions(t *testing.T) {
+	r := remoteSetup{host: "me@box", ctlDir: "/tmp/x"}
+	args := r.sshArgs("true")
+	if len(args) < 3 || args[len(args)-3] != "--" || args[len(args)-2] != "me@box" {
+		t.Fatalf("sshArgs = %q", args)
+	}
+}
+
+func TestHostListDropsUnsafeNames(t *testing.T) {
+	var l hostList
+	for _, h := range []string{"studio-01.local.", "-oProxyCommand=sh -c x", "Studio-01.local", "", "  ", "mini 01", " builder.local", "builder.local\n", "\tbox", "box\u2003", "mini-01.local", "localhost"} {
+		l.add(h)
+	}
+	if got := strings.Join(l.hosts, ","); got != "studio-01.local,mini-01.local" {
+		t.Fatalf("hosts = %q", got)
+	}
+}
