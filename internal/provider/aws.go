@@ -502,10 +502,10 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.Itoa(volume))
 	base.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
-	tags := [][2]string{{tagRunner, a.r.Name}, {tagOwner, owner}, {"Name", "spotexec-" + a.r.Name}}
+	tags := [][2]string{{tagRunner, a.r.Name}, {tagOwner, owner}, {tagHost, HostLabel()}, {"Name", "spotexec-" + a.r.Name}}
 	if spec.bake {
 		// Never part of the fleet: the scheduler must not place work on it.
-		tags = [][2]string{{tagBake, a.r.Name}, {tagOwner, owner}, {"Name", "spotexec-bake-" + a.r.Name}}
+		tags = [][2]string{{tagBake, a.r.Name}, {tagOwner, owner}, {tagHost, HostLabel()}, {"Name", "spotexec-bake-" + a.r.Name}}
 	}
 	for i, rt := range []string{"instance", "volume"} {
 		pfx := "TagSpecification." + strconv.Itoa(i+1)
@@ -878,4 +878,83 @@ func vcpusOf(t string) int {
 		return 4 * n
 	}
 	return 4
+}
+
+// tagHost names the machine that launched an instance, for people (and
+// `status -A`); ownership is still tagOwner.
+const tagHost = "spotexec-host"
+
+// HostLabel is this machine's short, stable name: macOS's LocalHostName,
+// else the hostname up to the first dot.
+func HostLabel() string {
+	if b, err := exec.Command("scutil", "--get", "LocalHostName").Output(); err == nil {
+		if h := strings.TrimSpace(string(b)); h != "" {
+			return h
+		}
+	}
+	h, _ := os.Hostname()
+	return strings.Split(h, ".")[0]
+}
+
+// AccountInstance is a live spotexec VM launched by any machine.
+type AccountInstance struct {
+	ID       string    `json:"id"`
+	Region   string    `json:"region"`
+	Runner   string    `json:"runner"`
+	Host     string    `json:"host,omitempty"`
+	Owner    string    `json:"owner"`
+	Type     string    `json:"type"`
+	Market   string    `json:"market"`
+	State    string    `json:"state"`
+	IP       string    `json:"ip,omitempty"`
+	Launched time.Time `json:"launched"`
+	Mine     bool      `json:"mine"`
+}
+
+// AccountInstances lists every live spotexec VM in this runner's region,
+// whichever machine launched it.
+func (a *AWSSpot) AccountInstances(ctx context.Context) ([]AccountInstance, error) {
+	me, _ := ownerID()
+	p := url.Values{"Filter.1.Name": {"tag-key"}, "Filter.1.Value.1": {tagRunner},
+		"Filter.2.Name": {"instance-state-name"}, "Filter.2.Value.1": {"pending"}, "Filter.2.Value.2": {"running"}, "Filter.2.Value.3": {"stopping"}, "Filter.2.Value.4": {"stopped"}}
+	var out []AccountInstance
+	for page := 0; page < 20; page++ {
+		b, err := a.api.ec2(ctx, "DescribeInstances", p)
+		if err != nil {
+			return out, err
+		}
+		ins, next, err := parseDescribeInstances(b)
+		if err != nil {
+			return out, err
+		}
+		for _, in := range ins {
+			market := "on-demand"
+			if in.Lifecycle == "spot" {
+				market = "spot"
+			}
+			out = append(out, AccountInstance{ID: in.InstanceID, Region: a.r.Region, Runner: in.tag(tagRunner), Host: in.tag(tagHost),
+				Owner: in.tag(tagOwner), Type: in.InstanceType, Market: market, State: in.State, IP: in.IPAddress,
+				Launched: in.launched(), Mine: in.tag(tagOwner) == me})
+		}
+		if next == "" {
+			break
+		}
+		p.Set("NextToken", next)
+	}
+	return out, nil
+}
+
+// TerminateAccountInstance terminates a spotexec VM whichever machine owns
+// it (it must carry the spotexec runner tag).
+func (a *AWSSpot) TerminateAccountInstance(ctx context.Context, id string) error {
+	b, err := a.api.ec2(ctx, "DescribeInstances", url.Values{"InstanceId.1": {id}})
+	if err != nil {
+		return err
+	}
+	ins, _, err := parseDescribeInstances(b)
+	if err != nil || len(ins) == 0 || ins[0].tag(tagRunner) == "" {
+		return fmt.Errorf("%s is not a spotexec instance", id)
+	}
+	_, err = a.api.ec2(ctx, "TerminateInstances", url.Values{"InstanceId.1": {id}})
+	return err
 }

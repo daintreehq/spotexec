@@ -197,13 +197,24 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 }
 
 func cmdStatus() *cobra.Command {
-	var asJSON bool
+	var asJSON, everyone bool
 	c := &cobra.Command{
 		Use:   "status [runner...]",
 		Short: "Show runner states, active slots, lock holders and idle timers",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadGlobal()
 			if err != nil {
+				return err
+			}
+			if everyone {
+				ins, err := accountInstances(cmd.Context(), cfg)
+				if asJSON {
+					if err != nil {
+						return err
+					}
+					return json.NewEncoder(os.Stdout).Encode(ins)
+				}
+				printAccountInstances(ins)
 				return err
 			}
 			rs, err := selectRunners(cfg, args)
@@ -222,6 +233,7 @@ func cmdStatus() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&asJSON, "json", false, "JSON output")
+	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "every spotexec VM in the account, whichever machine launched it")
 	return c
 }
 
@@ -388,7 +400,8 @@ func cmdUp() *cobra.Command {
 }
 
 func cmdDown() *cobra.Command {
-	var all bool
+	var all, everyone, yes bool
+	var machine string
 	c := &cobra.Command{
 		Use:   "down [runner...]",
 		Short: "Terminate ephemeral runner(s) now",
@@ -396,6 +409,9 @@ func cmdDown() *cobra.Command {
 			cfg, err := loadGlobal()
 			if err != nil {
 				return err
+			}
+			if everyone || machine != "" {
+				return downAccount(cmd.Context(), cfg, machine, yes)
 			}
 			var rs []*config.Runner
 			switch {
@@ -443,6 +459,9 @@ func cmdDown() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&all, "all", false, "terminate every ephemeral runner")
+	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "terminate spotexec VMs launched by any machine (with --machine: only that one's)")
+	c.Flags().StringVar(&machine, "machine", "", "only VMs launched by this machine (its name in `status -A`)")
+	c.Flags().BoolVarP(&yes, "yes", "y", false, "don't ask before terminating other machines' VMs")
 	return c
 }
 
@@ -881,4 +900,138 @@ func parseAge(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid age %q (e.g. 7d or 36h)", s)
 	}
 	return d, nil
+}
+
+// accountInstances lists every spotexec VM in the regions (and accounts)
+// the AWS runners use, deduplicated.
+func accountInstances(ctx context.Context, cfg *config.Config) ([]provider.AccountInstance, error) {
+	seen := map[string]bool{}
+	var out []provider.AccountInstance
+	var errs []string
+	for _, r := range cfg.Global.Runners {
+		if r.Type != config.TypeAWSSpot || seen[r.Region+"\x00"+r.Profile] {
+			continue
+		}
+		seen[r.Region+"\x00"+r.Profile] = true
+		p, err := provider.New(r)
+		if err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		a, ok := p.(*provider.AWSSpot)
+		if !ok {
+			continue
+		}
+		ins, err := a.AccountInstances(ctx)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", r.Region, err))
+		}
+		for _, in := range ins {
+			if !seen[in.ID] {
+				seen[in.ID] = true
+				out = append(out, in)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Host != out[j].Host {
+			return out[i].Host < out[j].Host
+		}
+		return out[i].Launched.Before(out[j].Launched)
+	})
+	if len(errs) > 0 {
+		return out, errors.New(strings.Join(errs, "; "))
+	}
+	return out, nil
+}
+
+func machineName(in provider.AccountInstance) string {
+	h := in.Host
+	if h == "" {
+		h = "owner " + strings.Split(in.Owner, "-")[0]
+	}
+	if in.Mine {
+		h += " (this)"
+	}
+	return h
+}
+
+func printAccountInstances(ins []provider.AccountInstance) {
+	if len(ins) == 0 {
+		fmt.Println("no spotexec VMs in the account")
+		return
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "MACHINE\tRUNNER\tINSTANCE\tTYPE\tMARKET\tSTATE\tUP\tREGION")
+	per := map[string]int{}
+	for _, in := range ins {
+		per[machineName(in)]++
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", machineName(in), in.Runner, in.ID, in.Type, in.Market, in.State, ui.Dur(time.Since(in.Launched).Round(time.Minute)), in.Region)
+	}
+	tw.Flush()
+	fmt.Printf("\n%d VM(s) across %d machine(s). Stop one machine's VMs: spotexec down -A --machine <name>\n", len(ins), len(per))
+}
+
+// downAccount terminates spotexec VMs launched by any machine (or by one).
+func downAccount(ctx context.Context, cfg *config.Config, machine string, yes bool) error {
+	ins, err := accountInstances(ctx, cfg)
+	if err != nil && len(ins) == 0 {
+		return err
+	}
+	short := strings.Split(machine, ".")[0]
+	var pick []provider.AccountInstance
+	for _, in := range ins {
+		if machine == "" || strings.EqualFold(in.Host, machine) || strings.EqualFold(in.Host, short) || strings.HasPrefix(in.Owner, machine) {
+			pick = append(pick, in)
+		}
+	}
+	if len(pick) == 0 {
+		fmt.Println("no matching spotexec VMs")
+		return nil
+	}
+	others := 0
+	for _, in := range pick {
+		if !in.Mine {
+			others++
+		}
+	}
+	if others > 0 && !yes {
+		if !ui.IsTerminal(os.Stdin) {
+			return fmt.Errorf("%d of these VMs belong to other machines; re-run with --yes to terminate them", others)
+		}
+		printAccountInstances(pick)
+		fmt.Printf("Terminate these %d VM(s), %d of them other machines'? Commands running on them fail. [y/N] ", len(pick), others)
+		var a string
+		fmt.Scanln(&a)
+		if a = strings.ToLower(strings.TrimSpace(a)); a != "y" && a != "yes" {
+			return exitWith(1)
+		}
+	}
+	byRegion := map[string]*provider.AWSSpot{}
+	for _, r := range cfg.Global.Runners {
+		if r.Type != config.TypeAWSSpot || byRegion[r.Region] != nil {
+			continue
+		}
+		if p, err := provider.New(r); err == nil {
+			if a, ok := p.(*provider.AWSSpot); ok {
+				byRegion[r.Region] = a
+			}
+		}
+	}
+	var errs []string
+	for _, in := range pick {
+		a := byRegion[in.Region]
+		if a == nil {
+			continue
+		}
+		if err := a.TerminateAccountInstance(ctx, in.ID); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", in.ID, err))
+			continue
+		}
+		fmt.Printf("terminated %s (%s, %s)\n", in.ID, machineName(in), in.Runner)
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
 }
