@@ -36,10 +36,24 @@ type Client struct {
 
 // New builds a client for a target.
 func New(t provider.Target, workRoot string) *Client {
-	// The known_hosts file is per instance for ephemeral VMs, so a Spot IP
-	// reused by a new instance gets its own master and helper markers.
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%s|%s", t.Host, t.User, t.Port, t.IdentityFile, t.KnownHostsFile)))
-	return &Client{T: t, ctlPath: filepath.Join(controlDir(), hex.EncodeToString(h[:])[:16]), WorkRoot: workRoot}
+	return &Client{T: t, ctlPath: filepath.Join(controlDir(), connID(t)), WorkRoot: workRoot}
+}
+
+// connID identifies a target's effective connection settings: it names the
+// control socket (and so the helper markers). Everything that can change
+// where or how ssh connects is part of it, the runner's ssh_options included
+// (a Port or ProxyJump there makes a different endpoint). The known_hosts
+// file is per instance for ephemeral VMs, so a Spot IP reused by a new
+// instance gets its own master and helper markers.
+func connID(t provider.Target) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s|%s|%d|%s|%s", t.Host, t.User, t.Port, t.IdentityFile, t.KnownHostsFile)
+	for _, o := range t.Options {
+		// Options keep their order (ssh uses the first value it sees);
+		// a NUL can't occur in an argv string, so it separates them safely.
+		fmt.Fprintf(h, "\x00%s", o)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // controlDir holds ControlMaster sockets. OpenSSH appends 17 bytes to the
@@ -90,6 +104,11 @@ func privateDir(dir string) bool {
 	return ok && int(st.Uid) == os.Getuid() && os.Chmod(dir, 0o700) == nil
 }
 
+// baseArgs builds the ssh options. ssh uses the first value it sees for an
+// option, so the order is precedence: the control settings spotexec depends
+// on can't be overridden, the target's own settings come next, then the
+// runner's ssh_options, and spotexec's tunable defaults last, so ssh_options
+// can change them.
 func (c *Client) baseArgs(master string) []string {
 	a := []string{
 		"-T",
@@ -97,10 +116,6 @@ func (c *Client) baseArgs(master string) []string {
 		"-o", "ControlMaster=" + master,
 		"-o", "ControlPath=" + c.ctlPath,
 		"-o", "ControlPersist=" + ControlPersist,
-		"-o", "ConnectTimeout=10",
-		"-o", "ServerAliveInterval=10",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "LogLevel=ERROR",
 	}
 	if c.T.IdentityFile != "" {
 		a = append(a, "-i", c.T.IdentityFile, "-o", "IdentitiesOnly=yes")
@@ -117,7 +132,12 @@ func (c *Client) baseArgs(master string) []string {
 	for _, o := range c.T.Options {
 		a = append(a, "-o", o)
 	}
-	return a
+	return append(a,
+		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=10",
+		"-o", "ServerAliveCountMax=3",
+		"-o", "LogLevel=ERROR",
+	)
 }
 
 // Args returns full ssh argv for running remoteCmd.

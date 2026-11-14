@@ -66,7 +66,7 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | `priority` | `0` | Lower runs first. Later runners in the pool only take overflow. |
 | `work_root` | `~/.cache/spotexec` | Where slots, caches and the helper live on the runner. |
 | `remote_path_setup` | (none) | Shell run before each command, after the login profile (for example `PATH` for mise or nvm). Not used inside a [project container](environments.md#project-containers). |
-| `ssh_options` | (none) | Extra `-o` options for `ssh`. |
+| `ssh_options` | (none) | Extra `-o` options for `ssh`, for example `["Port=2222", "ProxyJump=bastion"]`. They override spotexec's defaults (`ConnectTimeout=10`, `ServerAliveInterval=10`, `ServerAliveCountMax=3`, `LogLevel=ERROR`), and runners whose options differ never share a connection. |
 | `hourly_cost` | (none) | Price per machine-hour of a fleet instance, for `spotexec monitor`. |
 
 ### `ssh` runners
