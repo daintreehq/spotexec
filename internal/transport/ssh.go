@@ -144,10 +144,28 @@ func (c *Client) baseArgs(master string) []string {
 	)
 }
 
-// Args returns full ssh argv for running remoteCmd.
+// Args returns full ssh argv for running remoteCmd, a POSIX shell command.
 func (c *Client) Args(remoteCmd string) []string {
 	// "--" ends options: the host can never be read as one.
-	return append(append(c.baseArgs("no"), "--", c.T.Host), remoteCmd)
+	return append(append(c.baseArgs("no"), "--", c.T.Host), posixCommand(remoteCmd))
+}
+
+// posixCommand wraps a POSIX shell command so that any login shell runs it
+// with /bin/sh. sshd hands the command to the user's login shell, which on
+// a homelab runner may be fish, nushell or tcsh. All of them read
+// `/bin/sh -c '...'` the same way as long as the quoted text has no single
+// quote, backslash, newline or `!`; a command with any of those is passed as
+// octal escapes (a backslash followed by a digit means the same in every one
+// of those shells' single quotes), which sh's printf decodes.
+func posixCommand(cmd string) string {
+	if !strings.ContainsAny(cmd, "'\\\n!") {
+		return "/bin/sh -c '" + cmd + "'"
+	}
+	var b strings.Builder
+	for i := 0; i < len(cmd); i++ {
+		fmt.Fprintf(&b, "\\%03o", cmd[i])
+	}
+	return `/bin/sh -c 'eval "$(printf "` + b.String() + `")"'`
 }
 
 // MasterAlive reports whether a control master is up. It only asks the

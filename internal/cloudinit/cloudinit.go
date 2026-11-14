@@ -128,17 +128,42 @@ systemctl enable --now spotexec-watchdog.timer
 systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependencies=no --timer-property=DefaultDependencies=no /bin/sh -c 'trap "" TERM HUP; touch /var/tmp/spotexec/draining; {{.SelfDestruct}}; sleep 120; poweroff -f' >/dev/null 2>&1 || true
 
 # ---- 2. SSH access for the spotexec-managed key ----
+U={{.User}}
+# Public-key logins as the runner user only, whatever the image's sshd
+# defaults. sshd keeps the first value it reads, so these go in a drop-in
+# that sorts first (cloud-init's 50-cloud-init.conf may allow passwords), or
+# at the top of sshd_config if a setting before its Include (or no Include)
+# still wins. An sshd that rejects them (an explicit "AuthenticationMethods
+# any") is retried without AuthenticationMethods, then left as the image had
+# it: the key is never locked out. What may still allow more (Match blocks,
+# other AllowUsers) is logged. A root runner user may log in with its key.
 # Many agents may connect at once; the default MaxStartups (10:30:100) would
 # drop some handshakes. Every run from one machine shares its ControlMaster
 # connection, so MaxSessions (default 10 channels per connection) must allow
-# all slots plus status probes and helper uploads.
-if [ -d /etc/ssh/sshd_config.d ]; then
-  # ClientAlive: a vanished client (laptop asleep) is dropped in ~90s, so its
-  # session stops holding the lifecycle lock and the idle clock can run.
-  printf 'MaxStartups 100:30:200\nMaxSessions 256\nClientAliveInterval 30\nClientAliveCountMax 3\n' > /etc/ssh/sshd_config.d/60-spotexec.conf
-  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
-fi
-U={{.User}}
+# all slots plus status probes and helper uploads. ClientAlive: a vanished
+# client (laptop asleep) is dropped in ~90s, so its session stops holding
+# the lifecycle lock and the idle clock can run.
+C=/etc/ssh/sshd_config F=/etc/ssh/sshd_config.d/00-spotexec.conf S=/usr/sbin/sshd L=/var/log/spotexec-bootstrap.log
+R=no RT=no; [ "$U" = root ] && R=prohibit-password RT=without-password
+printf '%s\n' 'AuthenticationMethods publickey' 'PubkeyAuthentication yes' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'ChallengeResponseAuthentication no' 'HostbasedAuthentication no' 'GSSAPIAuthentication no' 'PermitEmptyPasswords no' "PermitRootLogin $R" "AllowUsers $U" 'MaxStartups 100:30:200' 'MaxSessions 256' 'ClientAliveInterval 30' 'ClientAliveCountMax 3' > "$D/sshd.conf"
+sshd_ok() { "$S" -T -C "user=$U,host=localhost,addr=127.0.0.1" 2>/dev/null | grep -E '^(allowusers|authenticationmethods|passwordauthentication|permitrootlogin|pubkeyauthentication) ' | LC_ALL=C sort | tr '\n' ';' | grep -qx "allowusers $U;authenticationmethods publickey;passwordauthentication no;permitrootlogin $RT;pubkeyauthentication yes;"; }
+unharden() { rm -f "$F"; sed -i '/^# spotexec begin$/,/^# spotexec end$/d' "$C"; }
+harden() {
+  unharden
+  grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*' "$C" && [ -d "${F%/*}" ] && cp "$1" "$F"
+  if ! sshd_ok; then
+    rm -f "$F"
+    { echo '# spotexec begin'; cat "$1"; echo '# spotexec end'; cat "$C"; } > "$C.sx" && cat "$C.sx" > "$C"; rm -f "$C.sx"
+  fi
+  "$S" -t 2>>"$L" || { unharden; return 1; }
+}
+install -d -m 0755 /run/sshd
+rm -f /etc/ssh/sshd_config.d/60-spotexec.conf
+grep -v '^AuthenticationMethods' "$D/sshd.conf" > "$D/sshd-compat.conf"
+harden "$D/sshd.conf" || harden "$D/sshd-compat.conf" || echo "spotexec: sshd rejected the hardened settings; left as the image had them" >> "$L"
+sshd_ok || echo "spotexec: warning: sshd allows more than public-key logins as $U (see sshd -T)" >> "$L"
+grep -qisE '^[[:space:]]*Match[[:space:]]' "$C" /etc/ssh/sshd_config.d/*.conf 2>/dev/null && echo "spotexec: warning: the image's sshd Match blocks can override key-only logins" >> "$L"
+systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
 # The runner user (the helper) owns its state files; others can't drain or
 # fake them. The bootstrap log stays readable to it, not to everyone.
 chgrp "$(id -gn "$U")" "$D" "$D/activity" && chmod 0775 "$D" && chmod 0664 "$D/activity"

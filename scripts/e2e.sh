@@ -28,8 +28,9 @@ ssh-keygen -q -t ed25519 -N '' -f "$WORK/id_ed25519"
 mkdir -p "$WORK/image"
 cp "$ROOT/scripts/e2e/Dockerfile" "$WORK/image/"
 cp "$WORK/id_ed25519.pub" "$WORK/image/"
-docker build -q -t spotexec-e2e "$WORK/image" >/dev/null
-docker run -d --name "$NAME" -p "$PORT:22" spotexec-e2e >/dev/null
+IMAGE=spotexec-e2e:$(git hash-object "$ROOT/scripts/e2e/Dockerfile" | cut -c1-10)
+docker build -q -t "$IMAGE" "$WORK/image" >/dev/null
+docker run -d --name "$NAME" -p "$PORT:22" "$IMAGE" >/dev/null
 for _ in $(seq 1 50); do
   ssh -q -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -i "$WORK/id_ed25519" -p "$PORT" dev@127.0.0.1 true 2>/dev/null && break
@@ -48,6 +49,14 @@ identity_file = "$WORK/id_ed25519"
 ssh_options = ["Port=$PORT", "StrictHostKeyChecking=no", "UserKnownHostsFile=/dev/null"]
 max_slots = 3
 EOF
+for u in fishy cshy; do cat >> "$SPOTEXEC_CONFIG_DIR/config.toml" <<EOF
+[runners.$u]
+type = "ssh"
+host = "$u@127.0.0.1"
+identity_file = "$WORK/id_ed25519"
+ssh_options = ["Port=$PORT", "StrictHostKeyChecking=no", "UserKnownHostsFile=/dev/null"]
+EOF
+done
 
 # --- test repository -------------------------------------------------------
 REPO="$WORK/repo"
@@ -71,6 +80,13 @@ check ".env* excluded by default" "grep -q noenv $WORK/last.out || ! grep -q 'SE
 check "symlinks preserved" "grep -qx a.txt $WORK/last.out"
 check "slot env injected" "grep -q slot=1 $WORK/last.out"
 check "remote paths rewritten to local" "grep -qF \"$REPO\" $WORK/last.out"
+
+echo "== non-POSIX login shells (fish, tcsh)"
+for u in fishy cshy; do
+  sh=$(docker exec "$NAME" getent passwd $u | cut -d: -f7)
+  "$SX" -q -r $u 'echo "ok as $(id -un)"' >"$WORK/sh.out" 2>"$WORK/sh.err" || true
+  check "a runner whose login shell is $sh installs the helper and runs" "grep -qx 'ok as $u' $WORK/sh.out"
+done
 
 echo "== fingerprint short-circuit"
 run true
@@ -299,7 +315,19 @@ EOF
 mkdir -p "$ROOT/.e2e-render" && cp "$WORK/render.go" "$ROOT/.e2e-render/main.go"
 (cd "$ROOT" && go run ./.e2e-render) > "$WORK/userdata.sh"; rm -f "$ROOT/.e2e-render/main.go"; rmdir "$ROOT/.e2e-render"
 docker cp "$WORK/userdata.sh" "$NAME:/tmp/userdata.sh"
+# An image drop-in that sorts first by default and allows passwords and root.
+docker exec "$NAME" bash -c 'printf "PasswordAuthentication yes\nPermitRootLogin yes\nKbdInteractiveAuthentication yes\n" > /etc/ssh/sshd_config.d/50-cloud-init.conf'
 docker exec "$NAME" bash -c 'mkdir -p /tmp/fakebin && for b in systemctl systemd-run; do printf "#!/bin/sh\nexit 0\n" > /tmp/fakebin/$b; chmod +x /tmp/fakebin/$b; done; PATH=/tmp/fakebin:$PATH bash /tmp/userdata.sh >/dev/null 2>&1; cat /var/tmp/spotexec/ready'
+sshd_eff() { docker exec "$NAME" /usr/sbin/sshd -T -C user=dev,host=localhost,addr=127.0.0.1 2>&1; }
+key_only() { sshd_eff | grep -cxE 'authenticationmethods publickey|passwordauthentication no|kbdinteractiveauthentication no|permitrootlogin no|allowusers dev' | grep -qx 5; }
+check "sshd takes key logins as the runner user only, over the image's drop-in" "key_only && docker exec $NAME test -f /etc/ssh/sshd_config.d/00-spotexec.conf"
+# An explicit "AuthenticationMethods any" makes sshd reject ours: the rest still applies.
+docker exec "$NAME" bash -c 'echo "AuthenticationMethods any" >> /etc/ssh/sshd_config.d/50-cloud-init.conf; PATH=/tmp/fakebin:$PATH bash /tmp/userdata.sh >/dev/null 2>&1'
+check "...and without AuthenticationMethods when sshd rejects it" "docker exec $NAME /usr/sbin/sshd -t && [ \$(sshd_eff | grep -cxE 'passwordauthentication no|kbdinteractiveauthentication no|permitrootlogin no|allowusers dev|hostbasedauthentication no') = 5 ]"
+docker exec "$NAME" sed -i '/AuthenticationMethods any/d' /etc/ssh/sshd_config.d/50-cloud-init.conf
+# An image whose sshd_config sets passwords before (or without) the Include.
+docker exec "$NAME" bash -c 'sed -i "/^Include/d" /etc/ssh/sshd_config; sed -i "1i PasswordAuthentication yes" /etc/ssh/sshd_config; PATH=/tmp/fakebin:$PATH bash /tmp/userdata.sh >/dev/null 2>&1'
+check "...and over settings at the top of sshd_config" "key_only && docker exec $NAME head -1 /etc/ssh/sshd_config | grep -qx '# spotexec begin' && docker exec $NAME /usr/sbin/sshd -t"
 check "watchdog installed and ready marker written" "docker exec $NAME test -x /usr/local/sbin/spotexec-watchdog"
 "$SX" -q true  # helper now holds/touches the lifecycle files as user dev
 check "helper (non-root) refreshes activity" "docker exec $NAME bash -c 'test \$(( \$(date +%s) - \$(stat -c %Y /var/tmp/spotexec/activity) )) -lt 3'"

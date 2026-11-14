@@ -77,6 +77,8 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | `user` | Login user when the host omits `user@`. |
 | `identity_file` | SSH private key (default: your ssh config). Fleets always use the generated key. |
 
+The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): spotexec runs its own commands under `/bin/sh`, and your commands under bash (or `sh` without it).
+
 ### `aws-spot` runners
 
 | Key | Default | Meaning |
@@ -98,7 +100,7 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | `ami` | `auto` | `auto` uses the newest matching bake, else Ubuntu 24.04. `base` ignores bakes. An `ami-…` ID pins one image. |
 | `user` | `ubuntu` | Login user of the AMI. |
 | `subnet_id`, `security_group_ids` | default VPC, a managed `spotexec-ssh` group | Network placement. |
-| `ssh_cidr` | `0.0.0.0/0` | Source range for the managed group's SSH rule. Auth is key-only; narrow it if your IP is stable. |
+| `ssh_cidr` | `0.0.0.0/0` | Source range for the managed group's SSH rule. sshd on the VMs takes key logins as `user` only; narrow it if your IP is stable. See [SSH exposure](aws.md#ssh-exposure). |
 | `cache_bucket` | `auto` | S3 [dependency cache](environments.md#dependency-cache): `auto`, a bucket name, or `off`. |
 
 ## Project config: `.spotexec.toml`

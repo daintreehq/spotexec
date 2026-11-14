@@ -194,11 +194,27 @@ Small increases are usually approved within minutes to hours. Two features use o
 
 By default nothing needs setting up. spotexec launches into the region's **default VPC** and:
 - requests a public IPv4 address per instance (AWS bills public IPv4 addresses by the hour);
-- creates a `spotexec-ssh` security group allowing TCP 22 from `ssh_cidr`. The default is `0.0.0.0/0`, with key-only authentication; narrow it to your address when it's stable, for example `ssh_cidr = "203.0.113.4/32"`.
+- creates a `spotexec-ssh` security group allowing TCP 22 from `ssh_cidr`. The default is `0.0.0.0/0`, with key-only authentication (see [SSH exposure](#ssh-exposure) below).
 
 Your machine must be able to make outbound SSH connections (TCP 22) to EC2 public addresses. Some corporate networks block this.
 
 If the region has no default VPC, `spotexec setup` offers to create it. When that isn't possible (your organization blocks it, or you'd rather use your own network), set `subnet_id` to a **public** subnet: one whose route table sends `0.0.0.0/0` to an internet gateway. spotexec then creates its security group in that subnet's VPC, or uses `security_group_ids` if you set them. Those groups must allow inbound TCP 22 from your address, and outbound HTTP/HTTPS for packages, the S3 cache and ECR.
+
+### SSH exposure
+
+By default every runner VM accepts SSH on port 22 from anywhere (`ssh_cidr = "0.0.0.0/0"`). That is deliberate: laptops roam between networks and several machines can share a fleet, so a source-address allowlist would break routinely. What keeps it safe is how sshd is set up on every spotexec VM, whatever the AMI's defaults:
+- only public-key logins (`AuthenticationMethods publickey`; passwords, keyboard-interactive, host-based and GSSAPI logins are off);
+- only as the runner `user` (`AllowUsers`); root logins are refused (unless `user` is `root`, which then logs in with the key only);
+- the key is the one spotexec generated on your machine, injected at launch; no EC2 key pair is attached.
+
+These settings go in `/etc/ssh/sshd_config.d/00-spotexec.conf`, which sorts ahead of drop-ins like cloud-init's own; on an image whose `sshd_config` would still override it, they go at the top of `sshd_config` instead. A custom `ami` can still loosen sshd deliberately (a `Match` block, another `AllowUsers` entry): the VM then logs a warning to `/var/log/spotexec-bootstrap.log`.
+
+To restrict the source as well (for example in an account with Security Hub control EC2.13, which flags port 22 open to the world):
+- **A stable address:** set `ssh_cidr` to it, such as `ssh_cidr = "203.0.113.4/32"`. spotexec then manages a separate `spotexec-ssh-<hash>` group with that rule. Runs from anywhere else can't connect.
+- **A VPN or office range:** set `ssh_cidr` to that range.
+- **Your own rules:** create security groups yourself and set `security_group_ids`; spotexec then uses them as they are and creates none. They must allow inbound TCP 22 from wherever you run `sx`, and outbound HTTP/HTTPS.
+
+A changed `ssh_cidr` or `security_group_ids` applies to VMs launched afterwards. Run `spotexec down` to replace the ones already running (or change their security groups in the console).
 
 ## 7. Configure the runner
 

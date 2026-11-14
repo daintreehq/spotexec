@@ -2,6 +2,8 @@ package transport
 
 import (
 	"context"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -103,4 +105,35 @@ func TestSSHOptionsPrecedeDefaults(t *testing.T) {
 	if i := slices.Index(a, "-i"); i < 0 || i > user {
 		t.Fatalf("identity after ssh_options: %v", a)
 	}
+}
+
+// sshd runs the remote command with the user's login shell. Whatever that
+// shell, the wrapped command must run under sh and mean exactly what it
+// says, quotes, backslashes, newlines and all.
+func TestPosixCommandUnderLoginShells(t *testing.T) {
+	cmds := []string{
+		`uname -sm`,
+		`test -x "$HOME"/x && echo present || echo absent`,
+		"set -e; t=/tmp/.upload.$$; printf '%s|%s\\n' \"a'b\" 'c\\d'; echo \"!x\" 100%d; echo $((1+2))\necho second line",
+		`exec printf '%s\n' "$0"`,
+	}
+	var shells []string
+	for _, sh := range []string{"sh", "bash", "zsh", "dash", "tcsh", "csh", "fish", "nu"} {
+		if p, err := exec.LookPath(sh); err == nil {
+			shells = append(shells, p)
+		}
+	}
+	for _, cmd := range cmds {
+		want, err := exec.Command("/bin/sh", "-c", cmd).CombinedOutput()
+		if err != nil {
+			t.Fatalf("sh -c %q: %v: %s", cmd, err, want)
+		}
+		for _, sh := range shells {
+			got, err := exec.Command(sh, "-c", posixCommand(cmd)).CombinedOutput()
+			if err != nil || string(got) != string(want) {
+				t.Errorf("%s -c %s:\n got %q (%v)\nwant %q", filepath.Base(sh), posixCommand(cmd), got, err, want)
+			}
+		}
+	}
+	t.Logf("login shells tried: %v", shells)
 }
