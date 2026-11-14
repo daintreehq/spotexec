@@ -53,6 +53,7 @@ const SpotexecPolicy = `{
       ] },
     { "Effect": "Allow", "Action": "ssm:GetParameter",
       "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/*" },
+    { "Effect": "Allow", "Action": "iam:GetUser", "Resource": "arn:aws:iam::*:user/spotexec/${aws:username}" },
     { "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
       "Condition": { "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } } },
     { "Effect": "Allow", "Action": [
@@ -169,8 +170,16 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 	// Does the profile already hold a working key for a spotexec user? Then
 	// keep that user, even if this machine's hostname has changed since.
 	var existing *awsCreds
+	profAcct, profARN := "", "" // who the profile signs in as, when it works
 	if c, err := s.resolveProfile(ctx, s.Profile); err == nil {
-		if acct, arn, err := callerIdentity(ctx, s.client(s.Region, staticResolver(c))); err == nil {
+		acct, arn, err := callerIdentity(ctx, s.client(s.Region, staticResolver(c)))
+		if err != nil && !keyRejected(err) {
+			// The key may well work: without knowing its account, replacing
+			// it could swap one account's key for another's.
+			return nil, fmt.Errorf("couldn't check which AWS account profile %q signs in to: %w; nothing was changed, try again", s.Profile, err)
+		}
+		if err == nil {
+			profAcct, profARN = acct, arn
 			cur := ""
 			if i := strings.Index(arn, ":user"+iamUserPath); i >= 0 {
 				cur = arn[i+len(":user"+iamUserPath):]
@@ -189,6 +198,43 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 
 	admin := s.client("us-east-1", &awsCredResolver{profile: s.AdminProfile, envOnly: s.AdminFromEnv})
 	acct, adminARN, adminErr := callerIdentity(ctx, admin)
+	if adminErr == nil && profAcct != "" && profAcct != acct {
+		// Changing anything here would set up a user in one account and
+		// keep (or overwrite) a key for another.
+		return nil, fmt.Errorf("AWS profile %q signs in to account %s (as %s), but your admin session is for account %s (%s); nothing was changed.\n"+
+			"To keep using account %s, sign in to it as an administrator (or pass --admin-profile with a profile for it) and re-run setup. "+
+			"To set up account %s instead, pass --profile with a new profile name (and point the runners at it), or remove the [%s] section from %s first",
+			s.Profile, profAcct, profARN, acct, adminARN, profAcct, acct, s.Profile, res.CredsFile)
+	}
+	// Only an administrator (not the spotexec user itself) can change IAM.
+	isAdmin := adminErr == nil && !strings.Contains(adminARN, ":user"+iamUserPath)
+	if existing != nil && s.UserName == "" {
+		// A profile copied from another machine (a synced ~/.aws) signs in as
+		// that machine's user: this machine gets its own instead, so the two
+		// never share, rotate or revoke each other's keys. The user's tags
+		// are read with the admin session, else with the key itself.
+		reader := admin
+		if !isAdmin {
+			reader = s.client("us-east-1", staticResolver(*existing))
+		}
+		if u, err := getUser(ctx, reader, name); err == nil {
+			if tag := u.Tags[tagMachine]; tag != "" && tag != machine {
+				other := orDash(u.Tags["spotexec-host"])
+				if !isAdmin {
+					return nil, fmt.Errorf("profile %s signs in as IAM user %s, which belongs to another machine (host %s), so this machine needs its own: sign in as an administrator (or pass --admin-profile) and re-run setup, or pass --user %s to share it deliberately", s.Profile, name, other, name)
+				}
+				s.logf("profile %s signs in as IAM user %s, which belongs to another machine (host %s); this machine gets its own user (pass --user %s to share it deliberately). If ~/.aws is synced between machines, give each machine its own --profile", s.Profile, name, other, name)
+				existing, name = nil, s.DefaultName
+				res.Account, res.UserARN, res.AccessKeyID = "", "", ""
+			}
+		} else if isAdmin {
+			return nil, iamHint(fmt.Errorf("IAM user %s: %w", name, err))
+		} else if c := awsCode(err); c != "AccessDenied" && c != "AccessDeniedException" {
+			// A policy from before the key could read its own user is the
+			// one expected refusal; anything else leaves ownership unknown.
+			return nil, fmt.Errorf("couldn't check which machine IAM user %s (profile %s) belongs to: %w", name, s.Profile, err)
+		}
+	}
 	if adminErr != nil {
 		if existing != nil && !s.Rotate {
 			// Already set up; without an admin session the policy just
@@ -288,6 +334,10 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 			continue
 		case existing == nil:
 			return nil, fmt.Errorf("IAM user %s belongs to another machine (host %s); pass a different --user", name, orDash(u.Tags["spotexec-host"]))
+		case tag != "" && s.UserName == "":
+			// The profile signs in as another machine's user and nobody asked
+			// for it by name (checked before asking; never reuse it here).
+			return nil, fmt.Errorf("IAM user %s, which profile %s signs in as, belongs to another machine (host %s); re-run setup to give this machine its own user, or pass --user %s to share it deliberately", name, s.Profile, orDash(u.Tags["spotexec-host"]), name)
 		}
 		s.logf("IAM user %s exists", name)
 		break
@@ -472,6 +522,20 @@ func (s *AWSUserSetup) quota(ctx context.Context, c awsCreds, res *AWSUserSetupR
 			res.Quotas[region] = v.Quota.Value
 		}
 	}
+}
+
+// keyRejected reports whether AWS definitively refused a key (it doesn't
+// exist, was deleted or has expired), as opposed to the call failing.
+func keyRejected(err error) bool {
+	var ce *CredentialError
+	if errors.As(err, &ce) {
+		return true
+	}
+	switch awsCode(err) {
+	case "InvalidClientTokenId", "SignatureDoesNotMatch", "ExpiredToken", "ExpiredTokenException", "UnrecognizedClientException", "AuthFailure":
+		return true
+	}
+	return false
 }
 
 func callerIdentity(ctx context.Context, c *awsClient) (account, arn string, err error) {

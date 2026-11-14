@@ -89,6 +89,21 @@ func allowed(t *testing.T, stmts []policyStatement, action, arn string, ctx map[
 	return false
 }
 
+// allowedIAMSelf checks iam:GetUser with the ${aws:username} policy
+// variable substituted.
+func allowedIAMSelf(t *testing.T, stmts []policyStatement, arn string, ctx map[string]string) bool {
+	var sub []policyStatement
+	for _, st := range stmts {
+		c := st
+		c.Resource = nil
+		for _, r := range st.Resource {
+			c.Resource = append(c.Resource, strings.ReplaceAll(r, "${aws:username}", ctx["aws:username"]))
+		}
+		sub = append(sub, c)
+	}
+	return allowed(t, sub, "iam:GetUser", arn, nil)
+}
+
 // The machine key may only change EC2 resources spotexec created and
 // tagged, and may only tag resources while creating them.
 func TestPolicyScopesMutationsToSpotexecResources(t *testing.T) {
@@ -162,6 +177,10 @@ func TestPolicyScopesMutationsToSpotexecResources(t *testing.T) {
 		}
 	}
 	// Every action the code calls with the machine key is granted somewhere.
+	self := map[string]string{"aws:username": "spotexec-mac"}
+	if !allowedIAMSelf(t, p.Statement, "arn:aws:iam::111122223333:user/spotexec/spotexec-mac", self) || allowedIAMSelf(t, p.Statement, "arn:aws:iam::111122223333:user/spotexec/spotexec-other", self) {
+		t.Error("iam:GetUser must cover exactly the key's own user")
+	}
 	for _, a := range []string{"ec2:DescribeVpcs", "ec2:DescribeSubnets", "ssm:GetParameter", "ecr:GetAuthorizationToken", "servicequotas:GetServiceQuota"} {
 		found := false
 		for _, st := range p.Statement {

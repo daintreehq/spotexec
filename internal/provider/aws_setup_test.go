@@ -41,6 +41,9 @@ type fakeIAM struct {
 	denyCreate  bool
 	propagation map[string]int // new key -> rejections left
 	noVPC       bool
+	foreign     map[string]string            // key -> ARN it signs in as, in another account
+	stsDown     map[string]string            // key -> error code GetCallerIdentity fails with (not a key rejection)
+	selfGetUser string                       // a user's key may GetUser itself (the current policy): "ok", or an error code
 	sgs         map[string]map[string]string // security group id -> tags; "name"/"desc" override spotexec's
 }
 
@@ -65,6 +68,18 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 		if n := f.propagation[key]; n > 0 {
 			f.propagation[key] = n - 1
 			iamErr(403, "InvalidClientTokenId")
+			return
+		}
+		if a, ok := f.foreign[key]; ok {
+			if action != "GetCallerIdentity" {
+				iamErr(403, "AccessDenied")
+				return
+			}
+			fmt.Fprintf(w, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>999988887777</Account><Arn>%s</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>`, a)
+			return
+		}
+		if code := f.stsDown[key]; code != "" {
+			iamErr(403, code)
 			return
 		}
 		isAdmin := key == "AKIADMIN"
@@ -95,7 +110,12 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 			}
 			return
 		}
-		if !isAdmin {
+		if !isAdmin && f.selfGetUser != "" && action == "GetUser" && v.Get("UserName") == f.keys[key].user {
+			if f.selfGetUser != "ok" {
+				iamErr(400, f.selfGetUser)
+				return
+			}
+		} else if !isAdmin {
 			iamErr(403, "AccessDenied")
 			return
 		}
@@ -371,6 +391,109 @@ func TestAWSUserSetupKeepsProfileUser(t *testing.T) {
 	}
 	if !res.AlreadyReady || !strings.HasSuffix(res.UserARN, "/spotexec-oldname") || f.users["spotexec-test"] != nil || f.users["spotexec-oldname"].tags[tagMachine] != testMachine {
 		t.Fatalf("result %+v, users %v", res, f.users)
+	}
+}
+
+// A credentials file copied from another machine signs in as that
+// machine's user: this one gets its own user and key, and the other
+// machine's key is left alone, unless the user is named explicitly.
+func TestAWSUserSetupCopiedCredentials(t *testing.T) {
+	newEnv := func(t *testing.T) (*fakeIAM, *AWSUserSetup, string) {
+		f := &fakeIAM{
+			users: map[string]*fakeUser{"spotexec-mac-a": {path: "/spotexec/", tags: map[string]string{tagMachine: "bbbbbbbb-2222-4333-8444-555555555555", "spotexec-host": "mac-a"}}},
+			keys:  map[string]fakeKey{"AKMACA": {"spotexec-mac-a", "2025-01-01T00:00:00Z"}},
+		}
+		s, creds, _ := newSetupEnv(t, f)
+		os.WriteFile(creds, []byte("[spotexec]\naws_access_key_id = AKMACA\naws_secret_access_key = x\n"), 0o600)
+		return f, s, creds
+	}
+	t.Run("own user", func(t *testing.T) {
+		f, s, creds := newEnv(t)
+		res, err := s.Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.AlreadyReady || !res.KeyCreated || !strings.HasSuffix(res.UserARN, "/spotexec/spotexec-test") || len(res.KeysDeleted) != 0 {
+			t.Fatalf("result %+v", res)
+		}
+		if f.keys["AKMACA"].user != "spotexec-mac-a" || f.users["spotexec-test"].tags[tagMachine] != testMachine {
+			t.Fatalf("keys %v, users %v", f.keys, f.users)
+		}
+		if b, _ := os.ReadFile(creds); !strings.Contains(string(b), "aws_access_key_id = "+res.AccessKeyID) {
+			t.Fatalf("credentials:\n%s", b)
+		}
+	})
+	// Without an administrator, the key reads its own user's tags and setup
+	// refuses to report it ready for this machine.
+	for name, adminKey := range map[string]string{"no admin session": "AKEXPIRED", "profile as admin": "AKMACA"} {
+		t.Run(name, func(t *testing.T) {
+			for selfGetUser, want := range map[string]string{
+				"ok":              "belongs to another machine (host mac-a), so this machine needs its own",
+				"ValidationError": "couldn't check which machine IAM user spotexec-mac-a",
+			} {
+				f, s, creds := newEnv(t)
+				f.selfGetUser = selfGetUser
+				t.Setenv("AWS_ACCESS_KEY_ID", adminKey)
+				before, _ := os.ReadFile(creds)
+				_, err := s.Run(context.Background())
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("%s: err = %v", selfGetUser, err)
+				}
+				if after, _ := os.ReadFile(creds); string(after) != string(before) || f.count("CreateAccessKey") != 0 {
+					t.Fatalf("changed: %s %v", after, f.calls)
+				}
+			}
+		})
+	}
+	t.Run("named explicitly", func(t *testing.T) {
+		f, s, _ := newEnv(t)
+		s.UserName = "spotexec-mac-a"
+		res, err := s.Run(context.Background())
+		if err != nil || !res.AlreadyReady || res.AccessKeyID != "AKMACA" || f.count("CreateAccessKey") != 0 {
+			t.Fatalf("result %+v %v", res, err)
+		}
+	})
+}
+
+// A profile for one account and an admin session for another: setup stops
+// before changing anything.
+func TestAWSUserSetupAccountMismatch(t *testing.T) {
+	f := &fakeIAM{foreign: map[string]string{"AKOTHERACCT": "arn:aws:iam::999988887777:user/spotexec/spotexec-test"}}
+	s, creds, _ := newSetupEnv(t, f)
+	before := "[spotexec]\naws_access_key_id = AKOTHERACCT\naws_secret_access_key = x\n"
+	os.WriteFile(creds, []byte(before), 0o600)
+	_, err := s.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "signs in to account 999988887777") || !strings.Contains(err.Error(), "admin session is for account 111122223333") {
+		t.Fatalf("err = %v", err)
+	}
+	for _, a := range []string{"CreateUser", "PutUserPolicy", "CreateAccessKey", "CreateDefaultVpc", "TagUser"} {
+		if f.count(a) != 0 {
+			t.Fatalf("%s called: %v", a, f.calls)
+		}
+	}
+	if b, _ := os.ReadFile(creds); string(b) != before {
+		t.Fatalf("credentials changed:\n%s", b)
+	}
+}
+
+// A profile whose account can't be determined (STS failing for another
+// reason than a bad key) is not replaced.
+func TestAWSUserSetupProfileAccountUnknown(t *testing.T) {
+	// AccessDenied (e.g. an endpoint policy) doesn't prove the key is bad.
+	for _, code := range []string{"RegionDisabledException", "AccessDenied"} {
+		t.Run(code, func(t *testing.T) {
+			f := &fakeIAM{stsDown: map[string]string{"AKMAYBE": code}}
+			s, creds, _ := newSetupEnv(t, f)
+			before := "[spotexec]\naws_access_key_id = AKMAYBE\naws_secret_access_key = x\n"
+			os.WriteFile(creds, []byte(before), 0o600)
+			_, err := s.Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "couldn't check which AWS account profile") || f.count("CreateUser") != 0 {
+				t.Fatalf("err = %v, calls %v", err, f.calls)
+			}
+			if b, _ := os.ReadFile(creds); string(b) != before {
+				t.Fatalf("credentials changed:\n%s", b)
+			}
+		})
 	}
 }
 
