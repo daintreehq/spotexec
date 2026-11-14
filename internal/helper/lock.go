@@ -136,6 +136,9 @@ type SlotState struct {
 	// SweepSkip) and makes every file that isn't synced pending.
 	Sweep     bool     `json:"sweep,omitempty"`
 	SweepSkip []string `json:"sweep_skip,omitempty"`
+	// VenvsRelocated: the cache dirs' virtualenvs point at this slot
+	// (see relocateVenvs); false for slots hydrated by older helpers.
+	VenvsRelocated bool `json:"venvs_relocated,omitempty"`
 }
 
 func readJSON(path string, v any) error {

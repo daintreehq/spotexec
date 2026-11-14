@@ -181,6 +181,35 @@ check "parallel task results are plain off a terminal" "grep -Eq '^sx: (test|lin
 sed -i.bak 's/^install = "npm ci"/install = "npm ci --no-audit"/' .spotexec.toml && rm -f .spotexec.toml.bak
 "$SX" --json verify >"$WORK/v2.out" 2>"$WORK/v2.err" || true
 check "two slots on a cold cache: one builds, the other hydrates" "grep -q '\"built\":true' $WORK/v2.err && grep -q '\"hydrated\":true' $WORK/v2.err && [ \$(grep -c '\"exit_code\":0' $WORK/v2.err) -ge 3 ]"
+
+echo "== python venv cache, relocated into each slot"
+PYREPO="$WORK/pyrepo"
+mkdir -p "$PYREPO/src/proj" && cd "$PYREPO"
+git init -q && git config user.email t@t && git config user.name t
+echo 'WHERE = __file__' > src/proj/__init__.py
+echo v1 > requirements.lock
+cat > .spotexec.toml <<'EOF'
+version = 1
+[deps]
+lockfiles = ["requirements.lock"]
+install = '''python3 -m venv --without-pip .venv && echo "$PWD/src" > "$(echo .venv/lib/python3*/site-packages)/proj.pth" && printf '#!%s/.venv/bin/python\nimport proj; print(proj.WHERE)\n' "$PWD" > .venv/bin/where && chmod +x .venv/bin/where'''
+cache_dirs = [".venv"]
+EOF
+git add -A && git commit -qm init
+VENV_CHECK='test "$(.venv/bin/where)" = "$SPOTEXEC_WORKSPACE/src/proj/__init__.py" && echo venv-here'
+run "$VENV_CHECK" || true
+check "venv built in the first slot" "ev '\"built\":true' | grep -q . && grep -q venv-here $WORK/last.out"
+VENV_SLOT=$(grep -o '"workspace_slot":[0-9]*' "$WORK/last.err" | head -1 | cut -d: -f2)
+("$SX" -q 'sleep 3' &) ; sleep 0.7
+run "$VENV_CHECK" || true
+check "a .venv hydrated into another slot runs that slot's interpreter and source" "ev '\"hydrated\":true' | grep -q . && grep -q venv-here $WORK/last.out"
+wait
+# Prune the slot that built it: the hydrated copy must not need it.
+docker exec "$NAME" sh -c "rm -rf /home/dev/.cache/spotexec/repos/pyrepo-*/slots/slot-0$VENV_SLOT"
+"$SX" --json --same-slot "$VENV_CHECK" >"$WORK/last.out" 2>"$WORK/last.err" || true
+check "...and keeps working once the building slot is gone" "[ -n '$VENV_SLOT' ] && grep -q venv-here $WORK/last.out && ! ev '\"built\":true' | grep -q ."
+cd "$REPO"
+
 ("$SX" -q 'sleep 3' &) ; sleep 1
 "$SX" --json --exclusive 'echo excl' >"$WORK/x.out" 2>"$WORK/x.err" || true
 check "--exclusive waits for running jobs" "grep -q excl $WORK/x.out && grep -q '\"event\":\"queued\"' $WORK/x.err"

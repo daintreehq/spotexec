@@ -67,6 +67,7 @@ With a container, native modules never cross toolchain versions. Without one, pi
 - **Across Spot VMs,** the first VM to install a dependency set uploads it as one compressed archive to a private S3 bucket in your account, `spotexec-cache-<account>-<region>`. The bucket is created on the first `[deps]` run, with S3's default Block Public Access and a 14-day expiry. Without the S3 permissions, set `cache_bucket = "off"`. Later VMs download it instead of installing.
 - **VMs never hold AWS credentials.** The CLI hands each one presigned URLs, and only for a bucket your account owns.
 - **Synced files are never touched.** A tracked file that lives inside a cache dir is left alone by hydration and cache clearing.
+- **Python virtualenvs are relocated.** A virtualenv records the absolute path it was built at (console-script shebangs, `activate`, editable installs of your own packages). When a cached `.venv` (the `uv.lock` preset, or any `cache_dirs` entry holding a `pyvenv.cfg`) is hydrated into another slot or VM, those paths are rewritten to that slot's workspace, so `.venv/bin/pytest` runs the slot's own interpreter against its own source.
 
 ## Baked images
 
