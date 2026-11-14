@@ -4,10 +4,11 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 
 	"github.com/daintreehq/spotexec/internal/cli"
 )
 
 func main() {
-	os.Exit(cli.Main(os.Args[1:]))
+	os.Exit(cli.MainAs(filepath.Base(os.Args[0]), os.Args[1:]))
 }

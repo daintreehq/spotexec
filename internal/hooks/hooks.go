@@ -500,7 +500,7 @@ Prefix test suites, type checkers, linters, formatters and builds with ` + "`sx`
 
 Files changed remotely (formatting, snapshot updates, codegen) are written back
 to this worktree automatically. Keep fast, interactive commands local (git,
-ls, rg, editors, dev servers). Named tasks: ` + "`sx tasks`" + `.
+ls, rg, editors, dev servers). ` + "`sx -h`" + ` lists the flags and this project's named tasks.
 
 Each ` + "`sx`" + ` may land on a different machine. To come back to the one your last
 command used (say, after installing a package there), add ` + "`--same-slot`" + `:

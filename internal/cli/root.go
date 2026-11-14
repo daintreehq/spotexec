@@ -4,11 +4,13 @@ package cli
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
+	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/helper"
 )
 
@@ -31,9 +33,17 @@ var subcommands = map[string]bool{
 	"completion": true, "sim": true, "image": true, "daemon": true, "container": true, "setup": true, "__complete": true, "__completeNoDesc": true,
 }
 
-// Main is the entry point; it returns the process exit code.
-func Main(args []string) int {
+// Main is the entry point for `spotexec`; it returns the process exit code.
+func Main(args []string) int { return MainAs("spotexec", args) }
+
+// MainAs runs as the named binary. As `sx` it only runs things: every word
+// is a command or a task, so none is shadowed by a subcommand, and spotexec's
+// own failures always exit 125.
+func MainAs(name string, args []string) int {
 	helper.Version = Version
+	if name == "sx" {
+		return sxMain(args)
+	}
 	// Shorthand: `sx [run flags] cmd...` and `sx <task>`.
 	if len(args) > 0 && !isHelpFlag(args[0]) {
 		var f runFlags
@@ -90,7 +100,7 @@ func shorthand(f *runFlags, rest []string, dashed bool) int {
 	l, err := load(f.dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "spotexec:", err)
-		return 2
+		return client.ExitInfra
 	}
 	if !dashed {
 		if _, ok := l.cfg.Project.Tasks[rest[0]]; ok {
@@ -143,13 +153,21 @@ func cmdRun() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load(f.dir)
 			if err != nil {
-				return err
+				return infraExit(err)
 			}
 			return exitWith(f.execute(l, runSpec{command: buildCommand(l.ws, args), display: displayOf(args)}))
 		},
 	}
 	c.Flags().SetInterspersed(false)
 	f.register(c.Flags())
+	// A bad flag must not look like the command's own exit 1 or 2.
+	c.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return infraExit(err) })
+	c.Args = func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			return infraExit(fmt.Errorf("missing command"))
+		}
+		return nil
+	}
 	return c
 }
 
@@ -162,7 +180,7 @@ func cmdExec() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load(f.dir)
 			if err != nil {
-				return err
+				return infraExit(err)
 			}
 			f.sync = "none"
 			return exitWith(f.executeLast(l, runSpec{command: buildCommand(l.ws, args), display: displayOf(args), sync: "none"}))
@@ -170,6 +188,14 @@ func cmdExec() *cobra.Command {
 	}
 	c.Flags().SetInterspersed(false)
 	f.register(c.Flags())
+	// A bad flag must not look like the command's own exit 1 or 2.
+	c.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return infraExit(err) })
+	c.Args = func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			return infraExit(fmt.Errorf("missing command"))
+		}
+		return nil
+	}
 	return c
 }
 
@@ -198,4 +224,74 @@ func cmdTasks() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// sxMain is `sx [flags] <command...>` / `sx <task> [args...]`.
+func sxMain(args []string) int {
+	var f runFlags
+	fs := pflag.NewFlagSet("sx", pflag.ContinueOnError)
+	fs.SetInterspersed(false)
+	fs.Usage = func() {}
+	fs.SetOutput(nopWriter{})
+	f.register(fs)
+	help := fs.BoolP("help", "h", false, "show this help")
+	version := fs.Bool("version", false, "print the version")
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "sx: %v (sx -h lists the flags)\n", err)
+		return client.ExitInfra
+	}
+	rest := fs.Args()
+	switch {
+	case *version:
+		fmt.Println("spotexec", Version)
+		return 0
+	case *help || len(rest) == 0 && fs.NFlag() == 0:
+		sxHelp(fs, f.dir)
+		return 0
+	case len(rest) == 0:
+		fmt.Fprintln(os.Stderr, "sx: missing command (sx -h for usage)")
+		return client.ExitInfra
+	}
+	return shorthand(&f, rest, fs.ArgsLenAtDash() == 0)
+}
+
+func sxHelp(fs *pflag.FlagSet, dir string) {
+	fmt.Printf(`sx runs a command from this worktree on a remote runner: it syncs the
+worktree, runs the command there, streams its output, and writes the files it
+changed back here.
+
+Usage:
+  sx [flags] <command> [args...]    sx pnpm test · sx 'pnpm lint && pnpm test'
+  sx [flags] <task> [args...]       a named task from .spotexec.toml
+  sx -s <command>                   again on the same VM and slot as last time
+
+Flags:
+%s
+Exit codes are the command's own; 124 is a timeout and 125 means spotexec
+itself failed. Set up and manage runners with spotexec (setup, init, status,
+doctor, down, …); see spotexec -h.
+`, fs.FlagUsages())
+	if l, err := load(dir); err == nil && len(l.cfg.Project.Tasks) > 0 {
+		names := make([]string, 0, len(l.cfg.Project.Tasks))
+		for n := range l.cfg.Project.Tasks {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		fmt.Println("\nTasks in this project:")
+		for _, n := range names {
+			t := l.cfg.Project.Tasks[n]
+			what := t.Run
+			if len(t.Parallel) > 0 {
+				what = "parallel: " + strings.Join(t.Parallel, ", ")
+			}
+			fmt.Printf("  %-18s %s\n", n, what)
+		}
+	}
+}
+
+// infraExit prints a spotexec error and exits 125, the code reserved for
+// spotexec's own failures on the run path.
+func infraExit(err error) error {
+	fmt.Fprintln(os.Stderr, "spotexec:", err)
+	return exitCode(client.ExitInfra)
 }

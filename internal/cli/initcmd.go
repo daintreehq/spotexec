@@ -248,6 +248,15 @@ func hookBinary() string {
 			}
 		}
 		if !strings.Contains(exe, os.TempDir()) && !strings.Contains(exe, "go-build") {
+			// Started as sx: the hook must call spotexec (sx only runs things).
+			if filepath.Base(exe) == "sx" {
+				if p := filepath.Join(filepath.Dir(exe), "spotexec"); fileExists(p) {
+					return p
+				}
+				if real, err := filepath.EvalSymlinks(exe); err == nil {
+					return real
+				}
+			}
 			return exe
 		}
 	}
@@ -418,4 +427,9 @@ func detectRegion() string {
 func belowLoad(threshold float64) bool {
 	l, err := hooks.LoadPerCPU()
 	return err != nil || l < threshold
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
