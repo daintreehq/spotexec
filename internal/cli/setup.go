@@ -351,14 +351,80 @@ var (
 	typeLine    = regexp.MustCompile(`^\s*type\s*=`)
 )
 
+// tomlLineStarts reports, for each line, whether it begins a new TOML
+// statement: a line inside a multi-line string or a multi-line array or
+// inline table is part of the value before it, whatever it looks like.
+func tomlLineStarts(lines []string) []bool {
+	starts := make([]bool, len(lines))
+	var ml string // the open multi-line string's delimiter, if any
+	depth := 0    // open [ and { in a value
+	for n, line := range lines {
+		starts[n] = ml == "" && depth == 0
+		if starts[n] && anyHeader.MatchString(line) {
+			continue // a table header: its brackets aren't a value's
+		}
+		for i := 0; i < len(line); i++ {
+			c := line[i]
+			if ml != "" {
+				if c == '\\' && ml == `"""` {
+					i++
+					continue
+				}
+				if strings.HasPrefix(line[i:], ml) {
+					i += 2
+					// Up to two more quotes belong to the string ("""a"""").
+					for k := 0; k < 2 && i+1 < len(line) && line[i+1] == ml[0]; k++ {
+						i++
+					}
+					ml = ""
+				}
+				continue
+			}
+			switch c {
+			case '#':
+				i = len(line)
+			case '"', '\'':
+				if d := strings.Repeat(string(c), 3); strings.HasPrefix(line[i:], d) {
+					ml, i = d, i+2
+					continue
+				}
+				for i++; i < len(line) && line[i] != c; i++ {
+					if c == '"' && line[i] == '\\' {
+						i++
+					}
+				}
+			case '[', '{':
+				depth++
+			case ']', '}':
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+	}
+	return starts
+}
+
+// setRunnerProfileText sets the profile line in each named runner's table,
+// leaving every other byte of the file as it was.
 func setRunnerProfileText(text string, runners []string, profile string) (string, error) {
 	want := map[string]bool{}
 	for _, r := range runners {
 		want[r] = true
 	}
 	lines := strings.Split(text, "\n")
+	starts := tomlLineStarts(lines)
 	set := fmt.Sprintf("profile = %q", profile)
+	// next returns the line after the statement that begins at j.
+	next := func(j, end int) int {
+		for j++; j < end && !starts[j]; j++ {
+		}
+		return j
+	}
 	for i := 0; i < len(lines); i++ {
+		if !starts[i] {
+			continue
+		}
 		m := tomlHeader.FindStringSubmatch(lines[i])
 		if m == nil || !want[strings.TrimSpace(m[2])] {
 			continue
@@ -366,32 +432,57 @@ func setRunnerProfileText(text string, runners []string, profile string) (string
 		name := strings.TrimSpace(m[2])
 		end := len(lines)
 		for j := i + 1; j < len(lines); j++ {
-			if anyHeader.MatchString(lines[j]) {
+			if starts[j] && anyHeader.MatchString(lines[j]) {
 				end = j
 				break
 			}
 		}
-		at, insertAfter, hint := -1, -1, -1
+		// Keep CRLF files CRLF: a line's "\r" is its terminator's first half.
+		crlf := strings.Contains(text, "\r\n")
+		eol := func(l string) string {
+			if strings.HasSuffix(l, "\r") {
+				return "\r"
+			}
+			return ""
+		}
+		at, insertAt, hint := -1, -1, -1
 		for j := i + 1; j < end; j++ {
+			if !starts[j] {
+				continue
+			}
 			switch {
 			case profileLine.MatchString(lines[j]):
 				at = j
 			case commented.MatchString(lines[j]) && hint < 0:
 				hint = j
-			case typeLine.MatchString(lines[j]) && insertAfter < 0:
-				insertAfter = j
+			case typeLine.MatchString(lines[j]) && insertAt < 0:
+				insertAt = next(j, end)
 			}
 		}
+		var repl []string
 		switch {
 		case at >= 0:
-			lines[at] = set
+			after := next(at, end)
+			insertAt, repl = at, []string{set + eol(lines[after-1])}
+			lines = append(lines[:at], lines[after:]...)
 		case hint >= 0:
-			lines[hint] = set + "   # set by `spotexec setup`"
+			lines[hint] = set + "   # set by `spotexec setup`" + eol(lines[hint])
 		default:
-			if insertAfter < 0 {
-				insertAfter = i
+			if insertAt < 0 {
+				insertAt = i + 1
 			}
-			lines = append(lines[:insertAfter+1], append([]string{set + "   # set by `spotexec setup`"}, lines[insertAfter+1:]...)...)
+			repl = []string{set + "   # set by `spotexec setup`"}
+			if insertAt < len(lines) {
+				if crlf {
+					repl[0] += "\r"
+				}
+			} else if crlf {
+				lines[insertAt-1] += "\r" // it was the unterminated last line
+			}
+		}
+		if repl != nil {
+			lines = append(lines[:insertAt], append(repl, lines[insertAt:]...)...)
+			starts = tomlLineStarts(lines)
 		}
 		delete(want, name)
 	}

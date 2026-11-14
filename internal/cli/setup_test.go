@@ -52,6 +52,99 @@ host = "me@box"
 	}
 }
 
+// Lines inside multi-line strings and arrays are values, not tables or keys,
+// however they look; everything but the profile line stays as it was.
+func TestSetRunnerProfileTextMultiline(t *testing.T) {
+	in := `version = 1 # "quoted [x]" comment
+
+[runners.aws]   # main
+type = "aws-spot"
+bootstrap_script = """
+[ -f /etc/foo ] && echo "\"" '
+profile = "inside"
+[runners.fake]
+type = "x"
+"""
+user_bootstrap_script = '''
+[ -d ~/.cache ] || mkdir ~/.cache
+# profile = "nope"
+'''
+tags = [
+  ["a", "b"],
+  { k = "[v" },
+]
+region = "us-east-1"
+
+[runners.other]
+type = "aws-spot"
+profile = """
+old"""   # odd but valid
+max_slots = 2
+`
+	out, err := setRunnerProfileText(in, []string{"aws", "other"}, "spotexec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(in, "type = \"aws-spot\"\nbootstrap_script", "type = \"aws-spot\"\nprofile = \"spotexec\"   # set by `spotexec setup`\nbootstrap_script", 1)
+	want = strings.Replace(want, "profile = \"\"\"\nold\"\"\"   # odd but valid\n", "profile = \"spotexec\"\n", 1)
+	if out != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", out, want)
+	}
+	// A runner whose header only appears inside a string isn't there.
+	if _, err := setRunnerProfileText(in, []string{"fake"}, "p"); err == nil {
+		t.Fatal("found a runner inside a string")
+	}
+	// CRLF files stay CRLF.
+	out, err = setRunnerProfileText("[runners.a]\r\ntype = \"aws-spot\"\r\n", []string{"a"}, "p")
+	if err != nil || out != "[runners.a]\r\ntype = \"aws-spot\"\r\nprofile = \"p\"   # set by `spotexec setup`\r\n" {
+		t.Fatalf("got %q %v", out, err)
+	}
+	// ... including ones without a final newline.
+	for in, want := range map[string]string{
+		"[runners.a]\r\ntype = \"aws-spot\"":        "[runners.a]\r\ntype = \"aws-spot\"\r\nprofile = \"p\"   # set by `spotexec setup`",
+		"[runners.a]\r\nprofile = \"old\"":          "[runners.a]\r\nprofile = \"p\"",
+		"[runners.a]\r\nprofile = \"old\"\r\nx = 1": "[runners.a]\r\nprofile = \"p\"\r\nx = 1",
+		"[runners.a]\r\n# profile = \"x\"\r\n":      "[runners.a]\r\nprofile = \"p\"   # set by `spotexec setup`\r\n",
+		"x = 1\r\n[runners.a]":                      "x = 1\r\n[runners.a]\r\nprofile = \"p\"   # set by `spotexec setup`",
+		"[runners.a]\ntype = \"aws-spot\"":          "[runners.a]\ntype = \"aws-spot\"\nprofile = \"p\"   # set by `spotexec setup`",
+	} {
+		if out, err := setRunnerProfileText(in, []string{"a"}, "p"); err != nil || out != want {
+			t.Errorf("setRunnerProfileText(%q) = %q, %v; want %q", in, out, err, want)
+		}
+	}
+}
+
+func TestSetRunnerProfileMultilineReloads(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.toml")
+	t.Setenv("SPOTEXEC_CONFIG", p)
+	in := `version = 1
+default_pool = ["aws"]
+
+[runners.aws]
+type = "aws-spot"
+region = "us-east-1"
+bootstrap_script = """
+[ -f /etc/foo ] && echo hi
+[ -d /opt ] || mkdir /opt
+"""
+instance_types = ["c7a.xlarge"]
+`
+	if err := os.WriteFile(p, []byte(in), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.LoadGlobal(); err != nil {
+		t.Fatalf("fixture doesn't load: %v", err)
+	}
+	if changed, err := setRunnerProfile(p, []string{"aws"}, "spotexec"); err != nil || len(changed) != 1 {
+		t.Fatalf("changed %v, err %v", changed, err)
+	}
+	g, err := config.LoadGlobal()
+	if err != nil || g.Runners["aws"].Profile != "spotexec" || g.Runners["aws"].BootstrapScript != "[ -f /etc/foo ] && echo hi\n[ -d /opt ] || mkdir /opt\n" {
+		t.Fatalf("reloaded %+v, %v", g, err)
+	}
+}
+
 func TestSetRunnerProfileTemplate(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "config.toml")
