@@ -56,7 +56,7 @@ func TestPartDone(t *testing.T) {
 		t.Fatalf("plain: %q", got)
 	}
 	var j syncBuf
-	for _, r := range []Reporter{&jsonReporter{w: &j}, &jsonReporter{w: &j, quiet: true}} {
+	for _, r := range []Reporter{&jsonReporter{w: &j}, &quietReporter{&plainReporter{w: &j}}} {
 		r.PartDone("lint", true)
 	}
 	if j.String() != "" {
@@ -67,5 +67,24 @@ func TestPartDone(t *testing.T) {
 	pr.PartDone("lint", false)
 	if !strings.Contains(pw.String(), "✗") || !strings.Contains(pw.String(), "lint") {
 		t.Fatalf("pretty: %q", pw.String())
+	}
+}
+
+func TestQuietReporterKeepsWarnings(t *testing.T) {
+	old := plainDelay
+	plainDelay = 10 * time.Millisecond
+	defer func() { plainDelay = old }()
+	var w syncBuf
+	q := &quietReporter{&plainReporter{w: &w}}
+	q.Status("aws#1 · booting")
+	time.Sleep(50 * time.Millisecond)
+	q.Event("sync_in", map[string]any{"files": 3})
+	q.Warn("SYNC_CONFLICT", "src/a.ts changed locally; the remote version is in the stash")
+	q.Done("4.1s on aws#1 · exit 0", true)
+	if got := w.String(); got != "sx: warning: src/a.ts changed locally; the remote version is in the stash\n" {
+		t.Fatalf("got %q", got)
+	}
+	if q.IsJSON() {
+		t.Fatal("quiet is not JSON")
 	}
 }

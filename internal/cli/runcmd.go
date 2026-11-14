@@ -58,7 +58,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.StringArrayVar(&f.pull, "pull", nil, "also pull these gitignored paths/globs back after the run (repeatable)")
 	fs.BoolVar(&f.json, "json", false, "NDJSON lifecycle events on stderr (default with SPOTEXEC_AGENT=1)")
 	fs.BoolVar(&f.pretty, "pretty", false, "human spinner output even when not a TTY")
-	fs.BoolVarP(&f.quiet, "quiet", "q", false, "no lifecycle output")
+	fs.BoolVarP(&f.quiet, "quiet", "q", false, "warnings only: no progress or summary")
 	fs.StringVar(&f.eventsFile, "events-file", "", "also append NDJSON events to this file")
 	fs.BoolVar(&f.noDeps, "no-deps", false, "skip dependency hydration")
 	fs.BoolVar(&f.forceLarge, "force-large-sync", false, "allow syncing more than 100k files / 5 GiB")

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -85,9 +86,62 @@ func NewDecider(h config.Hook) (*Decider, error) {
 // simple output filters (`| tail -50`, `| grep FAIL`), which keep running
 // locally on the streamed output. Redirects into files, subshells,
 // background jobs and anything else keep the command local.
+//
+// A pipe binds tighter than && and ;, so in `a && b | tail` only b is
+// filtered. Splitting that across two runs could land them on different
+// machines (b would miss a's build output), so a filtered line offloads only
+// when a single heavy command (after any leading cds) feeds the filters.
 func (d *Decider) ShouldOffload(command string) bool {
-	head, _, ok := splitFilters(command)
-	return ok && d.shouldOffload(head)
+	if shellHazard(command) {
+		return false
+	}
+	head, filters, ok := splitFilters(command)
+	if !ok || !d.shouldOffload(head) {
+		return false
+	}
+	segs, ops := splitList(head)
+	k := 0 // leading cds, which Wrap runs locally
+	for k < len(segs)-1 && isCd(segs[k]) {
+		k++
+	}
+	for _, seg := range segs {
+		if seg == "" {
+			return false // `a;; b`, `a && && b`: bash refuses the line
+		}
+	}
+	if k > 0 && ops[k-1] == "&&" && slices.Contains(ops[k:], ";") {
+		// `cd x && a; b` runs b even when the cd fails; hoisted, the cd
+		// would gate the whole rest of the line.
+		return false
+	}
+	if filters != "" && len(segs)-k > 1 {
+		return false
+	}
+	return true
+}
+
+// shellHazard reports shell syntax the splitters don't model: a comment
+// (which could hide an operator) or a backslash escape outside quotes.
+func shellHazard(c string) bool {
+	var q byte
+	for i := 0; i < len(c); i++ {
+		ch := c[i]
+		switch {
+		case q == '"' && ch == '\\':
+			i++
+		case q != 0:
+			if ch == q {
+				q = 0
+			}
+		case ch == '\'' || ch == '"':
+			q = ch
+		case ch == '\\':
+			return true
+		case ch == '#' && (i == 0 || c[i-1] == ' ' || c[i-1] == '\t'):
+			return true
+		}
+	}
+	return false
 }
 
 // outputFilter matches commands that only transform text on stdin.
@@ -190,6 +244,11 @@ func (d *Decider) shouldOffload(command string) bool {
 			continue
 		}
 		if cdSeg.MatchString(seg) {
+			if heavy {
+				// Offloaded, this cd would happen only remotely: the
+				// agent's shell would stay where it was.
+				return false
+			}
 			continue
 		}
 		matched := false
@@ -221,15 +280,95 @@ func splitSegments(c string) []string {
 	return strings.Split(c, "\x00")
 }
 
-// Wrap returns the offloaded form of command. Trailing output filters stay
-// local, reading the remote command's streamed output; spotexec's own
-// progress is silenced so it can't mix into what they read.
+// Wrap returns the offloaded form of command, meaning the same as the
+// original line:
+//   - leading `cd`s run locally, so the agent's shell (and any local filter
+//     such as `tee out.log`) ends up where it asked; spotexec then runs the
+//     rest from that directory, which maps to the same remote one;
+//   - trailing output filters stay local, reading the remote command's
+//     streamed output (ShouldOffload lets only one command feed them);
+//   - spotexec's own warnings and summary go to stderr, outside the pipe.
+//
+// It expects a line ShouldOffload accepted.
 func Wrap(bin, command string) string {
 	head, filters, ok := splitFilters(command)
-	if ok && filters != "" {
-		return bin + " run -q -- " + shellQuote(head) + " | " + filters
+	if !ok {
+		head, filters = strings.TrimSpace(command), ""
 	}
-	return bin + " run -- " + shellQuote(command)
+	segs, ops := splitList(head)
+	run := func(segs, ops []string) string { return bin + " run -- " + shellQuote(joinList(segs, ops)) }
+	var b strings.Builder
+	i := 0
+	for ; i < len(segs)-1 && isCd(segs[i]); i++ {
+		b.WriteString(segs[i] + listOp(ops[i]))
+	}
+	segs, ops = segs[i:], ops[i:]
+	if filters == "" {
+		b.WriteString(run(segs, ops))
+		return b.String()
+	}
+	b.WriteString(run(segs, ops) + " | " + filters)
+	return b.String()
+}
+
+func isCd(seg string) bool {
+	return cdSeg.MatchString(strings.TrimSpace(envSeg.ReplaceAllString(seg, "")))
+}
+
+// splitList splits a command list at unquoted "&&" and ";" (the only list
+// operators ShouldOffload lets through), returning the trimmed segments and
+// the operators between them.
+func splitList(c string) (segs, ops []string) {
+	var q rune
+	start := 0
+	for i := 0; i < len(c); i++ {
+		ch := rune(c[i])
+		switch {
+		case q != 0:
+			if ch == q {
+				q = 0
+			} else if ch == '\\' && q == '"' {
+				i++
+			}
+		case ch == '\'' || ch == '"':
+			q = ch
+		case ch == '\\':
+			i++
+		case ch == ';' || ch == '&' && i+1 < len(c) && c[i+1] == '&':
+			segs = append(segs, strings.TrimSpace(c[start:i]))
+			op := ";"
+			if ch == '&' {
+				op = "&&"
+				i++
+			}
+			ops = append(ops, op)
+			start = i + 1
+		}
+	}
+	segs = append(segs, strings.TrimSpace(c[start:]))
+	// A trailing ";" ends the list without starting another command.
+	if len(segs) > 1 && segs[len(segs)-1] == "" && ops[len(ops)-1] == ";" {
+		segs, ops = segs[:len(segs)-1], ops[:len(ops)-1]
+	}
+	return segs, ops
+}
+
+func listOp(op string) string {
+	if op == ";" {
+		return "; "
+	}
+	return " " + op + " "
+}
+
+func joinList(segs, ops []string) string {
+	var b strings.Builder
+	for i, s := range segs {
+		if i > 0 {
+			b.WriteString(listOp(ops[i-1]))
+		}
+		b.WriteString(s)
+	}
+	return b.String()
 }
 
 func shellQuote(s string) string {

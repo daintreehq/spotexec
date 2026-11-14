@@ -142,8 +142,10 @@ func TestParallelTasksFallBackLocally(t *testing.T) {
 	if strings.Contains(stderr, "\x1b") {
 		t.Errorf("ANSI in plain output: %q", stderr)
 	}
-	if _, stderr := runMain(t, "sx", "-C", dir, "-q", "--fallback-local", "--queue-timeout", "5s", "v"); strings.Contains(stderr, "sx: ") {
+	if _, stderr := runMain(t, "sx", "-C", dir, "-q", "--fallback-local", "--queue-timeout", "5s", "v"); strings.Contains(stderr, "sx: l · ") || strings.Contains(stderr, "sx: t · ") {
 		t.Errorf("quiet mode printed results: %q", stderr)
+	} else if !strings.Contains(stderr, "sx: warning: ") {
+		t.Errorf("quiet mode dropped the fallback warning: %q", stderr)
 	}
 	// Without fallback, the same task fails with 125, and parts that never
 	// reached a runner don't claim one.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,6 +24,7 @@ func TestShouldOffload(t *testing.T) {
 		"pytest /Users/me/dev/app/tests", "pnpm test 2>&1", "cd pkg && go test ./... 2>&1", "pnpm vitest run src/watch.test.ts", "./gradlew test", "mvn -q verify",
 		"pnpm test | tee out.txt", "pnpm test 2>&1 | tail -50", "cargo test 2>&1 | grep -E 'FAIL|panicked' | head -20",
 		"go test ./... | grep -v '^ok'", "pytest -q 2>&1 | tail -n 30",
+		"cd packages/api && pnpm test | tee test.log", "pytest -k 'a#b' | tail", "pytest issue#3",
 	}
 	no := []string{
 		"git status", "ls -la", "rg foo", "pnpm dev", "pnpm vitest --watch", "pnpm test | xargs echo",
@@ -48,11 +50,85 @@ func TestShouldOffload(t *testing.T) {
 func TestWrapKeepsFiltersLocal(t *testing.T) {
 	for in, want := range map[string]string{
 		"pnpm test":                         "sx run -- 'pnpm test'",
-		"pnpm test 2>&1 | tail -50":         "sx run -q -- 'pnpm test 2>&1' | tail -50",
-		"cargo test | grep -E 'FAIL|panic'": "sx run -q -- 'cargo test' | grep -E 'FAIL|panic'",
+		"pnpm test && pnpm lint":            "sx run -- 'pnpm test && pnpm lint'",
+		"pnpm test 2>&1 | tail -50":         "sx run -- 'pnpm test 2>&1' | tail -50",
+		"cargo test | grep -E 'FAIL|panic'": "sx run -- 'cargo test' | grep -E 'FAIL|panic'",
+		"pytest -k 'a;b' | tail":            `sx run -- 'pytest -k '\''a;b'\''' | tail`,
+		"pnpm test;":                        "sx run -- 'pnpm test'",
+		"cd pkg; pnpm test && pnpm lint;":   "cd pkg; sx run -- 'pnpm test && pnpm lint'",
 	} {
 		if got := Wrap("sx", in); got != want {
 			t.Errorf("Wrap(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A rewritten line means what the original meant: cds stay local (the
+// agent's shell and local filters land where it asked), and a pipe filters
+// only the command right before it, as in bash.
+func TestWrapPreservesShellSemantics(t *testing.T) {
+	for in, want := range map[string]string{
+		"cd packages/api && pnpm test | tee test.log": "cd packages/api && sx run -- 'pnpm test' | tee test.log",
+		"cd packages/api && pnpm test":                "cd packages/api && sx run -- 'pnpm test'",
+		"cd pkg; go test ./... 2>&1":                  "cd pkg; sx run -- 'go test ./... 2>&1'",
+		"cd a && cd b && pnpm test":                   "cd a && cd b && sx run -- 'pnpm test'",
+		"cd api && CI=1 pnpm lint 2>&1 | grep error":  "cd api && sx run -- 'CI=1 pnpm lint 2>&1' | grep error",
+	} {
+		if got := Wrap("sx", in); got != want {
+			t.Errorf("Wrap(%q) = %q, want %q", in, got, want)
+		}
+	}
+	d, _ := NewDecider(config.Hook{})
+	for _, c := range []string{
+		// Offloaded, the second cd would only happen remotely.
+		"pnpm build && cd pkg && pnpm test", "go vet ./... && cd sub && go test | tail",
+		// Only lint is filtered; as two runs, lint could miss build's output.
+		"pnpm test && pnpm lint | tail -50", "pnpm build; pnpm test | tail",
+		// A comment can hide an operator; escapes aren't modelled.
+		// Hoisted, the cd would also gate lint.
+		"cd missing && pnpm test; pnpm lint",
+		// bash refuses these without running anything.
+		"prettier --write .;;", "pnpm test && && pnpm lint", "pnpm test &&",
+		"pnpm test # off: ; pnpm format | tail -50", "pnpm test foo\\ ; pnpm lint", "pnpm test \\| tail",
+	} {
+		if d.ShouldOffload(c) {
+			t.Errorf("expected local: %q", c)
+		}
+	}
+}
+
+// The rewritten line must sequence, filter and change directory like the
+// original. Run both under sh, with shell functions standing in for the
+// heavy commands and for spotexec (which runs its snippet in a subshell from
+// the current directory, as the remote side does).
+func TestWrapRunsLikeOriginal(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	const fns = `oktest() { echo test-ran; }; failtest() { echo test-failed; return 3; }; oklint() { echo lint-ran; }; `
+	for _, line := range []string{
+		"cd sub && oktest | tee out.log",
+		"cd sub; failtest 2>&1 | grep test",
+		"cd sub && oktest && oklint",
+		"cd missing && failtest && oklint",
+		"cd missing; oktest; oklint",
+		"cd sub && cd missing; oktest && oklint",
+		"cd missing && oktest | tee out.log",
+	} {
+		run := func(cmdline string) string {
+			dir := t.TempDir()
+			os.Mkdir(filepath.Join(dir, "sub"), 0o755)
+			script := fns + `fakesx() { shift 2; (eval "$1"); }
+` + cmdline + `
+echo "status=$? pwd=${PWD##*/}"; ls -R`
+			c := exec.Command("sh", "-c", script)
+			c.Dir = dir
+			out, _ := c.CombinedOutput()
+			return strings.ReplaceAll(string(out), filepath.Base(dir), "ROOT")
+		}
+		wrapped := Wrap("fakesx", line)
+		if want, got := run(line), run(wrapped); got != want {
+			t.Errorf("%q -> %q\ngot:  %q\nwant: %q", line, wrapped, got, want)
 		}
 	}
 }

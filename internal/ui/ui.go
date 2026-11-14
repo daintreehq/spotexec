@@ -79,7 +79,7 @@ func New(mode Mode, w *os.File, eventsFile string) (Reporter, error) {
 	case ModeJSON:
 		return &jsonReporter{w: w, extra: extra}, nil
 	case ModeQuiet:
-		return &jsonReporter{w: io.Discard, extra: extra, quiet: true}, nil
+		return &quietReporter{&plainReporter{w: w, extra: extra}}, nil
 	}
 	p := &prettyReporter{w: w, extra: extra}
 	return p, nil
@@ -89,7 +89,6 @@ type jsonReporter struct {
 	mu    sync.Mutex
 	w     io.Writer
 	extra io.Writer
-	quiet bool
 }
 
 func (j *jsonReporter) Event(name string, fields map[string]any) {
@@ -110,7 +109,7 @@ func (j *jsonReporter) Status(string, ...any) {}
 func (j *jsonReporter) Clear()                {}
 func (j *jsonReporter) Done(string, bool)     {}
 func (j *jsonReporter) PartDone(string, bool) {}
-func (j *jsonReporter) IsJSON() bool          { return !j.quiet }
+func (j *jsonReporter) IsJSON() bool          { return true }
 func (j *jsonReporter) Warn(code, format string, args ...any) {
 	j.Event("warning", map[string]any{"code": code, "message": fmt.Sprintf(format, args...)})
 }
@@ -444,3 +443,11 @@ func (p *plainReporter) PartDone(summary string, ok bool) {
 }
 
 func (p *plainReporter) IsJSON() bool { return false }
+
+// quietReporter (-q) drops progress and the summary but keeps warnings: a
+// write-back conflict, a timeout or a local fallback is never silent.
+type quietReporter struct{ *plainReporter }
+
+func (quietReporter) Status(string, ...any) {}
+func (quietReporter) Done(string, bool)     {}
+func (quietReporter) PartDone(string, bool) {}
