@@ -23,6 +23,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/helper"
 	"github.com/daintreehq/spotexec/internal/helperbin"
 	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 	"github.com/daintreehq/spotexec/internal/transport"
 	"github.com/daintreehq/spotexec/internal/ui"
@@ -156,14 +157,11 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		}
 		slots, load, mem, idle := "-", "-", "-", "-"
 		if h := s.Helper; h != nil {
-			max := s.r.MaxSlots
-			if max == 0 {
-				max = h.CPUs / 4
-				if max < 1 {
-					max = 1
-				}
+			n := s.r.MaxSlots
+			if n == 0 {
+				n = min(max(h.CPUs/4, 1), protocol.MaxSlots)
 			}
-			slots = fmt.Sprintf("%d/%d", len(h.Holders), max)
+			slots = fmt.Sprintf("%d/%d", len(h.Holders), n)
 			if h.CPUs > 0 && h.Load1 > 0 {
 				load = fmt.Sprintf("%.1f/%d", h.Load1, h.CPUs)
 			}
@@ -193,6 +191,10 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		for _, h := range s.Helper.Holders {
 			age := time.Since(time.UnixMilli(h.StartedAt)).Round(time.Second)
 			fmt.Fprintf(w, "  %s slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Token, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
+		}
+		for _, h := range s.Helper.Waiters {
+			age := time.Since(time.UnixMilli(h.StartedAt)).Round(time.Second)
+			fmt.Fprintf(w, "  %s waiting for workspace slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Slot, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
 		}
 	}
 }

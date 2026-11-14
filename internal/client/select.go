@@ -385,14 +385,15 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 }
 
 // slotsOf is a runner's slots per machine as the helper will compute it:
-// max_slots, or (unset) vCPUs / 4, at least 1. For AWS the vCPUs are known
-// from the instance type; otherwise 4 until the runner reports.
+// max_slots, or (unset) vCPUs / 4, at least 1, at most protocol.MaxSlots.
+// For AWS the vCPUs are known from the instance type; otherwise 4 until the
+// runner reports.
 func slotsOf(r *config.Runner) int {
 	if r.MaxSlots > 0 {
 		return r.MaxSlots
 	}
 	if r.Type == config.TypeAWSSpot && len(r.InstanceTypes) > 0 {
-		return max(1, provider.VCPUsOf(r.InstanceTypes[0])/4)
+		return min(max(1, provider.VCPUsOf(r.InstanceTypes[0])/4), protocol.MaxSlots)
 	}
 	return 4
 }

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // Duration is a time.Duration that decodes from TOML strings like "5m".
@@ -329,9 +331,8 @@ func (r *Runner) validate() error {
 			return fmt.Errorf("invalid host %q", h)
 		}
 	}
-	if r.MaxSlots < 0 || r.MaxSlots > 44 {
-		// SPOTEXEC_PORT_BASE = 20000 + slot*1000 must stay a valid port.
-		return fmt.Errorf("max_slots must be between 1 and 44 (got %d)", r.MaxSlots)
+	if r.MaxSlots < 0 || r.MaxSlots > protocol.MaxSlots {
+		return fmt.Errorf("max_slots must be between 1 and %d (got %d)", protocol.MaxSlots, r.MaxSlots)
 	}
 	for name, d := range map[string]Duration{"idle_timeout": r.IdleTimeout, "max_lifetime": r.MaxLifetime, "boot_timeout": r.BootTimeout, "boot_delay": r.BootDelay} {
 		if d.Duration < 0 {

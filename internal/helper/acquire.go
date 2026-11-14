@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,12 +19,10 @@ import (
 
 var repoIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,80}$`)
 
-func autoSlots() int {
-	n := runtime.NumCPU() / 4
-	if n < 1 {
-		n = 1
-	}
-	return n
+// autoSlots is the slot count without max_slots: vCPUs / 4, within the
+// same bounds as an explicit max_slots.
+func autoSlots(cpus int) int {
+	return min(max(cpus/4, 1), protocol.MaxSlots)
 }
 
 func (s *Session) acquire(a protocol.Acquire) (err error) {
@@ -79,19 +79,34 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	}
 	max := a.MaxSlots
 	if max <= 0 {
-		max = autoSlots()
+		max = autoSlots(runtime.NumCPU())
 	}
-	if max > 99 {
-		max = 99
+	max = min(max, protocol.MaxSlots)
+	// exec, pull and --same-slot need one exact workspace.
+	only := a.OnlySlot && a.PreferSlot >= 1
+	if only && a.PreferSlot > max {
+		return perr(protocol.CodeBadRequest, "workspace slot %d no longer exists: this runner now has %d slots (max_slots)", a.PreferSlot, max)
 	}
 	start := time.Now()
 	deadline := start.Add(time.Duration(a.QueueMS) * time.Millisecond)
 	lastNotice := time.Time{}
 	holder := protocol.Holder{RepoID: a.RepoID, Client: a.Client, StartedAt: time.Now().UnixMilli(), HelperPID: os.Getpid()}
+	waiter := &slotWaiter{}
+	defer waiter.done()
 
 	// Tokens bound host-wide concurrency; their index drives SPOTEXEC_SLOT
 	// and port offsets so different repos never collide on ports either.
+	// A run that needs one exact workspace waits for it holding nothing,
+	// then takes a token and the workspace together: waiting must not use
+	// up capacity other runs could have (or make the runner look full).
+capacity:
 	for {
+		if only {
+			busy, err := s.waitForSlot(a, waiter, holder, deadline, &lastNotice)
+			if err != nil || busy {
+				return err
+			}
+		}
 		how := syscall.LOCK_SH
 		if a.Exclusive {
 			how = syscall.LOCK_EX
@@ -108,7 +123,13 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 			}
 			if ok {
 				s.gate = gate
-				break
+				if ok, err := s.takeOnlySlot(a, only, &holder); err != nil || ok {
+					if err != nil {
+						return err
+					}
+					break capacity
+				}
+				continue
 			}
 			gate.Unlock()
 		} else if gotGate {
@@ -133,7 +154,13 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 			}
 			if len(s.tokens) > 0 {
 				s.gate = gate
-				break
+				if ok, err := s.takeOnlySlot(a, only, &holder); err != nil || ok {
+					if err != nil {
+						return err
+					}
+					break capacity
+				}
+				continue
 			}
 			gate.Unlock()
 		}
@@ -148,6 +175,11 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 		}
 		if s.clientGone() {
 			return perr(protocol.CodeInternal, "client went away while queued")
+		}
+		if only {
+			w := holder
+			w.Slot = a.PreferSlot
+			waiter.register(s.layout, w)
 		}
 		if time.Since(lastNotice) > 2*time.Second {
 			lastNotice = time.Now()
@@ -198,16 +230,6 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 		order = append(order, c.n)
 	}
 	slotDeadline := time.Now().Add(30 * time.Second)
-	only := a.OnlySlot && a.PreferSlot >= 1 && a.PreferSlot <= max
-	if only {
-		// exec, pull and --same-slot need that exact workspace: wait for it
-		// (as long as the queue allows) rather than take another.
-		order = []int{a.PreferSlot}
-		slotDeadline = deadline
-		if a.QueueMS <= 0 {
-			slotDeadline = time.Now().Add(24 * time.Hour)
-		}
-	}
 	for s.slotLock == nil {
 		for _, n := range order {
 			dir := s.layout.Slot(a.RepoID, n)
@@ -224,21 +246,7 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 		if s.slotLock == nil {
 			// Otherwise only possible if max_slots differs between clients.
 			if time.Now().After(slotDeadline) {
-				if only {
-					return perr(protocol.CodeQueueTimeout, "workspace slot %d stayed busy for %s", a.PreferSlot, time.Since(start).Round(time.Second))
-				}
 				return perr(protocol.CodeQueueTimeout, "no free workspace slot for repo %s", a.RepoID)
-			}
-			if only {
-				if s.clientGone() {
-					return perr(protocol.CodeInternal, "client went away while queued")
-				}
-				if time.Since(lastNotice) > 2*time.Second {
-					lastNotice = time.Now()
-					if err := s.c.Send(protocol.TypeWaiting, protocol.Waiting{Holders: readHolders(s.layout)}); err != nil {
-						return err
-					}
-				}
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
@@ -369,4 +377,143 @@ func highestToken(l Layout) int {
 		}
 	}
 	return n
+}
+
+// waitForSlot waits, holding nothing, until the exact workspace slot an
+// exec, pull or --same-slot run needs is free. busy: it was taken and the
+// request doesn't wait (Busy was sent).
+func (s *Session) waitForSlot(a protocol.Acquire, w *slotWaiter, h protocol.Holder, deadline time.Time, lastNotice *time.Time) (busy bool, err error) {
+	lock := filepath.Join(s.layout.Slot(a.RepoID, a.PreferSlot), ".lock")
+	if a.QueueMS <= 0 {
+		deadline = time.Now().Add(24 * time.Hour)
+	}
+	for isHeld(lock) {
+		if !a.Wait {
+			return true, s.c.Send(protocol.TypeBusy, protocol.Busy{Holders: readHolders(s.layout)})
+		}
+		if time.Now().After(deadline) {
+			return false, perr(protocol.CodeQueueTimeout, "workspace slot %d stayed busy for %s", a.PreferSlot, time.Since(time.UnixMilli(h.StartedAt)).Round(time.Second))
+		}
+		if draining(s.layout.Root) {
+			return false, perr(protocol.CodeDraining, "runner is draining")
+		}
+		if s.clientGone() {
+			return false, perr(protocol.CodeInternal, "client went away while queued")
+		}
+		h.Slot = a.PreferSlot
+		w.register(s.layout, h)
+		if time.Since(*lastNotice) > 2*time.Second {
+			*lastNotice = time.Now()
+			if err := s.c.Send(protocol.TypeWaiting, protocol.Waiting{Holders: readHolders(s.layout)}); err != nil {
+				return false, err
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false, nil
+}
+
+// takeOnlySlot runs with capacity (token and gate) just taken. For a run
+// that needs one exact workspace it takes that slot too; if another run got
+// there first, the capacity is given back and ok is false (wait again).
+// Other runs pick their slot afterwards.
+func (s *Session) takeOnlySlot(a protocol.Acquire, only bool, h *protocol.Holder) (bool, error) {
+	if !only {
+		return true, nil
+	}
+	dir := s.layout.Slot(a.RepoID, a.PreferSlot)
+	l, ok, err := tryLock(filepath.Join(dir, ".lock"))
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		s.slotLock, s.slotDir = l, dir
+		h.Slot = a.PreferSlot
+		return true, nil
+	}
+	s.releaseCapacity()
+	return false, nil
+}
+
+// releaseCapacity gives back the tokens and gate taken so far.
+func (s *Session) releaseCapacity() {
+	if s.stopping.Load() {
+		select {} // Shutdown is releasing everything and will exit
+	}
+	s.relMu.Lock()
+	defer s.relMu.Unlock()
+	for _, t := range s.tokens {
+		t.Unlock()
+	}
+	s.tokens = nil
+	s.gate.Unlock()
+	s.gate = nil
+}
+
+// slotWaiter records a run waiting for its exact workspace slot (which
+// holds no token while it waits), so status can show it: a JSON file under
+// waiters/, locked for as long as the run waits.
+type slotWaiter struct {
+	l    *flock
+	path string
+}
+
+func (w *slotWaiter) register(l Layout, h protocol.Holder) {
+	if w.l != nil {
+		return
+	}
+	dir := filepath.Join(l.Root, "waiters")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	path := filepath.Join(dir, strconv.Itoa(os.Getpid())+".json")
+	if writeJSON(path, h) != nil {
+		return
+	}
+	lk, ok, err := tryLock(path)
+	if err != nil || !ok {
+		os.Remove(path)
+		return
+	}
+	w.l, w.path = lk, path
+}
+
+func (w *slotWaiter) done() {
+	if w.l != nil {
+		os.Remove(w.path)
+		w.l.Unlock()
+		w.l = nil
+	}
+}
+
+// readWaiters lists runs currently waiting for a specific workspace slot.
+func readWaiters(l Layout) []protocol.Holder {
+	var out []protocol.Holder
+	ents, _ := os.ReadDir(filepath.Join(l.Root, "waiters"))
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(l.Root, "waiters", e.Name())
+		var h protocol.Holder
+		if heldFile(path) && readJSON(path, &h) == nil {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// heldFile reports whether someone holds a lock on an existing file
+// (without creating it, unlike isHeld).
+func heldFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return errors.Is(err, syscall.EWOULDBLOCK)
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return false
 }

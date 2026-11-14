@@ -62,7 +62,7 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `type` | (required) | `ssh` or `aws-spot` (`sim` is the local simulator; see [Development](development.md)). |
-| `max_slots` | vCPUs ÷ 4, at least 1 | Concurrent jobs per machine (1–44). |
+| `max_slots` | vCPUs ÷ 4, between 1 and 44 | Concurrent jobs per machine (1–44: each slot gets its own range of 1000 ports). |
 | `priority` | `0` | Lower runs first. Later runners in the pool only take overflow. |
 | `work_root` | `~/.cache/spotexec` | Where slots, caches and the helper live on the runner. |
 | `remote_path_setup` | (none) | Shell run before each command, after the login profile (for example `PATH` for mise or nvm). Not used inside a [project container](environments.md#project-containers). |

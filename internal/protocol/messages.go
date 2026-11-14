@@ -29,6 +29,11 @@ const (
 	TypeImageResult = "image_result"
 )
 
+// MaxSlots caps slots per machine, explicit (max_slots) or automatic
+// (vCPUs / 4): each slot gets a 1000-port range at SPOTEXEC_PORT_BASE =
+// 20000 + slot*1000, which must stay a valid port.
+const MaxSlots = 44
+
 // Error codes carried by ErrorMsg.Code.
 const (
 	CodeDraining     = "RUNNER_DRAINING"
