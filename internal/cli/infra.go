@@ -777,7 +777,7 @@ func cmdSyncPlan() *cobra.Command {
 			}
 			p := l.cfg.Project
 			t := time.Now()
-			m, err := manifest.Build(cmd.Context(), manifest.Options{Root: l.ws.Root, Exclude: p.Sync.Exclude, Source: p.Sync.Source, Protect: p.Deps.CacheDirs})
+			m, err := manifest.Build(cmd.Context(), client.ManifestOptions(l.ws.Root, p))
 			if err != nil {
 				return err
 			}

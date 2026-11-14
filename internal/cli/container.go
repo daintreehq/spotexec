@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -104,14 +103,10 @@ func containerInit(ws *client.Workspace, rel string, force bool) error {
 	}
 	fmt.Println(msg)
 
-	// Files under .spotexec/ (and other built-in excludes) only sync once Git
-	// tracks them; stage the new Dockerfile so the first build can see it.
-	if ws.GitDir != "" {
-		if out, err := exec.Command("git", "-C", ws.Root, "add", "--", rel).CombinedOutput(); err != nil {
-			fmt.Printf("could not `git add %s` (%v: %s); add it yourself so it syncs\n", rel, err, strings.TrimSpace(string(out)))
-		} else {
-			fmt.Printf("staged %s (git add) so it syncs; commit it with the project\n", rel)
-		}
+	// The configured Dockerfile and its build context sync whether or not
+	// Git tracks them; committing it shares the image with the team.
+	if ws.Git {
+		fmt.Printf("commit %s with the project so everyone runs in the same image\n", rel)
 	}
 	fmt.Println("next: edit the Dockerfile, then `spotexec container build -r <runner>` to build it (and, on AWS, push it to ECR)")
 	return nil

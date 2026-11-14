@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -38,6 +39,12 @@ var BuiltinExcludes = []string{
 	".spotexec-tmp-*",
 }
 
+// NeverSync is never synced from untracked/non-Git sources, not even where
+// Options.Include lifts the built-in excludes: spotexec's own state in a
+// non-Git project's .spotexec/ (write-back lock, stashed conflicts). It is
+// matched case-insensitively, as macOS and Windows filesystems resolve it.
+var NeverSync = []string{"/.spotexec/conflicts/", "/.spotexec/writeback.lock"}
+
 var textAttr = regexp.MustCompile(`(^|\s)-?(text|crlf)(=|\s|$)`)
 
 // HeavyDirs are skipped by the remote post-run walk (they are build outputs
@@ -53,6 +60,13 @@ type Options struct {
 	Exclude []string // [sync].exclude patterns
 	Source  string   // "", "git" or "directory"
 	Protect []string // cache dirs never synced (deps.cache_dirs)
+	// Include lists repo-relative files and directories synced even where
+	// a built-in exclude covers them, Git or not: the container's
+	// Dockerfile, its .dockerignore and its build context (.spotexec/ by
+	// default). Below a directory listed here only the built-in excludes
+	// that match inside it apply. [sync].exclude still applies, and
+	// NeverSync always does.
+	Include []string
 }
 
 // Manifest is the local working set.
@@ -66,6 +80,7 @@ type Manifest struct {
 	Bytes       int64
 	Excluded    map[string]int // pattern/reason -> count, for sync-plan
 	Matcher     *ignore.Matcher
+	spot        *spotExcluder // spotexec's own excludes, with Include applied
 }
 
 // Build enumerates and hashes the working set.
@@ -81,7 +96,8 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		user.Add("/" + strings.Trim(strings.TrimPrefix(p, "./"), "/") + "/")
 	}
 	m.Matcher = user
-	builtin := ignore.New(BuiltinExcludes...)
+	builtin := newSpotExcluder(o.Include)
+	m.spot = builtin
 
 	useGit := o.Source != "directory" && isGitWorktree(ctx, o.Root)
 	if o.Source == "git" && !useGit {
@@ -147,8 +163,9 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 			cands = append(cands, cand{path: p})
 		}
 	} else {
-		dirMatcher := ignore.New(BuiltinExcludes...)
-		_ = dirMatcher.AddFile(filepath.Join(o.Root, ".gitignore"))
+		gitignore := ignore.New()
+		_ = gitignore.AddFile(filepath.Join(o.Root, ".gitignore"))
+		dirMatcher := orMatch{builtin, gitignore}
 		err := filepath.WalkDir(o.Root, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -173,6 +190,50 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		})
 		if err != nil {
 			return nil, err
+		}
+	}
+	// The container's build inputs: the Dockerfile and .dockerignore, and
+	// every file in the build context, are needed to build the image. Sync
+	// them even when Git ignores them (git status doesn't list them) or
+	// they sit in a built-in excluded directory such as .spotexec/.
+	listed := make(map[string]bool, len(cands))
+	for _, c := range cands {
+		listed[c.path] = true
+	}
+	add := func(p string) {
+		if !listed[p] && !user.Match(p, false) && !builtin.Match(p, false) {
+			cands = append(cands, cand{path: p})
+			listed[p] = true
+		}
+	}
+	for _, r := range builtin.include {
+		full, err := fsid.SafeJoin(o.Root, r)
+		if err != nil {
+			continue
+		}
+		fi, err := os.Lstat(full)
+		switch {
+		case err != nil:
+		case fi.Mode().IsRegular() || fi.Mode()&fs.ModeSymlink != 0:
+			add(r)
+		case fi.IsDir():
+			err := filepath.WalkDir(full, func(p string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				rel := path.Join(r, filepath.ToSlash(must(filepath.Rel(full, p))))
+				if d.IsDir() {
+					if p != full && (builtin.Match(rel, true) || user.Match(rel, true) || isNestedRepo(p)) {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				add(rel)
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -446,17 +507,20 @@ func (m *Manifest) CheckIgnored(ctx context.Context, paths []string) (map[string
 	if len(rest) == 0 {
 		return ign, nil
 	}
+	builtin := m.spot
+	if builtin == nil {
+		builtin = newSpotExcluder(nil)
+	}
 	if !m.Git {
-		dm := ignore.New(BuiltinExcludes...)
-		_ = dm.AddFile(filepath.Join(m.Root, ".gitignore"))
+		gitignore := ignore.New()
+		_ = gitignore.AddFile(filepath.Join(m.Root, ".gitignore"))
 		for _, p := range rest {
-			if dm.Match(p, false) {
+			if builtin.Match(p, false) || gitignore.Match(p, false) {
 				ign[p] = true
 			}
 		}
 		return ign, nil
 	}
-	builtin := ignore.New(BuiltinExcludes...)
 	var in bytes.Buffer
 	for _, p := range rest {
 		if builtin.Match(p, false) {
@@ -483,4 +547,67 @@ func (m *Manifest) CheckIgnored(ctx context.Context, paths []string) (map[string
 		}
 	}
 	return ign, nil
+}
+
+// spotExcluder applies spotexec's own excludes to untracked and non-Git
+// paths: NeverSync everywhere, and BuiltinExcludes except where they would
+// exclude a root Options.Include lists (or a directory above one): below a
+// root only the patterns matching deeper apply, so .spotexec/Dockerfile
+// syncs while .spotexec/node_modules does not.
+type spotExcluder struct {
+	builtin, never *ignore.Matcher
+	include        []string // cleaned repo-relative roots
+}
+
+func newSpotExcluder(include []string) *spotExcluder {
+	x := &spotExcluder{builtin: ignore.New(BuiltinExcludes...), never: ignore.New(NeverSync...)}
+	for _, p := range include {
+		p = path.Clean(strings.TrimPrefix(filepath.ToSlash(p), "./"))
+		if p == "." || p == ".." || strings.HasPrefix(p, "../") || path.IsAbs(p) {
+			continue // the root itself is never built-in excluded
+		}
+		x.include = append(x.include, p)
+	}
+	return x
+}
+
+// Match reports whether the slash-separated relative path is excluded.
+func (x *spotExcluder) Match(p string, isDir bool) bool {
+	if x.never.Match(strings.ToLower(p), isDir) {
+		return true
+	}
+	best := ""
+	for _, r := range x.include {
+		switch {
+		case p == r:
+			return false
+		case isDir && strings.HasPrefix(r, p+"/"):
+			return false // on the way to an included root
+		case strings.HasPrefix(p, r+"/") && len(r) > len(best):
+			best = r
+		}
+	}
+	if best != "" {
+		return x.builtin.MatchBelow(p, isDir, strings.Count(best, "/")+1)
+	}
+	return x.builtin.Match(p, isDir)
+}
+
+// isNestedRepo reports whether dir is another repository's worktree (a
+// submodule or nested clone), whose files are not ours to sync.
+func isNestedRepo(dir string) bool {
+	_, err := os.Lstat(filepath.Join(dir, ".git"))
+	return err == nil
+}
+
+// orMatch excludes what any of its matchers excludes.
+type orMatch []interface{ Match(string, bool) bool }
+
+func (o orMatch) Match(p string, isDir bool) bool {
+	for _, m := range o {
+		if m.Match(p, isDir) {
+			return true
+		}
+	}
+	return false
 }

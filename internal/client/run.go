@@ -200,7 +200,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if o.Sync != "none" {
 		o.Rep.Status("scanning %s", ws.Root)
 		t := time.Now()
-		m, err = manifest.Build(ctx, manifest.Options{Root: ws.Root, Exclude: p.Sync.Exclude, Source: p.Sync.Source, Protect: p.Deps.CacheDirs})
+		m, err = manifest.Build(ctx, ManifestOptions(ws.Root, p))
 		if err != nil {
 			return res, infra(fmt.Errorf("enumerating files: %w", err)), ""
 		}
@@ -1053,7 +1053,12 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read 
 	if !ok {
 		if read != nil {
 			if _, err := read(dockerfile); err == nil {
-				return "", fmt.Errorf("container.dockerfile %q exists but is not synced: it is gitignored, excluded, or untracked in a directory spotexec only syncs once Git tracks it (such as .spotexec/); run `git add %s`", dockerfile, dockerfile)
+				// The Dockerfile syncs whether or not Git tracks it, so only
+				// an exclude can keep it out.
+				if m.Matcher != nil && m.Matcher.Match(dockerfile, false) {
+					return "", fmt.Errorf("container.dockerfile %q exists but is not synced: [sync].exclude, .spotexecignore or deps.cache_dirs excludes it; remove that pattern", dockerfile)
+				}
+				return "", fmt.Errorf("container.dockerfile %q exists but is not synced: spotexec never syncs that path; move the Dockerfile and point container.dockerfile at it", dockerfile)
 			}
 		}
 		return "", fmt.Errorf("container.dockerfile %q is not in the synced working set", dockerfile)

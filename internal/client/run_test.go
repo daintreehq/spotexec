@@ -1,6 +1,10 @@
 package client
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -194,5 +198,54 @@ func TestInterruptedRunIsNeverOnSuccess(t *testing.T) {
 	}
 	if !wantWriteback("always", ExitInterrupted) {
 		t.Fatal("always must still write back what an interrupted run changed")
+	}
+}
+
+// A container project outside Git: the scaffolded Dockerfile under
+// .spotexec/ is synced and the image tag computes, with no `git add`.
+func TestImageTagNonGitProject(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".spotexec"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{".spotexec/Dockerfile", "app.py"} {
+		if err := os.WriteFile(filepath.Join(root, f), []byte("FROM scratch\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(rel string) ([]byte, error) { return os.ReadFile(filepath.Join(root, filepath.FromSlash(rel))) }
+	p := &config.Project{Container: config.Container{Dockerfile: ".spotexec/Dockerfile"}}
+	m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Git {
+		t.Fatal("temp dir is inside a git worktree")
+	}
+	if _, err := imageTag(m, ".spotexec/Dockerfile", "", "linux/amd64", read); err != nil {
+		t.Fatalf("imageTag: %v", err)
+	}
+	// With context = "." the Dockerfile's support files are build inputs too.
+	if err := os.WriteFile(filepath.Join(root, ".spotexec", "setup.sh"), []byte("true\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p.Container.Context = "."
+	m, err = manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.ByPath[".spotexec/setup.sh"]; !ok {
+		t.Fatal("context = \".\": .spotexec/setup.sh not synced")
+	}
+	p.Container.Context = ""
+	// Excluded on purpose: the error names the exclude, not git.
+	p.Sync.Exclude = []string{".spotexec/"}
+	m, err = manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = imageTag(m, ".spotexec/Dockerfile", "", "linux/amd64", read)
+	if err == nil || strings.Contains(err.Error(), "git add") || !strings.Contains(err.Error(), "exclude") {
+		t.Fatalf("want an exclude error without a git hint, got %v", err)
 	}
 }
