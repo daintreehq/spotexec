@@ -127,6 +127,18 @@ type SlotState struct {
 	WorktreeKey string `json:"worktree_key"`
 	DepsKey     string `json:"deps_key"`
 	LastUsed    int64  `json:"last_used"`
+	// Pending: files runs created here that were neither written back nor
+	// found to be ignored. They stay (a no-sync follow-up can inspect them)
+	// until the next run that syncs into the slot, which removes them.
+	Pending []string `json:"pending,omitempty"`
+	// Sweep: a run started here but its created files were never collected
+	// (the helper died). The next acquire walks the workspace (skipping
+	// SweepSkip) and makes every file that isn't synced pending.
+	Sweep     bool     `json:"sweep,omitempty"`
+	SweepSkip []string `json:"sweep_skip,omitempty"`
+	// VenvsRelocated: the cache dirs' virtualenvs point at this slot
+	// (see relocateVenvs); false for slots hydrated by older helpers.
+	VenvsRelocated bool `json:"venvs_relocated,omitempty"`
 }
 
 func readJSON(path string, v any) error {

@@ -21,8 +21,12 @@ const shortUsage = `spotexec (sx) runs commands from your worktree on remote har
 
 Usage:
   sx [flags] <command> [args...]       run a command remotely (sync + exec + write-back)
-  sx [flags] -- <command> [args...]    same, when the command shares a name with a subcommand
-  sx <task> [args...]                  run a named task from .spotexec.toml
+  sx [flags] <task> [args...]          run a named task from .spotexec.toml
+  sx [flags] -- <command> [args...]    run the command even if a task has its name
+  spotexec run [flags] -- <command>    the same as sx -- <command>
+
+sx -h lists the run flags and this project's tasks. spotexec <command> runs a
+command too, unless it is named like one of the commands below.
 `
 
 // subcommands that take precedence over the shorthand form.
@@ -30,7 +34,7 @@ var subcommands = map[string]bool{
 	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
 	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
 	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
-	"completion": true, "sim": true, "image": true, "daemon": true, "container": true, "setup": true, "__complete": true, "__completeNoDesc": true,
+	"completion": true, "sim": true, "image": true, "daemon": true, "container": true, "setup": true, "teardown": true, "__complete": true, "__completeNoDesc": true,
 }
 
 // Main is the entry point for `spotexec`; it returns the process exit code.
@@ -52,16 +56,22 @@ func MainAs(name string, args []string) int {
 		fs.Usage = func() {}
 		f.register(fs)
 		fs.SetOutput(nopWriter{})
-		if err := fs.Parse(args); err == nil {
-			rest := fs.Args()
-			dashed := fs.ArgsLenAtDash() == 0
-			if len(rest) > 0 && (dashed || !subcommands[rest[0]]) {
-				return shorthand(&f, rest, dashed)
-			}
-			if len(rest) == 0 && fs.NFlag() > 0 {
-				fmt.Fprintln(os.Stderr, "spotexec: missing command")
-				return 2
-			}
+		err := fs.Parse(args)
+		// Only run flags come before the first word here (subcommands take
+		// their flags after their name), so a parse failure is a mistake in
+		// a run: like sx and spotexec run, it exits 125, not Cobra's 1.
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "spotexec: %v (spotexec run -h lists the run flags)\n", err)
+			return client.ExitInfra
+		}
+		rest := fs.Args()
+		dashed := fs.ArgsLenAtDash() == 0
+		if len(rest) > 0 && (dashed || !subcommands[rest[0]]) {
+			return shorthand(&f, rest, dashed)
+		}
+		if len(rest) == 0 && fs.NFlag() > 0 {
+			fmt.Fprintln(os.Stderr, "spotexec: missing command")
+			return client.ExitInfra
 		}
 	}
 	root := newRoot()
@@ -81,6 +91,7 @@ type nopWriter struct{}
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 func isHelpFlag(s string) bool {
+	s, _, _ = strings.Cut(s, "=") // --help=true too
 	return s == "-h" || s == "--help" || s == "--version" || s == "-v"
 }
 
@@ -131,8 +142,10 @@ func newRoot() *cobra.Command {
 	root.AddCommand(
 		cmdRun(), cmdExec(), cmdSync(), cmdSyncPlan(), cmdPull(), cmdStatus(), cmdMonitor(),
 		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdInit(), cmdHook(),
-		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdDaemon(), cmdContainer(), cmdSetup(),
+		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdDaemon(), cmdContainer(), cmdSetup(), cmdTeardown(),
 	)
+	root.SetVersionTemplate("spotexec {{.Version}}\n") // as `spotexec version` and `sx --version`
+	addSxCompletion(root)
 	return root
 }
 
@@ -175,14 +188,13 @@ func cmdExec() *cobra.Command {
 	var f runFlags
 	c := &cobra.Command{
 		Use:   "exec [flags] -- <command> [args...]",
-		Short: "Run in the last-used slot without syncing first (same as sx --same-slot --sync none)",
+		Short: "Run in the last-used slot without syncing first (same as sx --same-slot --sync none --)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load(f.dir)
 			if err != nil {
 				return infraExit(err)
 			}
-			f.sync = "none"
 			return exitWith(f.executeLast(l, runSpec{command: buildCommand(l.ws, args), display: displayOf(args), sync: "none"}))
 		},
 	}
@@ -228,6 +240,16 @@ func cmdTasks() *cobra.Command {
 
 // sxMain is `sx [flags] <command...>` / `sx <task> [args...]`.
 func sxMain(args []string) int {
+	// v0.2.0 could install the Claude Code hook as `sx hook claude`. That
+	// line is the hook handler, never a command to run remotely.
+	if len(args) == 2 && args[0] == "hook" && args[1] == "claude" {
+		claudeHook()
+		return 0
+	}
+	// Shell completion scripts for sx ask it for candidates.
+	if len(args) > 0 && (args[0] == cobra.ShellCompRequestCmd || args[0] == cobra.ShellCompNoDescRequestCmd) {
+		return sxComplete(args)
+	}
 	var f runFlags
 	fs := pflag.NewFlagSet("sx", pflag.ContinueOnError)
 	fs.SetInterspersed(false)
@@ -263,6 +285,7 @@ changed back here.
 Usage:
   sx [flags] <command> [args...]    sx pnpm test · sx 'pnpm lint && pnpm test'
   sx [flags] <task> [args...]       a named task from .spotexec.toml
+  sx [flags] -- <command> [args...] the command, even if a task has its name
   sx -s <command>                   again on the same VM and slot as last time
 
 Flags:

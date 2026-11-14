@@ -133,7 +133,29 @@ func (s *Session) deps(d protocol.Deps) error {
 	cacheRoot := filepath.Join(s.layout.Deps(s.repoID), key)
 	ready := filepath.Join(cacheRoot, ".ready")
 
-	if s.state.DepsKey == key && len(expandCacheDirs(s.workspace, d.CacheDirs)) > 0 {
+	if dirs := expandCacheDirs(s.workspace, d.CacheDirs); s.state.DepsKey == key && len(dirs) > 0 {
+		if !s.state.VenvsRelocated {
+			// Hydrated by an older helper, which copied venvs as they were.
+			// Until this succeeds the slot's copy is suspect: a failure
+			// leaves the key unset, so the next run hydrates afresh.
+			s.state.DepsKey = ""
+			if err := saveSlotState(s.slotDir, s.state); err != nil {
+				return err
+			}
+			origins, synced := cacheOrigins(cacheRoot), s.syncedIndex()
+			for _, rel := range dirs {
+				if synced(rel) {
+					continue
+				}
+				if err := relocateVenvs(filepath.Join(s.workspace, filepath.FromSlash(rel)), rel, origins, s.workspace); err != nil {
+					return perr(protocol.CodeDepsFailed, "relocating %s: %v", rel, err)
+				}
+			}
+			s.state.DepsKey, s.state.VenvsRelocated = key, true
+			if err := saveSlotState(s.slotDir, s.state); err != nil {
+				return err
+			}
+		}
 		_ = os.Chtimes(ready, time.Now(), time.Now())
 		res.MS = time.Since(start).Milliseconds()
 		return s.c.Send(protocol.TypeDepsResult, res)
@@ -225,7 +247,7 @@ func (s *Session) deps(d protocol.Deps) error {
 		res.Hydrated, res.Method = true, method
 	}
 	_ = os.Chtimes(ready, time.Now(), time.Now())
-	s.state.DepsKey = key
+	s.state.DepsKey, s.state.VenvsRelocated = key, true
 	if err := saveSlotState(s.slotDir, s.state); err != nil {
 		return err
 	}
@@ -299,6 +321,10 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 			return perr(protocol.CodeDepsFailed, "snapshot %s: %v", rel, err)
 		}
 	}
+	// Where the cache was built, for relocateVenvs in other slots.
+	if err := os.WriteFile(filepath.Join(tmp, originFile), []byte(originOf(s.workspace)), 0o644); err != nil {
+		return err
+	}
 	if err := os.WriteFile(filepath.Join(tmp, ".ready"), []byte(strings.Join(dirs, "\n")), 0o644); err != nil {
 		return err
 	}
@@ -315,6 +341,7 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 	if err := s.clearCacheDirs(s.workspace, d.CacheDirs); err != nil {
 		return "", err
 	}
+	origins := cacheOrigins(cacheRoot)
 	method := "none"
 	synced := s.syncedIndex()
 	for _, rel := range strings.Split(strings.TrimSpace(string(b)), "\n") {
@@ -348,6 +375,10 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 		m, err := cloneTree(src, dst, d.Hydrate)
 		if err != nil {
 			return "", err
+		}
+		// A .venv built in another slot (or VM) points at that workspace.
+		if err := relocateVenvs(dst, rel, origins, s.workspace); err != nil {
+			return "", fmt.Errorf("relocating %s: %v", rel, err)
 		}
 		method = m
 	}

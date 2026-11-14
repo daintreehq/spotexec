@@ -1,9 +1,16 @@
 package client
 
 import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/transport"
 
 	"github.com/daintreehq/spotexec/internal/manifest"
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -101,5 +108,183 @@ func TestImageTagRejectsUnsyncedOrSymlinkedRules(t *testing.T) {
 	same := func(string) ([]byte, error) { return []byte("src\n"), nil }
 	if _, err := imageTag(mf(ents...), "Dockerfile", ".", "linux/amd64", same); err == nil {
 		t.Fatal("symlinked rules were accepted")
+	}
+}
+
+func TestUnknownWritebackPolicyNeverWritesBack(t *testing.T) {
+	if wantWriteback("nevre", 0) || wantWriteback("", 0) || wantWriteback("never", 0) {
+		t.Error("an unknown or never policy wrote back")
+	}
+	if !wantWriteback("always", 1) || !wantWriteback("on-success", 0) || wantWriteback("on-success", 1) {
+		t.Error("known policies misbehave")
+	}
+	for _, o := range []Options{{Sync: "auto", Writeback: "nevre"}, {Sync: "bogus", Writeback: "always"}, {}} {
+		if validOptions(o) == nil {
+			t.Errorf("%q/%q accepted", o.Sync, o.Writeback)
+		}
+	}
+	if err := validOptions(Options{Sync: "in", Writeback: "on-success"}); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestKeepLastRun(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	ws := &Workspace{WorktreeKey: "k"}
+	lr := LastRun{Runner: "a", Slot: 2}
+	var res Result
+	keepLastRun(ws, Options{Sync: "auto", DeferLastRun: true}, lr, &res)
+	if res.LastRun == nil || res.LastRun.Runner != "a" {
+		t.Fatal("deferred record not returned")
+	}
+	if _, err := LoadLastRun(ws); err == nil {
+		t.Fatal("deferred record was saved")
+	}
+	res = Result{}
+	keepLastRun(ws, Options{Sync: "none"}, lr, &res)
+	if res.LastRun != nil {
+		t.Fatal("unsynced run recorded")
+	}
+	keepLastRun(ws, Options{Sync: "in"}, lr, &res)
+	if got, err := LoadLastRun(ws); err != nil || got.Slot != 2 {
+		t.Fatalf("record not saved: %v %v", got, err)
+	}
+}
+
+func TestClassifyExec(t *testing.T) {
+	cases := []struct {
+		name string
+		r    protocol.Result
+		want execOutcome
+	}{
+		{"plain success", protocol.Result{ExitCode: 0}, execCompleted},
+		{"plain failure", protocol.Result{ExitCode: 1}, execCompleted},
+		{"never started", protocol.Result{ExitCode: 127, StartError: "no space left on device"}, execNotStarted},
+		{"canceled, handled SIGTERM and exited 0", protocol.Result{ExitCode: 0, Canceled: true}, execCanceled},
+		{"canceled, killed", protocol.Result{ExitCode: 143, Canceled: true}, execCanceled},
+		{"a shutdown is never written back, even if also canceled", protocol.Result{ExitCode: 143, Canceled: true, Shutdown: true}, execShutdown},
+		{"killed by the VM shutting down", protocol.Result{ExitCode: 143, Interrupted: true, Shutdown: true}, execShutdown},
+		{"finished normally during the warning", protocol.Result{ExitCode: 0, Interrupted: true}, execCompleted},
+		{"exited 143 itself during the warning", protocol.Result{ExitCode: 143, Interrupted: true}, execCompleted},
+	}
+	for _, c := range cases {
+		if got := classifyExec(c.r); got != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestShutdownIsALostRunner(t *testing.T) {
+	spot := &Lease{Runner: &config.Runner{Type: config.TypeAWSSpot}, InstanceID: "i-1"}
+	shutdown := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeShutdown, Message: "the runner is shutting down"}}
+	if got := lostRunner(spot, shutdown); got != "i-1" {
+		t.Fatalf("a shutdown error on a Spot runner: lost %q, want i-1", got)
+	}
+	other := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "x"}}
+	if got := lostRunner(spot, other); got != "" {
+		t.Fatalf("an ordinary helper error counted as a lost runner (%q)", got)
+	}
+	static := &Lease{Runner: &config.Runner{Type: config.TypeSSH}}
+	if got := lostRunner(static, shutdown); got != "" {
+		t.Fatalf("a static runner is never replayed (%q)", got)
+	}
+	if got := shutdownRunner(static); got != "" {
+		t.Fatalf("a static runner is never replayed (%q)", got)
+	}
+}
+
+func TestInterruptedRunIsNeverOnSuccess(t *testing.T) {
+	if wantWriteback("on-success", ExitInterrupted) {
+		t.Fatal("an interrupted run counted as success for on-success write-back")
+	}
+	if !wantWriteback("always", ExitInterrupted) {
+		t.Fatal("always must still write back what an interrupted run changed")
+	}
+}
+
+// A container project outside Git: the scaffolded Dockerfile under
+// .spotexec/ is synced and the image tag computes, with no `git add`.
+func TestImageTagNonGitProject(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".spotexec"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{".spotexec/Dockerfile", "app.py"} {
+		if err := os.WriteFile(filepath.Join(root, f), []byte("FROM scratch\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(rel string) ([]byte, error) { return os.ReadFile(filepath.Join(root, filepath.FromSlash(rel))) }
+	p := &config.Project{Container: config.Container{Dockerfile: ".spotexec/Dockerfile"}}
+	m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Git {
+		t.Fatal("temp dir is inside a git worktree")
+	}
+	if _, err := imageTag(m, ".spotexec/Dockerfile", "", "linux/amd64", read); err != nil {
+		t.Fatalf("imageTag: %v", err)
+	}
+	// With context = "." the Dockerfile's support files are build inputs too.
+	if err := os.WriteFile(filepath.Join(root, ".spotexec", "setup.sh"), []byte("true\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p.Container.Context = "."
+	m, err = manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.ByPath[".spotexec/setup.sh"]; !ok {
+		t.Fatal("context = \".\": .spotexec/setup.sh not synced")
+	}
+	p.Container.Context = ""
+	// Excluded on purpose: the error names the exclude, not git.
+	p.Sync.Exclude = []string{".spotexec/"}
+	m, err = manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = imageTag(m, ".spotexec/Dockerfile", "", "linux/amd64", read)
+	if err == nil || strings.Contains(err.Error(), "git add") || !strings.Contains(err.Error(), "exclude") {
+		t.Fatalf("want an exclude error without a git hint, got %v", err)
+	}
+}
+
+// sx in the home directory refuses to sync it, even with a leftover
+// ~/.spotexec.toml.
+func TestRunRefusesHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, ".spotexec.toml"), []byte("version = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := Resolve(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Marked {
+		t.Fatal("home resolved as a marked project")
+	}
+	_, err = Run(context.Background(), nil, ws, Options{Sync: "auto", Writeback: "always"})
+	if err == nil || !strings.Contains(err.Error(), "never syncs") {
+		t.Fatalf("want a refusal, got %v", err)
+	}
+	// A home directory that is a Git worktree (dotfiles), from a child.
+	if out, err := exec.Command("git", "-C", home, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	child := filepath.Join(home, "notes")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if ws, err = Resolve(child); err != nil {
+		t.Fatal(err)
+	}
+	if !ws.Git || ws.Marked {
+		t.Fatalf("git home: git=%v marked=%v, want git and unmarked", ws.Git, ws.Marked)
+	}
+	if _, err = Run(context.Background(), nil, ws, Options{Sync: "auto", Writeback: "always"}); err == nil || !strings.Contains(err.Error(), "never syncs") {
+		t.Fatalf("git home: want a refusal, got %v", err)
 	}
 }

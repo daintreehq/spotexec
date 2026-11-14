@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/helper"
 	"github.com/daintreehq/spotexec/internal/helperbin"
 	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 	"github.com/daintreehq/spotexec/internal/transport"
 	"github.com/daintreehq/spotexec/internal/ui"
@@ -155,14 +157,11 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		}
 		slots, load, mem, idle := "-", "-", "-", "-"
 		if h := s.Helper; h != nil {
-			max := s.r.MaxSlots
-			if max == 0 {
-				max = h.CPUs / 4
-				if max < 1 {
-					max = 1
-				}
+			n := s.r.MaxSlots
+			if n == 0 {
+				n = min(max(h.CPUs/4, 1), protocol.MaxSlots)
 			}
-			slots = fmt.Sprintf("%d/%d", len(h.Holders), max)
+			slots = fmt.Sprintf("%d/%d", len(h.Holders), n)
 			if h.CPUs > 0 && h.Load1 > 0 {
 				load = fmt.Sprintf("%.1f/%d", h.Load1, h.CPUs)
 			}
@@ -193,6 +192,10 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 			age := time.Since(time.UnixMilli(h.StartedAt)).Round(time.Second)
 			fmt.Fprintf(w, "  %s slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Token, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
 		}
+		for _, h := range s.Helper.Waiters {
+			age := time.Since(time.UnixMilli(h.StartedAt)).Round(time.Second)
+			fmt.Fprintf(w, "  %s waiting for workspace slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Slot, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
+		}
 	}
 }
 
@@ -207,15 +210,21 @@ func cmdStatus() *cobra.Command {
 				return err
 			}
 			if everyone {
-				ins, err := accountInstances(cmd.Context(), cfg)
+				res := findAccountInstances(cmd.Context(), accountScopes(cfg))
+				quotas := spotQuotas(cmd.Context(), cfg)
 				if asJSON {
-					if err != nil {
+					if res.Instances == nil {
+						res.Instances = []provider.AccountInstance{}
+					}
+					if err := json.NewEncoder(os.Stdout).Encode(accountStatus{AccountSearch: res, SpotQuotas: quotas}); err != nil {
 						return err
 					}
-					return json.NewEncoder(os.Stdout).Encode(ins)
+					return res.Err()
 				}
-				printAccountInstances(ins)
-				return err
+				printAccountInstances(res.Instances)
+				printSearched(res)
+				printSpotQuotas(os.Stdout, quotas)
+				return res.Err()
 			}
 			rs, err := selectRunners(cfg, args)
 			if err != nil {
@@ -233,7 +242,7 @@ func cmdStatus() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&asJSON, "json", false, "JSON output")
-	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "every spotexec VM in the account, whichever machine launched it")
+	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "every spotexec VM (bake builders and stopped VMs too), whichever machine launched it, in the regions and profiles your AWS runners use, and each region's Spot quota use")
 	return c
 }
 
@@ -364,31 +373,55 @@ func cmdUp() *cobra.Command {
 				err error
 			}
 			ch := make(chan res, count)
+			done := make(chan struct{})
+			defer close(done)
+			go func() {
+				select {
+				case <-ctx.Done():
+					rep.Warn("INTERRUPTED", "terminating the instance(s) being launched")
+				case <-done:
+				}
+			}()
 			for _, id := range ids {
 				go func() {
-					in, err := pool.Provision(ctx, id, func(f string, a ...any) {
+					// A VM that never gets ready (or is interrupted with
+					// Ctrl-C) is terminated and recorded as a failed boot.
+					in, err := pool.Prewarm(ctx, id, func(f string, a ...any) {
 						rep.Event("provision", map[string]any{"runner": r.Name, "message": fmt.Sprintf(f, a...)})
+					}, func(ctx context.Context, in provider.Instance) error {
+						return client.WaitReady(ctx, r, in.Target, rep, r.BootTimeout.Duration)
+					}, func(ctx context.Context, in provider.Instance) bool {
+						return client.BootFinished(ctx, r, in.Target)
 					})
 					if err == nil {
-						err = client.WaitReady(ctx, r, in.Target, rep, r.BootTimeout.Duration)
-					}
-					if err == nil {
-						_, err = transport.New(in.Target, r.WorkRoot).EnsureHelper(ctx, false)
+						// Ready, so other runs may already use it: a failed
+						// helper install leaves it to idle out.
+						if _, herr := transport.New(in.Target, r.WorkRoot).EnsureHelper(ctx, false); herr != nil {
+							err = fmt.Errorf("%s: installing the helper: %w (the VM is ready and ends itself after idle_timeout)", in.ID, herr)
+						}
 					}
 					ch <- res{in, err}
 				}()
 			}
 			var errs []string
+			bootFailed := false
 			for i := 0; i < count; i++ {
 				x := <-ch
 				if x.err != nil {
 					errs = append(errs, x.err.Error())
+					bootFailed = bootFailed || errors.Is(x.err, client.ErrBootstrapFailed)
 					continue
 				}
 				rep.Event("instance_ready", map[string]any{"runner": r.Name, "instance_id": x.in.ID, "host": x.in.Target.String()})
 			}
 			if len(errs) > 0 {
 				rep.Clear()
+				if ctx.Err() != nil {
+					return fmt.Errorf("interrupted: %s", strings.Join(errs, "; "))
+				}
+				if bootFailed {
+					errs = append(errs, fmt.Sprintf("fix bootstrap_script, then run `spotexec down %s` (until then, or for an hour, runs won't launch new VMs)", r.Name))
+				}
 				return errors.New(strings.Join(errs, "; "))
 			}
 			rep.Done(fmt.Sprintf("%s: %d instance(s) ready (each terminates after %s idle)", r.Name, count, r.IdleTimeout.Duration), true)
@@ -459,8 +492,8 @@ func cmdDown() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&all, "all", false, "terminate every ephemeral runner")
-	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "terminate spotexec VMs launched by any machine (with --machine: only that one's)")
-	c.Flags().StringVar(&machine, "machine", "", "only VMs launched by this machine (its name in `status -A`)")
+	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "terminate spotexec VMs (bake builders and stopped VMs too) launched by any machine, in the regions and profiles your AWS runners use (with --machine: only that one's)")
+	c.Flags().StringVar(&machine, "machine", "", "only VMs launched by the machine named `NAME` in status -A")
 	c.Flags().BoolVarP(&yes, "yes", "y", false, "don't ask before terminating other machines' VMs")
 	return c
 }
@@ -479,6 +512,7 @@ func cmdDoctor() *cobra.Command {
 				}
 				fmt.Printf("%s %-28s %s\n", mark, name, msg)
 			}
+			warn := func(name, msg string) { fmt.Printf("\x1b[33m!\x1b[0m %-28s %s\n", name, msg) }
 			for _, bin := range []string{"ssh", "git"} {
 				p, err := exec.LookPath(bin)
 				check(bin, err == nil, p)
@@ -503,6 +537,7 @@ func cmdDoctor() *cobra.Command {
 				}
 				check("project config", true, src)
 				check("workspace", true, fmt.Sprintf("%s (repo id %s)", l.ws.Root, l.ws.RepoID))
+				doctorContainer(l, args, check, warn)
 			} else {
 				check("project config", false, err.Error())
 			}
@@ -556,6 +591,40 @@ func cmdDoctor() *cobra.Command {
 			}
 			return nil
 		},
+	}
+}
+
+// doctorContainer reports the project's container: the image it runs in,
+// or, for a project with a toolchain but no container, that AWS VMs (among
+// the runners doctor checks, else the project's pool) boot without it.
+func doctorContainer(l *loaded, runners []string, check func(string, bool, string), warn func(string, string)) {
+	c := l.cfg.Project.Container
+	switch {
+	case c.Image != "":
+		check("container", true, "image "+c.Image)
+	case c.Dockerfile != "":
+		if _, err := os.Stat(filepath.Join(l.ws.Root, filepath.FromSlash(c.Dockerfile))); err != nil {
+			check("container", false, c.Dockerfile+" is missing (`spotexec container init` writes it)")
+			return
+		}
+		check("container", true, c.Dockerfile+" (the first sx builds it; `spotexec container build` builds it now)")
+	default:
+		_, stack, _ := scaffoldDockerfile(l.ws.Root)
+		rs, err := l.cfg.Pool(nil)
+		if len(runners) > 0 {
+			rs, err = selectRunners(l.cfg, runners)
+		}
+		ephemeral := false
+		if err == nil {
+			for _, r := range rs {
+				ephemeral = ephemeral || r.Ephemeral()
+			}
+		}
+		if stack != "" && ephemeral {
+			warn("container", "none, but this is a "+stack+" project and AWS VMs boot without it: run `spotexec container init`, or install it with bootstrap_script")
+			return
+		}
+		check("container", true, "none (commands use the runner's own toolchain)")
 	}
 }
 
@@ -753,7 +822,7 @@ func cmdSyncPlan() *cobra.Command {
 			}
 			p := l.cfg.Project
 			t := time.Now()
-			m, err := manifest.Build(cmd.Context(), manifest.Options{Root: l.ws.Root, Exclude: p.Sync.Exclude, Source: p.Sync.Source, Protect: p.Deps.CacheDirs})
+			m, err := manifest.Build(cmd.Context(), client.ManifestOptions(l.ws.Root, p))
 			if err != nil {
 				return err
 			}
@@ -829,7 +898,7 @@ func cmdPull() *cobra.Command {
 			defer stop()
 			rep, _ := ui.New(ui.ModeAuto, os.Stderr, "")
 			host, _ := os.Hostname()
-			lease, err := client.AcquireSlot(ctx, l.cfg, l.ws, r, lr, rep, host, "(pull)", false, 0, false, "")
+			lease, err := client.AcquireSlot(ctx, l.cfg, l.ws, r, lr, rep, host, client.PullDisplay, false, 0, false, "")
 			if err != nil {
 				return err
 			}
@@ -904,47 +973,48 @@ func parseAge(s string) (time.Duration, error) {
 	return d, nil
 }
 
-// accountInstances lists every spotexec VM in the regions (and accounts)
-// the AWS runners use, deduplicated.
-func accountInstances(ctx context.Context, cfg *config.Config) ([]provider.AccountInstance, error) {
-	seen := map[string]bool{}
-	var out []provider.AccountInstance
-	var errs []string
+// The account-wide discovery and termination (tests replace them).
+var (
+	findAccountInstances     = provider.FindAccountInstances
+	terminateAccountInstance = provider.TerminateAccountInstance
+)
+
+// accountScopes is every (region, profile) the AWS runners use: "the
+// account" for status -A and down -A means these.
+func accountScopes(cfg *config.Config) []provider.AccountScope {
+	var out []provider.AccountScope
+	seen := map[provider.AccountScope]bool{}
 	for _, r := range cfg.Global.Runners {
-		if r.Type != config.TypeAWSSpot || seen[r.Region+"\x00"+r.Profile] {
+		sc := provider.AccountScope{Region: r.Region, Profile: r.Profile}
+		if r.Type != config.TypeAWSSpot || seen[sc] {
 			continue
 		}
-		seen[r.Region+"\x00"+r.Profile] = true
-		p, err := provider.New(r)
-		if err != nil {
-			errs = append(errs, err.Error())
-			continue
-		}
-		a, ok := p.(*provider.AWSSpot)
-		if !ok {
-			continue
-		}
-		ins, err := a.AccountInstances(ctx)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", r.Region, err))
-		}
-		for _, in := range ins {
-			if !seen[in.ID] {
-				seen[in.ID] = true
-				out = append(out, in)
-			}
-		}
+		seen[sc] = true
+		out = append(out, sc)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Host != out[j].Host {
-			return out[i].Host < out[j].Host
+		if out[i].Region != out[j].Region {
+			return out[i].Region < out[j].Region
 		}
-		return out[i].Launched.Before(out[j].Launched)
+		return out[i].Profile < out[j].Profile
 	})
-	if len(errs) > 0 {
-		return out, errors.New(strings.Join(errs, "; "))
+	return out
+}
+
+// printSearched says where the search looked, and what it couldn't list.
+func printSearched(res *provider.AccountSearch) {
+	if len(res.Searched) == 0 && len(res.Failed) == 0 {
+		fmt.Println("no AWS runners configured, so no account to search")
+		return
 	}
-	return out, nil
+	var where []string
+	for _, sc := range res.Searched {
+		where = append(where, sc.String())
+	}
+	if len(where) > 0 {
+		fmt.Printf("searched %s (the regions your AWS runners use)\n", strings.Join(where, ", "))
+	}
+	// Regions that couldn't be listed come back as the command's error.
 }
 
 func machineName(in provider.AccountInstance) string {
@@ -964,33 +1034,42 @@ func printAccountInstances(ins []provider.AccountInstance) {
 		return
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "MACHINE\tRUNNER\tINSTANCE\tTYPE\tMARKET\tSTATE\tUP\tREGION")
+	fmt.Fprintln(tw, "MACHINE\tRUNNER\tINSTANCE\tTYPE\tMARKET\tSTATE\tUP\tREGION\tACCOUNT")
 	per := map[string]int{}
 	for _, in := range ins {
 		per[machineName(in)]++
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", machineName(in), in.Runner, in.ID, in.Type, in.Market, in.State, ui.Dur(time.Since(in.Launched).Round(time.Minute)), in.Region)
+		runner := in.Runner
+		if in.Builder {
+			runner += " (bake builder)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", machineName(in), runner, in.ID, in.Type, in.Market, in.State, ui.Dur(time.Since(in.Launched).Round(time.Minute)), in.Region, in.Account)
 	}
 	tw.Flush()
 	fmt.Printf("\n%d VM(s) across %d machine(s). Stop one machine's VMs: spotexec down -A --machine <name>\n", len(ins), len(per))
 }
 
-// downAccount terminates spotexec VMs launched by any machine (or by one).
+// downAccount terminates spotexec VMs (fleet VMs and bake builders, in any
+// state) launched by any machine (or by one), each through the profile that
+// found it. It fails when any region couldn't be listed or any VM
+// terminated, so "done" means done.
 func downAccount(ctx context.Context, cfg *config.Config, machine string, yes bool) error {
-	ins, err := accountInstances(ctx, cfg)
-	if err != nil && len(ins) == 0 {
-		return err
-	}
+	res := findAccountInstances(ctx, accountScopes(cfg))
 	short := strings.Split(machine, ".")[0]
 	var pick []provider.AccountInstance
-	for _, in := range ins {
+	for _, in := range res.Instances {
+		if in.State == "shutting-down" {
+			continue // already terminating
+		}
 		if machine == "" || strings.EqualFold(in.Host, machine) || strings.EqualFold(in.Host, short) || strings.HasPrefix(in.Owner, machine) {
 			pick = append(pick, in)
 		}
 	}
 	if len(pick) == 0 {
 		fmt.Println("no matching spotexec VMs")
-		return nil
+		printSearched(res)
+		return res.Err()
 	}
+	printSearched(res)
 	others := 0
 	for _, in := range pick {
 		if !in.Mine {
@@ -1012,28 +1091,16 @@ func downAccount(ctx context.Context, cfg *config.Config, machine string, yes bo
 			return exitWith(1)
 		}
 	}
-	byRegion := map[string]*provider.AWSSpot{}
-	for _, r := range cfg.Global.Runners {
-		if r.Type != config.TypeAWSSpot || byRegion[r.Region] != nil {
-			continue
-		}
-		if p, err := provider.New(r); err == nil {
-			if a, ok := p.(*provider.AWSSpot); ok {
-				byRegion[r.Region] = a
-			}
-		}
-	}
 	var errs []string
 	for _, in := range pick {
-		a := byRegion[in.Region]
-		if a == nil {
+		if err := terminateAccountInstance(ctx, in); err != nil {
+			errs = append(errs, fmt.Sprintf("couldn't terminate %s in %s: %v", in.ID, in.Region, err))
 			continue
 		}
-		if err := a.TerminateAccountInstance(ctx, in.ID); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", in.ID, err))
-			continue
-		}
-		fmt.Printf("terminated %s (%s, %s)\n", in.ID, machineName(in), in.Runner)
+		fmt.Printf("terminated %s (%s, %s, %s)\n", in.ID, machineName(in), in.Runner, in.Region)
+	}
+	if err := res.Err(); err != nil {
+		errs = append(errs, err.Error()+" (VMs there were not terminated)")
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))

@@ -17,6 +17,7 @@ check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 export SPOTEXEC_CONFIG_DIR="$WORK/cfg" SPOTEXEC_STATE_DIR="$WORK/state"
 mkdir -p "$SPOTEXEC_CONFIG_DIR"
 RUNNER=pool$$
+export SPOTEXEC_SIM_ACCOUNT=$RUNNER   # simulated quotas count this suite's VMs only
 cat > "$SPOTEXEC_CONFIG_DIR/config.toml" <<EOF
 version = 1
 default_pool = ["$RUNNER"]
@@ -34,13 +35,34 @@ max_slots = 4
 idle_timeout = "20s"
 boot_delay = "2s"
 priority = 20
+[runners.${RUNNER}l]
+type = "sim"
+max_instances = 2
+max_slots = 2
+idle_timeout = "60s"
+max_lifetime = "60s"
+boot_timeout = "20s"
+boot_delay = "1s"
+priority = 40
+[runners.${RUNNER}s]
+type = "sim"
+max_instances = 1
+max_slots = 2
+idle_timeout = "30s"
+boot_delay = "1s"
+priority = 50
+bootstrap_script = """
+echo boot-step-one; sleep 6
+echo boot-step-two; sleep 6
+"""
 EOF
 
 count() { docker ps -q --filter "label=spotexec-runner=$RUNNER" | wc -l | tr -d ' '; }
 countb() { docker ps -q --filter "label=spotexec-runner=${RUNNER}b" | wc -l | tr -d ' '; }
+countx() { docker ps -q --filter "label=spotexec-runner=${RUNNER}x" | wc -l | tr -d ' '; }
 cleanup() {
   # One filter per command: Docker ANDs repeated label filters.
-  for r in "$RUNNER" "${RUNNER}b"; do
+  for r in "$RUNNER" "${RUNNER}b" "${RUNNER}x" "${RUNNER}l" "${RUNNER}s"; do
     docker ps -q --filter "label=spotexec-runner=$r" | xargs -r docker rm -f >/dev/null 2>&1
   done
   return 0
@@ -100,6 +122,23 @@ ID=$(grep '"placed"' "$WORK/q.err" | sed 's/.*instance_id":"\([^"]*\)".*/\1/' | 
 wait $P; code=$?
 check "finished on the doomed instance without replay" "[ $code = 0 ] && grep -q 'quick attempt=1' $WORK/q.out && ! grep -q RUNNER_LOST $WORK/q.err"
 wait
+
+echo "== the VM's shutdown kills the command: lost runner, nothing written back, replayed"
+"$SX" --json --writeback always 'if [ "$SPOTEXEC_ATTEMPT" = 1 ]; then echo partial > partial.txt; sleep 60; fi # reclaim-marker
+echo finished attempt=$SPOTEXEC_ATTEMPT' >"$WORK/k.out" 2>"$WORK/k.err" &
+P=$!
+for _ in $(seq 1 40); do grep -q '"exec"' "$WORK/k.err" 2>/dev/null && break; sleep 0.5; done
+sleep 1
+ID=$(grep '"placed"' "$WORK/k.err" | sed 's/.*instance_id":"\([^"]*\)".*/\1/' | tail -1)
+"$SX" sim interrupt "$RUNNER" "$ID" --after 90s >/dev/null 2>&1 &
+IP=$!
+for _ in $(seq 1 20); do grep -q spot_interruption "$WORK/k.err" 2>/dev/null && break; sleep 0.5; done
+# Shutdown begins and kills the command while the helper is still alive.
+docker exec "$ID" sh -c 'touch /var/tmp/spotexec/sim/stopping; pkill -TERM -f reclaim-marker'
+wait $P; code=$?
+kill $IP 2>/dev/null; docker rm -f "$ID" >/dev/null 2>&1
+check "killed run replayed and succeeded on attempt 2" "[ $code = 0 ] && grep -q 'finished attempt=2' $WORK/k.out && grep -q RUNNER_LOST $WORK/k.err"
+check "nothing from the killed attempt was written back" "test ! -e partial.txt"
 
 echo "== rebalance recommendation is advisory (real EC2 sends it at boot)"
 "$SX" -q true
@@ -166,6 +205,80 @@ echo "lock-v2" > deps.lock
 "$SX" --json 'cat vendor/marker' >"$WORK/d3.out" 2>"$WORK/d3.err"
 check "a lockfile change misses the cache and reinstalls" "grep -q '\"built\":true' $WORK/d3.err"
 cd "$REPO"
+
+echo "== spotexec up ends a VM that fails to get ready"
+cleanup; sleep 1
+cat >> "$SPOTEXEC_CONFIG_DIR/config.toml" <<EOF
+[runners.${RUNNER}x]
+type = "sim"
+max_instances = 1
+idle_timeout = "10m"
+boot_delay = "1s"
+bootstrap_script = "exit 3"
+EOF
+"$SX" up "${RUNNER}x" >"$WORK/upx.out" 2>"$WORK/upx.err"; rc=$?
+check "up fails on a broken bootstrap_script" "[ $rc != 0 ] && grep -q 'bootstrap_script exited 3' $WORK/upx.err"
+check "the broken VM was terminated" "[ \$(countx) = 0 ]"
+SPOTEXEC_POOL="${RUNNER}x" "$SX" --json --queue-timeout 5s 'echo should-not-run' >"$WORK/upx2.out" 2>"$WORK/upx2.err"
+check "the failed boot is recorded: no relaunch of the broken setup" "[ \$(countx) = 0 ] && ! grep -q should-not-run $WORK/upx2.out"
+"$SX" down "${RUNNER}x" >/dev/null 2>&1
+sed -i.bak 's/bootstrap_script = "exit 3"/bootstrap_script = "sleep 120"/' "$SPOTEXEC_CONFIG_DIR/config.toml"
+"$SX" up "${RUNNER}x" >"$WORK/upi.out" 2>"$WORK/upi.err" & UP=$!
+for _ in $(seq 1 60); do [ "$(countx)" = 1 ] && break; sleep 0.5; done
+sleep 2
+kill -INT $UP; wait $UP; rc=$?
+check "Ctrl-C during boot fails up" "[ $rc != 0 ]"
+check "Ctrl-C during boot terminates the VM" "[ \$(countx) = 0 ]"
+
+echo "== a cold boot shows what the VM is doing (plain output, as agents see it)"
+SPOTEXEC_POOL=${RUNNER}s "$SX" 'echo booted' >"$WORK/bp.out" 2>"$WORK/bp.err"
+check "plain heartbeat names the bootstrap step and how long it has run" "grep -q booted $WORK/bp.out && grep -qE 'sx: ${RUNNER}s: running first-boot setup [0-9.]+s — (boot-step|spotexec: )' $WORK/bp.err"
+SPOTEXEC_POOL=${RUNNER}s "$SX" --json 'echo booted' >/dev/null 2>"$WORK/bpj.err"
+SPOTEXEC_POOL=${RUNNER}s "$SX" 'echo warm' >"$WORK/bw.out" 2>"$WORK/bw.err"
+check "a warm run says nothing about first boot" "grep -q warm $WORK/bw.out && ! grep -q first-boot $WORK/bw.err && ! grep -q boot_progress $WORK/bpj.err"
+docker ps -q --filter "label=spotexec-runner=${RUNNER}s" | xargs -r docker rm -f >/dev/null 2>&1
+SPOTEXEC_POOL=${RUNNER}s "$SX" --json 'echo booted' >/dev/null 2>"$WORK/bpj.err"
+check "agents get boot_progress events with the latest log line" "grep -qE '\"event\":\"boot_progress\".*\"line\":\"(boot-step|spotexec: )' $WORK/bpj.err"
+
+echo "== a VM near max_lifetime takes no new runs (60s lifetime: none in the last 15s)"
+cleanup; sleep 1
+placed() { grep '"placed"' "$1" | sed 's/.*instance_id":"\([^"]*\)".*/\1/' | tail -1; }
+SPOTEXEC_POOL=${RUNNER}l "$SX" --json 'echo first' >"$WORK/l1.out" 2>"$WORK/l1.err"
+L1=$(placed "$WORK/l1.err")
+born=$(docker inspect -f '{{index .Config.Labels "spotexec-launched"}}' "$L1" 2>/dev/null || echo 0)
+while [ $(( $(date +%s) - born/1000 )) -lt 47 ]; do sleep 1; done
+SPOTEXEC_POOL=${RUNNER}l "$SX" --json --same-slot 'echo same' >"$WORK/l2.out" 2>"$WORK/l2.err"; code=$?
+check "the VM's helper refuses a run to its slot near max_lifetime" "[ $code = 125 ] && ! grep -q same $WORK/l2.out && grep -q max_lifetime $WORK/l2.err"
+SPOTEXEC_POOL=${RUNNER}l "$SX" --json 'echo second' >"$WORK/l3.out" 2>"$WORK/l3.err"
+L3=$(placed "$WORK/l3.err")
+check "a new run goes to a fresh VM, not the ageing one" "grep -q second $WORK/l3.out && [ -n \"$L3\" ] && [ \"$L3\" != \"$L1\" ]"
+
+echo "== Spot vCPU quota (a simulated VM counts 4 vCPUs)"
+cleanup; sleep 1
+rm -rf "$SPOTEXEC_STATE_DIR/runners/$RUNNER/pool.json"
+t0=$(date +%s)
+SPOTEXEC_SIM_QUOTA=0 "$SX" 'echo never' >"$WORK/qz.out" 2>"$WORK/qz.err"; code=$?
+took=$(( $(date +%s) - t0 ))
+check "no VM and no quota: fails at once with exit 125 (${took}s)" "[ $code = 125 ] && [ $took -le 20 ] && ! grep -q never $WORK/qz.out"
+check "the error names the region, the vCPUs and the increase command" "grep -q 'quota in sim' $WORK/qz.err && grep -q 'needs 4 vCPUs' $WORK/qz.err && grep -q 'request-service-quota-increase --region sim --service-code ec2 --quota-code L-34B43A08' $WORK/qz.err"
+rm -rf "$SPOTEXEC_STATE_DIR/runners/$RUNNER/pool.json"
+for i in 1 2 3 4 5; do SPOTEXEC_SIM_QUOTA=4 "$SX" --json "sleep 3; echo quota$i" >"$WORK/qq$i.out" 2>"$WORK/qq$i.err" & done; wait
+check "room for one VM: all five jobs queue for it and succeed" "[ \$(cat $WORK/qq*.out | grep -c '^quota') = 5 ]"
+check "only one VM ran" "[ \$(count) = 1 ]"
+check "launches stop after the quota refusal (no retry loop)" "[ \$(cat $WORK/qq*.err | grep -c LAUNCH_FAILED) -le 2 ]"
+
+echo "== two machines sharing the account's quota (room for one VM)"
+cleanup; sleep 1
+rm -rf "$SPOTEXEC_STATE_DIR/runners/$RUNNER/pool.json"
+SPOTEXEC_SIM_QUOTA=4 "$SX" --json 'sleep 10; echo a-done' >"$WORK/ma.out" 2>"$WORK/ma.err" &
+P=$!
+for _ in $(seq 1 60); do grep -q '"exec"' "$WORK/ma.err" 2>/dev/null && break; sleep 0.5; done
+mkdir -p "$WORK/cfgB" && cp "$SPOTEXEC_CONFIG_DIR/config.toml" "$WORK/cfgB/"
+SPOTEXEC_CONFIG_DIR="$WORK/cfgB" SPOTEXEC_STATE_DIR="$WORK/stateB" SPOTEXEC_SIM_QUOTA=4 "$SX" 'echo b-ran' >"$WORK/mb.out" 2>"$WORK/mb.err"; code=$?
+check "the other machine, with no VM, fails at once (exit 125)" "[ $code = 125 ] && ! grep -q b-ran $WORK/mb.out"
+check "and says who holds the quota" "grep -q '4 of 4 vCPUs in use: 4 by owner ' $WORK/mb.err"
+wait $P
+check "the first machine's run was unaffected" "grep -q a-done $WORK/ma.out"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

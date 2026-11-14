@@ -14,6 +14,8 @@ import (
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/hooks"
+	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 const globalTemplate = `# spotexec global runner config (personal; never committed).
@@ -65,26 +67,38 @@ usermod -aG docker ubuntu
 `
 
 func cmdInit() *cobra.Command {
-	var global, force bool
+	var global, force, yes, noContainer bool
 	c := &cobra.Command{
 		Use:   "init",
-		Short: "Generate .spotexec.toml for this repo (or --global runner config)",
+		Short: "Generate .spotexec.toml for this repo, and a container for its toolchain (or --global runner config)",
+		Long: `Generate .spotexec.toml for this repository: dependency caching and tasks
+detected from its lockfiles and scripts.
+
+When it detects a language toolchain (Node.js or Bun, Python, Go, Rust, Java),
+init also writes .spotexec/Dockerfile, pinned to the versions the repository
+declares (.nvmrc, packageManager, .python-version, go.mod, rust-toolchain, ...),
+and points [container] at it: AWS VMs boot plain Ubuntu, and every command runs
+in that image. --no-container keeps commands on the runner's own toolchain, as
+does a setup whose runners are all SSH machines.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if global {
 				p := config.GlobalPath()
 				if _, err := os.Stat(p); err == nil && !force {
 					return fmt.Errorf("%s exists (use --force to overwrite)", p)
 				}
-				region, err := writeGlobalTemplate(p)
+				region, why, err := writeGlobalTemplate(p, "")
 				if err != nil {
 					return err
 				}
-				fmt.Printf("wrote %s (region %s)\nnext: `spotexec setup` (AWS access that doesn't expire), then `spotexec init` in a repo, then `sx <command>`\n", p, region)
+				fmt.Printf("wrote %s (region %s, %s)\nnext: `spotexec setup` (AWS access that doesn't expire), then `spotexec init` in a repo, then `sx <command>`\n", p, region, why)
 				return nil
 			}
 			wd, _ := os.Getwd()
 			ws, err := client.Resolve(wd)
 			if err != nil {
+				return err
+			}
+			if err := checkProjectDir(ws, yes); err != nil {
 				return err
 			}
 			p := filepath.Join(ws.Root, ".spotexec.toml")
@@ -99,6 +113,9 @@ func cmdInit() *cobra.Command {
 			for _, n := range notes {
 				fmt.Println("  " + n)
 			}
+			if err := initContainer(ws, noContainer); err != nil {
+				return err
+			}
 			if _, err := os.Stat(config.GlobalPath()); err != nil {
 				fmt.Println("no runners configured yet: run `spotexec setup`")
 			}
@@ -107,17 +124,83 @@ func cmdInit() *cobra.Command {
 	}
 	c.Flags().BoolVar(&global, "global", false, "write an example ~/.config/spotexec/config.toml")
 	c.Flags().BoolVar(&force, "force", false, "overwrite an existing file")
+	c.Flags().BoolVar(&yes, "yes", false, "mark a directory that isn't a Git repository without asking")
+	c.Flags().BoolVar(&noContainer, "no-container", false, "don't set up a project container: commands use the runner's own toolchain")
 	return c
 }
 
-// writeGlobalTemplate writes the example global config with the detected
-// AWS region and returns that region.
-func writeGlobalTemplate(p string) (string, error) {
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return "", err
+// initContainer sets up the project container when init detects a
+// toolchain: AWS VMs boot without one, and the image pins it exactly.
+func initContainer(ws *client.Workspace, skip bool) error {
+	_, stack, _ := scaffoldDockerfile(ws.Root)
+	switch {
+	case stack == "":
+		fmt.Println("no language toolchain detected, so commands use the runner's own tools; `spotexec container init` sets up a container image")
+		return nil
+	case skip:
+		fmt.Printf("%s project, no container (--no-container): commands use the runner's own toolchain, which AWS VMs only have if bootstrap_script installs it\n", stack)
+		return nil
+	case sshRunnersOnly():
+		fmt.Printf("%s project; your runners are SSH machines, so commands use their own toolchain (`spotexec container init` runs them in a container instead)\n", stack)
+		return nil
 	}
-	region := detectRegion()
-	return region, os.WriteFile(p, []byte(strings.ReplaceAll(globalTemplate, "{{REGION}}", region)), 0o644)
+	if _, err := os.Lstat(filepath.Join(ws.Root, filepath.FromSlash(defaultDockerfile))); err == nil {
+		msg, err := wireContainer(filepath.Join(ws.Root, ".spotexec.toml"), defaultDockerfile)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("kept the existing %s (`spotexec container init --force` rewrites it for %s)\n%s\n", defaultDockerfile, stack, msg)
+		return nil
+	}
+	return containerInit(ws, defaultDockerfile, false)
+}
+
+// sshRunnersOnly reports whether every configured runner is an SSH
+// machine, which runs commands with its own toolchain.
+func sshRunnersOnly() bool {
+	g, err := config.LoadGlobal()
+	if err != nil || len(g.Runners) == 0 {
+		return false
+	}
+	for _, r := range g.Runners {
+		if r.Ephemeral() {
+			return false
+		}
+	}
+	return true
+}
+
+// checkProjectDir refuses to make the home directory or / a project, and
+// asks before marking a directory that isn't a Git worktree: every file
+// under it would sync to runners.
+func checkProjectDir(ws *client.Workspace, yes bool) error {
+	if config.NeverProject(ws.Root) {
+		return fmt.Errorf("%s is your home directory, / or a credential directory, which spotexec never syncs (they hold ~/.aws, ~/.ssh and more): cd into the project's repository and run this again", ws.Root)
+	}
+	if ws.Git || ws.Marked || yes {
+		return nil
+	}
+	if !ui.IsTerminal(os.Stdin) {
+		return fmt.Errorf("%s is not in a Git repository, so every file under it would sync to runners: cd into the project's repository, or pass --yes if this directory is the project", ws.Root)
+	}
+	fmt.Printf("%s is not in a Git repository: every file under it (apart from [sync].exclude and built-in excludes such as node_modules/) will sync to runners.\nMake it a spotexec project? [y/N] ", ws.Root)
+	var a string
+	fmt.Scanln(&a)
+	if a = strings.ToLower(strings.TrimSpace(a)); a != "y" && a != "yes" {
+		return errors.New("nothing written: cd into the project's repository first")
+	}
+	return nil
+}
+
+// writeGlobalTemplate writes the example global config with the region
+// detected for AWS profile (see detectRegion), and returns that region and
+// where it came from.
+func writeGlobalTemplate(p, profile string) (region, why string, err error) {
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return "", "", err
+	}
+	region, why = detectRegion(profile)
+	return region, why, os.WriteFile(p, []byte(strings.ReplaceAll(globalTemplate, "{{REGION}}", region)), 0o644)
 }
 
 func exists(root, name string) bool {
@@ -133,32 +216,29 @@ func detectProject(root string) (string, []string) {
 	b.WriteString("version = 1\ntimeout = \"5m\"\nenv_allow = [\"NODE_OPTIONS\", \"TZ\"]\n\n")
 	b.WriteString("[sync]\nmode = \"auto\"          # write back files the command changed (prettier --write, vitest -u, codegen)\nwriteback = \"always\"\nexclude = [\".env*\", \"*.pem\", \"*.key\"]\npull_artifacts = []     # e.g. [\"coverage/\"]\n\n")
 
-	pm := ""
+	// The same package manager the project container installs.
+	pm, pmVer := jsPackageManager(root, readPackageJSON(root))
 	switch {
-	case exists(root, "pnpm-lock.yaml"):
-		pm = "pnpm"
+	case pm == "pnpm" && exists(root, "pnpm-lock.yaml"):
 		dirs := `["node_modules"]`
 		if exists(root, "pnpm-workspace.yaml") {
 			dirs = `["node_modules", "packages/*/node_modules", "apps/*/node_modules"]`
 			notes = append(notes, "pnpm workspace detected: adjust deps.cache_dirs globs to your package folders")
 		}
 		fmt.Fprintf(&b, "[deps]\nlockfiles = [\"pnpm-lock.yaml\"]\ninstall = \"pnpm install --frozen-lockfile\"\ncache_dirs = %s\n\n", dirs)
-	case exists(root, "bun.lock") || exists(root, "bun.lockb"):
-		pm = "bun"
+	case pm == "bun" && (exists(root, "bun.lock") || exists(root, "bun.lockb")):
 		lf := "bun.lock"
 		if !exists(root, lf) {
 			lf = "bun.lockb"
 		}
 		fmt.Fprintf(&b, "[deps]\nlockfiles = [%q]\ninstall = \"bun install --frozen-lockfile\"\ncache_dirs = [\"node_modules\"]\n\n", lf)
-	case exists(root, "yarn.lock"):
-		pm = "yarn"
+	case pm == "yarn" && exists(root, "yarn.lock"):
 		inst := "yarn install --frozen-lockfile"
-		if exists(root, ".yarnrc.yml") {
+		if exists(root, ".yarnrc.yml") || (pmVer != "" && !strings.HasPrefix(pmVer, "1.")) {
 			inst = "yarn install --immutable"
 		}
 		fmt.Fprintf(&b, "[deps]\nlockfiles = [\"yarn.lock\"]\ninstall = %q\ncache_dirs = [\"node_modules\"]\n\n", inst)
-	case exists(root, "package-lock.json"):
-		pm = "npm"
+	case pm == "npm" && exists(root, "package-lock.json"):
 		b.WriteString("[deps]\nlockfiles = [\"package-lock.json\"]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\n\n")
 	case exists(root, "uv.lock"):
 		b.WriteString("[deps]\nlockfiles = [\"uv.lock\"]\ninstall = \"uv sync --frozen\"\ncache_dirs = [\".venv\"]\n\n")
@@ -297,11 +377,14 @@ func cmdHook() *cobra.Command {
 					fmt.Printf("%s: %s\n", p, map[bool]string{true: "removed spotexec hook", false: "no spotexec hook found"}[ok])
 				} else {
 					hookCmd := transportQuote(hookBinary()) + " hook claude"
+					legacy := hooks.HasLegacyClaude(p)
 					ok, err := hooks.InstallClaude(p, hookCmd)
 					if err != nil {
 						return err
 					}
-					if ok {
+					if ok && legacy {
+						fmt.Printf("updated the PreToolUse hook in %s to call spotexec (sx only runs commands)\n", p)
+					} else if ok {
 						fmt.Printf("installed PreToolUse hook in %s\n", p)
 					} else {
 						fmt.Printf("hook already present in %s\n", p)
@@ -354,9 +437,7 @@ func cmdHook() *cobra.Command {
 		Use:    "claude",
 		Short:  "PreToolUse hook handler (reads the event JSON on stdin)",
 		Hidden: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			hooks.HandleClaude(os.Stdin, os.Stdout, transportQuote(hookBinary()))
-		},
+		Run:    func(*cobra.Command, []string) { claudeHook() },
 	}
 	check := &cobra.Command{
 		Use:                "check <command>",
@@ -377,6 +458,7 @@ func cmdHook() *cobra.Command {
 				return err
 			}
 			line := strings.Join(args, " ")
+			runnersErr := hooks.RunnersFor(line, wd, l.cfg.Project)
 			// The same decision the hook makes (project opt-in, disabled,
 			// cd outside the repository).
 			switch {
@@ -390,6 +472,8 @@ func cmdHook() *cobra.Command {
 				fmt.Println("local (cd leaves the repository)")
 			case l.cfg.Project.Hook.WhenLoadAbove > 0 && belowLoad(l.cfg.Project.Hook.WhenLoadAbove):
 				fmt.Printf("local (load per CPU is below when_load_above = %.2f)\n", l.cfg.Project.Hook.WhenLoadAbove)
+			case runnersErr != nil:
+				fmt.Printf("local (no usable runners: %v)\n", runnersErr)
 			default:
 				fmt.Println("offload:", hooks.Wrap("spotexec", line))
 				return nil
@@ -401,6 +485,11 @@ func cmdHook() *cobra.Command {
 	return c
 }
 
+// claudeHook handles one Claude Code PreToolUse event on stdin.
+func claudeHook() {
+	hooks.HandleClaude(os.Stdin, os.Stdout, transportQuote(hookBinary()))
+}
+
 func transportQuote(s string) string {
 	if strings.ContainsAny(s, " '\"") {
 		return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
@@ -408,20 +497,16 @@ func transportQuote(s string) string {
 	return s
 }
 
-// detectRegion picks the AWS region for a new config: AWS_REGION,
-// AWS_DEFAULT_REGION, the AWS CLI's configured region, or us-east-1.
-func detectRegion() string {
-	for _, k := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
+// detectRegion picks the AWS region for a new config the way the AWS CLI
+// would for profile (empty: AWS_PROFILE, else default), reading the AWS
+// config files directly: AWS_REGION, AWS_DEFAULT_REGION, the profile's
+// region, else us-east-1. why says which, for the user.
+func detectRegion(profile string) (region, why string) {
+	r, from := provider.ProfileRegion(profile)
+	if r != "" {
+		return r, "from " + from
 	}
-	if out, err := exec.Command("aws", "configure", "get", "region").Output(); err == nil {
-		if r := strings.TrimSpace(string(out)); r != "" {
-			return r
-		}
-	}
-	return "us-east-1"
+	return "us-east-1", "the default: " + from
 }
 
 func belowLoad(threshold float64) bool {

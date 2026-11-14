@@ -4,14 +4,18 @@ import "testing"
 
 func TestReservedPath(t *testing.T) {
 	for p, want := range map[string]bool{
-		".git/hooks/pre-commit": true,
-		".GIT/hooks/pre-commit": true,
-		"sub/.Git/config":       true,
-		".spotexec/x":           true,
-		".SpotExec/x":           true,
-		"src/git/x":             false,
-		".gitignore":            false,
-		"a/.github/workflows":   false,
+		".git/hooks/pre-commit":    true,
+		".GIT/hooks/pre-commit":    true,
+		"sub/.Git/config":          true,
+		".spotexec":                true,
+		".spotexec/conflicts/r1/x": true,
+		".SpotExec/Conflicts/r1/x": true,
+		".spotexec/WRITEBACK.lock": true,
+		".spotexec/Dockerfile":     false,
+		".spotexec/setup.sh":       false,
+		"src/git/x":                false,
+		".gitignore":               false,
+		"a/.github/workflows":      false,
 	} {
 		if got := reservedPath(p, false); got != want {
 			t.Errorf("reservedPath(%q) = %v, want %v", p, got, want)

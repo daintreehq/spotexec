@@ -33,7 +33,7 @@
 </p>
 
 <p align="center">
-  <code>sx</code> is short for <code>spotexec run --</code>, and works with any command: <code>sx&nbsp;cargo&nbsp;build</code>.
+  <code>sx</code> works with any command, as in <code>sx&nbsp;cargo&nbsp;build</code>, and runs your project's tasks by name: <code>sx&nbsp;test</code>.
 </p>
 
 ## Why spotexec
@@ -57,7 +57,7 @@ spotexec keeps everything local except the work. Only the heavy commands move, a
 brew install daintreehq/tap/spotexec
 ```
 
-Homebrew works on macOS and Linux, and installs `spotexec`, the `sx` alias and shell completions.
+Homebrew works on macOS and Linux, and installs `spotexec`, the `sx` alias and shell completions for both (`sx` completes its flags and the project's task names).
 
 <details>
 <summary><b>Linux packages</b> (.deb, .rpm, .apk)</summary>
@@ -70,6 +70,8 @@ sudo apt install ./spotexec_*_linux_amd64.deb      # Debian, Ubuntu
 sudo dnf install ./spotexec_*_linux_amd64.rpm      # Fedora, RHEL
 sudo apk add --allow-untrusted ./spotexec_*.apk    # Alpine
 ```
+
+The packages install the `sx` link and bash, zsh and fish completions too.
 
 </details>
 
@@ -107,7 +109,7 @@ aws login              # or: aws sso login, aws configure
 spotexec setup
 ```
 
-Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
+Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. The fleet uses 8-vCPU VMs; on a new account whose quota can't fit one (often 5 vCPUs), setup switches it to 4-vCPU VMs and prints the command to raise the quota. Finally it offers to bake an image, so new VMs skip their bootstrap. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
 
 **An SSH machine you already own**, such as a Linux box or a spare Mac. Key login must already work. Put it in `~/.config/spotexec/config.toml`:
 
@@ -129,12 +131,13 @@ To use both, list both in `default_pool` and give the homelab the lower `priorit
 
 ```sh
 cd ~/code/my-app
-spotexec init              # writes .spotexec.toml: lockfiles, tasks
-spotexec container init    # the toolchain as a Dockerfile, for AWS VMs
-spotexec doctor            # checks config, SSH, AWS, quota
+spotexec init              # writes .spotexec.toml (lockfiles, tasks) and .spotexec/Dockerfile (your toolchain)
+spotexec doctor            # checks config, SSH, AWS, quota, the container
 ```
 
-The runner needs your toolchain (`node`, `pnpm`, `go` and so on). AWS VMs boot plain Ubuntu, so give them a [project container](docs/environments.md#project-containers) or a runner `bootstrap_script`. On an SSH machine you can skip `container init` if the toolchain is on `PATH` in bash's login profile (`~/.bash_profile` or `~/.profile`, not `~/.zprofile`), or set by [`remote_path_setup`](docs/configuration.md).
+The runner needs your toolchain (`node`, `pnpm`, `go` and so on), and AWS VMs boot plain Ubuntu. So when `init` detects one (Node.js or Bun, Python, Go, Rust, Java), it also writes a [project container](docs/environments.md#project-containers): a Dockerfile pinned to the versions your repository declares (`.nvmrc`, `packageManager`, `.python-version`, `go.mod`, ...). Every command runs in it, and the first `sx` builds it. Commit `.spotexec/Dockerfile` with `.spotexec.toml`.
+
+If your runners are all SSH machines, `init` leaves the container out and commands use the machine's own toolchain: it must be on `PATH` in bash's login profile (`~/.bash_profile` or `~/.profile`, not `~/.zprofile`), or set by [`remote_path_setup`](docs/configuration.md). `spotexec init --no-container` does the same anywhere; AWS VMs then need the toolchain in the runner's `bootstrap_script`.
 
 ### 3. Run
 
@@ -149,7 +152,7 @@ spotexec status                # what's running where, and idle timers
 
 Files the command changes come back. Ignored outputs such as coverage reports need `pull_artifacts` in `.spotexec.toml`, or a flag like `--pull coverage/`; see [write-back and artifacts](docs/running.md#write-back-and-artifacts).
 
-The first AWS run boots a VM, which takes about a minute plus your bootstrap. Later runs reuse it until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time.
+The first AWS run boots a VM, which takes about a minute plus your bootstrap, and builds the project container there; later VMs pull the built image instead. While it boots, `sx` shows how long it has been going and the latest line of the VM's bootstrap log. Later runs reuse the VM until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
 
 ## With coding agents
 

@@ -5,6 +5,8 @@
 package hooks
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,8 +16,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
 )
@@ -85,9 +89,62 @@ func NewDecider(h config.Hook) (*Decider, error) {
 // simple output filters (`| tail -50`, `| grep FAIL`), which keep running
 // locally on the streamed output. Redirects into files, subshells,
 // background jobs and anything else keep the command local.
+//
+// A pipe binds tighter than && and ;, so in `a && b | tail` only b is
+// filtered. Splitting that across two runs could land them on different
+// machines (b would miss a's build output), so a filtered line offloads only
+// when a single heavy command (after any leading cds) feeds the filters.
 func (d *Decider) ShouldOffload(command string) bool {
-	head, _, ok := splitFilters(command)
-	return ok && d.shouldOffload(head)
+	if shellHazard(command) {
+		return false
+	}
+	head, filters, ok := splitFilters(command)
+	if !ok || !d.shouldOffload(head) {
+		return false
+	}
+	segs, ops := splitList(head)
+	k := 0 // leading cds, which Wrap runs locally
+	for k < len(segs)-1 && isCd(segs[k]) {
+		k++
+	}
+	for _, seg := range segs {
+		if seg == "" {
+			return false // `a;; b`, `a && && b`: bash refuses the line
+		}
+	}
+	if k > 0 && ops[k-1] == "&&" && slices.Contains(ops[k:], ";") {
+		// `cd x && a; b` runs b even when the cd fails; hoisted, the cd
+		// would gate the whole rest of the line.
+		return false
+	}
+	if filters != "" && len(segs)-k > 1 {
+		return false
+	}
+	return true
+}
+
+// shellHazard reports shell syntax the splitters don't model: a comment
+// (which could hide an operator) or a backslash escape outside quotes.
+func shellHazard(c string) bool {
+	var q byte
+	for i := 0; i < len(c); i++ {
+		ch := c[i]
+		switch {
+		case q == '"' && ch == '\\':
+			i++
+		case q != 0:
+			if ch == q {
+				q = 0
+			}
+		case ch == '\'' || ch == '"':
+			q = ch
+		case ch == '\\':
+			return true
+		case ch == '#' && (i == 0 || c[i-1] == ' ' || c[i-1] == '\t'):
+			return true
+		}
+	}
+	return false
 }
 
 // outputFilter matches commands that only transform text on stdin.
@@ -190,6 +247,11 @@ func (d *Decider) shouldOffload(command string) bool {
 			continue
 		}
 		if cdSeg.MatchString(seg) {
+			if heavy {
+				// Offloaded, this cd would happen only remotely: the
+				// agent's shell would stay where it was.
+				return false
+			}
 			continue
 		}
 		matched := false
@@ -221,15 +283,95 @@ func splitSegments(c string) []string {
 	return strings.Split(c, "\x00")
 }
 
-// Wrap returns the offloaded form of command. Trailing output filters stay
-// local, reading the remote command's streamed output; spotexec's own
-// progress is silenced so it can't mix into what they read.
+// Wrap returns the offloaded form of command, meaning the same as the
+// original line:
+//   - leading `cd`s run locally, so the agent's shell (and any local filter
+//     such as `tee out.log`) ends up where it asked; spotexec then runs the
+//     rest from that directory, which maps to the same remote one;
+//   - trailing output filters stay local, reading the remote command's
+//     streamed output (ShouldOffload lets only one command feed them);
+//   - spotexec's own warnings and summary go to stderr, outside the pipe.
+//
+// It expects a line ShouldOffload accepted.
 func Wrap(bin, command string) string {
 	head, filters, ok := splitFilters(command)
-	if ok && filters != "" {
-		return bin + " run -q -- " + shellQuote(head) + " | " + filters
+	if !ok {
+		head, filters = strings.TrimSpace(command), ""
 	}
-	return bin + " run -- " + shellQuote(command)
+	segs, ops := splitList(head)
+	run := func(segs, ops []string) string { return bin + " run -- " + shellQuote(joinList(segs, ops)) }
+	var b strings.Builder
+	i := 0
+	for ; i < len(segs)-1 && isCd(segs[i]); i++ {
+		b.WriteString(segs[i] + listOp(ops[i]))
+	}
+	segs, ops = segs[i:], ops[i:]
+	if filters == "" {
+		b.WriteString(run(segs, ops))
+		return b.String()
+	}
+	b.WriteString(run(segs, ops) + " | " + filters)
+	return b.String()
+}
+
+func isCd(seg string) bool {
+	return cdSeg.MatchString(strings.TrimSpace(envSeg.ReplaceAllString(seg, "")))
+}
+
+// splitList splits a command list at unquoted "&&" and ";" (the only list
+// operators ShouldOffload lets through), returning the trimmed segments and
+// the operators between them.
+func splitList(c string) (segs, ops []string) {
+	var q rune
+	start := 0
+	for i := 0; i < len(c); i++ {
+		ch := rune(c[i])
+		switch {
+		case q != 0:
+			if ch == q {
+				q = 0
+			} else if ch == '\\' && q == '"' {
+				i++
+			}
+		case ch == '\'' || ch == '"':
+			q = ch
+		case ch == '\\':
+			i++
+		case ch == ';' || ch == '&' && i+1 < len(c) && c[i+1] == '&':
+			segs = append(segs, strings.TrimSpace(c[start:i]))
+			op := ";"
+			if ch == '&' {
+				op = "&&"
+				i++
+			}
+			ops = append(ops, op)
+			start = i + 1
+		}
+	}
+	segs = append(segs, strings.TrimSpace(c[start:]))
+	// A trailing ";" ends the list without starting another command.
+	if len(segs) > 1 && segs[len(segs)-1] == "" && ops[len(ops)-1] == ";" {
+		segs, ops = segs[:len(segs)-1], ops[:len(ops)-1]
+	}
+	return segs, ops
+}
+
+func listOp(op string) string {
+	if op == ";" {
+		return "; "
+	}
+	return " " + op + " "
+}
+
+func joinList(segs, ops []string) string {
+	var b strings.Builder
+	for i, s := range segs {
+		if i > 0 {
+			b.WriteString(listOp(ops[i-1]))
+		}
+		b.WriteString(s)
+	}
+	return b.String()
 }
 
 func shellQuote(s string) string {
@@ -238,10 +380,23 @@ func shellQuote(s string) string {
 
 // claudeInput is the PreToolUse stdin payload (fields we use).
 type claudeInput struct {
+	SessionID string         `json:"session_id"`
 	ToolName  string         `json:"tool_name"`
 	ToolInput map[string]any `json:"tool_input"`
 	Cwd       string         `json:"cwd"`
-	Extra     map[string]any `json:"-"`
+}
+
+// BashTimeoutMS is the Bash tool timeout an offloaded command gets when the
+// agent set none: Claude Code's default is 2 minutes, too short for booting
+// a Spot VM, installing dependencies and then running. It is Claude Code's
+// default ceiling (BASH_MAX_TIMEOUT_MS raises it, and so does this).
+const BashTimeoutMS = 600000
+
+func bashTimeout() int {
+	if n, err := strconv.Atoi(os.Getenv("BASH_MAX_TIMEOUT_MS")); err == nil && n > BashTimeoutMS {
+		return n
+	}
+	return BashTimeoutMS
 }
 
 // HandleClaude processes one PreToolUse event. It never fails the tool call:
@@ -262,10 +417,11 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 	if dir == "" {
 		dir, _ = os.Getwd()
 	}
-	h, ok := projectHook(dir)
-	if !ok || h.Disabled {
+	proj, ok := project(dir)
+	if !ok || proj.Hook.Disabled {
 		return
 	}
+	h := proj.Hook
 	d, err := NewDecider(h)
 	if err != nil || !d.ShouldOffload(cmd) {
 		return
@@ -279,12 +435,27 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 			return
 		}
 	}
+	if err := RunnersFor(cmd, dir, proj); err != nil {
+		// Offloading would only fail: run it here, and say so once a
+		// session (a hook installed before `spotexec setup` would otherwise
+		// keep a first demo silently local).
+		if firstNotice(ev.SessionID) {
+			writeJSON(out, map[string]any{
+				"systemMessage": "spotexec: heavy commands are running on this machine: " + err.Error(),
+				"hookSpecificOutput": map[string]any{
+					"hookEventName":     "PreToolUse",
+					"additionalContext": "spotexec kept this command on this machine instead of offloading it, because it has no usable runners (" + err.Error() + "). Heavy commands keep running locally until that is fixed.",
+				},
+			})
+		}
+		return
+	}
 	wrapped := Wrap(bin, cmd)
 	if h.Mode == "block" {
 		writeJSON(out, map[string]any{"hookSpecificOutput": map[string]any{
 			"hookEventName":            "PreToolUse",
 			"permissionDecision":       "deny",
-			"permissionDecisionReason": "This project offloads heavy commands to remote runners. Re-run it as: " + wrapped + " (or prefix SPOTEXEC_LOCAL=1 if it must run on this machine, e.g. it needs local services)",
+			"permissionDecisionReason": fmt.Sprintf("This project offloads heavy commands to remote runners. Re-run it as: %s with a Bash timeout of %d ms, since a cold start can take minutes (or prefix SPOTEXEC_LOCAL=1 if it must run on this machine, e.g. it needs local services)", wrapped, bashTimeout()),
 		}})
 		return
 	}
@@ -293,10 +464,77 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 		newInput[k] = v
 	}
 	newInput["command"] = wrapped
+	if t, _ := newInput["timeout"].(float64); t <= 0 {
+		newInput["timeout"] = bashTimeout()
+	}
 	writeJSON(out, map[string]any{"hookSpecificOutput": map[string]any{
 		"hookEventName": "PreToolUse",
 		"updatedInput":  newInput,
 	}})
+}
+
+// RunnersFor is UsableRunners for the config the wrapped command line will
+// load: spotexec starts after the line's leading cds, which run locally.
+func RunnersFor(command, dir string, proj *config.Project) error {
+	if rd := wrapDir(command, dir); rd != dir {
+		// As spotexec run there resolves it: defaults when that worktree
+		// has no .spotexec.toml.
+		p, err := config.LoadProject(config.FindProject(rd, gitRoot(rd)))
+		if err != nil {
+			return err
+		}
+		proj = p
+	}
+	return UsableRunners(proj)
+}
+
+// UsableRunners reports why a run in this project would have no runner to
+// go to (none configured, an unknown pool entry, a broken config), or nil.
+func UsableRunners(proj *config.Project) error {
+	g, err := config.LoadGlobal()
+	if err != nil {
+		return err
+	}
+	cfg := &config.Config{Global: g, Project: proj}
+	if err := cfg.MergeProjectRunners(); err != nil {
+		return err
+	}
+	var override []string // as spotexec run resolves it
+	if r := os.Getenv("SPOTEXEC_RUNNER"); r != "" {
+		override = []string{r}
+	}
+	_, err = cfg.Pool(override)
+	return err
+}
+
+// firstNotice reports whether this session hasn't had the "staying local"
+// notice yet, and records that it has. Without a session id it is once a day.
+func firstNotice(session string) bool {
+	if session == "" {
+		session = time.Now().Format("2006-01-02")
+	}
+	sum := sha256.Sum256([]byte(session))
+	dir := filepath.Join(config.StateDir(), "hook-notices")
+	p := filepath.Join(dir, hex.EncodeToString(sum[:8]))
+	if os.MkdirAll(dir, 0o700) == nil {
+		// Claimed atomically: parallel tool calls of one session race here.
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			return false
+		}
+		if err == nil {
+			f.Close()
+		}
+		// Forget sessions older than a week.
+		if ents, err := os.ReadDir(dir); err == nil {
+			for _, e := range ents {
+				if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > 7*24*time.Hour {
+					os.Remove(filepath.Join(dir, e.Name()))
+				}
+			}
+		}
+	}
+	return true
 }
 
 // CdsInside reports whether every `cd` stays in the repository (see cdsInside).
@@ -321,23 +559,8 @@ func cdsInside(command, dir string) bool {
 		if !cdSeg.MatchString(seg) {
 			continue
 		}
-		target := strings.TrimSpace(strings.TrimPrefix(seg, "cd"))
-		// Unwrap one level of matching quotes; anything still quoted or
-		// escaped is too clever to reason about: keep it local.
-		if len(target) >= 2 && (target[0] == '"' || target[0] == '\'') && target[len(target)-1] == target[0] {
-			target = target[1 : len(target)-1]
-		}
-		if target == "" || strings.ContainsAny(target, "'\"\\$`") || strings.HasPrefix(target, "~") || strings.HasPrefix(target, "-") {
-			return false
-		}
-		if !filepath.IsAbs(target) {
-			target = filepath.Join(cur, target)
-		}
-		target = filepath.Clean(target)
-		if r, err := filepath.EvalSymlinks(target); err == nil {
-			target = r
-		}
-		if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+		target, ok := cdTarget(seg, cur)
+		if !ok || target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
 			return false
 		}
 		cur = target
@@ -345,27 +568,72 @@ func cdsInside(command, dir string) bool {
 	return true
 }
 
+// cdTarget resolves the directory a `cd` segment changes to from cur. ok is
+// false for targets too clever to reason about.
+func cdTarget(seg, cur string) (string, bool) {
+	target := strings.TrimSpace(strings.TrimPrefix(seg, "cd"))
+	// Unwrap one level of matching quotes; anything still quoted or
+	// escaped is too clever to reason about: keep it local.
+	if len(target) >= 2 && (target[0] == '"' || target[0] == '\'') && target[len(target)-1] == target[0] {
+		target = target[1 : len(target)-1]
+	}
+	if target == "" || strings.ContainsAny(target, "'\"\\$`") || strings.HasPrefix(target, "~") || strings.HasPrefix(target, "-") {
+		return "", false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(cur, target)
+	}
+	target = filepath.Clean(target)
+	if r, err := filepath.EvalSymlinks(target); err == nil {
+		target = r
+	}
+	return target, true
+}
+
+// wrapDir is the directory Wrap starts spotexec in: dir after the line's
+// leading cds.
+func wrapDir(command, dir string) string {
+	head, _, ok := splitFilters(command)
+	if !ok {
+		return dir
+	}
+	segs, _ := splitList(head)
+	cur := dir
+	for i := 0; i < len(segs)-1 && isCd(segs[i]); i++ {
+		t, ok := cdTarget(strings.TrimSpace(envSeg.ReplaceAllString(segs[i], "")), cur)
+		if !ok {
+			return dir
+		}
+		cur = t
+	}
+	return cur
+}
+
 func writeJSON(w io.Writer, v any) {
 	b, _ := json.Marshal(v)
 	w.Write(append(b, '\n'))
 }
 
-// projectHook loads [hook] for the project containing dir. Offloading only
-// happens in projects that opted in with a .spotexec.toml.
-func projectHook(dir string) (config.Hook, bool) {
-	root := dir
-	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
-		root = strings.TrimSpace(string(out))
-	}
-	p := config.FindProject(dir, root)
+// project loads the .spotexec.toml for the project containing dir.
+// Offloading only happens in projects that opted in with one.
+func project(dir string) (*config.Project, bool) {
+	p := config.FindProject(dir, gitRoot(dir))
 	if p == "" {
-		return config.Hook{}, false
+		return nil, false
 	}
 	proj, err := config.LoadProject(p)
 	if err != nil {
-		return config.Hook{}, false
+		return nil, false
 	}
-	return proj.Hook, true
+	return proj, true
+}
+
+// gitRoot is the worktree containing dir, or dir outside git.
+func gitRoot(dir string) string {
+	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	return dir
 }
 
 // LoadPerCPU returns the 1-minute load average divided by CPU count.
@@ -398,33 +666,90 @@ func LoadPerCPU() (float64, error) {
 	return l / float64(runtime.NumCPU()), nil
 }
 
-// HasClaude reports whether a Claude Code settings file has the hook.
-func HasClaude(settingsPath string) bool {
-	b, err := os.ReadFile(settingsPath)
-	if err != nil {
-		return false
+// Hook command forms in a Claude Code settings file.
+const (
+	hookNone    = iota
+	hookCurrent // calls spotexec
+	hookLegacy  // calls sx, as v0.2.0 could install it
+)
+
+// hookForm classifies a PreToolUse hook command.
+func hookForm(cmd string) int {
+	cmd = strings.TrimSpace(cmd)
+	if bin, ok := strings.CutSuffix(cmd, " hook claude"); ok {
+		bin = strings.TrimSpace(bin)
+		// Only the single executable the installer wrote: a compound line
+		// (`audit && sx hook claude`) is the user's own and not ours to rewrite.
+		quoted := len(bin) >= 2 && (bin[0] == '\'' || bin[0] == '"') && bin[len(bin)-1] == bin[0]
+		if quoted {
+			bin = strings.ReplaceAll(bin[1:len(bin)-1], `'\''`, "'")
+		}
+		if (quoted || !strings.ContainsAny(bin, " \t;&|()<>$`'\"\\")) && filepath.Base(bin) == "sx" {
+			return hookLegacy
+		}
 	}
-	var settings map[string]any
-	if json.Unmarshal(b, &settings) != nil {
-		return false
+	if strings.Contains(cmd, "hook claude") && strings.Contains(cmd, "spotexec") {
+		return hookCurrent
 	}
+	return hookNone
+}
+
+// claudeHooks returns the hook objects of every PreToolUse entry.
+func claudeHooks(settings map[string]any) []map[string]any {
 	hooks, _ := settings["hooks"].(map[string]any)
 	pre, _ := hooks["PreToolUse"].([]any)
+	var out []map[string]any
 	for _, e := range pre {
 		em, _ := e.(map[string]any)
 		hs, _ := em["hooks"].([]any)
 		for _, h := range hs {
-			hm, _ := h.(map[string]any)
-			if c, _ := hm["command"].(string); strings.Contains(c, "hook claude") && strings.Contains(c, "spotexec") || strings.HasSuffix(c, "sx hook claude") {
-				return true
+			if hm, ok := h.(map[string]any); ok {
+				out = append(out, hm)
 			}
+		}
+	}
+	return out
+}
+
+func readSettings(settingsPath string) (map[string]any, bool) {
+	b, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return nil, false
+	}
+	var settings map[string]any
+	if json.Unmarshal(b, &settings) != nil {
+		return nil, false
+	}
+	return settings, true
+}
+
+func hasForm(settingsPath string, form int) bool {
+	settings, ok := readSettings(settingsPath)
+	if !ok {
+		return false
+	}
+	for _, hm := range claudeHooks(settings) {
+		if c, _ := hm["command"].(string); hookForm(c) == form {
+			return true
 		}
 	}
 	return false
 }
 
+// HasClaude reports whether a Claude Code settings file has the hook, in
+// either form (a legacy `sx hook claude` entry still works).
+func HasClaude(settingsPath string) bool {
+	return hasForm(settingsPath, hookCurrent) || hasForm(settingsPath, hookLegacy)
+}
+
+// HasLegacyClaude reports whether a Claude Code settings file has a hook
+// that calls `sx hook claude`, which InstallClaude rewrites to spotexec.
+func HasLegacyClaude(settingsPath string) bool { return hasForm(settingsPath, hookLegacy) }
+
 // InstallClaude adds the PreToolUse hook to a Claude Code settings file,
-// preserving everything else. It is idempotent.
+// preserving everything else. It is idempotent. A legacy `sx hook claude`
+// entry is rewritten in place to hookCmd (or dropped, when a spotexec entry
+// is already there). It reports whether the file changed.
 func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 	settings := map[string]any{}
 	if b, err := os.ReadFile(settingsPath); err == nil && len(strings.TrimSpace(string(b))) > 0 {
@@ -437,20 +762,46 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 		hooks = map[string]any{}
 	}
 	pre, _ := hooks["PreToolUse"].([]any)
+	current, changed := false, false
 	for _, e := range pre {
 		em, _ := e.(map[string]any)
 		hs, _ := em["hooks"].([]any)
+		// Each legacy command is rewritten in place, keeping its matcher and
+		// options, unless its own entry already calls spotexec.
+		has := false
 		for _, h := range hs {
 			hm, _ := h.(map[string]any)
-			if c, _ := hm["command"].(string); strings.Contains(c, "hook claude") && strings.Contains(c, "spotexec") || strings.HasSuffix(c, "sx hook claude") {
-				return false, nil
+			if c, _ := hm["command"].(string); hookForm(c) == hookCurrent {
+				has, current = true, true
 			}
 		}
+		var keepHooks []any
+		for _, h := range hs {
+			hm, _ := h.(map[string]any)
+			if c, _ := hm["command"].(string); hookForm(c) == hookLegacy {
+				changed, current = true, true
+				if has {
+					continue
+				}
+				hm["command"] = hookCmd
+				has = true
+			}
+			keepHooks = append(keepHooks, h)
+		}
+		if len(keepHooks) != len(hs) {
+			em["hooks"] = keepHooks
+		}
 	}
-	pre = append(pre, map[string]any{
-		"matcher": "Bash",
-		"hooks":   []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}},
-	})
+	if !current {
+		pre = append(pre, map[string]any{
+			"matcher": "Bash",
+			"hooks":   []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}},
+		})
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
 	hooks["PreToolUse"] = pre
 	settings["hooks"] = hooks
 	b, err := json.MarshalIndent(settings, "", "  ")

@@ -156,7 +156,10 @@ func (s *Session) runProc1(script, dir string, env map[string]string, timeout, g
 	cmd.Dir = dir
 	// The helper's own environment: the job's is applied after the login
 	// profiles (a [env] HOME must not redirect where profiles are read).
-	cmd.Env = os.Environ()
+	// SPOTEXEC_WORKSPACE is there from the start, so every process the run
+	// leaves behind carries it, a forked subshell included (/proc shows the
+	// environment a process was exec'd with): see reapWorkspace.
+	cmd.Env = append(os.Environ(), "SPOTEXEC_WORKSPACE="+s.workspace)
 	cmd.SysProcAttr = childSysProcAttr()
 	devnull, _ := os.Open(os.DevNull)
 	if devnull != nil {
@@ -299,6 +302,19 @@ loop:
 	return res
 }
 
+// shutdownExit: the exit statuses a shutdown produces (SIGHUP, SIGKILL,
+// SIGTERM). In a container, `docker run` also exits 125 when dockerd stops
+// under it.
+func shutdownExit(code int, container bool) bool {
+	switch code {
+	case 128 + int(syscall.SIGHUP), 128 + int(syscall.SIGKILL), 128 + int(syscall.SIGTERM):
+		return true
+	case 125:
+		return container
+	}
+	return false
+}
+
 func (s *Session) exec(e protocol.Exec) error {
 	if s.slotLock == nil {
 		return perr(protocol.CodeBadRequest, "acquire required before exec")
@@ -322,6 +338,9 @@ func (s *Session) exec(e protocol.Exec) error {
 	// Any interrupted run leaves the workspace in an unknown state.
 	fp := s.state.Fingerprint
 	s.state.Fingerprint = ""
+	// Until the run's created files are collected, a helper that dies
+	// leaves them unknown: the next acquire sweeps the workspace for them.
+	s.state.Sweep, s.state.SweepSkip = e.Snapshot, e.Skip
 	if err := saveSlotState(s.slotDir, s.state); err != nil {
 		return fmt.Errorf("marking slot dirty before exec: %w", err)
 	}
@@ -354,21 +373,35 @@ func (s *Session) exec(e protocol.Exec) error {
 	pr := s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch)
 	// The container must be gone before we snapshot the workspace: a
 	// container we can't remove could still be writing into it.
+	// The VM's shutdown can kill the command (or dockerd, under a container)
+	// before this helper is signalled itself: that is a lost runner, not the
+	// command's result. A command that finished on its own is never one.
+	shutdown := pr.startErr == nil && !pr.timedOut && shutdownExit(pr.code, e.Container != nil) && systemStopping()
 	if err := cleanup(); err != nil {
+		if shutdown {
+			// dockerd went away with the VM: the run was cut short, not failed.
+			return perr(protocol.CodeShutdown, "the runner is shutting down: %v", err)
+		}
 		return perr(protocol.CodeImageFailed, "%v; refusing to collect results from a workspace it may still be modifying", err)
 	}
 	res := protocol.Result{
 		ExitCode: pr.code, Signal: pr.signal, TimedOut: pr.timedOut, Canceled: pr.canceled,
 		Interrupted: pr.spotIntr || s.interrupted.Load(), DurationMS: time.Since(start).Milliseconds(),
+		Shutdown: shutdown,
 	}
 	if pr.startErr != nil {
 		res.StartError = pr.startErr.Error()
 	}
-	if e.Snapshot {
+	// Nothing of a run the shutdown killed is collected (and the slot stays
+	// marked dirty): report it before anything else can fail.
+	if e.Snapshot && !shutdown {
 		t := time.Now()
 		post := s.takeSnapshot(e.Skip)
-		res.Changed, res.Deleted, res.Created, res.Truncated, res.Unverified = s.diff(pre, post)
+		var overflow []string
+		res.Changed, res.Deleted, res.Created, res.Truncated, res.Unverified, overflow = s.diff(pre, post)
 		res.SnapshotMS = time.Since(t).Milliseconds()
+		s.state.Pending = s.pendingAfter(res.Created, res.Unverified, overflow)
+		s.state.Sweep, s.state.SweepSkip = false, nil
 		if err := s.saveStored(); err != nil {
 			return err
 		}

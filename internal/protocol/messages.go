@@ -1,5 +1,7 @@
 package protocol
 
+import "time"
+
 // Message type names.
 const (
 	TypeHello       = "hello"
@@ -19,6 +21,7 @@ const (
 	TypeCancel      = "cancel"
 	TypeFetch       = "fetch"
 	TypeFetched     = "fetched"
+	TypeSettle      = "settle"
 	TypePull        = "pull"
 	TypeHeartbeat   = "hb"
 	TypeEvent       = "event"
@@ -27,6 +30,11 @@ const (
 	TypeImage       = "image"
 	TypeImageResult = "image_result"
 )
+
+// MaxSlots caps slots per machine, explicit (max_slots) or automatic
+// (vCPUs / 4): each slot gets a 1000-port range at SPOTEXEC_PORT_BASE =
+// 20000 + slot*1000, which must stay a valid port.
+const MaxSlots = 44
 
 // Error codes carried by ErrorMsg.Code.
 const (
@@ -39,12 +47,16 @@ const (
 	CodeSyncFailed   = "SYNC_FAILED"
 	CodeDepsFailed   = "DEPS_FAILED"
 	CodeImageFailed  = "IMAGE_FAILED"
+	CodeShutdown     = "RUNNER_SHUTTING_DOWN" // the VM began shutting down under the request
 )
 
 // ErrorMsg is sent by the helper for any failed request.
 type ErrorMsg struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Detail adds context for some codes: with RUNNER_BOOTING, the latest
+	// line of the VM's bootstrap log.
+	Detail string `json:"detail,omitempty"`
 }
 
 // Hello opens a session.
@@ -88,6 +100,16 @@ type Acquire struct {
 	OnlySlot    bool       `json:"only_slot,omitempty"`  // wait for PreferSlot rather than take another
 	KeepOwner   bool       `json:"keep_owner,omitempty"` // don't claim the slot (exec/pull)
 	SpotWatch   bool       `json:"spot_watch,omitempty"` // watch for spot interruption / rebalance notices
+	// ReadOnly: nothing will run, only files are copied (pull), so a VM near
+	// its max_lifetime may still serve it.
+	ReadOnly bool `json:"read_only,omitempty"`
+}
+
+// LifetimeDrainAhead is how long before an ephemeral VM's max_lifetime it
+// stops taking new runs, so the hard poweroff never cuts short a run that
+// started after that point: 15 minutes, or a quarter of a shorter lifetime.
+func LifetimeDrainAhead(maxLifetime time.Duration) time.Duration {
+	return min(15*time.Minute, maxLifetime/4)
 }
 
 // Holder describes a held token, for waiting/busy/status displays.
@@ -115,6 +137,10 @@ type Acquired struct {
 	PrevWorktreeKey  string `json:"prev_worktree_key"` // who last synced this slot
 	WaitedMS         int64  `json:"waited_ms"`
 	MaxSlots         int    `json:"max_slots"`
+	// Pending lists files earlier runs created in this slot that were never
+	// written back (nor found to be ignored): the next sync removes the ones
+	// the client doesn't ignore (Manifest.Remove).
+	Pending []string `json:"pending,omitempty"`
 }
 
 // Busy is returned when Wait=false and nothing is free.
@@ -136,6 +162,9 @@ type Manifest struct {
 	Fingerprint string   `json:"fingerprint"`
 	Entries     []Entry  `json:"entries"`
 	Protect     []string `json:"protect"` // dirs never pruned (cache_dirs)
+	// Remove: Acquired.Pending files to delete (not ignored by the client).
+	// The rest of the pending list is kept and forgotten.
+	Remove []string `json:"remove,omitempty"`
 }
 
 // Need lists the paths the helper is missing. The CLI follows with a tar blob.
@@ -235,7 +264,7 @@ type Exec struct {
 	Setup     string            `json:"setup"` // remote_path_setup prefix
 	TimeoutMS int64             `json:"timeout_ms"`
 	GraceMS   int64             `json:"grace_ms"`
-	Snapshot  bool              `json:"snapshot"` // compute mutations
+	Snapshot  bool              `json:"snapshot"` // compute mutations (and track created files)
 	Skip      []string          `json:"skip"`     // dir names/paths skipped by the post-run walk
 	SpotWatch bool              `json:"spot_watch"`
 	Container *ContainerRun     `json:"container,omitempty"`
@@ -248,19 +277,22 @@ type Started struct {
 
 // Result is the final exec outcome plus the mutation batch.
 type Result struct {
-	ExitCode    int      `json:"exit_code"`
-	Signal      string   `json:"signal,omitempty"`
-	TimedOut    bool     `json:"timed_out"`
-	Canceled    bool     `json:"canceled"`
-	Interrupted bool     `json:"spot_interrupted"`
-	DurationMS  int64    `json:"duration_ms"`
-	Changed     []Entry  `json:"changed,omitempty"` // manifest files with new content/mode
-	Deleted     []string `json:"deleted,omitempty"` // manifest files removed
-	Created     []Entry  `json:"created,omitempty"` // non-manifest files created/changed
-	Truncated   bool     `json:"truncated,omitempty"`
-	Unverified  []string `json:"unverified,omitempty"` // paths that could not be read after the run
-	SnapshotMS  int64    `json:"snapshot_ms"`
-	StartError  string   `json:"start_error,omitempty"`
+	ExitCode    int    `json:"exit_code"`
+	Signal      string `json:"signal,omitempty"`
+	TimedOut    bool   `json:"timed_out"`
+	Canceled    bool   `json:"canceled"`
+	Interrupted bool   `json:"spot_interrupted"`
+	// Shutdown: the command was killed by the VM shutting down (a Spot
+	// reclaim): a lost runner, not the command's result.
+	Shutdown   bool     `json:"shutdown,omitempty"`
+	DurationMS int64    `json:"duration_ms"`
+	Changed    []Entry  `json:"changed,omitempty"` // manifest files with new content/mode
+	Deleted    []string `json:"deleted,omitempty"` // manifest files removed
+	Created    []Entry  `json:"created,omitempty"` // non-manifest files created/changed
+	Truncated  bool     `json:"truncated,omitempty"`
+	Unverified []string `json:"unverified,omitempty"` // paths that could not be read after the run
+	SnapshotMS int64    `json:"snapshot_ms"`
+	StartError string   `json:"start_error,omitempty"`
 }
 
 // Fetch asks for the content of mutated files. Accept lists created paths the
@@ -268,6 +300,13 @@ type Result struct {
 type Fetch struct {
 	Paths  []string `json:"paths"`
 	Accept []string `json:"accept"`
+}
+
+// Settle tells the helper which files the run created are ignored by the
+// client (build outputs): they stay in the slot and are no longer pending.
+// There is no reply.
+type Settle struct {
+	Ignored []string `json:"ignored"`
 }
 
 // Pull asks for gitignored artifacts by glob (relative to the workspace).

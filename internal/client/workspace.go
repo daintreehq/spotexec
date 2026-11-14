@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -26,9 +27,10 @@ type Workspace struct {
 	RepoName    string
 	WorktreeKey string // unique per host+worktree
 	Cwd         string // cwd relative to Root ("." at root)
-	// Marked: Root is a Git worktree or holds a .spotexec.toml. Otherwise it
-	// is just the directory spotexec was started in, which must not be
-	// synced wholesale (it may be $HOME, holding ~/.aws and ~/.ssh).
+	// Marked: Root is a Git worktree or holds a .spotexec.toml (the home
+	// directory, / and credential directories never count, Git or not). Otherwise it is just the directory
+	// spotexec was started in, which must not be synced wholesale (it may
+	// be $HOME, holding ~/.aws and ~/.ssh).
 	Marked bool
 }
 
@@ -45,7 +47,7 @@ func Resolve(dir string) (*Workspace, error) {
 	}
 	root, isGit := manifest.Root(abs)
 	w := &Workspace{Root: root, Git: isGit}
-	if _, err := os.Stat(filepath.Join(root, ".spotexec.toml")); err == nil || isGit {
+	if _, err := os.Stat(filepath.Join(root, ".spotexec.toml")); (err == nil || isGit) && !config.NeverProject(root) {
 		w.Marked = true
 	}
 	rel, err := filepath.Rel(root, abs)
@@ -127,6 +129,9 @@ func LoadLastRun(w *Workspace) (*LastRun, error) {
 	return &lr, json.Unmarshal(b, &lr)
 }
 
+// SaveLastRun saves the last-run record.
+func SaveLastRun(w *Workspace, lr LastRun) { saveLastRun(w, lr) }
+
 func saveLastRun(w *Workspace, lr LastRun) {
 	p := lastRunPath(w)
 	_ = os.MkdirAll(filepath.Dir(p), 0o700)
@@ -144,4 +149,22 @@ func saveLastRun(w *Workspace, lr LastRun) {
 	if os.Rename(f.Name(), p) != nil {
 		os.Remove(f.Name())
 	}
+}
+
+// ManifestOptions are the manifest.Build options for project p rooted at
+// root. A container's Dockerfile, its companion .dockerignore and its build
+// context sync even inside built-in excludes such as .spotexec/, Git or
+// not: the runner builds the image from the synced copy.
+func ManifestOptions(root string, p *config.Project) manifest.Options {
+	o := manifest.Options{Root: root, Exclude: p.Sync.Exclude, Source: p.Sync.Source, Protect: p.Deps.CacheDirs}
+	if df := p.Container.Dockerfile; df != "" && p.Container.Image == "" {
+		ctx := p.Container.Context
+		if ctx == "" {
+			ctx = path.Dir(df)
+		}
+		// The Dockerfile's own directory too: with context = "." its
+		// support files (.spotexec/setup.sh) are still build inputs.
+		o.Include = []string{df, df + ".dockerignore", path.Dir(df), ctx}
+	}
+	return o
 }

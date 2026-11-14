@@ -41,7 +41,10 @@ var (
 	probeEvery     = 30 * time.Second
 	unhealthyAfter = 8 * time.Minute
 	sweepEvery     = 10 * time.Minute
-	retireAhead    = 15 * time.Minute // drain warm VMs this long before max_lifetime
+	// Warm VMs retire up to this long (a quarter of max_lifetime at most)
+	// before client.LifetimeDrainAhead drains whatever is left, one at a
+	// time, so their replacements are warm by then.
+	retireAhead = 10 * time.Minute
 )
 
 func init() {
@@ -305,7 +308,8 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// 2. Retire a warm instance shortly before max_lifetime, while its jobs
 	// can still finish, so the VM's hard stop never kills one and the
 	// replacement is warm in time.
-	if lt := r.MaxLifetime.Duration; lt > 2*retireAhead {
+	if lt := r.MaxLifetime.Duration; lt > 0 {
+		retireAt := lt - client.LifetimeDrainAhead(r) - min(retireAhead, lt/4)
 		// Ready warm capacity right now (answering, not booting): a VM is
 		// retired only while the others still cover the minimum, so co-born
 		// warm VMs are replaced one after another, never all at once.
@@ -319,7 +323,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		for i, in := range running {
 			// One at a time: warm VMs launched together would otherwise all
 			// retire in the same pass and leave no warm capacity.
-			if i < r.MinInstances && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > lt-retireAhead {
+			if i < r.MinInstances && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > retireAt {
 				// Drained locally now (so the warm pool replaces it); the
 				// VM itself is told below, retried until it confirms.
 				d.action("%s: retiring warm instance %s ahead of max_lifetime", r.Name, in.ID)
@@ -561,7 +565,12 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string) {
 		in, err := fl.pool.ProvisionHeld(pctx, id, nil)
 		if err != nil {
 			d.action("%s: launch failed: %v", fl.r.Name, err)
-			d.countFailure(fl, "") // a launch that never became usable
+			// A quota refusal says nothing about the fleet's health; the pool
+			// holds further launches back until there is room.
+			var qe *provider.QuotaError
+			if !errors.As(err, &qe) {
+				d.countFailure(fl, "") // a launch that never became usable
+			}
 			return
 		}
 		d.action("%s: %s running at %s", fl.r.Name, in.ID, in.Target.Host)

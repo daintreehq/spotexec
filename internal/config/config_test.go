@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -70,5 +71,82 @@ func TestEmbeddedArgs(t *testing.T) {
 		if got := embeddedArgs(run); got != want {
 			t.Errorf("embeddedArgs(%q) = %v, want %v", run, got, want)
 		}
+	}
+}
+
+func TestTasksMayShareSubcommandNames(t *testing.T) {
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte(`
+[tasks.sync]
+run = "pnpm sync"
+[tasks.status]
+run = "git status"
+[tasks.run]
+parallel = ["sync", "status"]
+`), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Tasks) != 3 {
+		t.Fatalf("tasks: %v", p.TaskNames())
+	}
+}
+
+func TestNeverProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if !NeverProject(home) || !NeverProject(home+"/") || !NeverProject("/") {
+		t.Fatal("home and / must never be projects")
+	}
+	sub := filepath.Join(home, "repo")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if NeverProject(sub) {
+		t.Fatal("a directory under home is fine")
+	}
+	if !NeverProject(filepath.Join(home, ".ssh")) || !NeverProject(filepath.Join(sub, ".AWS", "x")) {
+		t.Fatal("credential directories must never be projects")
+	}
+	for _, d := range []string{home, sub} {
+		if err := os.WriteFile(filepath.Join(d, ".spotexec.toml"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := FindProject(filepath.Join(home, "other"), home); got != "" {
+		t.Fatalf("FindProject found %s in home", got)
+	}
+	if got := FindProject(sub, sub); got != filepath.Join(sub, ".spotexec.toml") {
+		t.Fatalf("FindProject(sub) = %q", got)
+	}
+}
+
+// Credential directories reached through a symlink, and home spelled in
+// another case on a case-insensitive disk, are still never projects.
+func TestNeverProjectByIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	keys := filepath.Join(home, "privatekeys")
+	if err := os.MkdirAll(filepath.Join(keys, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(keys, filepath.Join(home, ".ssh")); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{keys, filepath.Join(keys, "sub"), filepath.Join(home, ".ssh", "sub")} {
+		if !NeverProject(d) {
+			t.Errorf("NeverProject(%s) = false: it is ~/.ssh", d)
+		}
+	}
+	if NeverProject(filepath.Join(home, "repo")) {
+		t.Error("an ordinary directory refused")
+	}
+	upper := strings.ToUpper(home)
+	if fi, err := os.Stat(upper); err != nil || !fi.IsDir() {
+		t.Skip("case-sensitive filesystem")
+	}
+	if !NeverProject(upper) {
+		t.Errorf("NeverProject(%s) = false on a case-insensitive disk", upper)
 	}
 }

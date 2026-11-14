@@ -18,6 +18,7 @@ import (
 type awsCredResolver struct {
 	profile string
 	fixed   *awsCreds // exactly these credentials, never re-resolved
+	envOnly bool      // only AWS_ACCESS_KEY_ID etc.; nothing else is consulted
 	mu      sync.Mutex
 	cached  *awsCreds
 }
@@ -79,7 +80,19 @@ func (r *awsCredResolver) profileName() string {
 	return "default"
 }
 
+// errNoPassedSession is the env-only resolver's error when the environment
+// holds no credentials.
+var errNoPassedSession = errors.New("no AWS sign-in was passed from the machine running `spotexec setup` (it isn't signed in to AWS)")
+
 func (r *awsCredResolver) resolve(ctx context.Context) (awsCreds, error) {
+	if r.envOnly {
+		// Setup run from another machine: act only with what it passed,
+		// never this machine's own AWS login.
+		if id, sec := os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"); id != "" && sec != "" {
+			return awsCreds{AccessKeyID: id, SecretAccessKey: sec, SessionToken: os.Getenv("AWS_SESSION_TOKEN"), Source: "environment"}, nil
+		}
+		return awsCreds{}, errNoPassedSession
+	}
 	// 1. Environment (only when no explicit profile is configured).
 	if r.profile == "" {
 		if id, sec := os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"); id != "" && sec != "" {
@@ -200,8 +213,8 @@ func parseSharedCredentials(sc *bufio.Scanner, profile, src string) (awsCreds, e
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(strings.TrimPrefix(strings.Trim(line, "[]"), "profile "))
+		if name, ok := iniHeader(line); ok {
+			section = name // verbatim, as the AWS CLI matches it
 			continue
 		}
 		if section != profile {

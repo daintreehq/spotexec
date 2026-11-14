@@ -6,20 +6,26 @@ import (
 )
 
 // reservedPath reports whether write-back or pull must never touch p: any
-// path through a .git or .spotexec component. The comparison folds case,
-// because macOS (and Windows) filesystems do: a remote ".GIT/hooks/x" lands
-// in the real .git/hooks. A runner is not trusted to write there: a git hook
-// would run on the laptop.
+// path through a .git component, and outside git spotexec's own state in
+// .spotexec/. The comparison folds case, because macOS (and Windows)
+// filesystems do: a remote ".GIT/hooks/x" lands in the real .git/hooks. A
+// runner is not trusted to write there: a git hook would run on the laptop.
 //
-// .spotexec holds spotexec's own state only outside git (in a git worktree
-// it lives under the git dir), so there it is an ordinary directory.
+// .spotexec holds spotexec's own state (the write-back lock, stashed
+// conflicts) only outside git (in a git worktree it lives under the git
+// dir). The rest of .spotexec/, such as a container's Dockerfile, is an
+// ordinary directory.
 func reservedPath(p string, git bool) bool {
-	for _, seg := range strings.Split(p, "/") {
-		if strings.EqualFold(seg, ".git") || (!git && strings.EqualFold(seg, ".spotexec")) {
+	segs := strings.Split(p, "/")
+	for _, seg := range segs {
+		if strings.EqualFold(seg, ".git") {
 			return true
 		}
 	}
-	return false
+	if git || !strings.EqualFold(segs[0], ".spotexec") {
+		return false
+	}
+	return len(segs) == 1 || strings.EqualFold(segs[1], "conflicts") || strings.EqualFold(segs[1], "writeback.lock")
 }
 
 // pullMatches reports whether p (workspace-relative) was asked for by one of

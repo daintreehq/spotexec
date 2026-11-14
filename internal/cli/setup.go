@@ -24,24 +24,36 @@ import (
 
 func cmdSetup() *cobra.Command {
 	var profile, adminProfile, user, install string
-	var yes, rotate, skipAWS, printPolicy, noVPC, noHooks, all, list bool
+	var yes, rotate, skipAWS, printPolicy, noVPC, noHooks, all, list, bake, adminFromEnv bool
 	var revoke string
 	c := &cobra.Command{
 		Use:   "setup [host...]",
 		Short: "First-time setup: runner config, plus a dedicated AWS user so you only sign in once",
 		Long: `First-time setup for this machine.
 
-1. Writes ~/.config/spotexec/config.toml if it doesn't exist yet.
+1. Writes ~/.config/spotexec/config.toml if it doesn't exist yet, with an
+   AWS Spot fleet of 8-vCPU VMs (4-vCPU ones when the account's Spot quota
+   can't fit one).
+
 2. For AWS runners, uses your current AWS sign-in once to create a dedicated
    IAM user with only spotexec's permissions, saves its access key as an AWS
    CLI profile ("spotexec"), and points the runners at it. spotexec then
-   keeps working when your own AWS session (aws login, SSO) expires.
+   keeps working when your own AWS session (aws login, SSO) expires. It also
+   checks the Spot vCPU quota, and offers to request more when not even one
+   VM fits.
 
-3. Sets up other machines over SSH: the hosts you name, or (interactively)
+3. If Claude Code is installed, offers its hook, so agents' heavy commands
+   run on your runners (--no-hooks skips it).
+
+4. Sets up other machines over SSH: the hosts you name, or (interactively)
    the ones you pick from those found on your network and in ~/.ssh/config.
    Each gets spotexec installed (Homebrew when it has it, otherwise the
    release binary in ~/.local/bin), a copy of this runner config, and its
    own IAM user and key, created with your AWS sign-in on this machine.
+
+5. For AWS runners without a current baked image, offers to bake one
+   (about 10-15 minutes), so new VMs skip their bootstrap. --yes skips the
+   offer; --bake bakes without asking.
 
 Safe to re-run: it refreshes the user's policy (for new spotexec versions)
 and keeps a working key. --rotate replaces the key.
@@ -60,14 +72,20 @@ and keeps a working key. --rotate replaces the key.
 			if revoke != "" {
 				return revokeMachine(cmd.Context(), adminProfile, revoke, yes)
 			}
+			// Before changing anything here.
+			if err := checkSSHHosts(args); err != nil {
+				return err
+			}
 			setupLocal := func() (bool, error) {
 				p := config.GlobalPath()
+				wrote := false // the starter template, sized below to the Spot quota
 				if _, err := os.Stat(p); err != nil {
-					region, err := writeGlobalTemplate(p)
+					region, why, err := writeGlobalTemplate(p, adminProfile)
 					if err != nil {
 						return false, err
 					}
-					fmt.Printf("✓ wrote %s (an aws runner in %s; edit it any time)\n", p, region)
+					wrote = true
+					fmt.Printf("✓ wrote %s (an aws runner in %s, %s; edit it any time)\n", p, region, why)
 				} else {
 					fmt.Printf("✓ runner config %s\n", p)
 				}
@@ -104,7 +122,7 @@ and keeps a working key. --rotate replaces the key.
 					}
 				}
 				s := &provider.AWSUserSetup{
-					AdminProfile: adminProfile, Profile: profile, UserName: user, DefaultName: defaultIAMUser(), Region: region, Rotate: rotate,
+					AdminProfile: adminProfile, AdminFromEnv: adminFromEnv, Profile: profile, UserName: user, DefaultName: defaultIAMUser(), Region: region, Rotate: rotate,
 					VPCRegions: vpcRegions, QuotaRegions: regions,
 					Log: func(f string, a ...any) { fmt.Printf("  "+f+"\n", a...) },
 					Confirm: func(plan provider.AWSSetupPlan) bool {
@@ -158,24 +176,41 @@ and keeps a working key. --rotate replaces the key.
 				if len(changed) > 0 {
 					fmt.Printf("✓ set profile = %q on %s in %s\n", profile, strings.Join(changed, ", "), g.Path)
 				}
-				for _, rg := range regions {
-					q, ok := res.Quotas[rg]
-					switch {
-					case !ok:
-					case q < float64(need[rg]):
-						fmt.Printf("! Spot vCPU quota in %s is %.0f, but your runners there may use up to %d. Until it's raised, fewer VMs run at once.\n", rg, q, need[rg])
-						fmt.Printf("  Request more (as an administrator): aws service-quotas request-service-quota-increase --region %s --service-code ec2 --quota-code L-34B43A08 --desired-value %d\n", rg, need[rg])
-					default:
-						fmt.Printf("✓ Spot vCPU quota in %s: %.0f (runners need up to %d)\n", rg, q, need[rg])
+				if q, ok := res.Quotas[aws[0].Region]; ok && wrote && q < starterVCPUs {
+					// A new account's quota can't fit one 8-vCPU VM.
+					sized, err := sizeStarterFleet(g.Path)
+					if err != nil {
+						return false, fmt.Errorf("sizing the starter fleet to the Spot quota: %w (set instance_types to 4-vCPU types such as c7a.xlarge in %s)", err, g.Path)
+					}
+					if sized {
+						fmt.Printf("✓ sized the starter fleet to the Spot quota in %s (%.0f vCPUs): 4-vCPU VMs instead of 8-vCPU ones\n", aws[0].Region, q)
+						g2, err := config.LoadGlobal()
+						if err != nil {
+							return false, err
+						}
+						aws = awsRunners(g2)
 					}
 				}
+				var ask func(provider.QuotaFit) bool
+				if !res.PolicyStale && !yes && ui.IsTerminal(os.Stdin) {
+					// The admin session is at hand: offer to file the request.
+					ask = func(f provider.QuotaFit) bool {
+						fmt.Printf("  Request %d vCPUs in %s now, with your AWS sign-in? [Y/n] ", f.Desired(), f.Region)
+						line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+						a := strings.ToLower(strings.TrimSpace(line))
+						return a == "" || a == "y" || a == "yes"
+					}
+				}
+				reportQuotas(os.Stdout, quotaFits(aws, res.Quotas), ask, func(f provider.QuotaFit) (string, error) {
+					return s.RequestQuotaIncrease(cmd.Context(), f.Region, f.Desired())
+				})
 				return true, nil
 			}
 			hasAWS, err := setupLocal()
 			if err != nil {
 				return err
 			}
-			hookOn := setupClaudeHook(yes, noHooks)
+			hookDeclined := setupClaudeHook(yes, noHooks)
 			hosts := args
 			if all {
 				for _, m := range loadMachines() {
@@ -193,12 +228,27 @@ and keeps a working key. --rotate replaces the key.
 			if len(hosts) > 0 {
 				if err := setupHosts(cmd.Context(), hosts, remoteSetup{
 					install: install, adminProfile: adminProfile, profile: profile,
-					rotate: rotate, noVPC: noVPC, aws: hasAWS, noHooks: noHooks || !hookOn,
+					rotate: rotate, noVPC: noVPC, aws: hasAWS,
+					// Each machine installs the hook if it has Claude Code,
+					// unless it was turned down here.
+					noHooks: noHooks || hookDeclined,
 				}); err != nil {
 					return err
 				}
 			}
-			printSetupNext()
+			// AWS runners may exist even when --skip-aws left credentials
+			// alone: they still boot cold, and --bake still applies.
+			awsConfigured := hasAWS
+			if g, err := config.LoadGlobal(); err == nil && len(awsRunners(g)) > 0 {
+				awsConfigured = true
+			}
+			if hasAWS || (bake && awsConfigured) {
+				interactive := ui.IsTerminal(os.Stdin) && ui.IsTerminal(os.Stdout)
+				if err := offerBake(cmd.Context(), os.Stdout, bufio.NewReader(os.Stdin), bake, yes, interactive); err != nil {
+					return err
+				}
+			}
+			printSetupNext(awsConfigured)
 			return nil
 		},
 	}
@@ -207,7 +257,7 @@ and keeps a working key. --rotate replaces the key.
 	c.Flags().StringVar(&user, "user", "", "IAM user name (default: spotexec-<hostname>)")
 	c.Flags().BoolVarP(&yes, "yes", "y", false, "don't ask for confirmation")
 	c.Flags().BoolVar(&rotate, "rotate", false, "replace the access key even if the current one works")
-	c.Flags().BoolVar(&skipAWS, "skip-aws", false, "only write the runner config")
+	c.Flags().BoolVar(&skipAWS, "skip-aws", false, "skip the AWS steps (IAM user and key, network, quota)")
 	c.Flags().BoolVar(&all, "all", false, "also update every machine set up from here before (config, spotexec version, AWS policy)")
 	c.Flags().BoolVar(&list, "list", false, "list every machine's spotexec IAM user, keys and running VMs, then exit")
 	c.Flags().StringVar(&revoke, "revoke", "", "delete a machine's IAM user and keys and terminate its VMs (host or IAM user name), then exit")
@@ -215,14 +265,22 @@ and keeps a working key. --rotate replaces the key.
 	c.Flags().BoolVar(&noVPC, "no-vpc", false, "don't create a default VPC when the region has none")
 	c.Flags().StringVar(&install, "install", "auto", "how to install spotexec on other machines: auto, brew, release, copy (this binary) or none")
 	c.Flags().BoolVar(&printPolicy, "print-policy", false, "print the IAM policy spotexec needs and exit")
+	c.Flags().BoolVar(&bake, "bake", false, "bake runner images at the end without asking (setup otherwise offers it, except with --yes)")
+	// Set by `spotexec setup <host>` on the other machine: the admin session
+	// is only what it passed in AWS_* variables, never that machine's own.
+	c.Flags().BoolVar(&adminFromEnv, "admin-from-env", false, "use only the AWS credentials in AWS_ACCESS_KEY_ID etc. to manage IAM users")
+	_ = c.Flags().MarkHidden("admin-from-env")
 	return c
 }
 
-func printSetupNext() {
+func printSetupNext(aws bool) {
 	if os.Getenv("SPOTEXEC_SETUP_NESTED") != "" {
 		return // run by another machine's setup, which says what's next
 	}
 	fmt.Println("\nNext: `cd` into a project, run `spotexec init`, then `sx <command>` (`spotexec doctor` checks everything).")
+	if aws {
+		fmt.Println("Before a demo, do one warm-up `sx` run: the first boots a VM (a minute or more, plus the bootstrap unless the image is baked), and later runs reuse it until it has been idle for idle_timeout.")
+	}
 }
 
 // awsRunners returns the AWS runners, default pool first.
@@ -327,14 +385,80 @@ var (
 	typeLine    = regexp.MustCompile(`^\s*type\s*=`)
 )
 
+// tomlLineStarts reports, for each line, whether it begins a new TOML
+// statement: a line inside a multi-line string or a multi-line array or
+// inline table is part of the value before it, whatever it looks like.
+func tomlLineStarts(lines []string) []bool {
+	starts := make([]bool, len(lines))
+	var ml string // the open multi-line string's delimiter, if any
+	depth := 0    // open [ and { in a value
+	for n, line := range lines {
+		starts[n] = ml == "" && depth == 0
+		if starts[n] && anyHeader.MatchString(line) {
+			continue // a table header: its brackets aren't a value's
+		}
+		for i := 0; i < len(line); i++ {
+			c := line[i]
+			if ml != "" {
+				if c == '\\' && ml == `"""` {
+					i++
+					continue
+				}
+				if strings.HasPrefix(line[i:], ml) {
+					i += 2
+					// Up to two more quotes belong to the string ("""a"""").
+					for k := 0; k < 2 && i+1 < len(line) && line[i+1] == ml[0]; k++ {
+						i++
+					}
+					ml = ""
+				}
+				continue
+			}
+			switch c {
+			case '#':
+				i = len(line)
+			case '"', '\'':
+				if d := strings.Repeat(string(c), 3); strings.HasPrefix(line[i:], d) {
+					ml, i = d, i+2
+					continue
+				}
+				for i++; i < len(line) && line[i] != c; i++ {
+					if c == '"' && line[i] == '\\' {
+						i++
+					}
+				}
+			case '[', '{':
+				depth++
+			case ']', '}':
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+	}
+	return starts
+}
+
+// setRunnerProfileText sets the profile line in each named runner's table,
+// leaving every other byte of the file as it was.
 func setRunnerProfileText(text string, runners []string, profile string) (string, error) {
 	want := map[string]bool{}
 	for _, r := range runners {
 		want[r] = true
 	}
 	lines := strings.Split(text, "\n")
+	starts := tomlLineStarts(lines)
 	set := fmt.Sprintf("profile = %q", profile)
+	// next returns the line after the statement that begins at j.
+	next := func(j, end int) int {
+		for j++; j < end && !starts[j]; j++ {
+		}
+		return j
+	}
 	for i := 0; i < len(lines); i++ {
+		if !starts[i] {
+			continue
+		}
 		m := tomlHeader.FindStringSubmatch(lines[i])
 		if m == nil || !want[strings.TrimSpace(m[2])] {
 			continue
@@ -342,32 +466,57 @@ func setRunnerProfileText(text string, runners []string, profile string) (string
 		name := strings.TrimSpace(m[2])
 		end := len(lines)
 		for j := i + 1; j < len(lines); j++ {
-			if anyHeader.MatchString(lines[j]) {
+			if starts[j] && anyHeader.MatchString(lines[j]) {
 				end = j
 				break
 			}
 		}
-		at, insertAfter, hint := -1, -1, -1
+		// Keep CRLF files CRLF: a line's "\r" is its terminator's first half.
+		crlf := strings.Contains(text, "\r\n")
+		eol := func(l string) string {
+			if strings.HasSuffix(l, "\r") {
+				return "\r"
+			}
+			return ""
+		}
+		at, insertAt, hint := -1, -1, -1
 		for j := i + 1; j < end; j++ {
+			if !starts[j] {
+				continue
+			}
 			switch {
 			case profileLine.MatchString(lines[j]):
 				at = j
 			case commented.MatchString(lines[j]) && hint < 0:
 				hint = j
-			case typeLine.MatchString(lines[j]) && insertAfter < 0:
-				insertAfter = j
+			case typeLine.MatchString(lines[j]) && insertAt < 0:
+				insertAt = next(j, end)
 			}
 		}
+		var repl []string
 		switch {
 		case at >= 0:
-			lines[at] = set
+			after := next(at, end)
+			insertAt, repl = at, []string{set + eol(lines[after-1])}
+			lines = append(lines[:at], lines[after:]...)
 		case hint >= 0:
-			lines[hint] = set + "   # set by `spotexec setup`"
+			lines[hint] = set + "   # set by `spotexec setup`" + eol(lines[hint])
 		default:
-			if insertAfter < 0 {
-				insertAfter = i
+			if insertAt < 0 {
+				insertAt = i + 1
 			}
-			lines = append(lines[:insertAfter+1], append([]string{set + "   # set by `spotexec setup`"}, lines[insertAfter+1:]...)...)
+			repl = []string{set + "   # set by `spotexec setup`"}
+			if insertAt < len(lines) {
+				if crlf {
+					repl[0] += "\r"
+				}
+			} else if crlf {
+				lines[insertAt-1] += "\r" // it was the unterminated last line
+			}
+		}
+		if repl != nil {
+			lines = append(lines[:insertAt], append(repl, lines[insertAt:]...)...)
+			starts = tomlLineStarts(lines)
 		}
 		delete(want, name)
 	}
@@ -383,14 +532,23 @@ func setRunnerProfileText(text string, runners []string, profile string) (string
 }
 
 // setupClaudeHook installs the Claude Code hook for all projects when Claude
-// Code is on this machine, asking first in a terminal. It reports whether the
-// hook is installed afterwards.
-func setupClaudeHook(yes, skip bool) bool {
+// Code is on this machine, asking first in a terminal. It reports whether
+// the user turned the hook down when asked.
+func setupClaudeHook(yes, skip bool) (declined bool) {
 	home, _ := os.UserHomeDir()
 	p := filepath.Join(home, ".claude", "settings.json")
+	if !skip && hooks.HasLegacyClaude(p) {
+		// Installed by v0.2.0 as `sx hook claude`; sx only runs commands now.
+		if _, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
+			fmt.Printf("! couldn't update the Claude Code hook: %v\n", err)
+		} else {
+			fmt.Printf("✓ updated the Claude Code hook in %s to call spotexec\n", p)
+			return true
+		}
+	}
 	if hooks.HasClaude(p) {
 		fmt.Printf("✓ Claude Code hook in %s\n", p)
-		return true
+		return false
 	}
 	if skip {
 		return false
@@ -407,7 +565,7 @@ func setupClaudeHook(yes, skip bool) bool {
 		fmt.Print("\nInstall the Claude Code hook for all your projects? Agents' heavy commands (tests, linters, builds)\nthen run on your runners; it only acts in projects with a .spotexec.toml. [Y/n] ")
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		if a := strings.ToLower(strings.TrimSpace(line)); a != "" && a != "y" && a != "yes" {
-			return false
+			return true
 		}
 	}
 	if _, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
@@ -416,7 +574,7 @@ func setupClaudeHook(yes, skip bool) bool {
 	}
 	fmt.Printf("✓ installed the Claude Code hook in %s\n", p)
 	fmt.Println("  Permission rules now see `spotexec run -- <cmd>`: allow `Bash(spotexec run:*)` if you pre-approve test commands.")
-	return true
+	return false
 }
 
 func containsFold(list []string, s string) bool {
@@ -491,31 +649,133 @@ func orDash(s string) string {
 	return s
 }
 
+// shortHost is the host name in an SSH destination: "me@studio-01.local"
+// is studio-01.
+func shortHost(dest string) string {
+	if i := strings.LastIndex(dest, "@"); i >= 0 {
+		dest = dest[i+1:]
+	}
+	return strings.ToLower(strings.Split(dest, ".")[0])
+}
+
+// matchMachine finds the machine --revoke names: an exact IAM user name,
+// a destination set up from here (the machine it reached), or a host name.
+func matchMachine(ms []provider.Machine, saved []savedMachine, target string) (*provider.Machine, error) {
+	for i := range ms {
+		if strings.EqualFold(ms[i].User, target) {
+			return &ms[i], nil
+		}
+	}
+	var hits []int
+	add := func(i int) {
+		for _, h := range hits {
+			if h == i {
+				return
+			}
+		}
+		hits = append(hits, i)
+	}
+	byID := false
+	for _, e := range saved {
+		if !strings.EqualFold(e.Host, target) || (e.MachineID == "" && e.Hostname == "") {
+			continue
+		}
+		byID = byID || e.MachineID != ""
+		for i, m := range ms {
+			if e.MachineID != "" { // authoritative when recorded
+				if m.MachineID == e.MachineID {
+					add(i)
+				}
+			} else if strings.EqualFold(m.Host, shortHost(e.Hostname)) {
+				add(i)
+			}
+		}
+	}
+	if len(hits) == 0 && byID {
+		// Never another machine that happens to have that name.
+		return nil, fmt.Errorf("%s was set up from here as a machine that has no spotexec IAM user any more (see spotexec setup --list)", target)
+	}
+	if len(hits) == 0 {
+		short := shortHost(target)
+		for i, m := range ms {
+			if strings.EqualFold(m.Host, short) || strings.EqualFold(m.User, "spotexec-"+short) {
+				add(i)
+			}
+		}
+	}
+	switch len(hits) {
+	case 0:
+		return nil, fmt.Errorf("no spotexec IAM user matches %q (see spotexec setup --list)", target)
+	case 1:
+		return &ms[hits[0]], nil
+	}
+	var users []string
+	for _, i := range hits {
+		users = append(users, ms[i].User)
+	}
+	return nil, fmt.Errorf("%q matches %s; name the IAM user", target, strings.Join(users, " and "))
+}
+
+// rosterMatch says whether a machine-list entry is the revoked machine hit,
+// out of the account's machines ms. By machine ID when both are known;
+// otherwise by name, and unsure when the name doesn't settle it (an entry
+// recorded before machine IDs were, such as an alias, or a host name two
+// machines share).
+func rosterMatch(e savedMachine, hit provider.Machine, ms []provider.Machine, target string) (match, unsure bool) {
+	if e.MachineID != "" && hit.MachineID != "" {
+		return e.MachineID == hit.MachineID, false
+	}
+	if strings.EqualFold(e.Host, target) {
+		return true, false // the destination revoke was given
+	}
+	if e.MachineID != "" {
+		// The revoked user has no machine ID tag: the entry is another
+		// machine only if that machine is known.
+		for _, m := range ms {
+			if m.MachineID == e.MachineID {
+				return false, false
+			}
+		}
+		return false, true
+	}
+	n := e.Hostname
+	if n == "" {
+		n = e.Host
+	}
+	same, isHit := 0, false
+	for _, m := range ms {
+		if m.Host != "" && strings.EqualFold(shortHost(n), m.Host) {
+			same++
+			isHit = isHit || m.User == hit.User
+		}
+	}
+	switch {
+	case isHit && same == 1:
+		return true, false
+	case isHit, same == 0 && e.Hostname == "" && e.MachineID == "":
+		return false, true
+	}
+	return false, false
+}
+
 func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) error {
+	// The runner config says where to look for the machine's VMs: don't
+	// revoke blind because it couldn't be read.
+	if _, err := config.LoadGlobal(); err != nil {
+		return fmt.Errorf("reading the runner config (it says which regions to search for the machine's VMs): %w", err)
+	}
 	regions := awsRegions()
 	ms, err := provider.ListMachines(ctx, adminProfile, regions)
 	if err != nil {
 		return err
 	}
-	short := strings.ToLower(strings.Split(strings.TrimPrefix(target, "spotexec-"), ".")[0])
-	if i := strings.LastIndex(short, "@"); i >= 0 {
-		short = short[i+1:]
-	}
-	var hit *provider.Machine
-	for i, m := range ms {
-		if strings.EqualFold(m.User, target) || strings.EqualFold(m.Host, short) || strings.EqualFold(m.User, "spotexec-"+short) {
-			if hit != nil {
-				return fmt.Errorf("%q matches both %s and %s; name the IAM user", target, hit.User, m.User)
-			}
-			hit = &ms[i]
-		}
-	}
-	if hit == nil {
-		return fmt.Errorf("no spotexec IAM user matches %q (see spotexec setup --list)", target)
+	hit, err := matchMachine(ms, loadMachines(), target)
+	if err != nil {
+		return err
 	}
 	what := fmt.Sprintf("IAM user %s (host %s) and its %d key(s)", hit.User, orDash(hit.Host), len(hit.Keys))
 	if hit.VMs > 0 {
-		what += fmt.Sprintf(", and terminate its %d running VM(s)", hit.VMs)
+		what += fmt.Sprintf(", and terminate its %d VM(s) (stopped ones and bake builders included)", hit.VMs)
 	}
 	if hit.This {
 		what += ". This is THIS machine: spotexec stops working here until you run `spotexec setup` again"
@@ -533,13 +793,14 @@ func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) e
 	if err := provider.RevokeMachine(ctx, adminProfile, hit.User, regions, func(f string, a ...any) { fmt.Printf("  "+f+"\n", a...) }); err != nil {
 		return err
 	}
-	gone := forgetMachine(func(h string) bool {
-		hs := strings.ToLower(strings.Split(h, ".")[0])
-		if i := strings.LastIndex(hs, "@"); i >= 0 {
-			hs = hs[i+1:]
+	saved := loadMachines()
+	var unsure []string
+	for _, e := range saved {
+		if _, u := rosterMatch(e, *hit, ms, target); u {
+			unsure = append(unsure, e.Host)
 		}
-		return hs == strings.ToLower(hit.Host) || hs == short
-	})
+	}
+	gone := forgetMachine(func(e savedMachine) bool { m, _ := rosterMatch(e, *hit, ms, target); return m })
 	fmt.Printf("✓ revoked %s", hit.User)
 	if len(gone) > 0 {
 		fmt.Printf(" and removed %s from the machine list", strings.Join(gone, ", "))
@@ -547,6 +808,10 @@ func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) e
 	fmt.Println()
 	if !hit.This {
 		fmt.Println("  Its key no longer works. On that machine, delete the [spotexec] section of ~/.aws/credentials.")
+	}
+	if len(unsure) > 0 {
+		fmt.Printf("! The machine list can't tell whether %s %s this machine (set up before spotexec recorded machine IDs).\n", strings.Join(unsure, ", "), map[bool]string{true: "is", false: "are"}[len(unsure) == 1])
+		fmt.Printf("  Remove any that are from %s, or `spotexec setup --all` will set them up again.\n", machinesPath())
 	}
 	return nil
 }

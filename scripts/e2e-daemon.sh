@@ -47,6 +47,7 @@ waitfor() { # desc, condition, seconds
   until eval "$2"; do [ $SECONDS -ge $end ] && return 1; sleep 2; done
 }
 cleanup() {
+  [ -n "${SEEN:-}" ] && kill "$SEEN" 2>/dev/null
   "$SX" daemon stop >/dev/null 2>&1
   for r in "$RUNNER" "${RUNNER}r"; do
     docker ps -aq --filter "label=spotexec-runner=$r" | xargs -r docker rm -f >/dev/null 2>&1
@@ -59,6 +60,11 @@ REPO="$WORK/repo"
 mkdir -p "$REPO" && cd "$REPO" && git init -q && git config user.email t@t && git config user.name t
 echo hello > a.txt && git add -A && git commit -qm init
 "$SX" sim build "$RUNNER" >/dev/null || { echo "could not build simulator image"; exit 2; }
+
+# When each of the second fleet's VMs was last seen alive (with its launch time).
+( while :; do docker ps --filter "label=spotexec-runner=${RUNNER}r" --format "$(date +%s) {{.Names}} {{.Label \"spotexec-launched\"}}" >>"$WORK/rseen" 2>/dev/null; sleep 1; done ) &
+SEEN=$!
+disown "$SEEN"   # the bare `wait`s below must not wait for it
 
 echo "== start"
 check "daemon status before start says not running" "\"$SX\" daemon status | grep >/dev/null 'not running'"
@@ -96,12 +102,15 @@ check "replacement warm instance running before the notice deadline" "waitfor x 
 check "notice logged" "\"$SX\" daemon status | grep >/dev/null 'spot interruption notice'"
 check "noticed instance gone, one warm instance left" "waitfor x '[ \$(count) = 1 ] && [ \"\$(ids)\" != \"$W\" ]' 90"
 
-echo "== warm instance retired ahead of max_lifetime (80s; retire 25s ahead)"
+echo "== warm instance retired ahead of max_lifetime (80s; retired from 40s, no new runs in the last 20s)"
 # The second fleet has been warm since the daemon started.
 check "retirement logged" "waitfor x '\"$SX\" daemon status | grep >/dev/null \"retiring warm instance\"' 120"
 check "retired instance replaced (fleet keeps one warm instance)" "waitfor x '[ \$(rids | wc -l | tr -d \" \") -ge 1 ]' 30"
 first=$(grep -m1 "${RUNNER}r: .* running at" "$SPOTEXEC_STATE_DIR/daemon/daemon.log" | grep -o 'sx-[a-z0-9-]*')
-check "the first warm instance stopped before its hard max_lifetime kill" "waitfor x '[ -z \"\$(docker ps -q --filter name=$first)\" ]' 60 && ! grep -q \"$first.*past max_lifetime\" $SPOTEXEC_STATE_DIR/daemon/daemon.log"
+waitfor x '[ -z "$(docker ps -q --filter name=$first)" ]' 60
+born=$(grep " $first " "$WORK/rseen" | head -1 | cut -d' ' -f3)
+last=$(grep " $first " "$WORK/rseen" | tail -1 | cut -d' ' -f1)
+check "the first warm instance stopped before its hard max_lifetime kill (gone at $(( ${last:-0} - ${born:-0} / 1000 ))s)" "[ -n \"$born\" ] && [ $last -lt \$(( $born / 1000 + 78 )) ]"
 
 echo "== health: an unresponsive instance is replaced"
 W=$(ids)

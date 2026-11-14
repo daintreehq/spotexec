@@ -1,8 +1,10 @@
 package provider
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -38,8 +40,14 @@ type fakeIAM struct {
 	created     int
 	calls       []string
 	denyCreate  bool
+	denyKey     bool           // CreateAccessKey fails
+	neverWorks  bool           // new keys are never accepted
 	propagation map[string]int // new key -> rejections left
 	noVPC       bool
+	foreign     map[string]string            // key -> ARN it signs in as, in another account
+	stsDown     map[string]string            // key -> error code GetCallerIdentity fails with (not a key rejection)
+	selfGetUser string                       // a user's key may GetUser itself (the current policy): "ok", or an error code
+	sgs         map[string]map[string]string // security group id -> tags; "name"/"desc" override spotexec's
 }
 
 func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
@@ -63,6 +71,18 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 		if n := f.propagation[key]; n > 0 {
 			f.propagation[key] = n - 1
 			iamErr(403, "InvalidClientTokenId")
+			return
+		}
+		if a, ok := f.foreign[key]; ok {
+			if action != "GetCallerIdentity" {
+				iamErr(403, "AccessDenied")
+				return
+			}
+			fmt.Fprintf(w, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>999988887777</Account><Arn>%s</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>`, a)
+			return
+		}
+		if code := f.stsDown[key]; code != "" {
+			iamErr(403, code)
 			return
 		}
 		isAdmin := key == "AKIADMIN"
@@ -93,11 +113,45 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 			}
 			return
 		}
-		if !isAdmin {
+		if !isAdmin && f.selfGetUser != "" && action == "GetUser" && v.Get("UserName") == f.keys[key].user {
+			if f.selfGetUser != "ok" {
+				iamErr(400, f.selfGetUser)
+				return
+			}
+		} else if !isAdmin {
 			iamErr(403, "AccessDenied")
 			return
 		}
 		switch action {
+		case "DescribeSecurityGroups":
+			if v.Get("Filter.1.Name") != "group-name" || v.Get("Filter.1.Value.1") != "spotexec-ssh" || v.Get("Filter.1.Value.2") != "spotexec-ssh-*" {
+				t.Errorf("DescribeSecurityGroups filter %v", v)
+			}
+			var b strings.Builder
+			for id, tags := range f.sgs {
+				name, desc := "spotexec-ssh", "spotexec runners: SSH ingress"
+				if tags["name"] != "" {
+					name, desc = tags["name"], tags["desc"]
+				}
+				fmt.Fprintf(&b, `<item><groupId>%s</groupId><groupName>%s</groupName><groupDescription>%s</groupDescription><tagSet>`, id, name, desc)
+				for k, val := range tags {
+					if k == "name" || k == "desc" {
+						continue
+					}
+					fmt.Fprintf(&b, `<item><key>%s</key><value>%s</value></item>`, k, val)
+				}
+				b.WriteString(`</tagSet></item>`)
+			}
+			fmt.Fprintf(w, `<DescribeSecurityGroupsResponse><securityGroupInfo>%s</securityGroupInfo></DescribeSecurityGroupsResponse>`, b.String())
+		case "CreateTags":
+			tags := f.sgs[v.Get("ResourceId.1")]
+			if tags == nil || v.Get("ResourceId.2") != "" {
+				t.Errorf("CreateTags %v", v)
+				iamErr(400, "InvalidID")
+				return
+			}
+			tags[v.Get("Tag.1.Key")] = v.Get("Tag.1.Value")
+			fmt.Fprint(w, `<CreateTagsResponse><return>true</return></CreateTagsResponse>`)
 		case "CreateDefaultVpc":
 			f.noVPC = false
 			fmt.Fprint(w, `<CreateDefaultVpcResponse><vpc><vpcId>vpc-new</vpcId></vpc></CreateDefaultVpcResponse>`)
@@ -150,10 +204,17 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 				iamErr(409, "LimitExceeded")
 				return
 			}
+			if f.denyKey {
+				iamErr(400, "ServiceFailure")
+				return
+			}
 			f.created++
 			id := fmt.Sprintf("AKNEW%d", f.created)
 			f.keys[id] = fakeKey{user: v.Get("UserName"), created: time.Now().UTC().Format(time.RFC3339Nano)}
 			f.propagation[id] = 2
+			if f.neverWorks {
+				f.propagation[id] = 1 << 30
+			}
 			fmt.Fprintf(w, `<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey><AccessKeyId>%s</AccessKeyId><SecretAccessKey>secret-%s</SecretAccessKey></AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>`, id, id)
 		case "DeleteAccessKey":
 			if f.keys[v.Get("AccessKeyId")].user != v.Get("UserName") {
@@ -293,6 +354,118 @@ func TestAWSUserSetupRotateMakesRoom(t *testing.T) {
 	}
 }
 
+// With both key slots used, rotation makes room by deleting the key the
+// profile doesn't use (even when it's the newer one), and retires the
+// profile's old key only once the replacement works.
+func TestAWSUserSetupRotateKeepsLocalKey(t *testing.T) {
+	newEnv := func(t *testing.T) (*fakeIAM, *AWSUserSetup, string) {
+		f := &fakeIAM{
+			users: map[string]*fakeUser{"spotexec-test": {path: "/spotexec/", tags: map[string]string{tagMachine: testMachine}}},
+			keys: map[string]fakeKey{
+				"AKLOCAL": {"spotexec-test", "2025-01-01T00:00:00Z"}, "AKLEFTOVER": {"spotexec-test", "2025-06-01T00:00:00Z"},
+			},
+		}
+		s, creds, _ := newSetupEnv(t, f)
+		os.WriteFile(creds, []byte("[spotexec]\naws_access_key_id = AKLOCAL\naws_secret_access_key = x\n"), 0o600)
+		s.Rotate = true
+		return f, s, creds
+	}
+	t.Run("success", func(t *testing.T) {
+		f, s, _ := newEnv(t)
+		res, err := s.Run(context.Background())
+		if err != nil || strings.Join(res.KeysDeleted, ",") != "AKLEFTOVER,AKLOCAL" || strings.Join(f.keysOf("spotexec-test"), ",") != "AKNEW1" {
+			t.Fatalf("result %+v %v, keys %v", res, err, f.keys)
+		}
+	})
+	t.Run("replacement never works", func(t *testing.T) {
+		f, s, creds := newEnv(t)
+		f.neverWorks, s.verifyFor = true, 50*time.Millisecond
+		if _, err := s.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "was left as it was") {
+			t.Fatalf("err = %v", err)
+		}
+		if b, _ := os.ReadFile(creds); !strings.Contains(string(b), "AKLOCAL") || f.keys["AKLOCAL"].user == "" {
+			t.Fatalf("credentials:\n%s\nkeys %v", b, f.keys)
+		}
+		if strings.Join(f.keysOf("spotexec-test"), ",") != "AKLOCAL" {
+			t.Fatalf("the failed key wasn't cleaned up: %v", f.keys)
+		}
+	})
+	for _, where := range []string{"credentials", "config"} {
+		t.Run("profile doesn't resolve, key in "+where, func(t *testing.T) {
+			// The key in the credentials or config file is still protected.
+			f, s, creds := newEnv(t)
+			if where == "config" {
+				os.Remove(creds)
+				os.WriteFile(os.Getenv("AWS_CONFIG_FILE"), []byte("[profile spotexec]\naws_access_key_id = AKLOCAL\naws_secret_access_key = x\n"), 0o600)
+			}
+			f.denyKey = true
+			s.resolveProfile = func(context.Context, string) (awsCreds, error) { return awsCreds{}, errors.New("aws: exit status 255") }
+			if _, err := s.Run(context.Background()); err == nil {
+				t.Fatal("expected an error")
+			}
+			if f.keys["AKLOCAL"].user == "" || f.keys["AKLEFTOVER"].user != "" {
+				t.Fatalf("keys %v", f.keys)
+			}
+		})
+	}
+	t.Run("replacement fails", func(t *testing.T) {
+		f, s, creds := newEnv(t)
+		f.denyKey = true
+		if _, err := s.Run(context.Background()); err == nil {
+			t.Fatal("expected an error")
+		}
+		if f.keys["AKLOCAL"].user == "" {
+			t.Fatalf("the working key was deleted: %v", f.keys)
+		}
+		if b, _ := os.ReadFile(creds); !strings.Contains(string(b), "AKLOCAL") {
+			t.Fatalf("credentials:\n%s", b)
+		}
+	})
+}
+
+func TestAWSUserSetupLock(t *testing.T) {
+	s := &AWSUserSetup{}
+	creds := filepath.Join(t.TempDir(), "credentials")
+	os.WriteFile(creds, nil, 0o600)
+	link := filepath.Join(t.TempDir(), "credentials") // a symlinked dotfile in another directory
+	if err := os.Symlink(creds, link); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := s.lock(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan func(), 1)
+	go func() {
+		u, _ := s.lock(creds)
+		got <- u
+	}()
+	select {
+	case <-got:
+		t.Fatal("a second setup didn't wait")
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case u := <-got:
+		u()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second setup never got the lock")
+	}
+}
+
+func TestRoomKey(t *testing.T) {
+	keys := []accessKey{{ID: "A", Status: "Active"}, {ID: "B", Status: "Inactive"}, {ID: "C", Status: "Active"}}
+	for local, want := range map[string]int{"": 1, "B": 0, "A": 1} {
+		if got := roomKey(keys, local); got != want {
+			t.Errorf("roomKey(local %q) = %d, want %d", local, got, want)
+		}
+	}
+	if roomKey(keys[:1], "A") != -1 {
+		t.Error("the only key is local: nothing to delete")
+	}
+}
+
 // Two machines with the same hostname must never share (or delete each
 // other's) keys.
 func TestAWSUserSetupHostnameCollision(t *testing.T) {
@@ -340,6 +513,109 @@ func TestAWSUserSetupKeepsProfileUser(t *testing.T) {
 	}
 	if !res.AlreadyReady || !strings.HasSuffix(res.UserARN, "/spotexec-oldname") || f.users["spotexec-test"] != nil || f.users["spotexec-oldname"].tags[tagMachine] != testMachine {
 		t.Fatalf("result %+v, users %v", res, f.users)
+	}
+}
+
+// A credentials file copied from another machine signs in as that
+// machine's user: this one gets its own user and key, and the other
+// machine's key is left alone, unless the user is named explicitly.
+func TestAWSUserSetupCopiedCredentials(t *testing.T) {
+	newEnv := func(t *testing.T) (*fakeIAM, *AWSUserSetup, string) {
+		f := &fakeIAM{
+			users: map[string]*fakeUser{"spotexec-mac-a": {path: "/spotexec/", tags: map[string]string{tagMachine: "bbbbbbbb-2222-4333-8444-555555555555", "spotexec-host": "mac-a"}}},
+			keys:  map[string]fakeKey{"AKMACA": {"spotexec-mac-a", "2025-01-01T00:00:00Z"}},
+		}
+		s, creds, _ := newSetupEnv(t, f)
+		os.WriteFile(creds, []byte("[spotexec]\naws_access_key_id = AKMACA\naws_secret_access_key = x\n"), 0o600)
+		return f, s, creds
+	}
+	t.Run("own user", func(t *testing.T) {
+		f, s, creds := newEnv(t)
+		res, err := s.Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.AlreadyReady || !res.KeyCreated || !strings.HasSuffix(res.UserARN, "/spotexec/spotexec-test") || len(res.KeysDeleted) != 0 {
+			t.Fatalf("result %+v", res)
+		}
+		if f.keys["AKMACA"].user != "spotexec-mac-a" || f.users["spotexec-test"].tags[tagMachine] != testMachine {
+			t.Fatalf("keys %v, users %v", f.keys, f.users)
+		}
+		if b, _ := os.ReadFile(creds); !strings.Contains(string(b), "aws_access_key_id = "+res.AccessKeyID) {
+			t.Fatalf("credentials:\n%s", b)
+		}
+	})
+	// Without an administrator, the key reads its own user's tags and setup
+	// refuses to report it ready for this machine.
+	for name, adminKey := range map[string]string{"no admin session": "AKEXPIRED", "profile as admin": "AKMACA"} {
+		t.Run(name, func(t *testing.T) {
+			for selfGetUser, want := range map[string]string{
+				"ok":              "belongs to another machine (host mac-a), so this machine needs its own",
+				"ValidationError": "couldn't check which machine IAM user spotexec-mac-a",
+			} {
+				f, s, creds := newEnv(t)
+				f.selfGetUser = selfGetUser
+				t.Setenv("AWS_ACCESS_KEY_ID", adminKey)
+				before, _ := os.ReadFile(creds)
+				_, err := s.Run(context.Background())
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("%s: err = %v", selfGetUser, err)
+				}
+				if after, _ := os.ReadFile(creds); string(after) != string(before) || f.count("CreateAccessKey") != 0 {
+					t.Fatalf("changed: %s %v", after, f.calls)
+				}
+			}
+		})
+	}
+	t.Run("named explicitly", func(t *testing.T) {
+		f, s, _ := newEnv(t)
+		s.UserName = "spotexec-mac-a"
+		res, err := s.Run(context.Background())
+		if err != nil || !res.AlreadyReady || res.AccessKeyID != "AKMACA" || f.count("CreateAccessKey") != 0 {
+			t.Fatalf("result %+v %v", res, err)
+		}
+	})
+}
+
+// A profile for one account and an admin session for another: setup stops
+// before changing anything.
+func TestAWSUserSetupAccountMismatch(t *testing.T) {
+	f := &fakeIAM{foreign: map[string]string{"AKOTHERACCT": "arn:aws:iam::999988887777:user/spotexec/spotexec-test"}}
+	s, creds, _ := newSetupEnv(t, f)
+	before := "[spotexec]\naws_access_key_id = AKOTHERACCT\naws_secret_access_key = x\n"
+	os.WriteFile(creds, []byte(before), 0o600)
+	_, err := s.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "signs in to account 999988887777") || !strings.Contains(err.Error(), "admin session is for account 111122223333") {
+		t.Fatalf("err = %v", err)
+	}
+	for _, a := range []string{"CreateUser", "PutUserPolicy", "CreateAccessKey", "CreateDefaultVpc", "TagUser"} {
+		if f.count(a) != 0 {
+			t.Fatalf("%s called: %v", a, f.calls)
+		}
+	}
+	if b, _ := os.ReadFile(creds); string(b) != before {
+		t.Fatalf("credentials changed:\n%s", b)
+	}
+}
+
+// A profile whose account can't be determined (STS failing for another
+// reason than a bad key) is not replaced.
+func TestAWSUserSetupProfileAccountUnknown(t *testing.T) {
+	// AccessDenied (e.g. an endpoint policy) doesn't prove the key is bad.
+	for _, code := range []string{"RegionDisabledException", "AccessDenied"} {
+		t.Run(code, func(t *testing.T) {
+			f := &fakeIAM{stsDown: map[string]string{"AKMAYBE": code}}
+			s, creds, _ := newSetupEnv(t, f)
+			before := "[spotexec]\naws_access_key_id = AKMAYBE\naws_secret_access_key = x\n"
+			os.WriteFile(creds, []byte(before), 0o600)
+			_, err := s.Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "couldn't check which AWS account profile") || f.count("CreateUser") != 0 {
+				t.Fatalf("err = %v, calls %v", err, f.calls)
+			}
+			if b, _ := os.ReadFile(creds); string(b) != before {
+				t.Fatalf("credentials changed:\n%s", b)
+			}
+		})
 	}
 }
 
@@ -404,6 +680,104 @@ func TestUpsertINISection(t *testing.T) {
 	}
 }
 
+// Section headers may carry a trailing comment, as the AWS CLI allows: an
+// upsert must find its own section and never run into (and rewrite) the next.
+func TestINIHeaderComments(t *testing.T) {
+	for _, c := range []struct {
+		line, name string
+		ok         bool
+	}{
+		{"[work]", "work", true},
+		{"[work] # prod keys", "work", true},
+		{"[profile  work] ; note", "profile  work", true},
+		{"[ spotexec ]#x", " spotexec ", true},
+		{"[]", "", false},
+		{"# [work]", "", false},
+		{"key = [v]", "", false},
+	} {
+		if name, ok := iniHeader(c.line); name != c.name || ok != c.ok {
+			t.Errorf("iniHeader(%q) = %q, %v", c.line, name, ok)
+		}
+	}
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "credentials")
+	// [spotexec] followed by a commented header: work's keys must survive.
+	os.WriteFile(p, []byte("[spotexec]\naws_access_key_id = OLD\n\n[work] # prod keys\naws_access_key_id = AKWORK\naws_secret_access_key = w\n"), 0o600)
+	if err := upsertINISection(p, "spotexec", [][2]string{{"aws_access_key_id", "NEW"}, {"aws_secret_access_key", "S"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	want := "[spotexec]\naws_access_key_id = NEW\naws_secret_access_key = S\n\n[work] # prod keys\naws_access_key_id = AKWORK\naws_secret_access_key = w\n"
+	if string(b) != want {
+		t.Fatalf("got:\n%s", b)
+	}
+	if c, err := parseSharedCredentials(bufio.NewScanner(strings.NewReader(string(b))), "work", "creds"); err != nil || c.AccessKeyID != "AKWORK" {
+		t.Fatalf("work after upsert: %+v %v", c, err)
+	}
+
+	// A commented [spotexec] header is updated in place, not duplicated.
+	os.WriteFile(p, []byte("[default]\nregion = x\n\n[spotexec] # spotexec's machine key\naws_access_key_id = OLD\naws_secret_access_key = O\n"), 0o600)
+	if err := upsertINISection(p, "spotexec", [][2]string{{"aws_access_key_id", "NEW"}, {"aws_secret_access_key", "S"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(p)
+	want = "[default]\nregion = x\n\n[spotexec] # spotexec's machine key\naws_access_key_id = NEW\naws_secret_access_key = S\n"
+	if string(b) != want {
+		t.Fatalf("got:\n%s", b)
+	}
+	if c, err := parseSharedCredentials(bufio.NewScanner(strings.NewReader(string(b))), "spotexec", "creds"); err != nil || c.AccessKeyID != "NEW" {
+		t.Fatalf("spotexec after upsert: %+v %v", c, err)
+	}
+
+	// Credentials section names are matched verbatim, as the AWS CLI does:
+	// "[team  prod]" and "[ spotexec ]" are other profiles, left untouched.
+	os.WriteFile(p, []byte("[team prod]\naws_access_key_id = A1\naws_secret_access_key = a\n[team  prod] # two spaces\naws_access_key_id = A2\naws_secret_access_key = b\n[ spotexec ]#x\naws_access_key_id = KEEP\n"), 0o600)
+	if err := upsertINISection(p, "spotexec", [][2]string{{"aws_access_key_id", "NEW"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(p)
+	if !strings.HasSuffix(string(b), "[ spotexec ]#x\naws_access_key_id = KEEP\n\n[spotexec]\naws_access_key_id = NEW\n") {
+		t.Fatalf("got:\n%s", b)
+	}
+	for name, want := range map[string]string{"team prod": "A1", "team  prod": "A2"} {
+		if c, err := parseSharedCredentials(bufio.NewScanner(strings.NewReader(string(b))), name, "creds"); err != nil || c.AccessKeyID != want {
+			t.Fatalf("%q: %+v %v", name, c, err)
+		}
+	}
+
+	// The config readers see commented headers too.
+	cfg := filepath.Join(dir, "config")
+	os.WriteFile(cfg, []byte("[profile spotexec] # machine key\nsso_session = corp\n[profile other] # x\nregion = r\n"), 0o600)
+	if vals, err := readINISection(cfg, "profile spotexec"); err != nil || vals["sso_session"] != "corp" || vals["region"] != "" {
+		t.Fatalf("readINISection: %v %v", vals, err)
+	}
+	if vals, err := readINI(cfg, "profile other"); err != nil || vals["region"] != "r" || vals["sso_session"] != "" {
+		t.Fatalf("readINI: %v %v", vals, err)
+	}
+}
+
+// Security groups from before spotexec tagged them at creation get the
+// owner tag on the next setup, so the scoped policy still lets the key
+// add rules to them; tagged ones are left alone.
+func TestAWSUserSetupTagsOldSecurityGroups(t *testing.T) {
+	f := &fakeIAM{sgs: map[string]map[string]string{
+		"sg-old":   {"Name": "spotexec-ssh"},
+		"sg-cidr":  {"name": "spotexec-ssh-0a1b2c3d", "desc": "spotexec runners: SSH ingress"},
+		"sg-new":   {tagOwner: "someone-else"},
+		"sg-prod":  {"name": "spotexec-ssh-production", "desc": "spotexec runners: SSH ingress"},
+		"sg-other": {"name": "spotexec-ssh", "desc": "hand-made"},
+	}}
+	s, _, _ := newSetupEnv(t, f)
+	if _, err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.sgs["sg-old"][tagOwner] != testMachine || f.sgs["sg-old"]["Name"] != "spotexec-ssh" || f.sgs["sg-cidr"][tagOwner] != testMachine ||
+		f.sgs["sg-new"][tagOwner] != "someone-else" || f.sgs["sg-prod"][tagOwner] != "" || f.sgs["sg-other"][tagOwner] != "" || f.count("CreateTags") != 2 {
+		t.Fatalf("groups %v, calls %v", f.sgs, f.calls)
+	}
+}
+
 // docs/aws.md shows the policy for manual setup; it must match what
 // `spotexec setup` attaches.
 func TestPolicyMatchesREADME(t *testing.T) {
@@ -417,5 +791,46 @@ func TestPolicyMatchesREADME(t *testing.T) {
 	}
 	if compactJSON(string(m[1])) != compactJSON(SpotexecPolicy) {
 		t.Fatal("docs/aws.md policy differs from SpotexecPolicy")
+	}
+}
+
+// Setup run from another machine acts only with the session that machine
+// passed, never this machine's own AWS login.
+func TestAWSUserSetupAdminFromEnv(t *testing.T) {
+	f := &fakeIAM{}
+	s, creds, _ := newSetupEnv(t, f)
+	s.AdminFromEnv = true
+	// This machine's own login could manage IAM users...
+	if err := os.WriteFile(creds, []byte("[default]\naws_access_key_id = AKIADMIN\naws_secret_access_key = admin-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_PROFILE", "default")
+	// ...but nothing was passed.
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	_, err := s.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no AWS sign-in was passed") {
+		t.Fatalf("err = %v", err)
+	}
+	if f.count("CreateUser") != 0 || f.count("GetCallerIdentity") != 0 {
+		t.Fatalf("calls %v", f.calls)
+	}
+
+	// A machine whose key still works is refreshed without one.
+	f.users = map[string]*fakeUser{"spotexec-test": {path: "/spotexec/", tags: map[string]string{tagMachine: testMachine}}}
+	f.keys = map[string]fakeKey{"AKMINE": {"spotexec-test", "2025-01-01T00:00:00Z"}}
+	if err := os.WriteFile(creds, []byte("[default]\naws_access_key_id = AKIADMIN\naws_secret_access_key = admin-secret\n[spotexec]\naws_access_key_id = AKMINE\naws_secret_access_key = x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Run(context.Background())
+	if err != nil || !res.AlreadyReady || !res.PolicyStale || f.count("PutUserPolicy") != 0 {
+		t.Fatalf("%+v %v, calls %v", res, err, f.calls)
+	}
+
+	// With the passed session, the policy is refreshed.
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIADMIN")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "admin-secret")
+	if res, err := s.Run(context.Background()); err != nil || res.PolicyStale || f.count("PutUserPolicy") != 1 {
+		t.Fatalf("%+v %v, calls %v", res, err, f.calls)
 	}
 }

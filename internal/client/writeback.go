@@ -30,9 +30,30 @@ type WritebackResult struct {
 	Applied     []string
 	Deleted     []string
 	Conflicts   []string
+	Stashed     []Conflict // one per Conflicts entry: where each remote version went
 	Ignored     int
 	Refused     []string // paths the runner reported that may not be written
 	ConflictDir string
+}
+
+// Conflict is a path where your local edit was kept and the remote version
+// was stashed instead.
+type Conflict struct {
+	Path    string `json:"path"`    // worktree-relative
+	Local   string `json:"local"`   // your file (absolute)
+	Remote  string `json:"remote"`  // the stashed remote version (absolute)
+	Deleted bool   `json:"deleted"` // the remote command deleted it (Remote is a marker file)
+}
+
+// conflict stashes the remote version of p and records the conflict.
+func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile) error {
+	stashed, err := stashConflict(wb.ConflictDir, p, want, rf)
+	if err != nil {
+		return err
+	}
+	wb.Conflicts = append(wb.Conflicts, p)
+	wb.Stashed = append(wb.Stashed, Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(p)), Remote: stashed, Deleted: !want.exists})
+	return nil
 }
 
 // remoteFile is a fetched file version.
@@ -91,7 +112,11 @@ func localVersion(root, rel string) (version, error) {
 // local == remote: nothing to do. local == base: apply remote. Otherwise
 // someone edited the file locally during the run: keep it and stash the
 // remote version under <git-dir>/spotexec/conflicts/<run-id>/.
-func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string) (WritebackResult, error) {
+//
+// ignored is which created files are ignored here, if already known.
+// proceed, when set, is asked once everything is fetched and before anything
+// is applied: false applies nothing.
+func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string, ignored map[string]bool, proceed func() bool) (WritebackResult, error) {
 	var wb WritebackResult
 	// Created (non-manifest) files only come back if not ignored locally.
 	// The runner's report is not trusted: changed or deleted paths must be
@@ -126,9 +151,11 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	for _, c := range created {
 		createdPaths = append(createdPaths, c.Path)
 	}
-	ignored, err := m.CheckIgnored(ctx, createdPaths)
-	if err != nil {
-		return wb, err
+	if ignored == nil {
+		var err error
+		if ignored, err = m.CheckIgnored(ctx, createdPaths); err != nil {
+			return wb, err
+		}
 	}
 	remote := map[string]version{}
 	var fetch, accept []string
@@ -185,13 +212,16 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	}); err != nil {
 		return wb, err
 	}
+	if proceed != nil && !proceed() {
+		return wb, nil
+	}
 
 	// Serialize cooperating spotexec write-backs into this worktree.
 	lockDir := conflictBase(ws)
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {
 		return wb, err
 	}
-	unlock, err := lockFile(filepath.Join(lockDir, "writeback.lock"))
+	unlock, err := lockFile(ctx, filepath.Join(lockDir, "writeback.lock"))
 	if err != nil {
 		return wb, err
 	}
@@ -242,10 +272,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 			}
 			want := version{true, rf.id, rf.mode}
 			if !local.eq(base) && !local.eq(want) {
-				if err := stashConflict(wb.ConflictDir, q, want, rf); err != nil {
+				if err := wb.conflict(ws.Root, q, want, rf); err != nil {
 					return wb, err
 				}
-				wb.Conflicts = append(wb.Conflicts, q)
 				break
 			}
 			if err := os.Rename(fd, fq); err != nil {
@@ -254,10 +283,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 			if !local.eq(want) {
 				err := writeLocal(ws.Root, q, rf, &local)
 				if errors.Is(err, errChangedUnderUs) {
-					if err := stashConflict(wb.ConflictDir, q, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, q, want, rf); err != nil {
 						return wb, err
 					}
-					wb.Conflicts = append(wb.Conflicts, q)
 					break
 				}
 				if err != nil {
@@ -304,10 +332,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 				// directory is needed, kept because of a local edit): keep
 				// the local side, stash the remote one.
 				if errors.Is(err, errChangedUnderUs) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) {
-					if err := stashConflict(wb.ConflictDir, p, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, p, want, rf); err != nil {
 						return err
 					}
-					wb.Conflicts = append(wb.Conflicts, p)
 					return nil
 				}
 				if err != nil {
@@ -327,10 +354,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 				removedDirs = append(removedDirs, path.Dir(p))
 			}
 		default:
-			if err := stashConflict(wb.ConflictDir, p, want, rf); err != nil {
+			if err := wb.conflict(ws.Root, p, want, rf); err != nil {
 				return err
 			}
-			wb.Conflicts = append(wb.Conflicts, p)
 		}
 		return nil
 	}
@@ -369,38 +395,36 @@ func conflictBase(ws *Workspace) string {
 	return filepath.Join(ws.Root, ".spotexec")
 }
 
-func stashConflict(dir, p string, want version, rf remoteFile) error {
+// stashConflict saves the remote version of p under dir and returns where it
+// went (a ".deleted" marker when the remote command deleted it).
+func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 	if !want.exists {
 		mark := []byte("deleted by the remote command\n")
-		err := func() error {
-			full, err := fsid.SafeJoin(dir, p+".deleted")
-			if err != nil {
-				return err
+		full, err := fsid.SafeJoin(dir, p+".deleted")
+		if err == nil {
+			if err = os.MkdirAll(filepath.Dir(full), 0o700); err == nil {
+				err = os.WriteFile(full, mark, 0o600)
 			}
-			if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
-				return err
-			}
-			return os.WriteFile(full, mark, 0o600)
-		}()
+		}
 		if err != nil && stashCollision(err) {
 			// Something in the stash is in the way: a fresh flattened name.
 			if err := os.MkdirAll(dir, 0o700); err != nil {
-				return err
+				return "", err
 			}
 			f, err := os.CreateTemp(dir, strings.ReplaceAll(p, "/", "__")+".deleted-*")
 			if err != nil {
-				return err
+				return "", err
 			}
 			_, err = f.Write(mark)
 			if cerr := f.Close(); err == nil {
 				err = cerr
 			}
-			return err
+			return f.Name(), err
 		}
-		return err
+		return full, err
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return "", err
 	}
 	err := writeLocal(dir, p, rf, nil)
 	if err != nil && stashCollision(err) {
@@ -415,9 +439,9 @@ func stashConflict(dir, p string, want version, rf remoteFile) error {
 			}
 			name = fmt.Sprintf("%s.%d", base, i)
 		}
-		return writeLocal(dir, name, rf, nil)
+		return filepath.Join(dir, name), writeLocal(dir, name, rf, nil)
 	}
-	return err
+	return filepath.Join(dir, filepath.FromSlash(p)), err
 }
 
 func stashCollision(err error) bool {
@@ -445,14 +469,20 @@ func writeLocal(root, p string, rf remoteFile, expect *version) error {
 			return err
 		}
 	} else {
-		if err := os.WriteFile(tmp, rf.data, fsid.Perm(rf.mode)); err != nil {
+		// Over an existing file, staged private (it may be a 0600 secret)
+		// and given that file's bits just before the rename; a new file
+		// gets 0644/0755 as the umask allows.
+		stage := fsid.Perm(rf.mode)
+		if _, existing := replacementPerm(full, rf.mode); existing {
+			stage = 0o600
+		}
+		if err := os.WriteFile(tmp, rf.data, stage); err != nil {
 			os.Remove(tmp)
 			return err
 		}
-		if err := os.Chmod(tmp, fsid.Perm(rf.mode)); err != nil {
-			os.Remove(tmp)
-			return err
-		}
+	}
+	if stagedHook != nil {
+		stagedHook()
 	}
 	if fi, err := os.Lstat(full); err == nil && fi.IsDir() {
 		os.Remove(tmp)
@@ -464,11 +494,44 @@ func writeLocal(root, p string, rf remoteFile, expect *version) error {
 			return errChangedUnderUs
 		}
 	}
+	if rf.mode != fsid.ModeSymlink {
+		// Read now, not before staging: a chmod made meanwhile (tightening
+		// a secret) must not be undone.
+		if perm, existing := replacementPerm(full, rf.mode); existing {
+			if err := os.Chmod(tmp, perm); err != nil {
+				os.Remove(tmp)
+				return err
+			}
+		}
+	}
 	if err := os.Rename(tmp, full); err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	return nil
+}
+
+// stagedHook runs after writeLocal stages a file (tests).
+var stagedHook func()
+
+// replacementPerm is the permission for a file written over full. An
+// existing regular file keeps its own bits (a 0600 .npmrc stays 0600); only
+// an executable-bit change made remotely is carried over, for whoever may
+// read the file. existing is false when there is no regular file there: a
+// new file gets the usual 0644/0755, which the umask narrows.
+func replacementPerm(full string, mode uint32) (perm os.FileMode, existing bool) {
+	fi, err := os.Lstat(full)
+	if err != nil || !fi.Mode().IsRegular() {
+		return fsid.Perm(mode), false
+	}
+	perm = fi.Mode().Perm()
+	switch {
+	case mode == fsid.ModeExec && perm&0o111 == 0:
+		perm |= (perm & 0o444) >> 2 // +x wherever it is readable
+	case mode != fsid.ModeExec:
+		perm &^= 0o111
+	}
+	return perm, true
 }
 
 func pruneEmptyDirs(root string, dirs []string) {
@@ -521,19 +584,66 @@ func readTar(r io.Reader, fn func(*tar.Header, io.Reader) error) error {
 	return nil
 }
 
-func lockFile(p string) (func(), error) {
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o644)
+// lockFile takes the worktree's write-back lock, waiting no longer than ctx
+// allows (a suspended or stuck sx holding it must not block every later
+// run, with its remote lease, forever). The holder records who it is in the
+// file, so a wait that gives up can say which process holds the lock.
+func lockFile(ctx context.Context, p string) (func(), error) {
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
+	start := time.Now()
+	delay := 10 * time.Millisecond
+	for {
+		if ctx.Err() != nil {
+			f.Close()
+			return nil, fmt.Errorf("gave up waiting for this worktree's write-back lock (%s), held by %s; if that sx is suspended (Ctrl-Z), resume it with `fg` or end it", p, lockOwner(p))
+		}
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, fmt.Errorf("gave up after %s waiting for this worktree's write-back lock (%s), held by %s; if that sx is suspended (Ctrl-Z), resume it with `fg` or end it", time.Since(start).Round(time.Second), p, lockOwner(p))
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, 250*time.Millisecond)
+	}
+	// The record stays after release (until the next holder overwrites it):
+	// clearing it first would leave nothing to report if this process were
+	// suspended in between.
+	if err := f.Truncate(0); err == nil {
+		_, _ = f.WriteAt([]byte(lockHolder()+"\n"), 0)
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 	}, nil
+}
+
+// lockOwner reads who holds the lock at p.
+func lockOwner(p string) string {
+	if b, err := os.ReadFile(p); err == nil && len(bytes.TrimSpace(b)) > 0 {
+		return string(bytes.TrimSpace(b))
+	}
+	return "another process"
+}
+
+// lockHolder describes this process for a lock it holds.
+func lockHolder() string {
+	args := append([]string{filepath.Base(os.Args[0])}, os.Args[1:]...)
+	cmd := strings.Join(args, " ")
+	if len(cmd) > 200 {
+		cmd = cmd[:200] + "…"
+	}
+	return fmt.Sprintf("pid %d (%s), since %s", os.Getpid(), cmd, time.Now().Format("15:04:05"))
 }
 
 // PullArtifacts fetches files matching patterns from the slot workspace and
@@ -673,7 +783,7 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {
 		return 0, err
 	}
-	unlock, err := lockFile(filepath.Join(lockDir, "writeback.lock"))
+	unlock, err := lockFile(ctx, filepath.Join(lockDir, "writeback.lock"))
 	if err != nil {
 		return 0, err
 	}

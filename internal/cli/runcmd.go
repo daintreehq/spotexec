@@ -2,14 +2,11 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +41,7 @@ type runFlags struct {
 	dir           string
 	noRetry       bool
 	priority      int
+	prioritySet   bool // --priority or SPOTEXEC_PRIORITY given (0 included)
 	sameSlot      bool
 	fs            *pflag.FlagSet // to tell explicit flags from defaults
 }
@@ -51,16 +49,16 @@ type runFlags struct {
 func (f *runFlags) register(fs *pflag.FlagSet) {
 	f.fs = fs
 	fs.DurationVar(&f.timeout, "timeout", 0, "wall-clock limit for the command (default 5m or .spotexec.toml timeout)")
-	fs.DurationVar(&f.queueTimeout, "queue-timeout", 0, "how long to wait for a free slot")
+	fs.DurationVar(&f.queueTimeout, "queue-timeout", 0, "how long to wait for a free slot (default 10m or .spotexec.toml queue_timeout)")
 	fs.StringVar(&f.sync, "sync", "", "sync mode: auto (bidirectional), in (no write-back), none")
 	fs.StringVar(&f.writeback, "writeback", "", "write-back policy: always, on-success, never")
 	fs.StringSliceVar(&f.pool, "pool", nil, "runner names to use (comma-separated)")
 	fs.StringVarP(&f.runner, "runner", "r", "", "use only this runner")
 	fs.BoolVar(&f.exclusive, "exclusive", false, "take every slot on the runner")
 	fs.StringArrayVar(&f.pull, "pull", nil, "also pull these gitignored paths/globs back after the run (repeatable)")
-	fs.BoolVar(&f.json, "json", false, "NDJSON lifecycle events on stderr (default when stderr is not a TTY)")
+	fs.BoolVar(&f.json, "json", false, "NDJSON lifecycle events on stderr (default with SPOTEXEC_AGENT=1)")
 	fs.BoolVar(&f.pretty, "pretty", false, "human spinner output even when not a TTY")
-	fs.BoolVarP(&f.quiet, "quiet", "q", false, "no lifecycle output")
+	fs.BoolVarP(&f.quiet, "quiet", "q", false, "warnings only: no progress or summary")
 	fs.StringVar(&f.eventsFile, "events-file", "", "also append NDJSON events to this file")
 	fs.BoolVar(&f.noDeps, "no-deps", false, "skip dependency hydration")
 	fs.BoolVar(&f.forceLarge, "force-large-sync", false, "allow syncing more than 100k files / 5 GiB")
@@ -81,34 +79,66 @@ func (f *runFlags) reporter() (ui.Reporter, error) {
 		mode = ui.ModeJSON
 	case f.pretty:
 		mode = ui.ModePretty
+	case f.changed("json") && os.Getenv("SPOTEXEC_AGENT") == "1":
+		// --json=false beats SPOTEXEC_AGENT=1's NDJSON default.
+		mode = ui.ModePlain
+		if ui.IsTerminal(os.Stderr) {
+			mode = ui.ModePretty
+		}
 	}
 	return ui.New(mode, os.Stderr, f.eventsFile)
 }
 
-// env overrides (SPOTEXEC_*), lower precedence than flags.
+// applyEnv fills in SPOTEXEC_* defaults for every flag not given on the
+// command line: an explicit flag always wins, whatever its value (so
+// --json=false, --priority 0 and --pool beat the environment).
 func (f *runFlags) applyEnv() {
-	if f.timeout == 0 {
+	if !f.changed("timeout") {
 		if d, err := time.ParseDuration(os.Getenv("SPOTEXEC_TIMEOUT")); err == nil {
 			f.timeout = d
 		}
 	}
-	if f.sync == "" {
-		f.sync = os.Getenv("SPOTEXEC_SYNC")
+	if !f.changed("sync") {
+		if v := os.Getenv("SPOTEXEC_SYNC"); v != "" {
+			f.sync = v
+		}
 	}
-	if f.runner == "" {
-		f.runner = os.Getenv("SPOTEXEC_RUNNER")
+	// A runner named in the environment narrows the default pool, never one
+	// given with --pool.
+	if !f.changed("runner") && !f.changed("pool") {
+		if v := os.Getenv("SPOTEXEC_RUNNER"); v != "" {
+			f.runner = v
+		}
 	}
-	if os.Getenv("SPOTEXEC_JSON") == "1" && !f.changed("pretty") && !f.changed("quiet") {
+	if os.Getenv("SPOTEXEC_JSON") == "1" && !f.changed("json") && !f.changed("pretty") && !f.changed("quiet") {
 		f.json = true
 	}
 	if os.Getenv("SPOTEXEC_SAME_SLOT") == "1" && !f.changed("same-slot") {
 		f.sameSlot = true
 	}
-	if f.priority == 0 {
-		if n, err := strconv.Atoi(os.Getenv("SPOTEXEC_PRIORITY")); err == nil {
-			f.priority = n
+	if f.changed("priority") {
+		f.prioritySet = true
+	} else if n, err := strconv.Atoi(os.Getenv("SPOTEXEC_PRIORITY")); err == nil {
+		f.priority, f.prioritySet = n, true
+	}
+}
+
+// validate rejects run settings no run could honour, before any runner is
+// acquired: an unknown --writeback must never fall through to writing back.
+func (f *runFlags) validate() error {
+	// An explicitly empty value would silently mean "the default".
+	for name, empty := range map[string]bool{"sync": f.sync == "", "writeback": f.writeback == "", "runner": f.runner == "", "pool": len(f.pool) == 0} {
+		if empty && f.changed(name) {
+			return fmt.Errorf("--%s needs a value", name)
 		}
 	}
+	if f.sync != "" && f.sync != "auto" && f.sync != "in" && f.sync != "none" {
+		return fmt.Errorf("--sync must be auto, in or none (got %q)", f.sync)
+	}
+	if f.writeback != "" && f.writeback != "always" && f.writeback != "on-success" && f.writeback != "never" {
+		return fmt.Errorf("--writeback must be always, on-success or never (got %q)", f.writeback)
+	}
+	return nil
 }
 
 // changed reports whether a flag was given on the command line (explicit
@@ -163,10 +193,56 @@ func buildCommand(ws *client.Workspace, args []string) string {
 		return rewriteRoot(args[0], ws.Root, toRoot, true)
 	}
 	q := make([]string, len(args))
+	assigning := true
 	for i, a := range args {
+		// Leading NAME=value words stay environment assignments: quoting
+		// them whole would make bash run "NAME=value" as a command. The
+		// value is quoted on its own, and since the shell expands it, a
+		// worktree path in it can become the absolute remote one.
+		if name, value, ok := envAssignment(a); ok && assigning {
+			q[i] = name + "=" + quoteValue(value, ws.Root)
+			continue
+		}
+		assigning = false
 		q[i] = transport.ShellQuote(rewriteRoot(a, ws.Root, toRoot, false))
 	}
 	return strings.Join(q, " ")
+}
+
+// quoteValue shell-quotes an assignment's value, with each worktree path in
+// it (matched before quoting) turned into the remote workspace's.
+func quoteValue(v, root string) string {
+	var b strings.Builder
+	last := 0
+	for i := 0; i+len(root) <= len(v); i++ {
+		if strings.HasPrefix(v[i:], root) && boundaryBefore(v, i) && boundaryAfter(v, i+len(root)) {
+			if i > last {
+				b.WriteString(transport.ShellQuote(v[last:i]))
+			}
+			b.WriteString(`"${SPOTEXEC_WORKSPACE:?}"`)
+			last = i + len(root)
+			i = last - 1
+		}
+	}
+	if last < len(v) || last == 0 {
+		b.WriteString(transport.ShellQuote(v[last:]))
+	}
+	return b.String()
+}
+
+// envAssignment splits a NAME=value word whose name is a valid shell
+// variable name.
+func envAssignment(s string) (name, value string, ok bool) {
+	name, value, ok = strings.Cut(s, "=")
+	if !ok || name == "" {
+		return "", "", false
+	}
+	for i, c := range name {
+		if !(c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || i > 0 && c >= '0' && c <= '9') {
+			return "", "", false
+		}
+	}
+	return name, value, true
 }
 
 // rewriteRoot replaces root where it appears as a whole path (followed by
@@ -262,6 +338,25 @@ type runSpec struct {
 	waitPush   bool // container build: push a fresh image before returning
 }
 
+// pinnedSync: spotexec sync and container build always sync, and exec
+// never does, whatever --sync or SPOTEXEC_SYNC says.
+func (s runSpec) pinnedSync() bool { return s.syncOnly || s.preferLast }
+
+// check rejects, before any runner is acquired, a run that couldn't do what
+// was asked.
+func (f *runFlags) check(s runSpec) error {
+	if err := f.validate(); err != nil {
+		return err
+	}
+	if s.pinnedSync() && f.changed("sync") && f.sync != s.sync {
+		if s.syncOnly {
+			return fmt.Errorf("--sync %s doesn't apply here: this command always syncs", f.sync)
+		}
+		return fmt.Errorf("--sync %s doesn't apply here: exec never syncs (use sx --same-slot to sync first)", f.sync)
+	}
+	return nil
+}
+
 func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan struct{}, stdout, stderr io.Writer) client.Options {
 	p := l.cfg.Project
 	o := client.Options{
@@ -272,7 +367,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 		Label: s.label, RetryPreempt: !f.noRetry, NoBoot: f.noBoot,
 		PreferLast: s.preferLast, SyncOnly: s.syncOnly, WaitPush: s.waitPush, Priority: s.priority,
 	}
-	if f.priority != 0 {
+	if f.prioritySet {
 		o.Priority = f.priority
 	}
 	if s.timeout > 0 {
@@ -290,7 +385,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 	if f.queueTimeout > 0 {
 		o.QueueTimeout = f.queueTimeout
 	}
-	if f.sync != "" {
+	if f.sync != "" && !s.pinnedSync() {
 		o.Sync = f.sync
 	}
 	if f.writeback != "" {
@@ -298,6 +393,11 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 	}
 	if f.runner != "" {
 		o.Pool = []string{f.runner}
+	}
+	// --same-slot and exec go back to the runner this worktree last used; an
+	// explicit --runner or --pool must include it.
+	if f.changed("runner") || f.changed("pool") {
+		o.LastWithin = o.Pool
 	}
 	if f.sameSlot {
 		// Without a sync, --same-slot is exec: the slot must still hold
@@ -317,8 +417,8 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	// we exit, or the pool could lose track of it for a while.
 	defer waitLaunches()
 	f.applyEnv()
-	if f.sync != "" && f.sync != "auto" && f.sync != "in" && f.sync != "none" {
-		fmt.Fprintf(os.Stderr, "spotexec: --sync must be auto, in or none\n")
+	if err := f.check(s); err != nil {
+		fmt.Fprintln(os.Stderr, "spotexec:", err)
 		return client.ExitInfra
 	}
 	rep, err := f.reporter()
@@ -331,16 +431,13 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	o := f.options(l, s, rep, intr, os.Stdout, os.Stderr)
 	res, err := client.Run(ctx, l.cfg, l.ws, o)
 	if err != nil {
-		var ie *client.InfraError
 		if ctx.Err() != nil {
 			rep.Clear()
-			return 130
+			return client.ExitInterrupted
 		}
-		// Only when no runner was ever reached (so the command never ran
-		// remotely), and only for real commands (not exec, sync or pull).
-		if errors.As(err, &ie) && (f.fallbackLocal || l.cfg.Global.LocalFallback) && !res.Reached && !o.PreferLast && !o.SameSlot && !o.SyncOnly && s.command != "" {
+		if f.fallsBack(l, o, res, err) {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
-			return runLocal(l, s.command)
+			return runLocal(ctx, intr, l, o, rep, 0, 1)
 		}
 		rep.Clear()
 		rep.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
@@ -348,6 +445,10 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 			fmt.Fprintf(os.Stderr, "spotexec: %v\n", err)
 		}
 		return client.ExitInfra
+	}
+	if ctx.Err() != nil && !res.Canceled {
+		// Interrupted after the command finished (while the session closed).
+		res.Canceled, res.ExitCode = true, client.ExitInterrupted
 	}
 	summary := fmt.Sprintf("%s on %s#%d", ui.Dur(res.Duration), res.Runner, res.Slot)
 	if res.Synced > 0 {
@@ -362,7 +463,12 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	if s.syncOnly && res.Image != "" {
 		summary += " · image " + res.Image
 	}
-	if res.ExitCode != 0 {
+	switch {
+	case res.Canceled:
+		// Even if the command handled the signal and exited 0: it was cut
+		// short, so `sx a && sx b` must not go on to b.
+		summary += " · interrupted"
+	case res.ExitCode != 0:
 		summary += fmt.Sprintf(" · exit %d", res.ExitCode)
 	}
 	rep.Done(summary, res.ExitCode == 0)
@@ -380,33 +486,6 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
-}
-
-func runLocal(l *loaded, command string) int {
-	cmd := exec.Command("/bin/sh", "-c", command)
-	cmd.Dir = filepath.Join(l.ws.Root, filepath.FromSlash(l.ws.Cwd))
-	// The command was written for the runner: worktree paths in it were
-	// rewritten to ${SPOTEXEC_WORKSPACE}, which here is the worktree itself
-	// (unset, "rm -rf ${SPOTEXEC_WORKSPACE}/tmp" would mean /tmp).
-	// Defaults, then the project's [env] (which may override them, as on a
-	// runner), then what must hold here.
-	cmd.Env = append(os.Environ(), "CI=true", "SPOTEXEC_CPUS="+strconv.Itoa(runtime.NumCPU()), "SPOTEXEC_SLOTS=1", "SPOTEXEC_SLOT=0", "SPOTEXEC_PORT_BASE=20000")
-	for k, v := range l.cfg.Project.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
-	cmd.Env = append(cmd.Env, "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				return 128 + int(ws.Signal())
-			}
-			return ee.ExitCode()
-		}
-		return 127
-	}
-	return 0
 }
 
 // taskCommand expands a task's run template with extra args. Arguments are
@@ -445,6 +524,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		return f.execute(l, runSpec{label: name, command: cmd, display: name + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool, priority: t.Priority})
 	}
 	f.applyEnv()
+	if err := f.validate(); err != nil {
+		fmt.Fprintln(os.Stderr, "spotexec:", err)
+		return client.ExitInfra
+	}
 	if f.sameSlot {
 		fmt.Fprintf(os.Stderr, "spotexec: --same-slot can't apply to %s: it's a parallel task, whose parts run on several slots at once\n", name)
 		return client.ExitInfra
@@ -471,6 +554,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		defer subCancel[i]()
 	}
 	stopped := make([]bool, len(t.Parallel)) // cancelled by fail_fast
+	records := make([]*client.LastRun, len(t.Parallel))
 	done := make([]bool, len(t.Parallel))
 	intrs := make([]chan struct{}, len(t.Parallel))
 	for i := range intrs {
@@ -499,28 +583,44 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			cmd := buildTaskLine(l, st.Run, nil)
 			spec := runSpec{label: sub, command: cmd, display: sub + ": " + cmd, timeout: st.Timeout.Duration, sync: st.Sync, exclusive: st.Exclusive, pool: st.Pool, priority: st.Priority}
 			o := f.options(l, spec, sr, intrs[i], ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu))
+			// Parts race to sync: which one saves the last-run record is
+			// decided below, once they are all done.
+			o.DeferLastRun = true
+			subStart := time.Now()
 			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
-			code := res.ExitCode
+			code, where := res.ExitCode, ""
+			if res.Runner != "" {
+				where = fmt.Sprintf(" on %s#%d", res.Runner, res.Slot)
+			}
+			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
+				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, sub)
+				code, err, where = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(t.Parallel)), nil, " locally"
+			}
 			if err != nil {
 				code = client.ExitInfra
 			}
+			took := res.Duration
+			if took == 0 {
+				took = time.Since(subStart)
+			}
 			mu.Lock()
-			codes[i], done[i] = code, true
+			codes[i], done[i], records[i] = code, true, res.LastRun
 			if stopped[i] {
 				// Cancelled by fail_fast: not a failure of its own.
 				mu.Unlock()
 				return
 			}
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
-			}
-			if !rep.IsJSON() {
-				status := "\x1b[32m✓\x1b[0m"
-				if code != 0 {
-					status = fmt.Sprintf("\x1b[31m✗ exit %d\x1b[0m", code)
+				sr.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
+				if !rep.IsJSON() {
+					fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
 				}
-				fmt.Fprintf(os.Stderr, "%s %s \x1b[2m%s on %s#%d\x1b[0m\n", status, sub, ui.Dur(res.Duration), res.Runner, res.Slot)
 			}
+			summary := fmt.Sprintf("%s · %s%s", sub, ui.Dur(took), where)
+			if code != 0 {
+				summary += fmt.Sprintf(" · exit %d", code)
+			}
+			sr.PartDone(summary, code == 0)
 			mu.Unlock()
 			if code != 0 && t.FailFast {
 				failOnce.Do(func() {
@@ -545,6 +645,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		}(i, sub, st)
 	}
 	wg.Wait()
+	saveFirstLastRun(l.ws, records)
 	// Interrupted: 130. A spotexec failure (125) outranks a command's own
 	// failure, so agents can tell "tests failed" from "couldn't run tests".
 	exit := 0
@@ -561,6 +662,18 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	}
 	rep.Event("result", map[string]any{"task": name, "exit_code": exit, "duration_ms": time.Since(start).Milliseconds(), "parallel": t.Parallel})
 	return exit
+}
+
+// saveFirstLastRun makes --same-slot after a parallel task predictable: it
+// returns to the first part, in `parallel` order, that recorded where it ran
+// (as a single run does once synced, with its container image ready).
+func saveFirstLastRun(ws *client.Workspace, records []*client.LastRun) {
+	for _, r := range records {
+		if r != nil {
+			client.SaveLastRun(ws, *r)
+			return
+		}
+	}
 }
 
 func buildTaskLine(l *loaded, run string, args []string) string {

@@ -63,8 +63,8 @@ func readINI(path, section string) (map[string]string, error) {
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			cur = strings.Join(strings.Fields(strings.Trim(line, "[]")), " ")
+		if name, ok := iniHeader(line); ok {
+			cur = configSectionName(name)
 			if cur == section {
 				found = true
 			}
