@@ -21,7 +21,7 @@ go test -race ./... # what CI runs
 make e2e            # end-to-end suites (SSH runner, Spot fleet simulator, pool manager); needs Docker
 ```
 
-See [Development](README.md#development) in the README for the simulator and the package layout.
+See [Development](docs/development.md) for the simulator and the package layout.
 
 ## Releasing
 
