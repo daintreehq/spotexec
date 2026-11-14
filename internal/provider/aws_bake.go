@@ -139,17 +139,14 @@ func (a *AWSSpot) ec2Arch() string {
 	return "x86_64"
 }
 
-// listBakes returns this runner's available bakes (newest first); with
-// matchHash only those built from the current bootstrap.
+// listBakes returns this runner's available bakes (newest first), made by
+// any machine in the account; with matchHash only those built from the
+// current bootstrap and arch.
 func (a *AWSSpot) listBakes(ctx context.Context, matchHash bool) ([]ec2Image, error) {
 	return a.listBakesIn(ctx, matchHash, "available")
 }
 
 func (a *AWSSpot) listBakesIn(ctx context.Context, matchHash bool, states ...string) ([]ec2Image, error) {
-	owner, err := a.ownerTag()
-	if err != nil {
-		return nil, err
-	}
 	p := url.Values{}
 	p.Set("Owner.1", "self")
 	p.Set("Filter.1.Name", "state")
@@ -173,11 +170,9 @@ func (a *AWSSpot) listBakesIn(ctx context.Context, matchHash bool, states ...str
 		// every machine sharing the config.
 		p.Set("Filter.4.Name", "tag:"+tagBakeHash)
 		p.Set("Filter.4.Value.1", a.BakeHash())
-	} else {
-		// Listing, pruning and clearing: only this machine's own bakes.
-		p.Set("Filter.4.Name", "tag:"+tagOwner)
-		p.Set("Filter.4.Value.1", owner)
 	}
+	// Listing, pruning and clearing see every machine's bakes too: another
+	// machine may boot this machine's bake, and this one another's.
 	b, err := a.api.ec2(ctx, "DescribeImages", p)
 	if err != nil {
 		return nil, err
@@ -200,6 +195,9 @@ type Bake struct {
 	Arch    string    `json:"arch"`
 	Hash    string    `json:"bootstrap_hash"`
 	Base    string    `json:"base_ami,omitempty"` // "" = not recorded (made by an older spotexec)
+	// Host is the machine that made it ("" = not recorded); Mine: this one.
+	Host string `json:"host,omitempty"`
+	Mine bool   `json:"mine"`
 	// Current: built from this runner's bootstrap, user and arch.
 	Current bool `json:"current"`
 	// InUse: the bake new VMs of this runner boot from.
@@ -223,9 +221,24 @@ type Bake struct {
 func (b Bake) Age(now time.Time) time.Duration { return now.Sub(b.Created) }
 
 func (a *AWSSpot) bakeOf(img ec2Image) Bake {
-	b := Bake{ID: img.ID, Name: img.Name, Created: img.created(), Arch: img.Arch, Hash: img.tag(tagBakeHash), Base: img.tag(tagBakeBase), img: img}
+	b := Bake{ID: img.ID, Name: img.Name, Created: img.created(), Arch: img.Arch, Hash: img.tag(tagBakeHash), Base: img.tag(tagBakeBase),
+		Host: img.tag(tagHost), img: img}
+	if owner, err := a.ownerTag(); err == nil && owner != "" {
+		b.Mine = img.tag(tagOwner) == owner
+	}
 	b.Current = b.Hash == a.BakeHash() && (b.Arch == "" || b.Arch == a.ec2Arch())
 	return b
+}
+
+// Maker names the machine that made the bake, for people.
+func (b Bake) Maker() string {
+	switch {
+	case b.Mine:
+		return "this machine"
+	case b.Host != "":
+		return b.Host
+	}
+	return "another machine"
 }
 
 // judgeBake decides whether b is stale or expired. cur is the base image
@@ -474,7 +487,7 @@ func (a *AWSSpot) BakeImage(ctx context.Context, builderID string, log Logger) (
 	c.Set("InstanceId", builderID)
 	c.Set("Name", name)
 	c.Set("Description", "spotexec baked runner image for "+a.r.Name)
-	tags := [][2]string{{tagRunner, a.r.Name}, {tagOwner, owner}, {tagBakeHash, a.BakeHash()}, {"Name", name}}
+	tags := [][2]string{{tagRunner, a.r.Name}, {tagOwner, owner}, {tagHost, HostLabel()}, {tagBakeHash, a.BakeHash()}, {"Name", name}}
 	if base != "" {
 		tags = append(tags, [2]string{tagBakeBase, base})
 	}
@@ -638,21 +651,74 @@ func (a *AWSSpot) terminateAny(ctx context.Context, id string) error {
 	return err
 }
 
-// pruneBakes deregisters all but the newest keep bakes of this runner,
-// deleting their snapshots.
+// A bake stops being picked once a newer one of its bootstrap becomes
+// available, which can be up to bakeAvailWait after that one was created;
+// launches that picked it just before then are given pruneSettle more to
+// send their requests before it may be deleted. (A launch that still loses
+// the race boots the base image instead: see launch.)
+const (
+	bakeAvailWait = 30 * time.Minute // BakeImage gives up on an image after this
+	pruneSettle   = time.Hour
+)
+
+// pruneBakes deregisters (with their snapshots) the bakes of this runner,
+// made by any machine, that nothing boots any more:
+//   - all but the newest keep of each bootstrap and arch, once the bake
+//     that superseded them has been out for pruneSettle (so a machine that
+//     picked one moments before is not cut off mid-launch);
+//   - any past BakeMaxAge plus a day (no launch uses those), so the bakes
+//     of a machine that was wiped or whose bootstrap changed don't pile up.
+//
+// A bake a VM is booting from right now is never deleted.
 func (a *AWSSpot) pruneBakes(ctx context.Context, keep int, log Logger) {
 	imgs, err := a.listBakes(ctx, false)
 	if err != nil {
 		return
 	}
-	for i, img := range imgs {
-		if i < keep {
+	now := time.Now()
+	type group struct{ hash, arch string }
+	seen := map[group][]ec2Image{}
+	for _, img := range imgs { // newest first
+		g := group{img.tag(tagBakeHash), img.Arch}
+		prev := seen[g]
+		seen[g] = append(prev, img)
+		expired := now.Sub(img.created()) > BakeMaxAge+24*time.Hour
+		superseded := len(prev) >= keep && now.Sub(prev[len(prev)-1].created()) > bakeAvailWait+pruneSettle
+		if !expired && !superseded {
+			continue
+		}
+		if why := a.bakeBusy(ctx, img.ID); why != "" {
+			if log != nil {
+				log("kept old bake %s: %s", img.ID, why)
+			}
 			continue
 		}
 		if err := a.deregister(ctx, img.ID, log); err != nil && log != nil {
 			log("%v", err)
 		}
 	}
+}
+
+// bakeBusy says why bake ami must not be deleted now ("" = it may be): a
+// VM is booting from it, or the check failed.
+func (a *AWSSpot) bakeBusy(ctx context.Context, ami string) string {
+	p := url.Values{}
+	p.Set("Filter.1.Name", "image-id")
+	p.Set("Filter.1.Value.1", ami)
+	p.Set("Filter.2.Name", "instance-state-name")
+	p.Set("Filter.2.Value.1", "pending")
+	b, err := a.api.ec2(ctx, "DescribeInstances", p)
+	if err != nil {
+		return "couldn't check for VMs booting from it: " + err.Error()
+	}
+	insts, _, err := parseDescribeInstances(b)
+	if err != nil {
+		return "couldn't check for VMs booting from it: " + err.Error()
+	}
+	if len(insts) > 0 {
+		return fmt.Sprintf("VM %s is booting from it", insts[0].InstanceID)
+	}
+	return ""
 }
 
 // Bakes lists this runner's bakes (newest first), each judged against the
@@ -684,27 +750,56 @@ func (a *AWSSpot) BakeImageCleanup(ctx context.Context, builderID string) (bool,
 	return true, a.terminateAny(ctx, builderID)
 }
 
-// ClearBakes deregisters every bake of this runner.
-func (a *AWSSpot) ClearBakes(ctx context.Context) (int, error) {
+// ClearResult is what ClearBakes did.
+type ClearResult struct {
+	Removed int
+	Kept    []string // bakes left alone, and why
+}
+
+// ClearBakes deregisters this runner's bakes and their snapshots: every bake
+// this machine made or could boot (its bootstrap and arch), and expired ones
+// from any machine. Other machines' bakes of another bootstrap are theirs
+// to use and are kept unless all is set. A bake a VM is booting from right
+// now, or another machine's bake still being created, is never deleted.
+func (a *AWSSpot) ClearBakes(ctx context.Context, all bool) (ClearResult, error) {
+	var res ClearResult
 	imgs, err := a.listBakesIn(ctx, false, "available", "pending", "failed")
 	if err != nil {
-		return 0, err
+		return res, err
 	}
-	n := 0
+	cur, now := a.currentBase(ctx), time.Now()
 	var errs []string
 	for _, img := range imgs {
+		b := a.bakeOf(img)
+		expired := false
+		if img.State == "available" {
+			a.judge(&b, cur, now) // as image list shows it
+			expired = b.Expired
+		}
+		if !all && !b.Mine && !b.Current && !expired {
+			res.Kept = append(res.Kept, fmt.Sprintf("%s: made by %s for another bootstrap (`spotexec image clear %s --all` removes it)", b.ID, b.Maker(), a.r.Name))
+			continue
+		}
+		if img.State == "pending" && !b.Mine {
+			res.Kept = append(res.Kept, fmt.Sprintf("%s: %s is still baking it", b.ID, b.Maker()))
+			continue
+		}
+		if why := a.bakeBusy(ctx, b.ID); why != "" {
+			res.Kept = append(res.Kept, fmt.Sprintf("%s: %s; try again in a minute", b.ID, why))
+			continue
+		}
 		if err := a.deregister(ctx, img.ID, nil); err != nil {
 			errs = append(errs, err.Error())
 			if !strings.Contains(err.Error(), "snapshots were not deleted") {
 				continue
 			}
 		}
-		n++
+		res.Removed++
 	}
 	if len(errs) > 0 {
-		return n, errors.New(strings.Join(errs, "; "))
+		return res, errors.New(strings.Join(errs, "; "))
 	}
-	return n, nil
+	return res, nil
 }
 
 // LockBake takes this runner's bake lock (non-blocking) for the duration of

@@ -21,7 +21,8 @@ spotexec daemon status [--json]              what the pool manager sees and has 
 spotexec container init [--path P] [--force] scaffold a Dockerfile and wire it into .spotexec.toml
 spotexec container build [run flags]         build the project image on a runner now (ECR on AWS)
 spotexec image bake [runner] [--pull IMG]    bake an AMI from the runner's bootstrap
-spotexec image list|clear [runner]           list or delete baked AMIs
+spotexec image list [runner]                 baked AMIs from every machine: base image, age, maker, which is in use
+spotexec image clear [runner] [--all]        delete this machine's and this bootstrap's bakes (--all: every machine's)
 spotexec setup [host...] [--all]             set up this machine (config, AWS user and key, hooks), then others over SSH
 spotexec setup --list | --revoke HOST        every machine's IAM user and VMs; revoke one
 spotexec doctor [runner...]                  verify config, SSH, helper, credentials, network, quota

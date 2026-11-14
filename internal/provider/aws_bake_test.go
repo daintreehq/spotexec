@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,8 @@ type fakeBakeAPI struct {
 	instances    []fakeInstance
 	base         string // what Canonical's SSM parameter resolves to
 	deregistered []string
+	gone         map[string]bool // images RunInstances reports as deleted
+	runs         []url.Values    // RunInstances requests
 }
 
 func (f *fakeBakeAPI) image(id string) *fakeImage {
@@ -143,6 +146,14 @@ func (f *fakeBakeAPI) handler(t *testing.T) http.HandlerFunc {
 			}
 			b.WriteString("</instancesSet></item></reservationSet></DescribeInstancesResponse>")
 			fmt.Fprint(w, b.String())
+		case "RunInstances":
+			f.runs = append(f.runs, v)
+			if f.gone[v.Get("ImageId")] {
+				w.WriteHeader(400)
+				fmt.Fprintf(w, "<Response><Errors><Error><Code>InvalidAMIID.NotFound</Code><Message>The image id '[%s]' does not exist</Message></Error></Errors></Response>", v.Get("ImageId"))
+				return
+			}
+			fmt.Fprintf(w, "<RunInstancesResponse><instancesSet><item><instanceId>i-new%d</instanceId><imageId>%s</imageId><instanceState><name>pending</name></instanceState></item></instancesSet></RunInstancesResponse>", len(f.runs), v.Get("ImageId"))
 		case "DeregisterImage":
 			id := v.Get("ImageId")
 			f.deregistered = append(f.deregistered, id)
@@ -328,14 +339,129 @@ func TestBakesListBaseAndAge(t *testing.T) {
 	if bakes[1].InUse || !bakes[1].Expired || bakes[1].Base != "ami-b1" {
 		t.Fatalf("old bake: %+v", bakes[1])
 	}
-	// Another machine's newer bake of the same bootstrap is what launches
-	// pick: this machine's is then not "in use".
-	f.images = append(f.images, bakeImg("ami-theirs", "owner-other", h, "ami-b2", now.Add(-time.Minute)))
+	// Another machine's newer bake of the same bootstrap is listed, with
+	// its maker, and is what launches pick.
+	theirs := bakeImg("ami-theirs", "owner-other", h, "ami-b2", now.Add(-time.Minute))
+	theirs.tags[tagHost] = "mac-a"
+	f.images = append(f.images, theirs)
 	bakes, _ = a.Bakes(context.Background())
-	for _, b := range bakes {
-		if b.InUse && b.ID != "ami-theirs" {
-			t.Fatalf("%s marked in use, but launches pick ami-theirs", b.ID)
+	if len(bakes) != 3 || bakes[0].ID != "ami-theirs" || !bakes[0].InUse || bakes[0].Mine || bakes[0].Maker() != "mac-a" {
+		t.Fatalf("another machine's bake not listed as the one in use: %+v", bakes)
+	}
+	for _, b := range bakes[1:] {
+		if b.InUse || !b.Mine || b.Maker() != "this machine" {
+			t.Fatalf("%+v", b)
 		}
+	}
+}
+
+// sharedBakes is a runner's bakes from two machines (made "ago" before now).
+func sharedBakes(now time.Time, h string) []*fakeImage {
+	ago := func(d time.Duration) time.Time { return now.Add(-d) }
+	theirs := func(id, hash string, created time.Time) *fakeImage {
+		i := bakeImg(id, "owner-other", hash, "ami-b2", created)
+		i.tags[tagHost] = "mac-a"
+		return i
+	}
+	// Their bake of another bootstrap on a base superseded 8 days ago:
+	// expired, though only 12 days old.
+	old := bakeImg("ami-v0", "owner-other", "h-v", "ami-b1", ago(12*24*time.Hour))
+	return []*fakeImage{
+		ubuntuImg("ami-b2", ago(8*24*time.Hour)),
+		bakeImg("ami-cur0", testOwner, h, "ami-b2", ago(10*time.Minute)),
+		theirs("ami-cur1", h, ago(3*time.Hour)),
+		theirs("ami-cur2", h, ago(5*time.Hour)),                       // superseded 3h ago: prunable
+		bakeImg("ami-cur3", testOwner, h, "ami-b2", ago(6*time.Hour)), // VM booting from it
+		theirs("ami-x0", "h-x", ago(10*time.Minute)),
+		theirs("ami-x1", "h-x", ago(20*time.Minute)),
+		theirs("ami-x2", "h-x", ago(48*time.Hour)),    // superseded only 20m ago: kept
+		theirs("ami-y0", "h-y", ago(48*time.Hour)),    // their current bake of another bootstrap
+		theirs("ami-z0", "h-z", ago(40*24*time.Hour)), // expired: nobody boots it
+		theirs("ami-w0", "h-w", ago(10*time.Minute)),
+		theirs("ami-w1", "h-w", ago(75*time.Minute)), // created 75m ago, maybe available only lately
+		theirs("ami-w2", "h-w", ago(72*time.Hour)),   // so not yet prunable
+		old,
+	}
+}
+
+// remaining lists the bakes not deregistered.
+func remaining(f *fakeBakeAPI) map[string]bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]bool{}
+	for _, i := range f.images {
+		if i.tags[tagRunner] != "" {
+			out[i.id] = true
+		}
+	}
+	return out
+}
+
+func TestPruneBakesManagesSharedBakes(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	now := time.Now()
+	f := &fakeBakeAPI{base: "ami-b2", instances: []fakeInstance{{id: "i-boot", image: "ami-cur3", state: "pending", launched: now}}}
+	a := newBakeEnv(t, f)
+	f.images = sharedBakes(now, a.BakeHash())
+	a.pruneBakes(context.Background(), 2, t.Logf)
+	left := remaining(f)
+	for _, id := range []string{"ami-cur0", "ami-cur1", "ami-cur3", "ami-x0", "ami-x1", "ami-x2", "ami-y0", "ami-w0", "ami-w1", "ami-w2", "ami-v0"} {
+		if !left[id] {
+			t.Errorf("%s was pruned", id)
+		}
+	}
+	for _, id := range []string{"ami-cur2", "ami-z0"} {
+		if left[id] {
+			t.Errorf("%s was not pruned", id)
+		}
+	}
+}
+
+func TestClearBakesSharedScope(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	now := time.Now()
+	f := &fakeBakeAPI{base: "ami-b2", instances: []fakeInstance{{id: "i-boot", image: "ami-cur3", state: "pending", launched: now}}}
+	a := newBakeEnv(t, f)
+	f.images = sharedBakes(now, a.BakeHash())
+	baking := bakeImg("ami-baking", "owner-other", a.BakeHash(), "ami-b2", now)
+	baking.state = "pending"
+	f.images = append(f.images, baking)
+
+	res, err := a.ClearBakes(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := remaining(f)
+	// This runner's bootstrap (whoever made them) and expired bakes go...
+	for _, id := range []string{"ami-cur0", "ami-cur1", "ami-cur2", "ami-z0", "ami-v0"} {
+		if left[id] {
+			t.Errorf("%s was not cleared", id)
+		}
+	}
+	// ...other machines' bakes of other bootstraps, a bake being booted and
+	// one still being made stay.
+	for _, id := range []string{"ami-cur3", "ami-x0", "ami-x1", "ami-x2", "ami-y0", "ami-w0", "ami-w1", "ami-w2", "ami-baking"} {
+		if !left[id] {
+			t.Errorf("%s was cleared", id)
+		}
+	}
+	if res.Removed != 5 || len(res.Kept) != 9 {
+		t.Fatalf("result %+v", res)
+	}
+	kept := strings.Join(res.Kept, "\n")
+	for _, want := range []string{"i-boot is booting from it", "another machine is still baking it", "made by mac-a for another bootstrap (`spotexec image clear aws --all`"} {
+		if !strings.Contains(kept, want) {
+			t.Errorf("kept list lacks %q:\n%s", want, kept)
+		}
+	}
+
+	// --all removes other machines' bakes too, still sparing the busy ones.
+	if _, err := a.ClearBakes(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	left = remaining(f)
+	if len(left) != 2 || !left["ami-cur3"] || !left["ami-baking"] {
+		t.Fatalf("after --all: %v", left)
 	}
 }
 
@@ -363,5 +489,42 @@ func TestBuilderBase(t *testing.T) {
 	a := newBakeEnv(t, f)
 	if got := a.builderBase(context.Background(), "i-builder"); got != "ami-b1" {
 		t.Fatalf("builder base = %q", got)
+	}
+}
+
+func TestLaunchFallsBackWhenBakeIsGone(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	now := time.Now()
+	f := &fakeBakeAPI{base: "ami-b2"}
+	a := newBakeEnv(t, f)
+	a.r.SecurityGroupIDs = []string{"sg-1"}
+	f.images = []*fakeImage{ubuntuImg("ami-b2", now.Add(-48*time.Hour)), bakeImg("ami-bake", "owner-other", a.BakeHash(), "ami-b2", now.Add(-time.Hour))}
+	// Another machine's `image clear` deregisters it after it was picked.
+	f.gone = map[string]bool{"ami-bake": true}
+	inst, err := a.launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	if len(f.runs) != 2 || f.runs[0].Get("ImageId") != "ami-bake" || f.runs[1].Get("ImageId") != "ami-b2" || inst.ImageID != "ami-b2" {
+		t.Fatalf("want a retry from the base image, got %d requests (%+v)", len(f.runs), inst)
+	}
+	ud, _ := base64.StdEncoding.DecodeString(f.runs[1].Get("UserData"))
+	if !strings.Contains(string(ud), "apt-get install -y make") {
+		t.Fatal("the fallback launch skipped the bootstrap")
+	}
+}
+
+func TestLaunchPinnedAMINoFallback(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	f := &fakeBakeAPI{base: "ami-b2"}
+	a := newBakeEnv(t, f)
+	a.r.SecurityGroupIDs = []string{"sg-1"}
+	a.r.AMI = "ami-pinned"
+	f.images = []*fakeImage{ubuntuImg("ami-pinned", time.Now())}
+	f.gone = map[string]bool{"ami-pinned": true}
+	if _, err := a.launch(context.Background(), t.Logf); err == nil || len(f.runs) != 1 {
+		t.Fatalf("a pinned AMI that is gone must fail, not fall back: %v (%d requests)", err, len(f.runs))
 	}
 }

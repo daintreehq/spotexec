@@ -423,7 +423,14 @@ func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger)
 
 // launch performs RunInstances across the configured instance types.
 func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
-	return a.launchWith(ctx, log, launchSpec{})
+	inst, err := a.launchWith(ctx, log, launchSpec{})
+	if err != nil && (a.r.AMI == "" || a.r.AMI == "auto") && strings.HasPrefix(awsCode(err), "InvalidAMIID") {
+		// The bake was deregistered (`image clear` or pruning on another
+		// machine) between picking it and launching: boot without it.
+		log("baked image is gone (%s); launching from the current Ubuntu image", awsCode(err))
+		return a.launchWith(ctx, log, launchSpec{noBake: true})
+	}
+	return inst, err
 }
 
 // launchSpec varies a launch: normal fleet instances (spot, from the newest
@@ -431,6 +438,7 @@ func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
 type launchSpec struct {
 	bake    bool
 	prepull []string
+	noBake  bool // boot the base image even if a bake matches
 }
 
 func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (ec2Instance, error) {
@@ -455,7 +463,7 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 		opts.BootstrapTimeout = a.BakeBootstrapTimeout(len(spec.prepull) > 0)
 		opts.MaxLifetime = 2*opts.BootstrapTimeout + 30*time.Minute
 		opts.IdleTimeout = opts.MaxLifetime
-	} else if a.r.AMI == "" || a.r.AMI == "auto" {
+	} else if (a.r.AMI == "" || a.r.AMI == "auto") && !spec.noBake {
 		// A baked image with this runner's bootstrap already applied?
 		if b, err := a.findBake(ctx); err == nil && b != nil {
 			switch {

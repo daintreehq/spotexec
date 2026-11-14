@@ -80,7 +80,7 @@ spotexec image clear aws
 
 From then on the fleet boots from the newest bake whose bootstrap hash matches, and skips the bootstrap, so a new VM is ready in roughly bare boot time. The per-instance setup (watchdog, SSH key, timers) still runs on every VM.
 
-Bakes are shared across machines. A bake holds no keys or machine state, so every machine whose runner has the same name and bootstrap uses it, and with the config copied by `spotexec setup`, one `image bake` speeds up the whole stack. `image list` and `image clear` show and delete only this machine's own bakes.
+Bakes are shared across machines. A bake holds no keys or machine state, so every machine whose runner has the same name and bootstrap uses it, and with the config copied by `spotexec setup`, one `image bake` speeds up the whole stack. `image list` shows the runner's bakes from every machine in the account, which machine made each, and which one new VMs boot from.
 
 Changing either bootstrap script, `arch` or `user` makes old bakes stop matching; run `image bake` again.
 
@@ -88,4 +88,6 @@ VMs don't run OS updates (they're short-lived, and apt would compete with your c
 - **When Canonical publishes a newer base image**, the bake is still used but reported as stale, for a week. After that, new VMs stop using it. (A bake made by an older spotexec, which didn't record its base, gets the same week.)
 - **After 30 days**, new VMs stop using it whatever the base.
 
-A VM that skips a stale bake boots the current Ubuntu image and runs the full bootstrap, as if there were no bake, so it is up to date but slower to start. Run `image bake` again to get fast boots back. `spotexec doctor` and `image list` show each bake's base image and age, and say when it is stale. Without a usable bake (and unless the runner pins an `ami`), VMs boot the current Ubuntu image. Only the two newest bakes per runner are kept, and older images and their snapshots are deleted.
+A VM that skips a stale bake boots the current Ubuntu image and runs the full bootstrap, as if there were no bake, so it is up to date but slower to start. Run `image bake` again to get fast boots back. `spotexec doctor` and `image list` show each bake's base image and age, and say when it is stale. Without a usable bake (and unless the runner pins an `ami`), VMs boot the current Ubuntu image.
+
+Each bake prunes the runner's bakes that nothing boots any more, whichever machine made them: all but the two newest of each bootstrap (once the bake that replaced them has been out an hour or more), and any past 31 days. So a wiped machine's bakes don't pile up. `image clear` removes the bakes this machine made or would boot, plus expired ones; other machines' bakes of a different bootstrap stay unless you pass `--all`. Neither ever deletes a bake that a VM is booting from at that moment, and a launch that picked a bake just as it was deleted boots the current Ubuntu image instead.
