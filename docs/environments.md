@@ -67,6 +67,8 @@ With `[deps]` configured, each slot's `cache_dirs` are restored from a cache key
 - in a [project container](#project-containers), the image's immutable ID;
 - otherwise, the runner's configured AMI, bootstrap scripts and `remote_path_setup`.
 
+`spotexec init` lists the root `node_modules` and each workspace's in `cache_dirs`, from package.json `workspaces` (npm, Yarn, Bun) or pnpm-workspace.yaml `packages`: the workspace glob `packages/*` becomes `packages/*/node_modules`. `cache_dirs` globs match one directory per `*`, so a workspace pattern they can't express (`**`, `{a,b}`) is left out, and init names it for you to add by hand. Update `cache_dirs` when the workspaces change.
+
 With a container, native modules never cross toolchain versions. Without one, pin tool versions in your bootstrap: upgrading Node on an `ssh` host, or a newer Ubuntu image behind `ami = "auto"`, doesn't change the key.
 
 - **On a runner,** caches are hydrated into the slot with `reflink` where the filesystem supports it (XFS, Btrfs, APFS), else `copy`. `hardlink` is opt-in, because shared inodes let one slot corrupt another's `node_modules`.
