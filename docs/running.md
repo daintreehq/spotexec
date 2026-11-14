@@ -45,7 +45,7 @@ If that VM is gone, `--same-slot` fails (exit `125`) and says so, rather than ru
 | `--pull GLOB` | Also copy these gitignored paths back (repeatable). |
 | `--no-deps` | Skip dependency hydration. |
 | `--no-retry` | Don't replay the run if its VM is lost. |
-| `--fallback-local` | Run locally if no runner could be reached (never after the command started remotely). |
+| `--fallback-local` | Run locally if no runner could be reached (never after the command started remotely). It runs as on a runner: under `bash` in its own process group, with stdin from `/dev/null`, the same `--timeout` (exit `124`) and grace period, and Ctrl-C, `SIGTERM` or `SIGHUP` stopping it (exit `130`). Each part of a parallel task falls back on its own, with its own `SPOTEXEC_SLOT` and port range. |
 | `--force-large-sync` | Allow syncing more than 100k files or 5 GiB. |
 | `--json` / `--pretty` / `-q, --quiet` | Progress format: NDJSON events, the spinner (even without a terminal), or nothing. Without them you get the spinner at a terminal and one plain summary line otherwise (NDJSON with `SPOTEXEC_AGENT=1`). |
 | `--events-file PATH` | Also append NDJSON events to a file. |

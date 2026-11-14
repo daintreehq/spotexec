@@ -2,14 +2,11 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -434,16 +431,13 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	o := f.options(l, s, rep, intr, os.Stdout, os.Stderr)
 	res, err := client.Run(ctx, l.cfg, l.ws, o)
 	if err != nil {
-		var ie *client.InfraError
 		if ctx.Err() != nil {
 			rep.Clear()
 			return 130
 		}
-		// Only when no runner was ever reached (so the command never ran
-		// remotely), and only for real commands (not exec, sync or pull).
-		if errors.As(err, &ie) && (f.fallbackLocal || l.cfg.Global.LocalFallback) && !res.Reached && !o.PreferLast && !o.SameSlot && !o.SyncOnly && s.command != "" {
+		if f.fallsBack(l, o, res, err) {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
-			return runLocal(l, s.command)
+			return runLocal(ctx, intr, l, o, rep, 0, 1)
 		}
 		rep.Clear()
 		rep.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
@@ -483,33 +477,6 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
-}
-
-func runLocal(l *loaded, command string) int {
-	cmd := exec.Command("/bin/sh", "-c", command)
-	cmd.Dir = filepath.Join(l.ws.Root, filepath.FromSlash(l.ws.Cwd))
-	// The command was written for the runner: worktree paths in it were
-	// rewritten to ${SPOTEXEC_WORKSPACE}, which here is the worktree itself
-	// (unset, "rm -rf ${SPOTEXEC_WORKSPACE}/tmp" would mean /tmp).
-	// Defaults, then the project's [env] (which may override them, as on a
-	// runner), then what must hold here.
-	cmd.Env = append(os.Environ(), "CI=true", "SPOTEXEC_CPUS="+strconv.Itoa(runtime.NumCPU()), "SPOTEXEC_SLOTS=1", "SPOTEXEC_SLOT=0", "SPOTEXEC_PORT_BASE=20000")
-	for k, v := range l.cfg.Project.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
-	cmd.Env = append(cmd.Env, "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				return 128 + int(ws.Signal())
-			}
-			return ee.ExitCode()
-		}
-		return 127
-	}
-	return 0
 }
 
 // taskCommand expands a task's run template with extra args. Arguments are
@@ -608,6 +575,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			o := f.options(l, spec, sr, intrs[i], ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu))
 			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
 			code := res.ExitCode
+			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
+				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, sub)
+				code, err = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(t.Parallel)), nil
+			}
 			if err != nil {
 				code = client.ExitInfra
 			}
