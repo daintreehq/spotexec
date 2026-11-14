@@ -1,5 +1,7 @@
 # spotexec
 
+**[spotexec.com](https://spotexec.com)** · [Documentation](#documentation) · [Releases](https://github.com/daintreehq/spotexec/releases)
+
 **Run your tests, type checks, linters and builds on remote hardware, straight from a local git worktree.**
 Use a homelab box over SSH, or AWS Spot instances that boot on demand and terminate themselves when idle.
 Files the command changes (`prettier --write`, `eslint --fix`, `vitest -u`, codegen) come back to your worktree through a 3-way check, so edits you make during the run are never overwritten.
@@ -19,7 +21,7 @@ $ sx pnpm vitest run -u src/auth.test.ts
 - **Safe.** Write-back compares content IDs against the exact bytes that were synced. A file you edited during the run is never overwritten: you keep it, and the runner's version is saved aside.
 - **Fast.** Only missing files are sent. Dependencies restore from a lockfile-keyed cache (local reflink or copy, plus S3 across VMs), and baked AMIs skip first-boot setup.
 - **Spot-aware.** Interruption notices are handled. A run that loses its VM is replayed once on a replacement, and an optional pool manager keeps warm capacity and replaces failing VMs.
-- **Agent-friendly.** It emits NDJSON lifecycle events when it isn't on a TTY, and a Claude Code hook can move heavy Bash commands to the fleet transparently.
+- **Agent-friendly.** Away from a terminal it adds just one summary line to the command's output (NDJSON events with `--json`), and a Claude Code hook can move heavy Bash commands to the fleet transparently.
 
 ---
 
@@ -106,7 +108,7 @@ The first AWS run boots a VM, which takes about a minute plus your bootstrap. La
 | [Setting up machines](docs/setup.md) | `spotexec setup`, choosing runners, setting up more machines over SSH, keys, rotation and revoking a machine. |
 | [AWS setup](docs/aws.md) | Every AWS step by hand: sign-in methods, the IAM policy, regions, Spot quota, networking, what gets created, cost guardrails, the life of a Spot VM. |
 | [Running commands](docs/running.md) | Run flags, the environment on the runner, exit codes, write-back and artifacts. |
-| [Coding agents](docs/agents.md) | NDJSON events and the Claude Code hook that moves heavy commands to the fleet. |
+| [Coding agents](docs/agents.md) | What agents see, `--same-slot`, NDJSON events and the Claude Code hook that moves heavy commands to the fleet. |
 | [Toolchains, containers and caches](docs/environments.md) | Project containers (`spotexec container`), the dependency cache, baked images. |
 | [Scaling and the pool manager](docs/scaling.md) | Slots, queueing, CPU sizing, warm pools. The [pool design](docs/POOL.md) has the scheduling details. |
 | [Configuration reference](docs/configuration.md) | Every key in `config.toml` and `.spotexec.toml`. |

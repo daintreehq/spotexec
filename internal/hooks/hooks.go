@@ -81,9 +81,97 @@ func NewDecider(h config.Hook) (*Decider, error) {
 
 // ShouldOffload reports whether a Bash command line should run remotely.
 // Every `&&`/`;`-separated segment must be either a heavy command or a
-// harmless prefix (cd, env assignment); pipes, redirects into files,
-// subshells, background jobs and anything else keep the command local.
+// harmless prefix (cd, env assignment). The line may end in a pipeline of
+// simple output filters (`| tail -50`, `| grep FAIL`), which keep running
+// locally on the streamed output. Redirects into files, subshells,
+// background jobs and anything else keep the command local.
 func (d *Decider) ShouldOffload(command string) bool {
+	head, _, ok := splitFilters(command)
+	return ok && d.shouldOffload(head)
+}
+
+// outputFilter matches commands that only transform text on stdin.
+var outputFilter = regexp.MustCompile(`^(tail|head|grep|egrep|fgrep|rg|sed|awk|wc|sort|uniq|cut|tr|cat|tee|column|jq|less|more|nl|fold|ts)(\s|$)`)
+
+// splitFilters splits "heavy | filter | filter" at unquoted single pipes.
+// ok is false when a part after the first isn't a plain output filter.
+func splitFilters(command string) (head, filters string, ok bool) {
+	parts, ok := splitPipes(strings.TrimSpace(command))
+	if !ok {
+		return "", "", false
+	}
+	if len(parts) == 1 {
+		return parts[0], "", true
+	}
+	for _, f := range parts[1:] {
+		f = strings.TrimSpace(f)
+		if !outputFilter.MatchString(f) || hasUnquoted(f, "<>;&`$(){}\n") {
+			return "", "", false
+		}
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(strings.Join(parts[1:], "|")), true
+}
+
+// splitPipes splits at unquoted "|" (not "||"). ok is false for unbalanced
+// quotes or an empty part.
+func splitPipes(c string) ([]string, bool) {
+	var parts []string
+	var q rune
+	start := 0
+	for i := 0; i < len(c); i++ {
+		ch := rune(c[i])
+		switch {
+		case q != 0:
+			if ch == q {
+				q = 0
+			} else if ch == '\\' && q == '"' {
+				i++
+			}
+		case ch == '\'' || ch == '"':
+			q = ch
+		case ch == '\\':
+			i++
+		case ch == '|':
+			if i+1 < len(c) && c[i+1] == '|' {
+				i++ // "||" is a control operator, not a pipe
+				continue
+			}
+			parts = append(parts, c[start:i])
+			start = i + 1
+		}
+	}
+	if q != 0 {
+		return nil, false
+	}
+	parts = append(parts, c[start:])
+	for _, p := range parts {
+		if strings.TrimSpace(p) == "" {
+			return nil, false
+		}
+	}
+	return parts, true
+}
+
+// hasUnquoted reports whether s has any of chars outside quotes.
+func hasUnquoted(s, chars string) bool {
+	var q rune
+	for i := 0; i < len(s); i++ {
+		ch := rune(s[i])
+		switch {
+		case q != 0:
+			if ch == q {
+				q = 0
+			}
+		case ch == '\'' || ch == '"':
+			q = ch
+		case strings.ContainsRune(chars, ch):
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Decider) shouldOffload(command string) bool {
 	// A trailing 2>&1 (agents add it to nearly everything) only merges the
 	// streams: harmless, and it stays part of the offloaded command.
 	c := strings.TrimSpace(trailingMerge.ReplaceAllString(strings.TrimSpace(command), ""))
@@ -133,8 +221,14 @@ func splitSegments(c string) []string {
 	return strings.Split(c, "\x00")
 }
 
-// Wrap returns the offloaded form of command.
+// Wrap returns the offloaded form of command. Trailing output filters stay
+// local, reading the remote command's streamed output; spotexec's own
+// progress is silenced so it can't mix into what they read.
 func Wrap(bin, command string) string {
+	head, filters, ok := splitFilters(command)
+	if ok && filters != "" {
+		return bin + " run -q -- " + shellQuote(head) + " | " + filters
+	}
 	return bin + " run -- " + shellQuote(command)
 }
 
@@ -407,4 +501,10 @@ Prefix test suites, type checkers, linters, formatters and builds with ` + "`sx`
 Files changed remotely (formatting, snapshot updates, codegen) are written back
 to this worktree automatically. Keep fast, interactive commands local (git,
 ls, rg, editors, dev servers). Named tasks: ` + "`sx tasks`" + `.
+
+Each ` + "`sx`" + ` may land on a different machine. To come back to the one your last
+command used (say, after installing a package there), add ` + "`--same-slot`" + `:
+
+    sx --same-slot 'sudo apt-get install -y libvips-dev'
+    sx --same-slot pnpm test
 `

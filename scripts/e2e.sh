@@ -132,6 +132,10 @@ check "two slots on a cold cache: one builds, the other hydrates" "grep -q '\"bu
 "$SX" --json --exclusive 'echo excl' >"$WORK/x.out" 2>"$WORK/x.err" || true
 check "--exclusive waits for running jobs" "grep -q excl $WORK/x.out && grep -q '\"event\":\"queued\"' $WORK/x.err"
 
+"$SX" 'echo plain > plain.txt' >"$WORK/p.out" 2>"$WORK/p.err" || true
+check "agents get plain, sparse stderr (one summary line, no NDJSON)" "grep -Eq '^sx: .* on box#[0-9]' $WORK/p.err && ! grep -q '\"event\"' $WORK/p.err && [ \$(wc -l < $WORK/p.err) -le 2 ] && grep -qx plain plain.txt"
+rm -f plain.txt
+
 echo "== pull, exec, status, unlock"
 "$SX" -q 'mkdir -p coverage && echo report > coverage/index.html'
 "$SX" pull 'coverage/*' >/dev/null 2>&1 || true

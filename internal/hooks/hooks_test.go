@@ -20,9 +20,13 @@ func TestShouldOffload(t *testing.T) {
 		"cargo test", "go test ./...", "cd packages/api && pnpm test", "CI=1 pnpm run lint",
 		"pnpm tsc --noEmit", "uv run pytest", "npm run test:unit",
 		"pytest /Users/me/dev/app/tests", "pnpm test 2>&1", "cd pkg && go test ./... 2>&1", "pnpm vitest run src/watch.test.ts", "./gradlew test", "mvn -q verify",
+		"pnpm test | tee out.txt", "pnpm test 2>&1 | tail -50", "cargo test 2>&1 | grep -E 'FAIL|panicked' | head -20",
+		"go test ./... | grep -v '^ok'", "pytest -q 2>&1 | tail -n 30",
 	}
 	no := []string{
-		"git status", "ls -la", "rg foo", "pnpm dev", "pnpm vitest --watch", "pnpm test | tee out.txt",
+		"git status", "ls -la", "rg foo", "pnpm dev", "pnpm vitest --watch", "pnpm test | xargs echo",
+		"git log | head", "pnpm test | tail -5 > out.txt", "pnpm test || echo failed", "pnpm test | sh",
+		"pnpm test | grep 'unterminated", "pnpm test |", "pnpm test | tail -$N",
 		"pnpm test > out.txt", "pnpm test && git commit -m x", "sx pnpm test", "echo $(pnpm test)",
 		"pnpm install", "pnpm test &", "",
 		"SPOTEXEC_LOCAL=1 pytest", "mvn deploy", "./gradlew bootRun", "pnpm run dev", "npm run serve",
@@ -36,6 +40,18 @@ func TestShouldOffload(t *testing.T) {
 	for _, c := range no {
 		if d.ShouldOffload(c) {
 			t.Errorf("expected local: %q", c)
+		}
+	}
+}
+
+func TestWrapKeepsFiltersLocal(t *testing.T) {
+	for in, want := range map[string]string{
+		"pnpm test":                         "sx run -- 'pnpm test'",
+		"pnpm test 2>&1 | tail -50":         "sx run -q -- 'pnpm test 2>&1' | tail -50",
+		"cargo test | grep -E 'FAIL|panic'": "sx run -q -- 'cargo test' | grep -E 'FAIL|panic'",
+	} {
+		if got := Wrap("sx", in); got != want {
+			t.Errorf("Wrap(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

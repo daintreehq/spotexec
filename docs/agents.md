@@ -1,8 +1,23 @@
 # Using spotexec with coding agents
 
-## Machine-readable output
+## What an agent sees
 
-When stderr isn't a terminal (or with `--json`, or `SPOTEXEC_AGENT=1`), lifecycle events go to stderr as NDJSON. The command's own stdout and stderr pass through untouched:
+An agent reads everything on stderr, so when stderr isn't a terminal `sx` keeps quiet. The command's own stdout and stderr pass through untouched, and spotexec adds:
+- a warning when something needs attention (`sx: warning: …`): a write-back conflict, a lost VM, a timeout;
+- a progress line only when a phase takes more than 3 seconds, such as booting a VM, queueing or installing dependencies, and again every 30 seconds while it lasts;
+- one summary line at the end, which says where the command ran and what came back:
+
+```console
+$ sx pnpm prettier --write src 2>&1 | cat
+src/index.ts 41ms
+sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
+```
+
+Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)).
+
+## Machine-readable events
+
+With `--json`, `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1`, lifecycle events go to stderr as NDJSON instead; `--events-file PATH` appends them to a file in any mode:
 
 ```json
 {"event":"slot_acquired","runner":"aws","slot":3,"connect_ms":13,"waited_ms":0}
@@ -28,7 +43,8 @@ spotexec hook check 'pnpm test'   # show what the hook would do with a command l
 
 The hook rewrites heavy Bash commands to `spotexec run -- '<cmd>'` before they execute:
 - **Offloaded:** tests, `tsc`, linters, formatters, builds, Maven and Gradle verify goals.
-- **Kept local:** `git`, `ls`, `rg`, dev servers, watch modes, pipes, redirects, background jobs, anything that `cd`s out of the repo, and anything prefixed with `SPOTEXEC_LOCAL=1`. Use that prefix, for example, for a test that needs `localhost:5432`.
+- **Output filters stay local.** Agents often trim output with a pipe, as in `pnpm test 2>&1 | tail -50` or `cargo test | grep -E 'FAIL|panicked'`. The heavy part runs remotely and the filters (`tail`, `head`, `grep`, `sed`, `awk`, `wc`, `sort`, `uniq`, `cut`, `tr`, `tee`, `jq`, …) read its streamed output on your machine: `spotexec run -q -- 'pnpm test 2>&1' | tail -50`.
+- **Kept local:** `git`, `ls`, `rg`, dev servers, watch modes, any other pipe, redirects into files, background jobs, anything that `cd`s out of the repo, and anything prefixed with `SPOTEXEC_LOCAL=1`. Use that prefix, for example, for a test that needs `localhost:5432`.
 - **Scope:** it acts only in projects with a `.spotexec.toml`, and approves nothing itself. Your permission rules see the rewritten `spotexec run -- <cmd>`, so allow `Bash(spotexec run:*)` if you pre-approve test commands.
 
 The `[hook]` table tunes it:

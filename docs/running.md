@@ -45,7 +45,7 @@ If that VM is gone, `--same-slot` fails (exit `125`) and says so, rather than ru
 | `--no-retry` | Don't replay the run if its VM is lost. |
 | `--fallback-local` | Run locally if no runner could be reached (never after the command started remotely). |
 | `--force-large-sync` | Allow syncing more than 100k files or 5 GiB. |
-| `--json` / `--pretty` / `-q, --quiet` | Event format: NDJSON, spinner, or nothing. |
+| `--json` / `--pretty` / `-q, --quiet` | Progress format: NDJSON events, the spinner (even without a terminal), or nothing. |
 | `--events-file PATH` | Also append NDJSON events to a file. |
 | `-C, --dir DIR` | Run as if started in `DIR`. |
 

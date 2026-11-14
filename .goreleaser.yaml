@@ -37,7 +37,7 @@ nfpms:
   - id: packages
     package_name: spotexec
     file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    homepage: https://github.com/daintreehq/spotexec
+    homepage: https://spotexec.com
     maintainer: Greg Priday
     description: Offload tests and builds from local worktrees to remote and AWS Spot runners
     license: MIT
@@ -65,7 +65,7 @@ brews:
         url: git@github.com:daintreehq/homebrew-tap.git
         private_key: "{{ .Env.HOMEBREW_TAP_DEPLOY_KEY }}"
     directory: Formula
-    homepage: https://github.com/daintreehq/spotexec
+    homepage: https://spotexec.com
     description: Offload tests and builds from local worktrees to remote and AWS Spot runners
     license: MIT
     commit_author:

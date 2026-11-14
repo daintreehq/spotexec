@@ -45,9 +45,11 @@ type runFlags struct {
 	noRetry       bool
 	priority      int
 	sameSlot      bool
+	fs            *pflag.FlagSet // to tell explicit flags from defaults
 }
 
 func (f *runFlags) register(fs *pflag.FlagSet) {
+	f.fs = fs
 	fs.DurationVar(&f.timeout, "timeout", 0, "wall-clock limit for the command (default 5m or .spotexec.toml timeout)")
 	fs.DurationVar(&f.queueTimeout, "queue-timeout", 0, "how long to wait for a free slot")
 	fs.StringVar(&f.sync, "sync", "", "sync mode: auto (bidirectional), in (no write-back), none")
@@ -67,7 +69,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.StringVarP(&f.dir, "dir", "C", "", "run as if started in this directory")
 	fs.BoolVar(&f.noRetry, "no-retry", false, "do not replay the run if its runner is lost (spot reclaim)")
 	fs.IntVar(&f.priority, "priority", 0, "queue priority when every slot is busy (higher runs first)")
-	fs.BoolVar(&f.sameSlot, "same-slot", false, "run in the slot (same VM) this worktree last used, waiting if it's busy; with --sync none, skip the sync")
+	fs.BoolVarP(&f.sameSlot, "same-slot", "s", false, "run in the slot (same VM) this worktree last used, waiting if it's busy; with --sync none, skip the sync")
 }
 
 func (f *runFlags) reporter() (ui.Reporter, error) {
@@ -96,10 +98,10 @@ func (f *runFlags) applyEnv() {
 	if f.runner == "" {
 		f.runner = os.Getenv("SPOTEXEC_RUNNER")
 	}
-	if os.Getenv("SPOTEXEC_JSON") == "1" {
+	if os.Getenv("SPOTEXEC_JSON") == "1" && !f.changed("pretty") && !f.changed("quiet") {
 		f.json = true
 	}
-	if os.Getenv("SPOTEXEC_SAME_SLOT") == "1" {
+	if os.Getenv("SPOTEXEC_SAME_SLOT") == "1" && !f.changed("same-slot") {
 		f.sameSlot = true
 	}
 	if f.priority == 0 {
@@ -107,6 +109,12 @@ func (f *runFlags) applyEnv() {
 			f.priority = n
 		}
 	}
+}
+
+// changed reports whether a flag was given on the command line (explicit
+// flags beat SPOTEXEC_* variables).
+func (f *runFlags) changed(name string) bool {
+	return f.fs != nil && f.fs.Changed(name)
 }
 
 // loaded is everything a run needs.
@@ -311,12 +319,12 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	f.applyEnv()
 	if f.sync != "" && f.sync != "auto" && f.sync != "in" && f.sync != "none" {
 		fmt.Fprintf(os.Stderr, "spotexec: --sync must be auto, in or none\n")
-		return 2
+		return client.ExitInfra
 	}
 	rep, err := f.reporter()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "spotexec:", err)
-		return 2
+		return client.ExitInfra
 	}
 	ctx, intr, stop := signals()
 	defer stop()
@@ -330,7 +338,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		}
 		// Only when no runner was ever reached (so the command never ran
 		// remotely), and only for real commands (not exec, sync or pull).
-		if errors.As(err, &ie) && (f.fallbackLocal || l.cfg.Global.LocalFallback) && !res.Reached && !o.PreferLast && !o.SyncOnly && s.command != "" {
+		if errors.As(err, &ie) && (f.fallbackLocal || l.cfg.Global.LocalFallback) && !res.Reached && !o.PreferLast && !o.SameSlot && !o.SyncOnly && s.command != "" {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
 			return runLocal(l, s.command)
 		}
@@ -437,10 +445,18 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		return f.execute(l, runSpec{label: name, command: cmd, display: name + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool, priority: t.Priority})
 	}
 	f.applyEnv()
+	if f.sameSlot {
+		fmt.Fprintf(os.Stderr, "spotexec: --same-slot can't apply to %s: it's a parallel task, whose parts run on several slots at once\n", name)
+		return client.ExitInfra
+	}
+	if len(args) > 0 {
+		fmt.Fprintf(os.Stderr, "spotexec: %s is a parallel task (%s), so it can't take extra arguments; run a part on its own: sx %s %s\n", name, strings.Join(t.Parallel, ", "), t.Parallel[0], strings.Join(args, " "))
+		return client.ExitInfra
+	}
 	rep, err := f.reporter()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "spotexec:", err)
-		return 2
+		return client.ExitInfra
 	}
 	ctx, intr, stop := signals()
 	defer stop()
