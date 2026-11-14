@@ -36,8 +36,12 @@ import (
 
 var imageRefRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}$`)
 
-// dockerRunner composes shell commands that run docker.
-type dockerRunner struct{ viaSG bool }
+// dockerRunner composes shell commands that run docker. info is what the
+// probe's `docker info` printed (stdout and stderr), for the daemon's CPUs.
+type dockerRunner struct {
+	viaSG bool
+	info  string
+}
 
 // cmd returns a shell command running `docker <args>` (args already quoted).
 func (d dockerRunner) cmd(args string) string {
@@ -69,11 +73,19 @@ func probeDocker(ctx context.Context) (dockerRunner, error) {
 	}
 	pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	if exec.CommandContext(pctx, "docker", "info").Run() == nil {
-		return dockerRunner{}, nil
+	info := func(name string, arg ...string) (string, error) {
+		cmd := exec.CommandContext(pctx, name, arg...)
+		cmd.WaitDelay = 5 * time.Second // a docker left behind by a killed sg can't hold the output pipe open
+		out, err := cmd.CombinedOutput()
+		return string(out), err
 	}
-	if inDockerGroup() && exec.CommandContext(pctx, "sg", "docker", "-c", "docker info").Run() == nil {
-		return dockerRunner{viaSG: true}, nil
+	if out, err := info("docker", "info"); err == nil {
+		return dockerRunner{info: out}, nil
+	}
+	if inDockerGroup() {
+		if out, err := info("sg", "docker", "-c", "docker info"); err == nil {
+			return dockerRunner{viaSG: true, info: out}, nil
+		}
 	}
 	return dockerRunner{}, errors.New("docker is installed but this user cannot use it (add it to the docker group)")
 }
@@ -622,6 +634,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 			return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
 		}
 	}
+	cpus := s.cpusetArgs(run, d) // before procMu: it may send an event
 	s.procMu.Lock()
 	if s.stopping.Load() {
 		s.procMu.Unlock()
@@ -688,6 +701,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
 			"-v", home+":/home/spotexec", "-e", "HOME=/home/spotexec")
 	}
+	args = append(args, cpus...)
 	args = append(args, run.Options...)
 	args = append(args, run.Image, "-c",
 		`if command -v bash >/dev/null 2>&1; then exec bash /tmp/spotexec-run.sh; else exec sh /tmp/spotexec-run.sh; fi`)

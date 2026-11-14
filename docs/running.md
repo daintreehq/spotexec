@@ -64,7 +64,7 @@ Every command gets:
 | `SPOTEXEC_WORKSPACE` | Absolute path of the remote checkout. |
 | `SPOTEXEC_SLOT` | Host-wide slot number, unique across repos. |
 | `SPOTEXEC_PORT_BASE` | `20000 + slot × 1000`. Bind test servers here and parallel jobs never collide. |
-| `SPOTEXEC_CPUS` | This job's share: vCPUs ÷ slots, or all of them with `--exclusive`. |
+| `SPOTEXEC_CPUS` | This job's share: vCPUs ÷ slots, rounded down (at least 1), or all of them with `--exclusive`. In a [project container](environments.md#project-containers) on a Linux runner, the job is normally also [pinned](environments.md#settings) to that many CPUs, so `nproc` and other tools that count the CPUs they may use see the same number. |
 | `SPOTEXEC_SLOTS` | Slots per machine. |
 | `SPOTEXEC_RUN_ID`, `SPOTEXEC_ATTEMPT` | Stable across a replay; `SPOTEXEC_ATTEMPT` is `2` on the replay. |
 | `COMPOSE_PROJECT_NAME` | `sx_<repo>_sNN`, so Docker Compose stacks don't collide. |
