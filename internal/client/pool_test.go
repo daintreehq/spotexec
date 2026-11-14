@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 // fakeFleet is an in-memory Fleet.

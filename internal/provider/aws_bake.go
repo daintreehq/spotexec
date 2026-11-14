@@ -7,7 +7,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"github.com/spotexec/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/config"
 	"net/url"
 	"os"
 	"path/filepath"

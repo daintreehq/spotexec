@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // Version is set by the build (ldflags) and shown in hello.

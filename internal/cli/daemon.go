@@ -14,8 +14,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/daemon"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/daemon"
 )
 
 func cmdDaemon() *cobra.Command {

@@ -17,7 +17,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/spotexec/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/config"
 )
 
 // DefaultPatterns match command segments worth offloading.

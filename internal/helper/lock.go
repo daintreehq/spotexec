@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // Lifecycle paths shared with the cloud-init watchdog on ephemeral runners.

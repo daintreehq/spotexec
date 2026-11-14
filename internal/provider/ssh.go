@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/config"
 )
 
 // SSH is a static runner reachable over SSH. With several hosts (e.g. LAN

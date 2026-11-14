@@ -12,9 +12,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/manifest"
-	"github.com/spotexec/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 // Workspace identifies the local worktree being run from.

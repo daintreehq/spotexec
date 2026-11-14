@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // SlotInfo describes one repo workspace slot.

@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/depskey"
-	"github.com/spotexec/spotexec/internal/fsid"
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/depskey"
+	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // depsKey hashes lockfile contents + install command + platform (the same

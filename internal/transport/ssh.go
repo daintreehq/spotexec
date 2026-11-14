@@ -20,8 +20,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/helperbin"
-	"github.com/spotexec/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/helperbin"
+	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 // ControlPersist keeps the master connection alive between runs.

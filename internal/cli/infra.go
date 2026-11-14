@@ -15,16 +15,16 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/spotexec/spotexec/internal/client"
-	"github.com/spotexec/spotexec/internal/cloudinit"
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/daemon"
-	"github.com/spotexec/spotexec/internal/helper"
-	"github.com/spotexec/spotexec/internal/helperbin"
-	"github.com/spotexec/spotexec/internal/manifest"
-	"github.com/spotexec/spotexec/internal/provider"
-	"github.com/spotexec/spotexec/internal/transport"
-	"github.com/spotexec/spotexec/internal/ui"
+	"github.com/daintreehq/spotexec/internal/client"
+	"github.com/daintreehq/spotexec/internal/cloudinit"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/daemon"
+	"github.com/daintreehq/spotexec/internal/helper"
+	"github.com/daintreehq/spotexec/internal/helperbin"
+	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // loadGlobal loads the runner set: global runners plus any declared by the

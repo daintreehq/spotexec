@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/cloudinit"
-	"github.com/spotexec/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/cloudinit"
+	"github.com/daintreehq/spotexec/internal/config"
 )
 
 // Sim is a local, Docker-backed simulation of a Spot fleet. Each "instance"

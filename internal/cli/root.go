@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/spotexec/spotexec/internal/helper"
+	"github.com/daintreehq/spotexec/internal/helper"
 )
 
 // Version is set at build time.

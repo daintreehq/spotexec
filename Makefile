@@ -1,5 +1,5 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-PKG     := github.com/spotexec/spotexec
+PKG     := github.com/daintreehq/spotexec
 LDFLAGS := -s -w -X $(PKG)/internal/cli.Version=$(VERSION) -X $(PKG)/internal/helper.Version=$(VERSION)
 HELPER_TARGETS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 EMBED_DIR := internal/helperbin/dist

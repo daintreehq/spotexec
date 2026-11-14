@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/config"
 )
 
 // Target is how to reach a runner over SSH.

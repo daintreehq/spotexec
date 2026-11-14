@@ -9,8 +9,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/spotexec/spotexec/internal/dockerignore"
-	"github.com/spotexec/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/dockerignore"
+	"github.com/daintreehq/spotexec/internal/fsid"
 	"io"
 	"io/fs"
 	"os"
@@ -22,13 +22,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/depskey"
-	"github.com/spotexec/spotexec/internal/manifest"
-	"github.com/spotexec/spotexec/internal/protocol"
-	"github.com/spotexec/spotexec/internal/provider"
-	"github.com/spotexec/spotexec/internal/transport"
-	"github.com/spotexec/spotexec/internal/ui"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/depskey"
+	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // Exit codes for spotexec's own failures (command exit codes pass through).

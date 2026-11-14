@@ -5,7 +5,7 @@ package main
 import (
 	"os"
 
-	"github.com/spotexec/spotexec/internal/cli"
+	"github.com/daintreehq/spotexec/internal/cli"
 )
 
 func main() {

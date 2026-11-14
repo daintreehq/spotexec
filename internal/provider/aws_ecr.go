@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // ImageRegistry is implemented by providers that can store built project

@@ -19,10 +19,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/fsid"
-	"github.com/spotexec/spotexec/internal/manifest"
-	"github.com/spotexec/spotexec/internal/protocol"
-	"github.com/spotexec/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/transport"
 )
 
 // WritebackResult summarizes a write-back.

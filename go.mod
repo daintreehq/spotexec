@@ -1,4 +1,4 @@
-module github.com/spotexec/spotexec
+module github.com/daintreehq/spotexec
 
 go 1.26.0
 

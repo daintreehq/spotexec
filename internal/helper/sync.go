@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/fsid"
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // storedEntry is the helper's record of a synced file: its content ID plus

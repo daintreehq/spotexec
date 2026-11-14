@@ -13,7 +13,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
 
-	"github.com/spotexec/spotexec/internal/client"
+	"github.com/daintreehq/spotexec/internal/client"
 )
 
 // defaultDockerfile is where `container init` writes the project image.

@@ -11,9 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/spotexec/spotexec/internal/client"
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/hooks"
+	"github.com/daintreehq/spotexec/internal/client"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/hooks"
 )
 
 const globalTemplate = `# spotexec global runner config (personal; never committed). See README.

@@ -20,8 +20,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/cloudinit"
-	"github.com/spotexec/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/cloudinit"
+	"github.com/daintreehq/spotexec/internal/config"
 )
 
 const (

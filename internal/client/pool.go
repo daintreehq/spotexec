@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 // Pool is the local view of one autoscaled fleet runner, shared by every sx

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/spotexec/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/fsid"
 )
 
 // With core.autocrlf=input git reports a CRLF file as clean while its index

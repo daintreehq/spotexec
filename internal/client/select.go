@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/protocol"
-	"github.com/spotexec/spotexec/internal/provider"
-	"github.com/spotexec/spotexec/internal/transport"
-	"github.com/spotexec/spotexec/internal/ui"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // Lease is an acquired slot on a runner, held until Close.

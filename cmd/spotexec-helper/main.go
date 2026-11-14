@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/helper"
+	"github.com/daintreehq/spotexec/internal/helper"
 )
 
 func main() {

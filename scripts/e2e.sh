@@ -173,7 +173,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/cloudinit"
+	"github.com/daintreehq/spotexec/internal/cloudinit"
 )
 
 func main() {

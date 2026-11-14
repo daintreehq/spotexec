@@ -10,11 +10,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/spotexec/spotexec/internal/client"
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/provider"
-	"github.com/spotexec/spotexec/internal/transport"
-	"github.com/spotexec/spotexec/internal/ui"
+	"github.com/daintreehq/spotexec/internal/client"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // cmdImage manages baked runner images (AMIs) for aws-spot fleets.

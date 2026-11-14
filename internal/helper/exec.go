@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/fsid"
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 func shellPath() (string, []string) {

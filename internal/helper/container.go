@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/spotexec/spotexec/internal/dockerignore"
+	"github.com/daintreehq/spotexec/internal/dockerignore"
 	"os"
 	"os/exec"
 	"os/user"
@@ -18,8 +18,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/fsid"
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // Project containers: commands run via `docker run` with the slot workspace

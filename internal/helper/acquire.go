@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 var repoIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,80}$`)

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/spotexec/spotexec/internal/fsid"
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // MaxCreated caps the number of created files reported back in one result.

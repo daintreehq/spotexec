@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/config"
 )
 
 // Queue is the local, fair admission queue for one pool of runners. Every

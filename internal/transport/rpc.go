@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/helper"
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/helper"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // Session is a live RPC channel to spotexec-helper.

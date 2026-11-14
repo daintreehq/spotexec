@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/spotexec/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/fsid"
 )
 
 // Spec identifies a dependency set.

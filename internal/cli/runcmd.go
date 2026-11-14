@@ -18,10 +18,10 @@ import (
 
 	"github.com/spf13/pflag"
 
-	"github.com/spotexec/spotexec/internal/client"
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/transport"
-	"github.com/spotexec/spotexec/internal/ui"
+	"github.com/daintreehq/spotexec/internal/client"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // runFlags are shared by the shorthand form, run, exec, and tasks.

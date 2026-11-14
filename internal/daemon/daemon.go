@@ -28,11 +28,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/client"
-	"github.com/spotexec/spotexec/internal/config"
-	"github.com/spotexec/spotexec/internal/helper"
-	"github.com/spotexec/spotexec/internal/provider"
-	"github.com/spotexec/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/client"
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/helper"
+	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/transport"
 )
 
 // Timings (variables so tests can shorten them; see SPOTEXEC_DAEMON_FAST).

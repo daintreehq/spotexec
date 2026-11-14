@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // SimDir holds injected notices in the Docker fleet simulator; it is checked

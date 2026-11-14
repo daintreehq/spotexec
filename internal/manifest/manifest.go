@@ -20,9 +20,9 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/spotexec/spotexec/internal/fsid"
-	"github.com/spotexec/spotexec/internal/ignore"
-	"github.com/spotexec/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/ignore"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // BuiltinExcludes are never synced from untracked/non-Git sources. Tracked
