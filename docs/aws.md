@@ -174,9 +174,9 @@ To span regions, define one runner per region and order them with `priority`, so
 
 ## 5. Check your Spot vCPU quota
 
-Spot capacity is limited by a per-region vCPU quota, *All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests* (`L-34B43A08`). New accounts often start very low, sometimes 5 vCPUs, which is not enough for even two 4-vCPU VMs.
+Spot capacity is limited by a per-region vCPU quota, *All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests* (`L-34B43A08`). New accounts often start very low, sometimes 5 vCPUs: enough for one 4-vCPU VM, but not one 8-vCPU VM. `spotexec setup` sizes the starter fleet to it (4-vCPU VMs when an 8-vCPU one doesn't fit) and offers to request an increase when not even one VM fits.
 
-You need at least `max_instances × vCPUs per instance`, summed over every fleet in the region. For example, 4 × `c7a.xlarge` needs 16 vCPUs. `spotexec doctor` shows the current value and what the runner may use. To check or raise it:
+You need at least `max_instances × vCPUs per instance`, summed over every fleet in the region. For example, 4 × `c7a.xlarge` needs 16 vCPUs. `spotexec doctor` shows the current value and what the runner may use; it fails only when not even one VM fits, and prints the increase command whenever the quota limits the fleet. To check or raise it:
 
 ```sh
 aws service-quotas get-service-quota --profile spotexec --region us-east-2 \

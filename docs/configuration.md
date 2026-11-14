@@ -39,8 +39,8 @@ priority = 10
 type = "aws-spot"
 region = "us-east-2"
 profile = "dev"
-instance_types = ["c7a.4xlarge", "c6a.4xlarge", "m7a.4xlarge"]
-max_slots = 8
+instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]
+max_slots = 4
 max_instances = 4
 min_instances = 0                 # kept warm only while `spotexec daemon` runs
 priority = 20
@@ -85,7 +85,7 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | --- | --- | --- |
 | `region` | `AWS_REGION`, `AWS_DEFAULT_REGION`, else `us-east-1` | EC2 region. |
 | `profile` | (env / default) | AWS profile to use. |
-| `instance_types` | `c7a.4xlarge`, `c6a.4xlarge`, `m7a.4xlarge` | Tried in order on capacity errors. All must share one architecture. |
+| `instance_types` | `c7a.2xlarge`, `m7a.2xlarge`, `c6a.2xlarge` (8 vCPUs, as in the starter config) | Tried in order on capacity errors. All must share one architecture. |
 | `arch` | from the first instance type | `amd64` or `arm64` (Graviton). |
 | `max_instances` | `4` | Fleet ceiling. |
 | `min_instances` | `0` | Warm floor, kept only while the [pool manager](scaling.md#pool-manager-optional) runs. |

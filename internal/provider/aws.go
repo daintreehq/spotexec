@@ -1035,13 +1035,8 @@ func (a *AWSSpot) Doctor(ctx context.Context) []Check {
 		out = append(out, Check{Name: "network", OK: true, Msg: msg})
 	}
 	// New accounts start with a small Spot vCPU quota (often 5 vCPUs).
-	qb, _ := json.Marshal(map[string]string{"ServiceCode": "ec2", "QuotaCode": "L-34B43A08"})
-	if status, b, err := a.api.do(ctx, "servicequotas", "application/x-amz-json-1.1", map[string]string{"X-Amz-Target": "ServiceQuotasV20190624.GetServiceQuota"}, qb); err == nil && status == 200 {
-		var v struct{ Quota struct{ Value float64 } }
-		_ = json.Unmarshal(b, &v)
-		need := a.r.MaxInstances * vcpusOf(a.r.InstanceTypes[0])
-		msg := fmt.Sprintf("%.0f vCPUs for standard Spot instances in %s; this runner may use up to %d", v.Quota.Value, a.r.Region, need)
-		out = append(out, Check{Name: "spot vCPU quota", OK: v.Quota.Value >= float64(need), Msg: msg})
+	if c, ok := a.quotaCheck(ctx); ok {
+		out = append(out, c)
 	}
 	// Instances live in the runner's region, which is easy to miss when the
 	// console (or the AWS CLI default) points elsewhere.

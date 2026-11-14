@@ -29,7 +29,7 @@ spotexec setup
    - creates an access key for that user and saves it as the AWS CLI profile `spotexec` (`~/.aws/credentials`, mode 600, with the region in `~/.aws/config`). It waits until the key works and checks that nothing else in `~/.aws` overrides it, then deletes any older keys the user has;
    - sets `profile = "spotexec"` on your AWS runners;
    - prepares the account: it creates the EC2 Spot service-linked role and, if the runner's region has no default VPC (common in older accounts), the default VPC. That's AWS's standard network and costs nothing; `--no-vpc` skips it;
-   - checks your Spot vCPU quota against what your runners may use, and prints the command to raise it if it's too low.
+   - checks your Spot vCPU quota. New accounts get about 5 vCPUs, too few for one of the starter config's 8-vCPU VMs, so a starter config setup has just written switches to 4-vCPU VMs (`c7a.xlarge`…) instead, keeping `max_instances`. If the quota can't fit even one VM, setup says so, prints the command to raise it and, in a terminal, offers to request the increase with your AWS sign-in. If it only limits how many VMs run at once, setup notes that and prints the command. spotexec never falls back to on-demand instances unless you set `on_demand_fallback`.
 
    With runners in several regions, the network and quota checks cover each region.
 3. **The Claude Code hook.** If Claude Code is on this machine, setup offers to install its hook for all your projects, so agents' heavy commands run on your runners (see [coding agents](agents.md#claude-code-hook)). The hook only acts in projects with a `.spotexec.toml`. `--no-hooks` skips this.
@@ -88,8 +88,8 @@ default_pool = ["aws"]
 type = "aws-spot"
 profile = "spotexec"   # set by `spotexec setup`
 region = "us-east-2"   # always set it: the AWS profile's region is not used
-instance_types = ["c7a.xlarge", "c6a.xlarge"]   # tried in order on capacity errors
-max_slots = 2          # concurrent jobs per VM
+instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]   # 8 vCPUs; tried in order on capacity errors
+max_slots = 4          # concurrent jobs per VM
 max_instances = 4      # fleet ceiling
 idle_timeout = "10m"   # the VM powers itself off after this long without work
 ```

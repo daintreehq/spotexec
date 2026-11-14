@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -293,4 +294,114 @@ func minStandardVCPUs(types []string) int {
 		}
 	}
 	return n
+}
+
+// MinLaunchVCPUs is the smallest Spot launch among instance types that use
+// the standard Spot quota (0 when none of them does).
+func MinLaunchVCPUs(types []string) int { return minStandardVCPUs(types) }
+
+// QuotaFit compares a region's standard Spot vCPU quota with what the
+// runners there need: one VM (the smallest launch) to work at all, and every
+// fleet at max_instances to run all at once.
+type QuotaFit struct {
+	Region string
+	Quota  int // vCPUs
+	OneVM  int // the smallest launch
+	Fleet  int // every fleet at max_instances
+	// Others: the runners can also launch types outside the standard
+	// families, which have quotas of their own.
+	Others bool
+}
+
+// Blocked: not even one VM can launch.
+func (f QuotaFit) Blocked() bool { return f.Quota < f.OneVM }
+
+// Limited: fewer VMs than max_instances can run at once.
+func (f QuotaFit) Limited() bool { return f.Quota < f.Fleet }
+
+// Desired is the quota to ask for: room for every fleet at max_instances.
+func (f QuotaFit) Desired() int { return max(f.Fleet, f.OneVM) }
+
+// Command requests that quota.
+func (f QuotaFit) Command() string {
+	return QuotaIncreaseCommand(f.Region, QuotaCodeSpotStandard, f.Desired())
+}
+
+// RequestQuotaIncrease asks Service Quotas, with the admin session, to
+// raise the region's standard Spot vCPU quota to desired. It returns the
+// request's status (e.g. PENDING, or CASE_OPENED).
+func (s *AWSUserSetup) RequestQuotaIncrease(ctx context.Context, region string, desired int) (string, error) {
+	creds := s.adminCreds // resolved before setup rewrote any profile
+	if creds == nil {
+		creds = &awsCredResolver{profile: s.AdminProfile}
+	}
+	cl := s.client(region, creds)
+	body, _ := json.Marshal(map[string]any{"ServiceCode": "ec2", "QuotaCode": QuotaCodeSpotStandard, "DesiredValue": desired})
+	status, b, err := cl.do(ctx, "servicequotas", "application/x-amz-json-1.1",
+		map[string]string{"X-Amz-Target": "ServiceQuotasV20190624.RequestServiceQuotaIncrease"}, body)
+	if err != nil {
+		return "", err
+	}
+	if status/100 != 2 {
+		var e struct {
+			Type    string `json:"__type"`
+			Message string `json:"message"`
+			Msg2    string `json:"Message"`
+		}
+		_ = json.Unmarshal(b, &e)
+		if strings.HasSuffix(e.Type, "ResourceAlreadyExistsException") {
+			return "already requested", nil
+		}
+		code := e.Type
+		if i := strings.LastIndex(code, "#"); i >= 0 {
+			code = code[i+1:]
+		}
+		return "", &awsError{Status: status, Code: code, Message: e.Message + e.Msg2}
+	}
+	var v struct {
+		RequestedQuota struct{ Status string }
+	}
+	_ = json.Unmarshal(b, &v)
+	return v.RequestedQuota.Status, nil
+}
+
+// quotaCheck is doctor's Spot quota finding: it fails only when not even
+// one VM fits, and says how to raise the quota whenever the quota is what
+// limits the fleet. ok is false when there is nothing to report.
+func (a *AWSSpot) quotaCheck(ctx context.Context) (Check, bool) {
+	one := minStandardVCPUs(a.r.InstanceTypes)
+	if one == 0 {
+		return Check{}, false // these types use other quotas
+	}
+	q, err := a.quotaValue(ctx, QuotaCodeSpotStandard)
+	if err != nil {
+		return Check{}, false
+	}
+	return quotaFinding(QuotaFit{Region: a.r.Region, Quota: q, OneVM: one, Fleet: a.r.MaxInstances * vcpusOf(a.r.InstanceTypes[0]),
+		Others: HasOtherFamilies(a.r.InstanceTypes)}), true
+}
+
+// HasOtherFamilies reports instance types outside the standard families.
+func HasOtherFamilies(types []string) bool {
+	for _, t := range types {
+		if !standardFamily(t) {
+			return true
+		}
+	}
+	return false
+}
+
+func quotaFinding(f QuotaFit) Check {
+	c := Check{Name: "spot vCPU quota", OK: !f.Blocked() || f.Others}
+	switch {
+	case f.Blocked() && f.Others:
+		c.Msg = fmt.Sprintf("%d vCPUs for standard Spot instances in %s: not enough for one standard-family VM (%d vCPUs), so only this runner's other instance types can launch. Raise it (as an AWS administrator): %s", f.Quota, f.Region, f.OneVM, f.Command())
+	case f.Blocked():
+		c.Msg = fmt.Sprintf("%d vCPUs for standard Spot instances in %s: not enough for one VM (%d vCPUs), so nothing can launch. Raise it (as an AWS administrator): %s", f.Quota, f.Region, f.OneVM, f.Command())
+	case f.Limited():
+		c.Msg = fmt.Sprintf("%d vCPUs for standard Spot instances in %s: fewer VMs run at once than max_instances allows (up to %d vCPUs). To run them all at once (as an AWS administrator): %s", f.Quota, f.Region, f.Fleet, f.Command())
+	default:
+		c.Msg = fmt.Sprintf("%d vCPUs for standard Spot instances in %s; this runner may use up to %d", f.Quota, f.Region, f.Fleet)
+	}
+	return c
 }

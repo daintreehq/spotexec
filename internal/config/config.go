@@ -259,7 +259,7 @@ func (r *Runner) applyDefaults() error {
 			r.Region = firstNonEmpty(os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"), "us-east-1")
 		}
 		if len(r.InstanceTypes) == 0 {
-			r.InstanceTypes = []string{"c7a.4xlarge", "c6a.4xlarge", "m7a.4xlarge"}
+			r.InstanceTypes = []string{"c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"} // the starter template's 8-vCPU types
 		}
 		if r.Arch == "" {
 			r.Arch = archForInstanceType(r.InstanceTypes[0])

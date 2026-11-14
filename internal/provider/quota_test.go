@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -398,5 +399,86 @@ func TestVCPUsOf(t *testing.T) {
 		if got := vcpusOf(it); got != want {
 			t.Errorf("%s: %d, want %d", it, got, want)
 		}
+	}
+}
+
+func TestDoctorQuotaFinding(t *testing.T) {
+	// Enough for two of the fleet's four VMs: passes, with the command.
+	c := quotaFinding(QuotaFit{Region: "us-east-2", Quota: 16, OneVM: 8, Fleet: 32})
+	if !c.OK || !strings.Contains(c.Msg, "fewer VMs run at once") || !strings.Contains(c.Msg, "--desired-value 32") {
+		t.Fatalf("limited: %+v", c)
+	}
+	c = quotaFinding(QuotaFit{Region: "us-east-2", Quota: 5, OneVM: 8, Fleet: 32})
+	if c.OK || !strings.Contains(c.Msg, "not enough for one VM (8 vCPUs)") || !strings.Contains(c.Msg, "request-service-quota-increase --region us-east-2") {
+		t.Fatalf("blocked: %+v", c)
+	}
+	c = quotaFinding(QuotaFit{Region: "us-east-2", Quota: 5, OneVM: 8, Fleet: 32, Others: true})
+	if !c.OK || !strings.Contains(c.Msg, "only this runner's other instance types can launch") {
+		t.Fatalf("mixed families: %+v", c)
+	}
+	c = quotaFinding(QuotaFit{Region: "us-east-2", Quota: 64, OneVM: 8, Fleet: 32})
+	if !c.OK || strings.Contains(c.Msg, "request-service-quota-increase") {
+		t.Fatalf("fine: %+v", c)
+	}
+	// Through the provider: a 4-vCPU fleet on a new account's 5 vCPUs.
+	a := (&fakeAWS{quota: 5}).server(t)
+	a.r.InstanceTypes = []string{"c7a.xlarge"}
+	if c, ok := a.quotaCheck(context.Background()); !ok || !c.OK {
+		t.Fatalf("one 4-vCPU VM fits 5 vCPUs: %+v", c)
+	}
+	a.r.InstanceTypes = []string{"g5.xlarge"}
+	if _, ok := a.quotaCheck(context.Background()); ok {
+		t.Fatal("G instances don't use the standard quota")
+	}
+}
+
+func TestRequestQuotaIncrease(t *testing.T) {
+	var got map[string]any
+	answer := `{"RequestedQuota":{"Id":"r-1","Status":"PENDING"}}`
+	code := 200
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Amz-Target") != "ServiceQuotasV20190624.RequestServiceQuotaIncrease" {
+			w.WriteHeader(400)
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(code)
+		fmt.Fprint(w, answer)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", t.TempDir()+"/credentials")
+	t.Setenv("AWS_CONFIG_FILE", t.TempDir()+"/config")
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKADMIN")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "s")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_PROFILE", "")
+	s := &AWSUserSetup{endpoints: map[string]string{"servicequotas": srv.URL}}
+	st, err := s.RequestQuotaIncrease(context.Background(), "us-east-2", 16)
+	if err != nil || st != "PENDING" {
+		t.Fatalf("%q %v", st, err)
+	}
+	if got["QuotaCode"] != QuotaCodeSpotStandard || got["ServiceCode"] != "ec2" || got["DesiredValue"] != float64(16) {
+		t.Fatalf("request %v", got)
+	}
+	// The admin session setup signed in with is reused, even if the
+	// profile it came from now holds the spotexec key.
+	var auth string
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		fmt.Fprint(w, `{"RequestedQuota":{"Status":"PENDING"}}`)
+	}))
+	t.Cleanup(srv2.Close)
+	s2 := &AWSUserSetup{endpoints: map[string]string{"servicequotas": srv2.URL},
+		adminCreds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKSESSION", SecretAccessKey: "s"}}}
+	if _, err := s2.RequestQuotaIncrease(context.Background(), "us-east-2", 16); err != nil || !strings.Contains(auth, "Credential=AKSESSION/") {
+		t.Fatalf("signed with %q (%v), want the admin session", auth, err)
+	}
+	code, answer = 400, `{"__type":"ResourceAlreadyExistsException","message":"already"}`
+	if st, err := s.RequestQuotaIncrease(context.Background(), "us-east-2", 16); err != nil || st != "already requested" {
+		t.Fatalf("pending request: %q %v", st, err)
+	}
+	code, answer = 400, `{"__type":"AccessDeniedException","Message":"no"}`
+	if _, err := s.RequestQuotaIncrease(context.Background(), "us-east-2", 16); err == nil || !strings.Contains(err.Error(), "AccessDenied") {
+		t.Fatalf("denied: %v", err)
 	}
 }

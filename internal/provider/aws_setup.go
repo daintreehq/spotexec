@@ -90,6 +90,7 @@ type AWSUserSetup struct {
 	// Confirm is asked before anything is created in the account.
 	Confirm func(plan AWSSetupPlan) bool
 
+	adminCreds     *awsCredResolver  // the admin session Run signed in with (reused for quota requests)
 	endpoints      map[string]string // tests
 	resolveProfile func(ctx context.Context, profile string) (awsCreds, error)
 	pollEvery      time.Duration
@@ -253,6 +254,7 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 			return nil, fmt.Errorf("couldn't check which machine IAM user %s (profile %s) belongs to: %w", name, s.Profile, err)
 		}
 	}
+	s.adminCreds = admin.creds
 	if adminErr != nil {
 		if existing != nil && !s.Rotate {
 			// Already set up; without an admin session the policy just

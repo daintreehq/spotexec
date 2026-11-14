@@ -70,11 +70,13 @@ and keeps a working key. --rotate replaces the key.
 			}
 			setupLocal := func() (bool, error) {
 				p := config.GlobalPath()
+				wrote := false // the starter template, sized below to the Spot quota
 				if _, err := os.Stat(p); err != nil {
 					region, why, err := writeGlobalTemplate(p, adminProfile)
 					if err != nil {
 						return false, err
 					}
+					wrote = true
 					fmt.Printf("✓ wrote %s (an aws runner in %s, %s; edit it any time)\n", p, region, why)
 				} else {
 					fmt.Printf("✓ runner config %s\n", p)
@@ -166,17 +168,34 @@ and keeps a working key. --rotate replaces the key.
 				if len(changed) > 0 {
 					fmt.Printf("✓ set profile = %q on %s in %s\n", profile, strings.Join(changed, ", "), g.Path)
 				}
-				for _, rg := range regions {
-					q, ok := res.Quotas[rg]
-					switch {
-					case !ok:
-					case q < float64(need[rg]):
-						fmt.Printf("! Spot vCPU quota in %s is %.0f, but your runners there may use up to %d. Until it's raised, fewer VMs run at once.\n", rg, q, need[rg])
-						fmt.Printf("  Request more (as an administrator): aws service-quotas request-service-quota-increase --region %s --service-code ec2 --quota-code L-34B43A08 --desired-value %d\n", rg, need[rg])
-					default:
-						fmt.Printf("✓ Spot vCPU quota in %s: %.0f (runners need up to %d)\n", rg, q, need[rg])
+				if q, ok := res.Quotas[aws[0].Region]; ok && wrote && q < starterVCPUs {
+					// A new account's quota can't fit one 8-vCPU VM.
+					sized, err := sizeStarterFleet(g.Path)
+					if err != nil {
+						return false, fmt.Errorf("sizing the starter fleet to the Spot quota: %w (set instance_types to 4-vCPU types such as c7a.xlarge in %s)", err, g.Path)
+					}
+					if sized {
+						fmt.Printf("✓ sized the starter fleet to the Spot quota in %s (%.0f vCPUs): 4-vCPU VMs instead of 8-vCPU ones\n", aws[0].Region, q)
+						g2, err := config.LoadGlobal()
+						if err != nil {
+							return false, err
+						}
+						aws = awsRunners(g2)
 					}
 				}
+				var ask func(provider.QuotaFit) bool
+				if !res.PolicyStale && !yes && ui.IsTerminal(os.Stdin) {
+					// The admin session is at hand: offer to file the request.
+					ask = func(f provider.QuotaFit) bool {
+						fmt.Printf("  Request %d vCPUs in %s now, with your AWS sign-in? [Y/n] ", f.Desired(), f.Region)
+						line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+						a := strings.ToLower(strings.TrimSpace(line))
+						return a == "" || a == "y" || a == "yes"
+					}
+				}
+				reportQuotas(os.Stdout, quotaFits(aws, res.Quotas), ask, func(f provider.QuotaFit) (string, error) {
+					return s.RequestQuotaIncrease(cmd.Context(), f.Region, f.Desired())
+				})
 				return true, nil
 			}
 			hasAWS, err := setupLocal()
