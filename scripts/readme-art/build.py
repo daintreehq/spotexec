@@ -322,19 +322,14 @@ def how(theme):
 # ---------------------------------------------------------------- lockups
 
 def lockups():
-    """The README hero: the settled lockup, with a hairline on the dark tile.
+    """The README hero uses the logo set's own light and dark lockups, unchanged.
 
-    The drawing is copied from docs/assets/logo unchanged. On dark canvases the
-    tile becomes brand ink with a 1px-at-display edge, so it holds on GitHub dark
-    (#0d1117) and dark dimmed (#212830) alike; #252A33 all but vanishes on dimmed.
+    The dark one inverts the tile (warm white #F5F2EC, ink chevron), as on
+    spotexec.com, so it holds on GitHub dark (#0d1117) and dark dimmed (#212830).
     """
-    import re
     logo = ROOT / "docs/assets/logo"
     write("logo-light.svg", (logo / "spotexec.svg").read_text())
-    dark = (logo / "spotexec-dark.svg").read_text()
-    tile = re.search(r'<path fill="#252A33" d="([^"]+)"/>', dark).group(1)
-    edge = f'<path fill="none" stroke="#3D444D" stroke-width="4" transform="translate(2 2) scale(0.984375)" d="{tile}"/>'
-    write("logo-dark.svg", dark.replace(f'<path fill="#252A33" d="{tile}"/>', f'<path fill="{INK}" d="{tile}"/>{edge}'))
+    write("logo-dark.svg", (logo / "spotexec-dark.svg").read_text())
 
 
 def main():

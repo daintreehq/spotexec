@@ -4,8 +4,9 @@
     "ink": "#0B0D10",
     "spot": "#FF7300",
     "chevron": "#FFFFFF",
-    "dark_tile": "#252A33",
-    "dark_wordmark": "#FFFFFF"
+    "dark_tile": "#F5F2EC",
+    "dark_chevron": "#0B0D10",
+    "dark_wordmark": "#F5F2EC"
   },
   "tile": {
     "size": 256.0,
