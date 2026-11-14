@@ -28,3 +28,30 @@ jobs:
         run: go test -race ./...
       - name: Smoke
         run: ./bin/spotexec version && ./bin/sx --help >/dev/null
+
+  release-smoke:
+    # Builds the release artifacts the way the Release workflow does (a
+    # snapshot, nothing published), then tests what users install: the
+    # archive, the sx entry point, completions and, on Linux, the .deb, .rpm
+    # and .apk packages.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # GoReleaser derives the snapshot version from tags
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish
+        env:
+          # Referenced by the brews section; a snapshot never pushes the tap.
+          HOMEBREW_TAP_DEPLOY_KEY: ""
+      - name: Smoke-test the release artifacts
+        run: ./scripts/smoke-release.sh dist

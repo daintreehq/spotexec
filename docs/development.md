@@ -6,6 +6,7 @@ Work happens on `develop` (GitFlow); releases are tagged on `main` and published
 make build          # helpers for all platforms, then bin/spotexec + bin/sx
 make test           # unit tests (go test ./...; add -race locally)
 make vet
+make completions    # completion scripts for spotexec and sx into completions/
 make e2e            # builds, then runs all three end-to-end suites:
                     #   scripts/e2e.sh         SSH runner: sync, write-back, conflicts, tasks, deps, pull, exec, watchdog
                     #   scripts/e2e-pool.sh    Spot fleet scenarios on the Docker simulator

@@ -32,6 +32,7 @@ spotexec hook install [--claude] [--codex] [--shared|--global] [--uninstall]
 spotexec hook check '<command>'              show whether the hook offloads a command
 spotexec cloud-init [runner]                 print the first-boot user-data
 spotexec completion bash|zsh|fish|powershell shell completion script
+spotexec completion sx bash|zsh|fish|powershell   the same for sx (flags and task names)
 spotexec version
 ```
 

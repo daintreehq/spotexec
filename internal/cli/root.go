@@ -140,6 +140,8 @@ func newRoot() *cobra.Command {
 		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdInit(), cmdHook(),
 		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdDaemon(), cmdContainer(), cmdSetup(),
 	)
+	root.SetVersionTemplate("spotexec {{.Version}}\n") // as `spotexec version` and `sx --version`
+	addSxCompletion(root)
 	return root
 }
 
@@ -239,6 +241,10 @@ func sxMain(args []string) int {
 	if len(args) == 2 && args[0] == "hook" && args[1] == "claude" {
 		claudeHook()
 		return 0
+	}
+	// Shell completion scripts for sx ask it for candidates.
+	if len(args) > 0 && (args[0] == cobra.ShellCompRequestCmd || args[0] == cobra.ShellCompNoDescRequestCmd) {
+		return sxComplete(args)
 	}
 	var f runFlags
 	fs := pflag.NewFlagSet("sx", pflag.ContinueOnError)

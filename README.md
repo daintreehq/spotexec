@@ -57,7 +57,7 @@ spotexec keeps everything local except the work. Only the heavy commands move, a
 brew install daintreehq/tap/spotexec
 ```
 
-Homebrew works on macOS and Linux, and installs `spotexec`, the `sx` alias and shell completions.
+Homebrew works on macOS and Linux, and installs `spotexec`, the `sx` alias and shell completions for both (`sx` completes its flags and the project's task names).
 
 <details>
 <summary><b>Linux packages</b> (.deb, .rpm, .apk)</summary>
@@ -70,6 +70,8 @@ sudo apt install ./spotexec_*_linux_amd64.deb      # Debian, Ubuntu
 sudo dnf install ./spotexec_*_linux_amd64.rpm      # Fedora, RHEL
 sudo apk add --allow-untrusted ./spotexec_*.apk    # Alpine
 ```
+
+The packages install the `sx` link and bash, zsh and fish completions too.
 
 </details>
 
