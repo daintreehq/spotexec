@@ -523,7 +523,7 @@ var ReservedTaskNames = map[string]bool{
 	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
 	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
 	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
-	"completion": true, "sim": true, "image": true, "daemon": true, "container": true,
+	"completion": true, "sim": true, "image": true, "daemon": true, "container": true, "setup": true,
 }
 
 // globalOnlyKeys are runner settings a project (.spotexec.toml) may not set.
@@ -651,7 +651,7 @@ func (c *Config) Pool(override []string) ([]*Runner, error) {
 		names = c.RunnerNames() // sorted: every process sees the same order
 	}
 	if len(names) == 0 {
-		return nil, fmt.Errorf("no runners configured; add one to %s (see `spotexec init --global`)", c.Global.Path)
+		return nil, fmt.Errorf("no runners configured; add one to %s (or run `spotexec setup`)", c.Global.Path)
 	}
 	var out []*Runner
 	for _, n := range names {

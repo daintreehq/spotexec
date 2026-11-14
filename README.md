@@ -97,10 +97,10 @@ Terminology used throughout this README:
 ### 1. Describe your hardware (once per machine)
 
 ```sh
-spotexec init --global      # writes an example ~/.config/spotexec/config.toml
+spotexec setup              # writes ~/.config/spotexec/config.toml and sets up AWS access
 ```
 
-Edit it so `default_pool` lists only runners you actually have. The template includes an `aws` runner.
+`spotexec setup` writes a starting config with one `aws` runner (in your AWS CLI's default region). If you're signed in to AWS, it also creates a dedicated IAM user and access key for spotexec, so you only ever sign in once; see [the fast path](#the-fast-path-spotexec-setup). Edit the config so `default_pool` lists only runners you actually have, and re-run `spotexec setup` after adding AWS runners.
 
 **Option A: an SSH machine you already own.** Non-interactive key login must already work, and the host key must be in `~/.ssh/known_hosts`, because spotexec runs `ssh -o BatchMode=yes`. Check with `ssh -o BatchMode=yes me@192.168.1.50 true`. Commands run under `bash` with a login profile (`~/.bash_profile`, falling back to `~/.profile`; not `~/.bashrc` or `~/.zprofile`), so your toolchain (`pnpm`, `go`, `cargo`, …) must be on `PATH` there, set by `remote_path_setup`, or come from a [project container](#project-containers).
 
@@ -114,7 +114,7 @@ hosts = ["me@192.168.1.50", "me@homelab.tailnet.ts.net"]   # same machine, two r
 max_slots = 4
 ```
 
-**Option B: AWS Spot, which scales to zero.** First work through [AWS setup](#aws-setup): credentials, region, IAM, Spot quota. VMs boot plain Ubuntu 24.04, so give them your toolchain. Either install it with `bootstrap_script` / `user_bootstrap_script` (see [step 7](#7-configure-the-runner)), or per repo with a [project container](#project-containers) (`spotexec container init`).
+**Option B: AWS Spot, which scales to zero.** Sign in to AWS once and run `spotexec setup`, or work through the manual [AWS setup](#aws-setup): credentials, region, IAM, Spot quota. VMs boot plain Ubuntu 24.04, so give them your toolchain. Either install it with `bootstrap_script` / `user_bootstrap_script` (see [step 7](#7-configure-the-runner)), or per repo with a [project container](#project-containers) (`spotexec container init`).
 
 ```toml
 version = 1
@@ -155,7 +155,28 @@ The first AWS run boots a VM, which takes about a minute plus your bootstrap. La
 
 ## AWS setup
 
-This is the full path from an AWS account to a working Spot fleet. It takes about ten minutes, plus however long a quota increase takes if your account needs one.
+This is the full path from an AWS account to a working Spot fleet. `spotexec setup` automates most of it; the steps below explain each part and how to do it by hand.
+
+### The fast path: `spotexec setup`
+
+```sh
+brew install awscli
+aws login                   # or aws sso login, or aws configure: any identity that can manage IAM users
+spotexec setup              # once per machine
+```
+
+Sign in as an administrator just this once. `spotexec setup` shows what it will do, asks before changing anything, and then:
+1. **Creates an IAM user** for this machine, `spotexec-<hostname>` (path `/spotexec/`, tagged `spotexec-managed`), with only [spotexec's permissions](#3-grant-permissions) as an inline policy.
+2. **Creates an access key** for that user and saves it as the AWS CLI profile `spotexec` (`~/.aws/credentials`, mode 600). It waits until the key works, then deletes any of the user's older keys.
+3. **Points your AWS runners at it** by setting `profile = "spotexec"` in `~/.config/spotexec/config.toml`.
+4. **Prepares the account:** it creates the Spot service-linked role. If the runner's region has no default VPC (common in older accounts), it creates one, which is free (`--no-vpc` skips this).
+5. **Checks your Spot vCPU quota** against what your runners may use.
+
+Your own `aws login` or SSO session can then expire: spotexec keeps working with its own key, which never expires but can only manage spotexec's own resources. Re-run `spotexec setup` after upgrading spotexec to refresh the user's policy, or with `--rotate` to replace the key. `spotexec setup --print-policy` prints the policy, and `--admin-profile`, `--profile` and `--user` change the names it uses.
+
+Prefer not to keep a long-lived key on disk? Skip `setup` (or use `--skip-aws`) and sign in with IAM Identity Center instead ([step 2A](#2-sign-in)). spotexec then works as long as your SSO session lasts.
+
+### Step by step
 
 1. [Install the AWS CLI](#1-install-the-aws-cli)
 2. [Sign in](#2-sign-in)
@@ -192,7 +213,7 @@ aws sso login --profile spotexec       # again whenever the session expires
 aws login --profile spotexec
 ```
 
-**C. IAM user access keys.** The simplest option for a personal account. Use a dedicated user with only the [policy below](#3-grant-permissions), not your root user. Create the user and key from an admin session (or in the IAM console):
+**C. IAM user access keys.** The simplest option for a personal account, and what `spotexec setup` does for you. Use a dedicated user with only the [policy below](#3-grant-permissions), not your root user. To do it by hand, create the user and key from an admin session (or in the IAM console):
 
 ```sh
 aws iam create-user --user-name spotexec
@@ -217,7 +238,7 @@ Credentials resolve in this order:
 
 ### 3. Grant permissions
 
-Attach this policy to the identity you signed in with. Save it as `spotexec-policy.json`. The first three statements are required.
+`spotexec setup` attaches this policy to the user it creates. To grant it yourself, attach it to the identity you signed in with; `spotexec setup --print-policy > spotexec-policy.json` saves it. The first three statements are required.
 
 The other five are optional:
 - S3, for the [dependency cache](#dependency-cache) (without it, set `cache_bucket = "off"` on the runner);
@@ -336,7 +357,7 @@ By default nothing needs setting up. spotexec launches into the region's **defau
 
 Your machine must be able to make outbound SSH connections (TCP 22) to EC2 public addresses. Some corporate networks block this.
 
-If the region has no default VPC (deleted, or blocked by your organization), set `subnet_id` to a **public** subnet: one whose route table sends `0.0.0.0/0` to an internet gateway. spotexec then creates its security group in that subnet's VPC, or uses `security_group_ids` if you set them. Those groups must allow inbound TCP 22 from your address, and outbound HTTP/HTTPS for packages, the S3 cache and ECR.
+If the region has no default VPC, `spotexec setup` offers to create it. When that isn't possible (your organization blocks it, or you'd rather use your own network), set `subnet_id` to a **public** subnet: one whose route table sends `0.0.0.0/0` to an internet gateway. spotexec then creates its security group in that subnet's VPC, or uses `security_group_ids` if you set them. Those groups must allow inbound TCP 22 from your address, and outbound HTTP/HTTPS for packages, the S3 cache and ECR.
 
 ### 7. Configure the runner
 
@@ -403,6 +424,8 @@ If `up` fails, the error says why: a credential problem names the login command 
 
 | Resource | When | Cleanup |
 | --- | --- | --- |
+| IAM user `spotexec-<hostname>` (path `/spotexec/`) with an inline `spotexec` policy and one access key | `spotexec setup` | Delete the user in IAM; also remove the `[spotexec]` profile from `~/.aws/credentials`. |
+| The region's default VPC | `spotexec setup`, only if the region had none | It's AWS's standard network and costs nothing; keep it. |
 | Spot instances tagged `spotexec-runner` / `spotexec-owner` | On demand | They terminate themselves; `spotexec down` terminates them now. |
 | Security group `spotexec-ssh` (`spotexec-ssh-<hash>` for a custom `ssh_cidr`, one per VPC) | First launch without `security_group_ids` | Delete by hand if you stop using spotexec. |
 | S3 bucket `spotexec-cache-<account>-<region>` | First run with `[deps]` (unless `cache_bucket = "off"`) | Objects expire after 14 days. |
@@ -950,6 +973,7 @@ spotexec container init [--path P] [--force] scaffold a Dockerfile and wire it i
 spotexec container build [run flags]         build the project image on a runner now (ECR on AWS)
 spotexec image bake [runner] [--pull IMG]    bake an AMI from the runner's bootstrap
 spotexec image list|clear [runner]           list or delete baked AMIs
+spotexec setup [--yes] [--rotate] [--no-vpc] first-time setup: config, AWS user and key (--print-policy, --skip-aws)
 spotexec doctor [runner...]                  verify config, SSH, helper, credentials, network, quota
 spotexec unlock [runner[/id]] (--slot N | --all)
 spotexec prune [runner[/id]...] [--older-than 7d] [--dry-run]
@@ -967,6 +991,7 @@ spotexec version
 | --- | --- |
 | `~/.config/spotexec/config.toml` | Global config (`SPOTEXEC_CONFIG`, `SPOTEXEC_CONFIG_DIR` or `XDG_CONFIG_HOME` override). |
 | `~/.config/spotexec/keys/` | Generated SSH key for ephemeral runners. |
+| `~/.aws/credentials` `[spotexec]`, `~/.aws/config` `[profile spotexec]` | The access key and region written by `spotexec setup`. |
 | `~/.config/spotexec/owner-id` | This machine's owner tag. Machines only ever see their own instances. |
 | `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
 | `.spotexec.toml`, `.spotexecignore` | Project config and extra sync excludes. |
