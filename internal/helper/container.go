@@ -573,6 +573,14 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	if !imageRefRe.MatchString(run.Image) {
 		return "", nil, nil, fmt.Errorf("invalid image reference %q", run.Image)
 	}
+	// Checked before anything (env-file with secrets) is written.
+	for _, o := range run.Options {
+		if bad := forbiddenOption(o); bad != "" {
+			// These would change what spotexec relies on to stop, find and
+			// clean up the container, or who it runs as (use container.user).
+			return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
+		}
+	}
 	runDir := filepath.Join(s.slotDir, "run")
 	home := filepath.Join(s.slotDir, "home")
 	for _, dd := range []string{runDir, home} {
@@ -618,6 +626,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	}
 	sb.WriteString(script + "\n")
 	if err := os.WriteFile(scriptPath, []byte(sb.String()), 0o600); err != nil {
+		os.Remove(envPath)
 		return "", nil, nil, err
 	}
 	args := []string{
@@ -631,13 +640,6 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	if !run.Root {
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
 			"-v", home+":/home/spotexec", "-e", "HOME=/home/spotexec")
-	}
-	for _, o := range run.Options {
-		if bad := forbiddenOption(o); bad != "" {
-			// These would change what spotexec relies on to stop, find and
-			// clean up the container, or who it runs as (use container.user).
-			return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
-		}
 	}
 	args = append(args, run.Options...)
 	args = append(args, run.Image, "-c",

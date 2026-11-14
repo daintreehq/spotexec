@@ -409,7 +409,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provi
 	case isCode(err, protocol.CodeBootFailed):
 		// The setup itself is broken: another VM would fail the same way.
 		m.fatal = err
-		return nil, nil, OutDraining
+		return nil, nil, OutBootFailed
 	}
 	return nil, nil, OutUnreachable
 }

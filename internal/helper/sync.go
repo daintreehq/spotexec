@@ -444,12 +444,20 @@ func (s *Session) pull(p protocol.Pull) error {
 		}
 		for _, m := range matches {
 			_ = filepath.WalkDir(m, func(fp string, d fs.DirEntry, err error) error {
-				if err != nil || d.IsDir() {
+				if err != nil {
+					return nil
+				}
+				if d.IsDir() {
+					if strings.EqualFold(d.Name(), ".git") {
+						return filepath.SkipDir // never pulled (and not a valid path)
+					}
 					return nil
 				}
 				rel, err := filepath.Rel(s.workspace, fp)
 				if err == nil {
-					files = append(files, filepath.ToSlash(rel))
+					if _, err := fsid.CleanRel(filepath.ToSlash(rel)); err == nil {
+						files = append(files, filepath.ToSlash(rel))
+					}
 				}
 				return nil
 			})

@@ -354,15 +354,18 @@ func (a *AWSSpot) terminateAny(ctx context.Context, id string) error {
 	p.Set("InstanceId.1", id)
 	var b []byte
 	var err error
+	// Just after launch the ID may not be visible yet: retry briefly
+	// (1+2+4+8s), never sleeping after the last attempt.
 	for attempt, wait := 0, time.Second; attempt < 5; attempt, wait = attempt+1, wait*2 {
-		// Just after launch the ID may not be visible yet.
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait / 2):
+			}
+		}
 		if b, err = a.api.ec2(ctx, "DescribeInstances", p); err == nil || awsCode(err) != "InvalidInstanceID.NotFound" {
 			break
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
 		}
 	}
 	if err != nil {

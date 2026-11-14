@@ -35,8 +35,9 @@ type Session struct {
 	lastSeen atomic.Int64
 	// owned is the work root while this session holds a slot (read by the
 	// heartbeat goroutine, so not s.tokens / s.layout directly).
-	owned atomic.Pointer[string]
-	relMu sync.Mutex
+	owned    atomic.Pointer[string]
+	relMu    sync.Mutex
+	stopping atomic.Bool // Shutdown/lastResort own cleanup and exit
 
 	lifecycle   *flock
 	tokens      []*flock
@@ -67,6 +68,7 @@ var current atomic.Pointer[Session]
 // when a blocked read of stdin can't be interrupted.
 func Shutdown(code int) {
 	if s := current.Load(); s != nil {
+		s.stopping.Store(true)
 		if pg := int(s.child.Load()); pg > 0 {
 			killGroup(pg, 2*time.Second)
 		}
@@ -88,6 +90,14 @@ func Serve(in io.Reader, out io.Writer) error {
 	s.lastSeen.Store(time.Now().UnixNano())
 	go s.readLoop()
 	defer s.release()
+	// Registered after release, so it runs first: while Shutdown/lastResort
+	// are cleaning up, wait for them (they exit the process) instead of
+	// releasing and returning underneath them.
+	defer func() {
+		if s.stopping.Load() {
+			select {}
+		}
+	}()
 	go s.lastResort()
 	done := make(chan struct{})
 	defer close(done)
@@ -193,6 +203,7 @@ func (s *Session) lastResort() {
 	for {
 		time.Sleep(5 * time.Second)
 		if time.Since(time.Unix(0, s.lastSeen.Load())) > ClientTimeout+30*time.Second {
+			s.stopping.Store(true)
 			if pg := int(s.child.Load()); pg > 0 {
 				killGroup(pg, 2*time.Second)
 			}

@@ -48,6 +48,7 @@ type note struct {
 	Ready        bool      `json:"ready,omitempty"`
 	ReadyAt      time.Time `json:"ready_at,omitempty"`
 	SawFull      bool      `json:"saw_full,omitempty"` // observed with every slot taken
+	BootFailed   bool      `json:"boot_failed,omitempty"`
 }
 
 type launchRec struct {
@@ -279,6 +280,7 @@ const (
 	OutBooting
 	OutDraining
 	OutUnreachable
+	OutBootFailed // its bootstrap_script failed: draining, and a fleet problem
 )
 
 // Observe records a probe result.
@@ -296,6 +298,8 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 			n.BusyUntil, n.SuspectUntil, n.Failures = now.Add(busyHintFor), time.Time{}, 0
 		case OutDraining:
 			n.Draining = true
+		case OutBootFailed:
+			n.Draining, n.BootFailed = true, true
 		case OutBooting:
 			n.BusyUntil = now.Add(2 * time.Second)
 		case OutUnreachable:
@@ -709,10 +713,13 @@ func (p *Pool) Snapshot(ctx context.Context, force bool) (poolView, error) {
 			return err
 		}
 		v.Instances = st.Instances
-		v.Draining = map[string]bool{}
+		v.Draining, v.BootFailed = map[string]bool{}, map[string]bool{}
 		for id, n := range st.Notes {
 			if n.Draining {
 				v.Draining[id] = true
+			}
+			if n.BootFailed {
+				v.BootFailed[id] = true
 			}
 		}
 		// Launches not yet visible as instances (listed ones are counted
@@ -736,6 +743,7 @@ func (p *Pool) Snapshot(ctx context.Context, force bool) (poolView, error) {
 type poolView struct {
 	Instances     []provider.Instance
 	Draining      map[string]bool
+	BootFailed    map[string]bool
 	Launching     int
 	Demand        int
 	LastLaunchErr string

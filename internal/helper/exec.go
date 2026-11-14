@@ -63,7 +63,7 @@ func wrapScript(script, dir, envFile string) string {
 }
 
 // writeEnvFile writes env as shell exports to a private temp file.
-func writeEnvFile(env map[string]string) (string, error) {
+func writeEnvFile(dir string, env map[string]string) (string, error) {
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		if envKeyRe.MatchString(k) {
@@ -78,7 +78,12 @@ func writeEnvFile(env map[string]string) (string, error) {
 	for _, k := range keys {
 		b.WriteString("export " + k + "=" + shq(env[k]) + "\n")
 	}
-	f, err := os.CreateTemp("", "spotexec-env-*") // 0600
+	// In the private work root, not $TMPDIR (which may be missing,
+	// unwritable, relative, or shared).
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(dir, "env-*") // 0600
 	if err != nil {
 		return "", err
 	}
@@ -87,7 +92,11 @@ func writeEnvFile(env map[string]string) (string, error) {
 		os.Remove(f.Name())
 		return "", err
 	}
-	return f.Name(), f.Close()
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // runProc spawns script in dir as its own process group, streams its output
@@ -104,7 +113,11 @@ type procResult struct {
 
 func (s *Session) runProc(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool) procResult {
 	shell, args := shellPath()
-	envFile, err := writeEnvFile(env)
+	envDir := filepath.Join(s.layout.Root, "tmp")
+	if s.layout.Root == "" {
+		envDir = os.TempDir()
+	}
+	envFile, err := writeEnvFile(envDir, env)
 	if err != nil {
 		return procResult{code: 127, startErr: err}
 	}
@@ -310,6 +323,12 @@ func (s *Session) exec(e protocol.Exec) error {
 		script, runEnv, cleanup = host, hostEnv, c
 	}
 	pr := s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch)
+	if s.stopping.Load() {
+		// The helper is being shut down (SIGTERM/SIGHUP: VM going away,
+		// unlock): the command was killed by us, not finished. Report
+		// nothing, so the client treats the runner as lost (and can replay).
+		select {}
+	}
 	// The container must be gone before we snapshot the workspace: a
 	// container we can't remove could still be writing into it.
 	if err := cleanup(); err != nil {

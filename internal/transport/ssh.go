@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -44,31 +45,29 @@ func New(t provider.Target, workRoot string) *Client {
 // controlDir holds ControlMaster sockets. OpenSSH appends 17 bytes to the
 // path while binding and macOS limits socket paths to 104 bytes, so a long
 // (or missing) home falls back to a short per-user directory in /tmp.
-func controlDir() string {
+func controlDir() string { return controlDirOnce() }
+
+var controlDirOnce = sync.OnceValue(func() string {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".cache", "spotexec", "cm")
-	if home == "" || len(dir)+17+17 > 100 {
-		dir = filepath.Join("/tmp", fmt.Sprintf("sx-cm-%d", os.Getuid()))
-		_ = os.Mkdir(dir, 0o700)
-		// /tmp is shared: use it only if it's really our own private dir.
-		owned := false
-		if fi, err := os.Lstat(dir); err == nil && fi.IsDir() {
-			if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) == os.Getuid() {
-				owned = true
-			}
-		}
-		if !owned {
-			d, err := os.MkdirTemp("", "sx-cm-")
-			if err == nil {
-				return d
-			}
-		}
-		_ = os.Chmod(dir, 0o700)
+	if home != "" && len(dir)+17+17 <= 100 {
+		_ = os.MkdirAll(dir, 0o700)
 		return dir
 	}
-	_ = os.MkdirAll(dir, 0o700)
-	return dir
-}
+	// /tmp is shared: use the per-user dir only if it's really ours and
+	// private; otherwise a fresh private one (short, under /tmp).
+	dir = filepath.Join("/tmp", fmt.Sprintf("sx-cm-%d", os.Getuid()))
+	_ = os.Mkdir(dir, 0o700)
+	if fi, err := os.Lstat(dir); err == nil && fi.IsDir() {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) == os.Getuid() && os.Chmod(dir, 0o700) == nil {
+			return dir
+		}
+	}
+	if d, err := os.MkdirTemp("/tmp", "sx-cm-"); err == nil {
+		return d
+	}
+	return os.TempDir()
+})
 
 func (c *Client) baseArgs(master string) []string {
 	a := []string{
@@ -301,7 +300,10 @@ func (c *Client) EnsureHelper(ctx context.Context, force bool) (string, error) {
 		return "", err
 	}
 	path := c.helperPath(hash)
-	check, err := c.Run(ctx, "test -x "+path+" && echo present || true", nil)
+	check := []byte("")
+	if !force { // a forced reinstall re-uploads even over a present (but broken) binary
+		check, err = c.Run(ctx, "test -x "+path+" && echo present || true", nil)
+	}
 	if err != nil {
 		return "", err
 	}

@@ -548,6 +548,7 @@ func remoteHelper(cmd *cobra.Command, names []string, single bool, args ...strin
 		return err
 	}
 	want := map[string]map[string]bool{} // runner -> instance ids (empty = all)
+	allOf := map[string]bool{}
 	var runnerNames []string
 	for _, n := range names {
 		rn, id, hasID := strings.Cut(n, "/")
@@ -560,6 +561,8 @@ func remoteHelper(cmd *cobra.Command, names []string, single bool, args ...strin
 		}
 		if id != "" {
 			want[rn][id] = true
+		} else {
+			allOf[rn] = true // the bare runner name means every instance
 		}
 	}
 	rs, err := selectRunners(cfg, runnerNames)
@@ -604,6 +607,9 @@ func remoteHelper(cmd *cobra.Command, names []string, single bool, args ...strin
 				continue
 			}
 			ids := want[r.Name]
+			if allOf[r.Name] {
+				ids = nil
+			}
 			found := map[string]bool{}
 			n := 0
 			for _, in := range insts {
@@ -623,6 +629,9 @@ func remoteHelper(cmd *cobra.Command, names []string, single bool, args ...strin
 				fmt.Printf("%s: no running instances, skipped\n", r.Name)
 			}
 			continue
+		}
+		if len(want[r.Name]) > 0 {
+			return fmt.Errorf("%s is a single machine: name it without an instance id", r.Name)
 		}
 		info, err := p.Status(cmd.Context())
 		if err != nil || info.State != provider.StateRunning {
@@ -809,10 +818,7 @@ func cmdPull() *cobra.Command {
 			defer lease.Close()
 			root := l.ws.Root
 			if dest != "" {
-				root = dest
-				if err := os.MkdirAll(root, 0o755); err != nil {
-					return err
-				}
+				root = dest // created by PullArtifacts once validated
 			}
 			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args)
 			if err != nil {

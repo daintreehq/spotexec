@@ -101,7 +101,12 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 			return err
 		}
 		if gotGate && a.Exclusive {
-			if ok := s.tryAll(max); ok {
+			ok := s.tryAll(max)
+			if !ok { // a status probe may hold one token for an instant
+				time.Sleep(25 * time.Millisecond)
+				ok = s.tryAll(max)
+			}
+			if ok {
 				s.gate = gate
 				break
 			}
@@ -264,6 +269,9 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 
 func (s *Session) rollbackAcquire() {
 	s.owned.Store(nil)
+	s.relMu.Lock() // not concurrently with a shutdown's release
+	defer s.relMu.Unlock()
+	defer func() { s.workspace = "" }()
 	for i, t := range s.tokens {
 		if t != nil {
 			_ = os.Remove(s.layout.TokenHolder(s.tokenIdxAt(i)))

@@ -55,3 +55,20 @@ max_instances = 3
 		t.Fatalf("default idle timeout should be 10m, got %s", r.IdleTimeout.Duration)
 	}
 }
+
+func TestEmbeddedArgs(t *testing.T) {
+	for run, want := range map[string]bool{
+		"pytest {args}":             false,
+		`pytest "{args}"`:           false,
+		"(cd pkg && pytest {args})": false,
+		"pnpm vitest run --minWorkers=1 --maxWorkers=$SPOTEXEC_CPUS {args}": false,
+		`sh -c "pytest {args} -v"`:  true,
+		`echo "testing {args} now"`: true,
+		"pytest --k={args}":         true,
+		`sh -c 'pytest {args}'`:     true,
+	} {
+		if got := embeddedArgs(run); got != want {
+			t.Errorf("embeddedArgs(%q) = %v, want %v", run, got, want)
+		}
+	}
+}

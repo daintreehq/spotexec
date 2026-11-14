@@ -721,18 +721,39 @@ func ExpandHome(p string) string {
 	return p
 }
 
-var standaloneArgs = regexp.MustCompile(`(^|\s)("\{args\}"|'\{args\}'|\{args\})(\s|$)`)
-
-// embeddedArgs reports a {args} that is not a word of its own (for example
-// inside "pytest {args}"), where "$@" can't be substituted safely.
+// embeddedArgs reports a {args} that is not a shell word of its own (for
+// example inside "pytest {args}"), where "$@" can't be substituted safely.
+// {args}, "{args}" and '{args}' are fine when they start and end at word
+// boundaries outside any quotes.
 func embeddedArgs(run string) bool {
-	rest := run
-	for {
-		loc := standaloneArgs.FindStringIndex(rest)
-		if loc == nil {
-			break
+	const ph = "{args}"
+	bound := func(c byte) bool { return strings.IndexByte(" \t\n;&|()", c) >= 0 }
+	inS, inD := false, false
+	for i := 0; i < len(run); i++ {
+		c := run[i]
+		if !inS && !inD {
+			for _, form := range []string{ph, `"` + ph + `"`, "'" + ph + "'"} {
+				if strings.HasPrefix(run[i:], form) {
+					end := i + len(form)
+					if (i == 0 || bound(run[i-1])) && (end == len(run) || bound(run[end])) {
+						i = end - 1
+						goto next
+					}
+				}
+			}
 		}
-		rest = rest[:loc[0]] + " " + rest[loc[1]:]
+		if strings.HasPrefix(run[i:], ph) {
+			return true // inside quotes, or glued to other text
+		}
+		switch {
+		case c == '\\' && !inS && i+1 < len(run):
+			i++
+		case c == '\'' && !inD:
+			inS = !inS
+		case c == '"' && !inS:
+			inD = !inD
+		}
+	next:
 	}
-	return strings.Contains(rest, "{args}")
+	return false
 }

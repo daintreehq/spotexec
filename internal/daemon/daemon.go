@@ -270,7 +270,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			delete(fl.seen, id)
 			delete(fl.noticed, id)
 			delete(fl.bootFailed, id)
+			d.mu.Lock()
 			delete(fl.counted, id)
+			d.mu.Unlock()
 		}
 	}
 
@@ -354,36 +356,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		return st // stopping: a cancelled probe proves nothing
 	}
 
-	// 4. Warm pool, after probing so a noticed instance is replaced in the
-	// same pass while its two-minute notice runs. EnsureMin counts under the
-	// pool lock, so launches sx planned meanwhile are included. If instances
-	// keep failing to become healthy, stop launching for a while: a broken
-	// bootstrap or image must not burn money in a loop.
-	d.mu.Lock()
-	var recent []time.Time
-	for _, t := range fl.failures {
-		if time.Since(t) < time.Hour {
-			recent = append(recent, t)
-		}
-	}
-	fl.failures = recent
-	d.mu.Unlock()
-	if len(recent) >= 3 && time.Since(fl.paused) > time.Hour {
-		fl.paused = time.Now()
-		d.action("%s: %d instances failed to become healthy within an hour; pausing warm launches for 1h (check `spotexec doctor` and the bootstrap log)", r.Name, len(recent))
-	}
-	if time.Since(fl.paused) < time.Hour {
-		st.LastError = "warm launches paused after repeated unhealthy instances"
-	} else if r.MinInstances > 0 {
-		if ids, err := fl.pool.EnsureMin(ctx, r.MinInstances); err == nil {
-			for _, id := range ids {
-				d.action("%s: launching to keep %d warm", r.Name, r.MinInstances)
-				d.provision(ctx, fl, id)
-			}
-		}
-	}
-
-	// 5. Replace instances that stopped answering, judged only right after
+	// 4. Replace instances that stopped answering, judged only right after
 	// a probe round. When no instance answered that round it may be our own
 	// network (a firewall blocking SSH, say), so then replace at most one
 	// instance per 30 minutes instead of churning the fleet.
@@ -433,13 +406,25 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			case !stale:
 				why = "first-boot setup never finished"
 			}
-			d.countFailure(fl, in.ID)
+			// The circuit breaker counts instances that never became
+			// healthy; one that served and later hung is not a setup problem.
+			if _, ok := fl.lastOK[in.ID]; !ok || fl.booting[in.ID] {
+				d.countFailure(fl, in.ID)
+			}
 			// Not retried if the request fails: the next probe re-judges it
 			// (it may answer again once the network is back).
-			d.terminate(ctx, fl, in.ID, why, false)
-			if fl.killing[in.ID] != "" {
+			if !d.terminate(ctx, fl, in.ID, why, false) {
 				delete(fl.killing, in.ID)
 			}
+		}
+	}
+
+	// A bootstrap failure an sx client found (it drained the VM): count it
+	// and end the VM now rather than letting it idle out.
+	for id := range view.BootFailed {
+		if listed[id] && fl.killing[id] == "" {
+			d.countFailure(fl, id)
+			d.terminate(ctx, fl, id, "bootstrap_script failed", false)
 		}
 	}
 
@@ -450,6 +435,35 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			(in.State != provider.StateRunning || in.Target.Host == "") {
 			d.countFailure(fl, in.ID)
 			d.terminate(ctx, fl, in.ID, "never became reachable (no address, or stuck pending)", false)
+		}
+	}
+
+	// 5. Warm pool, after probing and replacing so a noticed instance is replaced in the
+	// same pass while its two-minute notice runs. EnsureMin counts under the
+	// pool lock, so launches sx planned meanwhile are included. If instances
+	// keep failing to become healthy, stop launching for a while: a broken
+	// bootstrap or image must not burn money in a loop.
+	d.mu.Lock()
+	var recent []time.Time
+	for _, t := range fl.failures {
+		if time.Since(t) < time.Hour {
+			recent = append(recent, t)
+		}
+	}
+	fl.failures = recent
+	d.mu.Unlock()
+	if len(recent) >= 3 && time.Since(fl.paused) > time.Hour {
+		fl.paused = time.Now()
+		d.action("%s: %d instances failed to become healthy within an hour; pausing warm launches for 1h (check `spotexec doctor` and the bootstrap log)", r.Name, len(recent))
+	}
+	if time.Since(fl.paused) < time.Hour {
+		st.LastError = "warm launches paused after repeated unhealthy instances"
+	} else if r.MinInstances > 0 {
+		if ids, err := fl.pool.EnsureMin(ctx, r.MinInstances); err == nil {
+			for _, id := range ids {
+				d.action("%s: launching to keep %d warm", r.Name, r.MinInstances)
+				d.provision(ctx, fl, id)
+			}
 		}
 	}
 
@@ -482,7 +496,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 // terminate ends an instance, retrying on later passes until it is gone
 // from listings. It is marked draining locally only once the request
 // succeeds, so a failed call is never forgotten.
-func (d *Daemon) terminate(ctx context.Context, fl *fleet, id, why string, retry bool) {
+func (d *Daemon) terminate(ctx context.Context, fl *fleet, id, why string, retry bool) bool {
 	if !retry {
 		d.action("%s: terminating %s: %s", fl.r.Name, id, why)
 	}
@@ -491,10 +505,11 @@ func (d *Daemon) terminate(ctx context.Context, fl *fleet, id, why string, retry
 		if !retry {
 			d.action("%s: terminating %s failed: %v", fl.r.Name, id, err)
 		}
-		return
+		return false
 	}
 	fl.pool.Observe(id, client.OutDraining, time.Time{})
 	delete(fl.lastOK, id)
+	return true
 }
 
 // drainRemote tells a retiring VM to drain: running jobs finish, new ones
@@ -544,7 +559,7 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string) {
 		in, err := fl.pool.ProvisionHeld(pctx, id, nil)
 		if err != nil {
 			d.action("%s: launch failed: %v", fl.r.Name, err)
-			d.countFailure(fl, "launch:"+id) // a launch that never became usable
+			d.countFailure(fl, "") // a launch that never became usable
 			return
 		}
 		d.action("%s: %s running at %s", fl.r.Name, in.ID, in.Target.Host)
@@ -598,7 +613,7 @@ func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instan
 			}
 			answered++
 			mu.Unlock()
-			if hs.SpotNotice != "" || hs.Draining {
+			if (hs.SpotNotice != "" || hs.Draining) && hs.BootFailed == "" {
 				// Replace it now, during the two-minute notice, rather than
 				// after the instance vanishes from listings.
 				fl.pool.Observe(in.ID, client.OutDraining, in.LaunchedAt)
@@ -653,9 +668,11 @@ func ReadStatus() (*Status, error) {
 func (d *Daemon) countFailure(fl *fleet, id string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if fl.counted[id] {
-		return
+	if id != "" {
+		if fl.counted[id] {
+			return
+		}
+		fl.counted[id] = true
 	}
-	fl.counted[id] = true
 	fl.failures = append(fl.failures, time.Now())
 }

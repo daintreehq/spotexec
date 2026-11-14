@@ -35,18 +35,22 @@ func depsKey(ws string, d protocol.Deps) (string, error) {
 // never a synced (source) file: a broad pattern like "vendor/*" may match
 // tracked files, which are not dependency output.
 func (s *Session) clearCacheDirs(base string, patterns []string) error {
+	return clearCacheDirs(base, patterns, s.holdsSynced)
+}
+
+// holdsSynced reports whether rel is, contains, or lies inside a synced
+// (source) file: dependency handling must never replace those.
+func (s *Session) holdsSynced(rel string) bool {
 	s.loadStored()
-	return clearCacheDirs(base, patterns, func(rel string) bool {
-		if _, ok := s.stored[rel]; ok {
+	if _, ok := s.stored[rel]; ok {
+		return true
+	}
+	for p := range s.stored {
+		if strings.HasPrefix(p, rel+"/") || strings.HasPrefix(rel, p+"/") {
 			return true
 		}
-		for p := range s.stored {
-			if strings.HasPrefix(p, rel+"/") {
-				return true
-			}
-		}
-		return false
-	})
+	}
+	return false
 }
 
 func clearCacheDirs(base string, patterns []string, synced func(string) bool) error {
@@ -257,7 +261,12 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		}
 		return perr(protocol.CodeDepsFailed, "%s", msg)
 	}
-	dirs := expandCacheDirs(s.workspace, d.CacheDirs)
+	var dirs []string
+	for _, rel := range expandCacheDirs(s.workspace, d.CacheDirs) {
+		if !s.holdsSynced(rel) { // source files are never cached output
+			dirs = append(dirs, rel)
+		}
+	}
 	tmp := fmt.Sprintf("%s.tmp-%d", cacheRoot, os.Getpid())
 	_ = os.RemoveAll(tmp)
 	if err := os.MkdirAll(tmp, 0o755); err != nil {
@@ -302,6 +311,12 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 		src, err := fsid.SafeJoin(cacheRoot, rel)
 		if err != nil {
 			return "", err
+		}
+		if s.holdsSynced(rel) {
+			continue // source files live here: never overwrite them
+		}
+		if fi, err := os.Lstat(src); err != nil || !fi.IsDir() {
+			return "", fmt.Errorf("dependency cache entry %q is not a directory", rel)
 		}
 		dst, err := fsid.PrepareParent(s.workspace, rel)
 		if err != nil {

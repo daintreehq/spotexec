@@ -115,13 +115,27 @@ func (c *Client) open(ctx context.Context, path string) (*Session, error) {
 			s.Close() // the helper answered: report what it said
 			return nil, err
 		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			// No handshake in time while our caller still waits: a wedged
+			// link. Don't Close (Bye would let a slow helper exit 0 and look
+			// broken); drop the master so the next attempt dials afresh.
+			s.Abort()
+			c.CloseMaster()
+			return nil, &ConnError{Target: c.T.String(), Msg: "no handshake from the helper", Err: err}
+		}
 		s.Close()
 		switch code := s.exitCode(); {
 		case code == 0:
 			// The helper started and ended cleanly but no handshake (stray
 			// output from a shell profile, or an incompatible helper): not
 			// a connection problem, so Open may reinstall it.
-			return nil, s.wrap(err)
+			s.errMu.Lock()
+			rerr := s.err
+			s.errMu.Unlock()
+			if rerr == nil || errors.Is(rerr, io.EOF) {
+				rerr = io.ErrUnexpectedEOF
+			}
+			return nil, fmt.Errorf("helper ended without a handshake: %w", s.wrap(rerr))
 		case code == 255:
 			return nil, &ConnError{Target: c.T.String(), Msg: s.stderr.String(), Err: err}
 		case code > 0:

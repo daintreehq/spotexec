@@ -386,8 +386,9 @@ func stashConflict(dir, p string, want version, rf remoteFile) error {
 	err := writeLocal(dir, p, rf, nil)
 	if err != nil && (errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST)) {
 		// A directory/file collision inside the stash itself (a path that
-		// was a directory and is now a file): keep it beside, renamed.
-		return writeLocal(dir, p+".remote", rf, nil)
+		// was a directory and is now a file): keep it at the top of the
+		// stash under a flattened name, where nothing can be in the way.
+		return writeLocal(dir, strings.ReplaceAll(p, "/", "__")+".remote", rf, nil)
 	}
 	return err
 }
@@ -424,7 +425,7 @@ func writeLocal(root, p string, rf remoteFile, expect *version) error {
 	}
 	if fi, err := os.Lstat(full); err == nil && fi.IsDir() {
 		os.Remove(tmp)
-		return fmt.Errorf("a directory exists at %s", p)
+		return fmt.Errorf("a directory exists at %s: %w", p, syscall.EISDIR)
 	}
 	if expect != nil {
 		if now, err := localVersion(root, p); err != nil || !now.eq(*expect) {
@@ -479,7 +480,7 @@ func readTar(r io.Reader, fn func(*tar.Header, io.Reader) error) error {
 			return err
 		}
 		if _, err := fsid.CleanRel(h.Name); err != nil {
-			return err
+			continue // never a name we asked for: skip it, don't abort
 		}
 		if err := fn(h, tr); err != nil {
 			return err
@@ -543,8 +544,16 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
-	if r, err := filepath.EvalSymlinks(root); err == nil {
-		root = r
+	root = resolveExisting(root)
+	if g := ws.GitDir; g != "" {
+		if rg := resolveExisting(g); root == rg || strings.HasPrefix(root, rg+string(filepath.Separator)) {
+			return 0, fmt.Errorf("pull: refusing to write into the git directory")
+		}
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(root), "/") {
+		if strings.EqualFold(seg, ".git") {
+			return 0, fmt.Errorf("pull: refusing to write into a .git directory")
+		}
 	}
 	protected := map[string]bool{}
 	rel, relErr := filepath.Rel(ws.Root, root)
@@ -553,6 +562,9 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	}
 	if rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") && reservedPath(filepath.ToSlash(rel), ws.Git) {
 		return 0, fmt.Errorf("pull: refusing to write into %s", rel)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return 0, err
 	}
 	if rel != ".." && !strings.HasPrefix(rel, "../") {
 		prefix := ""
@@ -685,4 +697,21 @@ func protectedPaths(ctx context.Context, root string, paths []string) (map[strin
 		}
 	}
 	return out, nil
+}
+
+// resolveExisting resolves symlinks in the deepest existing ancestor of p
+// and re-joins the rest (EvalSymlinks fails on paths that don't exist yet).
+func resolveExisting(p string) string {
+	rest := ""
+	for cur := p; ; {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(r, rest)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
 }

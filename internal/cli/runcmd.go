@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,6 +168,10 @@ func rewriteRoot(s, root, toRoot string, snippet bool) string {
 			switch {
 			case snippet && !inSingle:
 				b.WriteString("${SPOTEXEC_WORKSPACE:?}") // aborts rather than expanding to "" if unset
+			case snippet:
+				// Inside single quotes: close them, splice the variable in
+				// double quotes, reopen ('a/x' -> ''"$W"'/x').
+				b.WriteString(`'"${SPOTEXEC_WORKSPACE:?}"'`)
 			default:
 				b.WriteString(toRoot)
 			}
@@ -357,7 +362,12 @@ func runLocal(l *loaded, command string) int {
 	// The command was written for the runner: worktree paths in it were
 	// rewritten to ${SPOTEXEC_WORKSPACE}, which here is the worktree itself
 	// (unset, "rm -rf ${SPOTEXEC_WORKSPACE}/tmp" would mean /tmp).
-	cmd.Env = append(os.Environ(), "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
+	cmd.Env = os.Environ()
+	for k, v := range l.cfg.Project.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	cmd.Env = append(cmd.Env, "SPOTEXEC=1", "CI=true", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1",
+		"SPOTEXEC_CPUS="+strconv.Itoa(runtime.NumCPU()), "SPOTEXEC_SLOTS=1", "SPOTEXEC_SLOT=0", "SPOTEXEC_PORT_BASE=20000")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError

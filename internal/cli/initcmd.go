@@ -347,6 +347,9 @@ func cmdHook() *cobra.Command {
 		Args:               cobra.MinimumNArgs(1),
 		DisableFlagParsing: true, // the command's own flags (pytest -x) are not ours
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 && isHelpFlag(args[0]) {
+				return cmd.Help()
+			}
 			wd, _ := os.Getwd()
 			l, err := load(wd)
 			if err != nil {
@@ -368,6 +371,8 @@ func cmdHook() *cobra.Command {
 				fmt.Println("local")
 			case !hooks.CdsInside(line, wd):
 				fmt.Println("local (cd leaves the repository)")
+			case l.cfg.Project.Hook.WhenLoadAbove > 0 && belowLoad(l.cfg.Project.Hook.WhenLoadAbove):
+				fmt.Printf("local (load per CPU is below when_load_above = %.2f)\n", l.cfg.Project.Hook.WhenLoadAbove)
 			default:
 				fmt.Println("offload:", hooks.Wrap("spotexec", line))
 				return nil
@@ -400,4 +405,9 @@ func detectRegion() string {
 		}
 	}
 	return "us-east-1"
+}
+
+func belowLoad(threshold float64) bool {
+	l, err := hooks.LoadPerCPU()
+	return err != nil || l < threshold
 }

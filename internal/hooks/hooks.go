@@ -42,7 +42,7 @@ var DefaultPatterns = []string{
 // Words are matched as whole command words, not inside paths: a test file
 // under ~/dev/ or src/watch.test.ts is not a dev server.
 var DefaultExclude = []string{
-	`--watch\b`, `(^|\s|:)(watch|dev|serve|start)(\s|:|$)`, `--ui\b`, `(^|\s)sx(\s|$)`, `(^|[\s/])spotexec(\s|$)`,
+	`--watch\b`, `(^|\s|:)(watch|serve)(\s|:|$)`, `(^|\s)(dev|start)(\s|:|$)`, `--ui\b`, `(^|\s)sx(\s|$)`, `(^|[\s/])spotexec(\s|$)`,
 	// The agent's explicit opt-out for one command.
 	`(^|\s)SPOTEXEC_LOCAL=1(\s|$)`,
 }

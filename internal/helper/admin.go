@@ -241,6 +241,14 @@ func Prune(w io.Writer, root string, maxAge time.Duration, dryRun bool) error {
 			freed++
 		}
 	}
+	// Env files of runs whose helper was killed (they hold job secrets).
+	if ents, err := os.ReadDir(filepath.Join(root, "tmp")); err == nil && !dryRun {
+		for _, e := range ents {
+			if fi, err := e.Info(); err == nil && strings.HasPrefix(e.Name(), "env-") && time.Since(fi.ModTime()) > time.Hour {
+				_ = os.Remove(filepath.Join(root, "tmp", e.Name()))
+			}
+		}
+	}
 	if d, err := probeDocker(context.Background()); err == nil && !dryRun {
 		if len(readHolders(l)) > 0 {
 			// A session may be between preparing its image and running it.
