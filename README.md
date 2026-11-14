@@ -33,7 +33,7 @@
 </p>
 
 <p align="center">
-  <code>sx</code> is short for <code>spotexec run --</code>, and works with any command: <code>sx&nbsp;cargo&nbsp;build</code>.
+  <code>sx</code> works with any command, as in <code>sx&nbsp;cargo&nbsp;build</code>, and runs your project's tasks by name: <code>sx&nbsp;test</code>.
 </p>
 
 ## Why spotexec
@@ -109,7 +109,7 @@ aws login              # or: aws sso login, aws configure
 spotexec setup
 ```
 
-Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. Finally it offers to bake an image, so new VMs skip their bootstrap. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
+Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. The fleet uses 8-vCPU VMs; on a new account whose quota can't fit one (often 5 vCPUs), setup switches it to 4-vCPU VMs and prints the command to raise the quota. Finally it offers to bake an image, so new VMs skip their bootstrap. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
 
 **An SSH machine you already own**, such as a Linux box or a spare Mac. Key login must already work. Put it in `~/.config/spotexec/config.toml`:
 
@@ -152,7 +152,7 @@ spotexec status                # what's running where, and idle timers
 
 Files the command changes come back. Ignored outputs such as coverage reports need `pull_artifacts` in `.spotexec.toml`, or a flag like `--pull coverage/`; see [write-back and artifacts](docs/running.md#write-back-and-artifacts).
 
-The first AWS run boots a VM, which takes about a minute plus your bootstrap; meanwhile `sx` shows how long it has been going and the latest line of the VM's bootstrap log. Later runs reuse it until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
+The first AWS run boots a VM, which takes about a minute plus your bootstrap, and builds the project container there; later VMs pull the built image instead. While it boots, `sx` shows how long it has been going and the latest line of the VM's bootstrap log. Later runs reuse the VM until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
 
 ## With coding agents
 

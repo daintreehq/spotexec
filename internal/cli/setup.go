@@ -31,19 +31,27 @@ func cmdSetup() *cobra.Command {
 		Short: "First-time setup: runner config, plus a dedicated AWS user so you only sign in once",
 		Long: `First-time setup for this machine.
 
-1. Writes ~/.config/spotexec/config.toml if it doesn't exist yet.
+1. Writes ~/.config/spotexec/config.toml if it doesn't exist yet, with an
+   AWS Spot fleet of 8-vCPU VMs (4-vCPU ones when the account's Spot quota
+   can't fit one).
+
 2. For AWS runners, uses your current AWS sign-in once to create a dedicated
    IAM user with only spotexec's permissions, saves its access key as an AWS
    CLI profile ("spotexec"), and points the runners at it. spotexec then
-   keeps working when your own AWS session (aws login, SSO) expires.
+   keeps working when your own AWS session (aws login, SSO) expires. It also
+   checks the Spot vCPU quota, and offers to request more when not even one
+   VM fits.
 
-3. Sets up other machines over SSH: the hosts you name, or (interactively)
+3. If Claude Code is installed, offers its hook, so agents' heavy commands
+   run on your runners (--no-hooks skips it).
+
+4. Sets up other machines over SSH: the hosts you name, or (interactively)
    the ones you pick from those found on your network and in ~/.ssh/config.
    Each gets spotexec installed (Homebrew when it has it, otherwise the
    release binary in ~/.local/bin), a copy of this runner config, and its
    own IAM user and key, created with your AWS sign-in on this machine.
 
-4. For AWS runners without a current baked image, offers to bake one
+5. For AWS runners without a current baked image, offers to bake one
    (about 10-15 minutes), so new VMs skip their bootstrap. --yes skips the
    offer; --bake bakes without asking.
 
@@ -249,7 +257,7 @@ and keeps a working key. --rotate replaces the key.
 	c.Flags().StringVar(&user, "user", "", "IAM user name (default: spotexec-<hostname>)")
 	c.Flags().BoolVarP(&yes, "yes", "y", false, "don't ask for confirmation")
 	c.Flags().BoolVar(&rotate, "rotate", false, "replace the access key even if the current one works")
-	c.Flags().BoolVar(&skipAWS, "skip-aws", false, "only write the runner config")
+	c.Flags().BoolVar(&skipAWS, "skip-aws", false, "skip the AWS steps (IAM user and key, network, quota)")
 	c.Flags().BoolVar(&all, "all", false, "also update every machine set up from here before (config, spotexec version, AWS policy)")
 	c.Flags().BoolVar(&list, "list", false, "list every machine's spotexec IAM user, keys and running VMs, then exit")
 	c.Flags().StringVar(&revoke, "revoke", "", "delete a machine's IAM user and keys and terminate its VMs (host or IAM user name), then exit")

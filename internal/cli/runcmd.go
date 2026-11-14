@@ -49,7 +49,7 @@ type runFlags struct {
 func (f *runFlags) register(fs *pflag.FlagSet) {
 	f.fs = fs
 	fs.DurationVar(&f.timeout, "timeout", 0, "wall-clock limit for the command (default 5m or .spotexec.toml timeout)")
-	fs.DurationVar(&f.queueTimeout, "queue-timeout", 0, "how long to wait for a free slot")
+	fs.DurationVar(&f.queueTimeout, "queue-timeout", 0, "how long to wait for a free slot (default 10m or .spotexec.toml queue_timeout)")
 	fs.StringVar(&f.sync, "sync", "", "sync mode: auto (bidirectional), in (no write-back), none")
 	fs.StringVar(&f.writeback, "writeback", "", "write-back policy: always, on-success, never")
 	fs.StringSliceVar(&f.pool, "pool", nil, "runner names to use (comma-separated)")

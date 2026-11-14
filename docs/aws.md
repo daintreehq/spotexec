@@ -146,10 +146,10 @@ The `region` in your `~/.aws/config` profile is **not** used at run time, so set
 
 Pick the region that is:
 - **Closest to you.** Every run makes several SSH round trips (handshake, sync, streaming output, write-back). A nearby region keeps small commands under a second of overhead.
-- **Stocked with your instance types.** The spotexec policy allows these read-only `Describe*` lookups (add `--profile spotexec`). For example, check that the region offers `c7a.xlarge`:
+- **Stocked with your instance types.** The spotexec policy allows these read-only `Describe*` lookups (add `--profile spotexec`). For example, check that the region offers the starter config's types:
   ```sh
   aws ec2 describe-instance-type-offerings --region us-east-2 \
-    --filters Name=instance-type,Values=c7a.large,c7a.xlarge --query 'InstanceTypeOfferings[].InstanceType'
+    --filters Name=instance-type,Values=c7a.2xlarge,m7a.2xlarge,c6a.2xlarge --query 'InstanceTypeOfferings[].InstanceType'
   ```
 - **Cheap and roomy for Spot.** Compare current prices, and ask AWS how likely a request is to be filled (scores 1–10; `get-spot-placement-scores` isn't in the spotexec policy, so run it from an admin session):
   ```sh
@@ -176,7 +176,7 @@ To span regions, define one runner per region and order them with `priority`, so
 
 Spot capacity is limited by a per-region vCPU quota, *All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests* (`L-34B43A08`). New accounts often start very low, sometimes 5 vCPUs: enough for one 4-vCPU VM, but not one 8-vCPU VM. `spotexec setup` sizes the starter fleet to it (4-vCPU VMs when an 8-vCPU one doesn't fit) and offers to request an increase when not even one VM fits.
 
-You need at least `max_instances × vCPUs per instance`, summed over every fleet in the region. For example, 4 × `c7a.xlarge` needs 16 vCPUs. `spotexec doctor` shows the current value and what the runner may use; it fails only when not even one VM fits, and prints the increase command whenever the quota limits the fleet. To check or raise it:
+You need at least `max_instances × vCPUs per instance`, summed over every fleet in the region. For example, the starter fleet of 4 × `c7a.2xlarge` (8 vCPUs each) needs 32 vCPUs, or 16 once setup has switched it to 4-vCPU VMs. `spotexec doctor` shows the current value and what the runner may use; it fails only when not even one VM fits, and prints the increase command whenever the quota limits the fleet. To check or raise it:
 
 ```sh
 aws service-quotas get-service-quota --profile spotexec --region us-east-2 \
@@ -285,13 +285,14 @@ If `up` fails, the error says why: a credential problem names the login command 
 
 | Resource | When | Cleanup |
 | --- | --- | --- |
-| IAM user `spotexec-<hostname>` (path `/spotexec/`) with an inline `spotexec` policy and one access key | `spotexec setup` | Delete the user in IAM; also remove the `[spotexec]` profile from `~/.aws/credentials`. |
+| IAM user `spotexec-<hostname>` (path `/spotexec/`) with an inline `spotexec` policy and one access key | `spotexec setup` | `spotexec setup --revoke <host>` for one machine ([revoking a machine](setup.md#revoking-a-machine)), or `spotexec teardown`. Then remove the `[spotexec]` profile from that machine's `~/.aws/credentials`. |
 | The region's default VPC | `spotexec setup`, only if the region had none | It's AWS's standard network and costs nothing; keep it. |
-| Spot instances tagged `spotexec-runner` / `spotexec-owner` | On demand | They terminate themselves; `spotexec down` terminates them now. |
+| Spot instances tagged `spotexec-runner` / `spotexec-owner` | On demand | They terminate themselves; `spotexec down <runner>` (or `--all` for every fleet) terminates this machine's now, `spotexec down -A` every machine's. |
+| On-demand `image bake` builders tagged `spotexec-bake-runner` / `spotexec-owner` | `spotexec image bake` | Terminated when the bake ends. One left behind (stopped, or older than four hours) is terminated by `spotexec down <runner>` or the pool manager; `spotexec down -A` terminates any machine's builders at once. |
 | Security group `spotexec-ssh` (`spotexec-ssh-<hash>` for a custom `ssh_cidr`, one per VPC), tagged `spotexec-owner` | First launch without `security_group_ids` | `spotexec teardown` (below). |
-| S3 bucket `spotexec-cache-<account>-<region>` | First run with `[deps]` (unless `cache_bucket = "off"`) | Objects expire after 14 days. |
-| ECR repositories `spotexec/<repo-id>` | First Dockerfile build | Keeps the newest 10 images. |
-| AMIs and snapshots | `spotexec image bake` | `spotexec image clear`. |
+| S3 bucket `spotexec-cache-<account>-<region>` | First run with `[deps]` (unless `cache_bucket = "off"`) | Objects expire after 14 days; `spotexec teardown` deletes the bucket. |
+| ECR repositories `spotexec/<repo-id>` | First Dockerfile build | Keeps the newest 10 images; `spotexec teardown` deletes the repositories. |
+| AMIs and snapshots | `spotexec image bake` | `spotexec image clear`, or `spotexec teardown`. |
 
 To remove all of it at once, run `spotexec teardown` while signed in as an administrator. It searches every region enabled in the account (or those you pass with `--region`) and lists every instance, AMI, snapshot, security group, ECR repository, cache bucket and IAM user spotexec created, from any machine. It asks before deleting them (`--dry-run` only lists them; `--yes` skips the question). It then deactivates every machine's key, so nothing new is launched, terminates the VMs (including any launched in the meantime) and waits until they're gone before removing the rest. It reports anything it couldn't list or delete with a non-zero exit, so you can re-run it. It only touches resources with spotexec's tags or exact names: a `cache_bucket` you named yourself, a security group you made, an untagged snapshot or an IAM user outside `/spotexec/` is left alone. So are the default VPC and the Spot service-linked role. Delete `~/.config/spotexec` and the `[spotexec]` profile yourself.
 
@@ -301,7 +302,7 @@ The SSH key is generated locally at `~/.config/spotexec/keys/id_ed25519` and inj
 
 The fleet shuts itself down without your laptop. One case is not covered: a VM whose kernel hangs before its timers fire. For a backstop that is fully independent of spotexec, add either of these to your account:
 - an **AWS Budgets** alert;
-- an **EventBridge** rule that terminates `spotexec-runner`-tagged instances older than N hours.
+- an **EventBridge** rule that terminates instances older than N hours that carry a `spotexec-runner` tag (fleet VMs) or a `spotexec-bake-runner` tag (`image bake` builders, which are on-demand).
 
 `spotexec status` lists pending and running instances only. Stopped instances (whose volumes still bill) don't appear there; `spotexec down` terminates them along with the rest. `spotexec status -A` lists every spotexec instance in any state but terminated, including `image bake` builders, and `spotexec down -A` terminates them. Both search the regions (and profiles) your AWS runners use, say which, and fail if a region couldn't be listed.
 

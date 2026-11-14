@@ -2,12 +2,12 @@
 
 ```sh
 sx [flags] <command> [args...]        # run a command remotely
-sx [flags] -- <command> [args...]     # same, when the command is named like a subcommand
-sx <task> [args...]                   # named task from .spotexec.toml
+sx [flags] <task> [args...]           # named task from .spotexec.toml
+sx [flags] -- <command> [args...]     # the command, even if a task has its name
 sx --same-slot <command>              # run on the same VM and slot as this worktree's last run
 ```
 
-`sx` only runs things: every word after its flags is a command or one of this project's tasks, never a spotexec subcommand, so `sx build` runs your `build` task and `sx status` runs a program called `status`. Manage runners with `spotexec` (`spotexec status`, `spotexec doctor`, …), and use `sx -h` for the run flags and this project's tasks. `spotexec <command>` (or `spotexec -- <command>`) also runs a command, as long as it isn't named like a subcommand.
+`sx` only runs things: every word after its flags is a command or one of this project's tasks, never a spotexec subcommand, so `sx status` runs a program called `status`. A task wins over a program of the same name: `sx build` runs your `build` task, and `sx -- build` runs the program called `build`. `spotexec run -- <command>` is the same as `sx -- <command>`: it never runs a task, which is why the [agent hook](agents.md#claude-code-hook) rewrites commands to it. Manage runners with `spotexec` (`spotexec status`, `spotexec doctor`, …), and use `sx -h` for the run flags and this project's tasks. `spotexec <command>` works like `sx <command>` as long as the command isn't named like a spotexec subcommand; `spotexec -- <command>` runs it whatever its name.
 
 `sx` stops reading its own flags at the first word that isn't one, so `sx pnpm vitest run --watch=false` passes everything after `pnpm` through unchanged. Several arguments are shell-quoted one by one, except leading `NAME=value` words, which stay environment assignments whatever the value holds: `sx NODE_OPTIONS="--max-old-space-size=8192 --no-warnings" pnpm test`. A single argument runs as a shell line, as in `sx 'pnpm lint && pnpm test'`. Absolute paths under your worktree are mapped to the remote workspace.
 
@@ -17,7 +17,7 @@ The synced project is the enclosing Git worktree, or the nearest directory with 
 
 Plain `sx` takes the first free slot. It prefers the one that already holds this worktree's files, so reruns usually land on the same VM, but that isn't guaranteed: the slot may be busy with another worktree, or the VM may have shut down after `idle_timeout`.
 
-When the machine's state matters, use `--same-slot`. It syncs, runs and writes back as usual, but only in the slot this worktree used last, waiting for it if it's busy. While it waits it takes none of the machine's capacity, so other runs keep using the free slots; `spotexec status` lists it as waiting. That's the slot `spotexec status` shows and `spotexec pull` reads from. A typical agent loop:
+When the machine's state matters, use `--same-slot`. It syncs, runs and writes back as usual, but only in the slot this worktree used last, waiting for it if it's busy. While it waits it takes none of the machine's capacity, so other runs keep using the free slots; `spotexec status` lists it as waiting. That's the slot `spotexec status` shows and `spotexec pull` reads from. A typical agent loop, on a runner without a project container:
 
 ```sh
 sx pnpm test                                   # fails: libvips is missing
@@ -25,18 +25,18 @@ sx --same-slot 'sudo apt-get install -y libvips-dev'
 sx --same-slot pnpm test                       # same VM, so libvips is there
 ```
 
-If that VM is gone (or `max_slots` has since dropped below that slot's number), `--same-slot` fails (exit `125`) and says so, rather than running somewhere the package isn't installed. So does `--same-slot` with a `--runner` or `--pool` that leaves out the runner it would return to. For anything you'd need on every VM, put it in the [project container](environments.md#project-containers) or the runner's `bootstrap_script`. Set `SPOTEXEC_SAME_SLOT=1` to make every `sx` in a shell behave this way.
+If that VM is gone (or `max_slots` has since dropped below that slot's number), `--same-slot` fails (exit `125`) and says so, rather than running somewhere the package isn't installed. So does `--same-slot` with a `--runner` or `--pool` that leaves out the runner it would return to. For anything you'd need on every VM, put it in the [project container](environments.md#project-containers) or the runner's `bootstrap_script`. In a project container, every run starts a fresh container: files in the workspace and `$HOME` carry over to the next `--same-slot` run, but system packages don't (spotexec warns `CONTAINER_FRESH`), so add them to the Dockerfile. Set `SPOTEXEC_SAME_SLOT=1` to make every `sx` in a shell behave this way.
 
 A parallel task's parts run in several slots at once, so `--same-slot` can't apply to the task itself. Afterwards, `--same-slot` returns to the slot of its first part (in `parallel` order) that got its files synced and its container image, if any, ready; that's the same point at which a single run becomes the one `--same-slot` returns to.
 
-`--same-slot --sync none` skips the sync and the write-back, and runs on whatever is in the slot, for poking around after a failure. `spotexec exec -- <command>` is the same thing.
+`--same-slot --sync none` skips the sync and the write-back, and runs on whatever is in the slot, for poking around after a failure. `spotexec exec -- <command>` is the same as `sx --same-slot --sync none -- <command>`.
 
 ## Run flags
 
 | Flag | Meaning |
 | --- | --- |
 | `--timeout D` | Wall-clock limit (default `5m`, or the project `timeout`). |
-| `--queue-timeout D` | How long to wait for a free slot (default `10m`). |
+| `--queue-timeout D` | How long to wait for a free slot (default `10m`, or the project `queue_timeout`). |
 | `--sync auto\|in\|none` | `auto` syncs and writes back; `in` syncs and discards changes; `none` runs on whatever the slot has. |
 | `--writeback always\|on-success\|never` | When changes come back. |
 | `-r, --runner NAME` / `--pool A,B` | Restrict where the command may run. |
@@ -49,7 +49,7 @@ A parallel task's parts run in several slots at once, so `--same-slot` can't app
 | `--no-retry` | Don't replay the run if its VM is lost. |
 | `--fallback-local` | Run locally if no runner could be reached (never after the command started remotely). It runs as on a runner: under `bash` in its own process group, with stdin from `/dev/null`, the same `--timeout` (exit `124`) and grace period, and Ctrl-C, `SIGTERM` or `SIGHUP` stopping it (exit `130`). Each part of a parallel task falls back on its own, with its own `SPOTEXEC_SLOT` and port range. |
 | `--force-large-sync` | Allow syncing more than 100k files or 5 GiB. |
-| `--json` / `--pretty` / `-q, --quiet` | Progress format: NDJSON events, the spinner (even without a terminal), or warnings only (no progress or summary). Without them you get the spinner at a terminal and one plain summary line otherwise (NDJSON with `SPOTEXEC_AGENT=1`). |
+| `--json` / `--pretty` / `-q, --quiet` | Progress format: NDJSON events, the spinner (even without a terminal), or warnings only (no progress or summary). `-q` wins over `--json`, and `--json` over `--pretty`. Without them you get the spinner at a terminal and one plain summary line otherwise, or NDJSON with `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1` (`-q`, `--json`, `--pretty` and `--json=false` override those). |
 | `--events-file PATH` | Also append NDJSON events to a file. |
 | `-C, --dir DIR` | Run as if started in `DIR`. |
 

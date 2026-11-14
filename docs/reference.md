@@ -2,11 +2,12 @@
 ## Command reference
 
 ```
-sx [flags] <command...>                      run remotely (shorthand for `spotexec run --`)
-sx <task> [args...]                          named task; parallel tasks fan out across slots
-spotexec run [flags] -- <cmd>                sync, run, write back
+sx [flags] <command...>                      sync, run remotely, write back
+sx [flags] <task> [args...]                  named task; parallel tasks fan out across slots
+sx [flags] -- <command...>                   the command, even if a task has its name
+spotexec run [flags] -- <cmd>                the same as sx --: <cmd> is never a task
 sx --same-slot [flags] <cmd>                 run in this worktree's last slot (same VM)
-spotexec exec [flags] -- <cmd>               same as sx --same-slot --sync none
+spotexec exec [flags] -- <cmd>               same as sx --same-slot --sync none -- <cmd>
 spotexec tasks                               list tasks from .spotexec.toml
 spotexec sync [flags]                        pre-sync a slot (and build the container image, install deps)
 spotexec sync-plan [--json]                  dry-run the sync: files, bytes, largest files, exclusions

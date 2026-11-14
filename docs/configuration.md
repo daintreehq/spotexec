@@ -9,18 +9,33 @@ There are two files, and the split is deliberate.
 
 Settings resolve in this order, highest first:
 1. CLI flags. A flag given on the command line beats its environment variable whatever its value, so `--json=false`, `--priority 0` and `--pool` all override the environment.
-2. `SPOTEXEC_*` environment variables: `SPOTEXEC_TIMEOUT`, `SPOTEXEC_SYNC`, `SPOTEXEC_RUNNER`, `SPOTEXEC_POOL`, `SPOTEXEC_PRIORITY`, `SPOTEXEC_SAME_SLOT=1`, `SPOTEXEC_JSON=1`, `SPOTEXEC_AGENT=1`.
+2. `SPOTEXEC_*` environment variables (below).
 3. `.spotexec.toml`.
 4. The global config.
 5. Built-in defaults.
 
 Exceptions to that order:
 - `-r` beats `--pool`, and `SPOTEXEC_RUNNER` beats `SPOTEXEC_POOL` and any configured pool (but not `--pool`);
-- `--json` beats `--pretty`;
+- for the output format, `-q` beats `--json`, which beats `--pretty`, and `-q`, `--json`, `--pretty` or `--json=false` beats `SPOTEXEC_JSON=1` and `SPOTEXEC_AGENT=1`;
 - a task's own `pool` beats `SPOTEXEC_POOL`;
 - `spotexec sync` always syncs and `spotexec exec` never does, whatever `SPOTEXEC_SYNC` says.
 
 Unknown `--sync` and `--writeback` values (from flags or the environment) are rejected with exit `125` before any runner is used.
+
+### Environment variables
+
+| Variable | Same as |
+| --- | --- |
+| `SPOTEXEC_TIMEOUT` | `--timeout`, for example `SPOTEXEC_TIMEOUT=15m`. |
+| `SPOTEXEC_SYNC` | `--sync`. |
+| `SPOTEXEC_RUNNER` | `-r`, `--runner`. |
+| `SPOTEXEC_POOL` | `--pool` (comma-separated runner names). |
+| `SPOTEXEC_PRIORITY` | `--priority`. |
+| `SPOTEXEC_SAME_SLOT=1` | `--same-slot`: every `sx` in that shell returns to this worktree's last slot. |
+| `SPOTEXEC_JSON=1` | `--json`. |
+| `SPOTEXEC_AGENT=1` | NDJSON events by default, for agent harnesses. |
+| `SPOTEXEC_CONFIG`, `SPOTEXEC_CONFIG_DIR` | The global config file, or its directory (default `~/.config/spotexec`, or under `XDG_CONFIG_HOME`). |
+| `SPOTEXEC_STATE_DIR` | Local state (default `~/.local/state/spotexec`, or under `XDG_STATE_HOME`). |
 
 ## Global config: `~/.config/spotexec/config.toml`
 
@@ -157,7 +172,7 @@ when_load_above = 0.6          # agents offload only when the laptop is busy
 | `timeout`, `sync`, `exclusive` | Per-task overrides of the run flags. |
 | `pool`, `priority` | Send this task to a different fleet, or move it ahead in the queue. |
 
-`sx <task>` runs any task, even one named like a spotexec subcommand: `sx sync` runs a task called `sync`. Only `spotexec <task>` gives subcommands precedence, so `spotexec sync` still means the subcommand. `spotexec tasks` lists them.
+`sx <task>` runs any task, even one named like a spotexec subcommand: `sx sync` runs a task called `sync`. Only `spotexec <task>` gives subcommands precedence, so `spotexec sync` still means the subcommand. A task also wins over a program of the same name; `sx -- <name>` and `spotexec run -- <name>` skip the tasks and run the program. `spotexec tasks` lists them.
 
 ## Project-defined fleets
 

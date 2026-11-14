@@ -493,7 +493,7 @@ func cmdDown() *cobra.Command {
 	}
 	c.Flags().BoolVar(&all, "all", false, "terminate every ephemeral runner")
 	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "terminate spotexec VMs (bake builders and stopped VMs too) launched by any machine, in the regions and profiles your AWS runners use (with --machine: only that one's)")
-	c.Flags().StringVar(&machine, "machine", "", "only VMs launched by this machine (its name in `status -A`)")
+	c.Flags().StringVar(&machine, "machine", "", "only VMs launched by the machine named `NAME` in status -A")
 	c.Flags().BoolVarP(&yes, "yes", "y", false, "don't ask before terminating other machines' VMs")
 	return c
 }

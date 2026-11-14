@@ -21,8 +21,12 @@ const shortUsage = `spotexec (sx) runs commands from your worktree on remote har
 
 Usage:
   sx [flags] <command> [args...]       run a command remotely (sync + exec + write-back)
-  sx [flags] -- <command> [args...]    same, when the command shares a name with a subcommand
-  sx <task> [args...]                  run a named task from .spotexec.toml
+  sx [flags] <task> [args...]          run a named task from .spotexec.toml
+  sx [flags] -- <command> [args...]    run the command even if a task has its name
+  spotexec run [flags] -- <command>    the same as sx -- <command>
+
+sx -h lists the run flags and this project's tasks. spotexec <command> runs a
+command too, unless it is named like one of the commands below.
 `
 
 // subcommands that take precedence over the shorthand form.
@@ -184,7 +188,7 @@ func cmdExec() *cobra.Command {
 	var f runFlags
 	c := &cobra.Command{
 		Use:   "exec [flags] -- <command> [args...]",
-		Short: "Run in the last-used slot without syncing first (same as sx --same-slot --sync none)",
+		Short: "Run in the last-used slot without syncing first (same as sx --same-slot --sync none --)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load(f.dir)
@@ -281,6 +285,7 @@ changed back here.
 Usage:
   sx [flags] <command> [args...]    sx pnpm test · sx 'pnpm lint && pnpm test'
   sx [flags] <task> [args...]       a named task from .spotexec.toml
+  sx [flags] -- <command> [args...] the command, even if a task has its name
   sx -s <command>                   again on the same VM and slot as last time
 
 Flags:

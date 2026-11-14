@@ -23,13 +23,13 @@ aws login                      # or aws sso login / aws configure: an identity t
 spotexec setup
 ```
 
-1. **Runner config.** If `~/.config/spotexec/config.toml` doesn't exist, setup writes a starting one with a single `aws` runner in the region of the AWS profile it signs in with (`AWS_REGION` or `AWS_DEFAULT_REGION`, else that profile's `region` in `~/.aws/config`, else `us-east-1`), and says which it picked. An existing config is left as it is.
+1. **Runner config.** If `~/.config/spotexec/config.toml` doesn't exist, setup writes a starting one with a single `aws` runner (up to four 8-vCPU Spot VMs, 4 slots each) in the region of the AWS profile it signs in with (`AWS_REGION` or `AWS_DEFAULT_REGION`, else that profile's `region` in `~/.aws/config`, else `us-east-1`), and says which it picked. An existing config is left as it is.
 2. **AWS access**, for each `aws-spot` runner. Setup shows what it's about to do and asks before changing anything, then:
    - creates an IAM user for this machine, `spotexec-<hostname>` (path `/spotexec/`), with only [spotexec's permissions](aws.md#3-grant-permissions) as an inline policy. The user is tagged with this machine's permanent ID, so two Macs that share a hostname each get their own user (the second gets a suffix), and a machine whose hostname changes keeps its user. A `spotexec` profile copied from another machine (a synced `~/.aws`) is replaced with this machine's own user and key, leaving the other machine's key alone, unless you name that user with `--user`. That takes an administrator's sign-in; without one, setup stops and says so. (A key whose policy predates this check can't read its own user, so then only a run with an administrator's sign-in can tell.) If the profile signs in to a different AWS account from your admin session, setup stops before changing anything;
    - creates an access key for that user and saves it as the AWS CLI profile `spotexec` (`~/.aws/credentials`, mode 600, with the region in `~/.aws/config`). It waits until the key works and checks that nothing else in `~/.aws` overrides it, then deletes any older keys the user has;
    - sets `profile = "spotexec"` on your AWS runners;
    - prepares the account: it creates the EC2 Spot service-linked role and, if the runner's region has no default VPC (common in older accounts), the default VPC. That's AWS's standard network and costs nothing; `--no-vpc` skips it;
-   - checks your Spot vCPU quota. New accounts get about 5 vCPUs, too few for one of the starter config's 8-vCPU VMs, so a starter config setup has just written switches to 4-vCPU VMs (`c7a.xlarge`…) instead, keeping `max_instances`. If the quota can't fit even one VM, setup says so, prints the command to raise it and, in a terminal, offers to request the increase with your AWS sign-in. If it only limits how many VMs run at once, setup notes that and prints the command. spotexec never falls back to on-demand instances unless you set `on_demand_fallback`.
+   - checks your Spot vCPU quota. New accounts get about 5 vCPUs, too few for one of the starter config's 8-vCPU VMs, so a starter config setup has just written switches to 4-vCPU VMs (`c7a.xlarge`…, 2 slots each) instead, keeping `max_instances`. A config that already existed is never resized. If the quota can't fit even one VM, setup says so, prints the command to raise it and, in a terminal, offers to request the increase with your AWS sign-in. If it only limits how many VMs run at once, setup notes that and prints the command. spotexec never falls back to on-demand instances unless you set `on_demand_fallback`.
 
    With runners in several regions, the network and quota checks cover each region.
 3. **The Claude Code hook.** If Claude Code is on this machine, setup offers to install its hook for all your projects, so agents' heavy commands run on your runners (see [coding agents](agents.md#claude-code-hook)). The hook only acts in projects with a `.spotexec.toml`. `--no-hooks` skips this.
@@ -38,10 +38,12 @@ spotexec setup
 
 From then on spotexec uses its own key. Your `aws login` or SSO session can expire without it noticing, so you sign in again only to change the setup.
 
+A first run on a new account looks like this (the hook, machine and bake prompts follow):
+
 ```console
 $ spotexec setup
-✓ runner config /Users/me/.config/spotexec/config.toml
-Setting up AWS access for aws (region us-east-1)…
+✓ wrote /Users/me/.config/spotexec/config.toml (an aws runner in us-east-2, from profile "default" in /Users/me/.aws/config; edit it any time)
+Setting up AWS access for aws (us-east-2)…
 
 Signed in to AWS account 123456789012 as arn:aws:iam::123456789012:user/me. This will:
   • create (or update) IAM user spotexec-studio-02 with only spotexec's permissions (see `spotexec setup --print-policy`)
@@ -50,15 +52,18 @@ Signed in to AWS account 123456789012 as arn:aws:iam::123456789012:user/me. This
 Continue? [Y/n]
   created IAM user spotexec-studio-02
   attached the spotexec policy
+  created the EC2 Spot service-linked role
   created access key AKIA…
   saved it as AWS profile spotexec (/Users/me/.aws/credentials)
-  verified: the key signs in and can reach EC2 in us-east-1
+  verified: the key signs in and can reach EC2 in us-east-2
 ✓ AWS profile spotexec → arn:aws:iam::123456789012:user/spotexec/spotexec-studio-02 (key AKIA…; it doesn't expire)
 ✓ set profile = "spotexec" on aws in /Users/me/.config/spotexec/config.toml
-✓ Spot vCPU quota in us-east-1: 640 (runners need up to 32)
+✓ sized the starter fleet to the Spot quota in us-east-2 (5 vCPUs): 4-vCPU VMs instead of 8-vCPU ones
+✓ Spot vCPU quota in us-east-2: 5. Note: your runners there may use up to 16, so fewer VMs run at once until it's raised:
+  aws service-quotas request-service-quota-increase --region us-east-2 --service-code ec2 --quota-code L-34B43A08 --desired-value 16
 ```
 
-Next, in each repository: `spotexec init`, then `sx <command>`. `spotexec doctor` checks everything end to end.
+Setup ends by saying what's next: in each repository, `spotexec init`, then `sx <command>`. When `init` detects the project's toolchain, it also writes a pinned [project container](environments.md#project-containers), since the VMs boot plain Ubuntu (unless every runner is an SSH machine, or you pass `--no-container`); the first `sx` builds it. `spotexec doctor` checks everything end to end.
 
 Before a demo, do one warm-up `sx` run. The first run boots a VM, which takes a minute or more (plus the bootstrap unless the image is baked); later runs reuse it until it has been idle for `idle_timeout`.
 
@@ -208,5 +213,5 @@ To keep no key on disk, skip the AWS step (`spotexec setup --skip-aws`) and sign
 | `--user NAME` | This machine's IAM user name (default `spotexec-<hostname>`). |
 | `--rotate` | Replace the access key even if it works. |
 | `--no-vpc` | Don't create a default VPC when the region has none. |
-| `--skip-aws` | Only write (and copy) the runner config. |
+| `--skip-aws` | Skip the AWS steps (IAM user and key, network, quota). The runner config, the hook and other machines are still set up. |
 | `--print-policy` | Print the IAM policy and exit. |

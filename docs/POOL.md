@@ -12,25 +12,34 @@ takes part in scheduling, and every VM shuts itself down.
                                                                   │
    EC2 API ◀── List / Launch / Terminate (tags: runner + owner)   │
                                                                   ▼
-   ┌─ i-a  [slot1 ●][slot2 ●]   busy                 ◀── bin-pack: fill the busiest
-   ├─ i-b  [slot1 ●][slot2 ○]   busy                     instance with room first
-   ├─ i-c  [slot1 ○][slot2 ○]   idle 3m ── watchdog ─▶ terminates at idle_timeout (5m)
+   ┌─ i-a  [slot1 ●][slot2 ●]   busy                 ◀── pack: the oldest instance
+   ├─ i-b  [slot1 ●][slot2 ○]   busy                     with a free slot first
+   ├─ i-c  [slot1 ○][slot2 ○]   idle 3m ── watchdog ─▶ terminates at idle_timeout (10m)
    └─ (launching)               claimed by agent 3
 ```
 
 ## Scheduling (client-side, per command)
 
-1. **Static runners first.** `ssh` runners in the pool are tried in priority
-   order, without blocking.
+1. **Pool order.** The runners in the pool are tried in `priority` order
+   (lowest first), without blocking: an `ssh` runner directly, a fleet
+   through its known instances.
 2. **Known instances.** The fleet's instance list is read from the local cache
-   (`pool.json`). It is refreshed from the cloud API when older than 8s, or
-   after any failure. Running instances are tried oldest first (ties broken
-   by instance ID) with a non-blocking acquire.
+   (`pool.json`). It is refreshed from the cloud API when older than 8s, and
+   after any launch, successful or not. Running instances are tried oldest
+   first (ties broken by instance ID) with a non-blocking acquire.
    - Packing work onto the oldest instances lets the newest go idle and
      terminate: the pool scales in without any coordinator.
+   - While the worktree's last-run record (the slot `--same-slot` returns
+     to) is less than 10 minutes old, the instance it names is tried first
+     instead, since its slot still holds the worktree's files and build
+     caches. A run is recorded once its files are synced and its container
+     image is ready; a parallel task, once it finishes; a `--sync none` run,
+     never. After that, work goes back to the oldest instances.
    - An instance that refuses with `RUNNER_DRAINING` is marked draining and
      skipped.
-   - An instance that cannot be reached is dropped from the cache.
+   - An instance that cannot be reached stays in the cache and still counts
+     as capacity, but isn't probed again for 3s, or for 30s once it is
+     older than `boot_timeout` and has failed to answer twice in a row.
 3. **Queue and scale out.** If every slot is busy, the job takes a ticket in
    a fair local queue (priority, then arrival; `queue.go`) and registers as
    demand on each fleet (a waiter file under `waiters/`). Under `pool.lock`,
