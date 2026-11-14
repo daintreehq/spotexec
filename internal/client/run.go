@@ -68,6 +68,7 @@ type Options struct {
 	RetryPreempt   bool
 	NoBoot         bool
 	SyncOnly       bool // stop after sync + deps (spotexec sync)
+	WaitPush       bool // push a freshly built image before returning (container build)
 	Priority       int  // queue priority when every slot is busy (higher first)
 }
 
@@ -121,6 +122,9 @@ type attempt struct {
 // attempt was applied locally. Once a result has arrived it is never
 // replayed.
 func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Result, error) {
+	if !ws.Marked && o.Sync != "none" && !o.PreferLast {
+		return Result{}, infra(fmt.Errorf("%s is not in a Git repository and has no .spotexec.toml, so spotexec won't sync it; run `spotexec init` there to mark it as a project, or pass --sync none", ws.Root))
+	}
 	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}}
 	reached := false
 	for {
@@ -899,7 +903,7 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read 
 // registry when it has one) and returns the local reference to run.
 func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, o Options, label string, ws *Workspace, lease *Lease, m *manifest.Manifest) (string, string, error) {
 	c := p.Container
-	req := protocol.Image{TimeoutMS: c.Timeout.Milliseconds()}
+	req := protocol.Image{TimeoutMS: c.Timeout.Milliseconds(), WaitPush: o.WaitPush}
 	if c.Image != "" {
 		req.Ref = c.Image
 	} else if o.PreferLast {
@@ -964,7 +968,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 		case protocol.TypeImageResult:
 			var r protocol.ImageResult
 			_ = env.Unmarshal(&r)
-			o.Rep.Event("image", map[string]any{"image": r.Image, "image_id": r.ImageID, "pulled": r.Pulled, "built": r.Built, "pushing": r.Pushing,
+			o.Rep.Event("image", map[string]any{"image": r.Image, "image_id": r.ImageID, "pulled": r.Pulled, "built": r.Built, "pushing": r.Pushing, "pushed": r.Pushed,
 				"installed_docker": r.InstalledDocker, "duration_ms": time.Since(t).Milliseconds()})
 			return r.Image, r.ImageID, nil
 		default:

@@ -178,6 +178,9 @@ type Image struct {
 	Tag        string        `json:"tag,omitempty"`
 	Registry   *RegistryAuth `json:"registry,omitempty"`
 	TimeoutMS  int64         `json:"timeout_ms"`
+	// WaitPush pushes a fresh build to Registry before replying (instead of
+	// in the background), so a push failure is reported.
+	WaitPush bool `json:"wait_push,omitempty"`
 }
 
 // ImageResult reports the local image reference to run.
@@ -187,6 +190,7 @@ type ImageResult struct {
 	Pulled          bool   `json:"pulled"`
 	Built           bool   `json:"built"`
 	Pushing         bool   `json:"pushing"`
+	Pushed          bool   `json:"pushed,omitempty"`
 	InstalledDocker bool   `json:"installed_docker"`
 	MS              int64  `json:"ms"`
 }

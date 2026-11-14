@@ -26,6 +26,10 @@ type Workspace struct {
 	RepoName    string
 	WorktreeKey string // unique per host+worktree
 	Cwd         string // cwd relative to Root ("." at root)
+	// Marked: Root is a Git worktree or holds a .spotexec.toml. Otherwise it
+	// is just the directory spotexec was started in, which must not be
+	// synced wholesale (it may be $HOME, holding ~/.aws and ~/.ssh).
+	Marked bool
 }
 
 var nonAlnum = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
@@ -41,6 +45,9 @@ func Resolve(dir string) (*Workspace, error) {
 	}
 	root, isGit := manifest.Root(abs)
 	w := &Workspace{Root: root, Git: isGit}
+	if _, err := os.Stat(filepath.Join(root, ".spotexec.toml")); err == nil || isGit {
+		w.Marked = true
+	}
 	rel, err := filepath.Rel(root, abs)
 	if err != nil || strings.HasPrefix(rel, "..") {
 		rel = "."

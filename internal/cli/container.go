@@ -54,7 +54,7 @@ func cmdContainer() *cobra.Command {
 				return fmt.Errorf("no [container] in %s; run `spotexec container init` first", filepath.Join(l.ws.Root, ".spotexec.toml"))
 			}
 			f.noDeps = true
-			return exitWith(f.execute(l, runSpec{display: "(container build)", syncOnly: true, sync: "in"}))
+			return exitWith(f.execute(l, runSpec{display: "(container build)", syncOnly: true, sync: "in", waitPush: true}))
 		},
 	}
 	f.register(build.Flags())
@@ -284,11 +284,15 @@ ENV GOMODCACHE=/home/spotexec/go/pkg/mod \
 		stack = "Rust " + rv
 		body = fmt.Sprintf(`FROM rust:%s-bookworm
 
-RUN rustup component add clippy rustfmt
+# Components are installed as root: keep the toolchain writable for the
+# non-root user, as the base image does. Install extra tools system-wide:
+# RUN cargo install --root /usr/local/cargo cargo-nextest
+RUN rustup component add clippy rustfmt && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
-# Keep the registry and git checkouts in the slot's persistent HOME, so they
-# survive between runs (the container itself is thrown away each time).
-ENV CARGO_HOME=/home/spotexec/.cargo
+# At run time, keep the registry and git checkouts in the slot's persistent
+# HOME, so they survive between runs (the container itself is thrown away).
+ENV CARGO_HOME=/home/spotexec/.cargo \
+    PATH=/home/spotexec/.cargo/bin:$PATH
 `, rv)
 	case exists(root, "pom.xml") || exists(root, "build.gradle") || exists(root, "build.gradle.kts"):
 		stack = "Java 21"
@@ -331,8 +335,9 @@ RUN apt-get update \
 #   at run time. Install tools here, not code; dependencies (node_modules,
 #   .venv, ...) come from the [deps] cache.
 # - Commands run as the runner's non-root user, with HOME=/home/spotexec (a
-#   per-slot directory that persists between runs). Install toolchains
-#   system-wide, never under /root.
+#   per-slot directory mounted at run time that persists between runs).
+#   Install toolchains system-wide (e.g. /usr/local), never under /root or
+#   /home/spotexec: anything built there is hidden by the mount.
 # - The build context is this file's directory. The image is rebuilt only
 #   when this file (or the context) changes, and needs /bin/sh (bash is used
 #   when present).

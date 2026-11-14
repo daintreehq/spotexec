@@ -261,7 +261,13 @@ func (s *Session) image(m protocol.Image) error {
 		res.Built = true
 		if m.Registry != nil && cfgDir != "" {
 			remote := m.Registry.Repo + ":" + m.Tag
-			if err := startImagePush(s.layout.Root, d, local, remote, cfgDir); err == nil {
+			if m.WaitPush {
+				_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_push", Message: remote})
+				if err := stream(d.cmd("tag "+shq(local)+" "+shq(remote)) + " && " + d.cmd("--config "+shq(cfgDir)+" push -q "+shq(remote))); err != nil {
+					return perr(protocol.CodeImageFailed, "built %s but could not push it to %s: %v", m.Dockerfile, remote, err)
+				}
+				res.Pushed = true
+			} else if err := startImagePush(s.layout.Root, d, local, remote, cfgDir); err == nil {
 				res.Pushing = true
 			}
 		}

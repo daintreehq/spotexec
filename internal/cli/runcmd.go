@@ -246,6 +246,7 @@ type runSpec struct {
 	priority   int
 	preferLast bool
 	syncOnly   bool
+	waitPush   bool // container build: push a fresh image before returning
 }
 
 func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan struct{}, stdout, stderr io.Writer) client.Options {
@@ -256,7 +257,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 		Pool: f.pool, Exclusive: f.exclusive || s.exclusive, Pull: f.pull, NoDeps: f.noDeps,
 		ForceLargeSync: f.forceLarge, Stdout: stdout, Stderr: stderr, Rep: rep, Interrupt: intr,
 		Label: s.label, RetryPreempt: !f.noRetry, NoBoot: f.noBoot,
-		PreferLast: s.preferLast, SyncOnly: s.syncOnly, Priority: s.priority,
+		PreferLast: s.preferLast, SyncOnly: s.syncOnly, WaitPush: s.waitPush, Priority: s.priority,
 	}
 	if f.priority != 0 {
 		o.Priority = f.priority
