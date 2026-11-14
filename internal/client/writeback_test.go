@@ -1,10 +1,14 @@
 package client
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
 )
@@ -103,5 +107,42 @@ func TestWriteLocalHonoursAChmodDuringStaging(t *testing.T) {
 	}
 	if got := perm(t, full); got != 0o600 {
 		t.Errorf("after write-back %o, want the tightened 0600", got)
+	}
+}
+
+func TestWritebackLockWaitIsBounded(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "writeback.lock")
+	unlock, err := lockFile(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another sx (here: another open file description) waits for it.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = lockFile(ctx, p)
+	if err == nil {
+		t.Fatal("took a lock that is held")
+	}
+	if waited := time.Since(start); waited > 3*time.Second {
+		t.Fatalf("waited %s past the deadline", waited)
+	}
+	if want := fmt.Sprintf("pid %d", os.Getpid()); !strings.Contains(err.Error(), want) {
+		t.Fatalf("error doesn't name the holder (%s): %v", want, err)
+	}
+	unlock()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	unlock2, err := lockFile(ctx2, p)
+	if err != nil {
+		t.Fatalf("lock not free after release: %v", err)
+	}
+	unlock2()
+	// A deadline that has already passed never takes the lock.
+	done, cancel3 := context.WithCancel(context.Background())
+	cancel3()
+	if u, err := lockFile(done, p); err == nil {
+		u()
+		t.Fatal("took the lock with an expired deadline")
 	}
 }

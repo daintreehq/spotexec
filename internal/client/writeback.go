@@ -200,7 +200,7 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {
 		return wb, err
 	}
-	unlock, err := lockFile(filepath.Join(lockDir, "writeback.lock"))
+	unlock, err := lockFile(ctx, filepath.Join(lockDir, "writeback.lock"))
 	if err != nil {
 		return wb, err
 	}
@@ -569,19 +569,66 @@ func readTar(r io.Reader, fn func(*tar.Header, io.Reader) error) error {
 	return nil
 }
 
-func lockFile(p string) (func(), error) {
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o644)
+// lockFile takes the worktree's write-back lock, waiting no longer than ctx
+// allows (a suspended or stuck sx holding it must not block every later
+// run, with its remote lease, forever). The holder records who it is in the
+// file, so a wait that gives up can say which process holds the lock.
+func lockFile(ctx context.Context, p string) (func(), error) {
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
+	start := time.Now()
+	delay := 10 * time.Millisecond
+	for {
+		if ctx.Err() != nil {
+			f.Close()
+			return nil, fmt.Errorf("gave up waiting for this worktree's write-back lock (%s), held by %s; if that sx is suspended (Ctrl-Z), resume it with `fg` or end it", p, lockOwner(p))
+		}
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, fmt.Errorf("gave up after %s waiting for this worktree's write-back lock (%s), held by %s; if that sx is suspended (Ctrl-Z), resume it with `fg` or end it", time.Since(start).Round(time.Second), p, lockOwner(p))
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, 250*time.Millisecond)
+	}
+	// The record stays after release (until the next holder overwrites it):
+	// clearing it first would leave nothing to report if this process were
+	// suspended in between.
+	if err := f.Truncate(0); err == nil {
+		_, _ = f.WriteAt([]byte(lockHolder()+"\n"), 0)
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 	}, nil
+}
+
+// lockOwner reads who holds the lock at p.
+func lockOwner(p string) string {
+	if b, err := os.ReadFile(p); err == nil && len(bytes.TrimSpace(b)) > 0 {
+		return string(bytes.TrimSpace(b))
+	}
+	return "another process"
+}
+
+// lockHolder describes this process for a lock it holds.
+func lockHolder() string {
+	args := append([]string{filepath.Base(os.Args[0])}, os.Args[1:]...)
+	cmd := strings.Join(args, " ")
+	if len(cmd) > 200 {
+		cmd = cmd[:200] + "…"
+	}
+	return fmt.Sprintf("pid %d (%s), since %s", os.Getpid(), cmd, time.Now().Format("15:04:05"))
 }
 
 // PullArtifacts fetches files matching patterns from the slot workspace and
@@ -721,7 +768,7 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {
 		return 0, err
 	}
-	unlock, err := lockFile(filepath.Join(lockDir, "writeback.lock"))
+	unlock, err := lockFile(ctx, filepath.Join(lockDir, "writeback.lock"))
 	if err != nil {
 		return 0, err
 	}
