@@ -49,7 +49,7 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	if _, err := os.Stat(LifecycleDir); err == nil {
 		b, err := os.ReadFile(filepath.Join(LifecycleDir, "ready"))
 		if err != nil {
-			return perr(protocol.CodeBooting, "runner is still running its first-boot setup")
+			return &protoError{code: protocol.CodeBooting, msg: "runner is still running its first-boot setup", detail: latestBootLine(bootLog)}
 		}
 		// A failed bootstrap_script leaves a VM without the toolchain the
 		// project needs: refuse work (and retire the VM) rather than run
@@ -577,4 +577,36 @@ func lifetimeLeft(dir string, now time.Time) (time.Duration, bool) {
 	lt := time.Duration(secs) * time.Second
 	left := time.Unix(created, 0).Add(lt).Sub(now)
 	return left, left < protocol.LifetimeDrainAhead(lt)
+}
+
+// bootLog is the VM's first-boot log (cloud-init's step markers and the
+// bootstrap scripts' output).
+var bootLog = "/var/log/spotexec-bootstrap.log"
+
+// latestBootLine is the last non-empty line of the boot log so far ("" if
+// none), so a client waiting on a cold boot can show what it is doing.
+// Progress bars rewrite their line with \r: only the latest rewrite counts.
+func latestBootLine(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	off := max(0, fi.Size()-4096)
+	buf := make([]byte, fi.Size()-off)
+	n, _ := f.ReadAt(buf, off)
+	lines := strings.FieldsFunc(string(buf[:n]), func(r rune) bool { return r == '\n' || r == '\r' })
+	for i := len(lines) - 1; i >= 0; i-- {
+		if l := strings.TrimSpace(lines[i]); l != "" {
+			if len(l) > 300 {
+				l = l[:300]
+			}
+			return l
+		}
+	}
+	return ""
 }

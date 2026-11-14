@@ -66,14 +66,16 @@ func Connect(ctx context.Context, r *config.Runner, t provider.Target) (*transpo
 var newProvider = provider.New
 
 type member struct {
-	fatal error // a problem no other instance of this runner would avoid
-	down  bool  // a static runner whose last probe failed
-	r     *config.Runner
-	p     provider.Provider
-	pool  *Pool // nil for static runners
-	t     provider.Target
-	tErr  error
-	ready bool
+	fatal     error         // a problem no other instance of this runner would avoid
+	down      bool          // a static runner whose last probe failed
+	boot      *bootProgress // a VM of this fleet running its first-boot setup
+	announced bool          // "connecting to" shown for this static runner
+	r         *config.Runner
+	p         provider.Provider
+	pool      *Pool // nil for static runners
+	t         provider.Target
+	tErr      error
+	ready     bool
 }
 
 // Acquire finds a free slot anywhere in the pool, scaling fleets out as
@@ -387,7 +389,11 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		if ticket != nil {
 			pos = fmt.Sprintf("#%d of %d · ", qs.Position+1, qs.Total)
 		}
-		req.Rep.Status("queued %s%s · %s", pos, ui.Dur(time.Since(start)), status)
+		if b := bootingNow(members); b != "" {
+			req.Rep.Status("%s", b) // what the new VM is doing says more than the queue
+		} else {
+			req.Rep.Status("queued %s%s · %s", pos, ui.Dur(time.Since(start)), status)
+		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("%s: no free slot within %s (%s)", protocol.CodeQueueTimeout, queue, status)
 		}
@@ -426,7 +432,12 @@ func (m *member) probeStatic(ctx context.Context, req AcquireRequest) (*Lease, [
 		}
 		m.t, m.ready = info.Target, true
 	}
-	req.Rep.Status("connecting to %s (%s)", m.r.Name, m.t)
+	if !m.announced {
+		// Once: re-probing a busy machine every round would keep replacing
+		// more useful progress (a VM's first boot) on the status line.
+		m.announced = true
+		req.Rep.Status("connecting to %s (%s)", m.r.Name, m.t)
+	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	lease, holders, err := tryAcquire(cctx, req, m.r, m.p, m.t, false)
@@ -443,6 +454,9 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provi
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	lease, holders, err := tryAcquire(cctx, req, m.r, m.p, in.Target, false)
+	if m.boot != nil && m.boot.id == in.ID && !isCode(err, protocol.CodeBooting) {
+		m.boot = nil // that VM is past its first boot (or gone)
+	}
 	switch {
 	case lease != nil:
 		lease.InstanceID = in.ID
@@ -453,6 +467,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provi
 	case isDraining(err):
 		return nil, nil, OutDraining
 	case isCode(err, protocol.CodeBooting):
+		m.sawBooting(req.Rep, in, err)
 		return nil, nil, OutBooting
 	case isCode(err, protocol.CodeBootFailed):
 		// The setup itself is broken: another VM would fail the same way.
@@ -460,6 +475,60 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provi
 		return nil, nil, OutBootFailed
 	}
 	return nil, nil, OutUnreachable
+}
+
+// bootProgress is the latest word from a VM running its first-boot setup.
+type bootProgress struct {
+	id       string    // the VM
+	launched time.Time // the VM's launch, for "how long it has been going"
+	line     string    // the latest line of its bootstrap log
+	seen     time.Time // when a probe last found it booting
+	evented  time.Time // when it was last reported as an event
+	evLine   string
+}
+
+// bootStatus is the status line for a booting VM: how long it has been
+// going and, after ui.DetailSep, what it is doing.
+func bootStatus(runner string, elapsed time.Duration, line string) string {
+	s := fmt.Sprintf("%s: running first-boot setup %s", runner, ui.Dur(elapsed.Round(time.Second)))
+	if line = ui.LogLine(line); line != "" {
+		s += ui.DetailSep + line
+	}
+	return s
+}
+
+// sawBooting records a probe's RUNNER_BOOTING answer, and reports a changed
+// bootstrap step as a boot_progress event (at most every 5s).
+func (m *member) sawBooting(rep ui.Reporter, in provider.Instance, err error) {
+	var re *transport.RemoteError
+	errors.As(err, &re)
+	b := m.boot
+	if b == nil || b.id != in.ID {
+		b = &bootProgress{id: in.ID}
+		m.boot = b
+	}
+	b.launched, b.seen = in.LaunchedAt, time.Now()
+	if re != nil {
+		b.line = re.Detail
+	}
+	if line := ui.LogLine(b.line); line != b.evLine && time.Since(b.evented) >= 5*time.Second {
+		b.evented, b.evLine = time.Now(), line
+		rep.Event("boot_progress", map[string]any{"runner": m.r.Name, "instance_id": in.ID,
+			"elapsed_ms": time.Since(in.LaunchedAt).Milliseconds(), "line": line})
+	}
+}
+
+// bootingNow is the status line for a fleet VM still in its first-boot
+// setup ("" when none is). It lasts until a probe of that VM says otherwise,
+// so a slow probe of another VM doesn't blank it; only a minute without any
+// word does.
+func bootingNow(members []*member) string {
+	for _, m := range members {
+		if b := m.boot; b != nil && time.Since(b.seen) < time.Minute && !b.launched.IsZero() {
+			return bootStatus(m.r.Name, time.Since(b.launched), b.line)
+		}
+	}
+	return ""
 }
 
 func (m *member) provision(ctx context.Context, id string, rep ui.Reporter) {
@@ -607,6 +676,15 @@ func tryAcquire(ctx context.Context, req AcquireRequest, r *config.Runner, p pro
 	}
 }
 
+// readyProbe prints the first-boot verdict, or "waiting" and the latest
+// line of the bootstrap log.
+const readyProbe = `cat /var/tmp/spotexec/ready 2>/dev/null || { echo waiting; tail -n 1 /var/log/spotexec-bootstrap.log 2>/dev/null; }`
+
+func parseReadyProbe(out string) (state, line string) {
+	state, line, _ = strings.Cut(strings.TrimLeft(out, "\n"), "\n")
+	return strings.TrimSpace(state), strings.TrimSpace(line)
+}
+
 // WaitReady polls until SSH accepts our key and /var/tmp/spotexec/ready exists.
 func WaitReady(ctx context.Context, r *config.Runner, t provider.Target, rep ui.Reporter, timeout time.Duration) error {
 	if timeout <= 0 {
@@ -618,15 +696,16 @@ func WaitReady(ctx context.Context, r *config.Runner, t provider.Target, rep ui.
 	start := time.Now()
 	for time.Now().Before(deadline) {
 		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		out, err := c.Run(cctx, "cat /var/tmp/spotexec/ready 2>/dev/null || echo waiting", nil)
+		// One round trip: the verdict, or "waiting" and the log's latest line.
+		out, err := c.Run(cctx, readyProbe, nil)
 		cancel()
 		if err == nil {
-			s := strings.TrimSpace(string(out))
+			s, line := parseReadyProbe(string(out))
 			switch {
 			case s == "0":
 				return nil
 			case s == "waiting":
-				rep.Status("%s: running first-boot setup %s", r.Name, ui.Dur(time.Since(start)))
+				rep.Status("%s", bootStatus(r.Name, time.Since(start), line))
 			default:
 				tail, _ := c.Run(ctx, "tail -n 20 /var/log/spotexec-bootstrap.log 2>/dev/null", nil)
 				return &bootstrapError{fmt.Sprintf("%s: bootstrap_script exited %s; last log lines:\n%s", r.Name, s, strings.TrimSpace(string(tail)))}

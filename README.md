@@ -152,7 +152,7 @@ spotexec status                # what's running where, and idle timers
 
 Files the command changes come back. Ignored outputs such as coverage reports need `pull_artifacts` in `.spotexec.toml`, or a flag like `--pull coverage/`; see [write-back and artifacts](docs/running.md#write-back-and-artifacts).
 
-The first AWS run boots a VM, which takes about a minute plus your bootstrap. Later runs reuse it until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
+The first AWS run boots a VM, which takes about a minute plus your bootstrap; meanwhile `sx` shows how long it has been going and the latest line of the VM's bootstrap log. Later runs reuse it until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
 
 ## With coding agents
 

@@ -44,6 +44,17 @@ max_lifetime = "60s"
 boot_timeout = "20s"
 boot_delay = "1s"
 priority = 40
+[runners.${RUNNER}s]
+type = "sim"
+max_instances = 1
+max_slots = 2
+idle_timeout = "30s"
+boot_delay = "1s"
+priority = 50
+bootstrap_script = """
+echo boot-step-one; sleep 6
+echo boot-step-two; sleep 6
+"""
 EOF
 
 count() { docker ps -q --filter "label=spotexec-runner=$RUNNER" | wc -l | tr -d ' '; }
@@ -51,7 +62,7 @@ countb() { docker ps -q --filter "label=spotexec-runner=${RUNNER}b" | wc -l | tr
 countx() { docker ps -q --filter "label=spotexec-runner=${RUNNER}x" | wc -l | tr -d ' '; }
 cleanup() {
   # One filter per command: Docker ANDs repeated label filters.
-  for r in "$RUNNER" "${RUNNER}b" "${RUNNER}x" "${RUNNER}l"; do
+  for r in "$RUNNER" "${RUNNER}b" "${RUNNER}x" "${RUNNER}l" "${RUNNER}s"; do
     docker ps -q --filter "label=spotexec-runner=$r" | xargs -r docker rm -f >/dev/null 2>&1
   done
   return 0
@@ -218,6 +229,16 @@ sleep 2
 kill -INT $UP; wait $UP; rc=$?
 check "Ctrl-C during boot fails up" "[ $rc != 0 ]"
 check "Ctrl-C during boot terminates the VM" "[ \$(countx) = 0 ]"
+
+echo "== a cold boot shows what the VM is doing (plain output, as agents see it)"
+SPOTEXEC_POOL=${RUNNER}s "$SX" 'echo booted' >"$WORK/bp.out" 2>"$WORK/bp.err"
+check "plain heartbeat names the bootstrap step and how long it has run" "grep -q booted $WORK/bp.out && grep -qE 'sx: ${RUNNER}s: running first-boot setup [0-9.]+s — (boot-step|spotexec: )' $WORK/bp.err"
+SPOTEXEC_POOL=${RUNNER}s "$SX" --json 'echo booted' >/dev/null 2>"$WORK/bpj.err"
+SPOTEXEC_POOL=${RUNNER}s "$SX" 'echo warm' >"$WORK/bw.out" 2>"$WORK/bw.err"
+check "a warm run says nothing about first boot" "grep -q warm $WORK/bw.out && ! grep -q first-boot $WORK/bw.err && ! grep -q boot_progress $WORK/bpj.err"
+docker ps -q --filter "label=spotexec-runner=${RUNNER}s" | xargs -r docker rm -f >/dev/null 2>&1
+SPOTEXEC_POOL=${RUNNER}s "$SX" --json 'echo booted' >/dev/null 2>"$WORK/bpj.err"
+check "agents get boot_progress events with the latest log line" "grep -qE '\"event\":\"boot_progress\".*\"line\":\"(boot-step|spotexec: )' $WORK/bpj.err"
 
 echo "== a VM near max_lifetime takes no new runs (60s lifetime: none in the last 15s)"
 cleanup; sleep 1

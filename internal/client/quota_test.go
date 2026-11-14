@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/transport"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
 
@@ -221,5 +223,61 @@ func TestAcquireQuotaWaitsForUnprobedStaticRunner(t *testing.T) {
 	WaitLaunches(5 * time.Second)
 	if err == nil || strings.Contains(err.Error(), "quota") {
 		t.Fatalf("want a queue timeout (the static runner may serve), got %v", err)
+	}
+}
+
+func TestParseReadyProbe(t *testing.T) {
+	for out, want := range map[string][2]string{
+		"0\n":                                {"0", ""},
+		"waiting\n":                          {"waiting", ""},
+		"waiting\nSetting up git (1:2.43)\n": {"waiting", "Setting up git (1:2.43)"},
+		"3\n":                                {"3", ""},
+	} {
+		if s, l := parseReadyProbe(out); s != want[0] || l != want[1] {
+			t.Errorf("%q: %q %q", out, s, l)
+		}
+	}
+}
+
+type eventRep struct {
+	nopRep
+	events []map[string]any
+}
+
+func (e *eventRep) Event(name string, f map[string]any) {
+	if name == "boot_progress" {
+		e.events = append(e.events, f)
+	}
+}
+
+func TestBootProgress(t *testing.T) {
+	m := &member{r: &config.Runner{Name: "aws"}}
+	in := provider.Instance{ID: "i-1", LaunchedAt: time.Now().Add(-42 * time.Second)}
+	rep := &eventRep{}
+	booting := func(line string) error {
+		return &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeBooting, Message: "booting", Detail: line}}
+	}
+	if bootingNow([]*member{m}) != "" {
+		t.Fatal("nothing seen booting yet")
+	}
+	m.sawBooting(rep, in, booting("spotexec: running bootstrap_script"))
+	got := bootingNow([]*member{m})
+	if got != "aws: running first-boot setup 42.0s"+ui.DetailSep+"spotexec: running bootstrap_script" {
+		t.Fatalf("status %q", got)
+	}
+	m.sawBooting(rep, in, booting("Setting up git")) // within 5s: no second event
+	if len(rep.events) != 1 || rep.events[0]["line"] != "spotexec: running bootstrap_script" || rep.events[0]["instance_id"] != "i-1" {
+		t.Fatalf("events %v", rep.events)
+	}
+	if !strings.HasSuffix(bootingNow([]*member{m}), ui.DetailSep+"Setting up git") {
+		t.Fatal("status not updated to the latest line")
+	}
+	m.boot.seen = time.Now().Add(-30 * time.Second) // a slow probe of another VM since
+	if bootingNow([]*member{m}) == "" {
+		t.Fatal("progress dropped while another probe was slow")
+	}
+	m.boot.seen = time.Now().Add(-time.Minute) // no word for a minute: no stale boot status
+	if bootingNow([]*member{m}) != "" {
+		t.Fatal("stale boot status")
 	}
 }

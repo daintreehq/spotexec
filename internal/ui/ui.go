@@ -361,8 +361,37 @@ type plainReporter struct {
 var plainDelay = 3 * time.Second
 
 // phaseKey identifies a phase regardless of the counters in its text
-// ("queued 2nd 4.1s" and "queued 2nd 5.2s" are the same phase).
+// ("queued 2nd 4.1s" and "queued 2nd 5.2s" are the same phase), and of any
+// detail after DetailSep.
 var digits = regexp.MustCompile(`[0-9][0-9.:]*`)
+
+// DetailSep separates a status line from a detail that changes as the
+// phase goes on (the latest line of a VM's bootstrap log): the spinner shows
+// it, and plain mode's heartbeat prints the latest one without treating each
+// change as a new phase.
+const DetailSep = " — "
+
+var ansi = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]`)
+
+// LogLine makes a line of someone else's log safe and short enough for a
+// status line: the last \r rewrite only, no escape sequences or control
+// characters, at most 100 characters.
+func LogLine(s string) string {
+	if i := strings.LastIndexAny(strings.TrimRight(s, "\r\n"), "\r\n"); i >= 0 {
+		s = s[i+1:]
+	}
+	s = ansi.ReplaceAllString(s, "")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			if r == '\t' {
+				return ' '
+			}
+			return -1
+		}
+		return r
+	}, s)
+	return truncate(strings.TrimSpace(s), 100)
+}
 
 func (p *plainReporter) Event(name string, fields map[string]any) {
 	if p.extra != nil {
@@ -382,7 +411,8 @@ func (p *plainReporter) Status(format string, args ...any) {
 	if strings.Contains(line, " · running ") {
 		return // the command's own output says it's running
 	}
-	key := digits.ReplaceAllString(line, "#")
+	key, _, _ := strings.Cut(line, DetailSep)
+	key = digits.ReplaceAllString(key, "#")
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.stopped {

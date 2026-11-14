@@ -34,6 +34,7 @@ With `--json`, `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1`, lifecycle events go to s
 Other events include:
 - `queued`, `queue_position`, `placed`;
 - `scale_out`, `provision`, `instance_running`, `instance_ready`;
+- `boot_progress` while a new VM runs its first-boot setup: `elapsed_ms` and the latest `line` of its bootstrap log, at most every 5s;
 - `manifest`, `deps`, `image`, `exec`, `pull`, `cancel`;
 - `spot_interruption`, `spot_rebalance`, `retry`;
 - `conflict`, one per write-back conflict: your kept file (`local`), the stashed remote version (`remote`, a marker when `deleted` is true), and a `diff` command to see the remote changes;

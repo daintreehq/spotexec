@@ -188,6 +188,9 @@ touch "$D/activity"
 exec 8<"$D/lifecycle.lock"
 flock -s 8
 # No background apt (see the note in cloudinit.go): updates come with the image.
+# Step markers in the log: a waiting client shows its latest line.
+B=/var/log/spotexec-bootstrap.log
+echo "spotexec: waiting for the OS's automatic updates to stop" >>"$B"
 systemctl stop unattended-upgrades.service apt-daily.service apt-daily-upgrade.service >/dev/null 2>&1 || true
 systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 status=0
@@ -197,6 +200,7 @@ cat > "$D/bootstrap-root.sh" <<'BOOTSTRAP_ROOT'
 {{.BootstrapScript}}
 BOOTSTRAP_ROOT
 umask 022
+echo "spotexec: running bootstrap_script" >>"$B"
 DEBIAN_FRONTEND=noninteractive timeout -k 30 {{.BootSecs}} bash -e "$D/bootstrap-root.sh" </dev/null >>/var/log/spotexec-bootstrap.log 2>&1 8<&- || status=$?
 {{- end}}
 {{- if .UserBootstrap}}
@@ -207,9 +211,11 @@ BOOTSTRAP_USER
 umask 022
 chown "$U" "$D/bootstrap-user.sh"
 if [ "$status" -eq 0 ]; then
+  echo "spotexec: running user_bootstrap_script" >>"$B"
   timeout -k 30 {{.BootSecs}} sudo -u "$U" -H bash -le "$D/bootstrap-user.sh" </dev/null >>/var/log/spotexec-bootstrap.log 2>&1 8<&- || status=$?
 fi
 {{- end}}
+echo "spotexec: first-boot setup finished (exit $status)" >>"$B"
 chmod 0640 /var/log/spotexec-bootstrap.log 2>/dev/null || true
 touch "$D/activity"
 exec 8<&-

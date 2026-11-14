@@ -88,3 +88,42 @@ func TestQuietReporterKeepsWarnings(t *testing.T) {
 		t.Fatal("quiet is not JSON")
 	}
 }
+
+func TestLogLine(t *testing.T) {
+	cases := map[string]string{
+		"Setting up docker.io (24.0.7) ...\n": "Setting up docker.io (24.0.7) ...",
+		"Get:1 10%\rGet:1 55%\rGet:1 100%":    "Get:1 100%",
+		"\x1b[32mok\x1b[0m\tdone":             "ok done",
+		"bell\x07 and nul\x00":                "bell and nul",
+		strings.Repeat("x", 150):              strings.Repeat("x", 99) + "…",
+		"   ":                                 "",
+	}
+	for in, want := range cases {
+		if got := LogLine(in); got != want {
+			t.Errorf("LogLine(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A boot phase whose detail keeps changing is still one phase: its
+// heartbeat isn't reset by each new log line, and prints the latest one.
+func TestPlainReporterDetailKeepsPhase(t *testing.T) {
+	old := plainDelay
+	plainDelay = 60 * time.Millisecond
+	defer func() { plainDelay = old }()
+	var w syncBuf
+	p := &plainReporter{w: &w}
+	for i := 1; i <= 6; i++ {
+		p.Status("aws: running first-boot setup %ds%sstep %d", i, DetailSep, i)
+		time.Sleep(15 * time.Millisecond)
+	}
+	time.Sleep(60 * time.Millisecond)
+	p.Done("done", true)
+	got := w.String()
+	if !strings.Contains(got, "sx: aws: running first-boot setup ") || !strings.Contains(got, DetailSep+"step ") {
+		t.Fatalf("no heartbeat with the latest step:\n%s", got)
+	}
+	if n := strings.Count(got, "first-boot"); n != 1 {
+		t.Fatalf("%d heartbeats, want 1:\n%s", n, got)
+	}
+}

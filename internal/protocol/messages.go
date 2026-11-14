@@ -54,6 +54,9 @@ const (
 type ErrorMsg struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Detail adds context for some codes: with RUNNER_BOOTING, the latest
+	// line of the VM's bootstrap log.
+	Detail string `json:"detail,omitempty"`
 }
 
 // Hello opens a session.
