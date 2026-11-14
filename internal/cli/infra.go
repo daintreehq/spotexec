@@ -211,14 +211,19 @@ func cmdStatus() *cobra.Command {
 			}
 			if everyone {
 				res := findAccountInstances(cmd.Context(), accountScopes(cfg))
+				quotas := spotQuotas(cmd.Context(), cfg)
 				if asJSON {
-					if err := json.NewEncoder(os.Stdout).Encode(res); err != nil {
+					if res.Instances == nil {
+						res.Instances = []provider.AccountInstance{}
+					}
+					if err := json.NewEncoder(os.Stdout).Encode(accountStatus{AccountSearch: res, SpotQuotas: quotas}); err != nil {
 						return err
 					}
 					return res.Err()
 				}
 				printAccountInstances(res.Instances)
 				printSearched(res)
+				printSpotQuotas(os.Stdout, quotas)
 				return res.Err()
 			}
 			rs, err := selectRunners(cfg, args)
@@ -237,7 +242,7 @@ func cmdStatus() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&asJSON, "json", false, "JSON output")
-	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "every spotexec VM (bake builders and stopped VMs too), whichever machine launched it, in the regions and profiles your AWS runners use")
+	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "every spotexec VM (bake builders and stopped VMs too), whichever machine launched it, in the regions and profiles your AWS runners use, and each region's Spot quota use")
 	return c
 }
 

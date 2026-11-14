@@ -11,7 +11,7 @@ spotexec tasks                               list tasks from .spotexec.toml
 spotexec sync [flags]                        pre-sync a slot (and build the container image, install deps)
 spotexec sync-plan [--json]                  dry-run the sync: files, bytes, largest files, exclusions
 spotexec pull <glob>... [--dest DIR]         copy gitignored files from the last slot
-spotexec status [runner...] [--json] [-A]    runners, instances, slot holders, idle timers (-A: every machine's VMs and builders)
+spotexec status [runner...] [--json] [-A]    runners, instances, slot holders, idle timers (-A: every machine's VMs and builders, Spot quota use; with --json, {"instances", "searched", "failed", "spot_quotas"})
 spotexec monitor [runner...] [--interval 2s] live load and burn-rate dashboard
 spotexec up [runner] [--count N]             pre-warm fleet VMs (waits until ready)
 spotexec down [runner...] [--all]            terminate fleet VMs (and leftover bake builders)

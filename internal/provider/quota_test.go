@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -149,6 +150,7 @@ func TestQuotaCodeFor(t *testing.T) {
 type fakeAWS struct {
 	quota     float64 // <0: AccessDenied
 	instances string  // DescribeInstances item XML
+	more      string  // a second page of items, when set
 }
 
 func (f *fakeAWS) server(t *testing.T) *AWSSpot {
@@ -166,7 +168,13 @@ func (f *fakeAWS) server(t *testing.T) *AWSSpot {
 		_ = r.ParseForm()
 		switch r.Form.Get("Action") {
 		case "DescribeInstances":
-			fmt.Fprintf(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet>%s</instancesSet></item></reservationSet></DescribeInstancesResponse>`, f.instances)
+			items, next := f.instances, ""
+			if r.Form.Get("NextToken") == "p2" {
+				items = f.more
+			} else if f.more != "" {
+				next = "<nextToken>p2</nextToken>"
+			}
+			fmt.Fprintf(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet>%s</instancesSet></item></reservationSet>%s</DescribeInstancesResponse>`, items, next)
 		default:
 			w.WriteHeader(400)
 			fmt.Fprint(w, `<Response><Errors><Error><Code>InvalidAction</Code><Message>x</Message></Error></Errors></Response>`)
@@ -231,5 +239,164 @@ func TestQuotaValueStalled(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("quota lookup not bounded")
+	}
+}
+
+func TestQuotaAdmit(t *testing.T) {
+	cases := []struct {
+		name     string
+		u        QuotaUsage
+		need     int
+		ok, fair bool
+	}{
+		{"unknown quota: EC2 decides", QuotaUsage{Quota: -1, Used: 100}, 8, true, false},
+		{"fits", QuotaUsage{Quota: 16, Used: 8, Mine: 8}, 8, true, false},
+		{"full", QuotaUsage{Quota: 16, Used: 12, Mine: 12}, 8, false, false},
+		{"new account below one VM", QuotaUsage{Quota: 5}, 8, false, false},
+		{"alone: may use all of it", QuotaUsage{Quota: 32, Used: 24, Mine: 24}, 8, true, false},
+		{"over its share, last room kept for others", QuotaUsage{Quota: 32, Used: 24, Mine: 16, Machines: map[string]int{"b": 8}}, 8, false, true},
+		{"over its share with room to spare", QuotaUsage{Quota: 64, Used: 24, Mine: 16, Machines: map[string]int{"b": 8}}, 8, true, false},
+		{"below its share takes the last room", QuotaUsage{Quota: 32, Used: 24, Mine: 8, Machines: map[string]int{"b": 16}}, 8, true, false},
+		{"no VMs yet: below its share", QuotaUsage{Quota: 16, Used: 8, Machines: map[string]int{"b": 8}}, 8, true, false},
+		{"no VMs and no room", QuotaUsage{Quota: 16, Used: 16, Machines: map[string]int{"b": 16}}, 8, false, false},
+	}
+	for _, c := range cases {
+		if ok, fair := c.u.Admit(c.need); ok != c.ok || fair != c.fair {
+			t.Errorf("%s: Admit = %v, %v; want %v, %v", c.name, ok, fair, c.ok, c.fair)
+		}
+	}
+}
+
+const quotaInstancesXML = `
+<item><instanceId>i-mine</instanceId><instanceType>c7a.2xlarge</instanceType><instanceState><name>running</name></instanceState>
+  <cpuOptions><coreCount>4</coreCount><threadsPerCore>2</threadsPerCore></cpuOptions>
+  <tagSet><item><key>spotexec-runner</key><value>aws</value></item><item><key>spotexec-owner</key><value>me-1</value></item></tagSet></item>
+<item><instanceId>i-studio</instanceId><instanceType>c7a.xlarge</instanceType><instanceState><name>pending</name></instanceState>
+  <tagSet><item><key>spotexec-runner</key><value>aws</value></item><item><key>spotexec-owner</key><value>them-2</value></item><item><key>spotexec-host</key><value>studio-01</value></item></tagSet></item>
+<item><instanceId>i-twin</instanceId><instanceType>c7a.xlarge</instanceType><instanceState><name>running</name></instanceState>
+  <tagSet><item><key>spotexec-runner</key><value>aws</value></item><item><key>spotexec-owner</key><value>twin-3</value></item><item><key>spotexec-host</key><value>studio-01</value></item></tagSet></item>
+<item><instanceId>i-other</instanceId><instanceType>m6i.large</instanceType><instanceState><name>running</name></instanceState>
+  <cpuOptions><coreCount>1</coreCount><threadsPerCore>1</threadsPerCore></cpuOptions></item>
+<item><instanceId>i-gpu</instanceId><instanceType>g5.xlarge</instanceType><instanceState><name>running</name></instanceState></item>`
+
+func TestAWSQuotaUsage(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SPOTEXEC_CONFIG_DIR", dir)
+	if err := os.WriteFile(dir+"/owner-id", []byte("me-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := (&fakeAWS{quota: 20, instances: quotaInstancesXML}).server(t)
+	u, err := a.QuotaUsage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Quota != 20 || u.Used != 18 || u.Mine != 8 || u.Other != 2 || len(u.Machines) != 2 ||
+		u.Machines["studio-01"] != 4 || u.Machines["studio-01 (owner twin)"] != 4 {
+		t.Fatalf("usage %+v", u)
+	}
+	want := "18 of 20 vCPUs in use: 8 by this machine, 4 by studio-01, 4 by studio-01 (owner twin), 2 by Spot instances spotexec didn't launch"
+	if u.String() != want {
+		t.Fatalf("got  %q\nwant %q", u.String(), want)
+	}
+
+	// The pre-launch check refuses what EC2 would, explaining the usage.
+	qe := a.admitSpot(u, 8)
+	if qe == nil || qe.Fair || qe.Usage == nil {
+		t.Fatalf("launch past the quota admitted: %+v", qe)
+	}
+	msg := qe.Error()
+	for _, w := range []string{"has no room", "18 of 20 vCPUs in use", "4 by studio-01", "--desired-value 42"} {
+		if !strings.Contains(msg, w) {
+			t.Errorf("message lacks %q:\n%s", w, msg)
+		}
+	}
+	// Room for one more VM: below its share (30/3 machines) this machine
+	// may take it; at its share (26/3), it's kept for the others.
+	u.Quota = 30
+	if qe := a.admitSpot(u, 8); qe != nil {
+		t.Fatalf("refused below its share: %v", qe)
+	}
+	u.Quota = 26
+	qe = a.admitSpot(u, 8)
+	if qe == nil || !qe.Fair || !strings.Contains(qe.Error(), "kept for the other machines") {
+		t.Fatalf("last room not kept for the others: %v", qe)
+	}
+	// An unreadable quota is reported as such.
+	a = (&fakeAWS{quota: -1, instances: quotaInstancesXML}).server(t)
+	if u, err := a.QuotaUsage(context.Background()); err == nil || u.Quota != -1 || u.Used != 18 {
+		t.Fatalf("unreadable quota: %+v %v", u, err)
+	}
+}
+
+// Each Spot candidate is admitted on its own: a big type can't take the
+// others' room just because a small one would fit, a type under another
+// quota is still tried, and on-demand (opted in) is unaffected.
+func TestLaunchAdmitsEachCandidate(t *testing.T) {
+	u := QuotaUsage{Region: "us-east-2", Quota: 32, Used: 24, Mine: 16, Machines: map[string]int{"studio-01": 8}}
+	a := quotaRunner("c7a.2xlarge", "c7a.large")
+	var calls []string
+	inst, err := a.launchAcross([]bool{true}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	if err != nil || inst.InstanceID != "i-c7a.large" || strings.Join(calls, ",") != "c7a.large" {
+		t.Fatalf("launched %q (calls %v, %v); want only the 2-vCPU type", inst.InstanceID, calls, err)
+	}
+	u = QuotaUsage{Region: "us-east-2", Quota: 16, Used: 16, Mine: 16}
+	a = quotaRunner("c7a.xlarge", "g5.xlarge")
+	calls = nil
+	inst, err = a.launchAcross([]bool{true}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	if err != nil || inst.InstanceID != "i-g5.xlarge" {
+		t.Fatalf("G type under its own quota not tried: %v %v", calls, err)
+	}
+	a = quotaRunner("c7a.xlarge")
+	a.r.OnDemandFallback = true
+	calls = nil
+	inst, err = a.launchAcross([]bool{true, false}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	if err != nil || strings.Join(calls, ",") != "c7a.xlarge/od" {
+		t.Fatalf("on-demand fallback: %v %v", calls, err)
+	}
+	a.r.OnDemandFallback = false
+	_, err = a.launchAcross([]bool{true}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	var qe *QuotaError
+	if !errors.As(err, &qe) || qe.Usage == nil || !strings.Contains(err.Error(), "16 of 16 vCPUs in use: 16 by this machine") {
+		t.Fatalf("want the checked quota error with its usage, got %v", err)
+	}
+}
+
+func TestQuotaUsageReadsEveryPage(t *testing.T) {
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	a := (&fakeAWS{quota: 64, instances: quotaInstancesXML, more: `<item><instanceId>i-late</instanceId><instanceType>c7a.4xlarge</instanceType></item>`}).server(t)
+	u, err := a.QuotaUsage(context.Background())
+	if err != nil || u.Used != 18+16 {
+		t.Fatalf("usage %+v, %v", u, err)
+	}
+}
+
+// The suggested quota fits this machine's fleet next to what the other
+// machines use, however launchAcross reports the refusal.
+func TestCheckedQuotaKeepsItsDesiredValue(t *testing.T) {
+	u := QuotaUsage{Region: "us-east-2", Quota: 64, Used: 64, Mine: 8, Machines: map[string]int{"studio-01": 56}}
+	a := quotaRunner("c7a.2xlarge")
+	var calls []string
+	_, err := a.launchAcross([]bool{true}, func(string, ...any) {}, a.admitting(&u, tries(nil, &calls)))
+	var qe *QuotaError
+	if !errors.As(err, &qe) || qe.Desired != 88 || !strings.Contains(err.Error(), "--desired-value 88") {
+		t.Fatalf("want desired 88 (56 others + 32 fleet), got %v", err)
+	}
+}
+
+func TestMinStandardVCPUs(t *testing.T) {
+	if n := minStandardVCPUs([]string{"c7a.2xlarge", "m7a.xlarge", "g5.large"}); n != 4 {
+		t.Fatalf("got %d", n)
+	}
+	if n := minStandardVCPUs([]string{"g5.xlarge"}); n != 0 {
+		t.Fatalf("got %d", n)
+	}
+}
+
+func TestVCPUsOf(t *testing.T) {
+	for it, want := range map[string]int{"t2.micro": 1, "t3.micro": 2, "t3.medium": 2, "c6g.medium": 1, "c7a.large": 2,
+		"c7a.xlarge": 4, "c7a.2xlarge": 8, "m7a.48xlarge": 192, "c4.8xlarge": 36, "c5.metal": 96, "m7i.metal-24xl": 96, "c7a.metal-48xl": 192} {
+		if got := vcpusOf(it); got != want {
+			t.Errorf("%s: %d, want %d", it, got, want)
+		}
 	}
 }

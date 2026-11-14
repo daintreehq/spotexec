@@ -1,7 +1,11 @@
 package provider
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/url"
+	"sort"
 	"strings"
 )
 
@@ -22,6 +26,12 @@ type QuotaError struct {
 	VCPUs   int    // vCPUs the refused launch needed
 	Desired int    // a quota that would fit this runner's whole fleet
 	Detail  string // what EC2 answered, per instance type
+	// Usage is the account's live usage when spotexec checked before
+	// launching (nil when EC2 refused the launch itself).
+	Usage *QuotaUsage
+	// Fair: the quota has room, but this machine is at its share and the
+	// last room is left to the other machines using it.
+	Fair bool
 }
 
 func (e *QuotaError) market() string {
@@ -33,6 +43,12 @@ func (e *QuotaError) market() string {
 
 func (e *QuotaError) Error() string {
 	msg := fmt.Sprintf("the account's %s vCPU quota in %s has no room for another VM (a launch needs %d vCPUs)", e.market(), e.Region, e.VCPUs)
+	if e.Fair {
+		msg = fmt.Sprintf("this machine has its share of the account's %s vCPU quota in %s, and the room left (%d vCPUs) is kept for the other machines using it", e.market(), e.Region, e.Usage.Quota-e.Usage.Used)
+	}
+	if e.Usage != nil {
+		msg += " (" + e.Usage.String() + ")"
+	}
 	if e.Detail != "" {
 		msg += " (" + e.Detail + ")"
 	}
@@ -83,4 +99,198 @@ func standardFamily(itype string) bool {
 		}
 	}
 	return strings.ContainsRune("acdhimrtz", rune(t[0]))
+}
+
+// QuotaUsage is a region's standard Spot vCPU quota and what is using it,
+// read live from the account: every machine sharing the account sees the
+// same numbers.
+type QuotaUsage struct {
+	Region string `json:"region"`
+	Quota  int    `json:"quota"` // vCPUs; -1 when it couldn't be read
+	Used   int    `json:"used"`  // vCPUs of pending and running standard-family Spot instances
+	Mine   int    `json:"mine"`  // of which this machine's spotexec VMs
+	// Machines are the other spotexec machines' vCPUs, by machine name.
+	Machines map[string]int `json:"machines,omitempty"`
+	Other    int            `json:"other"` // Spot instances spotexec didn't launch
+}
+
+// Admit decides whether this machine may launch need more vCPUs, sharing
+// the quota between the machines that use it:
+//
+//   - never past the quota;
+//   - while other spotexec machines have VMs in the account, a machine
+//     already at or above its share (the quota divided among the machines
+//     with VMs, itself included) only grows while room for another VM
+//     remains, so it can't take the last room from the others. Below its
+//     share it may use whatever room is left.
+//
+// Machines with no VMs don't count toward the shares; idle VMs end after
+// idle_timeout and give their vCPUs back.
+func (u QuotaUsage) Admit(need int) (ok bool, fair bool) {
+	if u.Quota < 0 {
+		return true, false // unknown: let EC2 decide
+	}
+	if u.Used+need > u.Quota {
+		return false, false
+	}
+	if len(u.Machines) == 0 {
+		return true, false
+	}
+	share := u.Quota / (len(u.Machines) + 1)
+	if u.Mine < share || u.Used+2*need <= u.Quota {
+		return true, false
+	}
+	return false, true
+}
+
+// String describes the usage, e.g. "12 of 16 vCPUs in use: 4 by this
+// machine, 8 by studio-01".
+func (u QuotaUsage) String() string {
+	s := fmt.Sprintf("%d of %d vCPUs in use", u.Used, u.Quota)
+	if u.Quota < 0 {
+		s = fmt.Sprintf("%d vCPUs in use (quota unknown)", u.Used)
+	}
+	var parts []string
+	if u.Mine > 0 {
+		parts = append(parts, fmt.Sprintf("%d by this machine", u.Mine))
+	}
+	names := make([]string, 0, len(u.Machines))
+	for n := range u.Machines {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		parts = append(parts, fmt.Sprintf("%d by %s", u.Machines[n], n))
+	}
+	if u.Other > 0 {
+		parts = append(parts, fmt.Sprintf("%d by Spot instances spotexec didn't launch", u.Other))
+	}
+	if len(parts) > 0 {
+		s += ": " + strings.Join(parts, ", ")
+	}
+	return s
+}
+
+// desired suggests a quota that fits this machine's whole fleet next to
+// what the others use now, and at least one more launch.
+func (u QuotaUsage) desired(need, fleet int) int {
+	return max(u.Quota+need, u.Used-u.Mine+max(u.Mine+need, fleet))
+}
+
+// QuotaUsage reads the region's standard Spot vCPU quota and counts what
+// uses it: every pending or running Spot instance in the account and region
+// (DescribeInstances), attributed to this machine, other spotexec machines
+// (by their host tag) or neither.
+func (a *AWSSpot) QuotaUsage(ctx context.Context) (QuotaUsage, error) {
+	u := QuotaUsage{Region: a.r.Region, Quota: -1, Machines: map[string]int{}}
+	me, _ := ownerID()
+	labels := map[string]string{} // owner -> machine name, unique per owner
+	taken := map[string]bool{}
+	label := func(host, owner string) string {
+		if l, ok := labels[owner]; ok {
+			return l
+		}
+		l := machineLabel(host, owner)
+		if taken[l] {
+			l += " (" + machineLabel("", owner) + ")"
+		}
+		labels[owner], taken[l] = l, true
+		return l
+	}
+	p := url.Values{"Filter.1.Name": {"instance-lifecycle"}, "Filter.1.Value.1": {"spot"},
+		"Filter.2.Name": {"instance-state-name"}, "Filter.2.Value.1": {"pending"}, "Filter.2.Value.2": {"running"},
+		"MaxResults": {"1000"}}
+	lctx, cancel := context.WithTimeout(ctx, 4*quotaLookupTimeout)
+	defer cancel()
+	for page := 0; ; page++ {
+		if page == 200 {
+			return u, errors.New("DescribeInstances: too many pages; usage incomplete")
+		}
+		b, err := a.api.ec2(lctx, "DescribeInstances", p)
+		if err != nil {
+			return u, err
+		}
+		ins, next, err := parseDescribeInstances(b)
+		if err != nil {
+			return u, err
+		}
+		for _, in := range ins {
+			if !standardFamily(in.InstanceType) {
+				continue // counts against another quota
+			}
+			n := vcpusOf(in.InstanceType) // quotas count a type's default vCPUs, whatever its CPU options
+			u.Used += n
+			switch owner := in.tag(tagOwner); {
+			case owner == "" || (in.tag(tagRunner) == "" && in.tag(tagBake) == ""):
+				u.Other += n
+			case owner == me:
+				u.Mine += n
+			default:
+				u.Machines[label(in.tag(tagHost), owner)] += n
+			}
+		}
+		if next == "" {
+			break
+		}
+		p.Set("NextToken", next)
+	}
+	if q, err := a.quotaValue(ctx, QuotaCodeSpotStandard); err == nil {
+		u.Quota = q
+	} else {
+		return u, fmt.Errorf("Spot vCPU quota: %w", err)
+	}
+	return u, nil
+}
+
+// machineLabel names a spotexec machine for people: its host tag, else the
+// start of its owner ID.
+func machineLabel(host, owner string) string {
+	if host != "" {
+		return host
+	}
+	return "owner " + strings.Split(owner, "-")[0]
+}
+
+// admitSpot is the pre-launch check for one standard-family Spot launch of
+// need vCPUs: nil when it fits the account's live usage u, else the
+// QuotaError explaining why not.
+func (a *AWSSpot) admitSpot(u QuotaUsage, need int) *QuotaError {
+	ok, fair := u.Admit(need)
+	if ok {
+		return nil
+	}
+	fleet := a.r.MaxInstances * vcpusOf(a.r.InstanceTypes[0])
+	return &QuotaError{Region: a.r.Region, Spot: true, Code: QuotaCodeSpotStandard, VCPUs: need,
+		Desired: u.desired(need, fleet), Usage: &u, Fair: fair}
+}
+
+// admitting wraps a launch attempt with the pre-launch check: Spot
+// candidates in the standard families must fit the live usage (nil: not
+// known, so EC2 decides).
+func (a *AWSSpot) admitting(usage *QuotaUsage, run func(itype string, spot bool) (ec2Instance, error)) func(string, bool) (ec2Instance, error) {
+	return func(itype string, spot bool) (ec2Instance, error) {
+		if spot && usage != nil && standardFamily(itype) {
+			if qe := a.admitSpot(*usage, vcpusOf(itype)); qe != nil {
+				return ec2Instance{}, qe
+			}
+		}
+		return run(itype, spot)
+	}
+}
+
+func firstLineOfErr(err error) string {
+	s, _, _ := strings.Cut(err.Error(), "\n")
+	return s
+}
+
+// minStandardVCPUs is the smallest launch among a runner's standard-family
+// instance types (0 if it has none).
+func minStandardVCPUs(types []string) int {
+	n := 0
+	for _, t := range types {
+		if standardFamily(t) && (n == 0 || vcpusOf(t) < n) {
+			n = vcpusOf(t)
+		}
+	}
+	return n
 }

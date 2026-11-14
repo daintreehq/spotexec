@@ -193,13 +193,28 @@ func simQuota() int {
 	return n
 }
 
-// accountVCPUs counts the vCPUs live in the simulated account.
-func (s *Sim) accountVCPUs(ctx context.Context) (int, error) {
-	out, err := docker(ctx, "ps", "-q", "--filter", "label=spotexec-sim-account="+simAccount())
+// QuotaUsage is the simulated account's quota use, attributed by owner
+// like the AWS provider's.
+func (s *Sim) QuotaUsage(ctx context.Context) (QuotaUsage, error) {
+	u := QuotaUsage{Region: "sim", Quota: simQuota(), Machines: map[string]int{}}
+	me, err := s.ownerTag()
 	if err != nil {
-		return 0, err
+		return u, err
 	}
-	return simVCPUs * len(strings.Fields(string(out))), nil
+	out, err := docker(ctx, "ps", "--filter", "label=spotexec-sim-account="+simAccount(),
+		"--format", "{{.Label \"spotexec-owner\"}}")
+	if err != nil {
+		return u, err
+	}
+	for _, owner := range strings.Fields(string(out)) {
+		u.Used += simVCPUs
+		if owner == me {
+			u.Mine += simVCPUs
+		} else {
+			u.Machines[machineLabel("", owner)] += simVCPUs // one host: tell them apart by owner
+		}
+	}
+	return u, nil
 }
 
 // Launch starts one simulated instance.
@@ -218,14 +233,15 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 			return Instance{}, err
 		}
 		defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
-		used, err := s.accountVCPUs(ctx)
+		// Like the AWS provider's pre-launch check (where EC2 itself would
+		// refuse a launch past the quota).
+		u, err := s.QuotaUsage(ctx)
 		if err != nil {
 			return Instance{}, err
 		}
-		if used+simVCPUs > q {
-			// What EC2's MaxSpotInstanceCountExceeded becomes.
+		if ok, fair := u.Admit(simVCPUs); !ok {
 			return Instance{}, &QuotaError{Region: "sim", Spot: true, Code: QuotaCodeSpotStandard, VCPUs: simVCPUs,
-				Desired: max(simVCPUs, s.r.MaxInstances*simVCPUs), Detail: "sim: MaxSpotInstanceCountExceeded"}
+				Desired: u.desired(simVCPUs, s.r.MaxInstances*simVCPUs), Usage: &u, Fair: fair}
 		}
 	}
 	owner, err := s.ownerTag()

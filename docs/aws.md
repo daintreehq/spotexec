@@ -75,7 +75,7 @@ The policy is scoped to what spotexec creates:
 
 So a leaked key can launch tagged VMs and manage spotexec's own resources, but can't terminate, image or open up anything else in the account.
 
-The S3 statement (the [dependency cache](environments.md#dependency-cache); without it, set `cache_bucket = "off"` on the runner) and the ECR statements (Dockerfile-built [containers](environments.md#project-containers)) are optional. Everything else is needed to launch and clean up VMs and to [bake images](environments.md#baked-images).
+The S3 statement (the [dependency cache](environments.md#dependency-cache); without it, set `cache_bucket = "off"` on the runner), the ECR statements (Dockerfile-built [containers](environments.md#project-containers)) and `servicequotas:GetServiceQuota` (`doctor`'s quota check and the pre-launch quota check) are optional. Everything else is needed to launch and clean up VMs and to [bake images](environments.md#baked-images).
 
 The policy is attached inline, and an IAM user's inline policies are limited to 2,048 characters, which is why some statements group several actions. Re-running `spotexec setup` replaces the policy with the current version's. It also tags any `spotexec-ssh*` security group an older spotexec made without the tag. Until then, a VM can still launch into such a group if it already allows SSH from `ssh_cidr`, but spotexec can't add a rule to it.
 
@@ -185,6 +185,8 @@ aws service-quotas get-service-quota --profile spotexec --region us-east-2 \
 aws service-quotas request-service-quota-increase --region us-east-2 \
   --service-code ec2 --quota-code L-34B43A08 --desired-value 64
 ```
+
+The quota is shared by every machine using the account. Before each launch, spotexec checks the live usage and shares the quota between the machines that have VMs in the region ([details](scaling.md#several-machines-one-spot-quota)). `spotexec status -A` shows each region's quota against what's using it.
 
 When the quota refuses a launch (`MaxSpotInstanceCountExceeded`), spotexec doesn't treat it as a capacity shortage and retry. Runs queue for the fleet's running VMs, and new launches wait until one of them ends or five minutes pass. With no VM running and no other runner in the pool, `sx` fails at once (exit 125) with the region, the vCPUs a launch needs and the increase command. It never falls back to on-demand unless you set `on_demand_fallback`.
 

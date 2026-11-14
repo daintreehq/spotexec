@@ -16,6 +16,16 @@ Every `sx` process schedules for itself, against shared local state:
   go test -p $SPOTEXEC_CPUS ./...
   ```
 
+### Several machines, one Spot quota
+
+The Spot vCPU quota belongs to the AWS account and region, so every machine using the account draws on the same quota, while each plans its own fleet. Before each Spot launch, spotexec reads the quota (Service Quotas) and counts the vCPUs of every pending or running Spot instance in the region (EC2 `DescribeInstances`). It attributes them to this machine, to other spotexec machines (by their `spotexec-owner` and `spotexec-host` tags), or to Spot instances spotexec didn't launch. A launch must fit what's left, and the quota is shared like this:
+
+- A machine with no VMs, or below its share, may use any room left. Its share is the quota divided among the machines that have VMs in the region, itself included.
+- A machine at or above its share keeps growing only while room for one more VM remains, so it can't take the last room from the other machines.
+- Nothing is reserved for machines with no VMs, and nothing is capped in the config: VMs idle out after `idle_timeout`, and their vCPUs go back to whoever needs them next.
+
+When a launch doesn't fit, the machine behaves as for any [quota refusal](aws.md#5-check-your-spot-vcpu-quota): its runs queue for the VMs it already has, or, with none, fail at once with exit 125. The error shows who is using the quota, for example `16 of 16 vCPUs in use: 8 by this machine, 8 by studio-01`, and the command to raise it. `spotexec status -A` prints the same breakdown for every region your runners use. If the quota can't be read, spotexec launches anyway and lets EC2 decide. The check is a snapshot, so EC2 stays the final judge: two machines launching at the same moment can both pass it, and open Spot requests from other tools that have no instance yet aren't counted. EC2 then refuses the launch, which is handled the same way.
+
 To mix machine sizes, define two fleets: a 2-vCPU fleet for light jobs and a 4-vCPU fleet for heavy ones. Route tasks to them with `pool`, or let overflow spill from one to the other by priority. [docs/POOL.md](POOL.md) has the full scheduling design.
 
 ## Pool manager (optional)

@@ -554,11 +554,21 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	if spec.bake {
 		markets = []bool{false} // on-demand: a reclaimed builder wastes the bake
 	}
-	inst, err := a.launchAcross(markets, log, func(itype string, spot bool) (ec2Instance, error) {
+	// The standard Spot quota is shared by every machine using the account:
+	// read its live use once, then admit each Spot candidate against it, so
+	// a launch that won't fit (or would take the others' last room) is
+	// explained, not just refused.
+	var usage *QuotaUsage
+	if !spec.bake && minStandardVCPUs(a.r.InstanceTypes) > 0 {
+		if u, err := a.QuotaUsage(ctx); err == nil && u.Quota >= 0 {
+			usage = &u
+		}
+	}
+	inst, err := a.launchAcross(markets, log, a.admitting(usage, func(itype string, spot bool) (ec2Instance, error) {
 		return a.runOne(ctx, base, itype, spot, log)
-	})
+	}))
 	var qe *QuotaError
-	if errors.As(err, &qe) && qe.Code != "" {
+	if errors.As(err, &qe) && qe.Code != "" && qe.Usage == nil {
 		// Suggest a quota above the current one: other runners or machines
 		// may be what fills it.
 		if q, qerr := a.quotaValue(ctx, qe.Code); qerr == nil {
@@ -615,14 +625,27 @@ func (a *AWSSpot) launchAcross(markets []bool, log Logger, try func(itype string
 				return inst, nil
 			}
 			class := classifyAWSError(err)
+			code := awsCode(err)
+			checked, isChecked := err.(*QuotaError) // refused by the pre-launch quota check
+			if isChecked {
+				class, code = errQuota, "quota"
+			}
 			if errors.Is(err, ErrLaunchAmbiguous) || (class != errNextType && class != errQuota) {
 				return ec2Instance{}, fmt.Errorf("launch %s: %w", itype, err)
 			}
-			log("skipping %s: %v", itype, err)
-			errs = append(errs, itype+": "+awsCode(err))
+			if isChecked {
+				log("skipping %s: %s", itype, firstLineOfErr(err))
+			} else {
+				log("skipping %s: %v", itype, err)
+			}
+			errs = append(errs, itype+": "+code)
 			switch {
 			case class == errQuota && (mq == nil || vcpusOf(itype) < mq.VCPUs):
-				mq = &QuotaError{Region: a.r.Region, Spot: spot, Code: quotaCodeFor(itype, spot), VCPUs: vcpusOf(itype)}
+				if isChecked {
+					mq = checked
+				} else {
+					mq = &QuotaError{Region: a.r.Region, Spot: spot, Code: quotaCodeFor(itype, spot), VCPUs: vcpusOf(itype)}
+				}
 			case class == errNextType && capacityCode(awsCode(err)):
 				if c := quotaCodeFor(itype, spot); short[c] == 0 || vcpusOf(itype) < short[c] {
 					short[c] = vcpusOf(itype)
@@ -653,8 +676,10 @@ func (a *AWSSpot) launchAcross(markets []bool, log Logger, try func(itype string
 		}
 	}
 	if quota != nil && quotaEveryMarket {
-		quota.Detail = strings.Join(errs, ", ")
-		quota.Desired = max(quota.VCPUs, a.r.MaxInstances*vcpusOf(a.r.InstanceTypes[0]))
+		if quota.Usage == nil { // the pre-launch check already says what uses the quota
+			quota.Detail = strings.Join(errs, ", ")
+		}
+		quota.Desired = max(quota.Desired, quota.VCPUs, a.r.MaxInstances*vcpusOf(a.r.InstanceTypes[0]))
 		return ec2Instance{}, quota
 	}
 	return ec2Instance{}, fmt.Errorf("no instance type could be launched in %s (%s); add more instance_types, raise max_price, or set on_demand_fallback = true", a.r.Region, strings.Join(errs, ", "))
@@ -1045,6 +1070,9 @@ func vcpusOf(t string) int {
 	_, size, _ := strings.Cut(t, ".")
 	switch size {
 	case "nano", "micro", "small":
+		if strings.HasPrefix(t, "t2.") {
+			return 1
+		}
 		return 2
 	case "medium":
 		if strings.HasPrefix(t, "t") {
@@ -1056,8 +1084,17 @@ func vcpusOf(t string) int {
 	case "xlarge":
 		return 4
 	}
+	if t == "c4.8xlarge" {
+		return 36 // the odd one out
+	}
 	if n, err := strconv.Atoi(strings.TrimSuffix(size, "xlarge")); err == nil {
 		return 4 * n
+	}
+	if n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(size, "metal-"), "xl")); err == nil {
+		return 4 * n // metal-48xl
+	}
+	if size == "metal" {
+		return 96 // varies by family (64-448); the common size
 	}
 	return 4
 }

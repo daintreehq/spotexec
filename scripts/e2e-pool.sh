@@ -224,6 +224,19 @@ check "room for one VM: all five jobs queue for it and succeed" "[ \$(cat $WORK/
 check "only one VM ran" "[ \$(count) = 1 ]"
 check "launches stop after the quota refusal (no retry loop)" "[ \$(cat $WORK/qq*.err | grep -c LAUNCH_FAILED) -le 2 ]"
 
+echo "== two machines sharing the account's quota (room for one VM)"
+cleanup; sleep 1
+rm -rf "$SPOTEXEC_STATE_DIR/runners/$RUNNER/pool.json"
+SPOTEXEC_SIM_QUOTA=4 "$SX" --json 'sleep 10; echo a-done' >"$WORK/ma.out" 2>"$WORK/ma.err" &
+P=$!
+for _ in $(seq 1 60); do grep -q '"exec"' "$WORK/ma.err" 2>/dev/null && break; sleep 0.5; done
+mkdir -p "$WORK/cfgB" && cp "$SPOTEXEC_CONFIG_DIR/config.toml" "$WORK/cfgB/"
+SPOTEXEC_CONFIG_DIR="$WORK/cfgB" SPOTEXEC_STATE_DIR="$WORK/stateB" SPOTEXEC_SIM_QUOTA=4 "$SX" 'echo b-ran' >"$WORK/mb.out" 2>"$WORK/mb.err"; code=$?
+check "the other machine, with no VM, fails at once (exit 125)" "[ $code = 125 ] && ! grep -q b-ran $WORK/mb.out"
+check "and says who holds the quota" "grep -q '4 of 4 vCPUs in use: 4 by owner ' $WORK/mb.err"
+wait $P
+check "the first machine's run was unaffected" "grep -q a-done $WORK/ma.out"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" = 0 ]
