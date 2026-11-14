@@ -89,10 +89,10 @@ The manifest records the Git blob ID of every synced file: the **baseline**. Aft
 | Your local file now | Outcome |
 | --- | --- |
 | Equals the remote result | Nothing to do. |
-| Equals the baseline | The remote version is applied atomically (temp file, then rename). |
+| Equals the baseline | The remote version is applied atomically (temp file, then rename). Your file keeps its permissions; only an executable-bit change made remotely comes back. |
 | Anything else | You edited it during the run. **Your file is kept**, the remote version is saved to `<git-dir>/spotexec/conflicts/<run-id>/<path>`, and a `SYNC_CONFLICT` warning is emitted. |
 
-Deletions apply deepest-first, then writes. New files only come back if Git wouldn't ignore them, so `dist/`, `target/` and `node_modules` never travel back. A runner can never write into `.git`, under any spelling.
+Deletions apply deepest-first, then writes. New files only come back if Git wouldn't ignore them (created no more permissively than your umask allows), so `dist/`, `target/` and `node_modules` never travel back. A runner can never write into `.git`, under any spelling.
 
 A new file the run created that doesn't come back (`--writeback never`, `--sync in`, a failed `on-success` run, a `--sync none` run, a dropped connection) stays in the slot until the next run that syncs into it, which removes it. Until then `spotexec exec` and `sx -s --sync none` can still look at it. Ignored outputs and `cache_dirs` are kept, like any build cache.
 

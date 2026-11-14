@@ -454,14 +454,20 @@ func writeLocal(root, p string, rf remoteFile, expect *version) error {
 			return err
 		}
 	} else {
-		if err := os.WriteFile(tmp, rf.data, fsid.Perm(rf.mode)); err != nil {
+		// Over an existing file, staged private (it may be a 0600 secret)
+		// and given that file's bits just before the rename; a new file
+		// gets 0644/0755 as the umask allows.
+		stage := fsid.Perm(rf.mode)
+		if _, existing := replacementPerm(full, rf.mode); existing {
+			stage = 0o600
+		}
+		if err := os.WriteFile(tmp, rf.data, stage); err != nil {
 			os.Remove(tmp)
 			return err
 		}
-		if err := os.Chmod(tmp, fsid.Perm(rf.mode)); err != nil {
-			os.Remove(tmp)
-			return err
-		}
+	}
+	if stagedHook != nil {
+		stagedHook()
 	}
 	if fi, err := os.Lstat(full); err == nil && fi.IsDir() {
 		os.Remove(tmp)
@@ -473,11 +479,44 @@ func writeLocal(root, p string, rf remoteFile, expect *version) error {
 			return errChangedUnderUs
 		}
 	}
+	if rf.mode != fsid.ModeSymlink {
+		// Read now, not before staging: a chmod made meanwhile (tightening
+		// a secret) must not be undone.
+		if perm, existing := replacementPerm(full, rf.mode); existing {
+			if err := os.Chmod(tmp, perm); err != nil {
+				os.Remove(tmp)
+				return err
+			}
+		}
+	}
 	if err := os.Rename(tmp, full); err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	return nil
+}
+
+// stagedHook runs after writeLocal stages a file (tests).
+var stagedHook func()
+
+// replacementPerm is the permission for a file written over full. An
+// existing regular file keeps its own bits (a 0600 .npmrc stays 0600); only
+// an executable-bit change made remotely is carried over, for whoever may
+// read the file. existing is false when there is no regular file there: a
+// new file gets the usual 0644/0755, which the umask narrows.
+func replacementPerm(full string, mode uint32) (perm os.FileMode, existing bool) {
+	fi, err := os.Lstat(full)
+	if err != nil || !fi.Mode().IsRegular() {
+		return fsid.Perm(mode), false
+	}
+	perm = fi.Mode().Perm()
+	switch {
+	case mode == fsid.ModeExec && perm&0o111 == 0:
+		perm |= (perm & 0o444) >> 2 // +x wherever it is readable
+	case mode != fsid.ModeExec:
+		perm &^= 0o111
+	}
+	return perm, true
 }
 
 func pruneEmptyDirs(root string, dirs []string) {
