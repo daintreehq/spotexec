@@ -1049,12 +1049,25 @@ func printSearched(res *provider.AccountSearch) {
 		fmt.Println("no AWS runners configured, so no account to search")
 		return
 	}
-	var where []string
+	// One group per account and profile: a fleet with regions = ["all"]
+	// is searched in every region with the same identity.
+	type ident struct{ account, profile string }
+	var order []ident
+	regions := map[ident][]string{}
 	for _, sc := range res.Searched {
-		where = append(where, sc.String())
+		id := ident{sc.Account, sc.Profile}
+		if _, ok := regions[id]; !ok {
+			order = append(order, id)
+		}
+		regions[id] = append(regions[id], sc.Region)
+	}
+	var where []string
+	for _, id := range order {
+		label := provider.AccountScope{Region: strings.Join(regions[id], ", "), Account: id.account, Profile: id.profile}.String()
+		where = append(where, label)
 	}
 	if len(where) > 0 {
-		fmt.Printf("searched %s (the regions your AWS runners use)\n", strings.Join(where, ", "))
+		fmt.Printf("searched %s (the regions your AWS runners use)\n", strings.Join(where, "; "))
 	}
 	// Regions that couldn't be listed come back as the command's error.
 }

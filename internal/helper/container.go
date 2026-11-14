@@ -119,14 +119,23 @@ func (s *Session) ensureDocker(ctx context.Context) (dockerRunner, bool, error) 
 	}
 	u, _ := user.Current()
 	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "docker_install", Message: "installing docker on the runner (add `apt-get install -y docker.io docker-buildx` and `usermod -aG docker " + u.Username + "` to bootstrap_script to skip this)"})
-	script := `set -e
-export DEBIAN_FRONTEND=noninteractive
-if ! command -v docker >/dev/null 2>&1; then
-  sudo -n apt-get update -o DPkg::Lock::Timeout=300 -qq
-  sudo -n apt-get install -y -qq -o DPkg::Lock::Timeout=300 docker.io docker-buildx
-fi
-sudo -n systemctl enable --now docker >/dev/null 2>&1 || sudo -n service docker start || true
-sudo -n usermod -aG docker ` + shq(u.Username)
+	// apt's output goes to a log, shown only if the install fails: the
+	// event above already says what is happening, and an agent reading the
+	// run's output shouldn't get dpkg's progress. sudo resets the
+	// environment, so DEBIAN_FRONTEND goes through env. Chained with &&
+	// rather than set -e, which an if condition would disable.
+	script := `log=` + shq(filepath.Join(s.layout.Root, "docker-install.log")) + `
+if ! (
+  { command -v docker >/dev/null 2>&1 || {
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -o DPkg::Lock::Timeout=300 -qq &&
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeout=300 docker.io docker-buildx; }; } &&
+  { sudo -n systemctl enable --now docker || sudo -n service docker start || true; } &&
+  sudo -n usermod -aG docker ` + shq(u.Username) + `
+) >"$log" 2>&1; then
+  echo "installing docker failed; the end of $log:" >&2
+  tail -n 40 "$log" >&2
+  exit 1
+fi`
 	left := min(10*time.Minute, time.Until(deadlineOf(ctx)))
 	if left <= 0 {
 		return dockerRunner{}, false, errors.New("no time left to install docker")

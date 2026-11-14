@@ -339,7 +339,11 @@ func Dur(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	}
-	return strings.TrimSuffix(d.Round(time.Second).String(), "0s")
+	s := d.Round(time.Second).String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s") // 6m0s → 6m, but 6m50s stays
+	}
+	return s
 }
 
 // plainReporter is the default when stderr isn't a terminal. An agent reads

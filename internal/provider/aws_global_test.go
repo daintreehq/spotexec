@@ -202,16 +202,30 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 				return
 			}
 			want := map[string]bool{}
-			for i := 1; p.Get(fmt.Sprintf("Filter.3.Value.%d", i)) != ""; i++ {
-				want[p.Get(fmt.Sprintf("Filter.3.Value.%d", i))] = true
+			for n := 1; p.Get(fmt.Sprintf("Filter.%d.Name", n)) != ""; n++ {
+				if p.Get(fmt.Sprintf("Filter.%d.Name", n)) != "instance-state-name" {
+					continue
+				}
+				for i := 1; p.Get(fmt.Sprintf("Filter.%d.Value.%d", n, i)) != ""; i++ {
+					want[p.Get(fmt.Sprintf("Filter.%d.Value.%d", n, i))] = true
+				}
 			}
-			f.log(region, act)
+			// Listed by owner alone (leftovers): bake builders as well.
+			byOwner := p.Get("Filter.1.Name") == "tag:spotexec-owner"
+			if byOwner {
+				f.log(region, act+" owned")
+			} else {
+				f.log(region, act)
+			}
 			if code := f.listErr[region]; code != "" {
 				ec2Err(w, 403, code)
 				return
 			}
 			owner, _ := ownerID()
 			fmt.Fprint(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet>`)
+			if byOwner && f.builders[region] {
+				fmt.Fprintf(w, `<item><instanceId>i-builder</instanceId><instanceState><name>stopped</name></instanceState><tagSet><item><key>spotexec-bake-runner</key><value>g</value></item><item><key>spotexec-owner</key><value>%s</value></item></tagSet></item>`, owner)
+			}
 			for id, typ := range f.instances[region] {
 				st := f.state[id]
 				if st == "" {

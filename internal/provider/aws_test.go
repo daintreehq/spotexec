@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -228,5 +231,77 @@ sso_start_url = https://example.awsapps.com/start
 	}
 	if _, err := configCredentials(context.Background(), "ssoonly"); err == nil || !strings.Contains(err.Error(), "aws sso login") {
 		t.Fatalf("expected an `aws sso login` hint without a cached token, got %v", err)
+	}
+}
+
+// A request that never answers is retried within the caller's deadline
+// instead of using it all up.
+func TestQueryRetriesStuckAttempt(t *testing.T) {
+	old := queryAttemptTimeout
+	queryAttemptTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { queryAttemptTimeout = old })
+	var n atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) == 1 {
+			<-release // never answers while the client waits
+			return
+		}
+		fmt.Fprint(w, `<DescribeRegionsResponse/>`)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) }) // runs first
+	c := &awsClient{region: "us-east-2", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AK", SecretAccessKey: "s"}},
+		http: srv.Client(), endpoints: map[string]string{"ec2": srv.URL + "/"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.ec2(ctx, "DescribeRegions", nil); err != nil {
+		t.Fatalf("err = %v after %d attempts", err, n.Load())
+	}
+	if n.Load() != 2 {
+		t.Fatalf("%d attempts", n.Load())
+	}
+}
+
+// A slow write isn't cut short and retried: a retry of one that went
+// through would fail as a duplicate.
+func TestQuerySlowWriteNotRetried(t *testing.T) {
+	old := queryAttemptTimeout
+	queryAttemptTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { queryAttemptTimeout = old })
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		time.Sleep(300 * time.Millisecond)
+		fmt.Fprint(w, `<CreateImageResponse><imageId>ami-1</imageId></CreateImageResponse>`)
+	}))
+	t.Cleanup(srv.Close)
+	c := &awsClient{region: "us-east-2", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AK", SecretAccessKey: "s"}},
+		http: srv.Client(), endpoints: map[string]string{"ec2": srv.URL + "/"}}
+	if _, err := c.ec2(context.Background(), "CreateImage", nil); err != nil || n.Load() != 1 {
+		t.Fatalf("err = %v after %d attempts", err, n.Load())
+	}
+}
+
+// A slow credential helper isn't cut short by a read's attempt deadline:
+// credentials resolve under the caller's.
+func TestQuerySlowCredentialsNotCutShort(t *testing.T) {
+	old := queryAttemptTimeout
+	queryAttemptTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { queryAttemptTimeout = old })
+	bin := t.TempDir()
+	aws := "#!/bin/sh\n/bin/sleep 0.4\nprintf '%s' '{\"Version\":1,\"AccessKeyId\":\"AK\",\"SecretAccessKey\":\"s\"}'\n"
+	if err := os.WriteFile(bin+"/aws", []byte(aws), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<DescribeRegionsResponse/>`)
+	}))
+	t.Cleanup(srv.Close)
+	c := &awsClient{region: "us-east-2", creds: &awsCredResolver{profile: "slow"},
+		http: srv.Client(), endpoints: map[string]string{"ec2": srv.URL + "/"}}
+	if _, err := c.ec2(context.Background(), "DescribeRegions", nil); err != nil {
+		t.Fatal(err)
 	}
 }
