@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -264,6 +265,9 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		script = d.Setup + "\n" + script
 	}
 	env := map[string]string{"CI": "true"}
+	if mb := s.memoryShareMB(); mb > 0 {
+		env["SPOTEXEC_MEMORY"] = strconv.FormatInt(mb, 10)
+	}
 	for k, v := range d.Env {
 		env[k] = v
 	}
@@ -292,6 +296,11 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		}
 		if pr.timedOut {
 			msg = "install command timed out"
+		} else if d.Container != nil && pr.startErr == nil && s.containerOOMKilled() {
+			msg += ": out of memory, the kernel killed a process in its container for exceeding the container's memory limit"
+			if s.memLimit > 0 {
+				msg += fmt.Sprintf(" (%s, this slot's share of the runner; use --exclusive or fewer max_slots)", gib(s.memLimit))
+			}
 		}
 		return perr(protocol.CodeDepsFailed, "%s", msg)
 	}

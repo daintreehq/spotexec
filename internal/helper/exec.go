@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,6 +54,9 @@ var envKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // then changes to dir and runs script.
 func wrapScript(script, dir, envFile string) string {
 	var b strings.Builder
+	if oomLowered.Load() {
+		b.WriteString(childOOMReset)
+	}
 	b.WriteString(profilePrelude)
 	if envFile != "" {
 		b.WriteString(". " + shq(envFile) + "\n")
@@ -124,6 +128,7 @@ func (s *Session) runProc(script, dir string, env map[string]string, timeout, gr
 }
 
 func (s *Session) runProc1(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool) procResult {
+	waitProtected()
 	// Starting a process (and its env file) is atomic with respect to
 	// Shutdown: it either sees the child and kills it, or we see it
 	// stopping and never start.
@@ -350,6 +355,11 @@ func (s *Session) exec(e protocol.Exec) error {
 		env[k] = v
 	}
 	env["SPOTEXEC_WORKSPACE"] = s.workspace
+	if _, set := env["SPOTEXEC_MEMORY"]; !set {
+		if mb := s.memoryShareMB(); mb > 0 {
+			env["SPOTEXEC_MEMORY"] = strconv.FormatInt(mb, 10)
+		}
+	}
 	script := e.Shell
 	if strings.TrimSpace(e.Setup) != "" {
 		script = e.Setup + "\n" + script
@@ -391,6 +401,9 @@ func (s *Session) exec(e protocol.Exec) error {
 	}
 	if pr.startErr != nil {
 		res.StartError = pr.startErr.Error()
+	}
+	if e.Container != nil && pr.startErr == nil && pr.code != 0 && !pr.timedOut && !pr.canceled && !shutdown {
+		res.OOMKilled, res.MemoryLimitMB = s.containerOOMKilled(), s.memLimit>>20
 	}
 	// Nothing of a run the shutdown killed is collected (and the slot stays
 	// marked dirty): report it before anything else can fail.

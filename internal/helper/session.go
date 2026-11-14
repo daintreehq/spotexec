@@ -33,6 +33,10 @@ type Session struct {
 	frames   chan protocol.Frame
 	readErr  atomic.Value // error
 	lastSeen atomic.Int64
+	// stalledAt is when the helper last found itself unscheduled for
+	// seconds (see watchStalls).
+	stalledAt atomic.Int64
+	stallTick atomic.Int64 // the stall sampler's latest run
 	// owned is the work root while this session holds a slot (read by the
 	// heartbeat goroutine, so not s.tokens / s.layout directly).
 	owned    atomic.Pointer[string]
@@ -40,17 +44,26 @@ type Session struct {
 	procMu   sync.Mutex  // held while a process or container is being started
 	stopping atomic.Bool // Shutdown/lastResort own cleanup and exit
 
-	lifecycle   *flock
-	tokens      []*flock
-	tokenIdx    int
-	slotLock    *flock
-	slotDir     string
-	workspace   string
-	repoID      string
-	state       SlotState
-	acq         protocol.Acquire
-	maxSlots    int  // the slot count acquire used (max_slots, or automatic)
-	cpusNoted   bool // the container_cpus event was sent
+	lifecycle *flock
+	tokens    []*flock
+	tokenIdx  int
+	slotLock  *flock
+	slotDir   string
+	workspace string
+	repoID    string
+	state     SlotState
+	acq       protocol.Acquire
+	maxSlots  int   // the slot count acquire used (max_slots, or automatic)
+	cpusNoted bool  // the container_cpus event was sent
+	memNoted  bool  // the container_memory event was sent
+	memLimit  int64 // the memory limit given to the last container, bytes
+	// lastContainer is the session's latest project container, to look up
+	// whether it was OOM-killed once it has exited.
+	lastContainer struct {
+		name    string
+		d       dockerRunner
+		started time.Time
+	}
 	stored      map[string]storedEntry
 	exiting     atomic.Bool
 	child       atomic.Int64 // running command's process group, if any
@@ -90,6 +103,7 @@ func Shutdown(code int) {
 }
 
 func Serve(in io.Reader, out io.Writer) error {
+	startProtection()
 	s := &Session{frames: make(chan protocol.Frame, 64)}
 	// Liveness counts bytes arriving, so a large manifest still streaming
 	// over a slow link is not mistaken for a silent client.
@@ -109,20 +123,38 @@ func Serve(in io.Reader, out io.Writer) error {
 	go s.lastResort()
 	done := make(chan struct{})
 	defer close(done)
+	go s.watchStalls(done)
 	go func() {
-		t := time.NewTicker(20 * time.Second)
+		// A heartbeat every 20s carries the runner's memory. Memory is
+		// checked every 2s, and pressure is reported at once: a VM running
+		// out of memory can stall the helper before its next heartbeat, and
+		// the client must know why it lost it (see Heartbeat.Pressure).
+		t := time.NewTicker(2 * time.Second)
 		defer t.Stop()
+		lastSent, lastRegular, pressured := time.Now(), time.Now(), false
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
-				// Only owned work counts as activity: probes and idle
-				// sessions must not keep an idle VM alive.
-				if root := s.owned.Load(); root != nil {
-					touchActivity(*root)
+				hb := memStats()
+				// By elapsed time, not ticks: a stalled ticker drops them.
+				regular := time.Since(lastRegular) >= 20*time.Second
+				onset := hb.Pressure() != "" && !pressured // the first sign goes out at once
+				pressured = hb.Pressure() != ""
+				if !regular && !onset && (!pressured || time.Since(lastSent) < 6*time.Second) {
+					continue
 				}
-				_ = s.c.Send(protocol.TypeHeartbeat, nil)
+				if regular {
+					lastRegular = time.Now()
+					// Only owned work counts as activity: probes and idle
+					// sessions must not keep an idle VM alive.
+					if root := s.owned.Load(); root != nil {
+						touchActivity(*root)
+					}
+				}
+				lastSent = time.Now()
+				_ = s.c.Send(protocol.TypeHeartbeat, hb)
 			}
 		}
 	}()
@@ -213,7 +245,7 @@ func (s *Session) next() (protocol.Frame, error) {
 func (s *Session) lastResort() {
 	for {
 		time.Sleep(5 * time.Second)
-		if time.Since(time.Unix(0, s.lastSeen.Load())) > ClientTimeout+30*time.Second {
+		if s.silentFor(ClientTimeout + 30*time.Second) {
 			s.stopping.Store(true)
 			s.procMu.Lock()
 			s.procMu.Unlock()
@@ -233,8 +265,61 @@ func (s *Session) lastResort() {
 	}
 }
 
+// clientGone: nothing from the client for ClientTimeout. Not while the
+// helper itself has just been stalled (a VM thrashing for memory starves
+// every process): the client's heartbeats are then still waiting in the
+// pipe, and must get the chance to arrive before it counts as gone.
 func (s *Session) clientGone() bool {
-	return time.Since(time.Unix(0, s.lastSeen.Load())) > ClientTimeout
+	return s.silentFor(ClientTimeout)
+}
+
+// stallGrace is how long after its own stall the helper waits for input
+// that queued up meanwhile before judging the client; stallCap bounds the
+// excuse, so stall after stall can't keep a dead client's run going.
+const (
+	stallGrace = 15 * time.Second
+	stallCap   = 4 * time.Minute
+)
+
+// silentFor: nothing from the client for longer than limit, and not
+// because the helper itself was just stalled.
+func (s *Session) silentFor(limit time.Duration) bool {
+	silent := time.Since(time.Unix(0, s.lastSeen.Load()))
+	if silent <= limit {
+		return false
+	}
+	return silent > limit+stallCap || !s.recentlyStalled()
+}
+
+// recentlyStalled: the helper was unscheduled for seconds within the last
+// stallGrace, or is only now running again (its stall sampler is overdue:
+// whichever goroutine wakes first after a stall must not act on it).
+func (s *Session) recentlyStalled() bool {
+	now := time.Now()
+	if t := s.stallTick.Load(); t != 0 && now.Sub(time.Unix(0, t)) > 3*time.Second {
+		return true
+	}
+	return now.Sub(time.Unix(0, s.stalledAt.Load())) < stallGrace
+}
+
+// watchStalls samples the helper's own scheduling every second, recording
+// when it last went unscheduled for several seconds.
+func (s *Session) watchStalls(done <-chan struct{}) {
+	last := time.Now()
+	s.stallTick.Store(last.UnixNano())
+	for {
+		select {
+		case <-done:
+			return
+		case <-time.After(time.Second):
+		}
+		now := time.Now()
+		if now.Sub(last) > 3*time.Second {
+			s.stalledAt.Store(now.UnixNano())
+		}
+		s.stallTick.Store(now.UnixNano())
+		last = now
+	}
 }
 
 func (s *Session) dispatch(env protocol.Envelope) error {

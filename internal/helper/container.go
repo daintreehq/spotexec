@@ -577,6 +577,7 @@ func startImagePush(root string, d dockerRunner, local, remote, cfgDir string) e
 // stdin). It holds the lifecycle lock, is bounded, and stops if the VM
 // starts draining.
 func ImagePush(root string) error {
+	resetOwnOOMScore() // started by a protected helper: don't keep its score
 	sc := bufio.NewScanner(os.Stdin)
 	var lines []string
 	for sc.Scan() {
@@ -634,7 +635,8 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 			return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
 		}
 	}
-	cpus := s.cpusetArgs(run, d) // before procMu: it may send an event
+	// Before procMu: these may send an event.
+	limits := append(s.cpusetArgs(run, d), s.memoryArgs(run, d)...)
 	s.procMu.Lock()
 	if s.stopping.Load() {
 		s.procMu.Unlock()
@@ -704,7 +706,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
 			"-v", home+":/home/spotexec", "-e", "HOME=/home/spotexec")
 	}
-	args = append(args, cpus...)
+	args = append(args, limits...)
 	args = append(args, run.Options...)
 	args = append(args, run.Image, "-c",
 		`if command -v bash >/dev/null 2>&1; then exec bash /tmp/spotexec-run.sh; else exec sh /tmp/spotexec-run.sh; fi`)
@@ -724,6 +726,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		}
 	}
 	s.containers.Store(name, d)
+	s.lastContainer.name, s.lastContainer.d, s.lastContainer.started = name, d, time.Now()
 	cleanup := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()

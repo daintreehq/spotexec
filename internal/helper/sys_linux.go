@@ -4,13 +4,60 @@ package helper
 
 import (
 	"bytes"
+	"context"
 	"io/fs"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
+
+// protectControlPlane makes the helper the kernel OOM killer's last
+// choice on spotexec's own VMs (where the runner user has passwordless
+// sudo): if a job outside a container, or the VM as a whole, runs out of
+// memory, a job is killed rather than the session reporting on it. Only the
+// helper: the sshd processes above it are shared with other sessions (a
+// ControlMaster connection) and would pass the score on to them. Command
+// scripts, and the helper's own background work, put themselves back to
+// the default score (oomLowered), since children inherit it. Off spotexec's
+// VMs (an ssh runner someone else runs) nothing is changed.
+func protectControlPlane() {
+	if _, err := os.Stat(LifecycleDir); err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sudo", "-n", "sh", "-c", "echo "+strconv.Itoa(controlOOMScore)+" >/proc/"+strconv.Itoa(os.Getpid())+"/oom_score_adj")
+	cmd.WaitDelay = time.Second
+	_ = cmd.Run()
+	if b, err := os.ReadFile("/proc/self/oom_score_adj"); err == nil && strings.TrimSpace(string(b)) == strconv.Itoa(controlOOMScore) {
+		oomLowered.Store(true)
+	}
+}
+
+// resetOwnOOMScore puts this process back to the default OOM score (a
+// background helper subcommand inheriting a protected helper's). Raising
+// it needs no privileges.
+func resetOwnOOMScore() {
+	_ = os.WriteFile("/proc/self/oom_score_adj", []byte("0"), 0)
+}
+
+// hostMemTotal is the machine's memory in bytes (MemTotal), or 0.
+func hostMemTotal() int64 {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(l, "MemTotal:"); ok {
+			kb, _ := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(v), " kB"), 10, 64)
+			return kb << 10
+		}
+	}
+	return 0
+}
 
 func inoCtime(fi fs.FileInfo) (uint64, int64) {
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {

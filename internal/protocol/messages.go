@@ -1,6 +1,9 @@
 package protocol
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Message type names.
 const (
@@ -297,6 +300,34 @@ type Result struct {
 	Unverified []string `json:"unverified,omitempty"` // paths that could not be read after the run
 	SnapshotMS int64    `json:"snapshot_ms"`
 	StartError string   `json:"start_error,omitempty"`
+	// OOMKilled: the kernel killed a process in the command's container for
+	// exceeding the container's memory limit (Docker's oom event).
+	OOMKilled bool `json:"oom_killed,omitempty"`
+	// MemoryLimitMB is the memory limit spotexec gave the container (MiB),
+	// or 0 when it set none (container.options did, or none applied).
+	MemoryLimitMB int64 `json:"memory_limit_mb,omitempty"`
+}
+
+// Heartbeat is the body of a helper heartbeat (empty from older helpers):
+// the runner's memory, so a client that loses the runner can tell whether
+// it was out of memory at the time. Zero fields are unknown.
+type Heartbeat struct {
+	MemTotalMB int64   `json:"mem_total_mb,omitempty"`
+	MemAvailMB int64   `json:"mem_avail_mb,omitempty"`
+	PSIFull10  float64 `json:"psi_full10,omitempty"` // /proc/pressure/memory "full" avg10, percent
+}
+
+// Pressure says whether a heartbeat shows a runner running out of memory:
+// under 5% of it available, or every non-idle task stalled on memory for
+// over 10% of the last 10s. "" when it doesn't.
+func (h Heartbeat) Pressure() string {
+	switch {
+	case h.MemTotalMB > 0 && h.MemAvailMB*20 < h.MemTotalMB:
+		return fmt.Sprintf("%d MiB of %d MiB memory available", h.MemAvailMB, h.MemTotalMB)
+	case h.PSIFull10 >= 10:
+		return fmt.Sprintf("every task stalled on memory %.0f%% of the time", h.PSIFull10)
+	}
+	return ""
 }
 
 // Fetch asks for the content of mutated files. Accept lists created paths the

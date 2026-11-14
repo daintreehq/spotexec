@@ -33,14 +33,50 @@ var cpuOptions = []string{"--cpuset-cpus", "--cpus", "--cpu-quota", "--cpu-perio
 
 // cpuOption returns the CPU flag opts sets, or "".
 func cpuOption(opts []string) string {
-	for _, o := range opts {
-		for _, f := range cpuOptions {
-			if o == f || strings.HasPrefix(o, f+"=") {
-				return f
-			}
+	for _, f := range dockerFlags(opts) {
+		if slices.Contains(cpuOptions, f) {
+			return f
 		}
 	}
 	return ""
+}
+
+// dockerBoolFlags are the docker run flags that take no value (as a
+// separate argument): every other flag consumes the next argument unless
+// it is written --flag=value.
+var dockerBoolFlags = []string{"--rm", "--init", "--privileged", "--read-only", "--tty", "--interactive", "--detach",
+	"--oom-kill-disable", "--no-healthcheck", "--publish-all", "--quiet", "--sig-proxy", "--help", "--disable-content-trust", "-t", "-i", "-d", "-P", "-q"}
+
+// dockerFlags lists the flags a docker run argument list sets, by name
+// (--memory, -m), skipping the values flags consume, so a value such as
+// `--label -metrics` is never read as a flag.
+func dockerFlags(opts []string) []string {
+	var flags []string
+	for i := 0; i < len(opts); i++ {
+		o := opts[i]
+		switch {
+		case strings.HasPrefix(o, "--") && len(o) > 2:
+			name, _, hasValue := strings.Cut(o, "=")
+			flags = append(flags, name)
+			if !hasValue && !slices.Contains(dockerBoolFlags, name) {
+				i++
+			}
+		case len(o) > 1 && o[0] == '-':
+			// A cluster of shorthands (-it, -m4g, -itm 4g): booleans, then
+			// at most one that takes a value, attached or next.
+			for j := 1; j < len(o); j++ {
+				f := "-" + o[j:j+1]
+				flags = append(flags, f)
+				if !slices.Contains(dockerBoolFlags, f) {
+					if j == len(o)-1 {
+						i++
+					}
+					break
+				}
+			}
+		}
+	}
+	return flags
 }
 
 // parseCPUList parses a kernel CPU list such as "0-3,8-11".
@@ -139,6 +175,18 @@ var (
 	dockerContextRe = regexp.MustCompile(`(?m)^\s*Context:\s*(\S+)\s*$`)
 )
 
+// dockerRemote says why the docker daemon may be on another machine than
+// this one, or "".
+func dockerRemote(info string) string {
+	if dh := os.Getenv("DOCKER_HOST"); dh != "" && !strings.HasPrefix(dh, "unix://") {
+		return "DOCKER_HOST points at another machine"
+	}
+	if m := dockerContextRe.FindStringSubmatch(info); m != nil && m[1] != "default" && m[1] != "rootless" {
+		return "docker uses the " + m[1] + " context"
+	}
+	return ""
+}
+
 // readCPUHost gathers cpuHost for this runner from the probe's docker info.
 func readCPUHost(info string) cpuHost {
 	h := cpuHost{numCPU: runtime.NumCPU()}
@@ -147,11 +195,7 @@ func readCPUHost(info string) cpuHost {
 	}
 	// Rootless Docker without cgroups drops resource limits silently.
 	h.noCpuset = strings.Contains(info, "No cpuset support") || strings.Contains(info, "rootless-mode without cgroups")
-	if dh := os.Getenv("DOCKER_HOST"); dh != "" && !strings.HasPrefix(dh, "unix://") {
-		h.remote = "DOCKER_HOST points at another machine"
-	} else if m := dockerContextRe.FindStringSubmatch(info); m != nil && m[1] != "default" && m[1] != "rootless" {
-		h.remote = "docker uses the " + m[1] + " context"
-	}
+	h.remote = dockerRemote(info)
 	if runtime.GOOS != "linux" {
 		h.why = "the runner isn't Linux, so its CPUs aren't Docker's"
 		return h
