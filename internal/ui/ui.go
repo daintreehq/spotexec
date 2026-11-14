@@ -1,6 +1,8 @@
-// Package ui renders lifecycle telemetry: compact NDJSON events for agents
-// (non-TTY stderr, --json, SPOTEXEC_AGENT=1) or an erasable spinner plus a dim
-// footer for humans. Command stdout/stderr always pass through untouched.
+// Package ui renders lifecycle telemetry: an erasable spinner plus a dim
+// footer for humans at a terminal; plain, sparse lines when stderr isn't a
+// terminal (agents, CI, pipes); or NDJSON events with --json,
+// SPOTEXEC_JSON=1 or SPOTEXEC_AGENT=1. Command stdout/stderr always pass
+// through untouched.
 package ui
 
 import (
@@ -9,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +27,7 @@ const (
 	ModeJSON
 	ModePretty
 	ModeQuiet
+	ModePlain
 )
 
 // Reporter is the telemetry sink.
@@ -38,6 +42,10 @@ type Reporter interface {
 	Warn(code, format string, args ...any)
 	// Done prints the final footer in pretty mode.
 	Done(summary string, ok bool)
+	// PartDone reports one finished part of a larger run (a task of a
+	// parallel task) without ending the output; JSON and quiet modes leave
+	// it to the events.
+	PartDone(summary string, ok bool)
 	// IsJSON reports agent mode.
 	IsJSON() bool
 }
@@ -62,14 +70,16 @@ func New(mode Mode, w *os.File, eventsFile string) (Reporter, error) {
 		case IsTerminal(w):
 			mode = ModePretty
 		default:
-			mode = ModeJSON
+			mode = ModePlain
 		}
 	}
 	switch mode {
+	case ModePlain:
+		return &plainReporter{w: w, extra: extra}, nil
 	case ModeJSON:
 		return &jsonReporter{w: w, extra: extra}, nil
 	case ModeQuiet:
-		return &jsonReporter{w: io.Discard, extra: extra, quiet: true}, nil
+		return &quietReporter{&plainReporter{w: w, extra: extra}}, nil
 	}
 	p := &prettyReporter{w: w, extra: extra}
 	return p, nil
@@ -79,7 +89,6 @@ type jsonReporter struct {
 	mu    sync.Mutex
 	w     io.Writer
 	extra io.Writer
-	quiet bool
 }
 
 func (j *jsonReporter) Event(name string, fields map[string]any) {
@@ -99,7 +108,8 @@ func (j *jsonReporter) Event(name string, fields map[string]any) {
 func (j *jsonReporter) Status(string, ...any) {}
 func (j *jsonReporter) Clear()                {}
 func (j *jsonReporter) Done(string, bool)     {}
-func (j *jsonReporter) IsJSON() bool          { return !j.quiet }
+func (j *jsonReporter) PartDone(string, bool) {}
+func (j *jsonReporter) IsJSON() bool          { return true }
 func (j *jsonReporter) Warn(code, format string, args ...any) {
 	j.Event("warning", map[string]any{"code": code, "message": fmt.Sprintf(format, args...)})
 }
@@ -262,6 +272,23 @@ func (p *prettyReporter) Done(summary string, ok bool) {
 	fmt.Fprintf(p.w, "%s %s%s%s\n", mark, dim, summary, reset)
 }
 
+func (p *prettyReporter) PartDone(summary string, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	line := p.line
+	p.clearLocked()
+	mark := grn + "✓" + reset
+	if !ok {
+		mark = red + "✗" + reset
+	}
+	fmt.Fprintf(p.w, "%s %s%s%s\n", mark, dim, summary, reset)
+	if line != "" && !p.stopped {
+		p.mu.Unlock()
+		p.Status("%s", line)
+		p.mu.Lock()
+	}
+}
+
 func (p *prettyReporter) IsJSON() bool { return false }
 
 func termWidth() int {
@@ -314,3 +341,143 @@ func Dur(d time.Duration) string {
 	}
 	return strings.TrimSuffix(d.Round(time.Second).String(), "0s")
 }
+
+// plainReporter is the default when stderr isn't a terminal. An agent reads
+// everything on stderr, so it says little: warnings, a progress line only
+// when a phase takes a while (booting, queueing, installing dependencies)
+// and every 30s after that, and one summary line at the end. No colour, no
+// carriage returns.
+type plainReporter struct {
+	mu      sync.Mutex
+	w       io.Writer
+	extra   io.Writer
+	line    string
+	key     string
+	gen     int
+	stopped bool
+}
+
+// plainDelay is how long a phase must last before it's mentioned.
+var plainDelay = 3 * time.Second
+
+// phaseKey identifies a phase regardless of the counters in its text
+// ("queued 2nd 4.1s" and "queued 2nd 5.2s" are the same phase), and of any
+// detail after DetailSep.
+var digits = regexp.MustCompile(`[0-9][0-9.:]*`)
+
+// DetailSep separates a status line from a detail that changes as the
+// phase goes on (the latest line of a VM's bootstrap log): the spinner shows
+// it, and plain mode's heartbeat prints the latest one without treating each
+// change as a new phase.
+const DetailSep = " — "
+
+var ansi = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]`)
+
+// LogLine makes a line of someone else's log safe and short enough for a
+// status line: the last \r rewrite only, no escape sequences or control
+// characters, at most 100 characters.
+func LogLine(s string) string {
+	if i := strings.LastIndexAny(strings.TrimRight(s, "\r\n"), "\r\n"); i >= 0 {
+		s = s[i+1:]
+	}
+	s = ansi.ReplaceAllString(s, "")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			if r == '\t' {
+				return ' '
+			}
+			return -1
+		}
+		return r
+	}, s)
+	return truncate(strings.TrimSpace(s), 100)
+}
+
+func (p *plainReporter) Event(name string, fields map[string]any) {
+	if p.extra != nil {
+		m := map[string]any{"event": name}
+		for k, v := range fields {
+			m[k] = v
+		}
+		b, _ := json.Marshal(orderedEvent(name, m))
+		p.mu.Lock()
+		p.extra.Write(append(b, '\n'))
+		p.mu.Unlock()
+	}
+}
+
+func (p *plainReporter) Status(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	if strings.Contains(line, " · running ") {
+		return // the command's own output says it's running
+	}
+	key, _, _ := strings.Cut(line, DetailSep)
+	key = digits.ReplaceAllString(key, "#")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stopped {
+		return
+	}
+	p.line = line
+	if key == p.key {
+		return // same phase: keep its timer
+	}
+	p.key = key
+	p.gen++
+	gen := p.gen
+	var tick func(d time.Duration)
+	tick = func(d time.Duration) {
+		time.AfterFunc(d, func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if p.gen != gen || p.stopped || p.line == "" {
+				return
+			}
+			fmt.Fprintf(p.w, "sx: %s\n", p.line)
+			tick(30 * time.Second)
+		})
+	}
+	tick(plainDelay)
+}
+
+func (p *plainReporter) Clear() {
+	p.mu.Lock()
+	p.line, p.key = "", ""
+	p.gen++
+	p.mu.Unlock()
+}
+
+func (p *plainReporter) Warn(code, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fmt.Fprintf(p.w, "sx: warning: %s\n", msg)
+	if p.extra != nil {
+		b, _ := json.Marshal(map[string]any{"event": "warning", "code": code, "message": msg})
+		p.extra.Write(append(b, '\n'))
+	}
+}
+
+func (p *plainReporter) Done(summary string, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stopped = true
+	p.gen++
+	fmt.Fprintf(p.w, "sx: %s\n", summary)
+}
+
+func (p *plainReporter) PartDone(summary string, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fmt.Fprintf(p.w, "sx: %s\n", summary)
+}
+
+func (p *plainReporter) IsJSON() bool { return false }
+
+// quietReporter (-q) drops progress and the summary but keeps warnings: a
+// write-back conflict, a timeout or a local fallback is never silent.
+type quietReporter struct{ *plainReporter }
+
+func (quietReporter) Status(string, ...any) {}
+func (quietReporter) Done(string, bool)     {}
+func (quietReporter) PartDone(string, bool) {}

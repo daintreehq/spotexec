@@ -13,11 +13,16 @@ import (
 
 // fakeFleet is an in-memory Fleet.
 type fakeFleet struct {
-	r     *config.Runner
-	mu    sync.Mutex
-	insts []provider.Instance
-	n     int
-	fail  error
+	r       *config.Runner
+	mu      sync.Mutex
+	insts   []provider.Instance
+	n       int
+	fail    error
+	termErr error
+	// slowRunning: WaitRunning blocks until its context ends.
+	slowRunning bool
+	// goneOnWait: WaitRunning reports the instance gone (reclaimed).
+	goneOnWait bool
 }
 
 func (f *fakeFleet) Runner() *config.Runner                        { return f.r }
@@ -42,12 +47,19 @@ func (f *fakeFleet) Launch(context.Context, provider.Logger) (provider.Instance,
 		return provider.Instance{}, f.fail
 	}
 	f.n++
-	in := provider.Instance{ID: "i-" + string(rune('a'+f.n)), State: provider.StateRunning, LaunchedAt: time.Now()}
+	in := provider.Instance{ID: "i-" + string(rune('a'+f.n)), State: provider.StateRunning, LaunchedAt: time.Now(), Target: provider.Target{Host: "192.0.2.1"}}
 	f.insts = append(f.insts, in)
 	return in, nil
 }
 
-func (f *fakeFleet) WaitRunning(_ context.Context, id string, _ provider.Logger) (provider.Instance, error) {
+func (f *fakeFleet) WaitRunning(ctx context.Context, id string, _ provider.Logger) (provider.Instance, error) {
+	if f.slowRunning {
+		<-ctx.Done()
+		return provider.Instance{}, ctx.Err()
+	}
+	if f.goneOnWait {
+		return provider.Instance{}, errors.New("instance reclaimed while booting")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, in := range f.insts {
@@ -61,6 +73,9 @@ func (f *fakeFleet) WaitRunning(_ context.Context, id string, _ provider.Logger)
 func (f *fakeFleet) Terminate(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.termErr != nil {
+		return f.termErr
+	}
 	for i, in := range f.insts {
 		if in.ID == id {
 			f.insts = append(f.insts[:i], f.insts[i+1:]...)
@@ -175,5 +190,44 @@ func TestAmbiguousLaunchExpiresWhileProcessLives(t *testing.T) {
 	f.fail = nil
 	if ids, _ := p.EnsureMin(ctx, 1); len(ids) != 1 {
 		t.Fatalf("ambiguous reservation never expired: reserved %d", len(ids))
+	}
+}
+
+// A VM close to max_lifetime takes no new runs and stops counting as
+// capacity, so waiting demand and the warm pool get a replacement: the hard
+// poweroff never meets a run that started after the drain point.
+func TestNearLifetimeInstancesDrain(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 4)
+	p.R.MaxLifetime.Duration = 12 * time.Hour
+	host := provider.Target{Host: "127.0.0.1", Port: 1}
+	old := provider.Instance{ID: "i-old", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-12*time.Hour + 10*time.Minute)}
+	young := provider.Instance{ID: "i-young", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Hour)}
+	f.insts = []provider.Instance{old, young}
+
+	cands, usable, err := p.Candidates(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].ID != "i-young" || usable != 1 {
+		t.Fatalf("candidates %v usable %d: the ageing VM must not take new runs", cands, usable)
+	}
+	// The oldest-first order would otherwise have picked it first.
+	if ids, _ := p.EnsureMin(ctx, 2); len(ids) != 1 {
+		t.Fatalf("ageing VM not replaced in the warm pool: reserved %d", len(ids))
+	}
+
+	// Short lifetimes drain a quarter ahead.
+	r := &config.Runner{}
+	r.MaxLifetime.Duration = time.Hour
+	if d := LifetimeDrainAhead(r); d != 15*time.Minute {
+		t.Fatalf("drain ahead %s", d)
+	}
+	r.MaxLifetime.Duration = 80 * time.Second
+	if d := LifetimeDrainAhead(r); d != 20*time.Second {
+		t.Fatalf("drain ahead %s", d)
+	}
+	if !NearLifetime(r, provider.Instance{LaunchedAt: time.Now().Add(-61 * time.Second)}) || NearLifetime(r, provider.Instance{LaunchedAt: time.Now().Add(-59 * time.Second)}) {
+		t.Fatal("NearLifetime boundary")
 	}
 }

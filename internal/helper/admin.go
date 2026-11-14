@@ -46,6 +46,7 @@ type Status struct {
 	Ephemeral   bool              `json:"ephemeral"`
 	IdleTimeout string            `json:"idle_timeout,omitempty"`
 	Holders     []protocol.Holder `json:"holders"`
+	Waiters     []protocol.Holder `json:"waiters,omitempty"` // runs waiting for their exact workspace slot (no token yet)
 	Slots       []SlotInfo        `json:"slots"`
 	DiskFreeMB  int64             `json:"disk_free_mb"`
 }
@@ -60,6 +61,7 @@ func GetStatus(root string) Status {
 	if st.Holders == nil {
 		st.Holders = []protocol.Holder{}
 	}
+	st.Waiters = readWaiters(l)
 	for _, p := range []string{ActivityFile, filepath.Join(root, "activity")} {
 		if fi, err := os.Stat(p); err == nil {
 			st.IdleS = max(0, int64(time.Since(fi.ModTime()).Seconds()))
@@ -173,6 +175,11 @@ func Unlock(w io.Writer, root string, token int, all bool) error {
 	}
 	if n == 0 {
 		fmt.Fprintln(w, "no matching held slots")
+	}
+	// Runs waiting for their exact workspace hold nothing to release; they
+	// carry on waiting (and may now get it).
+	for _, h := range readWaiters(l) {
+		fmt.Fprintf(w, "still waiting for workspace slot %d: %s pid %d: %s\n", h.Slot, h.Client.Host, h.Client.PID, h.Client.Command)
 	}
 	return nil
 }

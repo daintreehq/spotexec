@@ -3,6 +3,7 @@
 package helper
 
 import (
+	"bytes"
 	"io/fs"
 	"os"
 	"strconv"
@@ -47,8 +48,13 @@ func groupInDir(pgid int, dir string) bool {
 	return strings.HasPrefix(cwd, dir)
 }
 
-// reapWorkspace kills processes (owned by us) whose cwd is inside dir.
-func reapWorkspace(dir string, grace time.Duration) {
+// reapWorkspace kills processes (owned by us) left by runs in dir: those
+// whose cwd is inside it, and those a run there started (its
+// SPOTEXEC_WORKSPACE in their environment), which a background process
+// keeps after changing directory. It returns the pids still alive after
+// SIGKILL.
+func reapWorkspace(dir string, grace time.Duration) []int {
+	marker := []byte("SPOTEXEC_WORKSPACE=" + dir + "\x00")
 	find := func() []int {
 		var pids []int
 		ents, _ := os.ReadDir("/proc")
@@ -61,13 +67,17 @@ func reapWorkspace(dir string, grace time.Duration) {
 			c, err := os.Readlink("/proc/" + e.Name() + "/cwd")
 			if err == nil && (c == dir || strings.HasPrefix(c, dir+"/")) {
 				pids = append(pids, pid)
+				continue
+			}
+			if env, err := os.ReadFile("/proc/" + e.Name() + "/environ"); err == nil && (bytes.HasPrefix(env, marker) || bytes.Contains(env, append([]byte{0}, marker...))) {
+				pids = append(pids, pid)
 			}
 		}
 		return pids
 	}
 	pids := find()
 	if len(pids) == 0 {
-		return
+		return nil
 	}
 	for _, p := range pids {
 		_ = syscall.Kill(p, syscall.SIGTERM)
@@ -79,4 +89,11 @@ func reapWorkspace(dir string, grace time.Duration) {
 	for _, p := range find() {
 		_ = syscall.Kill(p, syscall.SIGKILL)
 	}
+	for i := 0; i < 40; i++ {
+		if pids = find(); len(pids) == 0 {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return pids
 }

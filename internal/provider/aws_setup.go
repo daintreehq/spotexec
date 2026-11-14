@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -22,32 +23,49 @@ const iamAPIVersion = "2010-05-08"
 // SpotexecPolicy is the least-privilege IAM policy spotexec needs. The
 // docs/aws.md "Grant permissions" section shows the same document (a test
 // keeps them in step).
+//
+// Reads are unconditional. Everything that changes an existing EC2
+// resource needs it to carry the spotexec-owner tag, and tags can only be
+// applied while spotexec's own Run/CreateImage/CreateSecurityGroup calls
+// create a resource, so the key can't tag its way into anything else.
+// RunInstances and CreateImage are authorised per resource type: the new
+// instance and volumes must be requested with the tag, the source instance
+// of an image must already carry it. Inline user policies are capped at
+// 2,048 characters (TestPolicyFitsInline).
 const SpotexecPolicy = `{
   "Version": "2012-10-17",
   "Statement": [
     { "Effect": "Allow", "Action": [
-        "ec2:RunInstances", "ec2:CreateTags", "ec2:DescribeInstances", "ec2:TerminateInstances",
-        "ec2:DescribeImages", "ec2:DescribeVpcs", "ec2:DescribeSubnets",
-        "ec2:DescribeSecurityGroups", "ec2:CreateSecurityGroup", "ec2:AuthorizeSecurityGroupIngress"
+        "ec2:Describe*", "ec2:CreateSecurityGroup", "ecr:GetAuthorizationToken", "servicequotas:GetServiceQuota"
       ], "Resource": "*" },
+    { "Effect": "Allow", "Action": "ec2:RunInstances",
+      "NotResource": ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"] },
+    { "Effect": "Allow", "Action": "ec2:RunInstances",
+      "Resource": ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"],
+      "Condition": { "Null": { "aws:RequestTag/spotexec-owner": "false" } } },
+    { "Effect": "Allow", "Action": "ec2:CreateTags", "Resource": "*",
+      "Condition": { "StringEquals": { "ec2:CreateAction": ["RunInstances", "CreateSecurityGroup", "CreateImage"] } } },
+    { "Effect": "Allow", "Action": [
+        "ec2:TerminateInstances", "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:StopInstances", "ec2:CreateImage", "ec2:DeregisterImage", "ec2:DeleteSnapshot"
+      ], "Resource": "*", "Condition": { "Null": { "aws:ResourceTag/spotexec-owner": "false" } } },
+    { "Effect": "Allow", "Action": ["ec2:AuthorizeSecurityGroupIngress", "ec2:CreateImage"], "Resource": [
+        "arn:aws:ec2:*:*:security-group-rule/*", "arn:aws:ec2:*::image/*", "arn:aws:ec2:*::snapshot/*"
+      ] },
     { "Effect": "Allow", "Action": "ssm:GetParameter",
       "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/*" },
+    { "Effect": "Allow", "Action": "iam:GetUser", "Resource": "arn:aws:iam::*:user/spotexec/${aws:username}" },
     { "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
       "Condition": { "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } } },
     { "Effect": "Allow", "Action": [
         "s3:CreateBucket", "s3:PutLifecycleConfiguration", "s3:ListBucket",
         "s3:GetObject", "s3:PutObject"
       ], "Resource": ["arn:aws:s3:::spotexec-cache-*", "arn:aws:s3:::spotexec-cache-*/*"] },
-    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
     { "Effect": "Allow", "Action": [
         "ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy",
         "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
         "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"
-      ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" },
-    { "Effect": "Allow", "Action": "servicequotas:GetServiceQuota", "Resource": "*" },
-    { "Effect": "Allow", "Action": [
-        "ec2:StopInstances", "ec2:CreateImage", "ec2:DeregisterImage", "ec2:DeleteSnapshot"
-      ], "Resource": "*" }
+      ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" }
   ]
 }`
 
@@ -58,25 +76,32 @@ const iamUserPath = "/spotexec/"
 // stores its access key as an AWS CLI profile, so spotexec keeps working
 // without interactive sign-ins. It is idempotent.
 type AWSUserSetup struct {
-	AdminProfile string // profile with IAM rights; "" = AWS_PROFILE / env / default
-	Profile      string // AWS CLI profile to write (e.g. "spotexec")
-	UserName     string // IAM user to create
-	Region       string // region for the verification call and quota check
-	Rotate       bool   // replace a working key with a new one
-	CheckVPC     bool   // offer to create Region's default VPC when it has none
+	AdminProfile string   // profile with IAM rights; "" = AWS_PROFILE / env / default
+	AdminFromEnv bool     // the admin session is only AWS_ACCESS_KEY_ID etc. (setup run from another machine)
+	Profile      string   // AWS CLI profile to write (e.g. "spotexec")
+	UserName     string   // IAM user name; "" = keep the profile's spotexec user, else DefaultName
+	DefaultName  string   // e.g. spotexec-<hostname>
+	MachineID    string   // this machine's owner id ("" = read it); tags the user so machines never share one
+	Region       string   // region for the verification call and quota check
+	Rotate       bool     // replace a working key with a new one
+	VPCRegions   []string // regions to give a default VPC when they have none
+	QuotaRegions []string // regions to report the Spot vCPU quota for (default: Region)
 	Log          func(format string, args ...any)
 	// Confirm is asked before anything is created in the account.
 	Confirm func(plan AWSSetupPlan) bool
 
+	adminCreds     *awsCredResolver  // the admin session Run signed in with (reused for quota requests)
 	endpoints      map[string]string // tests
 	resolveProfile func(ctx context.Context, profile string) (awsCreds, error)
 	pollEvery      time.Duration
+	verifyFor      time.Duration // how long a new key may take to work (default 90s)
 }
 
 // AWSSetupPlan is what setup is about to do, for confirmation.
 type AWSSetupPlan struct {
 	Account, AdminARN string
-	CreateVPC         bool // Region has no default VPC; setup will create it
+	UserName          string
+	CreateVPCIn       []string // regions without a default VPC; setup will create one
 }
 
 // AWSUserSetupResult reports what setup did.
@@ -86,13 +111,13 @@ type AWSUserSetupResult struct {
 	AccessKeyID  string
 	KeyCreated   bool
 	KeysDeleted  []string
-	PolicyStale  bool    // the policy could not be refreshed (no admin session)
-	QuotaVCPUs   float64 // Spot vCPU quota in Region; -1 when unknown
+	PolicyStale  bool               // the policy could not be refreshed (no admin session)
+	Quotas       map[string]float64 // Spot vCPU quota by region (missing when unknown)
 	CredsFile    string
 	ConfigFile   string
-	AlreadyReady bool   // a working key for the user was already in the profile
-	CreatedVPC   string // the default VPC setup created, if any
-	NoVPC        bool   // Region still has no default VPC
+	AlreadyReady bool              // a working key for the user was already in the profile
+	CreatedVPCs  map[string]string // default VPCs setup created, by region
+	NoVPC        []string          // regions still without a default VPC
 }
 
 // ErrSetupDeclined is returned when Confirm says no.
@@ -116,12 +141,22 @@ func staticResolver(c awsCreds) *awsCredResolver { return &awsCredResolver{fixed
 
 // Run performs the setup.
 func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
-	if s.Profile == "" || s.UserName == "" || s.Region == "" {
+	if s.Profile == "" || (s.UserName == "" && s.DefaultName == "") || s.Region == "" {
 		return nil, errors.New("aws setup: profile, user name and region are required")
 	}
-	if !validIAMName.MatchString(s.UserName) {
-		return nil, fmt.Errorf("%q is not a valid IAM user name (letters, digits and +=,.@_- only, at most 64)", s.UserName)
+	for _, n := range []string{s.UserName, s.DefaultName} {
+		if n != "" && !validIAMName.MatchString(n) {
+			return nil, fmt.Errorf("%q is not a valid IAM user name (letters, digits and +=,.@_- only, at most 64)", n)
+		}
 	}
+	machine := s.MachineID
+	if machine == "" {
+		var err error
+		if machine, err = ownerID(); err != nil {
+			return nil, err
+		}
+	}
+	name := s.UserName
 	if s.resolveProfile == nil {
 		s.resolveProfile = func(ctx context.Context, p string) (awsCreds, error) {
 			return (&awsCredResolver{profile: p}).resolve(ctx)
@@ -130,26 +165,96 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 	if s.pollEvery == 0 {
 		s.pollEvery = 3 * time.Second
 	}
-	res := &AWSUserSetupResult{QuotaVCPUs: -1, CredsFile: awsCredentialsFile(), ConfigFile: awsConfigFile()}
+	res := &AWSUserSetupResult{Quotas: map[string]float64{}, CreatedVPCs: map[string]string{}, CredsFile: awsCredentialsFile(), ConfigFile: awsConfigFile()}
 	if err := checkProfileIsPlain(res.ConfigFile, s.Profile); err != nil {
 		return nil, err
 	}
+	// One setup at a time: two concurrent rotations could each delete the
+	// key the other just saved.
+	unlock, err := s.lock(res.CredsFile)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
-	// Does the profile already hold a working key for this user?
+	// Does the profile already hold a working key for a spotexec user? Then
+	// keep that user, even if this machine's hostname has changed since.
 	var existing *awsCreds
+	profAcct, profARN := "", "" // who the profile signs in as, when it works
+	localKey := ""              // the key the profile holds now, working or not
+	// Known even when the profile can't be resolved right now: static keys
+	// in the credentials file, else in the config file.
+	if c, err := readSharedCredentials(s.Profile); err == nil {
+		localKey = c.AccessKeyID
+	} else if vals, err := readINISection(res.ConfigFile, configSection(s.Profile)); err == nil {
+		localKey = vals["aws_access_key_id"]
+	}
 	if c, err := s.resolveProfile(ctx, s.Profile); err == nil {
-		if acct, arn, err := callerIdentity(ctx, s.client(s.Region, staticResolver(c))); err == nil {
-			if strings.HasSuffix(arn, ":user"+iamUserPath+s.UserName) {
-				existing = &c
+		localKey = c.AccessKeyID
+		acct, arn, err := callerIdentity(ctx, s.client(s.Region, staticResolver(c)))
+		if err != nil && !keyRejected(err) {
+			// The key may well work: without knowing its account, replacing
+			// it could swap one account's key for another's.
+			return nil, fmt.Errorf("couldn't check which AWS account profile %q signs in to: %w; nothing was changed, try again", s.Profile, err)
+		}
+		if err == nil {
+			profAcct, profARN = acct, arn
+			cur := ""
+			if i := strings.Index(arn, ":user"+iamUserPath); i >= 0 {
+				cur = arn[i+len(":user"+iamUserPath):]
+			}
+			if cur != "" && (name == "" || cur == name) {
+				existing, name = &c, cur
 				res.Account, res.UserARN, res.AccessKeyID = acct, arn, c.AccessKeyID
 			} else {
 				s.logf("profile %s currently signs in as %s; it will be replaced", s.Profile, arn)
 			}
 		}
 	}
+	if name == "" {
+		name = s.DefaultName
+	}
 
-	admin := s.client("us-east-1", &awsCredResolver{profile: s.AdminProfile})
+	admin := s.client("us-east-1", &awsCredResolver{profile: s.AdminProfile, envOnly: s.AdminFromEnv})
 	acct, adminARN, adminErr := callerIdentity(ctx, admin)
+	if adminErr == nil && profAcct != "" && profAcct != acct {
+		// Changing anything here would set up a user in one account and
+		// keep (or overwrite) a key for another.
+		return nil, fmt.Errorf("AWS profile %q signs in to account %s (as %s), but your admin session is for account %s (%s); nothing was changed.\n"+
+			"To keep using account %s, sign in to it as an administrator (or pass --admin-profile with a profile for it) and re-run setup. "+
+			"To set up account %s instead, pass --profile with a new profile name (and point the runners at it), or remove the [%s] section from %s first",
+			s.Profile, profAcct, profARN, acct, adminARN, profAcct, acct, s.Profile, res.CredsFile)
+	}
+	// Only an administrator (not the spotexec user itself) can change IAM.
+	isAdmin := adminErr == nil && !strings.Contains(adminARN, ":user"+iamUserPath)
+	if existing != nil && s.UserName == "" {
+		// A profile copied from another machine (a synced ~/.aws) signs in as
+		// that machine's user: this machine gets its own instead, so the two
+		// never share, rotate or revoke each other's keys. The user's tags
+		// are read with the admin session, else with the key itself.
+		reader := admin
+		if !isAdmin {
+			reader = s.client("us-east-1", staticResolver(*existing))
+		}
+		if u, err := getUser(ctx, reader, name); err == nil {
+			if tag := u.Tags[tagMachine]; tag != "" && tag != machine {
+				other := orDash(u.Tags["spotexec-host"])
+				if !isAdmin {
+					return nil, fmt.Errorf("profile %s signs in as IAM user %s, which belongs to another machine (host %s), so this machine needs its own: sign in as an administrator (or pass --admin-profile) and re-run setup, or pass --user %s to share it deliberately", s.Profile, name, other, name)
+				}
+				s.logf("profile %s signs in as IAM user %s, which belongs to another machine (host %s); this machine gets its own user (pass --user %s to share it deliberately). If ~/.aws is synced between machines, give each machine its own --profile", s.Profile, name, other, name)
+				existing, name = nil, s.DefaultName
+				res.Account, res.UserARN, res.AccessKeyID = "", "", ""
+			}
+		} else if isAdmin {
+			return nil, iamHint(fmt.Errorf("IAM user %s: %w", name, err))
+		} else if c := awsCode(err); c != "AccessDenied" && c != "AccessDeniedException" {
+			// A policy from before the key could read its own user is the
+			// one expected refusal; anything else leaves ownership unknown.
+			return nil, fmt.Errorf("couldn't check which machine IAM user %s (profile %s) belongs to: %w", name, s.Profile, err)
+		}
+	}
+	s.adminCreds = admin.creds
 	if adminErr != nil {
 		if existing != nil && !s.Rotate {
 			// Already set up; without an admin session the policy just
@@ -160,7 +265,7 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		}
 		return nil, fmt.Errorf("spotexec setup needs an AWS session that can manage IAM users, once: %w", adminErr)
 	}
-	if existing != nil && strings.HasSuffix(adminARN, ":user"+iamUserPath+s.UserName) {
+	if existing != nil && strings.HasSuffix(adminARN, ":user"+iamUserPath+name) {
 		// The "admin" identity is the spotexec user itself (AWS_PROFILE or
 		// default points at it): it can't manage IAM, and needn't.
 		res.AlreadyReady, res.PolicyStale = true, true
@@ -171,57 +276,106 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		return res, nil
 	}
 	res.Account = acct
-	plan := AWSSetupPlan{Account: acct, AdminARN: adminARN}
-	adminEC2 := s.client(s.Region, admin.creds)
-	if s.CheckVPC {
-		if b, err := adminEC2.ec2(ctx, "DescribeVpcs", url.Values{"Filter.1.Name": {"isDefault"}, "Filter.1.Value.1": {"true"}}); err == nil && xmlFirst(b, "vpcSet>item>vpcId") == "" {
-			plan.CreateVPC = true
+	// Settle the name before asking: another machine may already use it.
+	if existing == nil && s.UserName == "" {
+		if u, err := getUser(ctx, admin, name); err == nil && u.Tags[tagMachine] != machine {
+			name = suffixName(s.DefaultName, machine)
+		}
+	}
+	plan := AWSSetupPlan{Account: acct, AdminARN: adminARN, UserName: name}
+	for _, region := range s.VPCRegions {
+		if b, err := s.client(region, admin.creds).ec2(ctx, "DescribeVpcs", url.Values{"Filter.1.Name": {"isDefault"}, "Filter.1.Value.1": {"true"}}); err == nil && xmlFirst(b, "vpcSet>item>vpcId") == "" {
+			plan.CreateVPCIn = append(plan.CreateVPCIn, region)
 		}
 	}
 	if s.Confirm != nil && !s.Confirm(plan) {
 		return nil, ErrSetupDeclined
 	}
-	if plan.CreateVPC {
+	for _, region := range plan.CreateVPCIn {
 		// AWS's standard default VPC: public subnets in every AZ, an internet
 		// gateway and routes. It costs nothing by itself.
-		if b, err := adminEC2.ec2(ctx, "CreateDefaultVpc", nil); err != nil {
-			res.NoVPC = true
-			s.logf("warning: couldn't create a default VPC in %s (%v); set subnet_id on the runner instead", s.Region, err)
+		if b, err := s.client(region, admin.creds).ec2(ctx, "CreateDefaultVpc", nil); err != nil {
+			res.NoVPC = append(res.NoVPC, region)
+			s.logf("warning: couldn't create a default VPC in %s (%v); set subnet_id on the runner instead", region, err)
 		} else {
-			res.CreatedVPC = xmlFirst(b, "vpc>vpcId")
-			s.logf("created the default VPC %s in %s", res.CreatedVPC, s.Region)
+			res.CreatedVPCs[region] = xmlFirst(b, "vpc>vpcId")
+			s.logf("created the default VPC %s in %s", res.CreatedVPCs[region], region)
 		}
 	}
 
-	// 1. The user (tagged, under /spotexec/).
-	p := url.Values{"UserName": {s.UserName}, "Path": {iamUserPath},
-		"Tags.member.1.Key": {"spotexec-managed"}, "Tags.member.1.Value": {"true"}}
-	b, err := admin.query(ctx, "iam", iamAPIVersion, "CreateUser", p)
-	switch {
-	case err == nil:
-		res.UserARN = xmlFirst(b, "CreateUserResult>User>Arn")
-		s.logf("created IAM user %s", s.UserName)
-	case awsCode(err) == "EntityAlreadyExists":
-		b, err := admin.query(ctx, "iam", iamAPIVersion, "GetUser", url.Values{"UserName": {s.UserName}})
+	// 1. The user, under /spotexec/ and tagged with this machine's id. A
+	// name another machine already uses (same hostname) gets a suffix, so
+	// setting up one machine can never touch another's key.
+	host := HostLabel()
+	owned := false
+	hostTag := host // what the user's spotexec-host tag says
+	for attempt := 0; ; attempt++ {
+		p := url.Values{"UserName": {name}, "Path": {iamUserPath}}
+		for i, kv := range [][2]string{{"spotexec-managed", "true"}, {tagMachine, machine}, {"spotexec-host", host}} {
+			p.Set(fmt.Sprintf("Tags.member.%d.Key", i+1), kv[0])
+			p.Set(fmt.Sprintf("Tags.member.%d.Value", i+1), kv[1])
+		}
+		b, err := admin.query(ctx, "iam", iamAPIVersion, "CreateUser", p)
+		if err == nil {
+			res.UserARN, owned = xmlFirst(b, "CreateUserResult>User>Arn"), true
+			s.logf("created IAM user %s", name)
+			break
+		}
+		if awsCode(err) != "EntityAlreadyExists" {
+			return nil, iamHint(fmt.Errorf("creating IAM user %s: %w", name, err))
+		}
+		u, err := getUser(ctx, admin, name)
 		if err != nil {
-			return nil, fmt.Errorf("IAM user %s: %w", s.UserName, err)
+			return nil, fmt.Errorf("IAM user %s: %w", name, err)
 		}
-		res.UserARN = xmlFirst(b, "GetUserResult>User>Arn")
-		if !strings.HasSuffix(res.UserARN, ":user"+iamUserPath+s.UserName) {
-			return nil, fmt.Errorf("IAM user %s already exists and wasn't created by spotexec (%s); pass --user to pick another name", s.UserName, res.UserARN)
+		res.UserARN = u.ARN
+		if !strings.HasSuffix(u.ARN, ":user"+iamUserPath+name) {
+			return nil, fmt.Errorf("IAM user %s already exists and wasn't created by spotexec (%s); pass --user to pick another name", name, u.ARN)
 		}
-		s.logf("IAM user %s exists", s.UserName)
-	default:
-		return nil, iamHint(fmt.Errorf("creating IAM user %s: %w", s.UserName, err))
+		tag := u.Tags[tagMachine]
+		hostTag = u.Tags["spotexec-host"]
+		switch {
+		case tag == machine:
+			owned = true
+		case tag == "" && existing != nil:
+			// Made by an older spotexec; this machine's profile signs in as
+			// it, so it's ours: label it.
+			if _, err := admin.query(ctx, "iam", iamAPIVersion, "TagUser", url.Values{"UserName": {name},
+				"Tags.member.1.Key": {tagMachine}, "Tags.member.1.Value": {machine},
+				"Tags.member.2.Key": {"spotexec-host"}, "Tags.member.2.Value": {host}}); err == nil {
+				owned = true
+			}
+		case existing == nil && s.UserName == "" && attempt == 0:
+			// Another machine's user (or an unlabelled one): use our own.
+			other := name
+			name = suffixName(s.DefaultName, machine)
+			plan.UserName = name
+			s.logf("IAM user %s belongs to another machine; using %s", other, name)
+			continue
+		case existing == nil:
+			return nil, fmt.Errorf("IAM user %s belongs to another machine (host %s); pass a different --user", name, orDash(u.Tags["spotexec-host"]))
+		case tag != "" && s.UserName == "":
+			// The profile signs in as another machine's user and nobody asked
+			// for it by name (checked before asking; never reuse it here).
+			return nil, fmt.Errorf("IAM user %s, which profile %s signs in as, belongs to another machine (host %s); re-run setup to give this machine its own user, or pass --user %s to share it deliberately", name, s.Profile, orDash(u.Tags["spotexec-host"]), name)
+		}
+		s.logf("IAM user %s exists", name)
+		break
+	}
+	if owned && hostTag != host {
+		// Keep the label current (a renamed machine, or an older user).
+		_, _ = admin.query(ctx, "iam", iamAPIVersion, "TagUser", url.Values{"UserName": {name},
+			"Tags.member.1.Key": {"spotexec-host"}, "Tags.member.1.Value": {host}})
 	}
 
 	// 2. Its policy (inline, so re-running replaces it with this version's).
 	if _, err := admin.query(ctx, "iam", iamAPIVersion, "PutUserPolicy", url.Values{
-		"UserName": {s.UserName}, "PolicyName": {"spotexec"}, "PolicyDocument": {compactJSON(SpotexecPolicy)},
+		"UserName": {name}, "PolicyName": {"spotexec"}, "PolicyDocument": {compactJSON(SpotexecPolicy)},
 	}); err != nil {
 		return nil, iamHint(fmt.Errorf("attaching the spotexec policy: %w", err))
 	}
 	s.logf("attached the spotexec policy")
+	s.tagOldSecurityGroups(ctx, admin.creds, machine)
 
 	// 3. The Spot service-linked role (a one-time account prerequisite).
 	if _, err := admin.query(ctx, "iam", iamAPIVersion, "CreateServiceLinkedRole", url.Values{"AWSServiceName": {"spot.amazonaws.com"}}); err == nil {
@@ -239,19 +393,28 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 
 	// 4. A new access key. The user belongs to this machine, so keys not in
 	// the local profile are stale; make room if both slots are used.
-	keys, err := listAccessKeys(ctx, admin, s.UserName)
+	keys, err := listAccessKeys(ctx, admin, name)
 	if err != nil {
 		return nil, err
 	}
+	if len(keys) >= 2 && !owned {
+		return nil, fmt.Errorf("IAM user %s already has two access keys and isn't labelled as this machine's, so setup won't delete one; delete one in the IAM console or pass a different --user", name)
+	}
 	if len(keys) >= 2 {
-		old := keys[0] // oldest
-		if err := deleteAccessKey(ctx, admin, s.UserName, old.ID); err != nil {
+		// Never the key the profile uses: if creating, saving or verifying
+		// its replacement fails, the machine must still have a working key.
+		victim := roomKey(keys, localKey)
+		if victim < 0 {
+			return nil, fmt.Errorf("IAM user %s has no access key setup can delete to make room (the profile uses %s); delete one in the IAM console", name, localKey)
+		}
+		old := keys[victim]
+		if err := deleteAccessKey(ctx, admin, name, old.ID); err != nil {
 			return nil, err
 		}
 		res.KeysDeleted = append(res.KeysDeleted, old.ID)
-		keys = keys[1:]
+		keys = append(keys[:victim:victim], keys[victim+1:]...)
 	}
-	b, err = admin.query(ctx, "iam", iamAPIVersion, "CreateAccessKey", url.Values{"UserName": {s.UserName}})
+	b, err := admin.query(ctx, "iam", iamAPIVersion, "CreateAccessKey", url.Values{"UserName": {name}})
 	if err != nil {
 		return nil, iamHint(fmt.Errorf("creating an access key: %w", err))
 	}
@@ -266,7 +429,27 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 	res.AccessKeyID, res.KeyCreated = newKey.AccessKeyID, true
 	s.logf("created access key %s", newKey.AccessKeyID)
 
-	// 5. Save it as the profile.
+	// 5. Wait for IAM to propagate the key and policy before saving it, so
+	// the profile keeps its current key if the new one never works.
+	c := s.client(s.Region, staticResolver(newKey))
+	if s.verifyFor == 0 {
+		s.verifyFor = 90 * time.Second
+	}
+	if err := s.poll(ctx, s.verifyFor, func() error {
+		if _, _, err := callerIdentity(ctx, c); err != nil {
+			return err
+		}
+		_, err := c.ec2(ctx, "DescribeInstances", url.Values{"MaxResults": {"5"}})
+		return err
+	}); err != nil {
+		if derr := deleteAccessKey(context.WithoutCancel(ctx), admin, name, newKey.AccessKeyID); derr == nil {
+			res.KeysDeleted = append(res.KeysDeleted, newKey.AccessKeyID)
+		}
+		return nil, fmt.Errorf("the new key %s doesn't work yet, so profile %s was left as it was: %w", newKey.AccessKeyID, s.Profile, err)
+	}
+
+	// 6. Save it as the profile, and check that the profile resolves to it
+	// (nothing in ~/.aws shadows it).
 	if err := upsertINISection(res.CredsFile, s.Profile, [][2]string{
 		{"aws_access_key_id", newKey.AccessKeyID}, {"aws_secret_access_key", newKey.SecretAccessKey},
 	}, []string{"aws_session_token"}); err != nil {
@@ -276,19 +459,6 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		return nil, fmt.Errorf("writing %s: %w", res.ConfigFile, err)
 	}
 	s.logf("saved it as AWS profile %s (%s)", s.Profile, res.CredsFile)
-
-	// 6. Wait for IAM to propagate the key and policy, then check that the
-	// profile resolves to this key (nothing in ~/.aws shadows it).
-	c := s.client(s.Region, staticResolver(newKey))
-	if err := s.poll(ctx, 90*time.Second, func() error {
-		if _, _, err := callerIdentity(ctx, c); err != nil {
-			return err
-		}
-		_, err := c.ec2(ctx, "DescribeInstances", url.Values{"MaxResults": {"5"}})
-		return err
-	}); err != nil {
-		return nil, fmt.Errorf("the new key doesn't work yet: %w", err)
-	}
 	if got, err := s.resolveProfile(ctx, s.Profile); err != nil {
 		return nil, fmt.Errorf("profile %s doesn't resolve after writing it: %w", s.Profile, err)
 	} else if got.AccessKeyID != newKey.AccessKeyID {
@@ -298,10 +468,13 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 
 	// 7. Retire the user's other keys: none of them is in use here.
 	for _, k := range keys {
+		if !owned {
+			break // not provably this machine's user: leave its keys alone
+		}
 		if k.ID == newKey.AccessKeyID {
 			continue
 		}
-		if err := deleteAccessKey(ctx, admin, s.UserName, k.ID); err != nil {
+		if err := deleteAccessKey(ctx, admin, name, k.ID); err != nil {
 			s.logf("warning: couldn't delete old access key %s: %v", k.ID, err)
 			continue
 		}
@@ -309,6 +482,64 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 	}
 	s.quota(ctx, newKey, res)
 	return res, nil
+}
+
+// tagOldSecurityGroups gives spotexec security groups made before they were
+// tagged at creation (exactly spotexec's name pattern and description) the
+// spotexec-owner tag, which the policy now requires
+// before the machine key may add an ingress rule (best effort).
+func (s *AWSUserSetup) tagOldSecurityGroups(ctx context.Context, creds *awsCredResolver, machine string) {
+	seen := map[string]bool{}
+	for _, region := range append(append([]string{s.Region}, s.QuotaRegions...), s.VPCRegions...) {
+		if seen[region] {
+			continue
+		}
+		seen[region] = true
+		c := s.client(region, creds)
+		b, err := c.ec2(ctx, "DescribeSecurityGroups", spotexecSGFilter())
+		if err != nil {
+			s.logf("warning: couldn't list spotexec's security groups in %s: %v", region, err)
+			continue
+		}
+		groups, _, err := parseSecurityGroups(b)
+		if err != nil {
+			continue
+		}
+		for _, g := range groups {
+			if g.tag(tagOwner) != "" || !g.madeBySpotexec() {
+				continue
+			}
+			if _, err := c.ec2(ctx, "CreateTags", url.Values{"ResourceId.1": {g.ID},
+				"Tag.1.Key": {tagOwner}, "Tag.1.Value": {machine}}); err != nil {
+				s.logf("warning: couldn't tag security group %s (%s) in %s: %v", g.Name, g.ID, region, err)
+				continue
+			}
+			s.logf("tagged security group %s (%s) in %s as spotexec's", g.Name, g.ID, region)
+		}
+	}
+}
+
+// lock serialises setups that write the same credentials file.
+func (s *AWSUserSetup) lock(credsFile string) (func(), error) {
+	if real, err := filepath.EvalSymlinks(credsFile); err == nil {
+		credsFile = real // the file upsertINISection writes
+	}
+	dir := filepath.Dir(credsFile)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, ".spotexec-setup.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		s.logf("waiting for another spotexec setup on this machine to finish")
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
 func (s *AWSUserSetup) poll(ctx context.Context, limit time.Duration, f func() error) error {
@@ -329,18 +560,38 @@ func (s *AWSUserSetup) poll(ctx context.Context, limit time.Duration, f func() e
 	}
 }
 
-// quota records the region's Spot vCPU quota (best effort).
+// quota records each region's Spot vCPU quota (best effort).
 func (s *AWSUserSetup) quota(ctx context.Context, c awsCreds, res *AWSUserSetupResult) {
-	cl := s.client(s.Region, staticResolver(c))
-	qb, _ := json.Marshal(map[string]string{"ServiceCode": "ec2", "QuotaCode": "L-34B43A08"})
-	status, b, err := cl.do(ctx, "servicequotas", "application/x-amz-json-1.1", map[string]string{"X-Amz-Target": "ServiceQuotasV20190624.GetServiceQuota"}, qb)
-	if err != nil || status != 200 {
-		return
+	regions := s.QuotaRegions
+	if len(regions) == 0 {
+		regions = []string{s.Region}
 	}
-	var v struct{ Quota struct{ Value float64 } }
-	if json.Unmarshal(b, &v) == nil {
-		res.QuotaVCPUs = v.Quota.Value
+	for _, region := range regions {
+		cl := s.client(region, staticResolver(c))
+		qb, _ := json.Marshal(map[string]string{"ServiceCode": "ec2", "QuotaCode": "L-34B43A08"})
+		status, b, err := cl.do(ctx, "servicequotas", "application/x-amz-json-1.1", map[string]string{"X-Amz-Target": "ServiceQuotasV20190624.GetServiceQuota"}, qb)
+		if err != nil || status != 200 {
+			continue
+		}
+		var v struct{ Quota struct{ Value float64 } }
+		if json.Unmarshal(b, &v) == nil {
+			res.Quotas[region] = v.Quota.Value
+		}
 	}
+}
+
+// keyRejected reports whether AWS definitively refused a key (it doesn't
+// exist, was deleted or has expired), as opposed to the call failing.
+func keyRejected(err error) bool {
+	var ce *CredentialError
+	if errors.As(err, &ce) {
+		return true
+	}
+	switch awsCode(err) {
+	case "InvalidClientTokenId", "SignatureDoesNotMatch", "ExpiredToken", "ExpiredTokenException", "UnrecognizedClientException", "AuthFailure":
+		return true
+	}
+	return false
 }
 
 func callerIdentity(ctx context.Context, c *awsClient) (account, arn string, err error) {
@@ -353,6 +604,7 @@ func callerIdentity(ctx context.Context, c *awsClient) (account, arn string, err
 
 type accessKey struct {
 	ID      string `xml:"AccessKeyId"`
+	Status  string `xml:"Status"`
 	Created string `xml:"CreateDate"`
 }
 
@@ -370,6 +622,22 @@ func listAccessKeys(ctx context.Context, c *awsClient, user string) ([]accessKey
 	}
 	sort.Slice(v.Keys, func(i, j int) bool { return v.Keys[i].Created < v.Keys[j].Created })
 	return v.Keys, nil
+}
+
+// roomKey picks the key to delete to make room for a new one: never the
+// one in local use, an inactive key first, else the oldest (keys are
+// oldest first). -1 when there is none.
+func roomKey(keys []accessKey, local string) int {
+	pick := -1
+	for i, k := range keys {
+		if k.ID == local {
+			continue
+		}
+		if pick < 0 || (k.Status == "Inactive" && keys[pick].Status != "Inactive") {
+			pick = i
+		}
+	}
+	return pick
 }
 
 func deleteAccessKey(ctx context.Context, c *awsClient, user, id string) error {
@@ -444,7 +712,7 @@ func readINISection(path, section string) (map[string]string, error) {
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if name, ok := iniHeader(line); ok {
-			in = name == section
+			in = configSectionName(name) == section
 			continue
 		}
 		if !in || line == "" || line[0] == '#' || line[0] == ';' {
@@ -457,11 +725,31 @@ func readINISection(path, section string) (map[string]string, error) {
 	return vals, sc.Err()
 }
 
+// iniHeader parses a (trimmed) section header line the way the AWS CLI's
+// INI parser does: the name is everything between "[" and the last "]" on
+// the line, so a trailing comment ("[work] # prod keys") is ignored rather
+// than making the line a non-header. The name is returned as written: the
+// AWS CLI compares credentials sections verbatim.
 func iniHeader(line string) (string, bool) {
-	if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-		return strings.Join(strings.Fields(line[1:len(line)-1]), " "), true
+	if !strings.HasPrefix(line, "[") {
+		return "", false
 	}
-	return "", false
+	end := strings.LastIndex(line, "]")
+	if end < 2 {
+		return "", false
+	}
+	return line[1:end], true
+}
+
+// configSectionName normalises a ~/.aws/config section name the way the
+// AWS CLI reads "profile" sections ("profile  x" is profile x).
+func configSectionName(raw string) string { return strings.Join(strings.Fields(raw), " ") }
+
+// sameINISection reports whether header names section: verbatim (as the
+// AWS CLI matches credentials sections), or with "profile" sections'
+// whitespace normalised.
+func sameINISection(header, section string) bool {
+	return header == section || (strings.HasPrefix(section, "profile ") && configSectionName(header) == section)
 }
 
 // upsertINISection sets keys in [section] of an AWS-style INI file, keeping
@@ -491,7 +779,7 @@ func upsertINISection(path, section string, set [][2]string, drop []string) erro
 			end = i
 			break
 		}
-		if name == section {
+		if sameINISection(name, section) {
 			start = i
 		}
 	}
@@ -589,4 +877,268 @@ func AdminSession(ctx context.Context, profile string) (env []string, arn string
 		return nil, "", err
 	}
 	return []string{c.AccessKeyID, c.SecretAccessKey, c.SessionToken}, arn, nil
+}
+
+const tagMachine = "spotexec-machine"
+
+// MachineID is this machine's spotexec owner id.
+func MachineID() (string, error) { return ownerID() }
+
+type iamUser struct {
+	ARN  string
+	Tags map[string]string
+}
+
+func getUser(ctx context.Context, c *awsClient, name string) (iamUser, error) {
+	b, err := c.query(ctx, "iam", iamAPIVersion, "GetUser", url.Values{"UserName": {name}})
+	if err != nil {
+		return iamUser{}, err
+	}
+	var v struct {
+		ARN  string `xml:"GetUserResult>User>Arn"`
+		Tags []struct {
+			Key   string `xml:"Key"`
+			Value string `xml:"Value"`
+		} `xml:"GetUserResult>User>Tags>member"`
+	}
+	if err := xml.Unmarshal(b, &v); err != nil {
+		return iamUser{}, err
+	}
+	u := iamUser{ARN: v.ARN, Tags: map[string]string{}}
+	for _, t := range v.Tags {
+		u.Tags[t.Key] = t.Value
+	}
+	return u, nil
+}
+
+// suffixName makes a per-machine variant of name that fits IAM's 64 chars.
+func suffixName(name, machine string) string {
+	id := strings.ReplaceAll(machine, "-", "")
+	if len(id) > 6 {
+		id = id[:6]
+	}
+	if len(name) > 64-7 {
+		name = name[:64-7]
+	}
+	return name + "-" + id
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
+}
+
+// Machine is one machine's spotexec IAM user, as seen from the account.
+type Machine struct {
+	User      string
+	Host      string // from the spotexec-host tag
+	MachineID string // from the spotexec-machine tag
+	Created   string
+	Keys      []MachineKey
+	VMs       int // spotexec instances (VMs and bake builders, any state but terminated) this machine owns, in the regions asked about
+	This      bool
+}
+
+// MachineKey is one access key and when it was last used.
+type MachineKey struct {
+	ID, Status, Created, LastUsed string
+}
+
+// ListMachines lists the IAM users under /spotexec/ with their keys and the
+// spotexec VMs each machine has running in regions.
+func ListMachines(ctx context.Context, adminProfile string, regions []string) ([]Machine, error) {
+	admin := accountClient("us-east-1", accountResolver(adminProfile))
+	b, err := admin.query(ctx, "iam", iamAPIVersion, "ListUsers", url.Values{"PathPrefix": {iamUserPath}, "MaxItems": {"1000"}})
+	if err != nil {
+		return nil, iamHint(fmt.Errorf("listing spotexec's IAM users: %w", err))
+	}
+	var v struct {
+		Users []struct {
+			Name    string `xml:"UserName"`
+			Created string `xml:"CreateDate"`
+		} `xml:"ListUsersResult>Users>member"`
+	}
+	if err := xml.Unmarshal(b, &v); err != nil {
+		return nil, err
+	}
+	me, _ := ownerID()
+	vms := map[string]int{}
+	for _, in := range FindAccountInstances(ctx, adminScopes(adminProfile, regions)).Instances {
+		vms[in.Owner]++
+	}
+	var out []Machine
+	for _, u := range v.Users {
+		m := Machine{User: u.Name, Created: u.Created}
+		if gu, err := getUser(ctx, admin, u.Name); err == nil {
+			m.Host, m.MachineID = gu.Tags["spotexec-host"], gu.Tags[tagMachine]
+		}
+		m.This = m.MachineID != "" && m.MachineID == me
+		m.VMs = vms[m.MachineID]
+		if keys, err := listAccessKeys(ctx, admin, u.Name); err == nil {
+			for _, k := range keys {
+				mk := MachineKey{ID: k.ID, Status: k.Status, Created: k.Created, LastUsed: "never"}
+				if lb, err := admin.query(ctx, "iam", iamAPIVersion, "GetAccessKeyLastUsed", url.Values{"AccessKeyId": {k.ID}}); err == nil {
+					if d := xmlFirst(lb, "GetAccessKeyLastUsedResult>AccessKeyLastUsed>LastUsedDate"); d != "" {
+						mk.LastUsed = d
+					}
+				}
+				m.Keys = append(m.Keys, mk)
+			}
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// adminScopes searches regions with the admin profile.
+func adminScopes(profile string, regions []string) []AccountScope {
+	var out []AccountScope
+	for _, r := range regions {
+		out = append(out, AccountScope{Region: r, Profile: profile})
+	}
+	return out
+}
+
+// RevokeMachine cuts a machine off and cleans up after it. In order:
+//  1. its access keys are deactivated, so it can't launch anything more;
+//  2. its VMs (fleet VMs and bake builders, in any state but terminated)
+//     are terminated in regions, found by the owner ID on its IAM user;
+//  3. only then are its keys, policy and IAM user deleted.
+//
+// If any region can't be searched or any VM terminated, it stops before
+// step 3 and returns an error: the user (the only link to the machine's
+// owner ID) is kept, so running it again finishes the job. user is the IAM
+// user name.
+func RevokeMachine(ctx context.Context, adminProfile, user string, regions []string, log func(string, ...any)) error {
+	admin := accountClient("us-east-1", accountResolver(adminProfile))
+	u, err := getUser(ctx, admin, user)
+	if err != nil {
+		return iamHint(fmt.Errorf("IAM user %s: %w", user, err))
+	}
+	if !strings.HasSuffix(u.ARN, ":user"+iamUserPath+user) {
+		return fmt.Errorf("IAM user %s wasn't created by spotexec (%s); not touching it", user, u.ARN)
+	}
+	keys, err := listAccessKeys(ctx, admin, user)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if k.Status == "Inactive" {
+			continue
+		}
+		if _, err := admin.query(ctx, "iam", iamAPIVersion, "UpdateAccessKey", url.Values{"UserName": {user}, "AccessKeyId": {k.ID}, "Status": {"Inactive"}}); err != nil {
+			return iamHint(fmt.Errorf("deactivating access key %s: %w", k.ID, err))
+		}
+		log("deactivated access key %s", k.ID)
+	}
+
+	m := u.Tags[tagMachine]
+	if m == "" {
+		return fmt.Errorf("IAM user %s has no %s tag (it was made by an older spotexec), so its VMs can't be identified; its keys are now deactivated and the user was kept. Tag it with that machine's owner ID (the contents of ~/.config/spotexec/owner-id there): `aws iam tag-user --user-name %s --tags Key=%s,Value=<owner-id>`, then run `spotexec setup --revoke %s` again", user, tagMachine, user, tagMachine, user)
+	}
+	if len(regions) == 0 {
+		return fmt.Errorf("no regions to search for %s's VMs (no AWS runners configured here); its keys are now deactivated, and IAM user %s was kept", user, user)
+	}
+	if err := stopMachineVMs(ctx, adminProfile, m, regions, log); err != nil {
+		return fmt.Errorf("%w; IAM user %s was kept (its keys are deactivated) so its VMs can still be found: fix this and run `spotexec setup --revoke %s` again", err, user, user)
+	}
+
+	return deleteIAMUser(ctx, admin, user, log)
+}
+
+// How long revoking waits for a machine's VMs to be gone, how often it
+// looks again, and how long the search must stay empty before it's
+// believed (EC2 listings are eventually consistent; tests shorten these).
+var (
+	revokeWait   = 10 * time.Minute
+	revokeSettle = 10 * time.Second
+	revokeQuiet  = 30 * time.Second
+)
+
+// stopMachineVMs terminates every spotexec instance owned by machine m
+// (any machine's when m is "") and waits until none is left: the search must stay empty for revokeQuiet
+// (so a launch the machine's key got in just before it was deactivated
+// still turns up), and every instance it asked to terminate must be seen
+// terminated, not merely missing from a listing.
+func stopMachineVMs(ctx context.Context, adminProfile, m string, regions []string, log func(string, ...any)) error {
+	deadline := time.Now().Add(revokeWait)
+	asked := map[string]AccountInstance{}
+	var quietSince time.Time
+	for {
+		search := FindAccountInstances(ctx, adminScopes(adminProfile, regions))
+		var errs, left []string
+		listed := map[string]bool{}
+		for _, in := range search.Instances {
+			if m != "" && in.Owner != m {
+				continue
+			}
+			listed[in.ID] = true
+			left = append(left, in.ID)
+			if in.State == "shutting-down" {
+				continue
+			}
+			kind := "VM"
+			if in.Builder {
+				kind = "bake builder"
+			}
+			if err := TerminateAccountInstance(ctx, in); err != nil {
+				errs = append(errs, fmt.Sprintf("couldn't terminate %s %s in %s: %v", kind, in.ID, in.Region, err))
+				continue
+			}
+			if _, ok := asked[in.ID]; !ok {
+				asked[in.ID] = in
+				log("terminating %s %s (%s, %s) in %s", kind, in.ID, in.Runner, in.State, in.Region)
+			}
+		}
+		// One that dropped out of the listing must be seen terminated.
+		for id, in := range asked {
+			if listed[id] {
+				continue
+			}
+			if st, err := instanceState(ctx, in); err != nil || st != "terminated" {
+				left = append(left, id)
+			} else {
+				delete(asked, id)
+			}
+		}
+		if err := search.Err(); err != nil {
+			errs = append(errs, err.Error())
+		}
+		if len(errs) > 0 {
+			return errors.New(strings.Join(errs, "; "))
+		}
+		now := time.Now()
+		switch {
+		case len(left) > 0:
+			quietSince = time.Time{}
+		case quietSince.IsZero():
+			quietSince = now
+		case now.Sub(quietSince) >= revokeQuiet:
+			return nil
+		}
+		if now.After(deadline) {
+			return fmt.Errorf("%s still not terminated after %s", strings.Join(left, ", "), revokeWait)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(revokeSettle):
+		}
+	}
+}
+
+// instanceState looks one instance up by ID, through the profile that
+// found it.
+func instanceState(ctx context.Context, in AccountInstance) (string, error) {
+	b, err := accountClient(in.Region, accountResolver(in.Profile)).ec2(ctx, "DescribeInstances", url.Values{"InstanceId.1": {in.ID}})
+	if err != nil {
+		return "", err
+	}
+	ins, _, err := parseDescribeInstances(b)
+	if err != nil || len(ins) == 0 {
+		return "", fmt.Errorf("%s not found", in.ID)
+	}
+	return ins[0].State, nil
 }

@@ -46,8 +46,9 @@ type errClass int
 
 const (
 	errFatal     errClass = iota
-	errNextType           // try the next instance type (capacity, price, unsupported, quota)
+	errNextType           // try the next instance type (capacity, price, unsupported)
 	errRetryable          // transient: retry the same request with backoff
+	errQuota              // the account's vCPU quota: a smaller type may fit, but waiting for capacity won't help
 )
 
 func classifyAWSError(err error) errClass {
@@ -57,9 +58,12 @@ func classifyAWSError(err error) errClass {
 	}
 	switch ae.Code {
 	case "InsufficientInstanceCapacity", "InsufficientCapacity", "SpotMaxPriceTooLow",
-		"Unsupported", "UnsupportedOperation", "MaxSpotInstanceCountExceeded",
-		"VcpuLimitExceeded", "InstanceLimitExceeded", "InsufficientHostCapacity":
+		"Unsupported", "UnsupportedOperation", "InsufficientHostCapacity":
 		return errNextType
+	case "MaxSpotInstanceCountExceeded", "VcpuLimitExceeded", "InstanceLimitExceeded":
+		// The account's (or region's) limit, not the capacity pool's: it
+		// lifts only when instances in the account end or the quota is raised.
+		return errQuota
 	case "RequestLimitExceeded", "Throttling", "ThrottlingException", "InternalError",
 		"InternalFailure", "Unavailable", "ServiceUnavailable", "InsufficientAddressCapacity":
 		return errRetryable
@@ -283,11 +287,13 @@ type ec2Tag struct {
 
 type ec2Instance struct {
 	InstanceID   string   `xml:"instanceId"`
+	ImageID      string   `xml:"imageId"`
 	InstanceType string   `xml:"instanceType"`
 	LaunchTime   string   `xml:"launchTime"`
 	IPAddress    string   `xml:"ipAddress"`
 	State        string   `xml:"instanceState>name"`
 	Lifecycle    string   `xml:"instanceLifecycle"`
+	Zone         string   `xml:"placement>availabilityZone"`
 	Tags         []ec2Tag `xml:"tagSet>item"`
 }
 

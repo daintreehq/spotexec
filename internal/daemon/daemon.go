@@ -41,7 +41,10 @@ var (
 	probeEvery     = 30 * time.Second
 	unhealthyAfter = 8 * time.Minute
 	sweepEvery     = 10 * time.Minute
-	retireAhead    = 15 * time.Minute // drain warm VMs this long before max_lifetime
+	// Warm VMs retire up to this long (a quarter of max_lifetime at most)
+	// before client.LifetimeDrainAhead drains whatever is left, one at a
+	// time, so their replacements are warm by then.
+	retireAhead = 10 * time.Minute
 )
 
 func init() {
@@ -115,6 +118,12 @@ type Daemon struct {
 	started time.Time
 	actions []string
 	log     func(string, ...any)
+	// installing: instance IDs whose helper is being uploaded in the
+	// background (a first contact over a slow link outlasts a probe round).
+	installing sync.Map
+	// installed: instance IDs whose helper this daemon installed (in case
+	// the local install markers couldn't be written).
+	installed sync.Map
 }
 
 // guard serialises Lock and Running, so Running's probe of daemon.lock never
@@ -305,7 +314,8 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// 2. Retire a warm instance shortly before max_lifetime, while its jobs
 	// can still finish, so the VM's hard stop never kills one and the
 	// replacement is warm in time.
-	if lt := r.MaxLifetime.Duration; lt > 2*retireAhead {
+	if lt := r.MaxLifetime.Duration; lt > 0 {
+		retireAt := lt - client.LifetimeDrainAhead(r) - min(retireAhead, lt/4)
 		// Ready warm capacity right now (answering, not booting): a VM is
 		// retired only while the others still cover the minimum, so co-born
 		// warm VMs are replaced one after another, never all at once.
@@ -319,7 +329,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		for i, in := range running {
 			// One at a time: warm VMs launched together would otherwise all
 			// retire in the same pass and leave no warm capacity.
-			if i < r.MinInstances && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > lt-retireAhead {
+			if i < r.MinInstances && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > retireAt {
 				// Drained locally now (so the warm pool replaces it); the
 				// VM itself is told below, retried until it confirms.
 				d.action("%s: retiring warm instance %s ahead of max_lifetime", r.Name, in.ID)
@@ -478,7 +488,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	}
 
 	// 7. Leftover image-bake builders (skipped while a bake runs here).
-	if a, ok := fl.f.(*provider.AWSSpot); ok && time.Since(fl.lastSwp) > sweepEvery {
+	if a, ok := fl.f.(interface {
+		SweepBuilders(context.Context, provider.Logger)
+	}); ok && time.Since(fl.lastSwp) > sweepEvery {
 		fl.lastSwp = time.Now()
 		a.SweepBuilders(ctx, func(f string, args ...any) { d.action("%s: %s", r.Name, fmt.Sprintf(f, args...)) })
 	}
@@ -561,7 +573,12 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string) {
 		in, err := fl.pool.ProvisionHeld(pctx, id, nil)
 		if err != nil {
 			d.action("%s: launch failed: %v", fl.r.Name, err)
-			d.countFailure(fl, "") // a launch that never became usable
+			// A quota refusal says nothing about the fleet's health; the pool
+			// holds further launches back until there is room.
+			var qe *provider.QuotaError
+			if !errors.As(err, &qe) {
+				d.countFailure(fl, "") // a launch that never became usable
+			}
 			return
 		}
 		d.action("%s: %s running at %s", fl.r.Name, in.ID, in.Target.Host)
@@ -589,9 +606,17 @@ func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instan
 		wg.Add(1)
 		go func(in provider.Instance) {
 			defer wg.Done()
+			c := transport.New(in.Target, fl.r.WorkRoot)
+			if _, done := d.installed.Load(in.ID); !done && !c.HelperInstalled() {
+				// A first contact uploads the helper, which over a slow link
+				// can outlast this round: install it in the background (once
+				// per VM) and probe once it's there, so a slow upload neither
+				// restarts every round nor holds up the round's other work.
+				d.installHelper(ctx, c, in.ID)
+				return
+			}
 			pctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 			defer cancel()
-			c := transport.New(in.Target, fl.r.WorkRoot)
 			if err := c.EnsureMaster(pctx); err != nil {
 				return
 			}
@@ -677,4 +702,23 @@ func (d *Daemon) countFailure(fl *fleet, id string) {
 		fl.counted[id] = true
 	}
 	fl.failures = append(fl.failures, time.Now())
+}
+
+// installHelper uploads the helper to a VM in the background, unless an
+// upload to it is already under way.
+func (d *Daemon) installHelper(ctx context.Context, c *transport.Client, id string) {
+	if _, busy := d.installing.LoadOrStore(id, true); busy {
+		return
+	}
+	go func() {
+		defer d.installing.Delete(id)
+		ictx, cancel := context.WithTimeout(ctx, 25*time.Second+transport.HelperUploadBudget)
+		defer cancel()
+		if err := c.EnsureMaster(ictx); err != nil {
+			return
+		}
+		if _, err := c.EnsureHelper(ictx, false); err == nil {
+			d.installed.Store(id, true)
+		}
+	}()
 }

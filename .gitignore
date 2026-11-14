@@ -72,4 +72,8 @@ AGENTS.local.md
 # Build output
 /bin/
 /dist/
+/completions/
 internal/helperbin/dist/*.gz
+
+# Local scratch (tooling state, check results)
+/.tmp/

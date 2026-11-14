@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/cloudinit"
@@ -169,10 +170,79 @@ func mappedPort(ports string) int {
 	return 0
 }
 
+// simVCPUs is what one simulated instance counts against a simulated quota.
+const simVCPUs = 4
+
+// simAccount is the simulated AWS account (SPOTEXEC_SIM_ACCOUNT): every
+// container is labelled with it, and a simulated quota counts the containers
+// of every runner and owner in the account, as EC2 does.
+func simAccount() string {
+	if a := os.Getenv("SPOTEXEC_SIM_ACCOUNT"); a != "" {
+		return a
+	}
+	return "local"
+}
+
+// simQuota is the simulated Spot vCPU quota (SPOTEXEC_SIM_QUOTA; -1 when
+// unlimited, the default).
+func simQuota() int {
+	n, err := strconv.Atoi(os.Getenv("SPOTEXEC_SIM_QUOTA"))
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
+// QuotaUsage is the simulated account's quota use, attributed by owner
+// like the AWS provider's.
+func (s *Sim) QuotaUsage(ctx context.Context) (QuotaUsage, error) {
+	u := QuotaUsage{Region: "sim", Quota: simQuota(), Machines: map[string]int{}}
+	me, err := s.ownerTag()
+	if err != nil {
+		return u, err
+	}
+	out, err := docker(ctx, "ps", "--filter", "label=spotexec-sim-account="+simAccount(),
+		"--format", "{{.Label \"spotexec-owner\"}}")
+	if err != nil {
+		return u, err
+	}
+	for _, owner := range strings.Fields(string(out)) {
+		u.Used += simVCPUs
+		if owner == me {
+			u.Mine += simVCPUs
+		} else {
+			u.Machines[machineLabel("", owner)] += simVCPUs // one host: tell them apart by owner
+		}
+	}
+	return u, nil
+}
+
 // Launch starts one simulated instance.
 func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 	if err := s.EnsureImage(ctx); err != nil {
 		return Instance{}, err
+	}
+	if q := simQuota(); q >= 0 {
+		// Counting and launching are one step, as in EC2.
+		lf, err := os.OpenFile(filepath.Join(os.TempDir(), "spotexec-sim-"+simAccount()+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return Instance{}, err
+		}
+		defer lf.Close()
+		if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
+			return Instance{}, err
+		}
+		defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+		// Like the AWS provider's pre-launch check (where EC2 itself would
+		// refuse a launch past the quota).
+		u, err := s.QuotaUsage(ctx)
+		if err != nil {
+			return Instance{}, err
+		}
+		if ok, fair := u.Admit(simVCPUs); !ok {
+			return Instance{}, &QuotaError{Region: "sim", Spot: true, Code: QuotaCodeSpotStandard, VCPUs: simVCPUs,
+				Desired: u.desired(simVCPUs, s.r.MaxInstances*simVCPUs), Usage: &u, Fair: fair}
+		}
 	}
 	owner, err := s.ownerTag()
 	if err != nil {
@@ -194,7 +264,7 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 	_, _ = rand.Read(b[:])
 	name := "sx-" + s.r.Name + "-" + hex.EncodeToString(b[:])
 	_, err = docker(ctx, "run", "-d", "--rm", "--name", name,
-		"--label", "spotexec-runner="+s.r.Name, "--label", "spotexec-owner="+owner,
+		"--label", "spotexec-runner="+s.r.Name, "--label", "spotexec-owner="+owner, "--label", "spotexec-sim-account="+simAccount(),
 		"--label", "spotexec-launched="+strconv.FormatInt(time.Now().UnixMilli(), 10),
 		"-e", "BOOT_DELAY="+strconv.FormatFloat(s.r.BootDelay.Seconds(), 'f', 1, 64),
 		"-e", "USER_DATA_B64="+base64.StdEncoding.EncodeToString([]byte(ud)),

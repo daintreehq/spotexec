@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,27 +42,43 @@ type AWSSpot struct {
 	api   *awsClient
 	dir   string
 	owner string
+	// placed: one region of a multi-region runner, which uses default VPCs
+	// only (messages mustn't suggest subnet_id).
+	placed bool
 }
 
 // NewAWSSpot constructs the provider.
 func NewAWSSpot(r *config.Runner) (Provider, error) {
+	if err := checkAWSRunner(r); err != nil {
+		return nil, err
+	}
+	return newAWSSpot(r, &awsCredResolver{profile: r.Profile}), nil
+}
+
+func checkAWSRunner(r *config.Runner) error {
 	if len(r.InstanceTypes) == 0 {
-		return nil, fmt.Errorf("runner %s: instance_types is empty", r.Name)
+		return fmt.Errorf("runner %s: instance_types is empty", r.Name)
 	}
 	if r.Arch != "amd64" && r.Arch != "arm64" {
-		return nil, fmt.Errorf("runner %s: arch must be amd64 or arm64 (got %q)", r.Name, r.Arch)
+		return fmt.Errorf("runner %s: arch must be amd64 or arm64 (got %q)", r.Name, r.Arch)
 	}
+	return nil
+}
+
+// newAWSSpot builds a provider for r.Region; creds may be shared between
+// the regional providers of one multi-region runner.
+func newAWSSpot(r *config.Runner, creds *awsCredResolver) *AWSSpot {
 	return &AWSSpot{
 		r:   r,
 		dir: RunnerStateDir(r.Name),
 		api: &awsClient{
 			region: r.Region,
-			creds:  &awsCredResolver{profile: r.Profile},
+			creds:  creds,
 			http:   &http.Client{Timeout: 60 * time.Second},
 			// ECR's API host is api.ecr.<region>, not ecr.<region>.
 			endpoints: map[string]string{"ecr": "https://api.ecr." + r.Region + ".amazonaws.com/"},
 		},
-	}, nil
+	}
 }
 
 func (a *AWSSpot) Runner() *config.Runner { return a.r }
@@ -282,7 +300,7 @@ func (a *AWSSpot) List(ctx context.Context) ([]Instance, error) {
 }
 
 func (a *AWSSpot) instance(i ec2Instance) Instance {
-	in := Instance{ID: i.InstanceID, State: mapEC2State(i.State), Type: i.InstanceType, LaunchedAt: i.launched(), Spot: i.Lifecycle == "spot"}
+	in := Instance{ID: i.InstanceID, State: mapEC2State(i.State), Type: i.InstanceType, LaunchedAt: i.launched(), Spot: i.Lifecycle == "spot", Region: a.r.Region, Zone: i.Zone}
 	if i.IPAddress != "" {
 		in.Target = a.target(i.InstanceID, i.IPAddress)
 	}
@@ -318,7 +336,7 @@ func (a *AWSSpot) WaitRunning(ctx context.Context, id string, log Logger) (Insta
 	if err != nil {
 		return Instance{}, err
 	}
-	return Instance{ID: info.InstanceID, State: info.State, Target: info.Target, Type: info.InstanceType, LaunchedAt: info.LaunchedAt, Spot: info.Spot}, nil
+	return Instance{ID: info.InstanceID, State: info.State, Target: info.Target, Type: info.InstanceType, LaunchedAt: info.LaunchedAt, Spot: info.Spot, Region: a.r.Region}, nil
 }
 
 // Up returns a running instance of the fleet, launching one if there is
@@ -423,7 +441,20 @@ func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger)
 
 // launch performs RunInstances across the configured instance types.
 func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
-	return a.launchWith(ctx, log, launchSpec{})
+	return a.launchOrUnbaked(ctx, log, launchSpec{})
+}
+
+// launchOrUnbaked launches a fleet instance as spec says, booting the base
+// image instead when the bake it picked was deregistered (`image clear` or
+// pruning on another machine) between picking it and launching.
+func (a *AWSSpot) launchOrUnbaked(ctx context.Context, log Logger, spec launchSpec) (ec2Instance, error) {
+	inst, err := a.launchWith(ctx, log, spec)
+	if err != nil && !spec.bake && !spec.noBake && (a.r.AMI == "" || a.r.AMI == "auto") && strings.HasPrefix(awsCode(err), "InvalidAMIID") {
+		log("baked image is gone (%s); launching from the current Ubuntu image", awsCode(err))
+		spec.noBake = true
+		return a.launchWith(ctx, log, spec)
+	}
+	return inst, err
 }
 
 // launchSpec varies a launch: normal fleet instances (spot, from the newest
@@ -431,6 +462,33 @@ func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
 type launchSpec struct {
 	bake    bool
 	prepull []string
+	noBake  bool // boot the base image even if a bake matches
+	// Multi-region placement: exactly this Spot type, in this availability
+	// zone (through the default VPC's subnet there), with no on-demand
+	// fallback (the coordinator decides that).
+	itype    string
+	zone     string
+	onDemand bool // on-demand only, any configured type (multi-region fallback)
+	// beforeSend runs once preparation succeeded, just before the first
+	// RunInstances; an error stops the launch with nothing sent.
+	beforeSend func() error
+}
+
+// regionError marks a failure to prepare a launch in one region (no
+// default VPC, AMI or security group trouble): another region may work.
+type regionError struct{ err error }
+
+func (e *regionError) Error() string { return e.err.Error() }
+func (e *regionError) Unwrap() error { return e.err }
+
+// asRegionError wraps err unless it is a credential failure or a
+// cancellation, which no other region can fix.
+func asRegionError(ctx context.Context, err error) error {
+	var ce *CredentialError
+	if err == nil || ctx.Err() != nil || errors.As(err, &ce) {
+		return err
+	}
+	return &regionError{err}
 }
 
 func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (ec2Instance, error) {
@@ -455,19 +513,28 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 		opts.BootstrapTimeout = a.BakeBootstrapTimeout(len(spec.prepull) > 0)
 		opts.MaxLifetime = 2*opts.BootstrapTimeout + 30*time.Minute
 		opts.IdleTimeout = opts.MaxLifetime
-	} else if a.r.AMI == "" || a.r.AMI == "auto" {
+	} else if (a.r.AMI == "" || a.r.AMI == "auto") && !spec.noBake {
 		// A baked image with this runner's bootstrap already applied?
-		if id, dev, size, created, err := a.findBake(ctx); err == nil && id != "" {
-			ami, rootDev = id, dev
-			opts.BootstrapScript, opts.UserBootstrap = "", ""
-			if size > volume {
-				volume = size // can't launch with a volume smaller than the image's snapshot
-			}
-			if age := time.Since(created); !created.IsZero() && age > 30*24*time.Hour {
-				// The OS inside doesn't get security updates until re-baked.
-				log("using baked image %s (%d days old: run `spotexec image bake %s` to pick up OS updates)", id, int(age.Hours()/24), a.r.Name)
-			} else {
-				log("using baked image %s", id)
+		if b, err := a.findBake(ctx); err == nil && b != nil {
+			switch {
+			case b.Expired:
+				// Its OS packages are too old: boot the current Ubuntu image
+				// and run the bootstrap instead.
+				log("not using baked image %s: %s; booting the current Ubuntu image (run `spotexec image bake %s`)", b.ID, b.Stale, a.r.Name)
+			default:
+				ami, rootDev = b.ID, b.img.RootDevice
+				opts.BootstrapScript, opts.UserBootstrap = "", ""
+				if size := b.img.rootSize(); size > volume {
+					volume = size // can't launch with a volume smaller than the image's snapshot
+				}
+				switch {
+				case b.Stale != "":
+					log("using baked image %s (stale: %s; run `spotexec image bake %s`)", b.ID, b.Stale, a.r.Name)
+				case b.CheckErr != "":
+					log("using baked image %s (%s)", b.ID, b.CheckErr)
+				default:
+					log("using baked image %s", b.ID)
+				}
 			}
 		}
 	}
@@ -477,17 +544,27 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	}
 	if ami == "" {
 		if ami, err = a.resolveAMI(ctx); err != nil {
-			return ec2Instance{}, err
+			return ec2Instance{}, asRegionError(ctx, err)
 		}
 	}
 	if rootDev == "" {
 		if rootDev, err = a.rootDevice(ctx, ami); err != nil {
-			return ec2Instance{}, err
+			return ec2Instance{}, asRegionError(ctx, err)
 		}
 	}
 	sgs, err := a.securityGroups(ctx, log)
 	if err != nil {
-		return ec2Instance{}, err
+		return ec2Instance{}, asRegionError(ctx, err)
+	}
+	subnet := a.r.SubnetID
+	if spec.zone != "" && subnet == "" {
+		if subnet, err = a.defaultSubnet(ctx, spec.zone); err != nil {
+			var ze *zoneError
+			if errors.As(err, &ze) {
+				return ec2Instance{}, err
+			}
+			return ec2Instance{}, asRegionError(ctx, err)
+		}
 	}
 	base := url.Values{}
 	base.Set("ImageId", ami)
@@ -502,10 +579,10 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.Itoa(volume))
 	base.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
-	tags := [][2]string{{tagRunner, a.r.Name}, {tagOwner, owner}, {"Name", "spotexec-" + a.r.Name}}
+	tags := [][2]string{{tagRunner, a.r.Name}, {tagOwner, owner}, {tagHost, HostLabel()}, {"Name", "spotexec-" + a.r.Name}}
 	if spec.bake {
 		// Never part of the fleet: the scheduler must not place work on it.
-		tags = [][2]string{{tagBake, a.r.Name}, {tagOwner, owner}, {"Name", "spotexec-bake-" + a.r.Name}}
+		tags = [][2]string{{tagBake, a.r.Name}, {tagOwner, owner}, {tagHost, HostLabel()}, {"Name", "spotexec-bake-" + a.r.Name}}
 	}
 	for i, rt := range []string{"instance", "volume"} {
 		pfx := "TagSpecification." + strconv.Itoa(i+1)
@@ -521,8 +598,8 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	base.Set("NetworkInterface.1.DeviceIndex", "0")
 	base.Set("NetworkInterface.1.AssociatePublicIpAddress", "true")
 	base.Set("NetworkInterface.1.DeleteOnTermination", "true")
-	if a.r.SubnetID != "" {
-		base.Set("NetworkInterface.1.SubnetId", a.r.SubnetID)
+	if subnet != "" {
+		base.Set("NetworkInterface.1.SubnetId", subnet)
 	}
 	for i, sg := range sgs {
 		base.Set("NetworkInterface.1.SecurityGroupId."+strconv.Itoa(i+1), sg)
@@ -535,10 +612,91 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	if spec.bake {
 		markets = []bool{false} // on-demand: a reclaimed builder wastes the bake
 	}
+	// The standard Spot quota is shared by every machine using the account:
+	// read its live use once, then admit each Spot candidate against it, so
+	// a launch that won't fit (or would take the others' last room) is
+	// explained, not just refused.
+	if spec.onDemand {
+		markets = []bool{false} // multi-region fallback: on-demand only
+	}
+	types := a.r.InstanceTypes
+	if spec.itype != "" {
+		types, markets = []string{spec.itype}, []bool{true}
+	}
+	var usage *QuotaUsage
+	if !spec.bake && markets[0] && minStandardVCPUs(types) > 0 {
+		if u, err := a.QuotaUsage(ctx); err == nil && u.Quota >= 0 {
+			usage = &u
+		}
+	}
+	if spec.beforeSend != nil {
+		if err := spec.beforeSend(); err != nil {
+			return ec2Instance{}, err
+		}
+	}
+	try := a.admitting(usage, func(itype string, spot bool) (ec2Instance, error) {
+		return a.runOne(ctx, base, itype, spot, log)
+	})
+	if spec.itype != "" {
+		// A placed launch: exactly one Spot type in one zone. The
+		// coordinator reports it, and decides from the error (an AWS code,
+		// or a *QuotaError from the pre-launch check) what to try next.
+		inst, err := try(spec.itype, true)
+		if err != nil {
+			return ec2Instance{}, fmt.Errorf("launch %s: %w", spec.itype, err)
+		}
+		return inst, nil
+	}
+	inst, err := a.launchAcross(markets, log, try)
+	var qe *QuotaError
+	if errors.As(err, &qe) && qe.Code != "" && qe.Usage == nil {
+		// Suggest a quota above the current one: other runners or machines
+		// may be what fills it.
+		if q, qerr := a.quotaValue(ctx, qe.Code); qerr == nil {
+			qe.Desired = max(qe.Desired, q+qe.VCPUs)
+		}
+	}
+	return inst, err
+}
+
+// quotaLookupTimeout bounds a Service Quotas read: it only adds detail.
+var quotaLookupTimeout = 5 * time.Second
+
+// quotaValue reads a vCPU quota for the runner's region from Service Quotas.
+func (a *AWSSpot) quotaValue(ctx context.Context, code string) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, quotaLookupTimeout)
+	defer cancel()
+	qb, _ := json.Marshal(map[string]string{"ServiceCode": "ec2", "QuotaCode": code})
+	status, b, err := a.api.do(ctx, "servicequotas", "application/x-amz-json-1.1", map[string]string{"X-Amz-Target": "ServiceQuotasV20190624.GetServiceQuota"}, qb)
+	if err != nil {
+		return 0, err
+	}
+	if status != 200 {
+		return 0, fmt.Errorf("GetServiceQuota: HTTP %d: %s", status, strings.TrimSpace(string(b)))
+	}
+	var v struct{ Quota struct{ Value float64 } }
+	if err := json.Unmarshal(b, &v); err != nil {
+		return 0, err
+	}
+	return int(v.Quota.Value), nil
+}
+
+// launchAcross tries each market (spot, then on-demand when allowed) and
+// each instance type in turn until one launches. Capacity and price
+// rejections move on to the next type, and so do quota rejections (a
+// smaller type may still fit). When the quota is what stopped every market
+// tried (no type smaller than the smallest refused one fell short only on
+// capacity), the error is a *QuotaError, so callers stop waiting for
+// capacity that the quota won't allow.
+func (a *AWSSpot) launchAcross(markets []bool, log Logger, try func(itype string, spot bool) (ec2Instance, error)) (ec2Instance, error) {
 	var errs []string
+	var quota *QuotaError
+	quotaEveryMarket := true
 	for _, spot := range markets {
+		var mq *QuotaError        // this market's quota refusal (smallest launch)
+		short := map[string]int{} // smallest type refused for capacity or price, by quota
 		for _, itype := range a.r.InstanceTypes {
-			inst, err := a.runOne(ctx, base, itype, spot, log)
+			inst, err := try(itype, spot)
 			if err == nil {
 				kind := "spot"
 				if !spot {
@@ -547,17 +705,75 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 				log("launched %s %s instance %s in %s", kind, itype, inst.InstanceID, a.r.Region)
 				return inst, nil
 			}
-			if errors.Is(err, ErrLaunchAmbiguous) || classifyAWSError(err) != errNextType {
+			class := classifyAWSError(err)
+			code := awsCode(err)
+			checked, isChecked := err.(*QuotaError) // refused by the pre-launch quota check
+			if isChecked {
+				class, code = errQuota, "quota"
+			}
+			if errors.Is(err, ErrLaunchAmbiguous) || (class != errNextType && class != errQuota) {
 				return ec2Instance{}, fmt.Errorf("launch %s: %w", itype, err)
 			}
-			log("skipping %s: %v", itype, err)
-			errs = append(errs, itype+": "+awsCode(err))
+			if isChecked {
+				log("skipping %s: %s", itype, firstLineOfErr(err))
+			} else {
+				log("skipping %s: %v", itype, err)
+			}
+			errs = append(errs, itype+": "+code)
+			switch {
+			case class == errQuota && (mq == nil || vcpusOf(itype) < mq.VCPUs):
+				if isChecked {
+					mq = checked
+				} else {
+					mq = &QuotaError{Region: a.r.Region, Spot: spot, Code: quotaCodeFor(itype, spot), VCPUs: vcpusOf(itype)}
+				}
+			case class == errNextType && capacityCode(awsCode(err)):
+				if c := quotaCodeFor(itype, spot); short[c] == 0 || vcpusOf(itype) < short[c] {
+					short[c] = vcpusOf(itype)
+				}
+			}
+		}
+		if mq != nil {
+			for code, n := range short {
+				if code != mq.Code || code == "" || n < mq.VCPUs {
+					// A type under another quota, or a smaller one, may
+					// launch once capacity returns.
+					mq = nil
+					break
+				}
+			}
+		}
+		if mq == nil {
+			quotaEveryMarket = false
+		} else if quota == nil {
+			quota = mq // the Spot quota is the one to report when both refused
 		}
 		if spot && a.r.OnDemandFallback {
-			log("no spot capacity; falling back to on-demand")
+			if mq != nil {
+				log("spot vCPU quota reached; falling back to on-demand")
+			} else {
+				log("no spot capacity; falling back to on-demand")
+			}
 		}
 	}
+	if quota != nil && quotaEveryMarket {
+		if quota.Usage == nil { // the pre-launch check already says what uses the quota
+			quota.Detail = strings.Join(errs, ", ")
+		}
+		quota.Desired = max(quota.Desired, quota.VCPUs, a.r.MaxInstances*vcpusOf(a.r.InstanceTypes[0]))
+		return ec2Instance{}, quota
+	}
 	return ec2Instance{}, fmt.Errorf("no instance type could be launched in %s (%s); add more instance_types, raise max_price, or set on_demand_fallback = true", a.r.Region, strings.Join(errs, ", "))
+}
+
+// capacityCode reports refusals that pass with time (capacity, price), as
+// opposed to types that can never launch here.
+func capacityCode(code string) bool {
+	switch code {
+	case "InsufficientInstanceCapacity", "InsufficientCapacity", "InsufficientHostCapacity", "SpotMaxPriceTooLow":
+		return true
+	}
+	return false
 }
 
 // runOne calls RunInstances for one instance type. The ClientToken makes the
@@ -684,10 +900,21 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 		return []string{id}, nil
 	}
 	if id == "" {
+		owner, err := a.ownerTag()
+		if err != nil {
+			return nil, err
+		}
 		p := url.Values{}
 		p.Set("GroupName", sgName)
-		p.Set("GroupDescription", "spotexec runners: SSH ingress")
+		p.Set("GroupDescription", sgDescription)
 		p.Set("VpcId", vpc)
+		// Tagged at creation: the IAM policy only lets spotexec's key change
+		// resources that carry spotexec-owner, and only tag them as they're made.
+		p.Set("TagSpecification.1.ResourceType", "security-group")
+		for i, t := range [][2]string{{tagOwner, owner}, {"Name", sgName}} {
+			p.Set("TagSpecification.1.Tag."+strconv.Itoa(i+1)+".Key", t[0])
+			p.Set("TagSpecification.1.Tag."+strconv.Itoa(i+1)+".Value", t[1])
+		}
 		b, err := a.api.ec2(ctx, "CreateSecurityGroup", p)
 		switch {
 		case err == nil:
@@ -715,9 +942,64 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 		p.Set("IpPermissions.1.IpRanges.1.CidrIp", a.r.SSHCIDR)
 	}
 	if _, err := a.api.ec2(ctx, "AuthorizeSecurityGroupIngress", p); err != nil && awsCode(err) != "InvalidPermission.Duplicate" {
+		if c := awsCode(err); (c == "UnauthorizedOperation" || c == "AccessDenied") && body != "" && !sgTagged([]byte(body)) {
+			return nil, fmt.Errorf("authorize SSH ingress on %s: %w\nsecurity group %s was made by an older spotexec and lacks the %s tag spotexec's IAM policy now requires: run `spotexec setup` once (it tags it), or delete the group", id, err, sgName, tagOwner)
+		}
 		return nil, fmt.Errorf("authorize SSH ingress on %s: %w", id, err)
 	}
 	return []string{id}, nil
+}
+
+// ec2SecurityGroup is one DescribeSecurityGroups item.
+type ec2SecurityGroup struct {
+	ID          string   `xml:"groupId"`
+	Name        string   `xml:"groupName"`
+	Description string   `xml:"groupDescription"`
+	VPC         string   `xml:"vpcId"`
+	Tags        []ec2Tag `xml:"tagSet>item"`
+}
+
+const sgDescription = "spotexec runners: SSH ingress"
+
+var sgNameRE = regexp.MustCompile(`^` + sgBaseName + `(-[0-9a-f]{8})?$`)
+
+// madeBySpotexec reports whether the group has exactly the name and
+// description securityGroups gives the groups it creates, so a group that
+// merely starts with "spotexec-ssh" is never adopted.
+func (g ec2SecurityGroup) madeBySpotexec() bool {
+	return sgNameRE.MatchString(g.Name) && g.Description == sgDescription
+}
+
+func (g ec2SecurityGroup) tag(k string) string {
+	for _, t := range g.Tags {
+		if t.Key == k {
+			return t.Value
+		}
+	}
+	return ""
+}
+
+func parseSecurityGroups(b []byte) ([]ec2SecurityGroup, string, error) {
+	var v struct {
+		Groups []ec2SecurityGroup `xml:"securityGroupInfo>item"`
+		Next   string             `xml:"nextToken"`
+	}
+	if err := xml.Unmarshal(b, &v); err != nil {
+		return nil, "", fmt.Errorf("parse DescribeSecurityGroups: %w", err)
+	}
+	return v.Groups, v.Next, nil
+}
+
+// sgTagged reports whether the (first) group in a DescribeSecurityGroups
+// response carries spotexec's owner tag.
+func sgTagged(b []byte) bool {
+	gs, _, err := parseSecurityGroups(b)
+	return err == nil && len(gs) > 0 && gs[0].tag(tagOwner) != ""
+}
+
+// spotexecSGFilter selects spotexec's own security groups by name.
+func spotexecSGFilter() url.Values {
+	return url.Values{"Filter.1.Name": {"group-name"}, "Filter.1.Value.1": {sgBaseName}, "Filter.1.Value.2": {sgBaseName + "-*"}}
 }
 
 // vpcID returns the configured subnet's VPC, or the default VPC.
@@ -743,8 +1025,37 @@ func (a *AWSSpot) vpcID(ctx context.Context) (string, error) {
 	if v := xmlFirst(b, "vpcSet>item>vpcId"); v != "" {
 		return v, nil
 	}
+	if a.placed {
+		return "", fmt.Errorf("no default VPC in %s (to use it: aws ec2 create-default-vpc --region %s)", a.r.Region, a.r.Region)
+	}
 	return "", fmt.Errorf("no default VPC in %s; set subnet_id (and optionally security_group_ids) on the runner", a.r.Region)
 }
+
+// defaultSubnet returns the default VPC's subnet in one availability zone,
+// so a launch lands in the zone whose Spot price was chosen.
+func (a *AWSSpot) defaultSubnet(ctx context.Context, zone string) (string, error) {
+	p := url.Values{}
+	p.Set("Filter.1.Name", "availability-zone")
+	p.Set("Filter.1.Value.1", zone)
+	p.Set("Filter.2.Name", "default-for-az")
+	p.Set("Filter.2.Value.1", "true")
+	b, err := a.api.ec2(ctx, "DescribeSubnets", p)
+	if err != nil {
+		return "", fmt.Errorf("describe default subnet in %s: %w", zone, err)
+	}
+	if id := xmlFirst(b, "subnetSet>item>subnetId"); id != "" {
+		return id, nil
+	}
+	// Default VPCs made before a zone opened have no subnet there; the
+	// region's other zones may still work.
+	return "", &zoneError{fmt.Errorf("no default subnet in %s", zone)}
+}
+
+// zoneError marks a launch that can't use one availability zone.
+type zoneError struct{ err error }
+
+func (e *zoneError) Error() string { return e.err.Error() }
+func (e *zoneError) Unwrap() error { return e.err }
 
 // Terminate ends one specific instance, but only if it carries our tags.
 func (a *AWSSpot) Terminate(ctx context.Context, id string) error {
@@ -782,9 +1093,16 @@ func (a *AWSSpot) Down(ctx context.Context, log Logger) error {
 		return err
 	}
 	defer unlock()
+	_, err = a.downLocked(ctx, log)
+	return err
+}
+
+// downLocked is Down for a caller holding the provisioning lock (and
+// handling builders). It returns how many instances it terminated.
+func (a *AWSSpot) downLocked(ctx context.Context, log Logger) (int, error) {
 	insts, err := a.describe(ctx, "pending", "running", "stopping", "stopped")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if len(insts) > 0 {
 		p := url.Values{}
@@ -792,7 +1110,7 @@ func (a *AWSSpot) Down(ctx context.Context, log Logger) error {
 			p.Set("InstanceId."+strconv.Itoa(i+1), inst.InstanceID)
 		}
 		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err != nil {
-			return fmt.Errorf("terminate: %w", err)
+			return 0, fmt.Errorf("terminate: %w", err)
 		}
 		for _, inst := range insts {
 			log("terminating %s (%s)", inst.InstanceID, inst.InstanceType)
@@ -801,7 +1119,7 @@ func (a *AWSSpot) Down(ctx context.Context, log Logger) error {
 	} else {
 		log("no running instances for %s", a.r.Name)
 	}
-	return nil
+	return len(insts), nil
 }
 
 // Doctor checks credentials, identity, AMI and networking.
@@ -834,13 +1152,8 @@ func (a *AWSSpot) Doctor(ctx context.Context) []Check {
 		out = append(out, Check{Name: "network", OK: true, Msg: msg})
 	}
 	// New accounts start with a small Spot vCPU quota (often 5 vCPUs).
-	qb, _ := json.Marshal(map[string]string{"ServiceCode": "ec2", "QuotaCode": "L-34B43A08"})
-	if status, b, err := a.api.do(ctx, "servicequotas", "application/x-amz-json-1.1", map[string]string{"X-Amz-Target": "ServiceQuotasV20190624.GetServiceQuota"}, qb); err == nil && status == 200 {
-		var v struct{ Quota struct{ Value float64 } }
-		_ = json.Unmarshal(b, &v)
-		need := a.r.MaxInstances * vcpusOf(a.r.InstanceTypes[0])
-		msg := fmt.Sprintf("%.0f vCPUs for standard Spot instances in %s; this runner may use up to %d", v.Quota.Value, a.r.Region, need)
-		out = append(out, Check{Name: "spot vCPU quota", OK: v.Quota.Value >= float64(need), Msg: msg})
+	if c, ok := a.quotaCheck(ctx); ok {
+		out = append(out, c)
 	}
 	// Instances live in the runner's region, which is easy to miss when the
 	// console (or the AWS CLI default) points elsewhere.
@@ -851,6 +1164,7 @@ func (a *AWSSpot) Doctor(ctx context.Context) []Check {
 		}
 	}
 	out = append(out, Check{Name: "console", OK: true, Msg: where})
+	out = append(out, a.bakeCheck(ctx))
 	for _, t := range a.r.InstanceTypes {
 		if strings.HasPrefix(t, "t2.") || strings.HasPrefix(t, "t3.") || strings.HasPrefix(t, "t3a.") || strings.HasPrefix(t, "t4g.") {
 			out = append(out, Check{Name: "instance types", OK: true, Msg: "note: " + t + " is burstable; sustained CPU on spot t-family instances bills surplus credits. Prefer c7a/m7a/c6a."})
@@ -858,6 +1172,11 @@ func (a *AWSSpot) Doctor(ctx context.Context) []Check {
 		}
 	}
 	return out
+}
+
+// spotQuota reads the region's standard Spot vCPU quota.
+func (a *AWSSpot) spotQuota(ctx context.Context) (int, error) {
+	return a.quotaValue(ctx, QuotaCodeSpotStandard)
 }
 
 // vcpusOf estimates vCPUs from an EC2 size suffix (large=2, xlarge=4, NxNlarge=4N).
@@ -868,14 +1187,66 @@ func vcpusOf(t string) int {
 	_, size, _ := strings.Cut(t, ".")
 	switch size {
 	case "nano", "micro", "small":
+		if strings.HasPrefix(t, "t2.") {
+			return 1
+		}
 		return 2
-	case "medium", "large":
+	case "medium":
+		if strings.HasPrefix(t, "t") {
+			return 2 // burstable mediums; the others (Graviton, a1) have 1
+		}
+		return 1
+	case "large":
 		return 2
 	case "xlarge":
 		return 4
 	}
+	if t == "c4.8xlarge" {
+		return 36 // the odd one out
+	}
 	if n, err := strconv.Atoi(strings.TrimSuffix(size, "xlarge")); err == nil {
 		return 4 * n
 	}
+	if n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(size, "metal-"), "xl")); err == nil {
+		return 4 * n // metal-48xl
+	}
+	if size == "metal" {
+		return 96 // varies by family (64-448); the common size
+	}
 	return 4
+}
+
+// tagHost names the machine that launched an instance, for people (and
+// `status -A`); ownership is still tagOwner.
+const tagHost = "spotexec-host"
+
+// HostLabel is this machine's short, stable name: macOS's LocalHostName,
+// else the hostname up to the first dot.
+func HostLabel() string {
+	if b, err := exec.Command("scutil", "--get", "LocalHostName").Output(); err == nil {
+		if h := strings.TrimSpace(string(b)); h != "" {
+			return h
+		}
+	}
+	h, _ := os.Hostname()
+	return strings.Split(h, ".")[0]
+}
+
+// AccountInstance is a spotexec instance (a fleet VM or an image-bake
+// builder) launched by any machine, and where it was found.
+type AccountInstance struct {
+	ID       string    `json:"id"`
+	Account  string    `json:"account,omitempty"`
+	Region   string    `json:"region"`
+	Profile  string    `json:"profile,omitempty"` // the AWS profile it was found (and is terminated) through
+	Runner   string    `json:"runner"`
+	Builder  bool      `json:"builder,omitempty"` // an `image bake` builder, not part of the fleet
+	Host     string    `json:"host,omitempty"`
+	Owner    string    `json:"owner"`
+	Type     string    `json:"type"`
+	Market   string    `json:"market"`
+	State    string    `json:"state"`
+	IP       string    `json:"ip,omitempty"`
+	Launched time.Time `json:"launched"`
+	Mine     bool      `json:"mine"`
 }

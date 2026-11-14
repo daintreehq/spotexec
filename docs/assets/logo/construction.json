@@ -1,0 +1,72 @@
+{
+  "units": "256-unit tile grid; lockup viewBox 0 0 W 256",
+  "colors": {
+    "ink": "#0B0D10",
+    "spot": "#FF7300",
+    "chevron": "#FFFFFF",
+    "dark_tile": "#F5F2EC",
+    "dark_chevron": "#0B0D10",
+    "dark_wordmark": "#F5F2EC"
+  },
+  "tile": {
+    "size": 256.0,
+    "corner": "Figma-style smoothed rounded rect",
+    "radius": 60.16,
+    "smoothing": 0.6
+  },
+  "chevron": {
+    "construction": "six vertices (-h+k,-h) (k,0) (-h+k,h) (-h,h-k) (-k,0) (-h,-h+k) about origin, k=t/sqrt(2), 45-degree arms, perpendicular end cuts",
+    "half_outer_height_h": 56.32,
+    "stroke_t": 29.44,
+    "apex_fillet": 3.072,
+    "end_fillets": 1.024,
+    "inner_notch": "sharp",
+    "origin": [
+      102.37584531212994,
+      128.0
+    ],
+    "origin_rule": "left ink margin equals spot right margin"
+  },
+  "spot": {
+    "cx": 182.0,
+    "cy": 128.0,
+    "r": 27.52
+  },
+  "icon16": {
+    "chev_h": 56.0,
+    "chev_t": 32.0,
+    "chev_x": 104.0,
+    "spot_cx": 176.0,
+    "spot_r": 28.0,
+    "apex_r": 3.072,
+    "end_r": 0,
+    "spot_cy": 128.0,
+    "note": "drawn on the 256 grid, displayed at 16px; spot centre lands on (11, 8) px"
+  },
+  "wordmark": {
+    "font": "IBMPlexSans[wdth,wght].ttf",
+    "axes": {
+      "wght": 610
+    },
+    "text": "spotexec",
+    "tracking": -14,
+    "pair_adjust": {
+      "sp": -18,
+      "po": -6,
+      "ot": 2,
+      "te": -2,
+      "ex": 10,
+      "xe": 4,
+      "ec": -6
+    },
+    "x_height": 99.84,
+    "baseline": 175.36,
+    "lift": 2.56,
+    "gap_to_s_ink": 48.64,
+    "font_scale": 0.19089866156787763,
+    "note": "IBM Plex Sans variable, glyph overlaps removed, outlined; tracking and pair_adjust in 1/1000 em"
+  },
+  "lockup_width": 1070.200981716061,
+  "clear_space": 32,
+  "precision": "4 decimals"
+}

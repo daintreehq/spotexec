@@ -87,6 +87,8 @@ type Instance struct {
 	Type       string    `json:"type,omitempty"`
 	LaunchedAt time.Time `json:"launched_at"`
 	Spot       bool      `json:"spot,omitempty"`
+	Region     string    `json:"region,omitempty"` // cloud region (aws-spot)
+	Zone       string    `json:"zone,omitempty"`   // availability zone, when known
 }
 
 // Fleet is implemented by ephemeral, autoscaled runner types: a pool of 0 to
@@ -113,6 +115,28 @@ type Terminator interface {
 	Terminate(ctx context.Context, instanceID string) error
 }
 
+// Placed is implemented by providers whose instances live in different
+// places (multi-region fleets). For returns the provider that owns one
+// instance, for location-bound services such as the dependency cache and
+// the image registry, which must be in the instance's own region.
+type Placed interface {
+	For(ctx context.Context, instanceID string) (Provider, error)
+}
+
+// ForInstance returns the provider serving instanceID: p itself, unless p
+// is Placed. When the owner can't be determined it returns p, which (being
+// Placed) offers no location-bound services: the run goes without them.
+func ForInstance(ctx context.Context, p Provider, instanceID string) Provider {
+	pl, ok := p.(Placed)
+	if !ok || instanceID == "" {
+		return p
+	}
+	if q, err := pl.For(ctx, instanceID); err == nil && q != nil {
+		return q
+	}
+	return p
+}
+
 // Check is a doctor finding.
 type Check struct {
 	Name string
@@ -126,6 +150,13 @@ func New(r *config.Runner) (Provider, error) {
 	case config.TypeSSH:
 		return &SSH{r: r}, nil
 	case config.TypeAWSSpot:
+		if r.MultiRegion() {
+			return NewAWSGlobal(r)
+		}
+		if heldElsewhere(r) {
+			return newLegacyAWSGlobal(r)
+		}
+		forgetDiscovery(r)
 		return NewAWSSpot(r)
 	case config.TypeSim:
 		return NewSim(r)

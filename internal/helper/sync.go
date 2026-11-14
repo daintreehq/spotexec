@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
@@ -139,6 +140,42 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		delete(s.stored, p)
 		dirs = append(dirs, path.Dir(p))
 	}
+	// Files earlier runs created and never wrote back: the client listed the
+	// ones it doesn't ignore, which go now. Ignored outputs and anything in
+	// a protected cache dir stay. Either way none is pending any more.
+	pending := map[string]bool{}
+	for _, p := range s.state.Pending {
+		pending[p] = true
+	}
+	var keep []string
+	for _, p := range m.Remove {
+		if _, ok := want[p]; ok || !pending[p] || underAny(p, m.Protect) {
+			continue // only what a run created here, and never a synced file
+		}
+		full, err := fsid.SafeJoin(s.workspace, p)
+		if err != nil {
+			if !gonePath(err) {
+				keep = append(keep, p) // can't tell: try again next sync
+			}
+			continue
+		}
+		fi, err := os.Lstat(full)
+		switch {
+		case err == nil && fi.IsDir():
+		case err == nil:
+			if err := os.Remove(full); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				keep = append(keep, p)
+				continue
+			}
+			deleted++
+			dirs = append(dirs, path.Dir(p))
+		case !gonePath(err):
+			keep = append(keep, p)
+		}
+	}
+	// Whatever couldn't be removed stays pending (and keeps the fingerprint
+	// shortcut off) so the next sync tries again.
+	s.state.Pending = keep
 	removeEmptyDirs(s.workspace, dirs, m.Protect)
 
 	var need []string
@@ -327,14 +364,7 @@ func removeEmptyDirs(root string, dirs []string, protect []string) {
 	}
 	sort.Slice(all, func(i, j int) bool { return strings.Count(all[i], "/") > strings.Count(all[j], "/") })
 	for _, d := range all {
-		skip := false
-		for _, p := range protect {
-			p = strings.Trim(p, "/")
-			if d == p || strings.HasPrefix(d, p+"/") {
-				skip = true
-			}
-		}
-		if skip {
+		if underAny(d, protect) {
 			continue
 		}
 		// Never act through a symlinked ancestor, and only ever rmdir.
@@ -346,6 +376,117 @@ func removeEmptyDirs(root string, dirs []string, protect []string) {
 			_ = os.Remove(full) // fails unless empty
 		}
 	}
+}
+
+// underAny reports whether p is one of dirs or inside one.
+func underAny(p string, dirs []string) bool {
+	for _, d := range dirs {
+		d = strings.Trim(d, "/")
+		if d != "" && (p == d || strings.HasPrefix(p, d+"/")) {
+			return true
+		}
+	}
+	return false
+}
+
+// pendingAfter is the slot's pending list after a run: earlier entries that
+// are still there and still not synced, plus what this run created (or
+// could not read).
+func (s *Session) pendingAfter(created []protocol.Entry, unverified, more []string) []string {
+	set := map[string]bool{}
+	for _, p := range s.state.Pending {
+		if _, ok := s.stored[p]; ok {
+			continue
+		}
+		full, err := fsid.SafeJoin(s.workspace, p)
+		if err != nil {
+			if !gonePath(err) {
+				set[p] = true // can't tell (permissions): keep it
+			}
+			continue
+		}
+		if fi, err := os.Lstat(full); err == nil && fi.IsDir() || err != nil && gonePath(err) {
+			continue // removed (or replaced by a directory) by the run itself
+		}
+		set[p] = true
+	}
+	for _, c := range created {
+		set[c.Path] = true
+	}
+	for _, p := range more {
+		set[p] = true
+	}
+	for _, p := range unverified {
+		if _, ok := s.stored[p]; !ok {
+			set[p] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// gonePath: an error meaning the path no longer exists as such (absent, a
+// parent replaced by a file, or reached only through a symlink, where the
+// walk records the file under its real path).
+func gonePath(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, fsid.ErrSymlinkParent)
+}
+
+// sweepPending recovers after a helper died during a run: every file in
+// the workspace that isn't synced becomes pending (the client keeps the
+// ones it ignores).
+func (s *Session) sweepPending() {
+	// Anything the dead run left running could still be creating files.
+	reapWorkspace(s.workspace, 2*time.Second)
+	s.stored = nil
+	s.loadStored()
+	snap := s.takeSnapshot(s.state.SweepSkip)
+	var more []string
+	for rel := range snap.sig {
+		if _, ok := s.stored[rel]; !ok {
+			more = append(more, rel)
+		}
+	}
+	s.state.Pending = s.pendingAfter(nil, nil, more)
+	s.state.Sweep, s.state.SweepSkip = false, nil
+	_ = saveSlotState(s.slotDir, s.state)
+}
+
+// dropPending forgets paths that are settled: written back (now synced
+// files) or ignored by the client (kept as build outputs).
+func (s *Session) dropPending(paths []string) {
+	if len(s.state.Pending) == 0 || len(paths) == 0 {
+		return
+	}
+	drop := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		drop[p] = true
+	}
+	var keep []string
+	for _, p := range s.state.Pending {
+		if !drop[p] {
+			keep = append(keep, p)
+		}
+	}
+	if len(keep) == len(s.state.Pending) {
+		return
+	}
+	s.state.Pending = keep
+	_ = saveSlotState(s.slotDir, s.state)
+}
+
+func (s *Session) settle(st protocol.Settle) {
+	if s.slotLock == nil {
+		return
+	}
+	s.dropPending(st.Ignored)
 }
 
 // sendTar streams the named workspace files as a gzip'd tar blob.
@@ -419,6 +560,8 @@ func (s *Session) fetch(f protocol.Fetch) error {
 		if err := s.saveStored(); err != nil {
 			return err
 		}
+		// Only once they are recorded as synced files.
+		s.dropPending(f.Accept)
 	}
 	if err := s.c.Send(protocol.TypeFetched, nil); err != nil {
 		return err

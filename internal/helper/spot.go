@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -54,6 +55,19 @@ func (s *Session) watchNotices() {
 			}
 		}
 	}
+}
+
+// systemStopping reports whether the machine is shutting down (systemd's
+// "stopping" state; in the simulator, a marker file standing in for it).
+func systemStopping() bool {
+	if _, err := os.Stat(SimDir); err == nil {
+		_, err := os.Stat(filepath.Join(SimDir, "stopping"))
+		return err == nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, "systemctl", "is-system-running").Output()
+	return strings.TrimSpace(string(out)) == "stopping"
 }
 
 func markDraining(root, msg string) {

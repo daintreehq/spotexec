@@ -8,16 +8,34 @@ There are two files, and the split is deliberate.
 | `.spotexec.toml` at the repository root | How this project syncs, installs and runs | Yes |
 
 Settings resolve in this order, highest first:
-1. CLI flags.
-2. `SPOTEXEC_*` environment variables: `SPOTEXEC_TIMEOUT`, `SPOTEXEC_SYNC`, `SPOTEXEC_RUNNER`, `SPOTEXEC_POOL`, `SPOTEXEC_PRIORITY`, `SPOTEXEC_JSON=1`, `SPOTEXEC_AGENT=1`.
+1. CLI flags. A flag given on the command line beats its environment variable whatever its value, so `--json=false`, `--priority 0` and `--pool` all override the environment.
+2. `SPOTEXEC_*` environment variables (below).
 3. `.spotexec.toml`.
 4. The global config.
 5. Built-in defaults.
 
-Three exceptions to that order:
-- a runner (`-r` or `SPOTEXEC_RUNNER`) beats any pool;
-- `--json` / `SPOTEXEC_JSON=1` beats `--pretty`;
-- a task's own `pool` beats `SPOTEXEC_POOL`.
+Exceptions to that order:
+- `-r` beats `--pool`, and `SPOTEXEC_RUNNER` beats `SPOTEXEC_POOL` and any configured pool (but not `--pool`);
+- for the output format, `-q` beats `--json`, which beats `--pretty`, and `-q`, `--json`, `--pretty` or `--json=false` beats `SPOTEXEC_JSON=1` and `SPOTEXEC_AGENT=1`;
+- a task's own `pool` beats `SPOTEXEC_POOL`;
+- `spotexec sync` always syncs and `spotexec exec` never does, whatever `SPOTEXEC_SYNC` says.
+
+Unknown `--sync` and `--writeback` values (from flags or the environment) are rejected with exit `125` before any runner is used.
+
+### Environment variables
+
+| Variable | Same as |
+| --- | --- |
+| `SPOTEXEC_TIMEOUT` | `--timeout`, for example `SPOTEXEC_TIMEOUT=15m`. |
+| `SPOTEXEC_SYNC` | `--sync`. |
+| `SPOTEXEC_RUNNER` | `-r`, `--runner`. |
+| `SPOTEXEC_POOL` | `--pool` (comma-separated runner names). |
+| `SPOTEXEC_PRIORITY` | `--priority`. |
+| `SPOTEXEC_SAME_SLOT=1` | `--same-slot`: every `sx` in that shell returns to this worktree's last slot. |
+| `SPOTEXEC_JSON=1` | `--json`. |
+| `SPOTEXEC_AGENT=1` | NDJSON events by default, for agent harnesses. |
+| `SPOTEXEC_CONFIG`, `SPOTEXEC_CONFIG_DIR` | The global config file, or its directory (default `~/.config/spotexec`, or under `XDG_CONFIG_HOME`). |
+| `SPOTEXEC_STATE_DIR` | Local state (default `~/.local/state/spotexec`, or under `XDG_STATE_HOME`). |
 
 ## Global config: `~/.config/spotexec/config.toml`
 
@@ -36,8 +54,8 @@ priority = 10
 type = "aws-spot"
 region = "us-east-2"
 profile = "dev"
-instance_types = ["c7a.4xlarge", "c6a.4xlarge", "m7a.4xlarge"]
-max_slots = 8
+instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]
+max_slots = 4
 max_instances = 4
 min_instances = 0                 # kept warm only while `spotexec daemon` runs
 priority = 20
@@ -59,11 +77,11 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `type` | (required) | `ssh` or `aws-spot` (`sim` is the local simulator; see [Development](development.md)). |
-| `max_slots` | vCPUs ÷ 4, at least 1 | Concurrent jobs per machine (1–44). |
+| `max_slots` | vCPUs ÷ 4, between 1 and 44 | Concurrent jobs per machine (1–44: each slot gets its own range of 1000 ports). |
 | `priority` | `0` | Lower runs first. Later runners in the pool only take overflow. |
 | `work_root` | `~/.cache/spotexec` | Where slots, caches and the helper live on the runner. |
 | `remote_path_setup` | (none) | Shell run before each command, after the login profile (for example `PATH` for mise or nvm). Not used inside a [project container](environments.md#project-containers). |
-| `ssh_options` | (none) | Extra `-o` options for `ssh`. |
+| `ssh_options` | (none) | Extra `-o` options for `ssh`, for example `["Port=2222", "ProxyJump=bastion"]`. They override spotexec's defaults (`ConnectTimeout=10`, `ServerAliveInterval=10`, `ServerAliveCountMax=3`, `LogLevel=ERROR`), and runners whose options differ never share a connection. |
 | `hourly_cost` | (none) | Price per machine-hour of a fleet instance, for `spotexec monitor`. |
 
 ### `ssh` runners
@@ -74,18 +92,21 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | `user` | Login user when the host omits `user@`. |
 | `identity_file` | SSH private key (default: your ssh config). Fleets always use the generated key. |
 
+The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): spotexec runs its own commands under `/bin/sh`, and your commands under bash (or `sh` without it).
+
 ### `aws-spot` runners
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `region` | `AWS_REGION`, `AWS_DEFAULT_REGION`, else `us-east-1` | EC2 region. |
+| `regions` | (unset) | Launch in several regions instead: a list, or `["all"]` for every region enabled in the account. Each new VM goes wherever Spot is cheapest right now. Not with `region`, `subnet_id`, `security_group_ids`, an `ami-…` ID or a named `cache_bucket`. A list of one region is the same as `region`. See [Let spotexec pick the region](aws.md#let-spotexec-pick-the-region). |
 | `profile` | (env / default) | AWS profile to use. |
-| `instance_types` | `c7a.4xlarge`, `c6a.4xlarge`, `m7a.4xlarge` | Tried in order on capacity errors. All must share one architecture. |
+| `instance_types` | `c7a.2xlarge`, `m7a.2xlarge`, `c6a.2xlarge` (8 vCPUs, as in the starter config) | Tried in order on capacity errors (with `regions`: cheapest first, across every region). All must share one architecture. |
 | `arch` | from the first instance type | `amd64` or `arm64` (Graviton). |
 | `max_instances` | `4` | Fleet ceiling. |
 | `min_instances` | `0` | Warm floor, kept only while the [pool manager](scaling.md#pool-manager-optional) runs. |
 | `idle_timeout` | `10m` | The VM powers off after this long with no work. |
-| `max_lifetime` | `12h` | Hard cap, regardless of activity. Must exceed `boot_timeout`. |
+| `max_lifetime` | `12h` | Hard cap, regardless of activity. Must exceed `boot_timeout`. New runs stop going to a VM 15 minutes before it (a quarter of a shorter lifetime). |
 | `boot_timeout` | `15m` | Longest wait for first-boot setup; a VM that takes longer is terminated. |
 | `bootstrap_script` | (none) | Runs as root on first boot, after the watchdog is armed. Bounded by `boot_timeout`. |
 | `user_bootstrap_script` | (none) | Then runs as the login user, in a login shell. |
@@ -95,7 +116,7 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | `ami` | `auto` | `auto` uses the newest matching bake, else Ubuntu 24.04. `base` ignores bakes. An `ami-…` ID pins one image. |
 | `user` | `ubuntu` | Login user of the AMI. |
 | `subnet_id`, `security_group_ids` | default VPC, a managed `spotexec-ssh` group | Network placement. |
-| `ssh_cidr` | `0.0.0.0/0` | Source range for the managed group's SSH rule. Auth is key-only; narrow it if your IP is stable. |
+| `ssh_cidr` | `0.0.0.0/0` | Source range for the managed group's SSH rule. sshd on the VMs takes key logins as `user` only; narrow it if your IP is stable. See [SSH exposure](aws.md#ssh-exposure). |
 | `cache_bucket` | `auto` | S3 [dependency cache](environments.md#dependency-cache): `auto`, a bucket name, or `off`. |
 
 ## Project config: `.spotexec.toml`
@@ -126,7 +147,7 @@ hydrate = "auto"               # auto (reflink, else copy) | reflink | copy | ha
 # timeout = "20m"
 
 [container]                    # optional; see "Project containers"
-dockerfile = ".spotexec/Dockerfile"   # written by `spotexec container init`
+dockerfile = ".spotexec/Dockerfile"   # written by `spotexec init` or `spotexec container init`
 
 [tasks.test]
 run = "pnpm vitest run --minWorkers=1 --maxWorkers=$SPOTEXEC_CPUS {args}"
@@ -152,7 +173,7 @@ when_load_above = 0.6          # agents offload only when the laptop is busy
 | `timeout`, `sync`, `exclusive` | Per-task overrides of the run flags. |
 | `pool`, `priority` | Send this task to a different fleet, or move it ahead in the queue. |
 
-Task names can't shadow subcommands (`run`, `status`, `sync`…). `spotexec tasks` lists them.
+`sx <task>` runs any task, even one named like a spotexec subcommand: `sx sync` runs a task called `sync`. Only `spotexec <task>` gives subcommands precedence, so `spotexec sync` still means the subcommand. A task also wins over a program of the same name; `sx -- <name>` and `spotexec run -- <name>` skip the tasks and run the program. `spotexec tasks` lists them.
 
 ## Project-defined fleets
 
@@ -170,4 +191,4 @@ max_instances = 3
 
 A project runner **must** build on one of your global runners: name it with `extends`, or reuse its name to override it. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts.
 
-How you connect and which account and network are used stay in your global config. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, or open a port. See [Security model](architecture.md#security-model).
+How you connect and which account and network are used stay in your global config. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `regions`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, or open a port. See [Security model](architecture.md#security-model).

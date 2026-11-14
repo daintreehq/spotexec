@@ -1,10 +1,12 @@
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# The tag without its "v" (0.2.0, 0.2.0-3-gabc1234-dirty), as GoReleaser
+# embeds it, so every build prints its version the same way.
+VERSION ?= $(patsubst v%,%,$(shell git describe --tags --always --dirty 2>/dev/null || echo dev))
 PKG     := github.com/daintreehq/spotexec
 LDFLAGS := -s -w -X $(PKG)/internal/cli.Version=$(VERSION) -X $(PKG)/internal/helper.Version=$(VERSION)
 HELPER_TARGETS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 EMBED_DIR := internal/helperbin/dist
 
-.PHONY: build helpers install test vet e2e clean
+.PHONY: build helpers completions install test vet e2e clean
 
 build: helpers
 	go build -trimpath -ldflags '$(LDFLAGS)' -o bin/spotexec ./cmd/spotexec
@@ -22,6 +24,17 @@ helpers:
 	done
 	@rm -f $(EMBED_DIR)/.tmp-helper
 
+# Shell completion scripts for spotexec and sx, shipped in the release
+# archives, the Homebrew formula and the Linux packages.
+completions:
+	@rm -rf completions && mkdir -p completions
+	go build -o completions/.gen ./cmd/spotexec
+	@for sh in bash zsh fish; do \
+		./completions/.gen completion $$sh > completions/spotexec.$$sh || exit 1; \
+		./completions/.gen completion sx $$sh > completions/sx.$$sh || exit 1; \
+	done
+	@rm -f completions/.gen
+
 install: build
 	install -m 0755 bin/spotexec $(shell go env GOPATH)/bin/spotexec
 	ln -sf spotexec $(shell go env GOPATH)/bin/sx
@@ -38,4 +51,4 @@ e2e: build
 	./scripts/e2e-daemon.sh
 
 clean:
-	rm -f bin/spotexec bin/sx $(EMBED_DIR)/spotexec-helper-*.gz
+	rm -rf bin/spotexec bin/sx completions $(EMBED_DIR)/spotexec-helper-*.gz

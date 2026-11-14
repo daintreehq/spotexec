@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 // Duration is a time.Duration that decodes from TOML strings like "5m".
@@ -65,6 +67,7 @@ type Runner struct {
 
 	// aws-spot
 	Region           string   `toml:"region"`
+	Regions          []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
 	Profile          string   `toml:"profile"`
 	InstanceTypes    []string `toml:"instance_types"`
 	MaxPrice         string   `toml:"max_price"`
@@ -85,6 +88,18 @@ type Runner struct {
 	// sim
 	Image     string   `toml:"image"`
 	BootDelay Duration `toml:"boot_delay"`
+}
+
+// AllRegions is the regions value meaning every enabled region.
+const AllRegions = "all"
+
+// MultiRegion reports whether an aws-spot runner places instances across
+// several regions (regions = [...] with more than one, or ["all"]).
+func (r *Runner) MultiRegion() bool { return r.Type == TypeAWSSpot && len(r.Regions) > 0 }
+
+// AnyRegion reports whether the runner may launch in every enabled region.
+func (r *Runner) AnyRegion() bool {
+	return r.MultiRegion() && len(r.Regions) == 1 && r.Regions[0] == AllRegions
 }
 
 // Ephemeral reports whether the runner is provisioned on demand.
@@ -231,6 +246,9 @@ func LoadGlobal() (*Global, error) {
 	}
 	for name, r := range g.Runners {
 		r.Name = name
+		if md.IsDefined("runners", name, "region") && md.IsDefined("runners", name, "regions") {
+			return nil, fmt.Errorf("%s: runner %q: set region or regions, not both", g.Path, name)
+		}
 		if err := r.applyDefaults(); err != nil {
 			return nil, fmt.Errorf("%s: runner %q: %w", g.Path, name, err)
 		}
@@ -253,11 +271,17 @@ func (r *Runner) applyDefaults() error {
 			return errors.New("ssh runner needs host or hosts")
 		}
 	case TypeAWSSpot:
+		if err := r.normalizeRegions(); err != nil {
+			return err
+		}
 		if r.Region == "" {
 			r.Region = firstNonEmpty(os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"), "us-east-1")
 		}
+		if strings.HasPrefix(r.Region, "cn-") {
+			return fmt.Errorf("region %q: the AWS China regions aren't supported", r.Region)
+		}
 		if len(r.InstanceTypes) == 0 {
-			r.InstanceTypes = []string{"c7a.4xlarge", "c6a.4xlarge", "m7a.4xlarge"}
+			r.InstanceTypes = []string{"c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"} // the starter template's 8-vCPU types
 		}
 		if r.Arch == "" {
 			r.Arch = archForInstanceType(r.InstanceTypes[0])
@@ -329,9 +353,8 @@ func (r *Runner) validate() error {
 			return fmt.Errorf("invalid host %q", h)
 		}
 	}
-	if r.MaxSlots < 0 || r.MaxSlots > 44 {
-		// SPOTEXEC_PORT_BASE = 20000 + slot*1000 must stay a valid port.
-		return fmt.Errorf("max_slots must be between 1 and 44 (got %d)", r.MaxSlots)
+	if r.MaxSlots < 0 || r.MaxSlots > protocol.MaxSlots {
+		return fmt.Errorf("max_slots must be between 1 and %d (got %d)", protocol.MaxSlots, r.MaxSlots)
 	}
 	for name, d := range map[string]Duration{"idle_timeout": r.IdleTimeout, "max_lifetime": r.MaxLifetime, "boot_timeout": r.BootTimeout, "boot_delay": r.BootDelay} {
 		if d.Duration < 0 {
@@ -371,6 +394,69 @@ func (r *Runner) validate() error {
 	return nil
 }
 
+// normalizeRegions validates regions and folds a single concrete region
+// into region (so it behaves exactly like a single-region runner). For
+// several regions, region becomes the home region: the first listed, or
+// for "all" the environment default, used for account-wide lookups.
+func (r *Runner) normalizeRegions() error {
+	if len(r.Regions) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, rg := range r.Regions {
+		switch {
+		case rg == AllRegions:
+			if len(r.Regions) > 1 {
+				return errors.New(`regions: "all" can't be combined with named regions`)
+			}
+		case !regionRe.MatchString(rg):
+			return fmt.Errorf("regions: invalid region %q", rg)
+		case seen[rg]:
+			return fmt.Errorf("regions: %q is listed twice", rg)
+		case strings.HasPrefix(rg, "cn-"):
+			return fmt.Errorf("regions: %q: the AWS China regions aren't supported", rg)
+		}
+		seen[rg] = true
+	}
+	// One set of credentials works in one partition: GovCloud regions can't
+	// share a list with the others.
+	gov := 0
+	for _, rg := range r.Regions {
+		if strings.HasPrefix(rg, "us-gov-") {
+			gov++
+		}
+	}
+	if gov > 0 && gov < len(r.Regions) {
+		return errors.New("regions: GovCloud (us-gov-*) and other regions can't be mixed: they need separate AWS accounts; define a runner for each")
+	}
+	if len(r.Regions) == 1 && r.Regions[0] != AllRegions {
+		if r.Region != "" && r.Region != r.Regions[0] {
+			return errors.New("set region or regions, not both")
+		}
+		r.Region, r.Regions = r.Regions[0], nil
+		return nil
+	}
+	// Network and image IDs only exist in one region: a multi-region runner
+	// uses each region's default VPC, its own security group and the
+	// region's Ubuntu image (or bake).
+	if r.SubnetID != "" {
+		return errors.New("subnet_id is specific to one region; remove it to use several regions (each region's default VPC is used)")
+	}
+	if len(r.SecurityGroupIDs) > 0 {
+		return errors.New("security_group_ids are specific to one region; remove them to use several regions (spotexec manages a group per region)")
+	}
+	if r.AMI != "" && r.AMI != "auto" && r.AMI != "base" {
+		return fmt.Errorf("ami %q is specific to one region; use \"auto\" or \"base\" with several regions", r.AMI)
+	}
+	if b := r.CacheBucket; b != "" && b != "auto" && b != "off" {
+		return fmt.Errorf("cache_bucket %q lives in one region; use \"auto\" (a bucket per region) or \"off\" with several regions", b)
+	}
+	if r.Region == "" && r.Regions[0] != AllRegions {
+		r.Region = r.Regions[0]
+	}
+	return nil
+}
+
 // archForInstanceType guesses the CPU architecture of an EC2 instance type:
 // Graviton families carry a "g" after the generation digit (c7g, m7gd, t4g).
 func archForInstanceType(t string) string {
@@ -390,14 +476,72 @@ func archForInstanceType(t string) string {
 	return "amd64"
 }
 
+// ValidRegion reports whether s looks like an AWS region name.
+func ValidRegion(s string) bool { return regionRe.MatchString(s) }
+
 // ArchForInstanceType is exported for providers.
 func ArchForInstanceType(t string) string { return archForInstanceType(t) }
 
+// CredentialDirs never sync from untracked or non-Git sources, and no
+// directory inside one is ever a project.
+var CredentialDirs = []string{".aws", ".ssh", ".gnupg"}
+
+// NeverProject reports whether dir is the home directory, the filesystem
+// root, or inside a credential directory (~/.ssh, even reached through a
+// symlink). None of them is ever a project: syncing them would upload
+// ~/.aws, ~/.ssh and the like, so a .spotexec.toml (or Git worktree) there
+// is ignored and `spotexec init` refuses to write one. Directories are
+// compared by identity, so another spelling of home (/Users/ME on a
+// case-insensitive disk) is still home.
+func NeverProject(dir string) bool {
+	d := filepath.Clean(dir)
+	if r, err := filepath.EvalSymlinks(d); err == nil {
+		d = r
+	}
+	if d == filepath.Dir(d) {
+		return true
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(d), "/") {
+		for _, c := range CredentialDirs {
+			if strings.EqualFold(seg, c) {
+				return true
+			}
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	hi, herr := os.Stat(home)
+	var creds []os.FileInfo
+	for _, c := range CredentialDirs {
+		if fi, err := os.Stat(filepath.Join(home, c)); err == nil && fi.IsDir() {
+			creds = append(creds, fi)
+		}
+	}
+	for a := d; ; a = filepath.Dir(a) {
+		if fi, err := os.Stat(a); err == nil {
+			if a == d && herr == nil && os.SameFile(fi, hi) {
+				return true
+			}
+			for _, c := range creds {
+				if os.SameFile(fi, c) {
+					return true
+				}
+			}
+		}
+		if a == filepath.Dir(a) {
+			return false
+		}
+	}
+}
+
 // FindProject walks up from dir to find .spotexec.toml, stopping at root.
+// One in the home directory or / does not count (see NeverProject).
 func FindProject(dir, root string) string {
 	for d := dir; ; d = filepath.Dir(d) {
 		p := filepath.Join(d, ".spotexec.toml")
-		if _, err := os.Stat(p); err == nil {
+		if _, err := os.Stat(p); err == nil && !NeverProject(d) {
 			return p
 		}
 		if d == root || d == filepath.Dir(d) {
@@ -495,9 +639,6 @@ func (p *Project) validate() error {
 		if t.Run != "" && embeddedArgs(t.Run) {
 			return fmt.Errorf("task %q: use {args} as a separate word (or \"{args}\"), not inside a quoted string: extra arguments are passed as \"$@\"", name)
 		}
-		if ReservedTaskNames[name] {
-			return fmt.Errorf("task %q has the name of a spotexec command, so `sx %s` would never run it: rename it", name, name)
-		}
 		if (t.Run == "") == (len(t.Parallel) == 0) {
 			return fmt.Errorf("task %q must set exactly one of run or parallel", name)
 		}
@@ -517,20 +658,11 @@ func (p *Project) validate() error {
 	return nil
 }
 
-// ReservedTaskNames are spotexec subcommands: a task with one of these names
-// could never be run with `sx <name>`.
-var ReservedTaskNames = map[string]bool{
-	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
-	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
-	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
-	"completion": true, "sim": true, "image": true, "daemon": true, "container": true, "setup": true,
-}
-
 // globalOnlyKeys are runner settings a project (.spotexec.toml) may not set.
 var globalOnlyKeys = []string{
 	"type", "host", "hosts", "ssh_options", "identity_file", "work_root",
 	"profile", "region", "subnet_id", "security_group_ids", "ssh_cidr",
-	"user", "cache_bucket",
+	"user", "cache_bucket", "regions",
 }
 
 var (
@@ -594,6 +726,7 @@ func (c *Config) MergeProjectRunners() error {
 		base.InstanceTypes = append([]string(nil), g.InstanceTypes...)
 		base.SSHOptions = append([]string(nil), g.SSHOptions...)
 		base.SecurityGroupIDs = append([]string(nil), g.SecurityGroupIDs...)
+		base.Regions = append([]string(nil), g.Regions...)
 		if p.md.IsDefined("runners", name, "instance_types") && !p.md.IsDefined("runners", name, "arch") {
 			base.Arch = "" // re-derive from the new instance types
 		}

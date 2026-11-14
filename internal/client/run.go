@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -33,8 +34,9 @@ import (
 
 // Exit codes for spotexec's own failures (command exit codes pass through).
 const (
-	ExitInfra   = 125
-	ExitTimeout = 124
+	ExitInfra       = 125
+	ExitTimeout     = 124
+	ExitInterrupted = 130 // Ctrl-C, SIGTERM or SIGHUP
 )
 
 // Large-sync guardrails.
@@ -59,7 +61,10 @@ type Options struct {
 	Pull           []string
 	NoDeps         bool
 	ForceLargeSync bool
-	PreferLast     bool // exec: reuse last runner+slot
+	PreferLast     bool     // exec: reuse last runner+slot without syncing
+	SameSlot       bool     // --same-slot: sync and run in this worktree's last slot
+	LastWithin     []string // with PreferLast/SameSlot: the last runner must be one of these
+	DeferLastRun   bool     // return the last-run record in Result instead of saving it
 	Stdout         io.Writer
 	Stderr         io.Writer
 	Rep            ui.Reporter
@@ -82,6 +87,7 @@ type Result struct {
 	Slot      int    `json:"slot"`
 	Duration  time.Duration
 	TimedOut  bool     `json:"timed_out"`
+	Canceled  bool     `json:"canceled"` // interrupted (Ctrl-C/SIGTERM); ExitCode is 130
 	Mutated   []string `json:"mutated_files"`
 	Deleted   []string `json:"deleted_files"`
 	Conflicts []string `json:"conflicts"`
@@ -89,6 +95,9 @@ type Result struct {
 	Synced    int      `json:"synced_files"`
 	SyncBytes int64    `json:"synced_bytes"`
 	Image     string   `json:"image,omitempty"` // the project container image used
+	// LastRun is where this worktree's files now are, when the run
+	// synced (saved already unless Options.DeferLastRun).
+	LastRun *LastRun `json:"-"`
 }
 
 // InfraError marks failures of spotexec itself (exit 125).
@@ -122,7 +131,13 @@ type attempt struct {
 // attempt was applied locally. Once a result has arrived it is never
 // replayed.
 func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Result, error) {
+	if err := validOptions(o); err != nil {
+		return Result{}, infra(err)
+	}
 	if !ws.Marked && o.Sync != "none" && !o.PreferLast {
+		if config.NeverProject(ws.Root) {
+			return Result{}, infra(fmt.Errorf("spotexec never syncs %s: it is your home directory, / or a credential directory (~/.aws, ~/.ssh); cd into a project, or pass --sync none", ws.Root))
+		}
 		return Result{}, infra(fmt.Errorf("%s is not in a Git repository and has no .spotexec.toml, so spotexec won't sync it; run `spotexec init` there to mark it as a project, or pass --sync none", ws.Root))
 	}
 	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}}
@@ -131,7 +146,7 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
 		reached = reached || res.Runner != ""
 		res.Reached = reached
-		retryable := lost != "" && o.RetryPreempt && ctx.Err() == nil && o.Sync != "none" && !o.PreferLast && att.n < 2
+		retryable := lost != "" && o.RetryPreempt && ctx.Err() == nil && o.Sync != "none" && !o.PreferLast && !o.SameSlot && att.n < 2
 		if !retryable {
 			return res, err
 		}
@@ -151,9 +166,14 @@ func lostRunner(l *Lease, err error) string {
 		return ""
 	}
 	// An error the helper reported itself means it was alive to report it
-	// (the command may well have run): never treat that as a lost runner.
+	// (the command may well have run): never treat that as a lost runner,
+	// unless it says the VM is shutting down (a container killed as dockerd
+	// stops with the VM).
 	var re *transport.RemoteError
 	if errors.As(err, &re) {
+		if re.Code == protocol.CodeShutdown {
+			return shutdownRunner(l)
+		}
 		return ""
 	}
 	// Writes to a dead SSH channel fail with plain pipe errors; the session
@@ -183,7 +203,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if o.Sync != "none" {
 		o.Rep.Status("scanning %s", ws.Root)
 		t := time.Now()
-		m, err = manifest.Build(ctx, manifest.Options{Root: ws.Root, Exclude: p.Sync.Exclude, Source: p.Sync.Source, Protect: p.Deps.CacheDirs})
+		m, err = manifest.Build(ctx, ManifestOptions(ws.Root, p))
 		if err != nil {
 			return res, infra(fmt.Errorf("enumerating files: %w", err)), ""
 		}
@@ -208,22 +228,38 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// Without a sync the slot's files are not ours: don't claim ownership.
 	base.KeepOwner = o.Sync == "none"
 	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority}
+	// Recently used here: go back to that VM while it has room (warm files
+	// and build caches). After a while, let work consolidate onto the
+	// oldest VMs again so younger ones can idle out.
+	if fi, err := os.Stat(lastRunPath(ws)); err == nil && time.Since(fi.ModTime()) < 10*time.Minute {
+		if lr, err := LoadLastRun(ws); err == nil {
+			req.PreferInstance = lr.InstanceID
+		}
+	}
 	var lease *Lease
-	if o.PreferLast {
+	if o.PreferLast || o.SameSlot {
 		// exec runs without syncing, so it must land in exactly the slot that
-		// holds this worktree's files.
+		// holds this worktree's files; --same-slot syncs, but wants the same
+		// machine state (whatever the last commands installed there).
 		lr, err := LoadLastRun(ws)
 		if err != nil {
-			return res, infra(errors.New("no previous run from this worktree; use `spotexec run` first")), ""
+			return res, infra(errors.New("no previous run from this worktree to return to; run `sx <command>` first")), ""
+		}
+		if len(o.LastWithin) > 0 && !slices.Contains(o.LastWithin, lr.Runner) {
+			return res, infra(fmt.Errorf("this worktree last ran on %s, which --runner/--pool excludes (%s), so --same-slot can't return there; drop one of them", lr.Runner, strings.Join(o.LastWithin, ", "))), ""
 		}
 		r, err := cfg.Runner(lr.Runner)
 		if err != nil {
 			return res, infra(err), ""
 		}
 		host, _ := os.Hostname()
-		lease, err = AcquireSlot(ctx, cfg, ws, r, lr, o.Rep, host, o.Display, o.Exclusive, o.QueueTimeout)
+		fp := ""
+		if o.SameSlot {
+			fp = base.Fingerprint
+		}
+		lease, err = AcquireSlot(ctx, cfg, ws, r, lr, o.Rep, host, o.Display, o.Exclusive, o.QueueTimeout, o.SameSlot && o.Sync != "none", fp)
 		if err != nil {
-			return res, infra(err), ""
+			return res, infra(fmt.Errorf("can't return to this worktree's last slot (%s slot %d%s): %w", lr.Runner, lr.Slot, instanceSuffix(lr.InstanceID), err)), ""
 		}
 	} else {
 		lease, err = Acquire(ctx, req)
@@ -260,11 +296,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// The last-run record (used by exec and pull) is written once this
 	// worktree's files are in the slot, and never for unsynced runs.
 	lastRun := LastRun{Runner: r.Name, InstanceID: lease.InstanceID, Slot: lease.Acq.Slot, Target: lease.Target, WorkRoot: r.WorkRoot, RemoteWS: remoteWS}
-	recordLastRun := func() {
-		if o.Sync != "none" && !o.PreferLast {
-			saveLastRun(ws, lastRun)
-		}
-	}
+	recordLastRun := func() { keepLastRun(ws, o, lastRun, &res) }
 	label := fmt.Sprintf("%s#%d", r.Name, lease.Acq.Token)
 
 	// 3. Forward sync.
@@ -274,7 +306,11 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		} else {
 			t := time.Now()
 			o.Rep.Status("%s · syncing %d files", label, len(m.Entries))
-			syn, err := syncIn(ctx, sess, m, p.Deps.CacheDirs, o)
+			stray, err := strayFiles(ctx, ws, m, lease.Acq.Pending)
+			if err != nil {
+				return res, infra(fmt.Errorf("checking files earlier runs left in %s: %w", label, err)), ""
+			}
+			syn, err := syncIn(ctx, sess, m, p.Deps.CacheDirs, stray, o)
 			if err != nil {
 				return res, infra(fmt.Errorf("sync to %s: %w", r.Name, err)), lostRunner(lease, err)
 			}
@@ -288,6 +324,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	var crun *protocol.ContainerRun
 	imageID := ""
 	if p.Container.Enabled() {
+		if o.SameSlot || o.PreferLast {
+			o.Rep.Warn("CONTAINER_FRESH", "this project runs in a container, which starts fresh each run: files in the workspace and $HOME carry over, but system packages installed by an earlier run don't (add them to %s)", orDefault(p.Container.Dockerfile, "the image"))
+		}
 		ref, id, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
 		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
@@ -345,7 +384,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	ex := protocol.Exec{
 		Shell: o.Command, Cwd: ws.Cwd, Env: env, Setup: r.RemotePathSetup,
 		TimeoutMS: o.Timeout.Milliseconds(), GraceMS: o.Grace.Milliseconds(),
-		Snapshot: o.Sync != "none", Skip: skip, SpotWatch: r.Type == config.TypeAWSSpot,
+		// Always snapshotted, so the helper knows which files even an
+		// unsynced run created (removed by the next run that syncs here).
+		Snapshot: true, Skip: skip, SpotWatch: r.Type == config.TypeAWSSpot,
 		Container: crun,
 	}
 	o.Rep.Status("%s · running %s", label, o.Display)
@@ -376,7 +417,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}()
 	onSpot := func() {
-		if lease.InstanceID == "" || !(o.RetryPreempt && att.n < 2 && o.Sync != "none" && !o.PreferLast) {
+		if lease.InstanceID == "" || !(o.RetryPreempt && att.n < 2 && o.Sync != "none" && !o.PreferLast && !o.SameSlot) {
 			return
 		}
 		f, ok := lease.Provider.(provider.Fleet)
@@ -405,15 +446,38 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if err != nil {
 		return res, infra(fmt.Errorf("lost runner %s during execution: %w", r.Name, err)), lostRunner(lease, err)
 	}
-	if result.StartError != "" {
-		o.Rep.Warn("START_FAILED", "could not start command: %s", result.StartError)
-	}
 	res.ExitCode, res.TimedOut = result.ExitCode, result.TimedOut
+	// An interrupt (Ctrl-C, SIGTERM) at any point up to the final result
+	// makes the run interrupted: 130, never a success.
+	checkCanceled := func() {
+		if ctx.Err() != nil && !res.Canceled {
+			res.Canceled, res.ExitCode = true, ExitInterrupted
+		}
+	}
+	switch classifyExec(result) {
+	case execNotStarted:
+		return res, infra(fmt.Errorf("the command could not be started on %s: %s", r.Name, result.StartError)), ""
+	case execCanceled:
+		res.Canceled, res.ExitCode = true, ExitInterrupted
+	case execShutdown:
+		// Killed by the VM shutting down (a Spot reclaim): like a lost
+		// runner, nothing from this attempt is written back, and on a Spot
+		// runner the run is replayed (unless the user interrupted it: then
+		// the CLI exits 130).
+		return res, infra(fmt.Errorf("%s shut down while the command ran (it was stopped with exit %d); nothing was written back", label, result.ExitCode)), shutdownRunner(lease)
+	}
+	checkCanceled()
 	// Post-exec work uses its own bounded context: an interrupt that already
 	// canceled ctx must not prevent writing back what the command changed.
 	post, cancelPost := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancelPost()
-	if len(result.Unverified) > 0 {
+	// Created files that are ignored here are build outputs the slot keeps;
+	// the rest stay pending until written back or removed by the next sync.
+	var ignoredCreated map[string]bool
+	if m != nil && len(result.Created) > 0 {
+		ignoredCreated = settleCreated(post, sess, m, result.Created)
+	}
+	if m != nil && len(result.Unverified) > 0 {
 		o.Rep.Warn("UNVERIFIED", "%d file(s) could not be read on the runner after the run and were not written back: %s", len(result.Unverified), strings.Join(firstN(result.Unverified, 5), ", "))
 	}
 	if result.TimedOut {
@@ -421,22 +485,27 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 
 	// 6. Write-back of mutations.
-	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, result.ExitCode) &&
+	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, res.ExitCode) &&
 		(len(result.Changed)+len(result.Deleted)+len(result.Created) > 0) {
 		t := time.Now()
-		wb, err := writeback(post, sess, ws, m, result, runID)
+		// on-success: an interrupt while the changes are being fetched means
+		// the run no longer counts as a success; apply nothing.
+		var proceed func() bool
+		if o.Writeback == "on-success" {
+			proceed = func() bool { return ctx.Err() == nil }
+		}
+		wb, err := writeback(post, sess, ws, m, result, runID, ignoredCreated, proceed)
+		// Conflicts stashed before any failure are reported either way.
+		reportConflicts(o.Rep, wb.Stashed, runID)
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
-			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", result.ExitCode, err)), ""
+			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)), ""
 		}
 		res.Mutated, res.Deleted, res.Conflicts = wb.Applied, wb.Deleted, wb.Conflicts
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "ignored_created": wb.Ignored, "duration_ms": time.Since(t).Milliseconds()})
 		if len(wb.Refused) > 0 {
 			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
-		}
-		for _, c := range wb.Conflicts {
-			o.Rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version, remote version saved under %s", c, wb.ConflictDir)
 		}
 		if result.Truncated {
 			o.Rep.Warn("WRITEBACK_TRUNCATED", "more than %d new files were created; only the first batch was considered for write-back", 50000)
@@ -455,9 +524,50 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		res.Pulled = n
 		o.Rep.Event("pull", map[string]any{"patterns": pulls, "files": n})
 	}
+	checkCanceled()
 	res.Duration = time.Since(start)
-	o.Rep.Event("result", map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "runner": r.Name, "slot": res.Slot})
+	o.Rep.Event("result", map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot})
 	return res, nil, ""
+}
+
+// keepLastRun records where this worktree's files now are (never for
+// unsynced runs): saved for exec, pull and --same-slot, or only returned
+// with DeferLastRun, for a caller choosing among several runs.
+func keepLastRun(ws *Workspace, o Options, lr LastRun, res *Result) {
+	if o.Sync == "none" || o.PreferLast {
+		return
+	}
+	res.LastRun = &lr
+	if !o.DeferLastRun {
+		saveLastRun(ws, lr)
+	}
+}
+
+// reportConflicts says, for each write-back conflict, exactly where to look:
+// the stash is under the git dir, out of sight of `git status` and editors.
+func reportConflicts(rep ui.Reporter, stashed []Conflict, runID string) {
+	for _, c := range stashed {
+		diff := conflictDiff(c)
+		if c.Deleted {
+			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run, and the remote command deleted it; kept your version (delete it yourself to accept the deletion). Your changes: %s", c.Path, diff)
+		} else {
+			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version. The remote version: %s", c.Path, diff)
+		}
+		rep.Event("conflict", map[string]any{"path": c.Path, "local": c.Local, "remote": c.Remote, "deleted": c.Deleted, "diff": diff, "run_id": runID})
+	}
+}
+
+// conflictDiff is a ready-to-run command comparing your kept file with what
+// the remote run produced (/dev/null for a side that doesn't exist).
+func conflictDiff(c Conflict) string {
+	local, remote := c.Local, c.Remote
+	if c.Deleted {
+		remote = os.DevNull // Remote is only a marker
+	}
+	if fi, err := os.Lstat(local); err != nil || fi.IsDir() {
+		local = os.DevNull // deleted (or replaced by a directory) locally
+	}
+	return "git diff --no-index -- " + transport.ShellQuote(local) + " " + transport.ShellQuote(remote)
 }
 
 func firstN(s []string, n int) []string {
@@ -474,14 +584,69 @@ func nz(s []string) []string {
 	return s
 }
 
+// validOptions rejects sync modes and write-back policies Run doesn't know,
+// rather than guessing what they meant.
+func validOptions(o Options) error {
+	switch o.Sync {
+	case "auto", "in", "none":
+	default:
+		return fmt.Errorf("sync mode must be auto, in or none (got %q)", o.Sync)
+	}
+	switch o.Writeback {
+	case "always", "on-success", "never":
+	default:
+		return fmt.Errorf("write-back policy must be always, on-success or never (got %q)", o.Writeback)
+	}
+	return nil
+}
+
+// execOutcome is how a result from the helper is treated.
+type execOutcome int
+
+const (
+	execCompleted  execOutcome = iota // the command's own exit status
+	execCanceled                      // interrupted by the user: exit 130, never a success
+	execShutdown                      // killed by the VM shutting down: a lost runner
+	execNotStarted                    // the helper could not start it: exit 125
+)
+
+// classifyExec decides what a helper result means. A command that finished
+// on its own during a Spot interruption's two-minute warning is a
+// legitimate result; one the shutdown killed is not.
+func classifyExec(r protocol.Result) execOutcome {
+	switch {
+	case r.StartError != "":
+		return execNotStarted
+	case r.Shutdown:
+		// Even if the user interrupted it too: nothing a killed process left
+		// behind is written back (the CLI still exits 130 then).
+		return execShutdown
+	case r.Canceled:
+		return execCanceled
+	}
+	return execCompleted
+}
+
+// shutdownRunner is what to exclude from a replay when the VM shut down
+// under a run ("" on a static runner: it is not replayed there).
+func shutdownRunner(l *Lease) string {
+	if !l.Runner.Ephemeral() {
+		return ""
+	}
+	if l.InstanceID != "" {
+		return l.InstanceID
+	}
+	return "static"
+}
+
 func wantWriteback(policy string, code int) bool {
 	switch policy {
-	case "never":
-		return false
+	case "always":
+		return true
 	case "on-success":
 		return code == 0
 	}
-	return true
+	return false // never, or anything unknown
 }
 
 func newRunID() string {
@@ -490,10 +655,79 @@ func newRunID() string {
 	return time.Now().UTC().Format("20060102-150405") + "-" + hex.EncodeToString(b)
 }
 
+// strayFiles picks, from the files earlier runs created in the slot and never
+// wrote back, the ones the next sync must remove: everything this worktree
+// doesn't ignore (ignored build outputs stay, like dependency caches).
+func strayFiles(ctx context.Context, ws *Workspace, m *manifest.Manifest, pending []string) ([]string, error) {
+	var stray, check []string
+	for _, p := range pending {
+		if _, ok := m.ByPath[p]; ok {
+			continue // synced over by this run
+		}
+		// Never a file of ours: an invalid or reserved path, or one under a
+		// synced file or a local symlink or file (git can't judge those).
+		if _, err := fsid.SafeJoin(ws.Root, p); err != nil || reservedPath(p, ws.Git) || underSyncedFile(m, p) {
+			stray = append(stray, p)
+			continue
+		}
+		check = append(check, p)
+	}
+	if len(check) == 0 {
+		return stray, nil
+	}
+	ign, err := m.CheckIgnored(ctx, check)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range check {
+		if !ign[p] {
+			stray = append(stray, p)
+		}
+	}
+	return stray, nil
+}
+
+// underSyncedFile reports whether a parent of p is a synced file or symlink.
+func underSyncedFile(m *manifest.Manifest, p string) bool {
+	for d := path.Dir(p); d != "." && d != "/" && d != ""; d = path.Dir(d) {
+		if _, ok := m.ByPath[d]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// settleCreated tells the helper which files the run created are ignored
+// here, and returns that set (nil if it couldn't be determined: write-back
+// then checks again and reports the error).
+func settleCreated(ctx context.Context, s *transport.Session, m *manifest.Manifest, created []protocol.Entry) map[string]bool {
+	paths := make([]string, 0, len(created))
+	for _, c := range created {
+		if _, err := fsid.CleanRel(c.Path); err == nil {
+			paths = append(paths, c.Path)
+		}
+	}
+	ign, err := m.CheckIgnored(ctx, paths)
+	if err != nil {
+		return nil
+	}
+	var keep []string
+	for _, p := range paths {
+		if ign[p] {
+			keep = append(keep, p)
+		}
+	}
+	if len(keep) > 0 {
+		_ = s.Conn.Send(protocol.TypeSettle, protocol.Settle{Ignored: keep})
+	}
+	return ign
+}
+
 // syncIn sends the manifest and streams whatever the helper reports missing.
-func syncIn(ctx context.Context, s *transport.Session, m *manifest.Manifest, protect []string, o Options) (protocol.Synced, error) {
+// remove lists files earlier runs left in the slot that must go.
+func syncIn(ctx context.Context, s *transport.Session, m *manifest.Manifest, protect, remove []string, o Options) (protocol.Synced, error) {
 	var syn protocol.Synced
-	if err := s.Conn.Send(protocol.TypeManifest, protocol.Manifest{Fingerprint: m.Fingerprint, Entries: m.Entries, Protect: protect}); err != nil {
+	if err := s.Conn.Send(protocol.TypeManifest, protocol.Manifest{Fingerprint: m.Fingerprint, Entries: m.Entries, Protect: protect, Remove: remove}); err != nil {
 		return syn, err
 	}
 	env, err := s.Expect(ctx, protocol.TypeNeed)
@@ -631,7 +865,8 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	}
 	// Shared cache: sign URLs for the key the runner will compute. Any
 	// failure just means installing without the cache.
-	if dc, ok := lease.Provider.(provider.DepsCache); ok {
+	// The cache lives in the instance's own region (multi-region fleets).
+	if dc, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.DepsCache); ok {
 		key, err := depskey.Key(ws.Root, depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Image: image, Toolchain: req.Toolchain, OS: s.Hello.OS, Arch: s.Hello.Arch})
 		if err == nil {
 			cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -822,7 +1057,12 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read 
 	if !ok {
 		if read != nil {
 			if _, err := read(dockerfile); err == nil {
-				return "", fmt.Errorf("container.dockerfile %q exists but is not synced: it is gitignored, excluded, or untracked in a directory spotexec only syncs once Git tracks it (such as .spotexec/); run `git add %s`", dockerfile, dockerfile)
+				// The Dockerfile syncs whether or not Git tracks it, so only
+				// an exclude can keep it out.
+				if m.Matcher != nil && m.Matcher.Match(dockerfile, false) {
+					return "", fmt.Errorf("container.dockerfile %q exists but is not synced: [sync].exclude, .spotexecignore or deps.cache_dirs excludes it; remove that pattern", dockerfile)
+				}
+				return "", fmt.Errorf("container.dockerfile %q exists but is not synced: spotexec never syncs that path; move the Dockerfile and point container.dockerfile at it", dockerfile)
 			}
 		}
 		return "", fmt.Errorf("container.dockerfile %q is not in the synced working set", dockerfile)
@@ -921,7 +1161,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 			return "", "", err
 		}
 		req.Dockerfile, req.Context, req.Tag = c.Dockerfile, c.Context, tag
-		if reg, ok := lease.Provider.(provider.ImageRegistry); ok {
+		if reg, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.ImageRegistry); ok {
 			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			auth, err := reg.RegistryFor(cctx, ws.RepoID)
 			cancel()
@@ -986,4 +1226,18 @@ func toolchainFor(r *config.Runner, crun *protocol.ContainerRun) string {
 		return "container"
 	}
 	return depskey.Toolchain(r.Type, r.AMI, r.Arch, r.Image, r.BootstrapScript, r.UserBootstrap, r.RemotePathSetup)
+}
+
+func instanceSuffix(id string) string {
+	if id == "" {
+		return ""
+	}
+	return ", instance " + id
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }

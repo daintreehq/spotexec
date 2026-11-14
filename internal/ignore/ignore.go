@@ -107,6 +107,23 @@ func (m *Matcher) Match(rel string, isDir bool) bool {
 	return m.matchOne(parts, isDir)
 }
 
+// MatchBelow is Match for a path whose first skip directories are wanted
+// whatever the patterns say: exclusions of those directories are ignored,
+// while every pattern is still matched against the whole path (so anchored
+// patterns keep their meaning).
+func (m *Matcher) MatchBelow(rel string, isDir bool, skip int) bool {
+	if m.Empty() {
+		return false
+	}
+	parts := strings.Split(rel, "/")
+	for i := skip + 1; i < len(parts); i++ {
+		if m.matchOne(parts[:i], true) {
+			return true
+		}
+	}
+	return m.matchOne(parts, isDir)
+}
+
 func (m *Matcher) matchOne(parts []string, isDir bool) bool {
 	ex := false
 	for _, r := range m.rules {

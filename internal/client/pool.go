@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 )
 
@@ -28,6 +29,8 @@ type Pool struct {
 	R     *config.Runner
 	Fleet provider.Fleet
 	dir   string
+	// since is when this process started waiting (Acquire); see quotaBlocked.
+	since time.Time
 }
 
 const (
@@ -37,6 +40,7 @@ const (
 	launchBackoff = 20 * time.Second // after a failed launch
 	listLagGrace  = 5 * time.Minute  // a launched instance may be missing from listings this long
 	orphanGrace   = 3 * time.Minute  // a launch whose provisioner died before recording an ID
+	quotaRetry    = 5 * time.Minute  // after a quota refusal, unless one of our VMs ends first
 )
 
 type note struct {
@@ -68,6 +72,45 @@ type poolState struct {
 	Notes         map[string]*note    `json:"notes"`
 	BackoffUntil  time.Time           `json:"backoff_until,omitempty"`
 	LastLaunchErr string              `json:"last_launch_error,omitempty"`
+	// The account's vCPU quota refused the last launch: no launches until
+	// one of this fleet's VMs ends (freeing quota) or quotaRetry passes.
+	QuotaErr  string    `json:"quota_error,omitempty"`
+	QuotaAt   time.Time `json:"quota_at,omitempty"`
+	QuotaLive int       `json:"quota_live,omitempty"` // instances listed when it was refused
+}
+
+// quotaBlocked reports the quota refusal that still holds launches back
+// ("" if none) for a process waiting since `since` (zero: always waiting).
+//
+// It holds for quotaRetry, or until one of the fleet's VMs ends and frees
+// quota. When the fleet had no VM at all, it holds only for processes
+// already waiting when it happened (they fail, or wait for another runner
+// without retrying); a run that starts later tries once more, since the
+// quota may have been raised meanwhile.
+func (st *poolState) quotaBlocked(since time.Time) string {
+	if st.QuotaErr == "" || time.Since(st.QuotaAt) > quotaRetry || st.vmCount() < st.QuotaLive {
+		return ""
+	}
+	if st.QuotaLive == 0 && !st.QuotaAt.After(since) {
+		return ""
+	}
+	return st.QuotaErr
+}
+
+// vmCount is the fleet's VMs holding quota: listed instances (draining ones
+// included, until they end) plus launches not listed yet.
+func (st *poolState) vmCount() int {
+	n := len(st.Instances)
+	listed := map[string]bool{}
+	for _, in := range st.Instances {
+		listed[in.ID] = true
+	}
+	for _, l := range st.Launches {
+		if !l.Failed && l.InstanceID != "" && !listed[l.InstanceID] {
+			n++
+		}
+	}
+	return n
 }
 
 // NewPool wraps a fleet runner.
@@ -153,10 +196,47 @@ func (st *poolState) note(id string) *note {
 	return n
 }
 
+// LifetimeDrainAhead is how long before a VM's max_lifetime it stops
+// taking new runs (and drains), so the hard poweroff at max_lifetime never
+// interrupts a run that started after that point: 15 minutes, or a quarter
+// of a shorter max_lifetime.
+// (The VM's helper enforces the same cutoff when a run reaches it.)
+func LifetimeDrainAhead(r *config.Runner) time.Duration {
+	lt := r.MaxLifetime.Duration
+	if lt <= 0 {
+		lt = 12 * time.Hour // cloud-init's default
+	}
+	return protocol.LifetimeDrainAhead(lt)
+}
+
+// NearLifetime reports whether an instance is within LifetimeDrainAhead of
+// its max_lifetime.
+func NearLifetime(r *config.Runner, in provider.Instance) bool {
+	lt := r.MaxLifetime.Duration
+	if lt <= 0 {
+		lt = 12 * time.Hour
+	}
+	return !in.LaunchedAt.IsZero() && time.Since(in.LaunchedAt) > lt-LifetimeDrainAhead(r)
+}
+
+// drainAging marks instances near max_lifetime draining: no new runs are
+// placed on them, and they stop counting as capacity, so a replacement is
+// launched for waiting demand (or the warm pool). Every sx process and the
+// daemon do this, so it holds whether or not the daemon runs.
+func (p *Pool) drainAging(st *poolState) {
+	for _, in := range st.Instances {
+		if NearLifetime(p.R, in) {
+			st.note(in.ID).Draining = true
+		}
+	}
+}
+
 // refresh re-lists the fleet when the cached listing is stale (or force),
-// reconciling notes and the launch ledger. Called with the lock held, so one
-// process refreshes while the others wait and reuse its result.
+// reconciling notes and the launch ledger, and drains instances near
+// max_lifetime. Called with the lock held, so one process refreshes while
+// the others wait and reuse its result.
 func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
+	defer p.drainAging(st)
 	if !force && time.Since(st.ListedAt) < listTTL {
 		return nil
 	}
@@ -332,6 +412,9 @@ type LaunchDecision struct {
 	Live     int // usable instances (not draining)
 	Demand   int
 	Capacity int // pending slots
+	// QuotaErr is set while the account's vCPU quota blocks launches: the
+	// fleet can only serve from the VMs it already has.
+	QuotaErr string
 }
 
 // Plan decides, under the pool lock, whether this process should launch one
@@ -390,6 +473,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			}
 		}
 		d.Live = usable
+		d.QuotaErr = st.quotaBlocked(p.since)
 		bootFailed := ""
 		for id, n := range st.Notes {
 			if n.BootFailed && time.Since(n.BootFailedAt) < time.Hour {
@@ -408,6 +492,8 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
 		case total >= 2*p.R.MaxInstances:
 			d.Reason = "too many draining instances still alive"
+		case d.QuotaErr != "":
+			d.Reason = "at the account's vCPU quota, so no new VMs; waiting for a slot on running ones"
 		case time.Now().Before(st.BackoffUntil):
 			d.Reason = "backing off after a failed launch: " + st.LastLaunchErr
 		default:
@@ -482,7 +568,7 @@ func (p *Pool) EnsureMin(ctx context.Context, min int) ([]string, error) {
 				total++
 			}
 		}
-		if time.Now().Before(st.BackoffUntil) || total >= 2*p.R.MaxInstances {
+		if time.Now().Before(st.BackoffUntil) || total >= 2*p.R.MaxInstances || st.quotaBlocked(time.Time{}) != "" {
 			return nil
 		}
 		for _, n := range st.Notes {
@@ -529,12 +615,24 @@ func (p *Pool) Reset() {
 var launchesInFlight sync.WaitGroup
 
 // WaitLaunches blocks (up to max) until in-flight launches are recorded.
-func WaitLaunches(max time.Duration) {
+func WaitLaunches(max time.Duration) { WaitLaunchesSaying(max, nil) }
+
+// WaitLaunchesSaying is WaitLaunches that calls say once if the wait passes
+// a second, so a finished command doesn't seem to hang.
+func WaitLaunchesSaying(max time.Duration, say func()) {
 	done := make(chan struct{})
 	go func() { launchesInFlight.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(max):
+		return
+	case <-time.After(time.Second):
+		if say != nil {
+			say()
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(max - time.Second):
 	}
 }
 
@@ -564,7 +662,12 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 	in, err := p.Fleet.Launch(ctx, log)
 	if err != nil {
 		ambiguous := errors.Is(err, provider.ErrLaunchAmbiguous)
+		var qe *provider.QuotaError
+		quota := errors.As(err, &qe)
 		_ = p.with(func(st *poolState) error {
+			if quota {
+				st.QuotaErr, st.QuotaAt, st.QuotaLive = err.Error(), time.Now(), st.vmCount()
+			}
 			for i := range st.Launches {
 				// An ambiguous failure (the request may have created an
 				// instance) keeps its reservation until the ledger expires
@@ -592,6 +695,8 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 				st.Launches[i].InstanceID = in.ID
 			}
 		}
+		// There was room after all.
+		st.QuotaErr, st.QuotaAt, st.QuotaLive = "", time.Time{}, 0
 		st.ListedAt = staleListing(st.ListedAt) // force the next caller to re-list
 		return nil
 	})
@@ -618,6 +723,13 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 			st.ListedAt = staleListing(st.ListedAt)
 			return nil
 		})
+		if terr != nil {
+			err = fmt.Errorf("%w; terminating %s also failed: %v (run `spotexec down %s`)", err, in.ID, terr, p.R.Name)
+		}
+	}
+	if err != nil {
+		// The launched instance, so a caller can still find (or end) it.
+		return in, err
 	}
 	return ran, err
 }

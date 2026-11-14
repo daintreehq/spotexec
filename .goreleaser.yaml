@@ -5,6 +5,8 @@ before:
   hooks:
     # Cross-compile the remote helper for every runner platform and embed it.
     - make helpers VERSION={{ .Version }}
+    # Completion scripts for spotexec and sx (archives, brew, packages).
+    - make completions
 
 builds:
   - id: spotexec
@@ -22,7 +24,7 @@ builds:
 archives:
   - formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    files: [LICENSE, README.md]
+    files: [LICENSE, README.md, completions/*]
 
 checksum:
   name_template: checksums.txt
@@ -37,7 +39,7 @@ nfpms:
   - id: packages
     package_name: spotexec
     file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    homepage: https://github.com/daintreehq/spotexec
+    homepage: https://spotexec.com
     maintainer: Greg Priday
     description: Offload tests and builds from local worktrees to remote and AWS Spot runners
     license: MIT
@@ -52,6 +54,33 @@ nfpms:
       - src: /usr/bin/spotexec
         dst: /usr/bin/sx
         type: symlink
+      - src: ./completions/spotexec.bash
+        dst: /usr/share/bash-completion/completions/spotexec
+      - src: ./completions/sx.bash
+        dst: /usr/share/bash-completion/completions/sx
+      - src: ./completions/spotexec.fish
+        dst: /usr/share/fish/vendor_completions.d/spotexec.fish
+      - src: ./completions/sx.fish
+        dst: /usr/share/fish/vendor_completions.d/sx.fish
+      # Debian's zsh reads vendor-completions; Fedora's and Alpine's site-functions.
+      - src: ./completions/spotexec.zsh
+        dst: /usr/share/zsh/vendor-completions/_spotexec
+        packager: deb
+      - src: ./completions/sx.zsh
+        dst: /usr/share/zsh/vendor-completions/_sx
+        packager: deb
+      - src: ./completions/spotexec.zsh
+        dst: /usr/share/zsh/site-functions/_spotexec
+        packager: rpm
+      - src: ./completions/sx.zsh
+        dst: /usr/share/zsh/site-functions/_sx
+        packager: rpm
+      - src: ./completions/spotexec.zsh
+        dst: /usr/share/zsh/site-functions/_spotexec
+        packager: apk
+      - src: ./completions/sx.zsh
+        dst: /usr/share/zsh/site-functions/_sx
+        packager: apk
 
 # Homebrew formula (macOS and Linux) in daintreehq/homebrew-tap, pushed with
 # a deploy key that can write to that repository only.
@@ -65,7 +94,7 @@ brews:
         url: git@github.com:daintreehq/homebrew-tap.git
         private_key: "{{ .Env.HOMEBREW_TAP_DEPLOY_KEY }}"
     directory: Formula
-    homepage: https://github.com/daintreehq/spotexec
+    homepage: https://spotexec.com
     description: Offload tests and builds from local worktrees to remote and AWS Spot runners
     license: MIT
     commit_author:
@@ -76,6 +105,12 @@ brews:
     install: |
       bin.install "spotexec"
       bin.install_symlink "spotexec" => "sx"
-      generate_completions_from_executable(bin/"spotexec", "completion")
+      bash_completion.install "completions/spotexec.bash" => "spotexec"
+      bash_completion.install "completions/sx.bash" => "sx"
+      zsh_completion.install "completions/spotexec.zsh" => "_spotexec"
+      zsh_completion.install "completions/sx.zsh" => "_sx"
+      fish_completion.install "completions/spotexec.fish"
+      fish_completion.install "completions/sx.fish"
     test: |
-      system "#{bin}/spotexec", "version"
+      assert_equal "spotexec #{version}", shell_output("#{bin}/spotexec --version").strip
+      assert_equal "spotexec #{version}", shell_output("#{bin}/sx --version").strip

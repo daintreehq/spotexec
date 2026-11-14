@@ -27,6 +27,13 @@ import (
 // ControlPersist keeps the master connection alive between runs.
 const ControlPersist = "15m"
 
+// muxTimeout bounds a control command (-O check/stop/exit). They only talk
+// to the local master process, so this is generous.
+const muxTimeout = 5 * time.Second
+
+// dialTimeout bounds starting a control master.
+const dialTimeout = time.Minute
+
 // Client runs commands on one target.
 type Client struct {
 	T        provider.Target
@@ -36,10 +43,24 @@ type Client struct {
 
 // New builds a client for a target.
 func New(t provider.Target, workRoot string) *Client {
-	// The known_hosts file is per instance for ephemeral VMs, so a Spot IP
-	// reused by a new instance gets its own master and helper markers.
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%s|%s", t.Host, t.User, t.Port, t.IdentityFile, t.KnownHostsFile)))
-	return &Client{T: t, ctlPath: filepath.Join(controlDir(), hex.EncodeToString(h[:])[:16]), WorkRoot: workRoot}
+	return &Client{T: t, ctlPath: filepath.Join(controlDir(), connID(t)), WorkRoot: workRoot}
+}
+
+// connID identifies a target's effective connection settings: it names the
+// control socket (and so the helper markers). Everything that can change
+// where or how ssh connects is part of it, the runner's ssh_options included
+// (a Port or ProxyJump there makes a different endpoint). The known_hosts
+// file is per instance for ephemeral VMs, so a Spot IP reused by a new
+// instance gets its own master and helper markers.
+func connID(t provider.Target) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s|%s|%d|%s|%s", t.Host, t.User, t.Port, t.IdentityFile, t.KnownHostsFile)
+	for _, o := range t.Options {
+		// Options keep their order (ssh uses the first value it sees);
+		// a NUL can't occur in an argv string, so it separates them safely.
+		fmt.Fprintf(h, "\x00%s", o)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // controlDir holds ControlMaster sockets. OpenSSH appends 17 bytes to the
@@ -90,6 +111,11 @@ func privateDir(dir string) bool {
 	return ok && int(st.Uid) == os.Getuid() && os.Chmod(dir, 0o700) == nil
 }
 
+// baseArgs builds the ssh options. ssh uses the first value it sees for an
+// option, so the order is precedence: the control settings spotexec depends
+// on can't be overridden, the target's own settings come next, then the
+// runner's ssh_options, and spotexec's tunable defaults last, so ssh_options
+// can change them.
 func (c *Client) baseArgs(master string) []string {
 	a := []string{
 		"-T",
@@ -97,10 +123,6 @@ func (c *Client) baseArgs(master string) []string {
 		"-o", "ControlMaster=" + master,
 		"-o", "ControlPath=" + c.ctlPath,
 		"-o", "ControlPersist=" + ControlPersist,
-		"-o", "ConnectTimeout=10",
-		"-o", "ServerAliveInterval=10",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "LogLevel=ERROR",
 	}
 	if c.T.IdentityFile != "" {
 		a = append(a, "-i", c.T.IdentityFile, "-o", "IdentitiesOnly=yes")
@@ -117,75 +139,160 @@ func (c *Client) baseArgs(master string) []string {
 	for _, o := range c.T.Options {
 		a = append(a, "-o", o)
 	}
-	return a
+	return append(a,
+		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=10",
+		"-o", "ServerAliveCountMax=3",
+		"-o", "LogLevel=ERROR",
+	)
 }
 
-// Args returns full ssh argv for running remoteCmd.
+// Args returns full ssh argv for running remoteCmd, a POSIX shell command.
 func (c *Client) Args(remoteCmd string) []string {
 	// "--" ends options: the host can never be read as one.
-	return append(append(c.baseArgs("no"), "--", c.T.Host), remoteCmd)
+	return append(append(c.baseArgs("no"), "--", c.T.Host), posixCommand(remoteCmd))
 }
 
-// MasterAlive reports whether a control master is up.
+// posixCommand wraps a POSIX shell command so that any login shell runs it
+// with /bin/sh. sshd hands the command to the user's login shell, which on
+// a homelab runner may be fish, nushell or tcsh. All of them read
+// `/bin/sh -c '...'` the same way as long as the quoted text has no single
+// quote, backslash, newline or `!`; a command with any of those is passed as
+// octal escapes (a backslash followed by a digit means the same in every one
+// of those shells' single quotes), which sh's printf decodes.
+func posixCommand(cmd string) string {
+	if !strings.ContainsAny(cmd, "'\\\n!") {
+		return "/bin/sh -c '" + cmd + "'"
+	}
+	var b strings.Builder
+	for i := 0; i < len(cmd); i++ {
+		fmt.Fprintf(&b, "\\%03o", cmd[i])
+	}
+	return `/bin/sh -c 'eval "$(printf "` + b.String() + `")"'`
+}
+
+// MasterAlive reports whether a control master is up. It only asks the
+// local master process: a master whose connection died (the laptop slept or
+// changed networks) still answers. Open finds those out and replaces them.
 func (c *Client) MasterAlive(ctx context.Context) bool {
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "check", "--", c.T.Host)
-	return cmd.Run() == nil
+	_, ok := c.masterPID(ctx)
+	return ok
 }
 
-// EnsureMaster starts the control master if needed. The master is started
-// with -f -N and file-backed stderr: a backgrounded master inheriting our
-// pipes would otherwise hold them open and hang every caller.
+// masterPID asks the control master whether it is running, and its pid (0
+// if ssh didn't say).
+func (c *Client) masterPID(ctx context.Context) (int, bool) {
+	ctx, cancel := context.WithTimeout(ctx, muxTimeout)
+	defer cancel()
+	var errb bytes.Buffer
+	cmd := exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "check", "--", c.T.Host)
+	cmd.Stderr = &errb
+	if cmd.Run() != nil {
+		return 0, false
+	}
+	// "Master running (pid=12345)"
+	_, after, _ := strings.Cut(errb.String(), "(pid=")
+	pid, _ := strconv.Atoi(strings.TrimRight(strings.TrimSpace(after), ")"))
+	return pid, true
+}
+
+// lockMaster serializes starting and retiring this target's master across
+// processes. Without flock (some network filesystems) it goes unlocked.
+func (c *Client) lockMaster(ctx context.Context) (func(), error) {
+	lf, err := os.OpenFile(c.ctlPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return func() {}, nil
+	}
+	for {
+		err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() { _ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN); lf.Close() }, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			lf.Close()
+			return func() {}, nil
+		}
+		select {
+		case <-ctx.Done():
+			lf.Close()
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// EnsureMaster starts the control master if needed.
 func (c *Client) EnsureMaster(ctx context.Context) error {
-	if c.MasterAlive(ctx) {
-		return nil
+	_, _, err := c.ensureMaster(ctx)
+	return err
+}
+
+// ensureMaster starts the control master if needed. It returns the master's
+// pid (0 if unknown) and whether it dialed a new connection (false: an
+// existing master is reused). The master is started with -f -N and
+// file-backed stderr: a backgrounded master inheriting our pipes would
+// otherwise hold them open and hang every caller.
+func (c *Client) ensureMaster(ctx context.Context) (int, bool, error) {
+	if pid, ok := c.masterPID(ctx); ok {
+		return pid, false, nil
 	}
 	// One process starts the master; the others wait and reuse it. (Racing
 	// starters lose the socket bind and leave stray `ssh -N` processes.)
-	if lf, err := os.OpenFile(c.ctlPath+".lock", os.O_CREATE|os.O_RDWR, 0o600); err == nil {
-		defer lf.Close()
-		locked := false
-		for {
-			err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-			if err == nil {
-				locked = true
-				break
-			}
-			if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
-				break // no flock here (some network filesystems): go unlocked
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
-		if locked {
-			defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
-			if c.MasterAlive(ctx) {
-				return nil
-			}
-		}
+	unlock, err := c.lockMaster(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	defer unlock()
+	if pid, ok := c.masterPID(ctx); ok {
+		return pid, false, nil
 	}
 	errf, err := os.CreateTemp("", "spotexec-ssh-*.err")
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	defer os.Remove(errf.Name())
 	defer errf.Close()
 	args := append(c.baseArgs("auto"), "-f", "-N", "--", c.T.Host)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
+	// ConnectTimeout covers connecting; this also bounds a server that
+	// accepts but never finishes the handshake.
+	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(dctx, "ssh", args...)
 	cmd.Stdout = nil
 	cmd.Stderr = errf
 	if err := cmd.Run(); err != nil {
 		b, _ := os.ReadFile(errf.Name())
-		return &ConnError{Target: c.T.String(), Msg: strings.TrimSpace(string(b)), Err: err}
+		return 0, false, &ConnError{Target: c.T.String(), Msg: strings.TrimSpace(string(b)), Err: err}
 	}
-	return nil
+	pid, _ := c.masterPID(ctx)
+	return pid, true, nil
 }
 
-// CloseMaster stops the control master.
+// CloseMaster stops the control master, ending every session on it.
 func (c *Client) CloseMaster() {
-	_ = exec.Command("ssh", "-o", "ControlPath="+c.ctlPath, "-O", "exit", "--", c.T.Host).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), muxTimeout)
+	defer cancel()
+	_ = exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "exit", "--", c.T.Host).Run()
+}
+
+// dropMaster retires the master with this pid (0: whichever is running)
+// after it failed to open a session: it stops accepting new sessions and
+// frees the control path at once, so the next attempt dials afresh. Unlike
+// CloseMaster it leaves sessions already on it alone: if the master was only
+// slow, other runs using it carry on, and if it is dead its own keepalives
+// end it. A master another run has already put in its place is kept.
+func (c *Client) dropMaster(pid int) {
+	ctx, cancel := context.WithTimeout(context.Background(), muxTimeout)
+	defer cancel()
+	unlock, err := c.lockMaster(ctx)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	if cur, ok := c.masterPID(ctx); !ok || (pid != 0 && cur != 0 && cur != pid) {
+		return
+	}
+	_ = exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "stop", "--", c.T.Host).Run()
 }
 
 // ConnError is an SSH-level failure (exit 255 or master start failure).
@@ -206,6 +313,10 @@ func (e *ConnError) Error() string {
 func (c *Client) Run(ctx context.Context, remoteCmd string, stdin io.Reader) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "ssh", c.Args(remoteCmd)...)
 	cmd.Stdin = stdin
+	// A session on a master hands its descriptors to the master, so killing
+	// the client (on ctx's deadline) doesn't close our pipes while the
+	// master holds a stuck channel: don't wait on them for long.
+	cmd.WaitDelay = 2 * time.Second
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -289,26 +400,81 @@ func markerPath(c *Client, hash string) string {
 	return filepath.Join(home, ".cache", "spotexec", "helpers", hex.EncodeToString(h[:])[:20])
 }
 
+// probeTimeout bounds the first remote command of a helper install, which
+// may dial a new connection (ConnectTimeout=10 by default), and the check
+// after it; uploadTimeout bounds the upload (a few MB).
+var (
+	probeTimeout  = 20 * time.Second
+	uploadTimeout = 5 * time.Minute
+)
+
+// runWithin is Run bounded by d: running out of time (while ctx itself is
+// still live) is a connection failure, since nothing got through.
+func (c *Client) runWithin(ctx context.Context, d time.Duration, remoteCmd string, stdin io.Reader) ([]byte, error) {
+	rctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	out, err := c.Run(rctx, remoteCmd, stdin)
+	if err != nil && errors.Is(rctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		return out, &ConnError{Target: c.T.String(), Msg: "no answer from the runner", Err: context.DeadlineExceeded}
+	}
+	return out, err
+}
+
 // EnsureHelper makes sure the right helper is installed and returns the
 // remote command prefix that invokes it.
+// HelperUploadBudget is the extra time a first contact gets to upload the
+// helper (a few MB): over a slow link that alone can take most of a short
+// probe deadline, and an upload cut short is started over from nothing.
+const HelperUploadBudget = 2 * time.Minute
+
+// HelperInstalled reports whether this exact helper was installed on the
+// target before (so connecting needs no upload). It makes no remote call.
+func (c *Client) HelperInstalled() bool {
+	_, ok := c.installedHash()
+	return ok
+}
+
+// installedHash is the hash of the helper the markers say is installed, if
+// this binary still embeds exactly that helper. One read of each marker:
+// another process may rewrite or remove them at any time.
+func (c *Client) installedHash() (string, bool) {
+	b, err := os.ReadFile(markerPathAny(c))
+	if err != nil {
+		return "", false
+	}
+	f := strings.Fields(string(b))
+	if len(f) != 3 {
+		return "", false
+	}
+	_, cur, err := helperbin.Get(f[0], f[1])
+	if err != nil || cur != f[2] {
+		return "", false
+	}
+	if _, err := os.Stat(markerPath(c, cur)); err != nil {
+		return "", false
+	}
+	return cur, true
+}
+
 func (c *Client) EnsureHelper(ctx context.Context, force bool) (string, error) {
+	return c.ensureHelper(ctx, force, probeTimeout)
+}
+
+// ensureHelper is EnsureHelper with a bound on the first remote command:
+// over a reused master it is short, so a dead one is found out quickly.
+func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Duration) (string, error) {
 	// Fast path: we've installed this exact helper on this host before.
 	// The marker records the remote platform and the hash we installed; it
 	// is only trusted if this binary still embeds that exact helper, so an
 	// upgraded CLI reinstalls instead of driving a stale helper.
 	if !force {
-		if b, err := os.ReadFile(markerPathAny(c)); err == nil {
-			f := strings.Fields(string(b))
-			if len(f) == 3 {
-				if _, cur, err := helperbin.Get(f[0], f[1]); err == nil && cur == f[2] {
-					if _, err := os.Stat(markerPath(c, cur)); err == nil {
-						return c.helperPath(cur), nil
-					}
-				}
-			}
+		if hash, ok := c.installedHash(); ok {
+			return c.helperPath(hash), nil
 		}
 	}
-	out, err := c.Run(ctx, "uname -sm", nil)
+	// The first command through the master doubles as a liveness probe: a
+	// dead connection must fail (and be replaced by Open) rather than hang.
+	out, err := c.runWithin(ctx, probe, "uname -sm", nil)
 	if err != nil {
 		return "", err
 	}
@@ -323,15 +489,19 @@ func (c *Client) EnsureHelper(ctx context.Context, force bool) (string, error) {
 	path := c.helperPath(hash)
 	check := []byte("")
 	if !force { // a forced reinstall re-uploads even over a present (but broken) binary
-		check, err = c.Run(ctx, "test -x "+path+" && echo present || true", nil)
+		check, err = c.runWithin(ctx, probe, "test -x "+path+" && echo present || true", nil)
 	}
 	if err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(string(check)) != "present" {
 		dir := RemoteRoot(c.WorkRoot) + "/bin"
-		script := fmt.Sprintf(`set -e; mkdir -p %[1]s; t=%[1]s/.upload.$$; gzip -dc > "$t"; chmod 755 "$t"; mv -f "$t" %[2]s; find %[1]s -maxdepth 1 -name 'spotexec-helper-*' ! -name %[3]s -mmin +1440 -exec rm -f {} + 2>/dev/null || true`, dir, path, ShellQuote(filepath.Base(path)))
-		if _, err := c.Run(ctx, script, bytes.NewReader(gz)); err != nil {
+		// An upload is activity (at its start and end): an ephemeral VM's
+		// idle watchdog must not stop a VM still being readied over a slow
+		// link. The upload is bounded by the probe's HelperUploadBudget,
+		// well under any idle_timeout.
+		script := fmt.Sprintf(`set -e; a=/var/tmp/spotexec/activity; [ -w "$a" ] && touch "$a" || true; mkdir -p %[1]s; t=%[1]s/.upload.$$; gzip -dc > "$t"; chmod 755 "$t"; mv -f "$t" %[2]s; [ -w "$a" ] && touch "$a" || true; find %[1]s -maxdepth 1 -name 'spotexec-helper-*' ! -name %[3]s -mmin +1440 -exec rm -f {} + 2>/dev/null || true`, dir, path, ShellQuote(filepath.Base(path)))
+		if _, err := c.runWithin(ctx, uploadTimeout, script, bytes.NewReader(gz)); err != nil {
 			return "", fmt.Errorf("uploading helper: %w", err)
 		}
 	}

@@ -64,41 +64,56 @@ Credentials resolve in this order:
 
 ## 3. Grant permissions
 
-`spotexec setup` attaches this policy to the user it creates. To grant it yourself, attach it to the identity you signed in with; `spotexec setup --print-policy > spotexec-policy.json` saves it. The first three statements are required.
+`spotexec setup` attaches this policy to the user it creates. To grant it yourself, attach it to the identity you signed in with; `spotexec setup --print-policy > spotexec-policy.json` saves it.
 
-The other five are optional:
-- S3, for the [dependency cache](environments.md#dependency-cache) (without it, set `cache_bucket = "off"` on the runner);
-- the two ECR statements, for Dockerfile-built [containers](environments.md#project-containers);
-- `servicequotas:GetServiceQuota`, for `doctor`'s quota check;
-- the last statement, for [image baking](environments.md#baked-images).
+The policy is scoped to what spotexec creates:
+- Reads (`ec2:Describe*`) are unconditional.
+- Every EC2 call that changes an existing resource (terminating or stopping an instance, imaging it, deregistering an AMI, deleting a snapshot, adding a rule to a security group) only works on resources tagged `spotexec-owner`.
+- Tags can only be applied while spotexec creates the resource (`ec2:CreateAction`), so the key can't tag an unrelated instance to get around the conditions. `RunInstances` is allowed only when the new instance and its volumes are requested with the `spotexec-owner` tag; the image, subnet and security groups it launches with needn't be spotexec's.
+- S3 and ECR access is limited to `spotexec-cache-*` buckets and `spotexec/*` repositories.
+- `iam:GetUser` only covers the key's own user under `/spotexec/`, so setup can check which machine it belongs to.
+
+So a leaked key can launch tagged VMs and manage spotexec's own resources, but can't terminate, image or open up anything else in the account.
+
+The S3 statement (the [dependency cache](environments.md#dependency-cache); without it, set `cache_bucket = "off"` on the runner), the ECR statements (Dockerfile-built [containers](environments.md#project-containers)) and `servicequotas:GetServiceQuota` (`doctor`'s quota check and the pre-launch quota check) are optional. Everything else is needed to launch and clean up VMs and to [bake images](environments.md#baked-images).
+
+The policy is attached inline, and an IAM user's inline policies are limited to 2,048 characters, which is why some statements group several actions. Re-running `spotexec setup` replaces the policy with the current version's. It also tags any `spotexec-ssh*` security group an older spotexec made without the tag. Until then, a VM can still launch into such a group if it already allows SSH from `ssh_cidr`, but spotexec can't add a rule to it.
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     { "Effect": "Allow", "Action": [
-        "ec2:RunInstances", "ec2:CreateTags", "ec2:DescribeInstances", "ec2:TerminateInstances",
-        "ec2:DescribeImages", "ec2:DescribeVpcs", "ec2:DescribeSubnets",
-        "ec2:DescribeSecurityGroups", "ec2:CreateSecurityGroup", "ec2:AuthorizeSecurityGroupIngress"
+        "ec2:Describe*", "ec2:CreateSecurityGroup", "ecr:GetAuthorizationToken", "servicequotas:GetServiceQuota"
       ], "Resource": "*" },
+    { "Effect": "Allow", "Action": "ec2:RunInstances",
+      "NotResource": ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"] },
+    { "Effect": "Allow", "Action": "ec2:RunInstances",
+      "Resource": ["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"],
+      "Condition": { "Null": { "aws:RequestTag/spotexec-owner": "false" } } },
+    { "Effect": "Allow", "Action": "ec2:CreateTags", "Resource": "*",
+      "Condition": { "StringEquals": { "ec2:CreateAction": ["RunInstances", "CreateSecurityGroup", "CreateImage"] } } },
+    { "Effect": "Allow", "Action": [
+        "ec2:TerminateInstances", "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:StopInstances", "ec2:CreateImage", "ec2:DeregisterImage", "ec2:DeleteSnapshot"
+      ], "Resource": "*", "Condition": { "Null": { "aws:ResourceTag/spotexec-owner": "false" } } },
+    { "Effect": "Allow", "Action": ["ec2:AuthorizeSecurityGroupIngress", "ec2:CreateImage"], "Resource": [
+        "arn:aws:ec2:*:*:security-group-rule/*", "arn:aws:ec2:*::image/*", "arn:aws:ec2:*::snapshot/*"
+      ] },
     { "Effect": "Allow", "Action": "ssm:GetParameter",
       "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/*" },
+    { "Effect": "Allow", "Action": "iam:GetUser", "Resource": "arn:aws:iam::*:user/spotexec/${aws:username}" },
     { "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
       "Condition": { "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } } },
     { "Effect": "Allow", "Action": [
         "s3:CreateBucket", "s3:PutLifecycleConfiguration", "s3:ListBucket",
         "s3:GetObject", "s3:PutObject"
       ], "Resource": ["arn:aws:s3:::spotexec-cache-*", "arn:aws:s3:::spotexec-cache-*/*"] },
-    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
     { "Effect": "Allow", "Action": [
         "ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy",
         "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
         "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"
-      ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" },
-    { "Effect": "Allow", "Action": "servicequotas:GetServiceQuota", "Resource": "*" },
-    { "Effect": "Allow", "Action": [
-        "ec2:StopInstances", "ec2:CreateImage", "ec2:DeregisterImage", "ec2:DeleteSnapshot"
-      ], "Resource": "*" }
+      ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" }
   ]
 }
 ```
@@ -127,16 +142,16 @@ A runner's region comes from, in order:
 3. `AWS_DEFAULT_REGION`;
 4. `us-east-1`.
 
-The `region` in your `~/.aws/config` profile is **not** used, so set `region` on the runner explicitly.
+The `region` in your `~/.aws/config` profile is **not** used at run time, so set `region` on the runner explicitly. When `spotexec setup` (or `spotexec init --global`) writes a new config, it fills `region` in the same order the AWS CLI uses: `AWS_REGION`, `AWS_DEFAULT_REGION`, then the `region` of the profile setup signs in with (`--admin-profile`, else `AWS_PROFILE`, else `default`; SSO profiles included), read from `~/.aws/config` (or `~/.aws/credentials`) without needing the AWS CLI, and `us-east-1` when none is set. It prints which one it used.
 
 Pick the region that is:
 - **Closest to you.** Every run makes several SSH round trips (handshake, sync, streaming output, write-back). A nearby region keeps small commands under a second of overhead.
-- **Stocked with your instance types.** These lookups aren't in the spotexec policy, so run them from an admin session. For example, check that the region offers `c7a.xlarge`:
+- **Stocked with your instance types.** The spotexec policy allows these read-only `Describe*` lookups (add `--profile spotexec`). For example, check that the region offers the starter config's types:
   ```sh
   aws ec2 describe-instance-type-offerings --region us-east-2 \
-    --filters Name=instance-type,Values=c7a.large,c7a.xlarge --query 'InstanceTypeOfferings[].InstanceType'
+    --filters Name=instance-type,Values=c7a.2xlarge,m7a.2xlarge,c6a.2xlarge --query 'InstanceTypeOfferings[].InstanceType'
   ```
-- **Cheap and roomy for Spot.** Compare current prices, and ask AWS how likely a request is to be filled (scores 1–10):
+- **Cheap and roomy for Spot.** Compare current prices, and ask AWS how likely a request is to be filled (scores 1–10; `get-spot-placement-scores` isn't in the spotexec policy, so run it from an admin session):
   ```sh
   aws ec2 describe-spot-price-history --region us-east-2 --instance-types c7a.xlarge \
     --product-descriptions Linux/UNIX --start-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -155,13 +170,44 @@ Moving a runner to another region therefore starts with a cold cache, and you'll
 
 The EC2 console is regional too. If you don't see your instances, switch the console's region selector; `spotexec doctor` prints the region and tag to look for.
 
-To span regions, define one runner per region and order them with `priority`, so the second only takes overflow.
+### Let spotexec pick the region
+
+Instead of `region`, a runner can list several regions, or allow them all:
+
+```toml
+[runners.aws]
+type = "aws-spot"
+regions = ["all"]          # every region enabled in the account
+# regions = ["us-east-1", "us-east-2", "eu-north-1"]
+instance_types = ["c7a.2xlarge", "c6a.2xlarge", "m7a.2xlarge"]
+max_instances = 4          # across all regions together
+```
+
+Each time the fleet needs a new VM, spotexec compares the current Linux Spot price of every listed instance type in every availability zone of those regions and launches the cheapest. If AWS refuses it, spotexec moves on to the next-cheapest option:
+- **No capacity** for that type in that zone: skipped for a minute, then longer if it keeps failing.
+- **Quota exhausted**: that instance size and larger are skipped in that region; smaller types, and types under another quota, can still launch there. When quota is all that stopped every option, spotexec says so and holds new launches for a few minutes, or until one of the fleet's VMs ends, instead of retrying.
+- **Region not usable** (no default VPC, launches blocked by permissions): the whole region is skipped for 10 minutes.
+- **Region not enabled** in the account (or misspelled): left out entirely, and `spotexec prices` lists it under "Not used" with the reason. spotexec rechecks which regions are enabled once a day, or now with `spotexec prices --refresh`.
+- **Anything that would fail everywhere** (a bad bootstrap script, invalid parameters): the launch stops.
+
+`spotexec prices` shows the ranking and marks where the next VM will go. Prices are cached for 15 minutes. VMs that are already running stay where they are; a price change only affects new launches.
+
+What changes with several regions:
+- **Distance.** The cheapest region may be on another continent, and every run makes several SSH round trips. If that latency matters, list nearby regions instead of `"all"`.
+- **Quota.** Each region has its own Spot vCPU quota, and a region the account has never used is often at 5 vCPUs. A launch there fails over to the next region. `spotexec doctor` checks the cheapest few regions.
+- **Network and images.** spotexec uses each region's default VPC and its own security group there, and the region's Ubuntu image, or a bake if you made one there (`spotexec image bake <runner> --region <r>`). That is why `subnet_id`, `security_group_ids` and `ami-…` IDs aren't allowed with `regions`. (A list of one region is just `region`, and those settings work as usual.) A region without a default VPC is skipped; `spotexec setup` creates one for each listed region (not for `"all"`).
+- **Caches.** The S3 dependency cache (`cache_bucket = "auto"`: a bucket per region) and ECR images are per region, so the first run in a new region starts cold. A named `cache_bucket` lives in one region, so it isn't allowed with `regions`.
+- **Permissions.** Comparing prices needs `ec2:DescribeRegions` and `ec2:DescribeSpotPriceHistory`, which the policy's `ec2:Describe*` covers. If your IAM user's policy predates that, re-run `spotexec setup` to update it.
+
+`spotexec status` shows each VM's region. `spotexec down` terminates VMs in every region the runner uses, including regions since removed from the config. Going back to a single `region` is safe too: until the VMs in the other regions are gone, spotexec still lists and terminates them, while new VMs launch only in that region. spotexec records where it launched in `placement.json` in the runner's state directory. If that file is lost, the next listing checks every region the runner is configured for once; VMs in a region no longer in the config are then left to their own idle shutdown and `max_lifetime`.
+
+To prefer one region and send only overflow elsewhere, define one runner per region and order them with `priority` instead.
 
 ## 5. Check your Spot vCPU quota
 
-Spot capacity is limited by a per-region vCPU quota, *All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests* (`L-34B43A08`). New accounts often start very low, sometimes 5 vCPUs, which is not enough for even two 4-vCPU VMs.
+Spot capacity is limited by a per-region vCPU quota, *All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests* (`L-34B43A08`). New accounts often start very low, sometimes 5 vCPUs: enough for one 4-vCPU VM, but not one 8-vCPU VM. `spotexec setup` sizes the starter fleet to it (4-vCPU VMs when an 8-vCPU one doesn't fit) and offers to request an increase when not even one VM fits.
 
-You need at least `max_instances × vCPUs per instance`, summed over every fleet in the region. For example, 4 × `c7a.xlarge` needs 16 vCPUs. `spotexec doctor` shows the current value and what the runner may use. To check or raise it:
+You need at least `max_instances × vCPUs per instance`, summed over every fleet in the region. For example, the starter fleet of 4 × `c7a.2xlarge` (8 vCPUs each) needs 32 vCPUs, or 16 once setup has switched it to 4-vCPU VMs. `spotexec doctor` shows the current value and what the runner may use; it fails only when not even one VM fits, and prints the increase command whenever the quota limits the fleet. To check or raise it:
 
 ```sh
 aws service-quotas get-service-quota --profile spotexec --region us-east-2 \
@@ -171,6 +217,10 @@ aws service-quotas request-service-quota-increase --region us-east-2 \
   --service-code ec2 --quota-code L-34B43A08 --desired-value 64
 ```
 
+The quota is shared by every machine using the account. Before each launch, spotexec checks the live usage and shares the quota between the machines that have VMs in the region ([details](scaling.md#several-machines-one-spot-quota)). `spotexec status -A` shows each region's quota against what's using it.
+
+When the quota refuses a launch (`MaxSpotInstanceCountExceeded`), spotexec doesn't treat it as a capacity shortage and retry. Runs queue for the fleet's running VMs, and new launches wait until one of them ends or five minutes pass. With no VM running and no other runner in the pool, `sx` fails at once (exit 125) with the region, the vCPUs a launch needs and the increase command. It never falls back to on-demand unless you set `on_demand_fallback`.
+
 Small increases are usually approved within minutes to hours. Two features use on-demand instances, which count against the separate on-demand quota (`L-1216C47A`):
 - `on_demand_fallback`;
 - the `image bake` builder.
@@ -179,11 +229,27 @@ Small increases are usually approved within minutes to hours. Two features use o
 
 By default nothing needs setting up. spotexec launches into the region's **default VPC** and:
 - requests a public IPv4 address per instance (AWS bills public IPv4 addresses by the hour);
-- creates a `spotexec-ssh` security group allowing TCP 22 from `ssh_cidr`. The default is `0.0.0.0/0`, with key-only authentication; narrow it to your address when it's stable, for example `ssh_cidr = "203.0.113.4/32"`.
+- creates a `spotexec-ssh` security group allowing TCP 22 from `ssh_cidr`. The default is `0.0.0.0/0`, with key-only authentication (see [SSH exposure](#ssh-exposure) below).
 
 Your machine must be able to make outbound SSH connections (TCP 22) to EC2 public addresses. Some corporate networks block this.
 
 If the region has no default VPC, `spotexec setup` offers to create it. When that isn't possible (your organization blocks it, or you'd rather use your own network), set `subnet_id` to a **public** subnet: one whose route table sends `0.0.0.0/0` to an internet gateway. spotexec then creates its security group in that subnet's VPC, or uses `security_group_ids` if you set them. Those groups must allow inbound TCP 22 from your address, and outbound HTTP/HTTPS for packages, the S3 cache and ECR.
+
+### SSH exposure
+
+By default every runner VM accepts SSH on port 22 from anywhere (`ssh_cidr = "0.0.0.0/0"`). That is deliberate: laptops roam between networks and several machines can share a fleet, so a source-address allowlist would break routinely. What keeps it safe is how sshd is set up on every spotexec VM, whatever the AMI's defaults:
+- only public-key logins (`AuthenticationMethods publickey`; passwords, keyboard-interactive, host-based and GSSAPI logins are off);
+- only as the runner `user` (`AllowUsers`); root logins are refused (unless `user` is `root`, which then logs in with the key only);
+- the key is the one spotexec generated on your machine, injected at launch; no EC2 key pair is attached.
+
+These settings go in `/etc/ssh/sshd_config.d/00-spotexec.conf`, which sorts ahead of drop-ins like cloud-init's own; on an image whose `sshd_config` would still override it, they go at the top of `sshd_config` instead. A custom `ami` can still loosen sshd deliberately (a `Match` block, another `AllowUsers` entry): the VM then logs a warning to `/var/log/spotexec-bootstrap.log`.
+
+To restrict the source as well (for example in an account with Security Hub control EC2.13, which flags port 22 open to the world):
+- **A stable address:** set `ssh_cidr` to it, such as `ssh_cidr = "203.0.113.4/32"`. spotexec then manages a separate `spotexec-ssh-<hash>` group with that rule. Runs from anywhere else can't connect.
+- **A VPN or office range:** set `ssh_cidr` to that range.
+- **Your own rules:** create security groups yourself and set `security_group_ids`; spotexec then uses them as they are and creates none. They must allow inbound TCP 22 from wherever you run `sx`, and outbound HTTP/HTTPS.
+
+A changed `ssh_cidr` or `security_group_ids` applies to VMs launched afterwards. Run `spotexec down` to replace the ones already running (or change their security groups in the console).
 
 ## 7. Configure the runner
 
@@ -244,19 +310,22 @@ spotexec image bake aws2       # optional: snapshot the bootstrap for ~bare-boot
 spotexec down aws2             # or simply let it idle out
 ```
 
-If `up` fails, the error says why: a credential problem names the login command to run, a capacity error names the instance type, and a bootstrap failure prints the end of the bootstrap log.
+If `up` fails, the error says why: a credential problem names the login command to run, a capacity error names the instance type, and a bootstrap failure prints the end of the bootstrap log. A VM that `up` launched but couldn't get ready (or that you interrupted with Ctrl-C) is terminated rather than left to idle out; after a bootstrap failure, runs stop launching new VMs of that runner for an hour, or until you fix the script and run `spotexec down aws2`. A VM that did finish booting is left running for other runs (it idles out as usual).
 
 ## What gets created in your account
 
 | Resource | When | Cleanup |
 | --- | --- | --- |
-| IAM user `spotexec-<hostname>` (path `/spotexec/`) with an inline `spotexec` policy and one access key | `spotexec setup` | Delete the user in IAM; also remove the `[spotexec]` profile from `~/.aws/credentials`. |
+| IAM user `spotexec-<hostname>` (path `/spotexec/`) with an inline `spotexec` policy and one access key | `spotexec setup` | `spotexec setup --revoke <host>` for one machine ([revoking a machine](setup.md#revoking-a-machine)), or `spotexec teardown`. Then remove the `[spotexec]` profile from that machine's `~/.aws/credentials`. |
 | The region's default VPC | `spotexec setup`, only if the region had none | It's AWS's standard network and costs nothing; keep it. |
-| Spot instances tagged `spotexec-runner` / `spotexec-owner` | On demand | They terminate themselves; `spotexec down` terminates them now. |
-| Security group `spotexec-ssh` (`spotexec-ssh-<hash>` for a custom `ssh_cidr`, one per VPC) | First launch without `security_group_ids` | Delete by hand if you stop using spotexec. |
-| S3 bucket `spotexec-cache-<account>-<region>` | First run with `[deps]` (unless `cache_bucket = "off"`) | Objects expire after 14 days. |
-| ECR repositories `spotexec/<repo-id>` | First Dockerfile build | Keeps the newest 10 images. |
-| AMIs and snapshots | `spotexec image bake` | `spotexec image clear`. |
+| Spot instances tagged `spotexec-runner` / `spotexec-owner` | On demand | They terminate themselves; `spotexec down <runner>` (or `--all` for every fleet) terminates this machine's now, `spotexec down -A` every machine's. |
+| On-demand `image bake` builders tagged `spotexec-bake-runner` / `spotexec-owner` | `spotexec image bake` | Terminated when the bake ends. One left behind (stopped, or older than four hours) is terminated by `spotexec down <runner>` or the pool manager; `spotexec down -A` terminates any machine's builders at once. |
+| Security group `spotexec-ssh` (`spotexec-ssh-<hash>` for a custom `ssh_cidr`, one per VPC), tagged `spotexec-owner` | First launch without `security_group_ids` | `spotexec teardown` (below). |
+| S3 bucket `spotexec-cache-<account>-<region>` | First run with `[deps]` (unless `cache_bucket = "off"`) | Objects expire after 14 days; `spotexec teardown` deletes the bucket. |
+| ECR repositories `spotexec/<repo-id>` | First Dockerfile build | Keeps the newest 10 images; `spotexec teardown` deletes the repositories. |
+| AMIs and snapshots | `spotexec image bake` | `spotexec image clear`, or `spotexec teardown`. |
+
+To remove all of it at once, run `spotexec teardown` while signed in as an administrator. It searches every region enabled in the account (or those you pass with `--region`) and lists every instance, AMI, snapshot, security group, ECR repository, cache bucket and IAM user spotexec created, from any machine. It asks before deleting them (`--dry-run` only lists them; `--yes` skips the question). It then deactivates every machine's key, so nothing new is launched, terminates the VMs (including any launched in the meantime) and waits until they're gone before removing the rest. It reports anything it couldn't list or delete with a non-zero exit, so you can re-run it. It only touches resources with spotexec's tags or exact names: a `cache_bucket` you named yourself, a security group you made, an untagged snapshot or an IAM user outside `/spotexec/` is left alone. So are the default VPC and the Spot service-linked role. Delete `~/.config/spotexec` and the `[spotexec]` profile yourself.
 
 The SSH key is generated locally at `~/.config/spotexec/keys/id_ed25519` and injected through user-data, so no EC2 key pair is involved. Each instance gets its own `known_hosts` file, filled on first connect.
 
@@ -264,9 +333,9 @@ The SSH key is generated locally at `~/.config/spotexec/keys/id_ed25519` and inj
 
 The fleet shuts itself down without your laptop. One case is not covered: a VM whose kernel hangs before its timers fire. For a backstop that is fully independent of spotexec, add either of these to your account:
 - an **AWS Budgets** alert;
-- an **EventBridge** rule that terminates `spotexec-runner`-tagged instances older than N hours.
+- an **EventBridge** rule that terminates instances older than N hours that carry a `spotexec-runner` tag (fleet VMs) or a `spotexec-bake-runner` tag (`image bake` builders, which are on-demand).
 
-`spotexec status` lists pending and running instances only. Stopped instances (whose volumes still bill) don't appear there; `spotexec down` terminates them along with the rest.
+`spotexec status` lists pending and running instances only. Stopped instances (whose volumes still bill) don't appear there; `spotexec down` terminates them along with the rest. `spotexec status -A` lists every spotexec instance in any state but terminated, including `image bake` builders, and `spotexec down -A` terminates them. Both search the regions (and profiles) your AWS runners use, say which, and fail if a region couldn't be listed.
 
 ## The life of a Spot VM
 
@@ -274,7 +343,7 @@ The fleet shuts itself down without your laptop. One case is not covered: a VM w
 2. **Arm.** The user-data script's first action installs the idle watchdog (a systemd timer) plus an independent `max_lifetime` backstop. Only then does it authorize the SSH key and run your bootstrap scripts. `spotexec cloud-init <runner>` prints the exact script.
 3. **Bootstrap.** Your scripts run under the lifecycle lock, so a long setup can't be mistaken for idleness. If one fails, the VM is marked failed: it refuses work and returns `BOOTSTRAP_FAILED` with the tail of `/var/log/spotexec-bootstrap.log`. The fleet then stops launching for an hour instead of burning money on a broken script.
 4. **Serve.** Jobs acquire slots, and every session refreshes the activity clock.
-5. **Interruption.** On a Spot interruption notice the VM drains: running jobs continue and new ones are refused. The CLI starts finding replacement capacity right away. A job that finishes within the 2 minutes is used normally. A job whose VM disappears first is **replayed once** on the replacement: sync, deps, run and write-back. Nothing from the lost attempt was written locally. Rebalance recommendations are only reported, because EC2 often sends them the moment a VM boots, and draining on them makes a fleet churn.
+5. **Interruption.** On a Spot interruption notice the VM drains: running jobs continue and new ones are refused. The CLI starts finding replacement capacity right away. A job that finishes within the 2 minutes is used normally. A job whose VM disappears first, or whose command is killed by the VM shutting down, is **replayed once** on the replacement: sync, deps, run and write-back. Nothing from the lost attempt was written locally. Rebalance recommendations are only reported, because EC2 often sends them the moment a VM boots, and draining on them makes a fleet churn.
 6. **Exit.** After `idle_timeout` with no sessions, or immediately once a draining VM has no sessions, or at `max_lifetime`, the VM powers itself off, which terminates it.
 
 > **Replays and side effects.** A replayed command may already have run to completion the first time. Commands with outside effects (deploys, publishing) should dedupe on `SPOTEXEC_RUN_ID`, or run with `--no-retry`.
