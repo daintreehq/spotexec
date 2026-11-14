@@ -10,6 +10,7 @@ Every machine you run `sx` on needs three things:
 - [This machine](#this-machine)
 - [Choosing runners](#choosing-runners)
 - [More machines](#more-machines)
+- [Managing your machines](#managing-your-machines)
 - [Credentials and keys](#credentials-and-keys)
 - [Options](#options)
 
@@ -24,12 +25,15 @@ spotexec setup
 
 1. **Runner config.** If `~/.config/spotexec/config.toml` doesn't exist, setup writes a starting one with a single `aws` runner in your AWS CLI's default region. An existing config is left as it is.
 2. **AWS access**, for each `aws-spot` runner. Setup shows what it's about to do and asks before changing anything, then:
-   - creates an IAM user for this machine, `spotexec-<hostname>` (path `/spotexec/`, tagged `spotexec-managed`), with only [spotexec's permissions](aws.md#3-grant-permissions) as an inline policy;
+   - creates an IAM user for this machine, `spotexec-<hostname>` (path `/spotexec/`), with only [spotexec's permissions](aws.md#3-grant-permissions) as an inline policy. The user is tagged with this machine's permanent ID, so two Macs that share a hostname each get their own user (the second gets a suffix), and a machine whose hostname changes keeps its user;
    - creates an access key for that user and saves it as the AWS CLI profile `spotexec` (`~/.aws/credentials`, mode 600, with the region in `~/.aws/config`). It waits until the key works and checks that nothing else in `~/.aws` overrides it, then deletes any older keys the user has;
    - sets `profile = "spotexec"` on your AWS runners;
    - prepares the account: it creates the EC2 Spot service-linked role and, if the runner's region has no default VPC (common in older accounts), the default VPC. That's AWS's standard network and costs nothing; `--no-vpc` skips it;
    - checks your Spot vCPU quota against what your runners may use, and prints the command to raise it if it's too low.
-3. **Other machines.** In a terminal, setup then lists the machines it can find and asks which ones to set up too; see [More machines](#more-machines).
+
+   With runners in several regions, the network and quota checks cover each region.
+3. **The Claude Code hook.** If Claude Code is on this machine, setup offers to install its hook for all your projects, so agents' heavy commands run on your runners (see [coding agents](agents.md#claude-code-hook)). The hook only acts in projects with a `.spotexec.toml`. `--no-hooks` skips this.
+4. **Other machines.** In a terminal, setup then lists the machines it can find and asks which ones to set up too; see [More machines](#more-machines).
 
 From then on spotexec uses its own key. Your `aws login` or SSO session can expire without it noticing, so you sign in again only to change the setup.
 
@@ -97,28 +101,55 @@ Name the machines, and setup runs on each of them after this one:
 spotexec setup studio-01.local studio-02.local me@build-box
 ```
 
-Or run `spotexec setup` on its own in a terminal and pick from the machines it finds: Macs with Remote Login on your network (Bonjour, or avahi on Linux) and the `Host` entries in `~/.ssh/config`.
+Or run `spotexec setup` on its own in a terminal and pick from the machines it finds: the ones set up from here before, Macs with Remote Login on your network (Bonjour, or avahi on Linux), and the `Host` entries in `~/.ssh/config`.
 
 ```console
 Set up other machines too? spotexec installs itself there over SSH, copies this config, and gives each machine its own AWS key.
-Found on your network and in ~/.ssh/config:
-   1. studio-01.local
+Found on your network, in ~/.ssh/config, and set up before:
+   1. studio-01.local   (set up Nov 14, spotexec 0.3.0)
    2. studio-02.local
    3. mini-01.local
 Numbers, `all`, or host names, separated by spaces (Enter to skip): 1 2
 ```
 
-For each machine, over one SSH connection (any SSH destination works, including `user@host` and `~/.ssh/config` aliases; key login is easiest, but a password prompt is fine):
+Machines are set up four at a time, and each one's output is printed as a block when it finishes. For each machine, over one SSH connection (any SSH destination works, including `user@host` and `~/.ssh/config` aliases; key login is easiest, but a password prompt is fine):
 
 1. **Installs spotexec.** With Homebrew there, it runs `brew install daintreehq/tap/spotexec`, or `brew upgrade` if spotexec is already installed. Without Homebrew, or when Homebrew refuses (for example because the machine's Xcode Command Line Tools are out of date), it downloads the latest release binary into `~/.local/bin` instead, and says how to add that to `PATH` if it isn't there. `--install brew|release|copy|none` picks the method; `copy` sends this machine's own binary, for a machine of the same OS and architecture.
 2. **Copies the runner config** to `~/.config/spotexec/config.toml` there. A different existing config is first saved as `config.toml.bak-<time>`.
-3. **Sets up AWS access**, for configs with AWS runners. It runs `spotexec setup` on that machine using your AWS sign-in here. The temporary credentials go over the SSH connection's input, so they never appear in a command line and are never saved there. That machine gets **its own** IAM user, `spotexec-<its hostname>`, and key. It also gets the same checks as this one.
+3. **Runs `spotexec setup` there.** For configs with AWS runners, it uses your AWS sign-in here. The temporary credentials go over the SSH connection's input, so they never appear in a command line and are never saved there. That machine gets **its own** IAM user, `spotexec-<its hostname>`, and key, and the same checks as this one. It also gets the Claude Code hook if this machine has it.
 
 These stay separate on each machine:
 - **IAM users and keys.** Retiring or losing a machine means deleting just that one user ([revoking a machine](#revoking-a-machine)).
-- **The SSH key and owner ID** in `~/.config/spotexec/`. Each machine launches and manages its own VMs and never touches another's; see [Known limits](architecture.md#known-limits).
+- **The SSH key and owner ID** in `~/.config/spotexec/`. Each machine launches and manages its own VMs, and its runs never touch another's; see [Known limits](architecture.md#known-limits). Baked images are shared ([baked images](environments.md#baked-images)), and `spotexec status -A` shows every machine's VMs.
 
-To push a config change everywhere, edit it here and run `spotexec setup` again with the same hosts. Each machine gets the new config, its spotexec is upgraded, and its working key is kept. Setting up a machine's AWS access needs a current AWS sign-in on this machine (run `aws login` first if it has expired). Machines already set up keep working without one.
+## Managing your machines
+
+Every machine set up from here is remembered in `~/.config/spotexec/machines.toml`.
+
+**Update them all** after editing the config or upgrading spotexec here:
+
+```sh
+spotexec setup --all
+```
+
+Each machine gets the new config, its spotexec is upgraded to the latest release, its IAM policy is refreshed, and its working key is kept. Creating a key for a new machine needs a current AWS sign-in here (run `aws login` first if it has expired); machines that already have a key are updated without one.
+
+**See them all:**
+
+```console
+$ spotexec setup --list
+IAM USER                           HOST       KEY                KEY CREATED       LAST USED         VMS
+spotexec-studio-01                 studio-01  AKIA…AJTC          2026-11-14 08:01  2026-11-14 11:20  2
+spotexec-studio-02                 studio-02  AKIA…BJS3          2026-11-14 08:19  2026-11-14 11:18  1
+spotexec-gregs-mac (this machine)  gregs-mac  AKIA…YEAW          2026-11-14 07:55  2026-11-14 11:21  0
+```
+
+```sh
+spotexec status -A                      # every spotexec VM in the account, by machine
+spotexec down -A --machine studio-02    # stop one machine's VMs (asks first)
+```
+
+`setup --list` and `--revoke` need an administrator's AWS sign-in; `status -A` and `down -A` work with the machine's own key.
 
 ## Credentials and keys
 
@@ -131,11 +162,15 @@ To push a config change everywhere, edit it here and run `spotexec setup` again 
 
 **Rotating the key.** `spotexec setup --rotate` creates a new key, verifies it, saves it, then deletes the old one.
 
-**Seeing every machine.** `aws iam list-users --path-prefix /spotexec/` lists the users spotexec created, one per machine.
-
 ### Revoking a machine
 
-Delete the machine's user. Its key stops working at once; its VMs terminate themselves when they go idle, or you can terminate them from the EC2 console (filter by tag `spotexec-runner`).
+```sh
+spotexec setup --revoke studio-01       # or the IAM user name, spotexec-studio-01
+```
+
+This deletes the machine's access keys, its policy and its IAM user, so its key stops working at once. It also terminates the machine's VMs and removes it from the machine list. On the machine itself, you can then delete the `[spotexec]` section of `~/.aws/credentials` and `[profile spotexec]` in `~/.aws/config`.
+
+By hand, the equivalent is:
 
 ```sh
 U=spotexec-studio-01
@@ -146,8 +181,6 @@ aws iam delete-user-policy --user-name "$U" --policy-name spotexec
 aws iam delete-user --user-name "$U"
 ```
 
-On the machine itself, remove the `[spotexec]` section from `~/.aws/credentials` and `[profile spotexec]` from `~/.aws/config`.
-
 ### Without a long-lived key
 
 To keep no key on disk, skip the AWS step (`spotexec setup --skip-aws`) and sign in with IAM Identity Center ([AWS guide, step 2A](aws.md#2-sign-in)), with the [policy](aws.md#3-grant-permissions) on your permission set. spotexec then works for as long as your SSO session lasts.
@@ -157,6 +190,10 @@ To keep no key on disk, skip the AWS step (`spotexec setup --skip-aws`) and sign
 | Flag | Effect |
 | --- | --- |
 | `[host...]` | Also set up these machines over SSH. |
+| `--all` | Also update every machine set up from here before. |
+| `--list` | List every machine's IAM user, key, last use and VMs, and exit. |
+| `--revoke HOST` | Delete a machine's IAM user and keys and terminate its VMs, and exit. |
+| `--no-hooks` | Don't install the Claude Code hook. |
 | `--yes`, `-y` | Don't ask for confirmation, and don't offer to set up other machines. |
 | `--install auto\|brew\|release\|copy\|none` | How to install spotexec on other machines (default `auto`: Homebrew if it's there, else the release binary). |
 | `--admin-profile NAME` | The AWS profile to create users with (default: `AWS_PROFILE`, then `default`). |

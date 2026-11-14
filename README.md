@@ -76,6 +76,7 @@ spotexec setup             # writes the runner config and gives this machine its
 
 ```sh
 spotexec setup studio-01.local studio-02.local   # install, copy the config and create a key on each, over SSH
+spotexec setup --all                              # later: push config changes and upgrades to all of them
 ```
 
 Have a Linux box or a spare Mac instead of (or as well as) AWS? Add it as an [SSH runner](docs/setup.md#choosing-runners).
