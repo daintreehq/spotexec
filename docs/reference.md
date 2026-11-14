@@ -3,7 +3,7 @@
 
 ```
 sx [flags] <command...>                      sync, run remotely, write back
-sx [flags] <task> [args...]                  named task; parallel tasks fan out across slots
+sx [flags] <task> [args...]                  named task; parallel and sharded tasks fan out across slots
 sx [flags] -- <command...>                   the command, even if a task has its name
 spotexec run [flags] -- <cmd>                the same as sx --: <cmd> is never a task
 sx --same-slot [flags] <cmd>                 run in this worktree's last slot (same VM)

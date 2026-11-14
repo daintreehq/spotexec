@@ -137,12 +137,29 @@ type Deps struct {
 type Task struct {
 	Run       string   `toml:"run"`
 	Parallel  []string `toml:"parallel"`
+	Shards    int      `toml:"shards"`
 	FailFast  bool     `toml:"fail_fast"`
 	Timeout   Duration `toml:"timeout"`
 	Exclusive bool     `toml:"exclusive"`
 	Sync      string   `toml:"sync"`
 	Pool      []string `toml:"pool"`
 	Priority  int      `toml:"priority"`
+}
+
+// MaxShards bounds a task's shards: past it, a typo would launch a fleet.
+const MaxShards = 64
+
+// Describe says what a task runs, for task lists and completions.
+func (t *Task) Describe() string {
+	switch {
+	case len(t.Parallel) > 0:
+		return "parallel: " + strings.Join(t.Parallel, ", ")
+	case t.Shards == 1:
+		return "1 shard: " + t.Run
+	case t.Shards > 1:
+		return fmt.Sprintf("%d shards: %s", t.Shards, t.Run)
+	}
+	return t.Run
 }
 
 // Container is [container]: run every command (and the dependency install)
@@ -641,6 +658,16 @@ func (p *Project) validate() error {
 		}
 		if (t.Run == "") == (len(t.Parallel) == 0) {
 			return fmt.Errorf("task %q must set exactly one of run or parallel", name)
+		}
+		if t.Shards != 0 || p.md.IsDefined("tasks", name, "shards") {
+			if len(t.Parallel) > 0 {
+				return fmt.Errorf("task %q: shards applies to a run task, not a parallel one (shard the tasks it lists instead)", name)
+			}
+			if t.Shards < 1 || t.Shards > MaxShards {
+				return fmt.Errorf("task %q: shards must be between 1 and %d (got %d)", name, MaxShards, t.Shards)
+			}
+		} else if strings.Contains(t.Run, "{shard}") || strings.Contains(t.Run, "{shards}") {
+			return fmt.Errorf("task %q: {shard} and {shards} need shards = N on the task", name)
 		}
 		for _, sub := range t.Parallel {
 			st, ok := p.Tasks[sub]

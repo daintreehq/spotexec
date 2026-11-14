@@ -53,6 +53,9 @@ func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Opt
 	for k, v := range l.cfg.Project.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
+	for k, v := range o.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
 	cmd.Env = append(cmd.Env, "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	grace := o.Grace

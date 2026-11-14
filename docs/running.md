@@ -27,7 +27,7 @@ sx --same-slot pnpm test                       # same VM, so libvips is there
 
 If that VM is gone (or `max_slots` has since dropped below that slot's number), `--same-slot` fails (exit `125`) and says so, rather than running somewhere the package isn't installed. So does `--same-slot` with a `--runner` or `--pool` that leaves out the runner it would return to. For anything you'd need on every VM, put it in the [project container](environments.md#project-containers) or the runner's `bootstrap_script`. In a project container, every run starts a fresh container: files in the workspace and `$HOME` carry over to the next `--same-slot` run, but system packages don't (spotexec warns `CONTAINER_FRESH`), so add them to the Dockerfile. Set `SPOTEXEC_SAME_SLOT=1` to make every `sx` in a shell behave this way.
 
-A parallel task's parts run in several slots at once, so `--same-slot` can't apply to the task itself. Afterwards, `--same-slot` returns to the slot of its first part (in `parallel` order) that got its files synced and its container image, if any, ready; that's the same point at which a single run becomes the one `--same-slot` returns to.
+A parallel or sharded task's parts run in several slots at once, so `--same-slot` can't apply to the task itself. Afterwards, `--same-slot` returns to the slot of its first part (in `parallel` order, shard 1 first) that got its files synced and its container image, if any, ready; that's the same point at which a single run becomes the one `--same-slot` returns to.
 
 `--same-slot --sync none` skips the sync and the write-back, and runs on whatever is in the slot, for poking around after a failure. `spotexec exec -- <command>` is the same as `sx --same-slot --sync none -- <command>`.
 
@@ -47,7 +47,7 @@ A parallel task's parts run in several slots at once, so `--same-slot` can't app
 | `--pull GLOB` | Also copy these gitignored paths back (repeatable). |
 | `--no-deps` | Skip dependency hydration. |
 | `--no-retry` | Don't replay the run if its VM is lost. |
-| `--fallback-local` | Run locally if no runner could be reached (never after the command started remotely). It runs as on a runner: under `bash` in its own process group, with stdin from `/dev/null`, the same `--timeout` (exit `124`) and grace period, and Ctrl-C, `SIGTERM` or `SIGHUP` stopping it (exit `130`). Each part of a parallel task falls back on its own, with its own `SPOTEXEC_SLOT` and port range. |
+| `--fallback-local` | Run locally if no runner could be reached (never after the command started remotely). It runs as on a runner: under `bash` in its own process group, with stdin from `/dev/null`, the same `--timeout` (exit `124`) and grace period, and Ctrl-C, `SIGTERM` or `SIGHUP` stopping it (exit `130`). Each part of a parallel or sharded task falls back on its own, with its own `SPOTEXEC_SLOT` and port range. |
 | `--force-large-sync` | Allow syncing more than 100k files or 5 GiB. |
 | `--json` / `--pretty` / `-q, --quiet` | Progress format: NDJSON events, the spinner (even without a terminal), or warnings only (no progress or summary). `-q` wins over `--json`, and `--json` over `--pretty`. Without them you get the spinner at a terminal and one plain summary line otherwise, or NDJSON with `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1` (`-q`, `--json`, `--pretty` and `--json=false` override those). |
 | `--events-file PATH` | Also append NDJSON events to a file. |
@@ -66,6 +66,7 @@ Every command gets:
 | `SPOTEXEC_PORT_BASE` | `20000 + slot × 1000`. Bind test servers here and parallel jobs never collide. |
 | `SPOTEXEC_CPUS` | This job's share: vCPUs ÷ slots, or all of them with `--exclusive`. |
 | `SPOTEXEC_SLOTS` | Slots per machine. |
+| `SPOTEXEC_SHARD`, `SPOTEXEC_SHARDS` | Only in a [sharded task](configuration.md#tasks): this part's number (from 1) and the number of parts, the same as `{shard}` and `{shards}`. |
 | `SPOTEXEC_RUN_ID`, `SPOTEXEC_ATTEMPT` | Stable across a replay; `SPOTEXEC_ATTEMPT` is `2` on the replay. |
 | `COMPOSE_PROJECT_NAME` | `sx_<repo>_sNN`, so Docker Compose stacks don't collide. |
 | `FORCE_COLOR`, `CLICOLOR_FORCE` | Set when your stdout is a terminal. |
@@ -78,7 +79,7 @@ Plus anything in `env_allow` (copied from your environment) and `env` (fixed val
 | --- | --- |
 | *command's own* | The remote command's exit status, passed through. |
 | `124` | The command hit `--timeout`. |
-| `125` | spotexec itself failed: no runner, SSH, sync, bootstrap, or the runner couldn't start the command at all. In a parallel task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". |
+| `125` | spotexec itself failed: no runner, SSH, sync, bootstrap, or the runner couldn't start the command at all. In a parallel or sharded task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". |
 | `128+N` | The command died from signal N. |
 | `130` | Interrupted (Ctrl-C, `SIGTERM` or `SIGHUP`), even if the command caught the signal and exited `0`. An interrupted run never counts as a success for `writeback = "on-success"`. |
 

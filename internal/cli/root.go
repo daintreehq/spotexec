@@ -226,12 +226,7 @@ func cmdTasks() *cobra.Command {
 				return nil
 			}
 			for _, n := range names {
-				t := l.cfg.Project.Tasks[n]
-				if len(t.Parallel) > 0 {
-					fmt.Printf("%-16s parallel: %s\n", n, strings.Join(t.Parallel, ", "))
-				} else {
-					fmt.Printf("%-16s %s\n", n, t.Run)
-				}
+				fmt.Printf("%-16s %s\n", n, l.cfg.Project.Tasks[n].Describe())
 			}
 			return nil
 		},
@@ -302,12 +297,7 @@ doctor, down, …); see spotexec -h.
 		sort.Strings(names)
 		fmt.Println("\nTasks in this project:")
 		for _, n := range names {
-			t := l.cfg.Project.Tasks[n]
-			what := t.Run
-			if len(t.Parallel) > 0 {
-				what = "parallel: " + strings.Join(t.Parallel, ", ")
-			}
-			fmt.Printf("  %-18s %s\n", n, what)
+			fmt.Printf("  %-18s %s\n", n, l.cfg.Project.Tasks[n].Describe())
 		}
 	}
 }

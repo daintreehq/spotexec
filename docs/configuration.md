@@ -168,10 +168,26 @@ when_load_above = 0.6          # agents offload only when the laptop is busy
 | Key | Meaning |
 | --- | --- |
 | `run` | Shell command. `{args}` (as its own word, or `"{args}"`) becomes the arguments after the task name, passed as `"$@"`; without it they are appended. |
-| `parallel` | Names of other (non-parallel) tasks to run at once, each in its own slot. Extra arguments are not forwarded. |
-| `fail_fast` | Stop the remaining parallel tasks when one fails. |
+| `parallel` | Names of other (non-parallel) tasks to run at once, each in its own slot. A sharded task named here fans out into its shards. Extra arguments are not forwarded. |
+| `shards` | Run a `run` task as this many parts at once (1 to 64), each in its own slot, like a parallel task's parts. In the command, `{shard}` becomes the part's number (from 1) and `{shards}` the count; each part also gets `SPOTEXEC_SHARD` and `SPOTEXEC_SHARDS`. Extra arguments go to every shard. |
+| `fail_fast` | Stop the remaining parts of a parallel or sharded task when one fails. In a parallel task, its own setting covers every part, shards included. |
 | `timeout`, `sync`, `exclusive` | Per-task overrides of the run flags. |
 | `pool`, `priority` | Send this task to a different fleet, or move it ahead in the queue. |
+
+A sharded task splits one command across the fleet, for test runners that take a shard option:
+
+```toml
+[tasks.test-all]
+run = "npx vitest run --maxWorkers=$SPOTEXEC_CPUS --shard={shard}/{shards} {args}"
+shards = 8
+timeout = "30m"
+fail_fast = false
+
+[tasks.ci]
+parallel = ["test-all", "lint"]   # 8 shards and lint, 9 parts at once
+```
+
+`sx test-all` runs eight parts, prefixed `[test-all 1/8]` to `[test-all 8/8]`, and exits as a parallel task does; `sx test-all --bail=1` passes `--bail=1` to all eight. With `--json`, each part's events carry `"shard"` and `"shards"` beside `"task"`, and the final `result` event has `"shards"`. Using `{shard}` or `{shards}` without `shards` is a config error, as is `shards` on a parallel task. With `shards = 1` the task is an ordinary run (so `--same-slot` applies), with `{shard}` and `{shards}` both `1`.
 
 `sx <task>` runs any task, even one named like a spotexec subcommand: `sx sync` runs a task called `sync`. Only `spotexec <task>` gives subcommands precedence, so `spotexec sync` still means the subcommand. A task also wins over a program of the same name; `sx -- <name>` and `spotexec run -- <name>` skip the tasks and run the program. `spotexec tasks` lists them.
 

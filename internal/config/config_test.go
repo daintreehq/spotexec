@@ -241,3 +241,54 @@ func TestProjectCannotSetRegions(t *testing.T) {
 		t.Fatal("extending must copy the region list")
 	}
 }
+
+func TestTaskShards(t *testing.T) {
+	load := func(tasks string) (*Project, error) {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		if err := os.WriteFile(pp, []byte(tasks), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return LoadProject(pp)
+	}
+	p, err := load(`
+[tasks.unit]
+run = "npx vitest run --shard={shard}/{shards} {args}"
+shards = 8
+[tasks.env-only]
+run = "./test.sh"
+shards = 2
+[tasks.all]
+parallel = ["unit", "lint"]
+[tasks.lint]
+run = "eslint ."
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Tasks["unit"].Describe(); got != "8 shards: npx vitest run --shard={shard}/{shards} {args}" {
+		t.Errorf("Describe: %q", got)
+	}
+	if got := p.Tasks["all"].Describe(); got != "parallel: unit, lint" {
+		t.Errorf("Describe: %q", got)
+	}
+	if got := p.Tasks["lint"].Describe(); got != "eslint ." {
+		t.Errorf("Describe: %q", got)
+	}
+	for tasks, want := range map[string]string{
+		"[tasks.a]\nrun = \"x\"\nshards = 0\n":                                                   "shards must be between 1 and 64 (got 0)",
+		"[tasks.a]\nrun = \"x\"\nshards = -2\n":                                                  "shards must be between 1 and 64",
+		"[tasks.a]\nrun = \"x\"\nshards = 65\n":                                                  "shards must be between 1 and 64 (got 65)",
+		"[tasks.a]\nparallel = [\"b\"]\nshards = 2\n[tasks.b]\nrun = \"x\"\n":                    "shards applies to a run task, not a parallel one",
+		"[tasks.a]\nrun = \"vitest --shard={shard}/8\"\n":                                        "{shard} and {shards} need shards = N",
+		"[tasks.a]\nrun = \"echo {shards}\"\n":                                                   "{shard} and {shards} need shards = N",
+		"[tasks.a]\nshards = 2\n":                                                                "must set exactly one of run or parallel",
+		"[tasks.a]\nparallel = [\"b\"]\n[tasks.b]\nparallel = [\"c\"]\n[tasks.c]\nrun = \"x\"\n": "nested parallel task",
+	} {
+		if _, err := load(tasks); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", tasks, err, want)
+		}
+	}
+	if p, err := load("[tasks.a]\nrun = \"x {shard}\"\nshards = 1\n"); err != nil || p.Tasks["a"].Describe() != "1 shard: x {shard}" {
+		t.Errorf("one shard: %v", err)
+	}
+}

@@ -335,7 +335,8 @@ type runSpec struct {
 	priority   int
 	preferLast bool
 	syncOnly   bool
-	waitPush   bool // container build: push a fresh image before returning
+	env        map[string]string // set for the command (a shard's number)
+	waitPush   bool              // container build: push a fresh image before returning
 }
 
 // pinnedSync: spotexec sync and container build always sync, and exec
@@ -366,6 +367,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 		ForceLargeSync: f.forceLarge, Stdout: stdout, Stderr: stderr, Rep: rep, Interrupt: intr,
 		Label: s.label, RetryPreempt: !f.noRetry, NoBoot: f.noBoot,
 		PreferLast: s.preferLast, SyncOnly: s.syncOnly, WaitPush: s.waitPush, Priority: s.priority,
+		Env: s.env,
 	}
 	if f.prioritySet {
 		o.Priority = f.priority
@@ -515,13 +517,64 @@ func taskCommand(run string, args []string) string {
 	return "set -- " + strings.Join(q, " ") + "\n" + body
 }
 
-// runTask executes a named task (possibly a parallel fan-out).
+// taskPart is one run of a task's fan-out: a task of a parallel task, or
+// one shard of a sharded task.
+type taskPart struct {
+	name          string // the task
+	label         string // output prefix and summaries: "test" or "test 3/8"
+	shard, shards int    // 1-based; 0 when not sharded
+	t             *config.Task
+	args          []string
+}
+
+// taskParts expands a task into the runs it fans out to: each task of a
+// parallel task (a sharded one into its shards), or each shard. Only a
+// sharded task's own arguments reach its shards.
+func taskParts(p *config.Project, name string, args []string) []taskPart {
+	t := p.Tasks[name]
+	if len(t.Parallel) == 0 {
+		return shardParts(name, t, args)
+	}
+	var parts []taskPart
+	for _, sub := range t.Parallel {
+		parts = append(parts, shardParts(sub, p.Tasks[sub], nil)...)
+	}
+	return parts
+}
+
+func shardParts(name string, t *config.Task, args []string) []taskPart {
+	if t.Shards == 0 {
+		return []taskPart{{name: name, label: name, t: t, args: args}}
+	}
+	parts := make([]taskPart, t.Shards)
+	for i := range parts {
+		parts[i] = taskPart{name: name, label: fmt.Sprintf("%s %d/%d", name, i+1, t.Shards), shard: i + 1, shards: t.Shards, t: t, args: args}
+	}
+	return parts
+}
+
+// spec builds the part's run: {shard} and {shards} substituted, and
+// SPOTEXEC_SHARD / SPOTEXEC_SHARDS in its environment.
+func (pt taskPart) spec(l *loaded) runSpec {
+	run := pt.t.Run
+	var env map[string]string
+	if pt.shards > 0 {
+		run = strings.NewReplacer("{shard}", strconv.Itoa(pt.shard), "{shards}", strconv.Itoa(pt.shards)).Replace(run)
+		env = map[string]string{"SPOTEXEC_SHARD": strconv.Itoa(pt.shard), "SPOTEXEC_SHARDS": strconv.Itoa(pt.shards)}
+	}
+	cmd := buildTaskLine(l, run, pt.args)
+	t := pt.t
+	return runSpec{label: pt.label, command: cmd, display: pt.label + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool, priority: t.Priority, env: env}
+}
+
+// runTask executes a named task (possibly a parallel or sharded fan-out).
 func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	t := l.cfg.Project.Tasks[name]
 	defer waitLaunches()
-	if len(t.Parallel) == 0 {
-		cmd := buildTaskLine(l, t.Run, args)
-		return f.execute(l, runSpec{label: name, command: cmd, display: name + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool, priority: t.Priority})
+	parts := taskParts(l.cfg.Project, name, args)
+	if len(t.Parallel) == 0 && len(parts) == 1 {
+		// A plain task, or one with a single shard: an ordinary run.
+		return f.execute(l, parts[0].spec(l))
 	}
 	f.applyEnv()
 	if err := f.validate(); err != nil {
@@ -529,10 +582,14 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		return client.ExitInfra
 	}
 	if f.sameSlot {
-		fmt.Fprintf(os.Stderr, "spotexec: --same-slot can't apply to %s: it's a parallel task, whose parts run on several slots at once\n", name)
+		if len(t.Parallel) > 0 {
+			fmt.Fprintf(os.Stderr, "spotexec: --same-slot can't apply to %s: it's a parallel task, whose parts run on several slots at once\n", name)
+		} else {
+			fmt.Fprintf(os.Stderr, "spotexec: --same-slot can't apply to %s: it's a sharded task, whose %d shards run on several slots at once\n", name, t.Shards)
+		}
 		return client.ExitInfra
 	}
-	if len(args) > 0 {
+	if len(args) > 0 && len(t.Parallel) > 0 {
 		fmt.Fprintf(os.Stderr, "spotexec: %s is a parallel task (%s), so it can't take extra arguments; run a part on its own: sx %s %s\n", name, strings.Join(t.Parallel, ", "), t.Parallel[0], strings.Join(args, " "))
 		return client.ExitInfra
 	}
@@ -544,19 +601,19 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	ctx, intr, stop := signals()
 	defer stop()
 	var mu sync.Mutex
-	codes := make([]int, len(t.Parallel))
-	// Each subtask gets its own context, so fail_fast can stop siblings that
+	codes := make([]int, len(parts))
+	// Each part gets its own context, so fail_fast can stop siblings that
 	// are still queued, syncing or installing (not only running ones).
-	subCtx := make([]context.Context, len(t.Parallel))
-	subCancel := make([]context.CancelFunc, len(t.Parallel))
-	for i := range t.Parallel {
+	subCtx := make([]context.Context, len(parts))
+	subCancel := make([]context.CancelFunc, len(parts))
+	for i := range parts {
 		subCtx[i], subCancel[i] = context.WithCancel(ctx)
 		defer subCancel[i]()
 	}
-	stopped := make([]bool, len(t.Parallel)) // cancelled by fail_fast
-	records := make([]*client.LastRun, len(t.Parallel))
-	done := make([]bool, len(t.Parallel))
-	intrs := make([]chan struct{}, len(t.Parallel))
+	stopped := make([]bool, len(parts)) // cancelled by fail_fast
+	records := make([]*client.LastRun, len(parts))
+	done := make([]bool, len(parts))
+	intrs := make([]chan struct{}, len(parts))
 	for i := range intrs {
 		intrs[i] = make(chan struct{}, 4)
 	}
@@ -573,16 +630,13 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	failOnce := sync.Once{}
 	var wg sync.WaitGroup
 	start := time.Now()
-	for i, sub := range t.Parallel {
-		st := l.cfg.Project.Tasks[sub]
+	for i, part := range parts {
 		wg.Add(1)
-		go func(i int, sub string, st *config.Task) {
+		go func(i int, part taskPart) {
 			defer wg.Done()
-			sr := &taskReporter{Reporter: rep, task: sub}
-			prefix := fmt.Sprintf("[%s] ", sub)
-			cmd := buildTaskLine(l, st.Run, nil)
-			spec := runSpec{label: sub, command: cmd, display: sub + ": " + cmd, timeout: st.Timeout.Duration, sync: st.Sync, exclusive: st.Exclusive, pool: st.Pool, priority: st.Priority}
-			o := f.options(l, spec, sr, intrs[i], ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu))
+			sr := &taskReporter{Reporter: rep, task: part.name, shard: part.shard, shards: part.shards}
+			prefix := fmt.Sprintf("[%s] ", part.label)
+			o := f.options(l, part.spec(l), sr, intrs[i], ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu))
 			// Parts race to sync: which one saves the last-run record is
 			// decided below, once they are all done.
 			o.DeferLastRun = true
@@ -593,8 +647,8 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 				where = fmt.Sprintf(" on %s#%d", res.Runner, res.Slot)
 			}
 			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
-				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, sub)
-				code, err, where = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(t.Parallel)), nil, " locally"
+				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, part.label)
+				code, err, where = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(parts)), nil, " locally"
 			}
 			if err != nil {
 				code = client.ExitInfra
@@ -616,7 +670,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 					fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
 				}
 			}
-			summary := fmt.Sprintf("%s · %s%s", sub, ui.Dur(took), where)
+			summary := fmt.Sprintf("%s · %s%s", part.label, ui.Dur(took), where)
 			if code != 0 {
 				summary += fmt.Sprintf(" · exit %d", code)
 			}
@@ -642,7 +696,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 					}
 				})
 			}
-		}(i, sub, st)
+		}(i, part)
 	}
 	wg.Wait()
 	saveFirstLastRun(l.ws, records)
@@ -660,12 +714,19 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	if ctx.Err() != nil {
 		exit = 130
 	}
-	rep.Event("result", map[string]any{"task": name, "exit_code": exit, "duration_ms": time.Since(start).Milliseconds(), "parallel": t.Parallel})
+	result := map[string]any{"task": name, "exit_code": exit, "duration_ms": time.Since(start).Milliseconds()}
+	if len(t.Parallel) > 0 {
+		result["parallel"] = t.Parallel
+	} else {
+		result["shards"] = t.Shards
+	}
+	rep.Event("result", result)
 	return exit
 }
 
-// saveFirstLastRun makes --same-slot after a parallel task predictable: it
-// returns to the first part, in `parallel` order, that recorded where it ran
+// saveFirstLastRun makes --same-slot after a parallel or sharded task
+// predictable: it returns to the first part, in `parallel` order (shard 1
+// first), that recorded where it ran
 // (as a single run does once synced, with its container image ready).
 func saveFirstLastRun(ws *client.Workspace, records []*client.LastRun) {
 	for _, r := range records {
@@ -680,15 +741,19 @@ func buildTaskLine(l *loaded, run string, args []string) string {
 	return buildCommand(l.ws, []string{taskCommand(run, args)})
 }
 
-// taskReporter tags events with the task name and suppresses the spinner
-// (several tasks share one terminal).
+// taskReporter tags events with the task name (and a shard's number) and
+// suppresses the spinner (several tasks share one terminal).
 type taskReporter struct {
 	ui.Reporter
-	task string
+	task          string
+	shard, shards int
 }
 
 func (t *taskReporter) Event(name string, fields map[string]any) {
 	m := map[string]any{"task": t.task}
+	if t.shards > 0 {
+		m["shard"], m["shards"] = t.shard, t.shards
+	}
 	for k, v := range fields {
 		m[k] = v
 	}

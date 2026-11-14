@@ -33,7 +33,7 @@ takes part in scheduling, and every VM shuts itself down.
      to) is less than 10 minutes old, the instance it names is tried first
      instead, since its slot still holds the worktree's files and build
      caches. A run is recorded once its files are synced and its container
-     image is ready; a parallel task, once it finishes; a `--sync none` run,
+     image is ready; a parallel or sharded task, once it finishes; a `--sync none` run,
      never. After that, work goes back to the oldest instances.
    - An instance that refuses with `RUNNER_DRAINING` is marked draining and
      skipped.
