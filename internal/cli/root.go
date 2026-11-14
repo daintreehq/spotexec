@@ -52,16 +52,22 @@ func MainAs(name string, args []string) int {
 		fs.Usage = func() {}
 		f.register(fs)
 		fs.SetOutput(nopWriter{})
-		if err := fs.Parse(args); err == nil {
-			rest := fs.Args()
-			dashed := fs.ArgsLenAtDash() == 0
-			if len(rest) > 0 && (dashed || !subcommands[rest[0]]) {
-				return shorthand(&f, rest, dashed)
-			}
-			if len(rest) == 0 && fs.NFlag() > 0 {
-				fmt.Fprintln(os.Stderr, "spotexec: missing command")
-				return 2
-			}
+		err := fs.Parse(args)
+		// Only run flags come before the first word here (subcommands take
+		// their flags after their name), so a parse failure is a mistake in
+		// a run: like sx and spotexec run, it exits 125, not Cobra's 1.
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "spotexec: %v (spotexec run -h lists the run flags)\n", err)
+			return client.ExitInfra
+		}
+		rest := fs.Args()
+		dashed := fs.ArgsLenAtDash() == 0
+		if len(rest) > 0 && (dashed || !subcommands[rest[0]]) {
+			return shorthand(&f, rest, dashed)
+		}
+		if len(rest) == 0 && fs.NFlag() > 0 {
+			fmt.Fprintln(os.Stderr, "spotexec: missing command")
+			return client.ExitInfra
 		}
 	}
 	root := newRoot()
@@ -81,6 +87,7 @@ type nopWriter struct{}
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 func isHelpFlag(s string) bool {
+	s, _, _ = strings.Cut(s, "=") // --help=true too
 	return s == "-h" || s == "--help" || s == "--version" || s == "-v"
 }
 

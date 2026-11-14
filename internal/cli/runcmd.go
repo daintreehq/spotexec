@@ -59,7 +59,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.StringVarP(&f.runner, "runner", "r", "", "use only this runner")
 	fs.BoolVar(&f.exclusive, "exclusive", false, "take every slot on the runner")
 	fs.StringArrayVar(&f.pull, "pull", nil, "also pull these gitignored paths/globs back after the run (repeatable)")
-	fs.BoolVar(&f.json, "json", false, "NDJSON lifecycle events on stderr (default when stderr is not a TTY)")
+	fs.BoolVar(&f.json, "json", false, "NDJSON lifecycle events on stderr (default with SPOTEXEC_AGENT=1)")
 	fs.BoolVar(&f.pretty, "pretty", false, "human spinner output even when not a TTY")
 	fs.BoolVarP(&f.quiet, "quiet", "q", false, "no lifecycle output")
 	fs.StringVar(&f.eventsFile, "events-file", "", "also append NDJSON events to this file")

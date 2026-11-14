@@ -219,3 +219,34 @@ func TestSameSlotRejectsAnotherRunner(t *testing.T) {
 		t.Errorf("--pool b,a: %v", o.LastWithin)
 	}
 }
+
+func TestUsageAndConfigFailuresExit125(t *testing.T) {
+	bad := project(t, "[sync]\nmode = \"sideways\"\n")
+	cases := [][]string{
+		{"sx", "--timeout", "invalid", "go", "test"},
+		{"spotexec", "--timeout", "invalid", "go", "test"},
+		{"spotexec", "run", "--timeout", "invalid", "--", "go", "test"},
+		{"sx", "--timeout", "1s"},
+		{"spotexec", "--timeout", "1s"},
+		{"spotexec", "run", "--timeout", "1s"},
+		{"sx", "--no-such-flag", "go", "test"},
+		{"spotexec", "--no-such-flag", "go", "test"},
+		{"spotexec", "run", "--no-such-flag", "--", "go", "test"},
+		{"sx", "-C", bad, "true"},
+		{"spotexec", "-C", bad, "true"},
+		{"spotexec", "run", "-C", bad, "--", "true"},
+	}
+	for _, c := range cases {
+		if code, stderr := runMain(t, c[0], c[1:]...); code != client.ExitInfra {
+			t.Errorf("%v: exit %d, want 125 (stderr %q)", c, code, stderr)
+		}
+	}
+}
+
+func TestHelpFormsStillWork(t *testing.T) {
+	for _, a := range []string{"-h", "--help", "--help=true", "--version", "--version=true"} {
+		if code, stderr := runMain(t, "spotexec", a); code != 0 {
+			t.Errorf("spotexec %s: exit %d (stderr %q)", a, code, stderr)
+		}
+	}
+}

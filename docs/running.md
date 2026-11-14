@@ -47,7 +47,7 @@ If that VM is gone, `--same-slot` fails (exit `125`) and says so, rather than ru
 | `--no-retry` | Don't replay the run if its VM is lost. |
 | `--fallback-local` | Run locally if no runner could be reached (never after the command started remotely). |
 | `--force-large-sync` | Allow syncing more than 100k files or 5 GiB. |
-| `--json` / `--pretty` / `-q, --quiet` | Progress format: NDJSON events, the spinner (even without a terminal), or nothing. |
+| `--json` / `--pretty` / `-q, --quiet` | Progress format: NDJSON events, the spinner (even without a terminal), or nothing. Without them you get the spinner at a terminal and one plain summary line otherwise (NDJSON with `SPOTEXEC_AGENT=1`). |
 | `--events-file PATH` | Also append NDJSON events to a file. |
 | `-C, --dir DIR` | Run as if started in `DIR`. |
 
@@ -76,10 +76,9 @@ Plus anything in `env_allow` (copied from your environment) and `env` (fixed val
 | --- | --- |
 | *command's own* | The remote command's exit status, passed through. |
 | `124` | The command hit `--timeout`. |
-| `125` | spotexec itself failed: no runner, SSH, sync, bootstrap. In a parallel task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". |
+| `125` | spotexec itself failed: a bad flag or configuration, no runner, SSH, sync, bootstrap. In a parallel task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". |
 | `128+N` | The command died from signal N. |
 | `130` | Interrupted (Ctrl-C, `SIGTERM` or `SIGHUP`). |
-| `1`, `2` | Usage or configuration error. |
 
 ## Write-back and artifacts
 
