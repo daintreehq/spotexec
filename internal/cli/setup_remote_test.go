@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -51,6 +53,7 @@ esac
 
 const fakeBrew = `#!/bin/sh
 d="$FAKE/brew"
+echo "$*" >> "$FAKE/brew.log"
 case "$1" in
   update) exit 0 ;;
   --prefix) echo "$d" ;;
@@ -96,6 +99,10 @@ func newFakeHost(t *testing.T, home string) *fakeHost {
 	f.write("stub/curl", fakeCurl, 0o755)
 	f.write("stub/loginsh", fakeLoginShell, 0o755)
 	f.write("spotexec-stub", fakeSpotexec, 0o755)
+	f.write("local-config.toml", "version = 1\n", 0o644)
+	t.Setenv("SPOTEXEC_CONFIG", filepath.Join(f.dir, "local-config.toml"))
+	t.Setenv("SPOTEXEC_CONFIG_DIR", filepath.Join(f.dir, "local-config"))
+	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("FAKE", f.dir)
 	t.Setenv("HOME", home)
 	t.Setenv("SHELL", filepath.Join(f.dir, "stub", "loginsh"))
@@ -189,10 +196,28 @@ func versionAt(t *testing.T, path string) string {
 	return versionOf(string(b))
 }
 
+// withLatest makes tag the latest release, with checksums.txt listing the
+// archives in the fake download directory (or sums, when given).
 func withLatest(t *testing.T, tag string) {
-	old := latestRelease
+	old, oldSums := latestRelease, releaseChecksums
 	latestRelease = func(context.Context) (string, error) { return tag, nil }
-	t.Cleanup(func() { latestRelease = old })
+	releaseChecksums = func(_ context.Context, got string) (map[string]string, error) {
+		if got != tag {
+			t.Errorf("checksums for %s, not %s", got, tag)
+		}
+		var b strings.Builder
+		files, _ := filepath.Glob(filepath.Join(os.Getenv("FAKE"), "dl", "*"))
+		for _, f := range files {
+			data, _ := os.ReadFile(f)
+			fmt.Fprintf(&b, "%x  %s\n", sha256.Sum256(data), filepath.Base(f))
+		}
+		if p := filepath.Join(os.Getenv("FAKE"), "checksums.txt"); fileExists(p) {
+			data, _ := os.ReadFile(p)
+			return parseChecksums(string(data)), nil
+		}
+		return parseChecksums(b.String()), nil
+	}
+	t.Cleanup(func() { latestRelease, releaseChecksums = old, oldSums })
 }
 
 func (f *fakeHost) install(r *remoteSetup) (installed, error) {
@@ -465,5 +490,85 @@ func TestCheckLoginShellRealShells(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// A download that doesn't match the release's checksum replaces nothing.
+func TestRemoteInstallReleaseChecksumMismatch(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+	withLatest(t, "v0.3.0")
+	f.release("0.3.0")
+	f.localInstalled("0.2.0")
+	name := "spotexec_0.3.0_" + f.goos() + "_" + f.goarch() + ".tar.gz"
+	f.write("checksums.txt", strings.Repeat("ab", 32)+"  "+name+"\n", 0o644)
+	_, err := f.install(f.setup())
+	if err == nil || !strings.Contains(err.Error(), "doesn't match the release's checksum") {
+		t.Fatalf("err = %v", err)
+	}
+	if v := versionAt(t, filepath.Join(f.home, ".local/bin/spotexec")); v != "0.2.0" {
+		t.Fatalf("~/.local/bin has %q", v)
+	}
+	if m, _ := filepath.Glob(filepath.Join(f.home, ".local/bin/.spotexec-install.*")); len(m) > 0 {
+		t.Fatalf("left %v", m)
+	}
+	// No checksum for the archive at all: nothing is downloaded.
+	f.write("checksums.txt", strings.Repeat("ab", 32)+"  other.tar.gz\n", 0o644)
+	if _, err := f.install(f.setup()); err == nil || !strings.Contains(err.Error(), "no checksum") {
+		t.Fatalf("err = %v", err)
+	}
+	// The right checksum installs it.
+	_ = os.Remove(filepath.Join(f.dir, "checksums.txt"))
+	if in, err := f.install(f.setup()); err != nil || in.want != "0.3.0" {
+		t.Fatalf("%+v %v", in, err)
+	}
+	if v := versionAt(t, filepath.Join(f.home, ".local/bin/spotexec")); v != "0.3.0" {
+		t.Fatalf("~/.local/bin has %q", v)
+	}
+}
+
+// A host already on the latest release downloads nothing.
+func TestRemoteInstallAlreadyCurrent(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+	withLatest(t, "v0.3.0")
+	f.localInstalled("0.3.0")
+	in, err := f.install(f.setup())
+	if err != nil || in.want != "0.3.0" || !strings.Contains(in.how, "already installed") {
+		t.Fatalf("%+v %v", in, err)
+	}
+	if fileExists(filepath.Join(f.dir, "curl.log")) {
+		t.Fatal("downloaded it again")
+	}
+	// ... even when it says v0.3.0, which setup then accepts; a missing sx
+	// is put back.
+	f.localInstalled("v0.3.0")
+	_ = os.Remove(filepath.Join(f.home, ".local/bin/sx"))
+	if err := f.setup().do(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	if fileExists(filepath.Join(f.dir, "curl.log")) {
+		t.Fatal("downloaded it again")
+	}
+	if l, _ := os.Readlink(filepath.Join(f.home, ".local/bin/sx")); l != "spotexec" {
+		t.Fatalf("sx -> %q", l)
+	}
+	// Homebrew's copy: no update or upgrade.
+	g := newFakeHost(t, t.TempDir())
+	withLatest(t, "v0.3.0")
+	g.brewInstalled("0.3.0")
+	if in, err := g.install(g.setup()); err != nil || in.want != "0.3.0" {
+		t.Fatalf("%+v %v", in, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(g.dir, "brew.log")); strings.Contains(string(b), "update") || strings.Contains(string(b), "upgrade") {
+		t.Fatalf("brew ran: %s", b)
+	}
+}
+
+func TestParseChecksums(t *testing.T) {
+	h := strings.Repeat("0f", 32)
+	got := parseChecksums(h + "  spotexec_0.3.0_linux_amd64.tar.gz\n" + strings.ToUpper(h) + " *b.tar.gz\nnot a line\n" + "abc  short.tar.gz\n")
+	if len(got) != 2 || got["spotexec_0.3.0_linux_amd64.tar.gz"] != h || got["b.tar.gz"] != h {
+		t.Fatalf("%v", got)
 	}
 }

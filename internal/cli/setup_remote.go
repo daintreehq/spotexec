@@ -170,9 +170,11 @@ func (r *remoteSetup) probe(ctx context.Context) (remoteInfo, error) {
 	return i, nil
 }
 
+const releasesURL = "https://github.com/daintreehq/spotexec/releases"
+
 // latestRelease returns the newest release tag (e.g. "v0.2.0").
 var latestRelease = func(ctx context.Context) (string, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, "https://github.com/daintreehq/spotexec/releases/latest", nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, releasesURL+"/latest", nil)
 	c := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := c.Do(req)
 	if err != nil {
@@ -184,6 +186,40 @@ var latestRelease = func(ctx context.Context) (string, error) {
 		return loc[i+5:], nil
 	}
 	return "", fmt.Errorf("can't find the latest release (HTTP %d)", resp.StatusCode)
+}
+
+// releaseChecksums returns the SHA-256 of each file in a release, from its
+// checksums.txt.
+var releaseChecksums = func(ctx context.Context, tag string) (map[string]string, error) {
+	u := releasesURL + "/download/" + tag + "/checksums.txt"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: HTTP %d", u, resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	return parseChecksums(string(b)), nil
+}
+
+var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// parseChecksums reads sha256sum output: "<hash>  <file>" per line.
+func parseChecksums(s string) map[string]string {
+	out := map[string]string{}
+	for _, l := range strings.Split(s, "\n") {
+		f := strings.Fields(l)
+		if len(f) == 2 && sha256Hex.MatchString(strings.ToLower(f[0])) {
+			out[strings.TrimPrefix(f[1], "*")] = strings.ToLower(f[0])
+		}
+	}
+	return out
 }
 
 // latest returns the newest release tag, looked up once per host.
@@ -282,10 +318,13 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 			want = strings.TrimPrefix(tag, "v")
 		}
 		r.printf("%s\n", "  installing spotexec with Homebrew (latest)…")
-		out, err := r.run(ctx, `brew update --quiet >/dev/null 2>&1; `+
+		// Left alone when Homebrew's copy is already the latest release.
+		out, err := r.run(ctx, `p="$(brew --prefix)/bin/spotexec"; `+
+			`if [ -z `+shq(want)+` ] || [ "$("$p" version 2>/dev/null)" != `+shq("spotexec "+want)+` ]; then `+
+			`brew update --quiet >/dev/null 2>&1; `+
 			`if brew list --versions spotexec >/dev/null 2>&1; then verb=upgrade; else verb=install; fi; `+
-			`out=$(brew "$verb" daintreehq/tap/spotexec 2>&1) || { printf '%s\n' "$out" | tail -n 20; exit 1; }; `+
-			`p="$(brew --prefix)/bin/spotexec"; echo "path=$p"; "$p" version 2>&1 | head -n 1`, nil)
+			`out=$(brew "$verb" daintreehq/tap/spotexec 2>&1) || { printf '%s\n' "$out" | tail -n 20; exit 1; }; fi; `+
+			`echo "path=$p"; v=$("$p" version 2>&1) || { echo "Error: Homebrew's spotexec doesn't run: $v"; exit 1; }; echo "$v"`, nil)
 		path, got := "", ""
 		if err == nil {
 			for _, l := range strings.Split(out, "\n") {
@@ -329,21 +368,44 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 			return installed{}, err
 		}
 		want := strings.TrimPrefix(tag, "v")
-		// A newer build already there (a development copy) stays.
-		old, _ := r.run(ctx, `f="$HOME/.local/bin/spotexec"; if [ -x "$f" ]; then "$f" version 2>/dev/null | head -n 1; fi`, nil)
+		// The same version stays as it is; so does a newer build (a
+		// development copy).
+		old, _ := r.run(ctx, `f="$HOME/.local/bin/spotexec"; if [ -x "$f" ] && v=$("$f" version 2>&1); then echo "$v"; fi`, nil)
 		if v := versionOf(old); v != "" {
 			if c, ok := compareVersions(v, want); ok && c > 0 {
 				return installed{bin: localBin, dir: "$HOME/.local/bin", how: "kept, newer than release " + tag, want: v}, nil
+			} else if ok && c == 0 {
+				// Only the sx link is put right, in case it went missing.
+				if _, err := r.run(ctx, `d="$HOME/.local/bin"; [ "$(readlink "$d/sx")" = spotexec ] || ln -sf spotexec "$d/sx"`, nil); err != nil {
+					return installed{}, err
+				}
+				return installed{bin: localBin, dir: "$HOME/.local/bin", how: "release " + tag + " in ~/.local/bin, already installed", want: v}, nil
 			}
 		}
-		url := fmt.Sprintf("https://github.com/daintreehq/spotexec/releases/download/%s/spotexec_%s_%s_%s.tar.gz", tag, want, i.os, i.arch)
+		name := fmt.Sprintf("spotexec_%s_%s_%s.tar.gz", want, i.os, i.arch)
+		sums, err := releaseChecksums(ctx, tag)
+		if err != nil {
+			return installed{}, fmt.Errorf("getting the checksums of release %s: %w", tag, err)
+		}
+		sum := sums[name]
+		if sum == "" {
+			return installed{}, fmt.Errorf("release %s lists no checksum for %s", tag, name)
+		}
+		url := releasesURL + "/download/" + tag + "/" + name
 		r.printf("  installing spotexec %s into ~/.local/bin…\n", tag)
-		// Unpacked next to the old one and checked before it is replaced.
+		// Downloaded and unpacked next to the old one, which is replaced
+		// only once the archive matches the release's checksum and the new
+		// binary runs.
 		if _, err := r.run(ctx, `set -e; d="$HOME/.local/bin"; mkdir -p "$d"; t=$(mktemp -d "$d/.spotexec-install.XXXXXX"); trap 'rm -rf "$t"' EXIT; `+
-			`curl -fsSL `+shq(url)+` | tar -xz -C "$t" spotexec; `+
+			`curl -fsSL -o "$t/a.tar.gz" `+shq(url)+`; `+
+			`if command -v sha256sum >/dev/null 2>&1; then s=$(sha256sum "$t/a.tar.gz"); `+
+			`elif command -v shasum >/dev/null 2>&1; then s=$(shasum -a 256 "$t/a.tar.gz"); `+
+			`else echo "neither sha256sum nor shasum is installed, so the download can't be verified" >&2; exit 1; fi; `+
+			`[ "${s%% *}" = `+shq(sum)+` ] || { echo "the download doesn't match the release's checksum (got ${s%% *})" >&2; exit 1; }; `+
+			`tar -xzf "$t/a.tar.gz" -C "$t" spotexec; `+
 			`v=$("$t/spotexec" version 2>&1) && [ "$v" = `+shq("spotexec "+want)+` ] || { echo "the downloaded spotexec doesn't run: $v" >&2; exit 1; }; `+
 			`mv -f "$t/spotexec" "$d/spotexec"; ln -sf spotexec "$d/sx"`, nil); err != nil {
-			return installed{}, fmt.Errorf("downloading %s: %w", url, err)
+			return installed{}, fmt.Errorf("installing %s: %w", url, err)
 		}
 		return installed{bin: localBin, dir: "$HOME/.local/bin", how: "release " + tag + " in ~/.local/bin", want: want}, nil
 	case "copy":
