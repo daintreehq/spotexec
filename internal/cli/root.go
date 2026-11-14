@@ -182,7 +182,6 @@ func cmdExec() *cobra.Command {
 			if err != nil {
 				return infraExit(err)
 			}
-			f.sync = "none"
 			return exitWith(f.executeLast(l, runSpec{command: buildCommand(l.ws, args), display: displayOf(args), sync: "none"}))
 		},
 	}

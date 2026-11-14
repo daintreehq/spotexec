@@ -103,3 +103,20 @@ func TestImageTagRejectsUnsyncedOrSymlinkedRules(t *testing.T) {
 		t.Fatal("symlinked rules were accepted")
 	}
 }
+
+func TestUnknownWritebackPolicyNeverWritesBack(t *testing.T) {
+	if wantWriteback("nevre", 0) || wantWriteback("", 0) || wantWriteback("never", 0) {
+		t.Error("an unknown or never policy wrote back")
+	}
+	if !wantWriteback("always", 1) || !wantWriteback("on-success", 0) || wantWriteback("on-success", 1) {
+		t.Error("known policies misbehave")
+	}
+	for _, o := range []Options{{Sync: "auto", Writeback: "nevre"}, {Sync: "bogus", Writeback: "always"}, {}} {
+		if validOptions(o) == nil {
+			t.Errorf("%q/%q accepted", o.Sync, o.Writeback)
+		}
+	}
+	if err := validOptions(Options{Sync: "in", Writeback: "on-success"}); err != nil {
+		t.Error(err)
+	}
+}

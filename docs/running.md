@@ -25,7 +25,7 @@ sx --same-slot 'sudo apt-get install -y libvips-dev'
 sx --same-slot pnpm test                       # same VM, so libvips is there
 ```
 
-If that VM is gone, `--same-slot` fails (exit `125`) and says so, rather than running somewhere the package isn't installed. For anything you'd need on every VM, put it in the [project container](environments.md#project-containers) or the runner's `bootstrap_script`. Set `SPOTEXEC_SAME_SLOT=1` to make every `sx` in a shell behave this way.
+If that VM is gone, `--same-slot` fails (exit `125`) and says so, rather than running somewhere the package isn't installed. So does `--same-slot` with a `--runner` or `--pool` that leaves out the runner it would return to. For anything you'd need on every VM, put it in the [project container](environments.md#project-containers) or the runner's `bootstrap_script`. Set `SPOTEXEC_SAME_SLOT=1` to make every `sx` in a shell behave this way.
 
 `--same-slot --sync none` skips the sync and the write-back, and runs on whatever is in the slot, for poking around after a failure. `spotexec exec -- <command>` is the same thing.
 

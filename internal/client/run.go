@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -59,8 +60,9 @@ type Options struct {
 	Pull           []string
 	NoDeps         bool
 	ForceLargeSync bool
-	PreferLast     bool // exec: reuse last runner+slot without syncing
-	SameSlot       bool // --same-slot: sync and run in this worktree's last slot
+	PreferLast     bool     // exec: reuse last runner+slot without syncing
+	SameSlot       bool     // --same-slot: sync and run in this worktree's last slot
+	LastWithin     []string // with PreferLast/SameSlot: the last runner must be one of these
 	Stdout         io.Writer
 	Stderr         io.Writer
 	Rep            ui.Reporter
@@ -123,6 +125,9 @@ type attempt struct {
 // attempt was applied locally. Once a result has arrived it is never
 // replayed.
 func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Result, error) {
+	if err := validOptions(o); err != nil {
+		return Result{}, infra(err)
+	}
 	if !ws.Marked && o.Sync != "none" && !o.PreferLast {
 		return Result{}, infra(fmt.Errorf("%s is not in a Git repository and has no .spotexec.toml, so spotexec won't sync it; run `spotexec init` there to mark it as a project, or pass --sync none", ws.Root))
 	}
@@ -225,6 +230,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		lr, err := LoadLastRun(ws)
 		if err != nil {
 			return res, infra(errors.New("no previous run from this worktree to return to; run `sx <command>` first")), ""
+		}
+		if len(o.LastWithin) > 0 && !slices.Contains(o.LastWithin, lr.Runner) {
+			return res, infra(fmt.Errorf("this worktree last ran on %s, which --runner/--pool excludes (%s), so --same-slot can't return there; drop one of them", lr.Runner, strings.Join(o.LastWithin, ", "))), ""
 		}
 		r, err := cfg.Runner(lr.Runner)
 		if err != nil {
@@ -491,14 +499,30 @@ func nz(s []string) []string {
 	return s
 }
 
+// validOptions rejects sync modes and write-back policies Run doesn't know,
+// rather than guessing what they meant.
+func validOptions(o Options) error {
+	switch o.Sync {
+	case "auto", "in", "none":
+	default:
+		return fmt.Errorf("sync mode must be auto, in or none (got %q)", o.Sync)
+	}
+	switch o.Writeback {
+	case "always", "on-success", "never":
+	default:
+		return fmt.Errorf("write-back policy must be always, on-success or never (got %q)", o.Writeback)
+	}
+	return nil
+}
+
 func wantWriteback(policy string, code int) bool {
 	switch policy {
-	case "never":
-		return false
+	case "always":
+		return true
 	case "on-success":
 		return code == 0
 	}
-	return true
+	return false // never, or anything unknown
 }
 
 func newRunID() string {

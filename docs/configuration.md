@@ -8,16 +8,19 @@ There are two files, and the split is deliberate.
 | `.spotexec.toml` at the repository root | How this project syncs, installs and runs | Yes |
 
 Settings resolve in this order, highest first:
-1. CLI flags.
-2. `SPOTEXEC_*` environment variables: `SPOTEXEC_TIMEOUT`, `SPOTEXEC_SYNC`, `SPOTEXEC_RUNNER`, `SPOTEXEC_POOL`, `SPOTEXEC_PRIORITY`, `SPOTEXEC_JSON=1`, `SPOTEXEC_AGENT=1`.
+1. CLI flags. A flag given on the command line beats its environment variable whatever its value, so `--json=false`, `--priority 0` and `--pool` all override the environment.
+2. `SPOTEXEC_*` environment variables: `SPOTEXEC_TIMEOUT`, `SPOTEXEC_SYNC`, `SPOTEXEC_RUNNER`, `SPOTEXEC_POOL`, `SPOTEXEC_PRIORITY`, `SPOTEXEC_SAME_SLOT=1`, `SPOTEXEC_JSON=1`, `SPOTEXEC_AGENT=1`.
 3. `.spotexec.toml`.
 4. The global config.
 5. Built-in defaults.
 
-Three exceptions to that order:
-- a runner (`-r` or `SPOTEXEC_RUNNER`) beats any pool;
-- `--json` / `SPOTEXEC_JSON=1` beats `--pretty`;
-- a task's own `pool` beats `SPOTEXEC_POOL`.
+Exceptions to that order:
+- `-r` beats `--pool`, and `SPOTEXEC_RUNNER` beats `SPOTEXEC_POOL` and any configured pool (but not `--pool`);
+- `--json` beats `--pretty`;
+- a task's own `pool` beats `SPOTEXEC_POOL`;
+- `spotexec sync` always syncs and `spotexec exec` never does, whatever `SPOTEXEC_SYNC` says.
+
+Unknown `--sync` and `--writeback` values (from flags or the environment) are rejected with exit `125` before any runner is used.
 
 ## Global config: `~/.config/spotexec/config.toml`
 

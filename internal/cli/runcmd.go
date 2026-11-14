@@ -44,6 +44,7 @@ type runFlags struct {
 	dir           string
 	noRetry       bool
 	priority      int
+	prioritySet   bool // --priority or SPOTEXEC_PRIORITY given (0 included)
 	sameSlot      bool
 	fs            *pflag.FlagSet // to tell explicit flags from defaults
 }
@@ -81,34 +82,66 @@ func (f *runFlags) reporter() (ui.Reporter, error) {
 		mode = ui.ModeJSON
 	case f.pretty:
 		mode = ui.ModePretty
+	case f.changed("json") && os.Getenv("SPOTEXEC_AGENT") == "1":
+		// --json=false beats SPOTEXEC_AGENT=1's NDJSON default.
+		mode = ui.ModePlain
+		if ui.IsTerminal(os.Stderr) {
+			mode = ui.ModePretty
+		}
 	}
 	return ui.New(mode, os.Stderr, f.eventsFile)
 }
 
-// env overrides (SPOTEXEC_*), lower precedence than flags.
+// applyEnv fills in SPOTEXEC_* defaults for every flag not given on the
+// command line: an explicit flag always wins, whatever its value (so
+// --json=false, --priority 0 and --pool beat the environment).
 func (f *runFlags) applyEnv() {
-	if f.timeout == 0 {
+	if !f.changed("timeout") {
 		if d, err := time.ParseDuration(os.Getenv("SPOTEXEC_TIMEOUT")); err == nil {
 			f.timeout = d
 		}
 	}
-	if f.sync == "" {
-		f.sync = os.Getenv("SPOTEXEC_SYNC")
+	if !f.changed("sync") {
+		if v := os.Getenv("SPOTEXEC_SYNC"); v != "" {
+			f.sync = v
+		}
 	}
-	if f.runner == "" {
-		f.runner = os.Getenv("SPOTEXEC_RUNNER")
+	// A runner named in the environment narrows the default pool, never one
+	// given with --pool.
+	if !f.changed("runner") && !f.changed("pool") {
+		if v := os.Getenv("SPOTEXEC_RUNNER"); v != "" {
+			f.runner = v
+		}
 	}
-	if os.Getenv("SPOTEXEC_JSON") == "1" && !f.changed("pretty") && !f.changed("quiet") {
+	if os.Getenv("SPOTEXEC_JSON") == "1" && !f.changed("json") && !f.changed("pretty") && !f.changed("quiet") {
 		f.json = true
 	}
 	if os.Getenv("SPOTEXEC_SAME_SLOT") == "1" && !f.changed("same-slot") {
 		f.sameSlot = true
 	}
-	if f.priority == 0 {
-		if n, err := strconv.Atoi(os.Getenv("SPOTEXEC_PRIORITY")); err == nil {
-			f.priority = n
+	if f.changed("priority") {
+		f.prioritySet = true
+	} else if n, err := strconv.Atoi(os.Getenv("SPOTEXEC_PRIORITY")); err == nil {
+		f.priority, f.prioritySet = n, true
+	}
+}
+
+// validate rejects run settings no run could honour, before any runner is
+// acquired: an unknown --writeback must never fall through to writing back.
+func (f *runFlags) validate() error {
+	// An explicitly empty value would silently mean "the default".
+	for name, empty := range map[string]bool{"sync": f.sync == "", "writeback": f.writeback == "", "runner": f.runner == "", "pool": len(f.pool) == 0} {
+		if empty && f.changed(name) {
+			return fmt.Errorf("--%s needs a value", name)
 		}
 	}
+	if f.sync != "" && f.sync != "auto" && f.sync != "in" && f.sync != "none" {
+		return fmt.Errorf("--sync must be auto, in or none (got %q)", f.sync)
+	}
+	if f.writeback != "" && f.writeback != "always" && f.writeback != "on-success" && f.writeback != "never" {
+		return fmt.Errorf("--writeback must be always, on-success or never (got %q)", f.writeback)
+	}
+	return nil
 }
 
 // changed reports whether a flag was given on the command line (explicit
@@ -262,6 +295,25 @@ type runSpec struct {
 	waitPush   bool // container build: push a fresh image before returning
 }
 
+// pinnedSync: spotexec sync and container build always sync, and exec
+// never does, whatever --sync or SPOTEXEC_SYNC says.
+func (s runSpec) pinnedSync() bool { return s.syncOnly || s.preferLast }
+
+// check rejects, before any runner is acquired, a run that couldn't do what
+// was asked.
+func (f *runFlags) check(s runSpec) error {
+	if err := f.validate(); err != nil {
+		return err
+	}
+	if s.pinnedSync() && f.changed("sync") && f.sync != s.sync {
+		if s.syncOnly {
+			return fmt.Errorf("--sync %s doesn't apply here: this command always syncs", f.sync)
+		}
+		return fmt.Errorf("--sync %s doesn't apply here: exec never syncs (use sx --same-slot to sync first)", f.sync)
+	}
+	return nil
+}
+
 func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan struct{}, stdout, stderr io.Writer) client.Options {
 	p := l.cfg.Project
 	o := client.Options{
@@ -272,7 +324,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 		Label: s.label, RetryPreempt: !f.noRetry, NoBoot: f.noBoot,
 		PreferLast: s.preferLast, SyncOnly: s.syncOnly, WaitPush: s.waitPush, Priority: s.priority,
 	}
-	if f.priority != 0 {
+	if f.prioritySet {
 		o.Priority = f.priority
 	}
 	if s.timeout > 0 {
@@ -290,7 +342,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 	if f.queueTimeout > 0 {
 		o.QueueTimeout = f.queueTimeout
 	}
-	if f.sync != "" {
+	if f.sync != "" && !s.pinnedSync() {
 		o.Sync = f.sync
 	}
 	if f.writeback != "" {
@@ -298,6 +350,11 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 	}
 	if f.runner != "" {
 		o.Pool = []string{f.runner}
+	}
+	// --same-slot and exec go back to the runner this worktree last used; an
+	// explicit --runner or --pool must include it.
+	if f.changed("runner") || f.changed("pool") {
+		o.LastWithin = o.Pool
 	}
 	if f.sameSlot {
 		// Without a sync, --same-slot is exec: the slot must still hold
@@ -317,8 +374,8 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	// we exit, or the pool could lose track of it for a while.
 	defer waitLaunches()
 	f.applyEnv()
-	if f.sync != "" && f.sync != "auto" && f.sync != "in" && f.sync != "none" {
-		fmt.Fprintf(os.Stderr, "spotexec: --sync must be auto, in or none\n")
+	if err := f.check(s); err != nil {
+		fmt.Fprintln(os.Stderr, "spotexec:", err)
 		return client.ExitInfra
 	}
 	rep, err := f.reporter()
@@ -445,6 +502,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		return f.execute(l, runSpec{label: name, command: cmd, display: name + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool, priority: t.Priority})
 	}
 	f.applyEnv()
+	if err := f.validate(); err != nil {
+		fmt.Fprintln(os.Stderr, "spotexec:", err)
+		return client.ExitInfra
+	}
 	if f.sameSlot {
 		fmt.Fprintf(os.Stderr, "spotexec: --same-slot can't apply to %s: it's a parallel task, whose parts run on several slots at once\n", name)
 		return client.ExitInfra
