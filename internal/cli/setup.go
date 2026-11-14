@@ -622,27 +622,124 @@ func orDash(s string) string {
 	return s
 }
 
+// shortHost is the host name in an SSH destination: "me@studio-01.local"
+// is studio-01.
+func shortHost(dest string) string {
+	if i := strings.LastIndex(dest, "@"); i >= 0 {
+		dest = dest[i+1:]
+	}
+	return strings.ToLower(strings.Split(dest, ".")[0])
+}
+
+// matchMachine finds the machine --revoke names: an exact IAM user name,
+// a destination set up from here (the machine it reached), or a host name.
+func matchMachine(ms []provider.Machine, saved []savedMachine, target string) (*provider.Machine, error) {
+	for i := range ms {
+		if strings.EqualFold(ms[i].User, target) {
+			return &ms[i], nil
+		}
+	}
+	var hits []int
+	add := func(i int) {
+		for _, h := range hits {
+			if h == i {
+				return
+			}
+		}
+		hits = append(hits, i)
+	}
+	byID := false
+	for _, e := range saved {
+		if !strings.EqualFold(e.Host, target) || (e.MachineID == "" && e.Hostname == "") {
+			continue
+		}
+		byID = byID || e.MachineID != ""
+		for i, m := range ms {
+			if e.MachineID != "" { // authoritative when recorded
+				if m.MachineID == e.MachineID {
+					add(i)
+				}
+			} else if strings.EqualFold(m.Host, shortHost(e.Hostname)) {
+				add(i)
+			}
+		}
+	}
+	if len(hits) == 0 && byID {
+		// Never another machine that happens to have that name.
+		return nil, fmt.Errorf("%s was set up from here as a machine that has no spotexec IAM user any more (see spotexec setup --list)", target)
+	}
+	if len(hits) == 0 {
+		short := shortHost(target)
+		for i, m := range ms {
+			if strings.EqualFold(m.Host, short) || strings.EqualFold(m.User, "spotexec-"+short) {
+				add(i)
+			}
+		}
+	}
+	switch len(hits) {
+	case 0:
+		return nil, fmt.Errorf("no spotexec IAM user matches %q (see spotexec setup --list)", target)
+	case 1:
+		return &ms[hits[0]], nil
+	}
+	var users []string
+	for _, i := range hits {
+		users = append(users, ms[i].User)
+	}
+	return nil, fmt.Errorf("%q matches %s; name the IAM user", target, strings.Join(users, " and "))
+}
+
+// rosterMatch says whether a machine-list entry is the revoked machine hit,
+// out of the account's machines ms. By machine ID when both are known;
+// otherwise by name, and unsure when the name doesn't settle it (an entry
+// recorded before machine IDs were, such as an alias, or a host name two
+// machines share).
+func rosterMatch(e savedMachine, hit provider.Machine, ms []provider.Machine, target string) (match, unsure bool) {
+	if e.MachineID != "" && hit.MachineID != "" {
+		return e.MachineID == hit.MachineID, false
+	}
+	if strings.EqualFold(e.Host, target) {
+		return true, false // the destination revoke was given
+	}
+	if e.MachineID != "" {
+		// The revoked user has no machine ID tag: the entry is another
+		// machine only if that machine is known.
+		for _, m := range ms {
+			if m.MachineID == e.MachineID {
+				return false, false
+			}
+		}
+		return false, true
+	}
+	n := e.Hostname
+	if n == "" {
+		n = e.Host
+	}
+	same, isHit := 0, false
+	for _, m := range ms {
+		if m.Host != "" && strings.EqualFold(shortHost(n), m.Host) {
+			same++
+			isHit = isHit || m.User == hit.User
+		}
+	}
+	switch {
+	case isHit && same == 1:
+		return true, false
+	case isHit, same == 0 && e.Hostname == "" && e.MachineID == "":
+		return false, true
+	}
+	return false, false
+}
+
 func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) error {
 	regions := awsRegions()
 	ms, err := provider.ListMachines(ctx, adminProfile, regions)
 	if err != nil {
 		return err
 	}
-	short := strings.ToLower(strings.Split(strings.TrimPrefix(target, "spotexec-"), ".")[0])
-	if i := strings.LastIndex(short, "@"); i >= 0 {
-		short = short[i+1:]
-	}
-	var hit *provider.Machine
-	for i, m := range ms {
-		if strings.EqualFold(m.User, target) || strings.EqualFold(m.Host, short) || strings.EqualFold(m.User, "spotexec-"+short) {
-			if hit != nil {
-				return fmt.Errorf("%q matches both %s and %s; name the IAM user", target, hit.User, m.User)
-			}
-			hit = &ms[i]
-		}
-	}
-	if hit == nil {
-		return fmt.Errorf("no spotexec IAM user matches %q (see spotexec setup --list)", target)
+	hit, err := matchMachine(ms, loadMachines(), target)
+	if err != nil {
+		return err
 	}
 	what := fmt.Sprintf("IAM user %s (host %s) and its %d key(s)", hit.User, orDash(hit.Host), len(hit.Keys))
 	if hit.VMs > 0 {
@@ -664,13 +761,14 @@ func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) e
 	if err := provider.RevokeMachine(ctx, adminProfile, hit.User, regions, func(f string, a ...any) { fmt.Printf("  "+f+"\n", a...) }); err != nil {
 		return err
 	}
-	gone := forgetMachine(func(h string) bool {
-		hs := strings.ToLower(strings.Split(h, ".")[0])
-		if i := strings.LastIndex(hs, "@"); i >= 0 {
-			hs = hs[i+1:]
+	saved := loadMachines()
+	var unsure []string
+	for _, e := range saved {
+		if _, u := rosterMatch(e, *hit, ms, target); u {
+			unsure = append(unsure, e.Host)
 		}
-		return hs == strings.ToLower(hit.Host) || hs == short
-	})
+	}
+	gone := forgetMachine(func(e savedMachine) bool { m, _ := rosterMatch(e, *hit, ms, target); return m })
 	fmt.Printf("✓ revoked %s", hit.User)
 	if len(gone) > 0 {
 		fmt.Printf(" and removed %s from the machine list", strings.Join(gone, ", "))
@@ -678,6 +776,10 @@ func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) e
 	fmt.Println()
 	if !hit.This {
 		fmt.Println("  Its key no longer works. On that machine, delete the [spotexec] section of ~/.aws/credentials.")
+	}
+	if len(unsure) > 0 {
+		fmt.Printf("! The machine list can't tell whether %s %s this machine (set up before spotexec recorded machine IDs).\n", strings.Join(unsure, ", "), map[bool]string{true: "is", false: "are"}[len(unsure) == 1])
+		fmt.Printf("  Remove any that are from %s, or `spotexec setup --all` will set them up again.\n", machinesPath())
 	}
 	return nil
 }

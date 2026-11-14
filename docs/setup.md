@@ -129,7 +129,7 @@ These stay separate on each machine:
 
 ## Managing your machines
 
-Every machine set up from here is remembered in `~/.config/spotexec/machines.toml`.
+Every machine set up from here is remembered in `~/.config/spotexec/machines.toml`, with the machine each SSH destination reached (its spotexec machine ID, which also tags its IAM user). Setting a machine up again under another name, say an alias, replaces its old entry, so `--all` sets each machine up once.
 
 **Update them all** after editing the config or upgrading spotexec here:
 
@@ -173,7 +173,7 @@ spotexec down -A --machine studio-02    # stop one machine's VMs (asks first)
 spotexec setup --revoke studio-01       # or the IAM user name, spotexec-studio-01
 ```
 
-This deletes the machine's access keys, its policy and its IAM user, so its key stops working at once. It also terminates the machine's VMs and removes it from the machine list. On the machine itself, you can then delete the `[spotexec]` section of `~/.aws/credentials` and `[profile spotexec]` in `~/.aws/config`.
+The machine can be named by its IAM user (an exact name always selects that user), by a destination you set it up with (`builder`, `me@studio-01.local`), or by its host name. When two machines share a host name, name the IAM user. This deletes the machine's access keys, its policy and its IAM user, so its key stops working at once. It also terminates the machine's VMs and removes every machine-list entry that reached it, aliases included. Entries recorded by spotexec versions before machine IDs, which it can't place, are listed for you to check. On the machine itself, you can then delete the `[spotexec]` section of `~/.aws/credentials` and `[profile spotexec]` in `~/.aws/config`.
 
 By hand, the equivalent is:
 

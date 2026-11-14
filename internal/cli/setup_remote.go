@@ -46,6 +46,8 @@ type remoteSetup struct {
 	adminARN string
 	adminErr error
 	fellBack bool // auto install fell back from Homebrew to the release
+	// The machine the host reached: its hostname and spotexec machine ID.
+	hostname, machineID string
 	// The newest release, looked up once.
 	latestTag string
 	latestErr error
@@ -604,6 +606,16 @@ func (r *remoteSetup) do(ctx context.Context) error {
 		}
 		return fmt.Errorf("spotexec setup failed there: %w", err)
 	}
+	// Which machine this destination reached, for the machine list.
+	r.hostname = i.hostname
+	id, err := r.run(ctx, `cat "${SPOTEXEC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/spotexec}/owner-id"`, nil)
+	if id = strings.TrimSpace(id); err == nil && id != "" && !strings.ContainsAny(id, " \t\n") {
+		r.machineID = id
+	} else if r.aws {
+		// AWS setup there made one; without it, revoking this machine
+		// couldn't find this entry.
+		return fmt.Errorf("set up, but its machine ID can't be read (%v); run setup for it again", firstLine(fmt.Sprint(err)))
+	}
 	return r.checkLoginShell(ctx, in.dir, got)
 }
 
@@ -755,12 +767,12 @@ func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
 				// Set up, but not usable from a fresh shell yet: remembered,
 				// so `setup --all` checks it again.
 				r.printf("  ✗ %s isn't ready: %v\n", h, err)
-				rememberMachine(h)
+				rememberMachine(h, r.machineID, r.hostname)
 			} else if err != nil {
 				r.printf("  ✗ %s: %v\n", h, err)
 			} else {
 				r.printf("  ✓ %s is ready: run `sx <command>` in a project there\n", h)
-				rememberMachine(h)
+				rememberMachine(h, r.machineID, r.hostname)
 			}
 			mu.Lock()
 			defer mu.Unlock()
@@ -785,9 +797,13 @@ type machineList struct {
 }
 
 type savedMachine struct {
-	Host      string    `toml:"host"`
+	Host      string    `toml:"host"` // the SSH destination
 	LastSetup time.Time `toml:"last_setup"`
 	Version   string    `toml:"version"`
+	// The machine it reached: its spotexec machine ID (which tags its IAM
+	// user) and hostname.
+	MachineID string `toml:"machine_id,omitempty"`
+	Hostname  string `toml:"hostname,omitempty"`
 }
 
 var machinesMu sync.Mutex
@@ -814,29 +830,42 @@ func saveMachines(ms []savedMachine) error {
 	return os.WriteFile(machinesPath(), b.Bytes(), 0o600)
 }
 
-func rememberMachine(host string) {
+// rememberMachine records a destination and the machine it reached. Another
+// destination for the same machine (an alias, an address) is dropped, so
+// `setup --all` sets each machine up once.
+func rememberMachine(host, machineID, hostname string) {
 	machinesMu.Lock()
 	defer machinesMu.Unlock()
-	ms := loadMachines()
+	now := time.Now().UTC().Truncate(time.Second)
+	var ms []savedMachine
 	found := false
-	for i := range ms {
-		if strings.EqualFold(ms[i].Host, host) {
-			ms[i].LastSetup, ms[i].Version, found = time.Now().UTC().Truncate(time.Second), Version, true
+	for _, m := range loadMachines() {
+		switch {
+		case strings.EqualFold(m.Host, host):
+			if found {
+				continue
+			}
+			found = true
+			// What it reaches now, even if unknown: never a stale identity.
+			m.LastSetup, m.Version, m.MachineID, m.Hostname = now, Version, machineID, hostname
+		case machineID != "" && m.MachineID == machineID:
+			continue
 		}
+		ms = append(ms, m)
 	}
 	if !found {
-		ms = append(ms, savedMachine{Host: host, LastSetup: time.Now().UTC().Truncate(time.Second), Version: Version})
+		ms = append(ms, savedMachine{Host: host, LastSetup: now, Version: Version, MachineID: machineID, Hostname: hostname})
 	}
 	_ = saveMachines(ms)
 }
 
-func forgetMachine(match func(host string) bool) []string {
+func forgetMachine(match func(savedMachine) bool) []string {
 	machinesMu.Lock()
 	defer machinesMu.Unlock()
 	var keep []savedMachine
 	var gone []string
 	for _, m := range loadMachines() {
-		if match(m.Host) {
+		if match(m) {
 			gone = append(gone, m.Host)
 		} else {
 			keep = append(keep, m)

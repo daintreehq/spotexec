@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 func TestSetRunnerProfileText(t *testing.T) {
@@ -231,5 +232,132 @@ func TestHostListDropsUnsafeNames(t *testing.T) {
 	}
 	if got := strings.Join(l.hosts, ","); got != "studio-01.local,mini-01.local" {
 		t.Fatalf("hosts = %q", got)
+	}
+}
+
+func TestMatchMachine(t *testing.T) {
+	ms := []provider.Machine{
+		{User: "spotexec-studio-01", Host: "studio-01", MachineID: "A"},
+		{User: "spotexec-studio-01-x1", Host: "Studio-01", MachineID: "B"},
+		{User: "spotexec-mini-01", Host: "mini-01", MachineID: "C"},
+	}
+	saved := []savedMachine{
+		{Host: "builder", MachineID: "B"},
+		{Host: "old-alias", Hostname: "mini-01.local"}, // recorded before machine IDs
+		{Host: "plain"},
+	}
+	for target, want := range map[string]string{
+		"spotexec-studio-01":       "spotexec-studio-01", // an exact IAM user name always wins
+		"SPOTEXEC-STUDIO-01-X1":    "spotexec-studio-01-x1",
+		"studio-01":                "error",
+		"studio-01.local":          "error",
+		"first.last@mini-01.local": "spotexec-mini-01",
+		"mini-01":                  "spotexec-mini-01",
+		"builder":                  "spotexec-studio-01-x1", // the machine the alias reached
+		"old-alias":                "spotexec-mini-01",
+		"plain":                    "error",
+		"nope":                     "error",
+	} {
+		hit, err := matchMachine(ms, saved, target)
+		got := "error"
+		if err == nil {
+			got = hit.User
+		}
+		if got != want {
+			t.Errorf("matchMachine(%q) = %s (%v), want %s", target, got, err, want)
+		}
+	}
+	if _, err := matchMachine(ms, saved, "studio-01"); err == nil || !strings.Contains(err.Error(), "spotexec-studio-01 and spotexec-studio-01-x1") {
+		t.Errorf("err = %v", err)
+	}
+	// A destination recorded as a machine that's gone never falls back to
+	// another machine of that name.
+	saved = append(saved, savedMachine{Host: "mini-01", MachineID: "Z"})
+	if hit, err := matchMachine(ms, saved, "mini-01"); err == nil {
+		t.Errorf("matched %s", hit.User)
+	}
+	// ... not even an untagged one.
+	ms = append(ms, provider.Machine{User: "spotexec-legacy", Host: "studio-09"})
+	saved = append(saved, savedMachine{Host: "nine", MachineID: "Z", Hostname: "studio-09.local"})
+	if hit, err := matchMachine(ms, saved, "nine"); err == nil {
+		t.Errorf("matched %s", hit.User)
+	}
+}
+
+// Revoking a machine removes every destination that reached it, and only
+// those; entries the list can't place are left and reported.
+func TestRevokeForgetsEveryDestination(t *testing.T) {
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	ms := []provider.Machine{
+		{User: "spotexec-studio-01", Host: "studio-01", MachineID: "A"},
+		{User: "spotexec-studio-01-x1", Host: "studio-01", MachineID: "B"},
+		{User: "spotexec-mini-01", Host: "mini-01", MachineID: "C"},
+		{User: "spotexec-box", Host: "box", MachineID: "D"},
+	}
+	rememberMachine("builder", "A", "studio-01.local")
+	rememberMachine("me@studio-01b.local", "B", "studio-01.local")
+	rememberMachine("mini-01.local", "C", "mini-01.local")
+	// The old schema: just the destination.
+	if err := saveMachines(append(loadMachines(), savedMachine{Host: "old-alias"}, savedMachine{Host: "studio-01.local"}, savedMachine{Host: "box.local"})); err != nil {
+		t.Fatal(err)
+	}
+	var unsure []string
+	for _, e := range loadMachines() {
+		if _, u := rosterMatch(e, ms[0], ms, "spotexec-studio-01"); u {
+			unsure = append(unsure, e.Host)
+		}
+	}
+	gone := forgetMachine(func(e savedMachine) bool { m, _ := rosterMatch(e, ms[0], ms, "spotexec-studio-01"); return m })
+	if strings.Join(gone, ",") != "builder" || strings.Join(unsure, ",") != "old-alias,studio-01.local" {
+		t.Fatalf("forgot %v, unsure about %v", gone, unsure)
+	}
+	// A legacy entry whose name only one machine has goes with it.
+	gone = forgetMachine(func(e savedMachine) bool { m, _ := rosterMatch(e, ms[3], ms, "box"); return m })
+	if strings.Join(gone, ",") != "box.local" {
+		t.Fatalf("forgot %v", gone)
+	}
+	// So does the destination revoke was given.
+	gone = forgetMachine(func(e savedMachine) bool { m, _ := rosterMatch(e, ms[1], ms, "studio-01.local"); return m })
+	if strings.Join(gone, ",") != "me@studio-01b.local,studio-01.local" {
+		t.Fatalf("forgot %v", gone)
+	}
+}
+
+// One entry per machine: a new destination for a known machine replaces
+// the old one, and an entry learns its machine ID.
+func TestRememberMachineIdentity(t *testing.T) {
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	rememberMachine("studio-01.local", "", "")
+	rememberMachine("studio-01.local", "A", "studio-01")
+	rememberMachine("builder", "A", "studio-01")
+	rememberMachine("mini", "", "")
+	ms := loadMachines()
+	if len(ms) != 2 || ms[0].Host != "builder" || ms[0].MachineID != "A" || ms[0].Hostname != "studio-01" || ms[1].Host != "mini" {
+		t.Fatalf("machines %+v", ms)
+	}
+	// The destination now reaches another machine whose ID isn't known:
+	// the old identity goes.
+	rememberMachine("builder", "", "mini-01")
+	if ms := loadMachines(); ms[0].MachineID != "" || ms[0].Hostname != "mini-01" {
+		t.Fatalf("machines %+v", ms)
+	}
+}
+
+// Revoking a user without a machine ID tag: entries of known machines stay,
+// others are reported.
+func TestRosterMatchUntaggedUser(t *testing.T) {
+	ms := []provider.Machine{{User: "spotexec-legacy"}, {User: "spotexec-mini", Host: "mini", MachineID: "C"}}
+	for _, c := range []struct {
+		e             savedMachine
+		match, unsure bool
+	}{
+		{savedMachine{Host: "alias", MachineID: "Q", Hostname: "old"}, false, true},
+		{savedMachine{Host: "mini.local", MachineID: "C", Hostname: "mini"}, false, false},
+		{savedMachine{Host: "spotexec-legacy", MachineID: "Q"}, true, false},
+		{savedMachine{Host: "plain"}, false, true},
+	} {
+		if m, u := rosterMatch(c.e, ms[0], ms, "spotexec-legacy"); m != c.match || u != c.unsure {
+			t.Errorf("rosterMatch(%+v) = %v, %v", c.e, m, u)
+		}
 	}
 }

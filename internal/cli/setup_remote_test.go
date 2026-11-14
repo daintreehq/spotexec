@@ -590,7 +590,15 @@ func TestRemoteSetupAdminSession(t *testing.T) {
 	withLatest(t, "v0.3.0")
 	r := f.setup()
 	r.aws, r.adminEnv, r.adminARN = true, []string{"AKIAHERE", "secret", "token"}, "arn:aws:iam::1:user/me"
-	if err := r.do(context.Background()); err != nil {
+	// AWS setup there leaves a machine ID, which setup must read back.
+	if err := r.do(context.Background()); err == nil || !strings.Contains(err.Error(), "machine ID can't be read") {
+		t.Fatalf("err = %v\n%s", err, f.out.String())
+	}
+	f.write("local-config/owner-id", "aaaa-1111\n", 0o644)
+	f.out.Reset()
+	r = f.setup()
+	r.aws, r.adminEnv, r.adminARN = true, []string{"AKIAHERE", "secret", "token"}, "arn:aws:iam::1:user/me"
+	if err := r.do(context.Background()); err != nil || r.machineID != "aaaa-1111" {
 		t.Fatalf("%v\n%s", err, f.out.String())
 	}
 	if out := f.out.String(); !strings.Contains(out, "--admin-from-env") || !strings.Contains(out, "admin key: AKIAHERE") {
@@ -646,6 +654,7 @@ func TestSetupHostsSpotexecUserSession(t *testing.T) {
 		return []string{"AKIASPOTEXEC", "s", ""}, "arn:aws:iam::1:user/spotexec/spotexec-here", nil
 	}
 	t.Cleanup(func() { adminSession = old })
+	f.write("local-config/owner-id", "aaaa-1111\n", 0o644)
 	out := captureStdout(t, func() {
 		if err := setupHosts(context.Background(), []string{"box"}, remoteSetup{install: "auto", profile: "spotexec", aws: true}); err != nil {
 			t.Error(err)
@@ -750,3 +759,23 @@ func TestSetupClaudeHookNotHere(t *testing.T) {
 }
 
 func readFile(p string) string { b, _ := os.ReadFile(p); return string(b) }
+
+// The machine list records the machine a destination reached.
+func TestSetupHostsRecordsIdentity(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+	f.localInstalled("0.3.0")
+	withLatest(t, "v0.3.0")
+	// The fake "remote" shares this environment, so its config dir is ours.
+	f.write("local-config/owner-id", "aaaa-1111\n", 0o644)
+	captureStdout(t, func() {
+		if err := setupHosts(context.Background(), []string{"builder"}, remoteSetup{install: "auto", profile: "spotexec"}); err != nil {
+			t.Error(err)
+		}
+	})
+	ms := loadMachines()
+	h, _ := os.Hostname()
+	if len(ms) != 1 || ms[0].Host != "builder" || ms[0].MachineID != "aaaa-1111" || ms[0].Hostname != h {
+		t.Fatalf("machines %+v", ms)
+	}
+}
