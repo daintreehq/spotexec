@@ -989,6 +989,8 @@ spotexec version
 
 ## Development
 
+Work happens on `develop` (GitFlow); releases are tagged on `main` and published automatically. See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch model and release process.
+
 ```sh
 make build          # helpers for all platforms, then bin/spotexec + bin/sx
 make test           # unit tests (go test ./...; add -race locally)
