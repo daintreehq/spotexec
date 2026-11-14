@@ -820,6 +820,38 @@ func (a *AWSSpot) LockBake() (unlock func(), err error) {
 	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
+// leftovers counts this runner's instances in the region that aren't
+// schedulable but still bill: fleet VMs that are stopping or stopped, and
+// bake builders in any live state.
+func (a *AWSSpot) leftovers(ctx context.Context) (int, error) {
+	fleet, err := a.describe(ctx, "pending", "running", "stopping", "stopped", "shutting-down")
+	if err != nil {
+		return 0, err
+	}
+	owner, err := a.ownerTag()
+	if err != nil {
+		return 0, err
+	}
+	p := url.Values{}
+	p.Set("Filter.1.Name", "tag:"+tagBake)
+	p.Set("Filter.1.Value.1", a.r.Name)
+	p.Set("Filter.2.Name", "tag:"+tagOwner)
+	p.Set("Filter.2.Value.1", owner)
+	p.Set("Filter.3.Name", "instance-state-name")
+	for i, st := range []string{"pending", "running", "stopping", "stopped", "shutting-down"} {
+		p.Set("Filter.3.Value."+strconv.Itoa(i+1), st)
+	}
+	b, err := a.api.ec2(ctx, "DescribeInstances", p)
+	if err != nil {
+		return 0, err
+	}
+	builders, _, err := parseDescribeInstances(b)
+	if err != nil {
+		return 0, err
+	}
+	return len(fleet) + len(builders), nil
+}
+
 // SweepBuilders terminates leftover bake builders of this runner (stopped,
 // or older than four hours) unless a bake on this machine is in progress: a
 // CLI that died mid-bake must not leave one billing. Called by `spotexec

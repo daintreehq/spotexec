@@ -170,7 +170,36 @@ Moving a runner to another region therefore starts with a cold cache, and you'll
 
 The EC2 console is regional too. If you don't see your instances, switch the console's region selector; `spotexec doctor` prints the region and tag to look for.
 
-To span regions, define one runner per region and order them with `priority`, so the second only takes overflow.
+### Let spotexec pick the region
+
+Instead of `region`, a runner can list several regions, or allow them all:
+
+```toml
+[runners.aws]
+type = "aws-spot"
+regions = ["all"]          # every region enabled in the account
+# regions = ["us-east-1", "us-east-2", "eu-north-1"]
+instance_types = ["c7a.2xlarge", "c6a.2xlarge", "m7a.2xlarge"]
+max_instances = 4          # across all regions together
+```
+
+Each time the fleet needs a new VM, spotexec compares the current Linux Spot price of every listed instance type in every availability zone of those regions and launches the cheapest. If AWS refuses it, spotexec moves on to the next-cheapest option:
+- **No capacity** for that type in that zone: skipped for a minute, then longer if it keeps failing.
+- **Quota exhausted**, region not enabled, no default VPC: the whole region is skipped for 10 minutes.
+- **Anything that would fail everywhere** (a bad bootstrap script, invalid parameters): the launch stops.
+
+`spotexec prices` shows the ranking and marks where the next VM will go. Prices are cached for 15 minutes. VMs that are already running stay where they are; a price change only affects new launches.
+
+What changes with several regions:
+- **Distance.** The cheapest region may be on another continent, and every run makes several SSH round trips. If that latency matters, list nearby regions instead of `"all"`.
+- **Quota.** Each region has its own Spot vCPU quota, and a region the account has never used is often at 5 vCPUs. A launch there fails over to the next region. `spotexec doctor` checks the cheapest few regions.
+- **Network and images.** spotexec uses each region's default VPC and its own security group there, and the region's Ubuntu image, or a bake if you made one there (`spotexec image bake <runner> --region <r>`). That is why `subnet_id`, `security_group_ids` and `ami-…` IDs aren't allowed with `regions`. (A list of one region is just `region`, and those settings work as usual.) A region without a default VPC is skipped; `spotexec setup` creates one for each listed region (not for `"all"`).
+- **Caches.** The S3 dependency cache (`cache_bucket = "auto"`: a bucket per region) and ECR images are per region, so the first run in a new region starts cold. A named `cache_bucket` lives in one region, so it isn't allowed with `regions`.
+- **Permissions.** Comparing prices needs `ec2:DescribeRegions` and `ec2:DescribeSpotPriceHistory`, which the policy's `ec2:Describe*` covers. If your IAM user's policy predates that, re-run `spotexec setup` to update it.
+
+`spotexec status` shows each VM's region. `spotexec down` terminates VMs in every region the runner uses, including regions since removed from the config. Going back to a single `region` is safe too: until the VMs in the other regions are gone, spotexec still lists and terminates them, while new VMs launch only in that region. spotexec records where it launched in `placement.json` in the runner's state directory. If that file is lost, the next listing checks every region the runner is configured for once; VMs in a region no longer in the config are then left to their own idle shutdown and `max_lifetime`.
+
+To prefer one region and send only overflow elsewhere, define one runner per region and order them with `priority` instead.
 
 ## 5. Check your Spot vCPU quota
 

@@ -1,0 +1,866 @@
+package provider
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/daintreehq/spotexec/internal/config"
+)
+
+// fakeRegionsEC2 serves just enough of EC2/SSM, per region, for multi-region
+// placement: prices, launches, listings and terminations.
+type fakeRegionsEC2 struct {
+	mu         sync.Mutex
+	prices     map[string][][3]string       // region -> {zone, type, price}
+	runErr     map[string]string            // "region/type" -> AWS error code for RunInstances
+	listErr    map[string]string            // region -> error code for tag-filtered DescribeInstances
+	noSubnet   map[string]bool              // zones without a default subnet
+	hang       bool                         // RunInstances never answers (until the client gives up)
+	fullSubnet map[string]bool              // zones whose subnet has no free addresses
+	launched   string                       // launch time reported for listed instances
+	state      map[string]string            // instance ID -> state (default running)
+	builders   map[string]bool              // regions holding a bake builder
+	instances  map[string]map[string]string // region -> id -> type
+	quota      map[string]int               // region -> standard Spot vCPU quota (unset: GetServiceQuota fails)
+	calls      []string                     // "region Action [detail]"
+	next       int
+}
+
+func (f *fakeRegionsEC2) log(region, s string) {
+	f.calls = append(f.calls, region+" "+s)
+}
+
+func (f *fakeRegionsEC2) callsOf(action string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, c := range f.calls {
+		if strings.Contains(c, " "+action) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (f *fakeRegionsEC2) launchTime() string {
+	if f.launched != "" {
+		return f.launched
+	}
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func ec2Err(w http.ResponseWriter, status int, code string) {
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `<Response><Errors><Error><Code>%s</Code><Message>%s</Message></Error></Errors></Response>`, code, code)
+}
+
+func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		region, service, _ := strings.Cut(strings.Trim(r.URL.Path, "/"), "/")
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if service == "servicequotas" {
+			q, ok := f.quota[region]
+			if !ok {
+				w.WriteHeader(400)
+				fmt.Fprint(w, `{"__type":"NoSuchResourceException"}`)
+				return
+			}
+			fmt.Fprintf(w, `{"Quota":{"Value":%d}}`, q)
+			return
+		}
+		if service == "ssm" {
+			f.log(region, "GetParameter")
+			fmt.Fprint(w, `{"Parameter":{"Value":"ami-ubuntu"}}`)
+			return
+		}
+		p, _ := url.ParseQuery(string(body))
+		act := p.Get("Action")
+		switch act {
+		case "DescribeRegions":
+			f.log(region, act)
+			fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo>
+<item><regionName>r-one-1</regionName><optInStatus>opt-in-not-required</optInStatus></item>
+<item><regionName>r-two-1</regionName><optInStatus>opted-in</optInStatus></item>
+<item><regionName>r-off-1</regionName><optInStatus>not-opted-in</optInStatus></item>
+</regionInfo></DescribeRegionsResponse>`)
+		case "DescribeSpotPriceHistory":
+			f.log(region, act)
+			fmt.Fprint(w, `<DescribeSpotPriceHistoryResponse><spotPriceHistorySet>`)
+			for _, row := range f.prices[region] {
+				fmt.Fprintf(w, `<item><instanceType>%s</instanceType><productDescription>Linux/UNIX</productDescription><spotPrice>%s</spotPrice><timestamp>2026-11-14T00:00:00.000Z</timestamp><availabilityZone>%s</availabilityZone></item>`, row[1], row[2], row[0])
+			}
+			fmt.Fprint(w, `</spotPriceHistorySet></DescribeSpotPriceHistoryResponse>`)
+		case "DescribeImages":
+			if p.Get("ImageId.1") != "" {
+				fmt.Fprint(w, `<DescribeImagesResponse><imagesSet><item><rootDeviceName>/dev/sda1</rootDeviceName></item></imagesSet></DescribeImagesResponse>`)
+			} else {
+				fmt.Fprint(w, `<DescribeImagesResponse><imagesSet/></DescribeImagesResponse>`)
+			}
+		case "DescribeVpcs":
+			fmt.Fprint(w, `<DescribeVpcsResponse><vpcSet><item><vpcId>vpc-1</vpcId></item></vpcSet></DescribeVpcsResponse>`)
+		case "DescribeSecurityGroups":
+			fmt.Fprint(w, `<DescribeSecurityGroupsResponse><securityGroupInfo><item><groupId>sg-1</groupId><ipPermissions><item><ipProtocol>tcp</ipProtocol><fromPort>22</fromPort><toPort>22</toPort><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges></item></ipPermissions></item></securityGroupInfo></DescribeSecurityGroupsResponse>`)
+		case "DescribeSubnets":
+			if f.noSubnet[p.Get("Filter.1.Value.1")] {
+				fmt.Fprint(w, `<DescribeSubnetsResponse><subnetSet/></DescribeSubnetsResponse>`)
+				return
+			}
+			fmt.Fprintf(w, `<DescribeSubnetsResponse><subnetSet><item><subnetId>subnet-%s</subnetId></item></subnetSet></DescribeSubnetsResponse>`, p.Get("Filter.1.Value.1"))
+		case "RunInstances":
+			typ := p.Get("InstanceType")
+			market := "spot"
+			if p.Get("InstanceMarketOptions.MarketType") == "" {
+				market = "on-demand"
+			}
+			f.log(region, act+" "+typ+" "+p.Get("NetworkInterface.1.SubnetId"))
+			f.log(region, "market "+market)
+			if f.hang {
+				f.mu.Unlock()
+				<-r.Context().Done()
+				f.mu.Lock()
+				return
+			}
+			if f.fullSubnet[strings.TrimPrefix(p.Get("NetworkInterface.1.SubnetId"), "subnet-")] {
+				ec2Err(w, 400, "InsufficientFreeAddressesInSubnet")
+				return
+			}
+			if code := f.runErr[region+"/"+typ+"/"+market]; code != "" {
+				ec2Err(w, 400, code)
+				return
+			}
+			if code := f.runErr[region+"/"+typ]; code != "" && market == "spot" {
+				ec2Err(w, 400, code)
+				return
+			}
+			f.next++
+			id := fmt.Sprintf("i-%s-%d", region, f.next)
+			if f.instances[region] == nil {
+				f.instances[region] = map[string]string{}
+			}
+			f.instances[region][id] = typ
+			fmt.Fprintf(w, `<RunInstancesResponse><instancesSet><item><instanceId>%s</instanceId><instanceType>%s</instanceType><instanceState><name>pending</name></instanceState></item></instancesSet></RunInstancesResponse>`, id, typ)
+		case "DescribeInstances":
+			if id := p.Get("InstanceId.1"); id != "" {
+				f.log(region, act+" "+id)
+				typ, ok := f.instances[region][id]
+				if !ok {
+					ec2Err(w, 400, "InvalidInstanceID.NotFound")
+					return
+				}
+				owner, _ := ownerID()
+				fmt.Fprintf(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>%s</instanceId><instanceType>%s</instanceType><instanceState><name>running</name></instanceState><tagSet><item><key>spotexec-runner</key><value>g</value></item><item><key>spotexec-owner</key><value>%s</value></item></tagSet></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`, id, typ, owner)
+				return
+			}
+			if p.Get("Filter.1.Name") == "tag:spotexec-bake-runner" {
+				f.log(region, act+" builders")
+				if f.builders[region] {
+					fmt.Fprint(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-builder</instanceId><instanceState><name>stopped</name></instanceState></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`)
+					return
+				}
+				fmt.Fprint(w, `<DescribeInstancesResponse><reservationSet/></DescribeInstancesResponse>`)
+				return
+			}
+			want := map[string]bool{}
+			for i := 1; p.Get(fmt.Sprintf("Filter.3.Value.%d", i)) != ""; i++ {
+				want[p.Get(fmt.Sprintf("Filter.3.Value.%d", i))] = true
+			}
+			f.log(region, act)
+			if code := f.listErr[region]; code != "" {
+				ec2Err(w, 403, code)
+				return
+			}
+			owner, _ := ownerID()
+			fmt.Fprint(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet>`)
+			for id, typ := range f.instances[region] {
+				st := f.state[id]
+				if st == "" {
+					st = "running"
+				}
+				if len(want) > 0 && !want[st] {
+					continue
+				}
+				fmt.Fprintf(w, `<item><instanceId>%s</instanceId><instanceType>%s</instanceType><instanceState><name>%s</name></instanceState><launchTime>%s</launchTime><placement><availabilityZone>%sa</availabilityZone></placement><tagSet><item><key>spotexec-runner</key><value>g</value></item><item><key>spotexec-owner</key><value>%s</value></item></tagSet></item>`, id, typ, st, f.launchTime(), region, owner)
+			}
+			fmt.Fprint(w, `</instancesSet></item></reservationSet></DescribeInstancesResponse>`)
+		case "TerminateInstances":
+			f.log(region, act+" "+p.Get("InstanceId.1"))
+			delete(f.instances[region], p.Get("InstanceId.1"))
+			fmt.Fprint(w, `<TerminateInstancesResponse/>`)
+		default:
+			t.Errorf("unexpected %s %s", region, act)
+			ec2Err(w, 400, "InvalidAction")
+		}
+	})
+}
+
+func newGlobalEnv(t *testing.T, f *fakeRegionsEC2, regions ...string) *AWSGlobal {
+	t.Helper()
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	if f.instances == nil {
+		f.instances = map[string]map[string]string{}
+	}
+	srv := httptest.NewServer(f.handler(t))
+	t.Cleanup(srv.Close)
+	r := &config.Runner{Name: "g", Type: config.TypeAWSSpot, Regions: regions, Region: "r-one-1",
+		InstanceTypes: []string{"c7a.2xlarge", "c6a.2xlarge"}, Arch: "amd64", User: "ubuntu", VolumeGB: 64,
+		SSHCIDR: "0.0.0.0/0", MaxInstances: 4, MaxLifetime: config.Duration{Duration: 2 * time.Hour},
+		BootTimeout: config.Duration{Duration: time.Minute}, IdleTimeout: config.Duration{Duration: time.Minute}}
+	p, err := NewAWSGlobal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := p.(*AWSGlobal)
+	g.creds = &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "secret"}}
+	g.endpoints = func(region string) map[string]string {
+		return map[string]string{"ec2": srv.URL + "/" + region + "/ec2", "ssm": srv.URL + "/" + region + "/ssm",
+			"servicequotas": srv.URL + "/" + region + "/servicequotas"}
+	}
+	return g
+}
+
+// discovered marks the one-time listing of every region as done.
+func discovered(t *testing.T, g *AWSGlobal) {
+	t.Helper()
+	if err := g.withState(func(st *placementState) { st.Discovered = true }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func active(t *testing.T, g *AWSGlobal) string {
+	t.Helper()
+	rs, err := g.activeRegions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Join(rs, ",")
+}
+
+func TestGlobalLaunchCheapestWithFallback(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{
+			"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.0500"}, {"r-one-1b", "c6a.2xlarge", "0.0550"}},
+			"r-two-1":   {{"r-two-1c", "c6a.2xlarge", "0.0600"}},
+			"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.0400"}, {"r-three-1b", "c6a.2xlarge", "0.0450"}},
+		},
+		runErr: map[string]string{
+			"r-three-1/c7a.2xlarge": "VcpuLimitExceeded",            // whole region out of quota
+			"r-one-1/c7a.2xlarge":   "InsufficientInstanceCapacity", // just this zone/type
+		},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
+	in, err := g.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// r-three-1's second option is skipped (its quota is regional);
+	// r-one-1's second option is tried (capacity is per zone and type).
+	if in.Region != "r-one-1" || in.Type != "c6a.2xlarge" || in.Zone != "r-one-1b" {
+		t.Fatalf("launched %+v, want c6a.2xlarge in r-one-1b", in)
+	}
+	runs := f.callsOf("RunInstances")
+	want := []string{
+		"r-three-1 RunInstances c7a.2xlarge subnet-r-three-1a",
+		"r-one-1 RunInstances c7a.2xlarge subnet-r-one-1a",
+		"r-one-1 RunInstances c6a.2xlarge subnet-r-one-1b",
+	}
+	if strings.Join(runs, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("launch order:\n%s\nwant:\n%s", strings.Join(runs, "\n"), strings.Join(want, "\n"))
+	}
+	// Every region a request went to is remembered, so listings look there.
+	if got := active(t, g); got != "r-one-1,r-three-1" {
+		t.Fatalf("active regions %s", got)
+	}
+	// Cooldowns stop the next launch retrying the failures: it goes
+	// straight to the next-cheapest pool that hasn't failed.
+	f.mu.Lock()
+	f.calls = nil
+	f.mu.Unlock()
+	if _, err := g.Launch(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 1 || runs[0] != "r-one-1 RunInstances c6a.2xlarge subnet-r-one-1b" {
+		t.Fatalf("second launch should go straight to the pool that worked: %v", runs)
+	}
+	// Prices came from the cache the second time.
+	if n := len(f.callsOf("DescribeSpotPriceHistory")); n != 0 {
+		t.Fatalf("re-fetched prices %d times", n)
+	}
+}
+
+// A region whose Spot quota has no room is skipped by the pre-launch check,
+// with nothing sent there, and the next-cheapest region is used.
+func TestGlobalLaunchSkipsRegionWithoutQuota(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{
+			"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.0500"}},
+			"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.0400"}, {"r-two-1b", "c6a.2xlarge", "0.0450"}},
+		},
+		quota: map[string]int{"r-one-1": 64, "r-two-1": 4}, // r-two-1 can't fit one 8-vCPU VM
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	in, err := g.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Region != "r-one-1" {
+		t.Fatalf("launched %+v, want r-one-1", in)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 1 || !strings.HasPrefix(runs[0], "r-one-1 ") {
+		t.Fatalf("RunInstances calls %v: nothing should be sent to the region without quota", runs)
+	}
+}
+
+func TestGlobalLaunchStopsOnConfigError(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{
+			"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}},
+			"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.06"}},
+		},
+		runErr: map[string]string{"r-one-1/c7a.2xlarge": "InvalidUserData.Malformed"},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	if _, err := g.Launch(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "InvalidUserData.Malformed") {
+		t.Fatalf("err = %v", err)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 1 {
+		t.Fatalf("a request that fails everywhere must not be retried in other regions: %v", runs)
+	}
+}
+
+func TestGlobalAllRegionsSkipsNotOptedIn(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.07"}},
+		"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.05"}},
+	}}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	tbl, err := g.Prices(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(tbl.Regions, ","); got != "r-one-1,r-two-1" {
+		t.Fatalf("regions %s", got)
+	}
+	if tbl.Prices[0].Region != "r-two-1" {
+		t.Fatalf("cheapest %+v", tbl.Prices[0])
+	}
+	for _, c := range f.callsOf("DescribeSpotPriceHistory") {
+		if strings.HasPrefix(c, "r-off-1") {
+			t.Fatal("priced a region that isn't enabled")
+		}
+	}
+}
+
+func TestGlobalUnofferedRegionUnpriced(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.07"}}}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	tbl, err := g.Prices(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tbl.Prices) != 1 || tbl.Unpriced["r-two-1"] == "" {
+		t.Fatalf("table %+v", tbl)
+	}
+}
+
+func TestGlobalListFailsIfARegionFails(t *testing.T) {
+	f := &fakeRegionsEC2{
+		instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}, "r-two-1": {"i-b": "c7a.2xlarge"}},
+		listErr:   map[string]string{"r-two-1": "UnauthorizedOperation"},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	discovered(t, g)
+	g.markActive("r-one-1", time.Now().Add(time.Hour))
+	g.markActive("r-two-1", time.Now().Add(time.Hour))
+	if _, err := g.List(context.Background()); err == nil {
+		t.Fatal("a listing missing one region must fail, not report its instances gone")
+	}
+	f.mu.Lock()
+	delete(f.listErr, "r-two-1")
+	f.mu.Unlock()
+	ins, err := g.List(context.Background())
+	if err != nil || len(ins) != 2 {
+		t.Fatalf("list = %v, %v", ins, err)
+	}
+	where := map[string]string{}
+	for _, in := range ins {
+		where[in.ID] = in.Region + "/" + in.Zone
+	}
+	if where["i-a"] != "r-one-1/r-one-1a" || where["i-b"] != "r-two-1/r-two-1a" {
+		t.Fatalf("locations %v", where)
+	}
+}
+
+func TestGlobalListOnlyQueriesActiveRegions(t *testing.T) {
+	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-two-1": {"i-b": "c7a.2xlarge"}}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
+	discovered(t, g)
+	g.markActive("r-two-1", time.Now().Add(time.Hour))
+	ins, err := g.List(context.Background())
+	if err != nil || len(ins) != 1 || ins[0].ID != "i-b" {
+		t.Fatalf("list = %v, %v", ins, err)
+	}
+	if got := f.callsOf("DescribeInstances"); len(got) != 1 || got[0] != "r-two-1 DescribeInstances" {
+		t.Fatalf("listed %v", got)
+	}
+}
+
+// First use (or an upgrade from a single-region runner, or a lost state
+// file): an existing VM must be found, not replaced.
+func TestGlobalFirstListDiscoversEverywhere(t *testing.T) {
+	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-two-1": {"i-old": "c7a.2xlarge"}}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	ins, err := g.List(context.Background())
+	if err != nil || len(ins) != 1 || ins[0].ID != "i-old" {
+		t.Fatalf("list = %v, %v", ins, err)
+	}
+	f.mu.Lock()
+	f.calls = nil
+	f.mu.Unlock()
+	if _, err := g.List(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.callsOf("DescribeInstances"); len(got) != 1 || got[0] != "r-two-1 DescribeInstances" {
+		t.Fatalf("after discovery only the region with a VM is listed: %v", got)
+	}
+}
+
+// A region past its expected lifetime is kept while a VM is still there
+// (a failed watchdog) and dropped only once a listing finds it empty.
+func TestGlobalExpiredRegionKeptUntilEmpty(t *testing.T) {
+	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-two-1": {"i-zombie": "c7a.2xlarge"}},
+		launched: time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	discovered(t, g)
+	g.markActive("r-two-1", time.Now().Add(-time.Minute))
+	if ins, err := g.List(context.Background()); err != nil || len(ins) != 1 {
+		t.Fatalf("list = %v, %v", ins, err)
+	}
+	if got := active(t, g); got != "r-two-1" {
+		t.Fatalf("a region with a live VM was forgotten: %q", got)
+	}
+	f.mu.Lock()
+	delete(f.instances["r-two-1"], "i-zombie")
+	f.mu.Unlock()
+	// Still tracked for an hour after it was last seen.
+	g.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	if _, err := g.List(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := active(t, g); got != "" {
+		t.Fatalf("an expired, empty region should be dropped: %q", got)
+	}
+}
+
+func TestGlobalCorruptStateIsAnError(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}}}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	os.MkdirAll(g.dir, 0o700)
+	os.WriteFile(filepath.Join(g.dir, "placement.json"), []byte("{not json"), 0o600)
+	if _, err := g.List(context.Background()); err == nil {
+		t.Fatal("unreadable placement state must not look like an empty fleet")
+	}
+	if _, err := g.Launch(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("must not launch without recording where: %v", err)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 0 {
+		t.Fatalf("launched with unrecordable state: %v", runs)
+	}
+}
+
+// A request whose response is lost (here: cancelled after sending) may
+// have created a VM: report it as ambiguous and launch nothing elsewhere.
+func TestGlobalAmbiguousLaunchStops(t *testing.T) {
+	f := &fakeRegionsEC2{hang: true, prices: map[string][][3]string{
+		"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}},
+		"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.06"}},
+	}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	if _, err := g.Prices(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, err := g.Launch(ctx, t.Logf)
+	if !errors.Is(err, ErrLaunchAmbiguous) {
+		t.Fatalf("err = %v, want ErrLaunchAmbiguous", err)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 1 {
+		t.Fatalf("launched again elsewhere: %v", runs)
+	}
+	if got := active(t, g); got != "r-one-1" {
+		t.Fatalf("the region of the ambiguous request must be listed: %q", got)
+	}
+}
+
+// Spot quota exhausted everywhere: on-demand fallback still has regions.
+func TestGlobalOnDemandFallbackAfterSpotQuota(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{
+			"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}},
+			"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.06"}},
+		},
+		runErr: map[string]string{"r-one-1/c7a.2xlarge": "MaxSpotInstanceCountExceeded", "r-two-1/c7a.2xlarge": "MaxSpotInstanceCountExceeded"},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	g.r.OnDemandFallback = true
+	in, err := g.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markets := f.callsOf("market")
+	if in.Region != "r-one-1" || len(markets) != 3 || markets[2] != "r-one-1 market on-demand" {
+		t.Fatalf("launched %+v via %v", in, markets)
+	}
+	// Without the fallback, the same failures are an error.
+	g2 := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	if _, err := g2.Launch(context.Background(), t.Logf); err == nil {
+		t.Fatal("no Spot quota and no fallback should fail")
+	}
+}
+
+func TestGlobalFullSubnetTriesNextZone(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{"r-one-1": {
+			{"r-one-1a", "c7a.2xlarge", "0.05"}, {"r-one-1a", "c6a.2xlarge", "0.051"}, {"r-one-1b", "c7a.2xlarge", "0.06"},
+		}},
+		fullSubnet: map[string]bool{"r-one-1a": true},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	in, err := g.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The whole zone is skipped (c6a in r-one-1a is never tried).
+	runs := f.callsOf("RunInstances")
+	want := "r-one-1 RunInstances c7a.2xlarge subnet-r-one-1a\nr-one-1 RunInstances c7a.2xlarge subnet-r-one-1b"
+	if strings.Join(runs, "\n") != want || in.Zone != "r-one-1b" {
+		t.Fatalf("launched %+v via %v", in, runs)
+	}
+}
+
+func TestGlobalTerminateFindsRegion(t *testing.T) {
+	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-two-1": {"i-b": "c7a.2xlarge"}}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	// Not in local state (e.g. launched by a process whose state was lost):
+	// found by asking each region.
+	if err := g.Terminate(context.Background(), "i-b"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.callsOf("TerminateInstances"); len(got) != 1 || got[0] != "r-two-1 TerminateInstances i-b" {
+		t.Fatalf("terminate calls %v", got)
+	}
+	if err := g.Terminate(context.Background(), "i-missing"); err == nil {
+		t.Fatal("terminating an unknown instance should fail")
+	}
+}
+
+func TestGlobalDownCoversRemovedRegion(t *testing.T) {
+	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-old-1": {"i-old": "c7a.2xlarge"}}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	// r-old-1 was in the config when i-old launched; it has since been
+	// removed. down must still end it.
+	g.markActive("r-old-1", time.Now().Add(time.Hour))
+	if err := g.Down(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.callsOf("TerminateInstances"); len(got) != 1 || !strings.HasPrefix(got[0], "r-old-1 ") {
+		t.Fatalf("terminate calls %v", got)
+	}
+}
+
+func TestPlacementStateFile(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.07"}}}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	if _, err := g.Launch(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(g.dir, "placement.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st placementState
+	if err := json.Unmarshal(b, &st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Where) != 1 || st.Active["r-one-1"].IsZero() {
+		t.Fatalf("state %s", b)
+	}
+}
+
+func TestLatestPricesNotHistoricalMinimum(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	rows := []SpotPrice{
+		{Region: "r", Zone: "ra", Type: "c7a.2xlarge", Price: "0.0100", Since: now.Add(-48 * time.Hour)}, // no longer applies
+		{Region: "r", Zone: "ra", Type: "c7a.2xlarge", Price: "0.0800", Since: now.Add(-time.Hour)},
+		{Region: "r", Zone: "rb", Type: "c7a.2xlarge", Price: "0.0600", Since: now.Add(-90 * 24 * time.Hour)}, // old but current
+		{Region: "r", Zone: "rb", Type: "c7a.2xlarge", Price: "0.0001", Since: now.Add(time.Hour)},            // future: ignore
+	}
+	for _, order := range [][]int{{0, 1, 2, 3}, {3, 2, 1, 0}, {1, 3, 0, 2}} {
+		var in []SpotPrice
+		for _, i := range order {
+			in = append(in, rows[i])
+		}
+		got := latestPrices(in, now)
+		if len(got) != 2 || got[0].Zone != "rb" || got[0].Price != "0.0600" || got[1].Price != "0.0800" {
+			t.Fatalf("order %v: latest = %+v", order, got)
+		}
+	}
+}
+
+func TestParseSpotPriceHistoryFilters(t *testing.T) {
+	b := []byte(`<DescribeSpotPriceHistoryResponse><spotPriceHistorySet>
+<item><instanceType>c7a.2xlarge</instanceType><productDescription>Windows</productDescription><spotPrice>0.01</spotPrice><timestamp>2026-11-14T00:00:00.000Z</timestamp><availabilityZone>ra</availabilityZone></item>
+<item><instanceType>c7a.2xlarge</instanceType><productDescription>Linux/UNIX</productDescription><spotPrice>0</spotPrice><timestamp>2026-11-14T00:00:00.000Z</timestamp><availabilityZone>ra</availabilityZone></item>
+<item><instanceType>c7a.2xlarge</instanceType><productDescription>Linux/UNIX</productDescription><spotPrice>bogus</spotPrice><timestamp>2026-11-14T00:00:00.000Z</timestamp><availabilityZone>ra</availabilityZone></item>
+<item><instanceType>c7a.2xlarge</instanceType><productDescription>Linux/UNIX (Amazon VPC)</productDescription><spotPrice>0.0712</spotPrice><timestamp>2026-11-14T00:00:00.000Z</timestamp><availabilityZone>rb</availabilityZone></item>
+</spotPriceHistorySet><nextToken>tok</nextToken></DescribeSpotPriceHistoryResponse>`)
+	ps, next, err := parseSpotPriceHistory("r", b)
+	if err != nil || next != "tok" {
+		t.Fatal(err, next)
+	}
+	if len(ps) != 1 || ps[0].Zone != "rb" || ps[0].Price != "0.0712" {
+		t.Fatalf("parsed %+v (Windows, zero and malformed prices must be dropped)", ps)
+	}
+}
+
+func TestRankPricesDeterministic(t *testing.T) {
+	ps := []SpotPrice{
+		{Region: "b", Zone: "b1", Type: "x", Price: "0.05"},
+		{Region: "a", Zone: "a2", Type: "y", Price: "0.050"},
+		{Region: "a", Zone: "a2", Type: "x", Price: "0.05"},
+		{Region: "c", Zone: "c1", Type: "x", Price: "0.04"},
+	}
+	rankPrices(ps)
+	var got []string
+	for _, p := range ps {
+		got = append(got, poolKey(p))
+	}
+	if s := strings.Join(got, " "); s != "c/c1/x a/a2/x a/a2/y b/b1/x" {
+		t.Fatal(s)
+	}
+}
+
+func TestForInstanceFallsBack(t *testing.T) {
+	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-two-1": {"i-b": "c7a.2xlarge"}}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	p := ForInstance(context.Background(), g, "i-b")
+	if p.Runner().Region != "r-two-1" {
+		t.Fatalf("cache provider in %s, want the instance's region", p.Runner().Region)
+	}
+	if _, ok := p.(DepsCache); !ok {
+		t.Fatal("the instance's regional provider should offer the cache")
+	}
+	if _, ok := p.(ImageRegistry); !ok {
+		t.Fatal("the instance's regional provider should offer the registry")
+	}
+	q := ForInstance(context.Background(), g, "i-gone")
+	if q != Provider(g) {
+		t.Fatalf("an unknown instance should fall back to the coordinator, got %T", q)
+	}
+	if _, ok := q.(DepsCache); ok {
+		t.Fatal("an unknown instance must get no cache, not the wrong region's")
+	}
+}
+
+func TestGlobalZoneWithoutSubnetTriesNextZone(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{
+			"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}, {"r-one-1b", "c7a.2xlarge", "0.06"}},
+			"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.07"}},
+		},
+		noSubnet: map[string]bool{"r-one-1a": true},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	in, err := g.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 1 || runs[0] != "r-one-1 RunInstances c7a.2xlarge subnet-r-one-1b" || in.Region != "r-one-1" {
+		t.Fatalf("a zone without a subnet should only skip that zone: %v", runs)
+	}
+}
+
+func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}},
+		"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.30"}},
+	}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	g.r.MaxPrice = "0.04"
+	if _, err := g.Launch(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "above max_price") {
+		t.Fatalf("err = %v", err)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 0 {
+		t.Fatalf("launched above max_price: %v", runs)
+	}
+	// At the cap is fine.
+	g2 := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	g2.r.MaxPrice = "0.05"
+	if in, err := g2.Launch(context.Background(), t.Logf); err != nil || in.Region != "r-one-1" {
+		t.Fatalf("at the cap: %+v %v", in, err)
+	}
+	// The option under the cap fails: the one above it must not be tried.
+	f.mu.Lock()
+	f.calls, f.runErr = nil, map[string]string{"r-one-1/c7a.2xlarge": "InsufficientInstanceCapacity"}
+	f.mu.Unlock()
+	g3 := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	g3.r.MaxPrice = "0.05"
+	if _, err := g3.Launch(context.Background(), t.Logf); err == nil {
+		t.Fatal("fell back above max_price")
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 1 || !strings.HasPrefix(runs[0], "r-one-1 ") {
+		t.Fatalf("runs %v", runs)
+	}
+}
+
+// provider.New picks the coordinator for several regions, and keeps it for
+// a runner moved back to one region while VMs may remain in the others.
+func TestNewPicksRegionalOrGlobal(t *testing.T) {
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	base := config.Runner{Name: "g", Type: config.TypeAWSSpot, Region: "r-one-1", InstanceTypes: []string{"c7a.2xlarge", "c6a.2xlarge"}, Arch: "amd64"}
+	single := base
+	if p, err := New(&single); err != nil || fmt.Sprintf("%T", p) != "*provider.AWSSpot" {
+		t.Fatalf("single region: %T %v", p, err)
+	}
+	multi := base
+	multi.Regions = []string{"r-one-1", "r-two-1"}
+	p, err := New(&multi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g, ok := p.(*AWSGlobal); !ok || g.legacy {
+		t.Fatalf("several regions: %T", p)
+	}
+	// It launched in r-two-1, then the config went back to r-one-1 only.
+	g := p.(*AWSGlobal)
+	if err := g.markActive("r-two-1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	p, err = New(&single)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg, ok := p.(*AWSGlobal)
+	if !ok || !lg.legacy {
+		t.Fatalf("back to one region with VMs elsewhere: %T", p)
+	}
+	regions, _ := lg.managedRegions(context.Background())
+	if strings.Join(regions, ",") != "r-one-1,r-two-1" {
+		t.Fatalf("managed regions %v", regions)
+	}
+	if pr, _ := lg.PlacementRegions(context.Background()); strings.Join(pr, ",") != "r-one-1" {
+		t.Fatalf("placement regions %v", pr)
+	}
+}
+
+// A single-region runner still tidying up old regions launches exactly as
+// before: its own region, instance_types in order, the configured network.
+func TestLegacyLaunchKeepsSingleRegionBehaviour(t *testing.T) {
+	f := &fakeRegionsEC2{runErr: map[string]string{"r-one-1/c7a.2xlarge": "InsufficientInstanceCapacity"},
+		prices: map[string][][3]string{"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.01"}}}}
+	g := newGlobalEnv(t, f, "r-one-1")
+	g.legacy = true
+	in, err := g.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := f.callsOf("RunInstances")
+	if in.Region != "r-one-1" || strings.Join(runs, "|") != "r-one-1 RunInstances c7a.2xlarge |r-one-1 RunInstances c6a.2xlarge " {
+		t.Fatalf("launched %+v via %v", in, runs)
+	}
+	if n := len(f.callsOf("DescribeSpotPriceHistory")); n != 0 {
+		t.Fatal("a single-region launch doesn't compare prices")
+	}
+}
+
+// Plain single-region use launches without recording anything in
+// placement.json, so going back to several regions must rediscover.
+func TestSingleRegionUseForgetsDiscovery(t *testing.T) {
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	r := config.Runner{Name: "g", Type: config.TypeAWSSpot, Region: "r-one-1", Regions: []string{"r-one-1", "r-two-1"}, InstanceTypes: []string{"c7a.2xlarge"}, Arch: "amd64"}
+	p, _ := New(&r)
+	g := p.(*AWSGlobal)
+	if err := g.withState(func(st *placementState) { st.Discovered = true }); err != nil {
+		t.Fatal(err)
+	}
+	single := r
+	single.Regions = nil
+	if p, _ := New(&single); fmt.Sprintf("%T", p) != "*provider.AWSSpot" {
+		t.Fatalf("got %T", p)
+	}
+	var d bool
+	_ = g.withState(func(st *placementState) { d = st.Discovered })
+	if d {
+		t.Fatal("single-region use must reset discovery")
+	}
+}
+
+// An expired region is kept while it still holds something that bills
+// even though it isn't schedulable: a stopped VM, or a bake builder.
+func TestGlobalExpiredRegionKeptForStoppedAndBuilders(t *testing.T) {
+	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-two-1": {"i-stopped": "c7a.2xlarge"}},
+		state: map[string]string{"i-stopped": "stopped"}, builders: map[string]bool{"r-three-1": true}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
+	discovered(t, g)
+	g.markActive("r-two-1", time.Now().Add(-time.Minute))
+	g.markActive("r-three-1", time.Now().Add(-time.Minute))
+	ins, err := g.List(context.Background())
+	if err != nil || len(ins) != 0 {
+		t.Fatalf("list = %v, %v (stopped VMs aren't schedulable)", ins, err)
+	}
+	if got := active(t, g); got != "r-three-1,r-two-1" {
+		t.Fatalf("regions with billable leftovers were forgotten: %q", got)
+	}
+}
+
+// Discovery records a region that holds only a stopped VM.
+func TestGlobalDiscoveryFindsStoppedOnly(t *testing.T) {
+	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-two-1": {"i-stopped": "c7a.2xlarge"}},
+		state: map[string]string{"i-stopped": "stopped"}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	if _, err := g.List(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := active(t, g); got != "r-two-1" {
+		t.Fatalf("active %q", got)
+	}
+}
+
+// A region found broken (no network) stays excluded from on-demand
+// fallback on later launches, when its Spot options are skipped by
+// cooldown before they are tried.
+func TestGlobalOnDemandSkipsRegionsCoolingForSetup(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.05"}},
+		"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.06"}},
+		"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.07"}},
+	}, runErr: map[string]string{"r-three-1/c7a.2xlarge": "InsufficientInstanceCapacity"}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
+	g.r.OnDemandFallback = true
+	g.coolRegion("r-one-1", "no default VPC", true)
+	g.coolRegion("r-two-1", "no default VPC", true)
+	in, err := g.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if markets := f.callsOf("market"); in.Region != "r-three-1" || markets[len(markets)-1] != "r-three-1 market on-demand" {
+		t.Fatalf("launched %+v via %v", in, markets)
+	}
+}

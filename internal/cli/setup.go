@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -110,11 +111,24 @@ and keeps a working key. --rotate replaces the key.
 				need := map[string]int{}
 				ownNet := map[string]bool{}
 				for _, r := range aws {
-					if _, seen := need[r.Region]; !seen {
-						regions = append(regions, r.Region)
+					if r.AnyRegion() {
+						// Every enabled region: launches skip regions that
+						// lack a default VPC or quota, so none is prepared.
+						fmt.Printf("  %s launches in any enabled region; regions without a default VPC or Spot quota are skipped automatically\n", r.Name)
+						continue
 					}
-					need[r.Region] += r.MaxInstances * provider.VCPUsOf(r.InstanceTypes[0])
-					ownNet[r.Region] = ownNet[r.Region] || r.SubnetID != ""
+					rs := []string{r.Region}
+					if r.MultiRegion() {
+						rs = r.Regions
+					}
+					for _, rg := range rs {
+						if _, seen := need[rg]; !seen {
+							regions = append(regions, rg)
+						}
+						// The whole fleet may land in any one of them.
+						need[rg] += r.MaxInstances * provider.VCPUsOf(r.InstanceTypes[0])
+						ownNet[rg] = ownNet[rg] || r.SubnetID != ""
+					}
 				}
 				for _, rg := range regions {
 					if !ownNet[rg] && !noVPC {
@@ -586,23 +600,44 @@ func containsFold(list []string, s string) bool {
 	return false
 }
 
-// awsRegions lists the regions the configured AWS runners use.
-func awsRegions() []string {
+// awsRegions lists the regions the configured AWS runners use or may still
+// have VMs in. A runner allowed in every region needs the account's list,
+// fetched with the admin profile.
+func awsRegions(ctx context.Context, adminProfile string) ([]string, error) {
 	g, err := config.LoadGlobal()
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	var errs []error
 	var out []string
-	for _, r := range awsRunners(g) {
-		if !containsFold(out, r.Region) {
-			out = append(out, r.Region)
+	add := func(rs ...string) {
+		for _, rg := range rs {
+			if !containsFold(out, rg) {
+				out = append(out, rg)
+			}
 		}
 	}
-	return out
+	for _, r := range awsRunners(g) {
+		add(r.Region)
+		add(r.Regions...)
+		add(provider.KnownRegions(r)...)
+		if r.AnyRegion() {
+			all, err := provider.EnabledRegions(ctx, adminProfile, r.Region)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("runner %s uses every region, but the account's regions couldn't be listed: %w", r.Name, err))
+			}
+			add(all...)
+		}
+	}
+	// "all" is not a region.
+	return slices.DeleteFunc(out, func(s string) bool { return s == config.AllRegions }), errors.Join(errs...)
 }
 
 func listMachines(ctx context.Context, adminProfile string) error {
-	regions := awsRegions()
+	regions, rerr := awsRegions(ctx, adminProfile)
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v; VM counts cover only %s\n", rerr, strings.Join(regions, ", "))
+	}
 	ms, err := provider.ListMachines(ctx, adminProfile, regions)
 	if err != nil {
 		return err
@@ -764,7 +799,12 @@ func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) e
 	if _, err := config.LoadGlobal(); err != nil {
 		return fmt.Errorf("reading the runner config (it says which regions to search for the machine's VMs): %w", err)
 	}
-	regions := awsRegions()
+	regions, rerr := awsRegions(ctx, adminProfile)
+	if rerr != nil {
+		// Revoking deletes the IAM user: don't leave its VMs running in
+		// regions that weren't checked.
+		return fmt.Errorf("%w; not revoking until every region can be checked", rerr)
+	}
 	ms, err := provider.ListMachines(ctx, adminProfile, regions)
 	if err != nil {
 		return err

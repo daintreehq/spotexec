@@ -96,7 +96,7 @@ func gatherStatus(ctx context.Context, rs []*config.Runner) []runnerStatus {
 			}
 			for _, in := range insts {
 				rows = append(rows, runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: r.HourlyCost, r: r, Fleet: r.Name,
-					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot}})
+					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}})
 			}
 			continue
 		}
@@ -178,7 +178,11 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 				state = "draining"
 			}
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.Name, s.Type, state, host, slots, load, mem, idle)
+		typ := s.Type
+		if s.r != nil && s.Info.Region != "" && (s.r.MultiRegion() || s.Info.Region != s.r.Region) {
+			typ += " " + s.Info.Region // which region each instance landed in
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.Name, typ, state, host, slots, load, mem, idle)
 	}
 	tw.Flush()
 	for _, s := range sts {
@@ -210,7 +214,7 @@ func cmdStatus() *cobra.Command {
 				return err
 			}
 			if everyone {
-				res := findAccountInstances(cmd.Context(), accountScopes(cfg))
+				res := searchAccount(cmd.Context(), cfg)
 				quotas := spotQuotas(cmd.Context(), cfg)
 				if asJSON {
 					if res.Instances == nil {
@@ -977,20 +981,52 @@ func parseAge(s string) (time.Duration, error) {
 var (
 	findAccountInstances     = provider.FindAccountInstances
 	terminateAccountInstance = provider.TerminateAccountInstance
+	enabledRegions           = provider.EnabledRegions
 )
 
-// accountScopes is every (region, profile) the AWS runners use: "the
-// account" for status -A and down -A means these.
-func accountScopes(cfg *config.Config) []provider.AccountScope {
+// searchAccount finds every spotexec VM in the scopes the AWS runners use;
+// a region list that couldn't be fetched is reported as a failed scope.
+func searchAccount(ctx context.Context, cfg *config.Config) *provider.AccountSearch {
+	scopes, failed := accountScopes(ctx, cfg)
+	res := findAccountInstances(ctx, scopes)
+	res.Failed = append(res.Failed, failed...)
+	return res
+}
+
+// accountScopes is every (region, profile) the AWS runners use, including
+// every region a multi-region runner launches in or may still hold VMs in:
+// "the account" for status -A and down -A means these.
+func accountScopes(ctx context.Context, cfg *config.Config) ([]provider.AccountScope, []provider.AccountScopeError) {
 	var out []provider.AccountScope
+	var failed []provider.AccountScopeError
 	seen := map[provider.AccountScope]bool{}
 	for _, r := range cfg.Global.Runners {
-		sc := provider.AccountScope{Region: r.Region, Profile: r.Profile}
-		if r.Type != config.TypeAWSSpot || seen[sc] {
+		if r.Type != config.TypeAWSSpot {
 			continue
 		}
-		seen[sc] = true
-		out = append(out, sc)
+		// Every region the runner launches in or may still hold VMs in:
+		// its region, its list of regions (or, for "all", every region
+		// enabled in the account), and any its placement state records.
+		regions := append([]string{r.Region}, r.Regions...)
+		regions = append(regions, provider.KnownRegions(r)...)
+		if r.AnyRegion() {
+			all, err := enabledRegions(ctx, r.Profile, r.Region)
+			if err != nil {
+				failed = append(failed, provider.AccountScopeError{
+					AccountScope: provider.AccountScope{Region: config.AllRegions, Profile: r.Profile},
+					Err:          fmt.Sprintf("runner %s uses every region, but the account's regions couldn't be listed: %v", r.Name, err),
+				})
+			}
+			regions = append(regions, all...)
+		}
+		for _, rg := range regions {
+			sc := provider.AccountScope{Region: rg, Profile: r.Profile}
+			if rg == "" || rg == config.AllRegions || seen[sc] {
+				continue
+			}
+			seen[sc] = true
+			out = append(out, sc)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Region != out[j].Region {
@@ -998,7 +1034,7 @@ func accountScopes(cfg *config.Config) []provider.AccountScope {
 		}
 		return out[i].Profile < out[j].Profile
 	})
-	return out
+	return out, failed
 }
 
 // printSearched says where the search looked, and what it couldn't list.
@@ -1053,7 +1089,7 @@ func printAccountInstances(ins []provider.AccountInstance) {
 // found it. It fails when any region couldn't be listed or any VM
 // terminated, so "done" means done.
 func downAccount(ctx context.Context, cfg *config.Config, machine string, yes bool) error {
-	res := findAccountInstances(ctx, accountScopes(cfg))
+	res := searchAccount(ctx, cfg)
 	short := strings.Split(machine, ".")[0]
 	var pick []provider.AccountInstance
 	for _, in := range res.Instances {

@@ -21,9 +21,10 @@ spotexec daemon start|stop|run               optional pool manager
 spotexec daemon status [--json]              what the pool manager sees and has done
 spotexec container init [--path P] [--force] [--yes] scaffold a Dockerfile and wire it into .spotexec.toml
 spotexec container build [run flags]         build the project image on a runner now (ECR on AWS)
-spotexec image bake [runner] [--pull IMG]    bake an AMI from the runner's bootstrap
-spotexec image list [runner]                 baked AMIs from every machine: base image, age, maker, which is in use
-spotexec image clear [runner] [--all]        delete this machine's and this bootstrap's bakes (--all: every machine's)
+spotexec image bake [runner] [--pull IMG]    bake an AMI from the runner's bootstrap (--region R for multi-region runners)
+spotexec image list [runner]                 baked AMIs from every machine: base image, age, maker, which is in use (every region a runner uses, or --region R)
+spotexec image clear [runner] [--all]        delete this machine's and this bootstrap's bakes (--all: every machine's; every region a runner uses, or --region R)
+spotexec prices [runner] [--refresh] [--json] current Spot prices across the runner's regions (with `regions`, the next VM takes the cheapest)
 spotexec setup [host...] [--all] [--bake]    set up this machine (config, AWS user and key, hooks), then others over SSH; offer a bake
 spotexec setup --list | --revoke HOST        every machine's IAM user and VMs; revoke one
 spotexec teardown [--dry-run] [--region R]   remove everything spotexec created in the AWS account (admin)

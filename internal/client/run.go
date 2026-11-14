@@ -865,7 +865,8 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	}
 	// Shared cache: sign URLs for the key the runner will compute. Any
 	// failure just means installing without the cache.
-	if dc, ok := lease.Provider.(provider.DepsCache); ok {
+	// The cache lives in the instance's own region (multi-region fleets).
+	if dc, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.DepsCache); ok {
 		key, err := depskey.Key(ws.Root, depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Image: image, Toolchain: req.Toolchain, OS: s.Hello.OS, Arch: s.Hello.Arch})
 		if err == nil {
 			cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -1160,7 +1161,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 			return "", "", err
 		}
 		req.Dockerfile, req.Context, req.Tag = c.Dockerfile, c.Context, tag
-		if reg, ok := lease.Provider.(provider.ImageRegistry); ok {
+		if reg, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.ImageRegistry); ok {
 			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			auth, err := reg.RegistryFor(cctx, ws.RepoID)
 			cancel()

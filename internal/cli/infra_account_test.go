@@ -38,11 +38,43 @@ func accountCfg() *config.Config {
 
 func TestAccountScopes(t *testing.T) {
 	var got []string
-	for _, sc := range accountScopes(accountCfg()) {
+	scopes, failed := accountScopes(context.Background(), accountCfg())
+	for _, sc := range scopes {
 		got = append(got, sc.Region+"/"+sc.Profile)
 	}
-	if strings.Join(got, ",") != "us-east-2/a,us-east-2/b,us-west-2/a" {
-		t.Fatalf("scopes %v", got)
+	if strings.Join(got, ",") != "us-east-2/a,us-east-2/b,us-west-2/a" || len(failed) != 0 {
+		t.Fatalf("scopes %v, failed %v", got, failed)
+	}
+}
+
+// A multi-region runner's scopes are every region it launches in; with
+// "all", every region enabled in the account, and a region list that
+// couldn't be fetched is a failed scope.
+func TestAccountScopesMultiRegion(t *testing.T) {
+	old := enabledRegions
+	t.Cleanup(func() { enabledRegions = old })
+	var fail error
+	enabledRegions = func(_ context.Context, profile, home string) ([]string, error) {
+		if fail != nil {
+			return nil, fail
+		}
+		return []string{"eu-north-1", "us-east-1", "us-east-2"}, nil
+	}
+	cfg := accountCfg()
+	cfg.Global.Runners["m"] = &config.Runner{Name: "m", Type: config.TypeAWSSpot, Region: "eu-north-1", Regions: []string{"eu-north-1", "us-west-2"}, Profile: "a"}
+	cfg.Global.Runners["any"] = &config.Runner{Name: "any", Type: config.TypeAWSSpot, Region: "us-east-1", Regions: []string{config.AllRegions}, Profile: "b"}
+	var got []string
+	scopes, failed := accountScopes(context.Background(), cfg)
+	for _, sc := range scopes {
+		got = append(got, sc.Region+"/"+sc.Profile)
+	}
+	want := "eu-north-1/a,eu-north-1/b,us-east-1/b,us-east-2/a,us-east-2/b,us-west-2/a"
+	if strings.Join(got, ",") != want || len(failed) != 0 {
+		t.Fatalf("scopes %v, failed %v; want %s", got, failed, want)
+	}
+	fail = errors.New("UnauthorizedOperation")
+	if _, failed := accountScopes(context.Background(), cfg); len(failed) != 1 || failed[0].Profile != "b" {
+		t.Fatalf("failed %v", failed)
 	}
 }
 
