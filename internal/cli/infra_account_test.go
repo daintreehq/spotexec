@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -106,7 +107,7 @@ func TestDownAccount(t *testing.T) {
 		if strings.Join(*term, ",") != "i-mine@a,i-builder@a,i-otheracct@b" {
 			t.Fatalf("terminated %v", *term)
 		}
-		if !strings.Contains(out, "\nsearched us-east-2, us-west-2 (account 111111111111, profile a); us-east-2 (account 222222222222, profile b); us-west-2 (account 111111111111, profile c) (the regions your AWS runners use)\n") {
+		if !slices.Contains(strings.Split(out, "\n"), "searched us-east-2, us-west-2 (account 111111111111, profile a); us-east-2 (account 222222222222, profile b); us-west-2 (account 111111111111, profile c) (the regions your AWS runners use)") {
 			t.Fatalf("output:\n%s", out)
 		}
 	})
