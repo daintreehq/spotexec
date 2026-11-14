@@ -30,9 +30,30 @@ type WritebackResult struct {
 	Applied     []string
 	Deleted     []string
 	Conflicts   []string
+	Stashed     []Conflict // one per Conflicts entry: where each remote version went
 	Ignored     int
 	Refused     []string // paths the runner reported that may not be written
 	ConflictDir string
+}
+
+// Conflict is a path where your local edit was kept and the remote version
+// was stashed instead.
+type Conflict struct {
+	Path    string `json:"path"`    // worktree-relative
+	Local   string `json:"local"`   // your file (absolute)
+	Remote  string `json:"remote"`  // the stashed remote version (absolute)
+	Deleted bool   `json:"deleted"` // the remote command deleted it (Remote is a marker file)
+}
+
+// conflict stashes the remote version of p and records the conflict.
+func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile) error {
+	stashed, err := stashConflict(wb.ConflictDir, p, want, rf)
+	if err != nil {
+		return err
+	}
+	wb.Conflicts = append(wb.Conflicts, p)
+	wb.Stashed = append(wb.Stashed, Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(p)), Remote: stashed, Deleted: !want.exists})
+	return nil
 }
 
 // remoteFile is a fetched file version.
@@ -251,10 +272,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 			}
 			want := version{true, rf.id, rf.mode}
 			if !local.eq(base) && !local.eq(want) {
-				if err := stashConflict(wb.ConflictDir, q, want, rf); err != nil {
+				if err := wb.conflict(ws.Root, q, want, rf); err != nil {
 					return wb, err
 				}
-				wb.Conflicts = append(wb.Conflicts, q)
 				break
 			}
 			if err := os.Rename(fd, fq); err != nil {
@@ -263,10 +283,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 			if !local.eq(want) {
 				err := writeLocal(ws.Root, q, rf, &local)
 				if errors.Is(err, errChangedUnderUs) {
-					if err := stashConflict(wb.ConflictDir, q, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, q, want, rf); err != nil {
 						return wb, err
 					}
-					wb.Conflicts = append(wb.Conflicts, q)
 					break
 				}
 				if err != nil {
@@ -313,10 +332,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 				// directory is needed, kept because of a local edit): keep
 				// the local side, stash the remote one.
 				if errors.Is(err, errChangedUnderUs) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) {
-					if err := stashConflict(wb.ConflictDir, p, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, p, want, rf); err != nil {
 						return err
 					}
-					wb.Conflicts = append(wb.Conflicts, p)
 					return nil
 				}
 				if err != nil {
@@ -336,10 +354,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 				removedDirs = append(removedDirs, path.Dir(p))
 			}
 		default:
-			if err := stashConflict(wb.ConflictDir, p, want, rf); err != nil {
+			if err := wb.conflict(ws.Root, p, want, rf); err != nil {
 				return err
 			}
-			wb.Conflicts = append(wb.Conflicts, p)
 		}
 		return nil
 	}
@@ -378,38 +395,36 @@ func conflictBase(ws *Workspace) string {
 	return filepath.Join(ws.Root, ".spotexec")
 }
 
-func stashConflict(dir, p string, want version, rf remoteFile) error {
+// stashConflict saves the remote version of p under dir and returns where it
+// went (a ".deleted" marker when the remote command deleted it).
+func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 	if !want.exists {
 		mark := []byte("deleted by the remote command\n")
-		err := func() error {
-			full, err := fsid.SafeJoin(dir, p+".deleted")
-			if err != nil {
-				return err
+		full, err := fsid.SafeJoin(dir, p+".deleted")
+		if err == nil {
+			if err = os.MkdirAll(filepath.Dir(full), 0o700); err == nil {
+				err = os.WriteFile(full, mark, 0o600)
 			}
-			if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
-				return err
-			}
-			return os.WriteFile(full, mark, 0o600)
-		}()
+		}
 		if err != nil && stashCollision(err) {
 			// Something in the stash is in the way: a fresh flattened name.
 			if err := os.MkdirAll(dir, 0o700); err != nil {
-				return err
+				return "", err
 			}
 			f, err := os.CreateTemp(dir, strings.ReplaceAll(p, "/", "__")+".deleted-*")
 			if err != nil {
-				return err
+				return "", err
 			}
 			_, err = f.Write(mark)
 			if cerr := f.Close(); err == nil {
 				err = cerr
 			}
-			return err
+			return f.Name(), err
 		}
-		return err
+		return full, err
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return "", err
 	}
 	err := writeLocal(dir, p, rf, nil)
 	if err != nil && stashCollision(err) {
@@ -424,9 +439,9 @@ func stashConflict(dir, p string, want version, rf remoteFile) error {
 			}
 			name = fmt.Sprintf("%s.%d", base, i)
 		}
-		return writeLocal(dir, name, rf, nil)
+		return filepath.Join(dir, name), writeLocal(dir, name, rf, nil)
 	}
-	return err
+	return filepath.Join(dir, filepath.FromSlash(p)), err
 }
 
 func stashCollision(err error) bool {

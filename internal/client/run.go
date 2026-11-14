@@ -492,6 +492,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			proceed = func() bool { return ctx.Err() == nil }
 		}
 		wb, err := writeback(post, sess, ws, m, result, runID, ignoredCreated, proceed)
+		// Conflicts stashed before any failure are reported either way.
+		reportConflicts(o.Rep, wb.Stashed, runID)
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
@@ -501,9 +503,6 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "ignored_created": wb.Ignored, "duration_ms": time.Since(t).Milliseconds()})
 		if len(wb.Refused) > 0 {
 			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
-		}
-		for _, c := range wb.Conflicts {
-			o.Rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version, remote version saved under %s", c, wb.ConflictDir)
 		}
 		if result.Truncated {
 			o.Rep.Warn("WRITEBACK_TRUNCATED", "more than %d new files were created; only the first batch was considered for write-back", 50000)
@@ -539,6 +538,33 @@ func keepLastRun(ws *Workspace, o Options, lr LastRun, res *Result) {
 	if !o.DeferLastRun {
 		saveLastRun(ws, lr)
 	}
+}
+
+// reportConflicts says, for each write-back conflict, exactly where to look:
+// the stash is under the git dir, out of sight of `git status` and editors.
+func reportConflicts(rep ui.Reporter, stashed []Conflict, runID string) {
+	for _, c := range stashed {
+		diff := conflictDiff(c)
+		if c.Deleted {
+			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run, and the remote command deleted it; kept your version (delete it yourself to accept the deletion). Your changes: %s", c.Path, diff)
+		} else {
+			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version. The remote version: %s", c.Path, diff)
+		}
+		rep.Event("conflict", map[string]any{"path": c.Path, "local": c.Local, "remote": c.Remote, "deleted": c.Deleted, "diff": diff, "run_id": runID})
+	}
+}
+
+// conflictDiff is a ready-to-run command comparing your kept file with what
+// the remote run produced (/dev/null for a side that doesn't exist).
+func conflictDiff(c Conflict) string {
+	local, remote := c.Local, c.Remote
+	if c.Deleted {
+		remote = os.DevNull // Remote is only a marker
+	}
+	if fi, err := os.Lstat(local); err != nil || fi.IsDir() {
+		local = os.DevNull // deleted (or replaced by a directory) locally
+	}
+	return "git diff --no-index -- " + transport.ShellQuote(local) + " " + transport.ShellQuote(remote)
 }
 
 func firstN(s []string, n int) []string {

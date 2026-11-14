@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -146,3 +147,103 @@ func TestWritebackLockWaitIsBounded(t *testing.T) {
 		t.Fatal("took the lock with an expired deadline")
 	}
 }
+
+func TestConflictStashIsDiffable(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	stash := filepath.Join(t.TempDir(), "conflicts", "run-1")
+	local := filepath.Join(root, "src", "a b.txt")
+	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, []byte("local edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wb := &WritebackResult{ConflictDir: stash}
+	rf := remoteFile{data: []byte("remote\n"), mode: fsid.ModeFile}
+	if err := wb.conflict(root, "src/a b.txt", version{true, fsid.Bytes(rf.data), rf.mode}, rf); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.conflict(root, "src/gone.txt", version{}, remoteFile{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(wb.Stashed) != 2 || len(wb.Conflicts) != 2 {
+		t.Fatalf("stashed %v", wb.Stashed)
+	}
+	c := wb.Stashed[0]
+	if c.Path != "src/a b.txt" || c.Local != local || c.Deleted {
+		t.Fatalf("conflict %+v", c)
+	}
+	if b, err := os.ReadFile(c.Remote); err != nil || string(b) != "remote\n" {
+		t.Fatalf("stashed copy at %s: %q, %v", c.Remote, b, err)
+	}
+	if d := wb.Stashed[1]; !d.Deleted || !strings.HasSuffix(d.Remote, ".deleted") {
+		t.Fatalf("deletion conflict %+v", d)
+	}
+	if _, err := os.Stat(wb.Stashed[1].Remote); err != nil {
+		t.Fatalf("deletion marker: %v", err)
+	}
+	// The suggested commands run as printed and show the difference.
+	diff := func(c Conflict, want ...string) {
+		t.Helper()
+		out, _ := exec.Command("sh", "-c", conflictDiff(c)).CombinedOutput()
+		for _, w := range want {
+			if !strings.Contains(string(out), w) {
+				t.Fatalf("%s: no %q in:\n%s", conflictDiff(c), w, out)
+			}
+		}
+	}
+	diff(c, "-local edit", "+remote")
+	// Deleted remotely: your copy against nothing.
+	gone := filepath.Join(root, "src", "gone.txt")
+	if err := os.WriteFile(gone, []byte("kept\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diff(wb.Stashed[1], "-kept")
+	// Deleted locally: nothing against the remote version.
+	if err := os.Remove(local); err != nil {
+		t.Fatal(err)
+	}
+	diff(c, "+remote")
+}
+
+func TestConflictsAreReported(t *testing.T) {
+	rec := &recordingReporter{}
+	stashed := []Conflict{
+		{Path: "a.txt", Local: "/w/a.txt", Remote: "/g/spotexec/conflicts/r/a.txt"},
+		{Path: "b.txt", Local: "/w/b.txt", Remote: "/g/spotexec/conflicts/r/b.txt.deleted", Deleted: true},
+	}
+	reportConflicts(rec, stashed, "r")
+	if len(rec.warnings) != 2 || len(rec.events) != 2 {
+		t.Fatalf("warnings %v, events %v", rec.warnings, rec.events)
+	}
+	for i, ev := range rec.events {
+		if ev["path"] != stashed[i].Path || ev["local"] != stashed[i].Local || ev["remote"] != stashed[i].Remote || ev["diff"] == "" {
+			t.Fatalf("event %v", ev)
+		}
+		if !strings.Contains(rec.warnings[i], ev["diff"].(string)) {
+			t.Fatalf("warning without its diff command: %s", rec.warnings[i])
+		}
+	}
+}
+
+type recordingReporter struct {
+	warnings []string
+	events   []map[string]any
+}
+
+func (r *recordingReporter) Event(name string, f map[string]any) {
+	if name == "conflict" {
+		r.events = append(r.events, f)
+	}
+}
+func (r *recordingReporter) Status(string, ...any) {}
+func (r *recordingReporter) Clear()                {}
+func (r *recordingReporter) Warn(code, format string, args ...any) {
+	r.warnings = append(r.warnings, code+": "+fmt.Sprintf(format, args...))
+}
+func (r *recordingReporter) Done(string, bool)     {}
+func (r *recordingReporter) PartDone(string, bool) {}
+func (r *recordingReporter) IsJSON() bool          { return true }

@@ -90,7 +90,7 @@ The manifest records the Git blob ID of every synced file: the **baseline**. Aft
 | --- | --- |
 | Equals the remote result | Nothing to do. |
 | Equals the baseline | The remote version is applied atomically (temp file, then rename). Your file keeps its permissions; only an executable-bit change made remotely comes back. |
-| Anything else | You edited it during the run. **Your file is kept**, the remote version is saved to `<git-dir>/spotexec/conflicts/<run-id>/<path>`, and a `SYNC_CONFLICT` warning is emitted. |
+| Anything else | You edited it during the run. **Your file is kept**, the remote version is saved to `<git-dir>/spotexec/conflicts/<run-id>/<path>`, and a `SYNC_CONFLICT` warning gives a ready-to-run `git diff --no-index` command comparing your file with the remote version. With `--json`, a `conflict` event carries both paths and that command. |
 
 Deletions apply deepest-first, then writes. New files only come back if Git wouldn't ignore them (created no more permissively than your umask allows), so `dist/`, `target/` and `node_modules` never travel back. A runner can never write into `.git`, under any spelling.
 

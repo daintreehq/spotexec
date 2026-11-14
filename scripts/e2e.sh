@@ -151,6 +151,8 @@ sleep 1; echo "local edit" > src/a.txt; wait
 check "concurrent local edit is kept" "grep -qx 'local edit' src/a.txt"
 check "remote version stashed" "ls .git/spotexec/conflicts/*/src/a.txt >/dev/null 2>&1"
 check "SYNC_CONFLICT reported" "grep -q SYNC_CONFLICT $WORK/conf.err"
+D=$(grep '"event":"conflict"' "$WORK/conf.err" | sed 's/.*"diff":"\([^"]*\)".*/\1/' | head -1)
+check "the conflict event's diff command shows the remote change" "[ -n \"\$D\" ] && { eval \"\$D\" || true; } | grep -qx '+remote'"
 
 echo "== concurrency (max_slots=3, 4 jobs)"
 for i in 1 2 3 4; do "$SX" --json "sleep 1.5; echo slot=\$SPOTEXEC_SLOT" >"$WORK/p$i.out" 2>"$WORK/p$i.err" & done; wait

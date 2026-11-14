@@ -27,6 +27,7 @@ With `--json`, `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1`, lifecycle events go to s
 {"event":"slot_acquired","runner":"aws","slot":3,"connect_ms":13,"waited_ms":0}
 {"event":"sync_in","mode":"fingerprint_hit","files":0,"bytes":0,"duration_ms":0}
 {"event":"sync_out","mutated_files":["src/index.ts"],"conflicts":[],"duration_ms":31}
+{"event":"conflict","path":"src/app.ts","local":"/repo/src/app.ts","remote":"/repo/.git/spotexec/conflicts/20260101-120000-ab12cd34ef56/src/app.ts","deleted":false,"diff":"git diff --no-index -- /repo/src/app.ts /repo/.git/spotexec/conflicts/20260101-120000-ab12cd34ef56/src/app.ts","run_id":"20260101-120000-ab12cd34ef56"}
 {"event":"result","exit_code":0,"duration_ms":4120,"timed_out":false}
 ```
 
@@ -35,6 +36,7 @@ Other events include:
 - `scale_out`, `provision`, `instance_running`, `instance_ready`;
 - `manifest`, `deps`, `image`, `exec`, `pull`, `cancel`;
 - `spot_interruption`, `spot_rebalance`, `retry`;
+- `conflict`, one per write-back conflict: your kept file (`local`), the stashed remote version (`remote`, a marker when `deleted` is true), and a `diff` command to see the remote changes;
 - `warning` events with stable codes (`SYNC_CONFLICT`, `RUNNER_LOST`, `SPOT_INTERRUPTION`, `TIMEOUT`, `LOCAL_FALLBACK`, …);
 - `error` with code `SPOTEXEC_ERROR` when spotexec itself fails (exit `125`). For example, a `BOOTSTRAP_FAILED` message.
 
