@@ -93,7 +93,14 @@ check "exit code passes through" "[ $code = 7 ]"
 check "timeout exits 124" "[ $code = 124 ]"
 "$SX" --json 'trap "echo got-term; exit 143" TERM; sleep 30 & wait' >"$WORK/c.out" 2>&1 &
 P=$!; sleep 1.5; kill -INT $P; wait $P && code=0 || code=$?
-check "ctrl-c terminates the remote process group" "grep -q got-term $WORK/c.out && [ $code = 143 ]"
+check "ctrl-c terminates the remote process group and exits 130" "grep -q got-term $WORK/c.out && [ $code = 130 ]"
+"$SX" --json --writeback on-success 'trap "echo handled > handled.txt; exit 0" TERM; sleep 30 & wait' >/dev/null 2>"$WORK/c2.err" &
+P=$!; sleep 1.5; kill -TERM $P; wait $P && code=0 || code=$?
+check "a command that handles SIGTERM and exits 0 is still interrupted (130, no on-success write-back)" "[ $code = 130 ] && test ! -e handled.txt && grep -q '\"canceled\":true' $WORK/c2.err"
+docker exec "$NAME" bash -c 'mkdir -p /home/dev/.cache/spotexec/tmp && chmod 000 /home/dev/.cache/spotexec/tmp'
+"$SX" --json 'echo ran > never.txt' >/dev/null 2>"$WORK/se.err" && code=0 || code=$?
+docker exec "$NAME" chmod 700 /home/dev/.cache/spotexec/tmp
+check "a command the runner can't start exits 125" "[ $code = 125 ] && test ! -e never.txt && grep -q 'could not be started' $WORK/se.err"
 
 echo "== conflicts"
 ("$SX" --json 'sleep 2; echo remote > src/a.txt' >/dev/null 2>"$WORK/conf.err") &

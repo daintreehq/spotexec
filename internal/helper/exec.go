@@ -299,6 +299,19 @@ loop:
 	return res
 }
 
+// shutdownExit: the exit statuses a shutdown produces (SIGHUP, SIGKILL,
+// SIGTERM). In a container, `docker run` also exits 125 when dockerd stops
+// under it.
+func shutdownExit(code int, container bool) bool {
+	switch code {
+	case 128 + int(syscall.SIGHUP), 128 + int(syscall.SIGKILL), 128 + int(syscall.SIGTERM):
+		return true
+	case 125:
+		return container
+	}
+	return false
+}
+
 func (s *Session) exec(e protocol.Exec) error {
 	if s.slotLock == nil {
 		return perr(protocol.CodeBadRequest, "acquire required before exec")
@@ -354,17 +367,28 @@ func (s *Session) exec(e protocol.Exec) error {
 	pr := s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch)
 	// The container must be gone before we snapshot the workspace: a
 	// container we can't remove could still be writing into it.
+	// The VM's shutdown can kill the command (or dockerd, under a container)
+	// before this helper is signalled itself: that is a lost runner, not the
+	// command's result. A command that finished on its own is never one.
+	shutdown := pr.startErr == nil && !pr.timedOut && shutdownExit(pr.code, e.Container != nil) && systemStopping()
 	if err := cleanup(); err != nil {
+		if shutdown {
+			// dockerd went away with the VM: the run was cut short, not failed.
+			return perr(protocol.CodeShutdown, "the runner is shutting down: %v", err)
+		}
 		return perr(protocol.CodeImageFailed, "%v; refusing to collect results from a workspace it may still be modifying", err)
 	}
 	res := protocol.Result{
 		ExitCode: pr.code, Signal: pr.signal, TimedOut: pr.timedOut, Canceled: pr.canceled,
 		Interrupted: pr.spotIntr || s.interrupted.Load(), DurationMS: time.Since(start).Milliseconds(),
+		Shutdown: shutdown,
 	}
 	if pr.startErr != nil {
 		res.StartError = pr.startErr.Error()
 	}
-	if e.Snapshot {
+	// Nothing of a run the shutdown killed is collected (and the slot stays
+	// marked dirty): report it before anything else can fail.
+	if e.Snapshot && !shutdown {
 		t := time.Now()
 		post := s.takeSnapshot(e.Skip)
 		res.Changed, res.Deleted, res.Created, res.Truncated, res.Unverified = s.diff(pre, post)

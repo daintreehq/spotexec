@@ -78,9 +78,9 @@ Plus anything in `env_allow` (copied from your environment) and `env` (fixed val
 | --- | --- |
 | *command's own* | The remote command's exit status, passed through. |
 | `124` | The command hit `--timeout`. |
-| `125` | spotexec itself failed: a bad flag or configuration, no runner, SSH, sync, bootstrap. In a parallel task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". |
+| `125` | spotexec itself failed: no runner, SSH, sync, bootstrap, or the runner couldn't start the command at all. In a parallel task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". |
 | `128+N` | The command died from signal N. |
-| `130` | Interrupted (Ctrl-C, `SIGTERM` or `SIGHUP`). |
+| `130` | Interrupted (Ctrl-C, `SIGTERM` or `SIGHUP`), even if the command caught the signal and exited `0`. An interrupted run never counts as a success for `writeback = "on-success"`. |
 
 ## Write-back and artifacts
 

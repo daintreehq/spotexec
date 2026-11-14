@@ -75,10 +75,10 @@ needed. The optional pool manager (`spotexec daemon`) also replaces a
 noticed warm instance within the notice. Then:
 
 - **The job finishes on the dying VM:** the result is used normally.
-- **The VM dies first (connection lost):** the whole run (sync, deps, exec,
-  write-back) is replayed on the replacement slot. Nothing was written back
-  locally from the lost attempt, so a replay is safe for anything that is
-  safe to re-run.
+- **The VM dies first (connection lost), or its shutdown kills the
+  command:** the whole run (sync, deps, exec, write-back) is replayed on the
+  replacement slot. Nothing was written back locally from the lost attempt,
+  so a replay is safe for anything that is safe to re-run.
 
 There is at most one reallocation per run by default (`--no-retry` disables
 it). A connection lost without a notice on an ephemeral runner is also retried

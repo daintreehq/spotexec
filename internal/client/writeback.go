@@ -91,7 +91,10 @@ func localVersion(root, rel string) (version, error) {
 // local == remote: nothing to do. local == base: apply remote. Otherwise
 // someone edited the file locally during the run: keep it and stash the
 // remote version under <git-dir>/spotexec/conflicts/<run-id>/.
-func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string) (WritebackResult, error) {
+//
+// proceed, when set, is asked once everything is fetched and before anything
+// is applied: false applies nothing.
+func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string, proceed func() bool) (WritebackResult, error) {
 	var wb WritebackResult
 	// Created (non-manifest) files only come back if not ignored locally.
 	// The runner's report is not trusted: changed or deleted paths must be
@@ -184,6 +187,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		return nil
 	}); err != nil {
 		return wb, err
+	}
+	if proceed != nil && !proceed() {
+		return wb, nil
 	}
 
 	// Serialize cooperating spotexec write-backs into this worktree.

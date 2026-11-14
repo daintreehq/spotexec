@@ -3,7 +3,9 @@ package client
 import (
 	"testing"
 
+	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/transport"
 
 	"github.com/daintreehq/spotexec/internal/manifest"
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -141,5 +143,56 @@ func TestKeepLastRun(t *testing.T) {
 	keepLastRun(ws, Options{Sync: "in"}, lr, &res)
 	if got, err := LoadLastRun(ws); err != nil || got.Slot != 2 {
 		t.Fatalf("record not saved: %v %v", got, err)
+	}
+}
+
+func TestClassifyExec(t *testing.T) {
+	cases := []struct {
+		name string
+		r    protocol.Result
+		want execOutcome
+	}{
+		{"plain success", protocol.Result{ExitCode: 0}, execCompleted},
+		{"plain failure", protocol.Result{ExitCode: 1}, execCompleted},
+		{"never started", protocol.Result{ExitCode: 127, StartError: "no space left on device"}, execNotStarted},
+		{"canceled, handled SIGTERM and exited 0", protocol.Result{ExitCode: 0, Canceled: true}, execCanceled},
+		{"canceled, killed", protocol.Result{ExitCode: 143, Canceled: true}, execCanceled},
+		{"a shutdown is never written back, even if also canceled", protocol.Result{ExitCode: 143, Canceled: true, Shutdown: true}, execShutdown},
+		{"killed by the VM shutting down", protocol.Result{ExitCode: 143, Interrupted: true, Shutdown: true}, execShutdown},
+		{"finished normally during the warning", protocol.Result{ExitCode: 0, Interrupted: true}, execCompleted},
+		{"exited 143 itself during the warning", protocol.Result{ExitCode: 143, Interrupted: true}, execCompleted},
+	}
+	for _, c := range cases {
+		if got := classifyExec(c.r); got != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestShutdownIsALostRunner(t *testing.T) {
+	spot := &Lease{Runner: &config.Runner{Type: config.TypeAWSSpot}, InstanceID: "i-1"}
+	shutdown := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeShutdown, Message: "the runner is shutting down"}}
+	if got := lostRunner(spot, shutdown); got != "i-1" {
+		t.Fatalf("a shutdown error on a Spot runner: lost %q, want i-1", got)
+	}
+	other := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "x"}}
+	if got := lostRunner(spot, other); got != "" {
+		t.Fatalf("an ordinary helper error counted as a lost runner (%q)", got)
+	}
+	static := &Lease{Runner: &config.Runner{Type: config.TypeSSH}}
+	if got := lostRunner(static, shutdown); got != "" {
+		t.Fatalf("a static runner is never replayed (%q)", got)
+	}
+	if got := shutdownRunner(static); got != "" {
+		t.Fatalf("a static runner is never replayed (%q)", got)
+	}
+}
+
+func TestInterruptedRunIsNeverOnSuccess(t *testing.T) {
+	if wantWriteback("on-success", ExitInterrupted) {
+		t.Fatal("an interrupted run counted as success for on-success write-back")
+	}
+	if !wantWriteback("always", ExitInterrupted) {
+		t.Fatal("always must still write back what an interrupted run changed")
 	}
 }

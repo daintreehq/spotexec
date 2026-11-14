@@ -34,8 +34,9 @@ import (
 
 // Exit codes for spotexec's own failures (command exit codes pass through).
 const (
-	ExitInfra   = 125
-	ExitTimeout = 124
+	ExitInfra       = 125
+	ExitTimeout     = 124
+	ExitInterrupted = 130 // Ctrl-C, SIGTERM or SIGHUP
 )
 
 // Large-sync guardrails.
@@ -86,6 +87,7 @@ type Result struct {
 	Slot      int    `json:"slot"`
 	Duration  time.Duration
 	TimedOut  bool     `json:"timed_out"`
+	Canceled  bool     `json:"canceled"` // interrupted (Ctrl-C/SIGTERM); ExitCode is 130
 	Mutated   []string `json:"mutated_files"`
 	Deleted   []string `json:"deleted_files"`
 	Conflicts []string `json:"conflicts"`
@@ -161,9 +163,14 @@ func lostRunner(l *Lease, err error) string {
 		return ""
 	}
 	// An error the helper reported itself means it was alive to report it
-	// (the command may well have run): never treat that as a lost runner.
+	// (the command may well have run): never treat that as a lost runner,
+	// unless it says the VM is shutting down (a container killed as dockerd
+	// stops with the VM).
 	var re *transport.RemoteError
 	if errors.As(err, &re) {
+		if re.Code == protocol.CodeShutdown {
+			return shutdownRunner(l)
+		}
 		return ""
 	}
 	// Writes to a dead SSH channel fail with plain pipe errors; the session
@@ -430,10 +437,27 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if err != nil {
 		return res, infra(fmt.Errorf("lost runner %s during execution: %w", r.Name, err)), lostRunner(lease, err)
 	}
-	if result.StartError != "" {
-		o.Rep.Warn("START_FAILED", "could not start command: %s", result.StartError)
-	}
 	res.ExitCode, res.TimedOut = result.ExitCode, result.TimedOut
+	// An interrupt (Ctrl-C, SIGTERM) at any point up to the final result
+	// makes the run interrupted: 130, never a success.
+	checkCanceled := func() {
+		if ctx.Err() != nil && !res.Canceled {
+			res.Canceled, res.ExitCode = true, ExitInterrupted
+		}
+	}
+	switch classifyExec(result) {
+	case execNotStarted:
+		return res, infra(fmt.Errorf("the command could not be started on %s: %s", r.Name, result.StartError)), ""
+	case execCanceled:
+		res.Canceled, res.ExitCode = true, ExitInterrupted
+	case execShutdown:
+		// Killed by the VM shutting down (a Spot reclaim): like a lost
+		// runner, nothing from this attempt is written back, and on a Spot
+		// runner the run is replayed (unless the user interrupted it: then
+		// the CLI exits 130).
+		return res, infra(fmt.Errorf("%s shut down while the command ran (it was stopped with exit %d); nothing was written back", label, result.ExitCode)), shutdownRunner(lease)
+	}
+	checkCanceled()
 	// Post-exec work uses its own bounded context: an interrupt that already
 	// canceled ctx must not prevent writing back what the command changed.
 	post, cancelPost := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -446,14 +470,20 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 
 	// 6. Write-back of mutations.
-	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, result.ExitCode) &&
+	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, res.ExitCode) &&
 		(len(result.Changed)+len(result.Deleted)+len(result.Created) > 0) {
 		t := time.Now()
-		wb, err := writeback(post, sess, ws, m, result, runID)
+		// on-success: an interrupt while the changes are being fetched means
+		// the run no longer counts as a success; apply nothing.
+		var proceed func() bool
+		if o.Writeback == "on-success" {
+			proceed = func() bool { return ctx.Err() == nil }
+		}
+		wb, err := writeback(post, sess, ws, m, result, runID, proceed)
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
-			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", result.ExitCode, err)), ""
+			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)), ""
 		}
 		res.Mutated, res.Deleted, res.Conflicts = wb.Applied, wb.Deleted, wb.Conflicts
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "ignored_created": wb.Ignored, "duration_ms": time.Since(t).Milliseconds()})
@@ -480,8 +510,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		res.Pulled = n
 		o.Rep.Event("pull", map[string]any{"patterns": pulls, "files": n})
 	}
+	checkCanceled()
 	res.Duration = time.Since(start)
-	o.Rep.Event("result", map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "runner": r.Name, "slot": res.Slot})
+	o.Rep.Event("result", map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot})
 	return res, nil, ""
 }
 
@@ -526,6 +557,45 @@ func validOptions(o Options) error {
 		return fmt.Errorf("write-back policy must be always, on-success or never (got %q)", o.Writeback)
 	}
 	return nil
+}
+
+// execOutcome is how a result from the helper is treated.
+type execOutcome int
+
+const (
+	execCompleted  execOutcome = iota // the command's own exit status
+	execCanceled                      // interrupted by the user: exit 130, never a success
+	execShutdown                      // killed by the VM shutting down: a lost runner
+	execNotStarted                    // the helper could not start it: exit 125
+)
+
+// classifyExec decides what a helper result means. A command that finished
+// on its own during a Spot interruption's two-minute warning is a
+// legitimate result; one the shutdown killed is not.
+func classifyExec(r protocol.Result) execOutcome {
+	switch {
+	case r.StartError != "":
+		return execNotStarted
+	case r.Shutdown:
+		// Even if the user interrupted it too: nothing a killed process left
+		// behind is written back (the CLI still exits 130 then).
+		return execShutdown
+	case r.Canceled:
+		return execCanceled
+	}
+	return execCompleted
+}
+
+// shutdownRunner is what to exclude from a replay when the VM shut down
+// under a run ("" on a static runner: it is not replayed there).
+func shutdownRunner(l *Lease) string {
+	if !l.Runner.Ephemeral() {
+		return ""
+	}
+	if l.InstanceID != "" {
+		return l.InstanceID
+	}
+	return "static"
 }
 
 func wantWriteback(policy string, code int) bool {

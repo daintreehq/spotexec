@@ -433,7 +433,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	if err != nil {
 		if ctx.Err() != nil {
 			rep.Clear()
-			return 130
+			return client.ExitInterrupted
 		}
 		if f.fallsBack(l, o, res, err) {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
@@ -445,6 +445,10 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 			fmt.Fprintf(os.Stderr, "spotexec: %v\n", err)
 		}
 		return client.ExitInfra
+	}
+	if ctx.Err() != nil && !res.Canceled {
+		// Interrupted after the command finished (while the session closed).
+		res.Canceled, res.ExitCode = true, client.ExitInterrupted
 	}
 	summary := fmt.Sprintf("%s on %s#%d", ui.Dur(res.Duration), res.Runner, res.Slot)
 	if res.Synced > 0 {
@@ -459,7 +463,12 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	if s.syncOnly && res.Image != "" {
 		summary += " · image " + res.Image
 	}
-	if res.ExitCode != 0 {
+	switch {
+	case res.Canceled:
+		// Even if the command handled the signal and exited 0: it was cut
+		// short, so `sx a && sx b` must not go on to b.
+		summary += " · interrupted"
+	case res.ExitCode != 0:
 		summary += fmt.Sprintf(" · exit %d", res.ExitCode)
 	}
 	rep.Done(summary, res.ExitCode == 0)

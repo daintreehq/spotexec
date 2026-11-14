@@ -102,6 +102,23 @@ wait $P; code=$?
 check "finished on the doomed instance without replay" "[ $code = 0 ] && grep -q 'quick attempt=1' $WORK/q.out && ! grep -q RUNNER_LOST $WORK/q.err"
 wait
 
+echo "== the VM's shutdown kills the command: lost runner, nothing written back, replayed"
+"$SX" --json --writeback always 'if [ "$SPOTEXEC_ATTEMPT" = 1 ]; then echo partial > partial.txt; sleep 60; fi # reclaim-marker
+echo finished attempt=$SPOTEXEC_ATTEMPT' >"$WORK/k.out" 2>"$WORK/k.err" &
+P=$!
+for _ in $(seq 1 40); do grep -q '"exec"' "$WORK/k.err" 2>/dev/null && break; sleep 0.5; done
+sleep 1
+ID=$(grep '"placed"' "$WORK/k.err" | sed 's/.*instance_id":"\([^"]*\)".*/\1/' | tail -1)
+"$SX" sim interrupt "$RUNNER" "$ID" --after 90s >/dev/null 2>&1 &
+IP=$!
+for _ in $(seq 1 20); do grep -q spot_interruption "$WORK/k.err" 2>/dev/null && break; sleep 0.5; done
+# Shutdown begins and kills the command while the helper is still alive.
+docker exec "$ID" sh -c 'touch /var/tmp/spotexec/sim/stopping; pkill -TERM -f reclaim-marker'
+wait $P; code=$?
+kill $IP 2>/dev/null; docker rm -f "$ID" >/dev/null 2>&1
+check "killed run replayed and succeeded on attempt 2" "[ $code = 0 ] && grep -q 'finished attempt=2' $WORK/k.out && grep -q RUNNER_LOST $WORK/k.err"
+check "nothing from the killed attempt was written back" "test ! -e partial.txt"
+
 echo "== rebalance recommendation is advisory (real EC2 sends it at boot)"
 "$SX" -q true
 ID=$(docker ps --filter "label=spotexec-runner=$RUNNER" --format '{{.Names}}' | head -1)

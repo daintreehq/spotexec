@@ -39,6 +39,7 @@ const (
 	CodeSyncFailed   = "SYNC_FAILED"
 	CodeDepsFailed   = "DEPS_FAILED"
 	CodeImageFailed  = "IMAGE_FAILED"
+	CodeShutdown     = "RUNNER_SHUTTING_DOWN" // the VM began shutting down under the request
 )
 
 // ErrorMsg is sent by the helper for any failed request.
@@ -248,19 +249,22 @@ type Started struct {
 
 // Result is the final exec outcome plus the mutation batch.
 type Result struct {
-	ExitCode    int      `json:"exit_code"`
-	Signal      string   `json:"signal,omitempty"`
-	TimedOut    bool     `json:"timed_out"`
-	Canceled    bool     `json:"canceled"`
-	Interrupted bool     `json:"spot_interrupted"`
-	DurationMS  int64    `json:"duration_ms"`
-	Changed     []Entry  `json:"changed,omitempty"` // manifest files with new content/mode
-	Deleted     []string `json:"deleted,omitempty"` // manifest files removed
-	Created     []Entry  `json:"created,omitempty"` // non-manifest files created/changed
-	Truncated   bool     `json:"truncated,omitempty"`
-	Unverified  []string `json:"unverified,omitempty"` // paths that could not be read after the run
-	SnapshotMS  int64    `json:"snapshot_ms"`
-	StartError  string   `json:"start_error,omitempty"`
+	ExitCode    int    `json:"exit_code"`
+	Signal      string `json:"signal,omitempty"`
+	TimedOut    bool   `json:"timed_out"`
+	Canceled    bool   `json:"canceled"`
+	Interrupted bool   `json:"spot_interrupted"`
+	// Shutdown: the command was killed by the VM shutting down (a Spot
+	// reclaim): a lost runner, not the command's result.
+	Shutdown   bool     `json:"shutdown,omitempty"`
+	DurationMS int64    `json:"duration_ms"`
+	Changed    []Entry  `json:"changed,omitempty"` // manifest files with new content/mode
+	Deleted    []string `json:"deleted,omitempty"` // manifest files removed
+	Created    []Entry  `json:"created,omitempty"` // non-manifest files created/changed
+	Truncated  bool     `json:"truncated,omitempty"`
+	Unverified []string `json:"unverified,omitempty"` // paths that could not be read after the run
+	SnapshotMS int64    `json:"snapshot_ms"`
+	StartError string   `json:"start_error,omitempty"`
 }
 
 // Fetch asks for the content of mutated files. Accept lists created paths the
