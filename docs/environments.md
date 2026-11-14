@@ -80,4 +80,6 @@ spotexec image clear aws
 
 From then on the fleet boots from the newest bake whose bootstrap hash matches, and skips the bootstrap, so a new VM is ready in roughly bare boot time. The per-instance setup (watchdog, SSH key, timers) still runs on every VM.
 
+Bakes are shared across machines. A bake holds no keys or machine state, so every machine whose runner has the same name and bootstrap uses it, and with the config copied by `spotexec setup`, one `image bake` speeds up the whole stack. `image list` and `image clear` show and delete only this machine's own bakes.
+
 Changing either bootstrap script, `arch` or `user` makes old bakes stop matching; run `image bake` again. Only the two newest bakes per runner are kept, and older images and their snapshots are deleted.

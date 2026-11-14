@@ -129,11 +129,16 @@ func (a *AWSSpot) listBakesIn(ctx context.Context, matchHash bool, states ...str
 	}
 	p.Set("Filter.3.Name", "tag:"+tagRunner)
 	p.Set("Filter.3.Value.1", a.r.Name)
-	p.Set("Filter.4.Name", "tag:"+tagOwner)
-	p.Set("Filter.4.Value.1", owner)
 	if matchHash {
-		p.Set("Filter.5.Name", "tag:"+tagBakeHash)
-		p.Set("Filter.5.Value.1", a.BakeHash())
+		// Picking an image to boot: any machine's bake of the same bootstrap
+		// will do (bakes hold no keys or machine state), so one bake serves
+		// every machine sharing the config.
+		p.Set("Filter.4.Name", "tag:"+tagBakeHash)
+		p.Set("Filter.4.Value.1", a.BakeHash())
+	} else {
+		// Listing, pruning and clearing: only this machine's own bakes.
+		p.Set("Filter.4.Name", "tag:"+tagOwner)
+		p.Set("Filter.4.Value.1", owner)
 	}
 	b, err := a.api.ec2(ctx, "DescribeImages", p)
 	if err != nil {
