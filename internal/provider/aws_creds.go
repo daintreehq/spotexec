@@ -17,6 +17,7 @@ import (
 // awsCredResolver resolves and caches credentials for one profile.
 type awsCredResolver struct {
 	profile string
+	fixed   *awsCreds // exactly these credentials, never re-resolved
 	mu      sync.Mutex
 	cached  *awsCreds
 }
@@ -40,6 +41,9 @@ func (r *awsCredResolver) get(ctx context.Context) (awsCreds, error) {
 }
 
 func (r *awsCredResolver) get1(ctx context.Context) (awsCreds, error) {
+	if r.fixed != nil {
+		return *r.fixed, nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if c := r.cached; c != nil && (c.Expiration.IsZero() || time.Until(c.Expiration) > 5*time.Minute) {
@@ -93,7 +97,7 @@ func (r *awsCredResolver) resolve(ctx context.Context) (awsCreds, error) {
 		}
 		// AWS CLI v1 or < 2.9 has no export-credentials: resolve natively.
 		if !strings.Contains(err.Error(), "Invalid choice") && !strings.Contains(err.Error(), "invalid choice") {
-			return awsCreds{}, fmt.Errorf("AWS credentials for profile %q: %v. Fix: run `aws sso login%s` (or `aws login` / `aws configure`), or set `profile = \"...\"` on the runner", r.profileName(), err, profileFlag(r.profileName()))
+			return awsCreds{}, fmt.Errorf("AWS credentials for profile %q: %v. Fix: run `aws sso login%s` (or `aws login` / `aws configure`), or set `profile = \"...\"` on the runner. To stop signing in again and again, run `spotexec setup` once while signed in", r.profileName(), err, profileFlag(r.profileName()))
 		}
 	}
 	// 3. No (usable) aws CLI: static keys in the shared credentials file,

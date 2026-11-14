@@ -47,7 +47,7 @@ func selectRunners(cfg *config.Config, names []string) ([]*config.Runner, error)
 		names = cfg.RunnerNames()
 	}
 	if len(names) == 0 {
-		return nil, fmt.Errorf("no runners configured in %s (run `spotexec init --global` for a starting point)", cfg.Global.Path)
+		return nil, fmt.Errorf("no runners configured in %s (run `spotexec setup` to create one)", cfg.Global.Path)
 	}
 	var out []*config.Runner
 	for _, n := range names {

@@ -16,7 +16,8 @@ import (
 	"github.com/daintreehq/spotexec/internal/hooks"
 )
 
-const globalTemplate = `# spotexec global runner config (personal; never committed). See README.
+const globalTemplate = `# spotexec global runner config (personal; never committed).
+# Reference: https://github.com/daintreehq/spotexec/blob/main/docs/configuration.md
 version = 1
 
 # Runners are tried in priority order (lowest first). A fleet grows (up to
@@ -74,14 +75,11 @@ func cmdInit() *cobra.Command {
 				if _, err := os.Stat(p); err == nil && !force {
 					return fmt.Errorf("%s exists (use --force to overwrite)", p)
 				}
-				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				region, err := writeGlobalTemplate(p)
+				if err != nil {
 					return err
 				}
-				region := detectRegion()
-				if err := os.WriteFile(p, []byte(strings.ReplaceAll(globalTemplate, "{{REGION}}", region)), 0o644); err != nil {
-					return err
-				}
-				fmt.Printf("wrote %s (region %s)\nnext: `spotexec doctor`, then `spotexec init` in a repo, then `sx <command>`\n", p, region)
+				fmt.Printf("wrote %s (region %s)\nnext: `spotexec setup` (AWS access that doesn't expire), then `spotexec init` in a repo, then `sx <command>`\n", p, region)
 				return nil
 			}
 			wd, _ := os.Getwd()
@@ -102,7 +100,7 @@ func cmdInit() *cobra.Command {
 				fmt.Println("  " + n)
 			}
 			if _, err := os.Stat(config.GlobalPath()); err != nil {
-				fmt.Println("no runners configured yet: run `spotexec init --global`")
+				fmt.Println("no runners configured yet: run `spotexec setup`")
 			}
 			return nil
 		},
@@ -110,6 +108,16 @@ func cmdInit() *cobra.Command {
 	c.Flags().BoolVar(&global, "global", false, "write an example ~/.config/spotexec/config.toml")
 	c.Flags().BoolVar(&force, "force", false, "overwrite an existing file")
 	return c
+}
+
+// writeGlobalTemplate writes the example global config with the detected
+// AWS region and returns that region.
+func writeGlobalTemplate(p string) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return "", err
+	}
+	region := detectRegion()
+	return region, os.WriteFile(p, []byte(strings.ReplaceAll(globalTemplate, "{{REGION}}", region)), 0o644)
 }
 
 func exists(root, name string) bool {
