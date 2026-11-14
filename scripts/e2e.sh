@@ -296,6 +296,19 @@ check "pull never overwrites tracked source files" "! grep -q remote-copy src/a.
 "$SX" -q 'setsid sh -c "sleep 60" </dev/null >/dev/null 2>&1 & sleep 0.3; echo started' || true
 check "processes escaping the group are reaped" "! docker exec $NAME pgrep -u dev -f 'sleep 60' >/dev/null"
 
+echo "== a killed helper's leftovers"
+# A background writer (a forked subshell) that left the workspace
+# directory, then the helper killed outright (OOM, SIGKILL): only its direct
+# child dies with it, and nothing left in the group is in the workspace.
+"$SX" -q --no-retry 'cd /tmp; (while :; do date >> "$SPOTEXEC_WORKSPACE/bg.txt"; sleep 0.2; done) </dev/null >/dev/null 2>&1 & sleep 30' >/dev/null 2>&1 &
+KP=$!; sleep 3
+docker exec "$NAME" pkill -KILL -u dev -f 'spotexec-helper-[0-9a-f]* rpc' || true
+wait $KP || true
+# (bg[.]txt: a pattern that doesn't match the shell running the check)
+check "the background writer outlives its killed helper" "docker exec $NAME pgrep -u dev -f 'bg[.]txt' >/dev/null"
+"$SX" -q --sync none 'pgrep -u dev -f "bg[.]txt" >/dev/null && echo writer-alive || echo slot-clean' >"$WORK/kr.out" 2>&1 || true
+check "the slot's next holder stops it before running" "grep -qx slot-clean $WORK/kr.out && ! docker exec $NAME pgrep -u dev -f 'bg[.]txt' >/dev/null"
+
 echo "== idle watchdog (cloud-init script, run as root in the container)"
 "$SX" cloud-init --help >/dev/null
 cat > "$WORK/render.go" <<'EOF'

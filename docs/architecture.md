@@ -57,7 +57,7 @@ The trust boundaries, from the inside out:
 
 ## Known limits
 
-- **Process cleanup is not cgroup-based.** Commands run in their own process group. On Linux runners, processes that escaped it (for example via `setsid`) are killed after the run if their working directory is inside the slot. One that also left the workspace can survive, as can any escaped process on a macOS runner.
+- **Process cleanup is not cgroup-based.** Commands run in their own process group. On Linux runners, processes that escaped it (for example via `setsid`) are killed after the run, and again before the slot's next run, if their working directory is inside the slot or they inherited the run's `SPOTEXEC_WORKSPACE`; that covers a helper killed outright (OOM, `SIGKILL`) too. One that also cleared its environment can survive, as can any escaped process on a macOS runner.
 - **Write-back can't be atomic against editors that ignore locks.** Each file is checked before its new content is staged, and again just before the rename. A save landing in that last syscall window can still be replaced.
 - **Case-only directory renames keep the old spelling locally.** On a case-insensitive filesystem (the macOS default), a remote `mv src Src` updates the files but leaves the directory named `src`. Case-only *file* renames are applied correctly.
 - **Each machine gets its own instances.** Instances are tagged with this machine's owner ID, and a machine never discovers or terminates another's. To share VMs between two machines, copy `owner-id`. They then coordinate only through EC2's eventually consistent tag filters. Machines do share the account's Spot vCPU quota: each checks live usage before launching ([sharing the quota](scaling.md#several-machines-one-spot-quota)).

@@ -24,4 +24,4 @@ func childSysProcAttr() *syscall.SysProcAttr {
 func groupInDir(pgid int, dir string) bool { return false }
 
 // reapWorkspace is a no-op without /proc.
-func reapWorkspace(dir string, grace time.Duration) {}
+func reapWorkspace(dir string, grace time.Duration) []int { return nil }

@@ -156,7 +156,10 @@ func (s *Session) runProc1(script, dir string, env map[string]string, timeout, g
 	cmd.Dir = dir
 	// The helper's own environment: the job's is applied after the login
 	// profiles (a [env] HOME must not redirect where profiles are read).
-	cmd.Env = os.Environ()
+	// SPOTEXEC_WORKSPACE is there from the start, so every process the run
+	// leaves behind carries it, a forked subshell included (/proc shows the
+	// environment a process was exec'd with): see reapWorkspace.
+	cmd.Env = append(os.Environ(), "SPOTEXEC_WORKSPACE="+s.workspace)
 	cmd.SysProcAttr = childSysProcAttr()
 	devnull, _ := os.Open(os.DevNull)
 	if devnull != nil {

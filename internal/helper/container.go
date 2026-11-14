@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/daintreehq/spotexec/internal/dockerignore"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/user"
@@ -686,6 +687,16 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		q[i] = shq(a)
 	}
 	host := "exec " + d.cmd(strings.Join(q, " "))
+	marker := filepath.Join(s.slotDir, rootRunMarker)
+	if run.Root {
+		// Cleared once the run's files are given back: if the run is
+		// aborted first, the slot's next holder does it (reclaimFiles).
+		if err := os.WriteFile(marker, []byte(run.Image+"\n"), 0o644); err != nil {
+			os.Remove(scriptPath)
+			os.Remove(envPath)
+			return "", nil, nil, err
+		}
+	}
 	s.containers.Store(name, d)
 	cleanup := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -697,20 +708,137 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		os.Remove(scriptPath)
 		os.Remove(envPath)
 		if run.Root {
-			// Root-created files would block later cleanup/hydration and
-			// write-back reads: give them back to the runner user. Only files
-			// with another owner are touched (chown -R would bump every
-			// file's ctime and make untouched files look changed), and it
-			// runs through Docker itself, so no host sudo is needed.
-			u, g := strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid())
-			fix := "find " + shq(s.workspace) + " \\( ! -user " + u + " -o ! -group " + g + " \\) -exec chown -h " + u + ":" + g + " {} +"
-			if _, err := runShell(ctx, d.cmd("run --rm --user 0:0 --network none --entrypoint /bin/sh -v "+shq(s.workspace+":"+s.workspace)+" "+shq(run.Image)+" -c "+shq(fix))+" >/dev/null 2>&1"); err != nil {
-				_, _ = runShell(ctx, "sudo -n "+fix+" 2>/dev/null")
-			}
+			switch err := s.giveBackFiles(ctx, &d, run.Image); {
+			case err == nil:
+				os.Remove(marker)
+			case errors.Is(err, errRepairRunning):
+				return err
+			} // otherwise the slot's next holder tries again (reclaimFiles)
 		}
 		return nil
 	}
 	return host, nil, cleanup, nil
+}
+
+// rootRunMarker, in a slot directory, names the image of a root container
+// run whose files haven't been given back to the runner user yet.
+const rootRunMarker = "root-run"
+
+// errRepairRunning: a timed-out ownership repair's container couldn't be
+// removed, so it may still be changing files.
+var errRepairRunning = errors.New("the ownership fix-up container is still running")
+
+// giveBackFiles gives files a root container run created in the workspace
+// back to the runner user: root-owned files would block later cleanup,
+// hydration and write-back reads (EACCES on every sync). Only files with
+// another owner are touched (chown -R would bump every file's ctime and
+// make untouched files look changed), and it runs through Docker itself
+// (d, with the run's image), so no host sudo is needed; `sudo -n` is the
+// fallback. It reports what is still not ours afterwards.
+func (s *Session) giveBackFiles(ctx context.Context, d *dockerRunner, image string) error {
+	u, g := strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid())
+	fix := "find " + shq(s.workspace) + " \\( ! -user " + u + " -o ! -group " + g + " \\) -exec chown -h " + u + ":" + g + " {} +"
+	ok := false
+	if d != nil && image != "" {
+		// Named like the slot's containers, so if this helper dies midway
+		// the next holder removes it before doing the same; the image is
+		// the run's, already here (never pulled, so no slow start); and the
+		// docker client dies with the helper, so it can't start the
+		// container after the next holder's sweep.
+		name := s.containerPrefix() + "chown-" + strconv.Itoa(os.Getpid())
+		cmd := shellCmd(ctx, d.cmd("run --rm --pull never --name "+shq(name)+" --user 0:0 --network none --entrypoint /bin/sh -v "+shq(s.workspace+":"+s.workspace)+" "+shq(image)+" -c "+shq(fix))+" >/dev/null 2>&1")
+		cmd.SysProcAttr = childSysProcAttr()
+		// Marked like the run's own processes, so the next holder reaps the
+		// client even where the parent-death signal doesn't hold (sg).
+		cmd.Env = append(os.Environ(), "SPOTEXEC_WORKSPACE="+s.workspace)
+		ok = cmd.Run() == nil
+		if ctx.Err() != nil {
+			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := removeContainer(rctx, *d, name)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("%w: %v", errRepairRunning, err)
+			}
+		}
+	}
+	if !ok {
+		_, _ = runShell(ctx, "sudo -n "+fix+" 2>/dev/null")
+	}
+	return foreignFile(s.workspace)
+}
+
+// foreignFile reports the first file under dir not owned by the runner
+// user and group (or not readable to check).
+func foreignFile(dir string) error {
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	stop := errors.New("stop")
+	var found error
+	err := filepath.WalkDir(dir, func(p string, e fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			found = err
+			return stop
+		}
+		fi, err := e.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // gone meanwhile
+		}
+		if err != nil {
+			found = err
+			return stop
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && (st.Uid != uid || st.Gid != gid) {
+			found = fmt.Errorf("%s is owned by %d:%d", p, st.Uid, st.Gid)
+			return stop
+		}
+		return nil
+	})
+	if found != nil {
+		return found
+	}
+	if err != nil && !errors.Is(err, stop) && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// reclaimFiles finishes what an aborted root container run in this slot
+// (client gone, sshd teardown, unlock) skipped: giving its files back. A
+// slot whose files can't be given back is not handed out.
+func (s *Session) reclaimFiles(slot int) error {
+	marker := filepath.Join(s.slotDir, rootRunMarker)
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	d, err := probeDocker(ctx)
+	if err != nil {
+		// Its container (root, so invisible to reapWorkspace) may still be
+		// running, and only docker can tell.
+		return perr(protocol.CodeInternal, "workspace slot %d: can't check on the containers of an aborted root container run: %v", slot, err)
+	}
+	// Swept here again with a docker known to work (the sweep at acquire
+	// skips a docker it can't reach).
+	if left := s.sweepSlotContainers(ctx, d); left != "" {
+		return perr(protocol.CodeInternal, "workspace slot %d: containers from an earlier run can't be removed: %s", slot, left)
+	}
+	dp := &d
+	if err := s.giveBackFiles(ctx, dp, strings.TrimSpace(string(b))); err != nil {
+		return perr(protocol.CodeInternal, "workspace slot %d holds files an aborted root container run left behind that couldn't be given back to %s (%v); fix their owner on the runner (sudo chown -R) or remove %s", slot, currentUser(), err, s.workspace)
+	}
+	os.Remove(marker)
+	return nil
+}
+
+func currentUser() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return "uid " + strconv.Itoa(os.Getuid())
 }
 
 // removeContainer force-removes a container and confirms it is gone.
@@ -735,8 +863,11 @@ func (s *Session) containerPrefix() string {
 }
 
 // removeContainers force-removes containers started by this session (client
-// loss) or left over in this slot by a dead helper (slot reacquisition).
-func (s *Session) removeContainers(prefixOnly bool) {
+// loss) or, with prefixOnly, all of this slot's (slot reacquisition by a
+// new helper, after one died). It returns the slot's containers that still
+// exist afterwards ("" if none, or if docker isn't usable by this user, in
+// which case none could have been started).
+func (s *Session) removeContainers(prefixOnly bool) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	s.containers.Range(func(k, v any) bool {
@@ -745,11 +876,26 @@ func (s *Session) removeContainers(prefixOnly bool) {
 		}
 		return true
 	})
-	if prefixOnly {
-		if d, err := probeDocker(ctx); err == nil {
-			_, _ = runShell(ctx, d.cmd("ps -aq --filter "+shq("name=^"+s.containerPrefix())+" | xargs -r docker rm -f")+" >/dev/null 2>&1")
-		}
+	if !prefixOnly {
+		return ""
 	}
+	d, err := probeDocker(ctx)
+	if err != nil {
+		return ""
+	}
+	return s.sweepSlotContainers(ctx, d)
+}
+
+// sweepSlotContainers force-removes all of this slot's containers and
+// returns those that still exist.
+func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) string {
+	filter := "--filter " + shq("name=^"+s.containerPrefix())
+	_, _ = runShell(ctx, d.cmd("ps -aq "+filter+" | xargs -r docker rm -f")+" >/dev/null 2>&1")
+	out, err := runShell(ctx, d.cmd("ps -a --format '{{.Names}}' "+filter))
+	if err != nil {
+		return "(docker ps failed: " + strings.TrimSpace(string(out)) + ")"
+	}
+	return strings.Join(strings.Fields(string(out)), " ")
 }
 
 func shq(s string) string {

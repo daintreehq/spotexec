@@ -261,20 +261,34 @@ capacity:
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		return err
 	}
-	// Reap any process group left behind by a previous holder that died hard.
+	// A slot is only handed over once nothing from an earlier run is still
+	// running in it and its files are the runner user's again. A helper
+	// that died hard (OOM, SIGKILL) took only its direct child with it:
+	// reap the rest of its process group...
 	var prev protocol.Holder
 	if readJSON(filepath.Join(s.slotDir, "holder.json"), &prev) == nil && prev.ChildPGID > 0 {
 		if groupAlive(prev.ChildPGID) && groupInDir(prev.ChildPGID, s.workspace) {
 			killGroup(prev.ChildPGID, 2*time.Second)
 		}
 	}
-	// Containers a previous (dead) helper left in this slot must not keep
-	// writing into the workspace.
+	// ...whatever escaped the group (setsid, double fork, a subshell that
+	// left the directory) but still runs in, or was started from, the
+	// workspace, docker clients included, so none starts a container
+	// after the sweep below...
+	if left := reapWorkspace(s.workspace, 2*time.Second); len(left) > 0 {
+		return perr(protocol.CodeInternal, "workspace slot %d: processes from an earlier run (pids %v) are still running in it and can't be stopped", holder.Slot, left)
+	}
+	// ...and its containers.
 	if _, err := exec.LookPath("docker"); err == nil {
 		s.repoID = a.RepoID
-		s.removeContainers(true)
+		if left := s.removeContainers(true); left != "" {
+			return perr(protocol.CodeInternal, "workspace slot %d: containers from an earlier run can't be removed: %s", holder.Slot, left)
+		}
 		// Script/env files of runs whose helper died (they can hold secrets).
 		_ = os.RemoveAll(filepath.Join(s.slotDir, "run"))
+	}
+	if err := s.reclaimFiles(holder.Slot); err != nil {
+		return err
 	}
 	holder.Token = s.tokenIdxAt(0)
 	s.writeHolder(holder)
