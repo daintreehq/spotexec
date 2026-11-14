@@ -27,16 +27,18 @@ type fakeHost struct {
 }
 
 const fakeSSH = `#!/bin/sh
-# Fake ssh: run the remote command here.
+# Fake ssh: run the remote command here, logging "<batch> <host> <command>".
+batch=prompts
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; break ;;
     -O) exit 0 ;;
-    -o) shift 2 ;;
+    -o) if [ "$2" = BatchMode=yes ]; then batch=batch; fi; shift 2 ;;
     *) shift ;;
   esac
 done
-[ -n "$FAKE_SSH_LOG" ] && printf '%s\n' "$1" >> "$FAKE_SSH_LOG"
+printf '%s %s %.30s\n' "$batch" "$1" "$2" >> "$FAKE/ssh.log"
+if grep -qx "$1" "$FAKE/unreachable" 2>/dev/null; then echo "ssh: connect to host $1: Connection refused" >&2; exit 255; fi
 shift
 cd "$HOME" || exit 1
 exec /bin/sh -c "$*"
@@ -671,3 +673,80 @@ func TestRetryCommand(t *testing.T) {
 		}
 	}
 }
+
+// Hosts are connected to one at a time, in the foreground, before the
+// parallel setup, which then never prompts.
+func TestSetupHostsConnectsFirst(t *testing.T) {
+	f := newFakeHost(t, filepath.Join(t.TempDir(), "my home"))
+	_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+	f.localInstalled("0.3.0")
+	withLatest(t, "v0.3.0")
+	f.write("unreachable", "gone\n", 0o644)
+	var err error
+	out := captureStdout(t, func() {
+		err = setupHosts(context.Background(), []string{"a", "gone", "b"}, remoteSetup{install: "auto", profile: "spotexec"})
+	})
+	if err == nil || err.Error() != "setup failed on gone" {
+		t.Fatalf("err = %v\n%s\n%s", err, out, readFile(filepath.Join(f.dir, "ssh.log")))
+	}
+	if !strings.Contains(out, "✓ a is ready") || !strings.Contains(out, "✓ b is ready") || !strings.Contains(out, "✗ gone: can't connect over SSH") {
+		t.Fatalf("output:\n%s", out)
+	}
+	if strings.Contains(out, "--no-hooks") {
+		t.Fatalf("--no-hooks passed:\n%s", out)
+	}
+	b, _ := os.ReadFile(filepath.Join(f.dir, "ssh.log"))
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) < 4 || lines[0] != "prompts a true" || lines[1] != "prompts gone true" || lines[2] != "prompts b true" {
+		t.Fatalf("ssh calls:\n%s", b)
+	}
+	for _, l := range lines[3:] {
+		if !strings.HasPrefix(l, "batch ") || strings.HasPrefix(l, "batch gone") {
+			t.Fatalf("ssh calls:\n%s", b)
+		}
+	}
+	// The machines were remembered.
+	var hosts []string
+	for _, m := range loadMachines() {
+		hosts = append(hosts, m.Host)
+	}
+	if strings.Join(hosts, ",") != "a,b" && strings.Join(hosts, ",") != "b,a" {
+		t.Fatalf("remembered %v", hosts)
+	}
+}
+
+// Paths with spaces, both $HOME and an existing install.
+func TestRemoteSetupPathsWithSpaces(t *testing.T) {
+	f := newFakeHost(t, filepath.Join(t.TempDir(), "my home"))
+	_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+	withLatest(t, "v0.3.0")
+	f.release("0.3.0")
+	r := f.setup()
+	if err := r.do(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	if !strings.Contains(f.out.String(), "remote setup setup --yes") {
+		t.Fatalf("output:\n%s", f.out.String())
+	}
+	if _, err := os.Stat(filepath.Join(f.home, ".config", "spotexec", "config.toml")); err != nil {
+		t.Fatal(err)
+	}
+	// --install none runs whatever is on PATH there, by its full path.
+	r = f.setup()
+	r.install, r.noHooks = "none", true
+	f.out.Reset()
+	if err := r.do(context.Background()); err != nil || !strings.Contains(f.out.String(), "--no-hooks") {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+}
+
+// Without Claude Code here, the hook isn't turned down for other machines.
+func TestSetupClaudeHookNotHere(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PATH", "/usr/bin:/bin")
+	if setupClaudeHook(true, false) || setupClaudeHook(false, false) || setupClaudeHook(false, true) {
+		t.Fatal("reported as declined")
+	}
+}
+
+func readFile(p string) string { b, _ := os.ReadFile(p); return string(b) }

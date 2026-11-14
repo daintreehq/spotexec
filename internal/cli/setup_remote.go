@@ -84,13 +84,30 @@ func checkSSHHosts(hosts []string) error {
 	return nil
 }
 
-// sshArgs runs script with /bin/sh there, exactly as given.
+// sshOpts are the options of every ssh to the host: one shared connection,
+// opened by connect and kept until close, however long the host waits for
+// its turn (the limit only matters if setup is killed).
+func (r *remoteSetup) sshOpts() []string {
+	return []string{
+		"-o", "ControlMaster=auto", "-o", "ControlPath=" + filepath.Join(r.ctlDir, "%C"), "-o", "ControlPersist=4h",
+		"-o", "ConnectTimeout=15",
+	}
+}
+
+// sshArgs runs script with /bin/sh there, exactly as given, over the
+// connection connect opened. BatchMode: it never prompts, so hosts set up in
+// parallel can't ask for passwords on the same terminal at once.
 func (r *remoteSetup) sshArgs(script string) []string {
 	// "--" ends option parsing, so the host is never read as an option.
-	return []string{
-		"-o", "ControlMaster=auto", "-o", "ControlPath=" + filepath.Join(r.ctlDir, "%C"), "-o", "ControlPersist=120",
-		"-o", "ConnectTimeout=15", "--", r.host, "/bin/sh -c " + shq(script),
-	}
+	return append(r.sshOpts(), "-o", "BatchMode=yes", "--", r.host, "/bin/sh -c "+shq(script))
+}
+
+// connect opens the shared connection in the foreground, so ssh can ask
+// about the host key or for a password on the terminal.
+func (r *remoteSetup) connect(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, "ssh", append(r.sshOpts(), "--", r.host, "true")...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
 }
 
 // run runs a shell script on the host, with the usual install locations on
@@ -538,9 +555,9 @@ func (r *remoteSetup) do(ctx context.Context) error {
 		return err
 	}
 	out, err := r.run(ctx, `set -e; d="${XDG_CONFIG_HOME:-$HOME/.config}/spotexec"; mkdir -p "$d"; f="$d/config.toml"; `+
-		`cat > "$d/.config.toml.new"; if [ -f "$f" ] && ! cmp -s "$f" "$d/.config.toml.new"; then `+
+		`n="$d/.config.toml.new.$$"; cat > "$n"; if [ -f "$f" ] && ! cmp -s "$f" "$n"; then `+
 		`b="$f.bak-$(date +%Y%m%d%H%M%S)"; cp "$f" "$b"; echo "backed up the previous config to $b"; fi; `+
-		`mv "$d/.config.toml.new" "$f"; echo "$f"`, bytes.NewReader(cfg))
+		`mv "$n" "$f"; echo "$f"`, bytes.NewReader(cfg))
 	if err != nil {
 		return fmt.Errorf("copying the runner config: %w", err)
 	}
@@ -674,8 +691,9 @@ func (r *remoteSetup) close() {
 
 var adminSession = provider.AdminSession // tests
 
-// setupHosts sets up the hosts, four at a time, printing each one's output
-// as a block when it finishes, and records them in the machine list.
+// setupHosts connects to each host in turn, then sets them up four at a
+// time, printing each one's output as a block when it finishes, and records
+// them in the machine list.
 func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
 	if err := checkSSHHosts(hosts); err != nil {
 		return err
@@ -697,14 +715,28 @@ func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
 			base.adminEnv, base.adminErr = nil, fmt.Errorf("signed in as %s, spotexec's own user here, which can't manage IAM users", base.adminARN)
 		}
 	}
-	if len(hosts) > 1 {
-		fmt.Printf("\nSetting up %s…\n", strings.Join(hosts, ", "))
-	}
 	var mu sync.Mutex
 	var failed []string
+	// Connect to each host in turn first, so host-key and password prompts
+	// come one at a time; the parallel work below reuses these connections.
+	var ready []string
+	for _, h := range hosts {
+		r := base
+		r.host, r.ctlDir = h, dir
+		defer r.close()
+		if err := r.connect(ctx); err != nil {
+			fmt.Printf("  ✗ %s: can't connect over SSH (%v)\n", h, err)
+			failed = append(failed, h)
+			continue
+		}
+		ready = append(ready, h)
+	}
+	if len(ready) > 1 {
+		fmt.Printf("\nSetting up %s…\n", strings.Join(ready, ", "))
+	}
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
-	for _, h := range hosts {
+	for _, h := range ready {
 		wg.Add(1)
 		go func(h string) {
 			defer wg.Done()
@@ -713,7 +745,7 @@ func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
 			var buf bytes.Buffer
 			r := base
 			r.host, r.ctlDir, r.out = h, dir, &buf
-			if len(hosts) == 1 {
+			if len(ready) == 1 {
 				r.out = os.Stdout // one host: stream it
 			}
 			err := r.do(ctx)

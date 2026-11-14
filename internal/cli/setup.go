@@ -183,7 +183,7 @@ and keeps a working key. --rotate replaces the key.
 			if err != nil {
 				return err
 			}
-			hookOn := setupClaudeHook(yes, noHooks)
+			hookDeclined := setupClaudeHook(yes, noHooks)
 			hosts := args
 			if all {
 				for _, m := range loadMachines() {
@@ -201,7 +201,10 @@ and keeps a working key. --rotate replaces the key.
 			if len(hosts) > 0 {
 				if err := setupHosts(cmd.Context(), hosts, remoteSetup{
 					install: install, adminProfile: adminProfile, profile: profile,
-					rotate: rotate, noVPC: noVPC, aws: hasAWS, noHooks: noHooks || !hookOn,
+					rotate: rotate, noVPC: noVPC, aws: hasAWS,
+					// Each machine installs the hook if it has Claude Code,
+					// unless it was turned down here.
+					noHooks: noHooks || hookDeclined,
 				}); err != nil {
 					return err
 				}
@@ -502,9 +505,9 @@ func setRunnerProfileText(text string, runners []string, profile string) (string
 }
 
 // setupClaudeHook installs the Claude Code hook for all projects when Claude
-// Code is on this machine, asking first in a terminal. It reports whether the
-// hook is installed afterwards.
-func setupClaudeHook(yes, skip bool) bool {
+// Code is on this machine, asking first in a terminal. It reports whether
+// the user turned the hook down when asked.
+func setupClaudeHook(yes, skip bool) (declined bool) {
 	home, _ := os.UserHomeDir()
 	p := filepath.Join(home, ".claude", "settings.json")
 	if !skip && hooks.HasLegacyClaude(p) {
@@ -518,7 +521,7 @@ func setupClaudeHook(yes, skip bool) bool {
 	}
 	if hooks.HasClaude(p) {
 		fmt.Printf("✓ Claude Code hook in %s\n", p)
-		return true
+		return false
 	}
 	if skip {
 		return false
@@ -535,7 +538,7 @@ func setupClaudeHook(yes, skip bool) bool {
 		fmt.Print("\nInstall the Claude Code hook for all your projects? Agents' heavy commands (tests, linters, builds)\nthen run on your runners; it only acts in projects with a .spotexec.toml. [Y/n] ")
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		if a := strings.ToLower(strings.TrimSpace(line)); a != "" && a != "y" && a != "yes" {
-			return false
+			return true
 		}
 	}
 	if _, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
@@ -544,7 +547,7 @@ func setupClaudeHook(yes, skip bool) bool {
 	}
 	fmt.Printf("✓ installed the Claude Code hook in %s\n", p)
 	fmt.Println("  Permission rules now see `spotexec run -- <cmd>`: allow `Bash(spotexec run:*)` if you pre-approve test commands.")
-	return true
+	return false
 }
 
 func containsFold(list []string, s string) bool {
