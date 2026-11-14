@@ -133,9 +133,23 @@ func TestParallelTasksFallBackLocally(t *testing.T) {
 	if len(ports) != 2 {
 		t.Errorf("parallel local parts share a port range: %v", ports)
 	}
-	// Without fallback, the same task fails with 125.
-	if code, _ := runMain(t, "sx", "-C", dir, "--queue-timeout", "5s", "v"); code != client.ExitInfra {
-		t.Errorf("without fallback: exit %d", code)
+	// Each part's result comes through the plain reporter: no ANSI.
+	for _, want := range []string{"sx: l · ", "sx: t · ", " locally\n"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr lacks %q: %q", want, stderr)
+		}
+	}
+	if strings.Contains(stderr, "\x1b") {
+		t.Errorf("ANSI in plain output: %q", stderr)
+	}
+	if _, stderr := runMain(t, "sx", "-C", dir, "-q", "--fallback-local", "--queue-timeout", "5s", "v"); strings.Contains(stderr, "sx: ") {
+		t.Errorf("quiet mode printed results: %q", stderr)
+	}
+	// Without fallback, the same task fails with 125, and parts that never
+	// reached a runner don't claim one.
+	code, stderr = runMain(t, "sx", "-C", dir, "--queue-timeout", "5s", "v")
+	if code != client.ExitInfra || !strings.Contains(stderr, "sx: l · ") || !strings.Contains(stderr, "exit 125") || strings.Contains(stderr, "#0") {
+		t.Errorf("without fallback: exit %d, stderr %q", code, stderr)
 	}
 }
 
@@ -150,3 +164,17 @@ func (l *lockedBuf) Write(p []byte) (int, error) {
 	return l.b.Write(p)
 }
 func (l *lockedBuf) String() string { l.mu.Lock(); defer l.mu.Unlock(); return l.b.String() }
+
+func TestSameSlotAfterParallelTaskUsesTheFirstPart(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	ws := &client.Workspace{WorktreeKey: "k"}
+	saveFirstLastRun(ws, []*client.LastRun{nil, {Runner: "b", Slot: 3}, {Runner: "c", Slot: 1}})
+	if lr, err := client.LoadLastRun(ws); err != nil || lr.Runner != "b" || lr.Slot != 3 {
+		t.Fatalf("got %+v, %v", lr, err)
+	}
+	// No part synced: the previous record stays.
+	saveFirstLastRun(ws, []*client.LastRun{nil, nil})
+	if lr, _ := client.LoadLastRun(ws); lr.Runner != "b" {
+		t.Fatalf("record replaced: %+v", lr)
+	}
+}

@@ -45,3 +45,27 @@ func TestPlainReporterIsSparse(t *testing.T) {
 		t.Fatal("ANSI in plain output")
 	}
 }
+
+func TestPartDone(t *testing.T) {
+	var w syncBuf
+	p := &plainReporter{w: &w}
+	p.PartDone("lint · 1.2s on a#1", true)
+	p.PartDone("test · 3.0s on a#2 · exit 1", false)
+	p.Done("verify", false)
+	if got := w.String(); got != "sx: lint · 1.2s on a#1\nsx: test · 3.0s on a#2 · exit 1\nsx: verify\n" {
+		t.Fatalf("plain: %q", got)
+	}
+	var j syncBuf
+	for _, r := range []Reporter{&jsonReporter{w: &j}, &jsonReporter{w: &j, quiet: true}} {
+		r.PartDone("lint", true)
+	}
+	if j.String() != "" {
+		t.Fatalf("json/quiet printed %q", j.String())
+	}
+	var pw syncBuf
+	pr := &prettyReporter{w: &pw}
+	pr.PartDone("lint", false)
+	if !strings.Contains(pw.String(), "✗") || !strings.Contains(pw.String(), "lint") {
+		t.Fatalf("pretty: %q", pw.String())
+	}
+}

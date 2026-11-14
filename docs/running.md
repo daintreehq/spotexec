@@ -27,6 +27,8 @@ sx --same-slot pnpm test                       # same VM, so libvips is there
 
 If that VM is gone, `--same-slot` fails (exit `125`) and says so, rather than running somewhere the package isn't installed. So does `--same-slot` with a `--runner` or `--pool` that leaves out the runner it would return to. For anything you'd need on every VM, put it in the [project container](environments.md#project-containers) or the runner's `bootstrap_script`. Set `SPOTEXEC_SAME_SLOT=1` to make every `sx` in a shell behave this way.
 
+A parallel task's parts run in several slots at once, so `--same-slot` can't apply to the task itself. Afterwards, `--same-slot` returns to the slot of its first part (in `parallel` order) that got its files synced and its container image, if any, ready; that's the same point at which a single run becomes the one `--same-slot` returns to.
+
 `--same-slot --sync none` skips the sync and the write-back, and runs on whatever is in the slot, for poking around after a failure. `spotexec exec -- <command>` is the same thing.
 
 ## Run flags

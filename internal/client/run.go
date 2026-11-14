@@ -63,6 +63,7 @@ type Options struct {
 	PreferLast     bool     // exec: reuse last runner+slot without syncing
 	SameSlot       bool     // --same-slot: sync and run in this worktree's last slot
 	LastWithin     []string // with PreferLast/SameSlot: the last runner must be one of these
+	DeferLastRun   bool     // return the last-run record in Result instead of saving it
 	Stdout         io.Writer
 	Stderr         io.Writer
 	Rep            ui.Reporter
@@ -92,6 +93,9 @@ type Result struct {
 	Synced    int      `json:"synced_files"`
 	SyncBytes int64    `json:"synced_bytes"`
 	Image     string   `json:"image,omitempty"` // the project container image used
+	// LastRun is where this worktree's files now are, when the run
+	// synced (saved already unless Options.DeferLastRun).
+	LastRun *LastRun `json:"-"`
 }
 
 // InfraError marks failures of spotexec itself (exit 125).
@@ -282,11 +286,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// The last-run record (used by exec and pull) is written once this
 	// worktree's files are in the slot, and never for unsynced runs.
 	lastRun := LastRun{Runner: r.Name, InstanceID: lease.InstanceID, Slot: lease.Acq.Slot, Target: lease.Target, WorkRoot: r.WorkRoot, RemoteWS: remoteWS}
-	recordLastRun := func() {
-		if o.Sync != "none" && !o.PreferLast {
-			saveLastRun(ws, lastRun)
-		}
-	}
+	recordLastRun := func() { keepLastRun(ws, o, lastRun, &res) }
 	label := fmt.Sprintf("%s#%d", r.Name, lease.Acq.Token)
 
 	// 3. Forward sync.
@@ -483,6 +483,19 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	res.Duration = time.Since(start)
 	o.Rep.Event("result", map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "runner": r.Name, "slot": res.Slot})
 	return res, nil, ""
+}
+
+// keepLastRun records where this worktree's files now are (never for
+// unsynced runs): saved for exec, pull and --same-slot, or only returned
+// with DeferLastRun, for a caller choosing among several runs.
+func keepLastRun(ws *Workspace, o Options, lr LastRun, res *Result) {
+	if o.Sync == "none" || o.PreferLast {
+		return
+	}
+	res.LastRun = &lr
+	if !o.DeferLastRun {
+		saveLastRun(ws, lr)
+	}
 }
 
 func firstN(s []string, n int) []string {

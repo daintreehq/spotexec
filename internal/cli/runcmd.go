@@ -545,6 +545,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		defer subCancel[i]()
 	}
 	stopped := make([]bool, len(t.Parallel)) // cancelled by fail_fast
+	records := make([]*client.LastRun, len(t.Parallel))
 	done := make([]bool, len(t.Parallel))
 	intrs := make([]chan struct{}, len(t.Parallel))
 	for i := range intrs {
@@ -573,32 +574,44 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			cmd := buildTaskLine(l, st.Run, nil)
 			spec := runSpec{label: sub, command: cmd, display: sub + ": " + cmd, timeout: st.Timeout.Duration, sync: st.Sync, exclusive: st.Exclusive, pool: st.Pool, priority: st.Priority}
 			o := f.options(l, spec, sr, intrs[i], ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu))
+			// Parts race to sync: which one saves the last-run record is
+			// decided below, once they are all done.
+			o.DeferLastRun = true
+			subStart := time.Now()
 			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
-			code := res.ExitCode
+			code, where := res.ExitCode, ""
+			if res.Runner != "" {
+				where = fmt.Sprintf(" on %s#%d", res.Runner, res.Slot)
+			}
 			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
 				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, sub)
-				code, err = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(t.Parallel)), nil
+				code, err, where = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(t.Parallel)), nil, " locally"
 			}
 			if err != nil {
 				code = client.ExitInfra
 			}
+			took := res.Duration
+			if took == 0 {
+				took = time.Since(subStart)
+			}
 			mu.Lock()
-			codes[i], done[i] = code, true
+			codes[i], done[i], records[i] = code, true, res.LastRun
 			if stopped[i] {
 				// Cancelled by fail_fast: not a failure of its own.
 				mu.Unlock()
 				return
 			}
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
-			}
-			if !rep.IsJSON() {
-				status := "\x1b[32m✓\x1b[0m"
-				if code != 0 {
-					status = fmt.Sprintf("\x1b[31m✗ exit %d\x1b[0m", code)
+				sr.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
+				if !rep.IsJSON() {
+					fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
 				}
-				fmt.Fprintf(os.Stderr, "%s %s \x1b[2m%s on %s#%d\x1b[0m\n", status, sub, ui.Dur(res.Duration), res.Runner, res.Slot)
 			}
+			summary := fmt.Sprintf("%s · %s%s", sub, ui.Dur(took), where)
+			if code != 0 {
+				summary += fmt.Sprintf(" · exit %d", code)
+			}
+			sr.PartDone(summary, code == 0)
 			mu.Unlock()
 			if code != 0 && t.FailFast {
 				failOnce.Do(func() {
@@ -623,6 +636,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		}(i, sub, st)
 	}
 	wg.Wait()
+	saveFirstLastRun(l.ws, records)
 	// Interrupted: 130. A spotexec failure (125) outranks a command's own
 	// failure, so agents can tell "tests failed" from "couldn't run tests".
 	exit := 0
@@ -639,6 +653,18 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	}
 	rep.Event("result", map[string]any{"task": name, "exit_code": exit, "duration_ms": time.Since(start).Milliseconds(), "parallel": t.Parallel})
 	return exit
+}
+
+// saveFirstLastRun makes --same-slot after a parallel task predictable: it
+// returns to the first part, in `parallel` order, that recorded where it ran
+// (as a single run does once synced, with its container image ready).
+func saveFirstLastRun(ws *client.Workspace, records []*client.LastRun) {
+	for _, r := range records {
+		if r != nil {
+			client.SaveLastRun(ws, *r)
+			return
+		}
+	}
 }
 
 func buildTaskLine(l *loaded, run string, args []string) string {

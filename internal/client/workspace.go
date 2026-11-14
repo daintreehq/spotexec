@@ -127,6 +127,9 @@ func LoadLastRun(w *Workspace) (*LastRun, error) {
 	return &lr, json.Unmarshal(b, &lr)
 }
 
+// SaveLastRun saves the last-run record.
+func SaveLastRun(w *Workspace, lr LastRun) { saveLastRun(w, lr) }
+
 func saveLastRun(w *Workspace, lr LastRun) {
 	p := lastRunPath(w)
 	_ = os.MkdirAll(filepath.Dir(p), 0o700)

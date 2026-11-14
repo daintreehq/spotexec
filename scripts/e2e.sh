@@ -124,6 +124,7 @@ check "other slot hydrated from cache" "ev '\"hydrated\":true' | grep -q ."
 wait
 "$SX" verify >"$WORK/v.out" 2>&1 || true
 check "parallel task fan-out" "grep -q '\\[test\\] ok=true' $WORK/v.out && grep -q '\\[lint\\]' $WORK/v.out"
+check "parallel task results are plain off a terminal" "grep -Eq '^sx: (test|lint) · .* on box#[0-9]' $WORK/v.out && ! grep -q \$'\\x1b' $WORK/v.out"
 
 sed -i.bak 's/^install = "npm ci"/install = "npm ci --no-audit"/' .spotexec.toml && rm -f .spotexec.toml.bak
 "$SX" --json verify >"$WORK/v2.out" 2>"$WORK/v2.err" || true

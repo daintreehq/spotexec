@@ -42,6 +42,10 @@ type Reporter interface {
 	Warn(code, format string, args ...any)
 	// Done prints the final footer in pretty mode.
 	Done(summary string, ok bool)
+	// PartDone reports one finished part of a larger run (a task of a
+	// parallel task) without ending the output; JSON and quiet modes leave
+	// it to the events.
+	PartDone(summary string, ok bool)
 	// IsJSON reports agent mode.
 	IsJSON() bool
 }
@@ -105,6 +109,7 @@ func (j *jsonReporter) Event(name string, fields map[string]any) {
 func (j *jsonReporter) Status(string, ...any) {}
 func (j *jsonReporter) Clear()                {}
 func (j *jsonReporter) Done(string, bool)     {}
+func (j *jsonReporter) PartDone(string, bool) {}
 func (j *jsonReporter) IsJSON() bool          { return !j.quiet }
 func (j *jsonReporter) Warn(code, format string, args ...any) {
 	j.Event("warning", map[string]any{"code": code, "message": fmt.Sprintf(format, args...)})
@@ -268,6 +273,23 @@ func (p *prettyReporter) Done(summary string, ok bool) {
 	fmt.Fprintf(p.w, "%s %s%s%s\n", mark, dim, summary, reset)
 }
 
+func (p *prettyReporter) PartDone(summary string, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	line := p.line
+	p.clearLocked()
+	mark := grn + "✓" + reset
+	if !ok {
+		mark = red + "✗" + reset
+	}
+	fmt.Fprintf(p.w, "%s %s%s%s\n", mark, dim, summary, reset)
+	if line != "" && !p.stopped {
+		p.mu.Unlock()
+		p.Status("%s", line)
+		p.mu.Lock()
+	}
+}
+
 func (p *prettyReporter) IsJSON() bool { return false }
 
 func termWidth() int {
@@ -412,6 +434,12 @@ func (p *plainReporter) Done(summary string, ok bool) {
 	defer p.mu.Unlock()
 	p.stopped = true
 	p.gen++
+	fmt.Fprintf(p.w, "sx: %s\n", summary)
+}
+
+func (p *plainReporter) PartDone(summary string, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	fmt.Fprintf(p.w, "sx: %s\n", summary)
 }
 

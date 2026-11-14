@@ -120,3 +120,26 @@ func TestUnknownWritebackPolicyNeverWritesBack(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestKeepLastRun(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	ws := &Workspace{WorktreeKey: "k"}
+	lr := LastRun{Runner: "a", Slot: 2}
+	var res Result
+	keepLastRun(ws, Options{Sync: "auto", DeferLastRun: true}, lr, &res)
+	if res.LastRun == nil || res.LastRun.Runner != "a" {
+		t.Fatal("deferred record not returned")
+	}
+	if _, err := LoadLastRun(ws); err == nil {
+		t.Fatal("deferred record was saved")
+	}
+	res = Result{}
+	keepLastRun(ws, Options{Sync: "none"}, lr, &res)
+	if res.LastRun != nil {
+		t.Fatal("unsynced run recorded")
+	}
+	keepLastRun(ws, Options{Sync: "in"}, lr, &res)
+	if got, err := LoadLastRun(ws); err != nil || got.Slot != 2 {
+		t.Fatalf("record not saved: %v %v", got, err)
+	}
+}
