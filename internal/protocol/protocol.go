@@ -22,8 +22,9 @@ import (
 const Version = 1
 
 // MaxFrame bounds a single frame so a corrupt length prefix cannot make either
-// side allocate unbounded memory.
-const MaxFrame = 16 << 20
+// side allocate unbounded memory. Manifests are single frames, and a large
+// monorepo (100k+ files with long paths) needs tens of MiB.
+const MaxFrame = 128 << 20
 
 // Chunk is the preferred payload size for stream data frames.
 const Chunk = 64 << 10
@@ -58,6 +59,21 @@ type Conn struct {
 }
 
 // NewConn wraps a reader and writer.
+// ProgressReader calls OnRead whenever bytes arrive, so liveness can count
+// a large frame still streaming in (not only finished frames).
+type ProgressReader struct {
+	R      io.Reader
+	OnRead func()
+}
+
+func (p ProgressReader) Read(b []byte) (int, error) {
+	n, err := p.R.Read(b)
+	if n > 0 && p.OnRead != nil {
+		p.OnRead()
+	}
+	return n, err
+}
+
 func NewConn(r io.Reader, w io.Writer) *Conn {
 	return &Conn{r: bufio.NewReaderSize(r, 128<<10), w: w, bw: bufio.NewWriterSize(w, 128<<10)}
 }

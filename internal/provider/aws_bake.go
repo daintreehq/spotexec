@@ -39,7 +39,10 @@ func (a *AWSSpot) BakeHash() string {
 
 func (a *AWSSpot) bakeRootScript(prepull []string) string {
 	var b strings.Builder
-	b.WriteString(a.r.BootstrapScript)
+	// In a subshell, so an `exit 0` in the user's script can't skip the rest.
+	// Not followed by ||: that would disable -e inside it. ":" keeps an
+	// empty script valid.
+	b.WriteString("(\n:\n" + a.r.BootstrapScript + "\n)\n")
 	b.WriteString("\n# spotexec bake: docker for project containers\n")
 	b.WriteString("export DEBIAN_FRONTEND=noninteractive\n")
 	b.WriteString("command -v docker >/dev/null 2>&1 || { apt-get update -o DPkg::Lock::Timeout=300 -qq && apt-get install -y -qq -o DPkg::Lock::Timeout=300 docker.io docker-buildx zstd; }\n")
@@ -115,8 +118,15 @@ func (a *AWSSpot) listBakesIn(ctx context.Context, matchHash bool, states ...str
 	for i, st := range states {
 		p.Set("Filter.1.Value."+strconv.Itoa(i+1), st)
 	}
+	// Architecture only matters for picking a bake to boot; listing and
+	// clearing must also see bakes from a previous arch setting.
 	p.Set("Filter.2.Name", "architecture")
-	p.Set("Filter.2.Value.1", a.ec2Arch())
+	p.Set("Filter.2.Value.1", "x86_64")
+	p.Set("Filter.2.Value.2", "arm64")
+	if matchHash {
+		p.Set("Filter.2.Value.1", a.ec2Arch())
+		p.Del("Filter.2.Value.2")
+	}
 	p.Set("Filter.3.Name", "tag:"+tagRunner)
 	p.Set("Filter.3.Value.1", a.r.Name)
 	p.Set("Filter.4.Name", "tag:"+tagOwner)
@@ -141,12 +151,13 @@ func (a *AWSSpot) listBakesIn(ctx context.Context, matchHash bool, states ...str
 
 // findBake returns the newest bake matching the current bootstrap, its
 // root device and root volume size (launches can't use a smaller volume).
-func (a *AWSSpot) findBake(ctx context.Context) (string, string, int, error) {
+func (a *AWSSpot) findBake(ctx context.Context) (string, string, int, time.Time, error) {
 	imgs, err := a.listBakes(ctx, true)
 	if err != nil || len(imgs) == 0 {
-		return "", "", 0, err
+		return "", "", 0, time.Time{}, err
 	}
-	return imgs[0].ID, imgs[0].RootDevice, imgs[0].rootSize(), nil
+	created, _ := time.Parse(time.RFC3339, imgs[0].Created)
+	return imgs[0].ID, imgs[0].RootDevice, imgs[0].rootSize(), created, nil
 }
 
 // SanitizeScript prepares a bake builder for imaging: everything instance-
@@ -343,12 +354,16 @@ func (a *AWSSpot) terminateAny(ctx context.Context, id string) error {
 	p.Set("InstanceId.1", id)
 	var b []byte
 	var err error
-	for attempt := 0; attempt < 10; attempt++ {
+	for attempt, wait := 0, time.Second; attempt < 5; attempt, wait = attempt+1, wait*2 {
 		// Just after launch the ID may not be visible yet.
 		if b, err = a.api.ec2(ctx, "DescribeInstances", p); err == nil || awsCode(err) != "InvalidInstanceID.NotFound" {
 			break
 		}
-		time.Sleep(3 * time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
 	}
 	if err != nil {
 		return err
@@ -357,7 +372,10 @@ func (a *AWSSpot) terminateAny(ctx context.Context, id string) error {
 	if err != nil || len(got) == 0 {
 		return err
 	}
-	owner, _ := a.ownerTag()
+	owner, oerr := a.ownerTag()
+	if oerr != nil || owner == "" {
+		return fmt.Errorf("refusing to terminate %s: can't determine this machine's owner tag: %v", id, oerr)
+	}
 	if got[0].tag(tagOwner) != owner || (got[0].tag(tagBake) != a.r.Name && got[0].tag(tagRunner) != a.r.Name) {
 		return fmt.Errorf("refusing to terminate %s: not ours", id)
 	}

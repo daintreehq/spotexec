@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spotexec/spotexec/internal/config"
@@ -57,6 +58,7 @@ func Connect(ctx context.Context, r *config.Runner, t provider.Target) (*transpo
 }
 
 type member struct {
+	fatal error // a problem no other instance of this runner would avoid
 	r     *config.Runner
 	p     provider.Provider
 	pool  *Pool // nil for static runners
@@ -101,9 +103,35 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 	var ticket *Ticket
 	defer func() { ticket.Leave() }()
 	waiters := map[string]*Waiter{}
+	var wmu sync.Mutex // waiters and ticket, shared with the heartbeat below
 	defer func() {
+		wmu.Lock()
+		defer wmu.Unlock()
 		for _, w := range waiters {
 			w.Done()
+		}
+	}()
+	// Keep the ticket and waiters fresh even while one round blocks for a
+	// long time (slow probes, a slow cloud listing): stale ones are ignored
+	// as stopped processes, which would reorder the queue and drop demand.
+	beat, beatDone := make(chan struct{}), make(chan struct{})
+	defer func() { close(beat); <-beatDone }() // joined before the ticket/waiters go
+	go func() {
+		defer close(beatDone)
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-beat:
+				return
+			case <-t.C:
+				wmu.Lock()
+				ticket.Touch()
+				for _, w := range waiters {
+					w.Touch()
+				}
+				wmu.Unlock()
+			}
 		}
 	}()
 	join := func() error {
@@ -114,7 +142,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		if err != nil {
 			return err
 		}
+		wmu.Lock()
 		ticket = t
+		wmu.Unlock()
 		return nil
 	}
 	// Everyone takes a ticket before probing: newcomers never overtake
@@ -210,16 +240,24 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					if lease != nil {
 						return lease, nil
 					}
+					if m.fatal != nil {
+						return nil, fmt.Errorf("%s: %w (fix bootstrap_script, then `spotexec down %s`)", m.r.Name, m.fatal, m.r.Name)
+					}
 					if out == OutBusy {
 						lastHolders = holders
 					}
 					// Root and user bootstrap each get boot_timeout.
-					if out == OutBooting && time.Since(in.LaunchedAt) > 2*m.r.BootTimeout.Duration+2*time.Minute {
+					if out == OutBooting && !in.LaunchedAt.IsZero() && time.Since(in.LaunchedAt) > 2*m.r.BootTimeout.Duration+2*time.Minute {
 						// First-boot setup never finished (hung bootstrap):
-						// the VM can't serve and may never idle out.
-						m.pool.Observe(in.ID, OutDraining, in.LaunchedAt)
+						// the VM can't serve and may never idle out. Marked
+						// draining only once the terminate request succeeded,
+						// so a failed attempt is retried by the next prober.
 						req.Rep.Warn("BOOT_STUCK", "%s: %s never finished first-boot setup; terminating it", m.r.Name, in.ID)
-						go func(id string) { _ = m.pool.Fleet.Terminate(context.WithoutCancel(ctx), id) }(in.ID)
+						tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+						if err := m.pool.Fleet.Terminate(tctx, in.ID); err == nil {
+							m.pool.Observe(in.ID, OutDraining, in.LaunchedAt)
+						}
+						cancel()
 					}
 				}
 			}
@@ -243,6 +281,10 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		if err := join(); err != nil {
 			return nil, err
 		}
+		// Out of time: give up before planning a launch nobody will use.
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("%s: no free slot within %s", protocol.CodeQueueTimeout, queue)
+		}
 		// Everything is full: signal demand and grow fleets in priority order,
 		// each covering only what the fleets before it are not launching.
 		status := ""
@@ -263,7 +305,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				if err != nil {
 					return nil, err
 				}
+				wmu.Lock()
 				waiters[m.r.Name] = w
+				wmu.Unlock()
 			}
 			if req.NoBoot {
 				continue
@@ -276,6 +320,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			if d.Launch && !provisioning[d.ID] {
 				provisioning[d.ID] = true
 				req.Rep.Event("scale_out", map[string]any{"runner": m.r.Name, "launch_id": d.ID, "demand": d.Demand, "instances": d.Live})
+				// Registered before the goroutine starts, so a process exiting
+				// right now still waits for it (WaitLaunches).
+				HoldLaunch()
 				go m.provision(ctx, d.ID, req.Rep)
 			}
 			covered += d.Capacity
@@ -312,9 +359,15 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 	}
 }
 
+// slotsOf is a runner's slots per machine as the helper will compute it:
+// max_slots, or (unset) vCPUs / 4, at least 1. For AWS the vCPUs are known
+// from the instance type; otherwise 4 until the runner reports.
 func slotsOf(r *config.Runner) int {
 	if r.MaxSlots > 0 {
 		return r.MaxSlots
+	}
+	if r.Type == config.TypeAWSSpot && len(r.InstanceTypes) > 0 {
+		return max(1, provider.VCPUsOf(r.InstanceTypes[0])/4)
 	}
 	return 4
 }
@@ -353,6 +406,10 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provi
 		return nil, nil, OutDraining
 	case isCode(err, protocol.CodeBooting):
 		return nil, nil, OutBooting
+	case isCode(err, protocol.CodeBootFailed):
+		// The setup itself is broken: another VM would fail the same way.
+		m.fatal = err
+		return nil, nil, OutDraining
 	}
 	return nil, nil, OutUnreachable
 }
@@ -363,11 +420,12 @@ func (m *member) provision(ctx context.Context, id string, rep ui.Reporter) {
 	}
 	if ctx.Err() != nil {
 		m.pool.Cancel(id) // interrupted before the launch request: don't send it
+		ReleaseLaunch()
 		return
 	}
 	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.r.BootTimeout.Duration+time.Minute)
 	defer cancel()
-	in, err := m.pool.Provision(pctx, id, logf)
+	in, err := m.pool.ProvisionHeld(pctx, id, logf)
 	if err != nil {
 		rep.Warn("LAUNCH_FAILED", "%s: %v", m.r.Name, firstLine(err.Error()))
 		return
@@ -386,6 +444,7 @@ func isCode(err error, code string) bool {
 // time the doomed run needs it.
 func EnsureSpare(ctx context.Context, req AcquireRequest) {
 	req.Rep = quietReporter{req.Rep}
+	req.Base.KeepOwner = true // only probing for room, not using the slot
 	l, err := Acquire(ctx, req)
 	if err == nil {
 		l.Close()
@@ -397,6 +456,17 @@ type quietReporter struct{ ui.Reporter }
 
 func (q quietReporter) Status(string, ...any) {}
 func (q quietReporter) Clear()                {}
+
+// Event drops what would describe the spare's throwaway slot as if it were
+// the run's own (placed, slot_acquired, queue progress); launches and
+// warnings still come through.
+func (q quietReporter) Event(name string, f map[string]any) {
+	switch name {
+	case "placed", "slot_acquired", "queued", "queue_position":
+		return
+	}
+	q.Reporter.Event(name, f)
+}
 
 func isDraining(err error) bool {
 	var re *transport.RemoteError
@@ -493,8 +563,7 @@ func WaitReady(ctx context.Context, r *config.Runner, t provider.Target, rep ui.
 				rep.Status("%s: running first-boot setup %s", r.Name, ui.Dur(time.Since(start)))
 			default:
 				tail, _ := c.Run(ctx, "tail -n 20 /var/log/spotexec-bootstrap.log 2>/dev/null", nil)
-				rep.Warn("BOOTSTRAP_FAILED", "%s: bootstrap_script exited %s; continuing anyway. Last log lines:\n%s", r.Name, s, strings.TrimSpace(string(tail)))
-				return nil
+				return fmt.Errorf("%s: bootstrap_script exited %s; last log lines:\n%s", r.Name, s, strings.TrimSpace(string(tail)))
 			}
 		} else {
 			last = err

@@ -2,6 +2,7 @@ package helper
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"os"
@@ -105,7 +106,7 @@ func pollNotices(ctx context.Context, out chan<- notice) {
 				wait, backoff = backoff, min(backoff*2, 60*time.Second)
 			} else {
 				backoff = 3 * time.Second
-				if body, ok := imdsGet(ctx, client, &token, "spot/instance-action"); ok {
+				if body, ok := imdsGet(ctx, client, &token, "spot/instance-action"); ok && validAction(body) {
 					out <- notice{"interruption", "EC2 spot interruption notice: " + body}
 					return
 				}
@@ -162,8 +163,24 @@ func SpotNotice(ctx context.Context) string {
 		return ""
 	}
 	token := string(b)
-	if body, ok := imdsGet(ctx, client, &token, "spot/instance-action"); ok {
+	if body, ok := imdsGet(ctx, client, &token, "spot/instance-action"); ok && validAction(body) {
 		return "EC2 spot interruption notice: " + body
 	}
 	return ""
+}
+
+// validAction accepts only a real instance-action document (anything else
+// answering on the link-local address must not drain the VM).
+func validAction(body string) bool {
+	var v struct {
+		Action string `json:"action"`
+	}
+	if json.Unmarshal([]byte(body), &v) != nil {
+		return false
+	}
+	switch v.Action {
+	case "terminate", "stop", "hibernate":
+		return true
+	}
+	return false
 }

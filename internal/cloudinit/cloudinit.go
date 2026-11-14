@@ -19,6 +19,7 @@ package cloudinit
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 	"text/template"
 	"time"
@@ -43,13 +44,13 @@ var tmpl = template.Must(template.New("ud").Parse(`#!/bin/bash
 set -u
 D=/var/tmp/spotexec
 mkdir -p "$D"
-chmod 1777 "$D"
+chmod 0755 "$D"   # opened to the runner user's group below
 # User-data runs once per instance, so this is the instance's own birth time
 # (an AMI baked from a runner must not inherit an old one).
 date +%s > "$D/created_at"
 touch "$D/lifecycle.lock" "$D/activity"
 chmod 0644 "$D/lifecycle.lock"
-chmod 0666 "$D/activity"
+chmod 0644 "$D/activity"
 echo "{{.IdleText}}" > "$D/idle_timeout"
 rm -f "$D/draining" "$D/ready"
 
@@ -78,9 +79,13 @@ if [ -f "$D/draining" ]; then
   exit 0
 fi
 idle_for() {
-  local last
+  local last n
+  n=$(date +%s)
   last=$(stat -c %Y "$D/activity" 2>/dev/null || echo "$created")
-  echo $(( $(date +%s) - last ))
+  # A clock stepped backwards must not leave activity "in the future"
+  # (which would postpone idle shutdown by the size of the jump).
+  if [ "$last" -gt "$n" ]; then last=$n; touch "$D/activity" 2>/dev/null; fi
+  echo $(( n - last ))
 }
 [ "$(idle_for)" -ge "$IDLE" ] || exit 0
 # An active spotexec session holds this lock shared; only shut down if none do.
@@ -111,7 +116,9 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now spotexec-watchdog.timer
 # Independent backstop in case the timer unit is ever broken.
-systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} /bin/sh -c 'touch /var/tmp/spotexec/draining; {{.SelfDestruct}}; sleep 120; poweroff -f' >/dev/null 2>&1 || true
+# No default dependencies, and SIGTERM ignored: shutdown must not stop the
+# timer before it fires, nor kill the forced poweroff that backs it up.
+systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependencies=no --timer-property=DefaultDependencies=no /bin/sh -c 'trap "" TERM HUP; touch /var/tmp/spotexec/draining; {{.SelfDestruct}}; sleep 120; poweroff -f' >/dev/null 2>&1 || true
 
 # ---- 2. SSH access for the spotexec-managed key ----
 # Many agents may connect at once; the default MaxStartups (10:30:100) would
@@ -123,6 +130,11 @@ if [ -d /etc/ssh/sshd_config.d ]; then
   systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
 fi
 U={{.User}}
+# The runner user (the helper) owns its state files; others can't drain or
+# fake them. The bootstrap log stays readable to it, not to everyone.
+chgrp "$(id -gn "$U")" "$D" "$D/activity" && chmod 0775 "$D" && chmod 0664 "$D/activity"
+touch /var/log/spotexec-bootstrap.log
+chgrp "$(id -gn "$U")" /var/log/spotexec-bootstrap.log && chmod 0640 /var/log/spotexec-bootstrap.log
 H=$(getent passwd "$U" | cut -d: -f6)
 if [ -n "$H" ]; then
   install -d -m 0700 -o "$U" -g "$(id -gn "$U")" "$H/.ssh"
@@ -132,16 +144,17 @@ if [ -n "$H" ]; then
 fi
 
 # ---- 3. User bootstrap ----
-systemctl stop unattended-upgrades.service apt-daily.service apt-daily-upgrade.service >/dev/null 2>&1 || true
-systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
-status=0
 # Bootstrap runs under a shared lifecycle lock so the idle watchdog cannot
 # power the VM off mid-setup when setup takes longer than idle_timeout
-# (max_lifetime still applies). The scripts themselves get fd 8 closed so a
+# (max_lifetime still applies); taken before stopping apt, which can block
+# for minutes on first boot. The scripts themselves get fd 8 closed so a
 # daemon they start cannot hold the lock forever.
 touch "$D/activity"
 exec 8<"$D/lifecycle.lock"
 flock -s 8
+systemctl stop unattended-upgrades.service apt-daily.service apt-daily-upgrade.service >/dev/null 2>&1 || true
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+status=0
 {{- if .BootstrapScript}}
 umask 077
 cat > "$D/bootstrap-root.sh" <<'BOOTSTRAP_ROOT'
@@ -161,11 +174,13 @@ if [ "$status" -eq 0 ]; then
   timeout -k 30 {{.BootSecs}} sudo -u "$U" -H bash -le "$D/bootstrap-user.sh" </dev/null >>/var/log/spotexec-bootstrap.log 2>&1 8<&- || status=$?
 fi
 {{- end}}
-chmod 0644 /var/log/spotexec-bootstrap.log 2>/dev/null || true
+chmod 0640 /var/log/spotexec-bootstrap.log 2>/dev/null || true
 touch "$D/activity"
 exec 8<&-
 echo "$status" > "$D/ready"
 `))
+
+var userRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
 // Render produces the user-data script.
 func Render(o Options) (string, error) {
@@ -181,12 +196,16 @@ func Render(o Options) (string, error) {
 	if strings.ContainsAny(o.PublicKey, "'\n") || o.PublicKey == "" {
 		return "", fmt.Errorf("invalid public key")
 	}
-	if strings.ContainsAny(o.User, "'\"$ \n;") || o.User == "" {
+	if !userRe.MatchString(o.User) {
 		return "", fmt.Errorf("invalid user %q", o.User)
 	}
 	for _, s := range []string{o.BootstrapScript, o.UserBootstrap} {
-		if strings.Contains(s, "\nBOOTSTRAP_ROOT") || strings.Contains(s, "\nBOOTSTRAP_USER") {
-			return "", fmt.Errorf("bootstrap script may not contain heredoc terminators")
+		// Any line equal to a terminator (after trimming, as the shell
+		// compares) would end the heredoc early and run the rest as root.
+		for _, line := range strings.Split(s, "\n") {
+			if t := strings.TrimSpace(line); t == "BOOTSTRAP_ROOT" || t == "BOOTSTRAP_USER" {
+				return "", fmt.Errorf("bootstrap script may not contain a line %q", t)
+			}
 		}
 	}
 	if o.BootstrapTimeout <= 0 {

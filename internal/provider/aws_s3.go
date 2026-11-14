@@ -67,7 +67,14 @@ func (a *AWSSpot) CacheURLs(ctx context.Context, repoID, key string) (string, st
 
 // accountID returns (and caches) the AWS account of these credentials.
 func (a *AWSSpot) accountID(ctx context.Context) (string, error) {
-	p := filepath.Join(a.dir, "account-id-"+a.r.Profile)
+	// Keyed by the access key too: switching credentials (a different
+	// account under the same profile name, or none) must not reuse it.
+	keyID := ""
+	if c, err := a.api.creds.get(ctx); err == nil {
+		h := sha256.Sum256([]byte(c.AccessKeyID))
+		keyID = hex.EncodeToString(h[:])[:12]
+	}
+	p := filepath.Join(a.dir, "account-id-"+a.r.Profile+"-"+keyID)
 	if b, err := os.ReadFile(p); err == nil && len(strings.TrimSpace(string(b))) == 12 {
 		return strings.TrimSpace(string(b)), nil
 	}

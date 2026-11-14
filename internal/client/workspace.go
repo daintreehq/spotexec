@@ -122,7 +122,19 @@ func LoadLastRun(w *Workspace) (*LastRun, error) {
 
 func saveLastRun(w *Workspace, lr LastRun) {
 	p := lastRunPath(w)
-	_ = os.MkdirAll(filepath.Dir(p), 0o755)
+	_ = os.MkdirAll(filepath.Dir(p), 0o700)
 	b, _ := json.Marshal(lr)
-	_ = os.WriteFile(p, b, 0o644)
+	// Atomic: a concurrent reader never sees a half-written record.
+	f, err := os.CreateTemp(filepath.Dir(p), ".lastrun-*")
+	if err != nil {
+		return
+	}
+	_, werr := f.Write(b)
+	if cerr := f.Close(); werr != nil || cerr != nil {
+		os.Remove(f.Name())
+		return
+	}
+	if os.Rename(f.Name(), p) != nil {
+		os.Remove(f.Name())
+	}
 }

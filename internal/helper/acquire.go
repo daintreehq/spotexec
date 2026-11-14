@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,6 +26,14 @@ func autoSlots() int {
 }
 
 func (s *Session) acquire(a protocol.Acquire) (err error) {
+	if s.layout.Root == "" {
+		return perr(protocol.CodeBadRequest, "hello required before acquire")
+	}
+	if len(s.tokens) > 0 {
+		// Rejected before the rollback below is armed: the slot already held
+		// must stay held.
+		return perr(protocol.CodeBadRequest, "already holding a slot")
+	}
 	// Any failure (or a Busy reply) leaves the session holding nothing, so a
 	// still-connected client can retry instead of pinning a token.
 	defer func() {
@@ -32,23 +41,29 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 			s.rollbackAcquire()
 		}
 	}()
-	if s.layout.Root == "" {
-		return perr(protocol.CodeBadRequest, "hello required before acquire")
-	}
-	if len(s.tokens) > 0 {
-		return perr(protocol.CodeBadRequest, "already holding a slot")
-	}
 	if !repoIDRe.MatchString(a.RepoID) {
 		return perr(protocol.CodeBadRequest, "invalid repo id %q", a.RepoID)
 	}
-	if draining(s.layout.Root) {
-		return perr(protocol.CodeDraining, "runner is draining (shutting down or spot interruption)")
-	}
 	// Ephemeral runners refuse work until first-boot setup has finished.
+	// (Checked before draining, so a failed setup keeps reporting why.)
 	if _, err := os.Stat(LifecycleDir); err == nil {
-		if _, err := os.Stat(filepath.Join(LifecycleDir, "ready")); err != nil {
+		b, err := os.ReadFile(filepath.Join(LifecycleDir, "ready"))
+		if err != nil {
 			return perr(protocol.CodeBooting, "runner is still running its first-boot setup")
 		}
+		// A failed bootstrap_script leaves a VM without the toolchain the
+		// project needs: refuse work (and retire the VM) rather than run
+		// jobs, or build a dependency cache, on a broken machine.
+		if st := strings.TrimSpace(string(b)); st != "" && st != "0" {
+			if _, err := os.Stat(filepath.Join(LifecycleDir, "idle_timeout")); err == nil {
+				markDraining(s.layout.Root, "bootstrap failed") // ephemeral: let it go
+			}
+			tail, _ := exec.Command("tail", "-n", "15", "/var/log/spotexec-bootstrap.log").Output()
+			return perr(protocol.CodeBootFailed, "bootstrap_script failed (exit %s) on this VM; last lines of /var/log/spotexec-bootstrap.log:\n%s", st, strings.TrimSpace(string(tail)))
+		}
+	}
+	if draining(s.layout.Root) {
+		return perr(protocol.CodeDraining, "runner is draining (shutting down or spot interruption)")
 	}
 	// Ephemeral runners: hold the lifecycle lock shared so the idle watchdog
 	// (which needs it exclusively) cannot shut the VM down under us.
@@ -92,14 +107,23 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 			}
 			gate.Unlock()
 		} else if gotGate {
-			for i := 1; i <= max; i++ {
-				l, ok, err := tryLock(s.layout.TokenLock(i))
-				if err != nil {
-					return err
+			// Status probes (spotexec status, the pool manager) test free
+			// tokens by locking them for an instant: on an all-busy first
+			// pass, look again after a moment before reporting busy, or a
+			// probe would make an idle VM look full (and scale out).
+			for pass := 0; pass < 2 && len(s.tokens) == 0; pass++ {
+				if pass > 0 {
+					time.Sleep(25 * time.Millisecond)
 				}
-				if ok {
-					s.tokens, s.tokenIdx = []*flock{l}, i
-					break
+				for i := 1; i <= max; i++ {
+					l, ok, err := tryLock(s.layout.TokenLock(i))
+					if err != nil {
+						return err
+					}
+					if ok {
+						s.tokens, s.tokenIdx = []*flock{l}, i
+						break
+					}
 				}
 			}
 			if len(s.tokens) > 0 {
@@ -225,6 +249,13 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 		s.watching = true
 		go s.watchNotices()
 	}
+	// A drain that began while we were acquiring (the pool manager retiring
+	// this VM) wins: don't start work it was promised wouldn't start.
+	if draining(s.layout.Root) {
+		return perr(protocol.CodeDraining, "runner is draining")
+	}
+	root := s.layout.Root
+	s.owned.Store(&root)
 	return s.c.Send(protocol.TypeAcquired, protocol.Acquired{
 		Token: holder.Token, Slot: holder.Slot, Workspace: s.workspace,
 		FingerprintMatch: match, WaitedMS: waited.Milliseconds(), MaxSlots: max, PrevWorktreeKey: prevKey,
@@ -232,6 +263,7 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 }
 
 func (s *Session) rollbackAcquire() {
+	s.owned.Store(nil)
 	for i, t := range s.tokens {
 		if t != nil {
 			_ = os.Remove(s.layout.TokenHolder(s.tokenIdxAt(i)))

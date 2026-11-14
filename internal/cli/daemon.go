@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -59,6 +60,10 @@ func cmdDaemon() *cobra.Command {
 				return err
 			}
 			logPath := filepath.Join(daemon.Dir(), "daemon.log")
+			// Keep one previous log; never let it grow without bound.
+			if fi, err := os.Stat(logPath); err == nil && fi.Size() > 5<<20 {
+				_ = os.Rename(logPath, logPath+".1")
+			}
 			lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 			if err != nil {
 				return err
@@ -70,16 +75,21 @@ func cmdDaemon() *cobra.Command {
 				return err
 			}
 			lf.Close()
-			_ = p.Process.Release()
-			for i := 0; i < 50; i++ {
+			exited := make(chan struct{})
+			go func() { _ = p.Wait(); close(exited) }()
+			for i := 0; i < 100; i++ {
 				if pid := daemon.Running(); pid != 0 {
 					fmt.Printf("spotexec daemon started (pid %d); log: %s\n", pid, logPath)
 					return nil
 				}
-				time.Sleep(100 * time.Millisecond)
+				select {
+				case <-exited: // it already failed: say why without waiting
+					return fmt.Errorf("daemon did not start; log tail:\n%s", tailFile(logPath, 10))
+				case <-time.After(100 * time.Millisecond):
+				}
 			}
-			b, _ := os.ReadFile(logPath)
-			return fmt.Errorf("daemon did not start; log tail:\n%s", tail(string(b), 10))
+			_ = p.Process.Kill() // don't leave a half-started daemon behind
+			return fmt.Errorf("daemon did not start; log tail:\n%s", tailFile(logPath, 10))
 		},
 	}
 	stopCmd := &cobra.Command{
@@ -96,10 +106,10 @@ func cmdDaemon() *cobra.Command {
 			}
 			// The daemon may wait up to 60s for launches already sent to the
 			// cloud to be recorded.
-			for i := 0; i < 750 && daemon.Running() != 0; i++ {
+			for i := 0; i < 750 && daemon.Running() == pid; i++ {
 				time.Sleep(100 * time.Millisecond)
 			}
-			if daemon.Running() != 0 {
+			if daemon.Running() == pid {
 				return errors.New("daemon did not stop")
 			}
 			fmt.Printf("spotexec daemon stopped (pid %d)\n", pid)
@@ -113,6 +123,9 @@ func cmdDaemon() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pid := daemon.Running()
 			st, err := daemon.ReadStatus()
+			if err == nil && (pid == 0 || st.PID != pid) {
+				st, err = nil, errors.New("no current status") // a previous daemon's
+			}
 			if asJSON {
 				return json.NewEncoder(os.Stdout).Encode(map[string]any{"running": pid != 0, "pid": pid, "status": st})
 			}
@@ -167,28 +180,25 @@ func cmdDaemon() *cobra.Command {
 	return c
 }
 
-func tail(s string, n int) string {
-	lines := []rune(s)
-	_ = lines
-	out := []string{}
-	cur := ""
-	for _, r := range s {
-		if r == '\n' {
-			out = append(out, cur)
-			cur = ""
-			continue
-		}
-		cur += string(r)
+// tailFile returns the last n lines of a file, reading only its end.
+func tailFile(path string, n int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
 	}
-	if cur != "" {
-		out = append(out, cur)
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return ""
 	}
-	if len(out) > n {
-		out = out[len(out)-n:]
+	off := max(0, fi.Size()-64<<10)
+	b := make([]byte, fi.Size()-off)
+	if _, err := f.ReadAt(b, off); err != nil && len(b) == 0 {
+		return ""
 	}
-	res := ""
-	for _, l := range out {
-		res += l + "\n"
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
 	}
-	return res
+	return strings.Join(lines, "\n") + "\n"
 }

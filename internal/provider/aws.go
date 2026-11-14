@@ -457,13 +457,18 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 		opts.IdleTimeout = opts.MaxLifetime
 	} else if a.r.AMI == "" || a.r.AMI == "auto" {
 		// A baked image with this runner's bootstrap already applied?
-		if id, dev, size, err := a.findBake(ctx); err == nil && id != "" {
+		if id, dev, size, created, err := a.findBake(ctx); err == nil && id != "" {
 			ami, rootDev = id, dev
 			opts.BootstrapScript, opts.UserBootstrap = "", ""
 			if size > volume {
 				volume = size // can't launch with a volume smaller than the image's snapshot
 			}
-			log("using baked image %s", id)
+			if age := time.Since(created); !created.IsZero() && age > 30*24*time.Hour {
+				// The OS inside doesn't get security updates until re-baked.
+				log("using baked image %s (%d days old: run `spotexec image bake %s` to pick up OS updates)", id, int(age.Hours()/24), a.r.Name)
+			} else {
+				log("using baked image %s", id)
+			}
 		}
 	}
 	ud, err := cloudinit.Render(opts)
@@ -743,20 +748,13 @@ func (a *AWSSpot) vpcID(ctx context.Context) (string, error) {
 
 // Terminate ends one specific instance, but only if it carries our tags.
 func (a *AWSSpot) Terminate(ctx context.Context, id string) error {
-	insts, err := a.describe(ctx, "pending", "running", "stopping", "stopped")
-	if err != nil {
-		return err
+	// Looked up by ID (tag-filtered listings lag for brand-new instances);
+	// the owner and runner tags are still checked before terminating.
+	err := a.terminateAny(ctx, id)
+	if err == nil {
+		_ = os.Remove(a.knownHosts(id))
 	}
-	for _, i := range insts {
-		if i.InstanceID == id {
-			p := url.Values{}
-			p.Set("InstanceId.1", id)
-			_, err := a.api.ec2(ctx, "TerminateInstances", p)
-			_ = os.Remove(a.knownHosts(id))
-			return err
-		}
-	}
-	return nil
+	return err
 }
 
 // pruneKnownHosts removes known_hosts files older than max_lifetime (their
@@ -863,6 +861,9 @@ func (a *AWSSpot) Doctor(ctx context.Context) []Check {
 }
 
 // vcpusOf estimates vCPUs from an EC2 size suffix (large=2, xlarge=4, NxNlarge=4N).
+// VCPUsOf estimates an EC2 instance type's vCPUs from its size name.
+func VCPUsOf(t string) int { return vcpusOf(t) }
+
 func vcpusOf(t string) int {
 	_, size, _ := strings.Cut(t, ".")
 	switch size {

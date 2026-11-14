@@ -73,6 +73,9 @@ type Options struct {
 
 // Result of a run.
 type Result struct {
+	// Reached: some attempt got a runner (so the command may have run there;
+	// a local fallback must not run it again).
+	Reached   bool   `json:"-"`
 	ExitCode  int    `json:"exit_code"`
 	Runner    string `json:"runner"`
 	Slot      int    `json:"slot"`
@@ -118,8 +121,11 @@ type attempt struct {
 // replayed.
 func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Result, error) {
 	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}}
+	reached := false
 	for {
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
+		reached = reached || res.Runner != ""
+		res.Reached = reached
 		retryable := lost != "" && o.RetryPreempt && ctx.Err() == nil && o.Sync != "none" && !o.PreferLast && att.n < 2
 		if !retryable {
 			return res, err
@@ -137,6 +143,12 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 // lostRunner reports what to exclude when the connection to a lease died.
 func lostRunner(l *Lease, err error) string {
 	if l == nil || err == nil || !l.Runner.Ephemeral() {
+		return ""
+	}
+	// An error the helper reported itself means it was alive to report it
+	// (the command may well have run): never treat that as a lost runner.
+	var re *transport.RemoteError
+	if errors.As(err, &re) {
 		return ""
 	}
 	// Writes to a dead SSH channel fail with plain pipe errors; the session
@@ -188,6 +200,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if m != nil {
 		base.Fingerprint = m.Fingerprint
 	}
+	// Without a sync the slot's files are not ours: don't claim ownership.
+	base.KeepOwner = o.Sync == "none"
 	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority}
 	var lease *Lease
 	if o.PreferLast {
@@ -238,11 +252,14 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}
 	remoteWS := lease.Acq.Workspace
-	prevImage := ""
-	if prev, err := LoadLastRun(ws); err == nil {
-		prevImage = prev.Image // keep the last prepared image for `sx exec`
+	// The last-run record (used by exec and pull) is written once this
+	// worktree's files are in the slot, and never for unsynced runs.
+	lastRun := LastRun{Runner: r.Name, InstanceID: lease.InstanceID, Slot: lease.Acq.Slot, Target: lease.Target, WorkRoot: r.WorkRoot, RemoteWS: remoteWS}
+	recordLastRun := func() {
+		if o.Sync != "none" && !o.PreferLast {
+			saveLastRun(ws, lastRun)
+		}
 	}
-	saveLastRun(ws, LastRun{Image: prevImage, Runner: r.Name, InstanceID: lease.InstanceID, Slot: lease.Acq.Slot, Target: lease.Target, WorkRoot: r.WorkRoot, RemoteWS: remoteWS})
 	label := fmt.Sprintf("%s#%d", r.Name, lease.Acq.Token)
 
 	// 3. Forward sync.
@@ -272,11 +289,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root"}
 		imageID = id
-		if lr, err := LoadLastRun(ws); err == nil {
-			lr.Image = ref
-			saveLastRun(ws, *lr)
-		}
+		lastRun.Image = ref
 	}
+	recordLastRun()
 
 	// 5. Dependencies.
 	if p.Deps.Install != "" && !o.NoDeps && o.Sync != "none" {
@@ -299,6 +314,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		"SPOTEXEC_RUNNER":    r.Name,
 		"SPOTEXEC_RUN_ID":    runID,
 		"SPOTEXEC_ATTEMPT":   fmt.Sprint(att.n),
+		"SPOTEXEC_WORKSPACE": remoteWS,
 		// CPUs this job may use: its fair share of the machine, or all of
 		// it for --exclusive. Use it for test-runner worker counts.
 		"SPOTEXEC_CPUS":        fmt.Sprint(cpuShare(sess.Hello.CPUs, lease.Acq.MaxSlots, o.Exclusive)),
@@ -410,8 +426,11 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 		res.Mutated, res.Deleted, res.Conflicts = wb.Applied, wb.Deleted, wb.Conflicts
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "ignored_created": wb.Ignored, "duration_ms": time.Since(t).Milliseconds()})
+		if len(wb.Refused) > 0 {
+			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
+		}
 		for _, c := range wb.Conflicts {
-			o.Rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version, remote version saved to %s", c, filepath.Join(wb.ConflictDir, c))
+			o.Rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version, remote version saved under %s", c, wb.ConflictDir)
 		}
 		if result.Truncated {
 			o.Rep.Warn("WRITEBACK_TRUNCATED", "more than %d new files were created; only the first batch was considered for write-back", 50000)
@@ -423,7 +442,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// 7. Explicit artifact pulls.
 	pulls := append(append([]string{}, p.Sync.PullArtifacts...), o.Pull...)
 	if len(pulls) > 0 {
-		n, err := PullArtifacts(post, sess, ws.Root, pulls)
+		n, err := PullArtifacts(post, sess, ws, ws.Root, pulls)
 		if err != nil {
 			o.Rep.Warn("PULL_FAILED", "pulling %v: %v", pulls, err)
 		}
@@ -479,6 +498,17 @@ func syncIn(ctx context.Context, s *transport.Session, m *manifest.Manifest, pro
 	if err := env.Unmarshal(&need); err != nil {
 		return syn, err
 	}
+	var uploaded map[string]protocol.Entry // what we actually sent, hashed here
+	// The runner may only ask for files in the manifest we sent it: never
+	// anything else on this machine (a compromised runner would otherwise
+	// read ~/.aws/credentials through "../..").
+	asked := map[string]bool{}
+	for _, p := range need.Paths {
+		if _, ok := m.ByPath[p]; !ok || asked[p] {
+			return syn, fmt.Errorf("runner asked for %q, which is not in the working set", p)
+		}
+		asked[p] = true
+	}
 	if len(need.Paths) > 0 {
 		if need.Bytes > AbortBytes && !o.ForceLargeSync {
 			return syn, fmt.Errorf("refusing to transfer %s (limit %s); add excludes or pass --force-large-sync", ui.Bytes(need.Bytes), ui.Bytes(AbortBytes))
@@ -487,13 +517,20 @@ func syncIn(ctx context.Context, s *transport.Session, m *manifest.Manifest, pro
 			o.Rep.Warn("LARGE_SYNC", "transferring %s", ui.Bytes(need.Bytes))
 		}
 		bw := &protocol.BlobWriter{C: s.Conn}
+		uploaded = map[string]protocol.Entry{}
 		zw, _ := gzip.NewWriterLevel(bw, gzip.BestSpeed)
 		tw := tar.NewWriter(zw)
 		werr := func() error {
 			for _, p := range need.Paths {
-				if err := addLocalTar(tw, filepath.Join(m.Root, filepath.FromSlash(p)), p); err != nil {
+				full, err := fsid.SafeJoin(m.Root, p) // no symlinked parent directories
+				if err != nil {
 					return err
 				}
+				sent, err := addLocalTar(tw, full, p)
+				if err != nil {
+					return err
+				}
+				uploaded[p] = sent
 			}
 			if err := tw.Close(); err != nil {
 				return err
@@ -516,38 +553,47 @@ func syncIn(ctx context.Context, s *transport.Session, m *manifest.Manifest, pro
 		return syn, err
 	}
 	// Files that changed while we were reading them: the bytes that actually
-	// landed remotely are the write-back baseline.
-	for _, c := range syn.Corrected {
-		m.Update(c)
+	// landed remotely are the write-back baseline. Taken from what we hashed
+	// while sending, never from the runner's report (it could otherwise
+	// plant entries for files we never uploaded).
+	for p, e := range uploaded {
+		if cur := m.ByPath[p]; cur.ID != e.ID || cur.Mode != e.Mode {
+			m.Update(e)
+		}
 	}
 	return syn, nil
 }
 
-func addLocalTar(tw *tar.Writer, full, name string) error {
+// addLocalTar adds one file and returns the entry for exactly what was sent.
+func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 	fi, err := os.Lstat(full)
 	if err != nil {
-		return fmt.Errorf("%s vanished during sync; re-run", name)
+		return protocol.Entry{}, fmt.Errorf("%s vanished during sync; re-run", name)
 	}
 	if fi.Mode()&fs.ModeSymlink != 0 {
 		t, err := os.Readlink(full)
 		if err != nil {
-			return err
+			return protocol.Entry{}, err
 		}
-		return tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: t, Mode: 0o777})
+		e := protocol.Entry{Path: name, ID: fsid.Bytes([]byte(t)), Mode: fsid.ModeSymlink, Size: int64(len(t))}
+		return e, tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: t, Mode: 0o777})
+	}
+	if !fi.Mode().IsRegular() {
+		return protocol.Entry{}, fmt.Errorf("%s is no longer a regular file; re-run", name)
 	}
 	b, err := os.ReadFile(full)
 	if err != nil {
-		return err
+		return protocol.Entry{}, err
 	}
-	mode := int64(0o644)
+	mode, emode := int64(0o644), fsid.ModeFile
 	if fi.Mode()&0o111 != 0 {
-		mode = 0o755
+		mode, emode = 0o755, fsid.ModeExec
 	}
 	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Size: int64(len(b)), Mode: mode, ModTime: fi.ModTime()}); err != nil {
-		return err
+		return protocol.Entry{}, err
 	}
 	_, err = tw.Write(b)
-	return err
+	return protocol.Entry{Path: name, ID: fsid.Bytes(b), Mode: emode, Size: int64(len(b))}, err
 }
 
 func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string) error {
@@ -629,7 +675,7 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 		case protocol.TypeError:
 			var em protocol.ErrorMsg
 			_ = env.Unmarshal(&em)
-			return fmt.Errorf("dependencies: %s", em.Message)
+			return fmt.Errorf("dependencies: %w", &transport.RemoteError{ErrorMsg: em})
 		case protocol.TypeDepsResult:
 			var dr protocol.DepsResult
 			_ = env.Unmarshal(&dr)
@@ -770,12 +816,23 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read 
 	if !ok {
 		return "", fmt.Errorf("container.dockerfile %q is not in the synced working set", dockerfile)
 	}
+	if df.Mode == fsid.ModeSymlink {
+		return "", fmt.Errorf("container.dockerfile %q must be a regular file, not a symlink", dockerfile)
+	}
+	// Normalised exactly as the helper does (normContext).
 	if buildCtx == "" {
 		buildCtx = path.Dir(dockerfile)
 	}
-	buildCtx = strings.Trim(path.Clean(buildCtx), "/")
+	buildCtx = strings.TrimSuffix(strings.TrimPrefix(buildCtx, "./"), "/")
 	if buildCtx == "." {
 		buildCtx = ""
+	}
+	if buildCtx != "" {
+		c, err := fsid.CleanRel(buildCtx)
+		if err != nil {
+			return "", fmt.Errorf("container.context %q must stay inside the repository", buildCtx)
+		}
+		buildCtx = c
 	}
 	h := sha256.New()
 	fmt.Fprintf(h, "platform\x00%s\x00dockerfile\x00%s\x00%s\x00ctx\x00%s\x00", platform, dockerfile, df.ID, buildCtx)
@@ -838,7 +895,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 	req := protocol.Image{TimeoutMS: c.Timeout.Milliseconds()}
 	if c.Image != "" {
 		req.Ref = c.Image
-	} else if m == nil {
+	} else if o.PreferLast {
 		// exec (no sync): reuse the image this worktree last built here.
 		lr, err := LoadLastRun(ws)
 		if err != nil || lr.Image == "" {
@@ -896,7 +953,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 		case protocol.TypeError:
 			var em protocol.ErrorMsg
 			_ = env.Unmarshal(&em)
-			return "", "", fmt.Errorf("container image: %s", em.Message)
+			return "", "", fmt.Errorf("container image: %w", &transport.RemoteError{ErrorMsg: em})
 		case protocol.TypeImageResult:
 			var r protocol.ImageResult
 			_ = env.Unmarshal(&r)

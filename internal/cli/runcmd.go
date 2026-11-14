@@ -135,28 +135,73 @@ func load(dir string) (*loaded, error) {
 
 // buildCommand turns argv into a remote shell line. A single argument is
 // taken as a shell snippet (so `sx 'pnpm build && pnpm test'` works); several
-// are quoted individually. Absolute local paths inside the worktree become
-// paths relative to the (mirrored) working directory.
+// are quoted individually. Absolute local paths inside the worktree are
+// mapped to the remote workspace: in a snippet to "$SPOTEXEC_WORKSPACE" (so
+// they stay right after a `cd`), or, where the shell won't expand that
+// (single quotes, separate arguments), to a path relative to the mirrored
+// working directory.
 func buildCommand(ws *client.Workspace, args []string) string {
 	toRoot := "."
 	if ws.Cwd != "." {
 		toRoot = strings.TrimSuffix(strings.Repeat("../", strings.Count(ws.Cwd, "/")+1), "/")
 	}
-	rewrite := func(s string) string {
-		s = strings.ReplaceAll(s, ws.Root+"/", toRoot+"/")
-		if s == ws.Root {
-			return toRoot
-		}
-		return s
-	}
 	if len(args) == 1 {
-		return rewrite(args[0])
+		return rewriteRoot(args[0], ws.Root, toRoot, true)
 	}
 	q := make([]string, len(args))
 	for i, a := range args {
-		q[i] = transport.ShellQuote(rewrite(a))
+		q[i] = transport.ShellQuote(rewriteRoot(a, ws.Root, toRoot, false))
 	}
 	return strings.Join(q, " ")
+}
+
+// rewriteRoot replaces root where it appears as a whole path (followed by
+// '/', the end, or a shell delimiter, and not as part of a longer name such
+// as /repo-other).
+func rewriteRoot(s, root, toRoot string, snippet bool) string {
+	var b strings.Builder
+	inSingle, inDouble := false, false
+	for i := 0; i < len(s); {
+		c := s[i]
+		if strings.HasPrefix(s[i:], root) && boundaryBefore(s, i) && boundaryAfter(s, i+len(root)) {
+			switch {
+			case snippet && !inSingle:
+				b.WriteString("${SPOTEXEC_WORKSPACE:?}") // aborts rather than expanding to "" if unset
+			default:
+				b.WriteString(toRoot)
+			}
+			i += len(root)
+			continue
+		}
+		switch {
+		case c == '\\' && !inSingle && i+1 < len(s):
+			b.WriteByte(c)
+			b.WriteByte(s[i+1])
+			i += 2
+			continue
+		case c == '\'' && !inDouble:
+			inSingle = !inSingle
+		case c == '"' && !inSingle:
+			inDouble = !inDouble
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+func boundaryBefore(s string, i int) bool {
+	if i == 0 {
+		return true
+	}
+	return strings.ContainsRune(" \t\n'\"=:(;&|", rune(s[i-1]))
+}
+
+func boundaryAfter(s string, i int) bool {
+	if i == len(s) {
+		return true
+	}
+	return strings.ContainsRune("/ \t\n'\";&|):", rune(s[i]))
 }
 
 // signals turns SIGINT/SIGTERM into a cancellable context plus an interrupt
@@ -263,7 +308,9 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 			rep.Clear()
 			return 130
 		}
-		if errors.As(err, &ie) && (f.fallbackLocal || l.cfg.Global.LocalFallback) && res.Runner == "" {
+		// Only when no runner was ever reached (so the command never ran
+		// remotely), and only for real commands (not exec, sync or pull).
+		if errors.As(err, &ie) && (f.fallbackLocal || l.cfg.Global.LocalFallback) && !res.Reached && !o.PreferLast && !o.SyncOnly && s.command != "" {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
 			return runLocal(l, s.command)
 		}
@@ -307,10 +354,17 @@ func plural(n int) string {
 func runLocal(l *loaded, command string) int {
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Dir = filepath.Join(l.ws.Root, filepath.FromSlash(l.ws.Cwd))
+	// The command was written for the runner: worktree paths in it were
+	// rewritten to ${SPOTEXEC_WORKSPACE}, which here is the worktree itself
+	// (unset, "rm -rf ${SPOTEXEC_WORKSPACE}/tmp" would mean /tmp).
+	cmd.Env = append(os.Environ(), "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
+			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				return 128 + int(ws.Signal())
+			}
 			return ee.ExitCode()
 		}
 		return 127
@@ -323,8 +377,13 @@ func runLocal(l *loaded, command string) int {
 // {args} expands to "$@", so quoting in the template cannot be broken out of.
 func taskCommand(run string, args []string) string {
 	if len(args) == 0 {
-		return strings.TrimSpace(strings.ReplaceAll(run, "{args}", ""))
+		// A quoted placeholder must vanish with its quotes, or the command
+		// would get an empty argument ("").
+		return strings.TrimSpace(strings.NewReplacer(`"{args}"`, "", `'{args}'`, "", "{args}", "").Replace(run))
 	}
+	// A multi-line TOML string ends in a newline: "$@" must stay on the
+	// command's own line.
+	run = strings.TrimRight(run, " \t\r\n")
 	q := make([]string, len(args))
 	for i, a := range args {
 		q[i] = transport.ShellQuote(a)
@@ -358,6 +417,16 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	defer stop()
 	var mu sync.Mutex
 	codes := make([]int, len(t.Parallel))
+	// Each subtask gets its own context, so fail_fast can stop siblings that
+	// are still queued, syncing or installing (not only running ones).
+	subCtx := make([]context.Context, len(t.Parallel))
+	subCancel := make([]context.CancelFunc, len(t.Parallel))
+	for i := range t.Parallel {
+		subCtx[i], subCancel[i] = context.WithCancel(ctx)
+		defer subCancel[i]()
+	}
+	stopped := make([]bool, len(t.Parallel)) // cancelled by fail_fast
+	done := make([]bool, len(t.Parallel))
 	intrs := make([]chan struct{}, len(t.Parallel))
 	for i := range intrs {
 		intrs[i] = make(chan struct{}, 4)
@@ -385,16 +454,21 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			cmd := buildTaskLine(l, st.Run, nil)
 			spec := runSpec{label: sub, command: cmd, display: sub + ": " + cmd, timeout: st.Timeout.Duration, sync: st.Sync, exclusive: st.Exclusive, pool: st.Pool, priority: st.Priority}
 			o := f.options(l, spec, sr, intrs[i], ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu))
-			res, err := client.Run(ctx, l.cfg, l.ws, o)
+			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
 			code := res.ExitCode
 			if err != nil {
 				code = client.ExitInfra
-				mu.Lock()
-				fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
-				mu.Unlock()
 			}
-			codes[i] = code
 			mu.Lock()
+			codes[i], done[i] = code, true
+			if stopped[i] {
+				// Cancelled by fail_fast: not a failure of its own.
+				mu.Unlock()
+				return
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
+			}
 			if !rep.IsJSON() {
 				status := "\x1b[32m✓\x1b[0m"
 				if code != 0 {
@@ -406,20 +480,39 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			if code != 0 && t.FailFast {
 				failOnce.Do(func() {
 					for j, c := range intrs {
-						if j != i {
-							c <- struct{}{}
+						mu.Lock()
+						skip := j == i || done[j]
+						if !skip {
+							stopped[j] = true
 						}
+						mu.Unlock()
+						if skip {
+							continue
+						}
+						select { // never block on a full buffer
+						case c <- struct{}{}:
+						default:
+						}
+						subCancel[j]()
 					}
 				})
 			}
 		}(i, sub, st)
 	}
 	wg.Wait()
+	// Interrupted: 130. A spotexec failure (125) outranks a command's own
+	// failure, so agents can tell "tests failed" from "couldn't run tests".
 	exit := 0
-	for _, c := range codes {
-		if c != 0 && exit == 0 {
+	for i, c := range codes {
+		if stopped[i] {
+			continue // the failure that stopped it is what counts
+		}
+		if c != 0 && (exit == 0 || c == client.ExitInfra) {
 			exit = c
 		}
+	}
+	if ctx.Err() != nil {
+		exit = 130
 	}
 	rep.Event("result", map[string]any{"task": name, "exit_code": exit, "duration_ms": time.Since(start).Milliseconds(), "parallel": t.Parallel})
 	return exit

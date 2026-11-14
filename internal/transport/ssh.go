@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spotexec/spotexec/internal/helperbin"
@@ -34,12 +35,39 @@ type Client struct {
 
 // New builds a client for a target.
 func New(t provider.Target, workRoot string) *Client {
+	// The known_hosts file is per instance for ephemeral VMs, so a Spot IP
+	// reused by a new instance gets its own master and helper markers.
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%s|%s", t.Host, t.User, t.Port, t.IdentityFile, t.KnownHostsFile)))
+	return &Client{T: t, ctlPath: filepath.Join(controlDir(), hex.EncodeToString(h[:])[:16]), WorkRoot: workRoot}
+}
+
+// controlDir holds ControlMaster sockets. OpenSSH appends 17 bytes to the
+// path while binding and macOS limits socket paths to 104 bytes, so a long
+// (or missing) home falls back to a short per-user directory in /tmp.
+func controlDir() string {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".cache", "spotexec", "cm")
+	if home == "" || len(dir)+17+17 > 100 {
+		dir = filepath.Join("/tmp", fmt.Sprintf("sx-cm-%d", os.Getuid()))
+		_ = os.Mkdir(dir, 0o700)
+		// /tmp is shared: use it only if it's really our own private dir.
+		owned := false
+		if fi, err := os.Lstat(dir); err == nil && fi.IsDir() {
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) == os.Getuid() {
+				owned = true
+			}
+		}
+		if !owned {
+			d, err := os.MkdirTemp("", "sx-cm-")
+			if err == nil {
+				return d
+			}
+		}
+		_ = os.Chmod(dir, 0o700)
+		return dir
+	}
 	_ = os.MkdirAll(dir, 0o700)
-	// A short hashed name keeps the socket under the 104-byte sun_path limit.
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%s", t.Host, t.User, t.Port, t.IdentityFile)))
-	return &Client{T: t, ctlPath: filepath.Join(dir, hex.EncodeToString(h[:])[:16]), WorkRoot: workRoot}
+	return dir
 }
 
 func (c *Client) baseArgs(master string) []string {
@@ -74,12 +102,13 @@ func (c *Client) baseArgs(master string) []string {
 
 // Args returns full ssh argv for running remoteCmd.
 func (c *Client) Args(remoteCmd string) []string {
-	return append(append(c.baseArgs("no"), c.T.Host), remoteCmd)
+	// "--" ends options: the host can never be read as one.
+	return append(append(c.baseArgs("no"), "--", c.T.Host), remoteCmd)
 }
 
 // MasterAlive reports whether a control master is up.
 func (c *Client) MasterAlive(ctx context.Context) bool {
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "check", c.T.Host)
+	cmd := exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "check", "--", c.T.Host)
 	return cmd.Run() == nil
 }
 
@@ -90,13 +119,40 @@ func (c *Client) EnsureMaster(ctx context.Context) error {
 	if c.MasterAlive(ctx) {
 		return nil
 	}
+	// One process starts the master; the others wait and reuse it. (Racing
+	// starters lose the socket bind and leave stray `ssh -N` processes.)
+	if lf, err := os.OpenFile(c.ctlPath+".lock", os.O_CREATE|os.O_RDWR, 0o600); err == nil {
+		defer lf.Close()
+		locked := false
+		for {
+			err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			if err == nil {
+				locked = true
+				break
+			}
+			if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+				break // no flock here (some network filesystems): go unlocked
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		if locked {
+			defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+			if c.MasterAlive(ctx) {
+				return nil
+			}
+		}
+	}
 	errf, err := os.CreateTemp("", "spotexec-ssh-*.err")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(errf.Name())
 	defer errf.Close()
-	args := append(c.baseArgs("auto"), "-f", "-N", c.T.Host)
+	args := append(c.baseArgs("auto"), "-f", "-N", "--", c.T.Host)
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 	cmd.Stdout = nil
 	cmd.Stderr = errf
@@ -109,7 +165,7 @@ func (c *Client) EnsureMaster(ctx context.Context) error {
 
 // CloseMaster stops the control master.
 func (c *Client) CloseMaster() {
-	_ = exec.Command("ssh", "-o", "ControlPath="+c.ctlPath, "-O", "exit", c.T.Host).Run()
+	_ = exec.Command("ssh", "-o", "ControlPath="+c.ctlPath, "-O", "exit", "--", c.T.Host).Run()
 }
 
 // ConnError is an SSH-level failure (exit 255 or master start failure).
@@ -251,7 +307,7 @@ func (c *Client) EnsureHelper(ctx context.Context, force bool) (string, error) {
 	}
 	if strings.TrimSpace(string(check)) != "present" {
 		dir := RemoteRoot(c.WorkRoot) + "/bin"
-		script := fmt.Sprintf(`set -e; mkdir -p %[1]s; t=%[1]s/.upload.$$; gzip -dc > "$t"; chmod 755 "$t"; mv -f "$t" %[2]s; for f in %[1]s/spotexec-helper-*; do [ "$f" = %[2]s ] || rm -f "$f"; done`, dir, path)
+		script := fmt.Sprintf(`set -e; mkdir -p %[1]s; t=%[1]s/.upload.$$; gzip -dc > "$t"; chmod 755 "$t"; mv -f "$t" %[2]s; find %[1]s -maxdepth 1 -name 'spotexec-helper-*' ! -name %[3]s -mmin +1440 -exec rm -f {} + 2>/dev/null || true`, dir, path, ShellQuote(filepath.Base(path)))
 		if _, err := c.Run(ctx, script, bytes.NewReader(gz)); err != nil {
 			return "", fmt.Errorf("uploading helper: %w", err)
 		}
@@ -285,13 +341,15 @@ func (c *Client) HelperCmd(ctx context.Context, args ...string) ([]byte, error) 
 	}
 	q = append(q, "--work-root", ShellQuote(c.WorkRoot))
 	out, err := c.Run(ctx, strings.Join(q, " "), nil)
-	if err != nil && !isConn(err) {
+	if err != nil && !isConn(err) && ctx.Err() == nil {
 		// Helper may have been deleted remotely: reinstall once.
 		c.ForgetHelper()
-		if path, err2 := c.EnsureHelper(ctx, true); err2 == nil {
-			q[0] = path
-			return c.Run(ctx, strings.Join(q, " "), nil)
+		path, err2 := c.EnsureHelper(ctx, true)
+		if err2 != nil {
+			return out, err2
 		}
+		q[0] = path
+		return c.Run(ctx, strings.Join(q, " "), nil)
 	}
 	return out, err
 }

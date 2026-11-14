@@ -268,7 +268,9 @@ func cmdMonitor() *cobra.Command {
 }
 
 func firstEphemeral(cfg *config.Config) (*config.Runner, error) {
-	rs, err := selectRunners(cfg, cfg.Global.DefaultPool)
+	// The same pool sx would use here (SPOTEXEC_POOL, the project's pool,
+	// then default_pool), so `down` stops what `sx` started.
+	rs, err := cfg.Pool(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -412,6 +414,9 @@ func cmdDown() *cobra.Command {
 			var errs []string
 			for _, r := range rs {
 				if !r.Ephemeral() {
+					if len(args) > 0 {
+						errs = append(errs, fmt.Sprintf("%s is a static ssh runner: there is nothing to terminate", r.Name))
+					}
 					continue
 				}
 				p, err := provider.New(r)
@@ -533,40 +538,113 @@ func cmdDoctor() *cobra.Command {
 	}
 }
 
-// remoteHelper runs a helper admin command on each named runner that is up.
-func remoteHelper(cmd *cobra.Command, names []string, args ...string) error {
+// remoteHelper runs a helper admin command on each named runner that is up:
+// every running instance of a fleet, or one instance named "<runner>/<id>"
+// (as `spotexec status` prints them). With single set (unlocking a slot
+// number), a fleet with several instances must name the instance.
+func remoteHelper(cmd *cobra.Command, names []string, single bool, args ...string) error {
 	cfg, err := loadGlobal()
 	if err != nil {
 		return err
 	}
-	rs, err := selectRunners(cfg, names)
+	want := map[string]map[string]bool{} // runner -> instance ids (empty = all)
+	var runnerNames []string
+	for _, n := range names {
+		rn, id, hasID := strings.Cut(n, "/")
+		if hasID && (id == "" || strings.Contains(id, "/")) {
+			return fmt.Errorf("invalid target %q (use <runner> or <runner>/<instance-id>)", n)
+		}
+		if _, seen := want[rn]; !seen {
+			want[rn] = map[string]bool{}
+			runnerNames = append(runnerNames, rn)
+		}
+		if id != "" {
+			want[rn][id] = true
+		}
+	}
+	rs, err := selectRunners(cfg, runnerNames)
 	if err != nil {
 		return err
+	}
+	var failed []string
+	type target struct {
+		label string
+		t     provider.Target
+		r     *config.Runner
+	}
+	var targets []target
+	run := func(label string, t provider.Target, r *config.Runner) {
+		c := transport.New(t, r.WorkRoot)
+		if err := c.EnsureMaster(cmd.Context()); err != nil {
+			fmt.Printf("%s: %v\n", label, err)
+			failed = append(failed, label)
+			return
+		}
+		out, err := c.HelperCmd(cmd.Context(), args...)
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if line != "" {
+				fmt.Printf("%s: %s\n", label, line)
+			}
+		}
+		if err != nil {
+			fmt.Printf("%s: %v\n", label, err)
+			failed = append(failed, label)
+		}
 	}
 	for _, r := range rs {
 		p, err := provider.New(r)
 		if err != nil {
 			return err
 		}
+		if f, ok := p.(provider.Fleet); ok {
+			insts, err := f.List(cmd.Context())
+			if err != nil {
+				fmt.Printf("%s: %v\n", r.Name, err)
+				failed = append(failed, r.Name)
+				continue
+			}
+			ids := want[r.Name]
+			found := map[string]bool{}
+			n := 0
+			for _, in := range insts {
+				if in.State == provider.StateRunning && in.Target.Host != "" && (len(ids) == 0 || ids[in.ID]) {
+					targets = append(targets, target{r.Name + "/" + in.ID, in.Target, r})
+					found[in.ID] = true
+					n++
+				}
+			}
+			for id := range ids {
+				if !found[id] {
+					fmt.Printf("%s/%s: not running\n", r.Name, id)
+					failed = append(failed, r.Name+"/"+id)
+				}
+			}
+			if n == 0 && len(ids) == 0 {
+				fmt.Printf("%s: no running instances, skipped\n", r.Name)
+			}
+			continue
+		}
 		info, err := p.Status(cmd.Context())
 		if err != nil || info.State != provider.StateRunning {
 			fmt.Printf("%s: not running, skipped\n", r.Name)
 			continue
 		}
-		c := transport.New(info.Target, r.WorkRoot)
-		if err := c.EnsureMaster(cmd.Context()); err != nil {
-			fmt.Printf("%s: %v\n", r.Name, err)
-			continue
+		targets = append(targets, target{r.Name, info.Target, r})
+	}
+	// Unlocking one slot number must name exactly one machine: decide
+	// before touching anything.
+	if single && len(targets) > 1 {
+		var labels []string
+		for _, t := range targets {
+			labels = append(labels, t.label)
 		}
-		out, err := c.HelperCmd(cmd.Context(), args...)
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			if line != "" {
-				fmt.Printf("%s: %s\n", r.Name, line)
-			}
-		}
-		if err != nil {
-			fmt.Printf("%s: %v\n", r.Name, err)
-		}
+		return fmt.Errorf("slot numbers are per machine and %d are running (%s): name one", len(targets), strings.Join(labels, ", "))
+	}
+	for _, t := range targets {
+		run(t.label, t.t, t.r)
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("failed on %s", strings.Join(failed, ", "))
 	}
 	return nil
 }
@@ -575,12 +653,12 @@ func cmdUnlock() *cobra.Command {
 	var slot int
 	var all bool
 	c := &cobra.Command{
-		Use:   "unlock [runner] (--slot N | --all)",
+		Use:   "unlock [runner[/instance-id]] (--slot N | --all)",
 		Short: "Reclaim a wedged slot (kills its command and helper)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if slot == 0 && !all {
-				return errors.New("pass --slot N or --all")
+			if (slot == 0) == !all {
+				return errors.New("pass either --slot N or --all")
 			}
 			a := []string{"unlock"}
 			if all {
@@ -588,7 +666,7 @@ func cmdUnlock() *cobra.Command {
 			} else {
 				a = append(a, "--token", fmt.Sprint(slot))
 			}
-			return remoteHelper(cmd, args, a...)
+			return remoteHelper(cmd, args, !all, a...)
 		},
 	}
 	c.Flags().IntVar(&slot, "slot", 0, "slot number (as shown by status)")
@@ -597,20 +675,24 @@ func cmdUnlock() *cobra.Command {
 }
 
 func cmdPrune() *cobra.Command {
-	var olderThan time.Duration
+	var olderThan string
 	var dry bool
 	c := &cobra.Command{
-		Use:   "prune [runner...]",
+		Use:   "prune [runner[/instance-id]...]",
 		Short: "Remove old dependency caches and idle slot workspaces on runners",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			a := []string{"prune", "--older-than", olderThan.String()}
+			age, err := parseAge(olderThan)
+			if err != nil {
+				return err
+			}
+			a := []string{"prune", "--older-than", age.String()}
 			if dry {
 				a = append(a, "--dry-run")
 			}
-			return remoteHelper(cmd, args, a...)
+			return remoteHelper(cmd, args, false, a...)
 		},
 	}
-	c.Flags().DurationVar(&olderThan, "older-than", 7*24*time.Hour, "remove items unused for this long")
+	c.Flags().StringVar(&olderThan, "older-than", "7d", "remove items unused for this long (e.g. 7d, 36h)")
 	c.Flags().BoolVar(&dry, "dry-run", false, "only print what would be removed")
 	return c
 }
@@ -732,7 +814,7 @@ func cmdPull() *cobra.Command {
 					return err
 				}
 			}
-			n, err := client.PullArtifacts(ctx, lease.Sess, root, args)
+			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args)
 			if err != nil {
 				return err
 			}
@@ -780,4 +862,20 @@ func cmdCloudInit() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// parseAge is time.ParseDuration plus a days unit ("7d").
+func parseAge(s string) (time.Duration, error) {
+	if n, ok := strings.CutSuffix(s, "d"); ok {
+		var d int
+		if _, err := fmt.Sscanf(n, "%d", &d); err != nil || d < 0 || d > 36500 || fmt.Sprint(d) != n {
+			return 0, fmt.Errorf("invalid age %q", s)
+		}
+		return time.Duration(d) * 24 * time.Hour, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("invalid age %q (e.g. 7d or 36h)", s)
+	}
+	return d, nil
 }

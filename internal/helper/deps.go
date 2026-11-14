@@ -30,6 +30,48 @@ func depsKey(ws string, d protocol.Deps) (string, error) {
 
 // expandCacheDirs resolves cache_dirs globs (e.g. "packages/*/node_modules")
 // to existing relative directories under base.
+// clearCacheDirs removes whatever matches cache_dirs in the workspace
+// (directories, files or symlinks, which are removed, never followed), but
+// never a synced (source) file: a broad pattern like "vendor/*" may match
+// tracked files, which are not dependency output.
+func (s *Session) clearCacheDirs(base string, patterns []string) error {
+	s.loadStored()
+	return clearCacheDirs(base, patterns, func(rel string) bool {
+		if _, ok := s.stored[rel]; ok {
+			return true
+		}
+		for p := range s.stored {
+			if strings.HasPrefix(p, rel+"/") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func clearCacheDirs(base string, patterns []string, synced func(string) bool) error {
+	for _, p := range patterns {
+		p = strings.Trim(p, "/")
+		matches, _ := filepath.Glob(filepath.Join(base, filepath.FromSlash(p)))
+		for _, m := range matches {
+			rel, err := filepath.Rel(base, m)
+			if err != nil {
+				continue
+			}
+			if _, err := fsid.SafeJoin(base, filepath.ToSlash(rel)); err != nil {
+				continue // reached through a symlink: not ours to touch
+			}
+			if synced(filepath.ToSlash(rel)) {
+				continue // holds source files: leave it
+			}
+			if err := os.RemoveAll(m); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func expandCacheDirs(base string, patterns []string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -187,6 +229,11 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 	for k, v := range d.Env {
 		env[k] = v
 	}
+	// Start from nothing: leftovers from another branch's dependencies
+	// (or a symlink planted there) must not end up in this key's cache.
+	if err := s.clearCacheDirs(s.workspace, d.CacheDirs); err != nil {
+		return perr(protocol.CodeDepsFailed, "clearing cache_dirs: %v", err)
+	}
 	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: d.Install})
 	cleanup := func() error { return nil }
 	if d.Container != nil {
@@ -239,10 +286,8 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, rel := range expandCacheDirs(s.workspace, d.CacheDirs) {
-		if err := os.RemoveAll(filepath.Join(s.workspace, filepath.FromSlash(rel))); err != nil {
-			return "", err
-		}
+	if err := s.clearCacheDirs(s.workspace, d.CacheDirs); err != nil {
+		return "", err
 	}
 	method := "none"
 	for _, rel := range strings.Split(strings.TrimSpace(string(b)), "\n") {
@@ -260,6 +305,11 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 		}
 		dst, err := fsid.PrepareParent(s.workspace, rel)
 		if err != nil {
+			return "", err
+		}
+		// Whatever is there (a symlink, a file, an earlier copy for a nested
+		// entry) must go: copying into it would follow it or nest.
+		if err := os.RemoveAll(dst); err != nil {
 			return "", err
 		}
 		m, err := cloneTree(src, dst, d.Hydrate)

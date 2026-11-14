@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -314,6 +315,59 @@ func (r *Runner) applyDefaults() error {
 	if r.WorkRoot == "" {
 		r.WorkRoot = "~/.cache/spotexec"
 	}
+	return r.validate()
+}
+
+// validate rejects values that would pass silently and break later.
+func (r *Runner) validate() error {
+	if r.Name != "" && !runnerNameRe.MatchString(r.Name) {
+		return fmt.Errorf("invalid runner name %q (letters, digits, '.', '_' and '-')", r.Name)
+	}
+	for _, h := range r.Hosts {
+		// A leading '-' would be read by ssh as an option.
+		if h == "" || strings.HasPrefix(h, "-") || strings.ContainsAny(h, " \t\r\n\x00") {
+			return fmt.Errorf("invalid host %q", h)
+		}
+	}
+	if r.MaxSlots < 0 || r.MaxSlots > 44 {
+		// SPOTEXEC_PORT_BASE = 20000 + slot*1000 must stay a valid port.
+		return fmt.Errorf("max_slots must be between 1 and 44 (got %d)", r.MaxSlots)
+	}
+	for name, d := range map[string]Duration{"idle_timeout": r.IdleTimeout, "max_lifetime": r.MaxLifetime, "boot_timeout": r.BootTimeout, "boot_delay": r.BootDelay} {
+		if d.Duration < 0 {
+			return fmt.Errorf("%s must not be negative", name)
+		}
+	}
+	if !r.Ephemeral() {
+		return nil
+	}
+	for name, d := range map[string]Duration{"idle_timeout": r.IdleTimeout, "max_lifetime": r.MaxLifetime, "boot_timeout": r.BootTimeout} {
+		if d.Duration < time.Second {
+			return fmt.Errorf("%s must be at least 1s (got %s)", name, d.Duration)
+		}
+	}
+	if r.MaxLifetime.Duration <= r.BootTimeout.Duration {
+		return fmt.Errorf("max_lifetime (%s) must be longer than boot_timeout (%s): the VM would stop mid-setup", r.MaxLifetime.Duration, r.BootTimeout.Duration)
+	}
+	if !userRe.MatchString(r.User) {
+		return fmt.Errorf("invalid user %q", r.User)
+	}
+	if r.Type == TypeAWSSpot {
+		if !regionRe.MatchString(r.Region) {
+			return fmt.Errorf("invalid region %q", r.Region)
+		}
+		if r.Arch != "amd64" && r.Arch != "arm64" {
+			return fmt.Errorf("arch must be amd64 or arm64 (got %q)", r.Arch)
+		}
+		for _, t := range r.InstanceTypes {
+			if archForInstanceType(t) != r.Arch {
+				return fmt.Errorf("instance_types mixes architectures (%s is not %s): use one runner per architecture", t, r.Arch)
+			}
+		}
+		if r.VolumeGB < 8 {
+			return fmt.Errorf("volume_gb must be at least 8 (got %d)", r.VolumeGB)
+		}
+	}
 	return nil
 }
 
@@ -321,6 +375,9 @@ func (r *Runner) applyDefaults() error {
 // Graviton families carry a "g" after the generation digit (c7g, m7gd, t4g).
 func archForInstanceType(t string) string {
 	fam, _, _ := strings.Cut(t, ".")
+	if fam == "a1" || strings.HasPrefix(fam, "mac2") {
+		return "arm64" // Graviton 1 and Apple silicon Macs
+	}
 	for i := 0; i < len(fam); i++ {
 		if fam[i] >= '0' && fam[i] <= '9' {
 			rest := fam[i+1:]
@@ -425,7 +482,22 @@ func (p *Project) validate() error {
 	if p.Deps.Install != "" && len(p.Deps.CacheDirs) == 0 {
 		return errors.New("deps.install requires deps.cache_dirs")
 	}
+	if p.Deps.Install != "" && len(p.Deps.Lockfiles) == 0 {
+		return errors.New("deps.install requires deps.lockfiles (the cache key)")
+	}
+	if !oneOf(p.Sync.Source, "", "git", "directory") {
+		return fmt.Errorf("sync.source must be git or directory (got %q)", p.Sync.Source)
+	}
+	if !oneOf(p.Hook.Mode, "", "rewrite", "block") {
+		return fmt.Errorf("hook.mode must be rewrite or block (got %q)", p.Hook.Mode)
+	}
 	for name, t := range p.Tasks {
+		if t.Run != "" && embeddedArgs(t.Run) {
+			return fmt.Errorf("task %q: use {args} as a separate word (or \"{args}\"), not inside a quoted string: extra arguments are passed as \"$@\"", name)
+		}
+		if ReservedTaskNames[name] {
+			return fmt.Errorf("task %q has the name of a spotexec command, so `sx %s` would never run it: rename it", name, name)
+		}
 		if (t.Run == "") == (len(t.Parallel) == 0) {
 			return fmt.Errorf("task %q must set exactly one of run or parallel", name)
 		}
@@ -445,6 +517,28 @@ func (p *Project) validate() error {
 	return nil
 }
 
+// ReservedTaskNames are spotexec subcommands: a task with one of these names
+// could never be run with `sx <name>`.
+var ReservedTaskNames = map[string]bool{
+	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
+	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
+	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
+	"completion": true, "sim": true, "image": true, "daemon": true,
+}
+
+// globalOnlyKeys are runner settings a project (.spotexec.toml) may not set.
+var globalOnlyKeys = []string{
+	"type", "host", "hosts", "ssh_options", "identity_file", "work_root",
+	"profile", "region", "subnet_id", "security_group_ids", "ssh_cidr",
+	"user", "cache_bucket",
+}
+
+var (
+	runnerNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+	regionRe     = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]+$`)
+	userRe       = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+)
+
 // MergeProjectRunners decodes runners declared in .spotexec.toml and adds
 // them to the global set (a project runner with the same name as a global
 // one overrides it). `extends = "name"` starts from a copy of a global
@@ -452,10 +546,33 @@ func (p *Project) validate() error {
 // sizes, slots or bootstrap.
 func (c *Config) MergeProjectRunners() error {
 	p := c.Project
-	if p == nil || len(p.Runners) == 0 {
+	if p == nil {
 		return nil
 	}
-	for name, prim := range p.Runners {
+	// Extends resolve against the user's own runners only, in a fixed order.
+	global := map[string]*Runner{}
+	for k, v := range c.Global.Runners {
+		global[k] = v
+	}
+	names := make([]string, 0, len(p.Runners))
+	for name := range p.Runners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		prim := p.Runners[name]
+		if !runnerNameRe.MatchString(name) {
+			return fmt.Errorf("%s: invalid runner name %q (letters, digits, '.', '_' and '-')", p.Path, name)
+		}
+		// A repository is not trusted to choose how this machine connects, which
+		// credentials or account are used, or which network is opened: those
+		// stay in the global config. Sizing, scheduling and the VM's own setup
+		// may be overridden.
+		for _, key := range globalOnlyKeys {
+			if p.md.IsDefined("runners", name, key) {
+				return fmt.Errorf("%s: runner %q: %q can only be set in the global config (%s)", p.Path, name, key, GlobalPath())
+			}
+		}
 		var probe Runner
 		if err := p.md.PrimitiveDecode(prim, &probe); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
@@ -465,13 +582,18 @@ func (c *Config) MergeProjectRunners() error {
 		if from == "" {
 			from = name
 		}
-		if g, ok := c.Global.Runners[from]; ok {
-			base = *g
-			base.Hosts = append([]string(nil), g.Hosts...)
-			base.InstanceTypes = append([]string(nil), g.InstanceTypes...)
-		} else if probe.Extends != "" {
-			return fmt.Errorf("%s: runner %q extends unknown runner %q", p.Path, name, probe.Extends)
+		g, ok := global[from]
+		if !ok {
+			if probe.Extends != "" {
+				return fmt.Errorf("%s: runner %q extends unknown runner %q", p.Path, name, probe.Extends)
+			}
+			return fmt.Errorf("%s: runner %q must extend one of your global runners (extends = \"...\")", p.Path, name)
 		}
+		base = *g
+		base.Hosts = append([]string(nil), g.Hosts...)
+		base.InstanceTypes = append([]string(nil), g.InstanceTypes...)
+		base.SSHOptions = append([]string(nil), g.SSHOptions...)
+		base.SecurityGroupIDs = append([]string(nil), g.SecurityGroupIDs...)
 		if p.md.IsDefined("runners", name, "instance_types") && !p.md.IsDefined("runners", name, "arch") {
 			base.Arch = "" // re-derive from the new instance types
 		}
@@ -483,6 +605,17 @@ func (c *Config) MergeProjectRunners() error {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
 		}
 		c.Global.Runners[name] = &base
+	}
+	if und := p.md.Undecoded(); len(und) > 0 {
+		var keys []string
+		for _, k := range und {
+			if len(k) > 0 && k[0] == "runners" {
+				keys = append(keys, k.String())
+			}
+		}
+		if len(keys) > 0 {
+			return fmt.Errorf("%s: unknown keys: %s", p.Path, strings.Join(keys, ", "))
+		}
 	}
 	for _, n := range p.Pool {
 		if _, ok := c.Global.Runners[n]; !ok {
@@ -515,9 +648,7 @@ func (c *Config) Pool(override []string) ([]*Runner, error) {
 		names = c.Global.DefaultPool
 	}
 	if len(names) == 0 {
-		for n := range c.Global.Runners {
-			names = append(names, n)
-		}
+		names = c.RunnerNames() // sorted: every process sees the same order
 	}
 	if len(names) == 0 {
 		return nil, fmt.Errorf("no runners configured; add one to %s (see `spotexec init --global`)", c.Global.Path)
@@ -588,4 +719,20 @@ func ExpandHome(p string) string {
 		return filepath.Join(home, strings.TrimPrefix(p, "~"))
 	}
 	return p
+}
+
+var standaloneArgs = regexp.MustCompile(`(^|\s)("\{args\}"|'\{args\}'|\{args\})(\s|$)`)
+
+// embeddedArgs reports a {args} that is not a word of its own (for example
+// inside "pytest {args}"), where "$@" can't be substituted safely.
+func embeddedArgs(run string) bool {
+	rest := run
+	for {
+		loc := standaloneArgs.FindStringIndex(rest)
+		if loc == nil {
+			break
+		}
+		rest = rest[:loc[0]] + " " + rest[loc[1]:]
+	}
+	return strings.Contains(rest, "{args}")
 }

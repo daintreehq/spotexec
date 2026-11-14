@@ -62,9 +62,16 @@ func cmdImage() *cobra.Command {
 					return fmt.Errorf("invalid image reference %q", p)
 				}
 			}
-			// Pre-pull the project's container image when there is one.
+			// Pre-pull the project's container image when there is one and the
+			// builder can reach it (it has no registry credentials, so not a
+			// private ECR image).
 			if l, err := load(""); err == nil && l.cfg.Project.Container.Image != "" {
-				pulls = append(pulls, l.cfg.Project.Container.Image)
+				img := l.cfg.Project.Container.Image
+				if strings.Contains(img, ".dkr.ecr.") {
+					fmt.Fprintf(os.Stderr, "not pre-pulling %s (private ECR: VMs pull it at run time)\n", img)
+				} else if provider.ImageRefOK(img) {
+					pulls = append(pulls, img)
+				}
 			}
 			rep, _ := ui.New(ui.ModeAuto, os.Stderr, "")
 			ctx, _, stop := signals()

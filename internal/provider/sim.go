@@ -211,7 +211,8 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 
 // WaitRunning waits for the container's SSH port mapping.
 func (s *Sim) WaitRunning(ctx context.Context, id string, log Logger) (Instance, error) {
-	deadline := time.Now().Add(30 * time.Second)
+	started := time.Now()
+	deadline := started.Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		insts, err := s.List(ctx)
 		if err != nil {
@@ -226,7 +227,7 @@ func (s *Sim) WaitRunning(ctx context.Context, id string, log Logger) (Instance,
 				}
 			}
 		}
-		if !found && time.Since(time.Now()) > 0 {
+		if !found && time.Since(started) > 5*time.Second { // allow listing lag
 			return Instance{}, fmt.Errorf("simulated instance %s is gone", id)
 		}
 		select {

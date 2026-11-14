@@ -87,19 +87,25 @@ type Status struct {
 }
 
 type fleet struct {
-	r       *config.Runner
-	f       provider.Fleet
-	pool    *client.Pool
-	lastOK  map[string]time.Time
-	lastPrb time.Time
-	lastSwp time.Time
-	blind   time.Time       // last replacement made while no instance answered
-	busy    map[string]bool // launch ids being provisioned by this daemon
-	noticed map[string]bool
-	seen    map[string]time.Time         // when this daemon first saw each instance
-	booting map[string]bool              // answered, but first-boot setup unfinished
-	killing map[string]string            // terminations to retry until gone (id -> reason)
-	retire  map[string]provider.Instance // warm VMs to drain remotely, until confirmed
+	r          *config.Runner
+	f          provider.Fleet
+	pool       *client.Pool
+	lastOK     map[string]time.Time
+	lastPrb    time.Time
+	lastSwp    time.Time
+	blind      time.Time // last replacement made while no instance answered
+	blindKills int
+	busy       map[string]bool // launch ids being provisioned by this daemon
+	noticed    map[string]bool
+	seen       map[string]time.Time         // when this daemon first saw each instance
+	booting    map[string]bool              // answered, but first-boot setup unfinished
+	bootFailed map[string]bool              // its bootstrap_script failed
+	counted    map[string]bool              // already counted by the circuit breaker
+	killing    map[string]string            // terminations to retry until gone (id -> reason)
+	retire     map[string]provider.Instance // warm VMs to drain remotely, until confirmed
+	// Circuit breaker: replacements of instances that never became healthy.
+	failures []time.Time
+	paused   time.Time
 }
 
 // Daemon manages every fleet runner in the global config.
@@ -190,7 +196,7 @@ func New(cfg *config.Config, log func(string, ...any)) (*Daemon, error) {
 		if !ok {
 			continue
 		}
-		d.fleets = append(d.fleets, &fleet{r: r, f: f, pool: client.NewPool(r, f), lastOK: map[string]time.Time{}, busy: map[string]bool{}, noticed: map[string]bool{}, seen: map[string]time.Time{}, booting: map[string]bool{}, killing: map[string]string{}, retire: map[string]provider.Instance{}})
+		d.fleets = append(d.fleets, &fleet{r: r, f: f, pool: client.NewPool(r, f), lastOK: map[string]time.Time{}, busy: map[string]bool{}, noticed: map[string]bool{}, seen: map[string]time.Time{}, booting: map[string]bool{}, bootFailed: map[string]bool{}, counted: map[string]bool{}, killing: map[string]string{}, retire: map[string]provider.Instance{}})
 	}
 	if len(d.fleets) == 0 {
 		return nil, errors.New("no fleet (aws-spot or sim) runners configured")
@@ -201,6 +207,7 @@ func New(cfg *config.Config, log func(string, ...any)) (*Daemon, error) {
 // Run manages the fleets until ctx ends.
 func (d *Daemon) Run(ctx context.Context) error {
 	d.action("daemon started (pid %d), managing %d fleet(s)", os.Getpid(), len(d.fleets))
+	d.writeStatus(nil) // replace the previous daemon's status straight away
 	for {
 		d.pass(ctx)
 		select {
@@ -262,6 +269,8 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		if !listed[id] {
 			delete(fl.seen, id)
 			delete(fl.noticed, id)
+			delete(fl.bootFailed, id)
+			delete(fl.counted, id)
 		}
 	}
 
@@ -293,9 +302,20 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// can still finish, so the VM's hard stop never kills one and the
 	// replacement is warm in time.
 	if lt := r.MaxLifetime.Duration; lt > 2*retireAhead {
+		// Ready warm capacity right now (answering, not booting): a VM is
+		// retired only while the others still cover the minimum, so co-born
+		// warm VMs are replaced one after another, never all at once.
+		ready := 0
+		for _, in := range running {
+			if _, ok := fl.lastOK[in.ID]; ok && !fl.booting[in.ID] {
+				ready++
+			}
+		}
 		var keep []provider.Instance
 		for i, in := range running {
-			if i < r.MinInstances && time.Since(in.LaunchedAt) > lt-retireAhead {
+			// One at a time: warm VMs launched together would otherwise all
+			// retire in the same pass and leave no warm capacity.
+			if i < r.MinInstances && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > lt-retireAhead {
 				// Drained locally now (so the warm pool replaces it); the
 				// VM itself is told below, retried until it confirms.
 				d.action("%s: retiring warm instance %s ahead of max_lifetime", r.Name, in.ID)
@@ -336,8 +356,25 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 
 	// 4. Warm pool, after probing so a noticed instance is replaced in the
 	// same pass while its two-minute notice runs. EnsureMin counts under the
-	// pool lock, so launches sx planned meanwhile are included.
-	if r.MinInstances > 0 {
+	// pool lock, so launches sx planned meanwhile are included. If instances
+	// keep failing to become healthy, stop launching for a while: a broken
+	// bootstrap or image must not burn money in a loop.
+	d.mu.Lock()
+	var recent []time.Time
+	for _, t := range fl.failures {
+		if time.Since(t) < time.Hour {
+			recent = append(recent, t)
+		}
+	}
+	fl.failures = recent
+	d.mu.Unlock()
+	if len(recent) >= 3 && time.Since(fl.paused) > time.Hour {
+		fl.paused = time.Now()
+		d.action("%s: %d instances failed to become healthy within an hour; pausing warm launches for 1h (check `spotexec doctor` and the bootstrap log)", r.Name, len(recent))
+	}
+	if time.Since(fl.paused) < time.Hour {
+		st.LastError = "warm launches paused after repeated unhealthy instances"
+	} else if r.MinInstances > 0 {
 		if ids, err := fl.pool.EnsureMin(ctx, r.MinInstances); err == nil {
 			for _, id := range ids {
 				d.action("%s: launching to keep %d warm", r.Name, r.MinInstances)
@@ -351,6 +388,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// network (a firewall blocking SSH, say), so then replace at most one
 	// instance per 30 minutes instead of churning the fleet.
 	if probed {
+		if answered > 0 {
+			fl.blind, fl.blindKills = time.Time{}, 0
+		}
 		for _, in := range running {
 			age := time.Since(in.LaunchedAt)
 			// Silence counts from the last answer, or from when this daemon
@@ -360,21 +400,56 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 				since = last
 			}
 			stale := time.Since(since) > unhealthyAfter && age > r.BootTimeout.Duration
-			stuck := fl.booting[in.ID] && age > 2*r.BootTimeout.Duration+2*time.Minute
+			stuck := (fl.booting[in.ID] && age > 2*r.BootTimeout.Duration+2*time.Minute) || fl.bootFailed[in.ID]
 			if !stale && !stuck {
 				continue
 			}
 			if answered == 0 {
-				if time.Since(fl.blind) < 30*time.Minute {
+				// Nothing answers: possibly our own network (though the cloud
+				// API answered this pass). The first such round arms a clock;
+				// the first replacement waits another unhealthy period, then
+				// at most one per 30 minutes.
+				if fl.blind.IsZero() {
+					fl.blind = time.Now()
+					fl.blindKills = 0
+					continue
+				}
+				wait := unhealthyAfter
+				if fl.blindKills > 0 {
+					wait = 30 * time.Minute
+				}
+				if time.Since(fl.blind) < wait {
 					continue
 				}
 				fl.blind = time.Now()
+				fl.blindKills++
+			} else {
+				fl.blind = time.Time{}
 			}
 			why := fmt.Sprintf("unresponsive for %s", time.Since(since).Round(time.Second))
-			if !stale {
+			switch {
+			case fl.bootFailed[in.ID]:
+				why = "bootstrap_script failed (see /var/log/spotexec-bootstrap.log on the VM)"
+			case !stale:
 				why = "first-boot setup never finished"
 			}
+			d.countFailure(fl, in.ID)
+			// Not retried if the request fails: the next probe re-judges it
+			// (it may answer again once the network is back).
 			d.terminate(ctx, fl, in.ID, why, false)
+			if fl.killing[in.ID] != "" {
+				delete(fl.killing, in.ID)
+			}
+		}
+	}
+
+	// Instances that never got an address or never left pending are not
+	// usable and are invisible to the probes above.
+	for _, in := range view.Instances {
+		if fl.killing[in.ID] == "" && !in.LaunchedAt.IsZero() && time.Since(in.LaunchedAt) > r.BootTimeout.Duration+time.Minute &&
+			(in.State != provider.StateRunning || in.Target.Host == "") {
+			d.countFailure(fl, in.ID)
+			d.terminate(ctx, fl, in.ID, "never became reachable (no address, or stuck pending)", false)
 		}
 	}
 
@@ -414,7 +489,7 @@ func (d *Daemon) terminate(ctx context.Context, fl *fleet, id, why string, retry
 	fl.killing[id] = why
 	if err := fl.f.Terminate(ctx, id); err != nil {
 		if !retry {
-			d.action("%s: terminating %s failed (will retry): %v", fl.r.Name, id, err)
+			d.action("%s: terminating %s failed: %v", fl.r.Name, id, err)
 		}
 		return
 	}
@@ -469,6 +544,7 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string) {
 		in, err := fl.pool.ProvisionHeld(pctx, id, nil)
 		if err != nil {
 			d.action("%s: launch failed: %v", fl.r.Name, err)
+			d.countFailure(fl, "launch:"+id) // a launch that never became usable
 			return
 		}
 		d.action("%s: %s running at %s", fl.r.Name, in.ID, in.Target.Host)
@@ -515,7 +591,11 @@ func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instan
 			_ = json.Unmarshal(out, &hs)
 			mu.Lock()
 			fl.lastOK[in.ID] = time.Now()
-			fl.booting[in.ID] = hs.Booting
+			// A failed bootstrap never becomes usable: same as stuck booting.
+			fl.booting[in.ID] = hs.Booting || hs.BootFailed != ""
+			if hs.BootFailed != "" {
+				fl.bootFailed[in.ID] = true
+			}
 			answered++
 			mu.Unlock()
 			if hs.SpotNotice != "" || hs.Draining {
@@ -566,4 +646,16 @@ func ReadStatus() (*Status, error) {
 	}
 	var s Status
 	return &s, json.Unmarshal(b, &s)
+}
+
+// countFailure records one instance (or launch) that never became healthy,
+// once, for the warm-launch circuit breaker.
+func (d *Daemon) countFailure(fl *fleet, id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if fl.counted[id] {
+		return
+	}
+	fl.counted[id] = true
+	fl.failures = append(fl.failures, time.Now())
 }

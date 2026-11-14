@@ -40,8 +40,9 @@ type Status struct {
 	UptimeS     int64             `json:"uptime_s"`
 	Draining    bool              `json:"draining"`
 	SpotNotice  string            `json:"spot_notice,omitempty"`
-	Booting     bool              `json:"booting,omitempty"` // first-boot setup not finished
-	IdleS       int64             `json:"idle_s"`            // seconds since last activity (-1 unknown)
+	Booting     bool              `json:"booting,omitempty"`     // first-boot setup not finished
+	BootFailed  string            `json:"boot_failed,omitempty"` // bootstrap exit status, if it failed
+	IdleS       int64             `json:"idle_s"`                // seconds since last activity (-1 unknown)
 	Ephemeral   bool              `json:"ephemeral"`
 	IdleTimeout string            `json:"idle_timeout,omitempty"`
 	Holders     []protocol.Holder `json:"holders"`
@@ -61,20 +62,24 @@ func GetStatus(root string) Status {
 	}
 	for _, p := range []string{ActivityFile, filepath.Join(root, "activity")} {
 		if fi, err := os.Stat(p); err == nil {
-			st.IdleS = int64(time.Since(fi.ModTime()).Seconds())
+			st.IdleS = max(0, int64(time.Since(fi.ModTime()).Seconds()))
 			break
 		}
 	}
 	if b, err := os.ReadFile(filepath.Join(LifecycleDir, "idle_timeout")); err == nil {
 		st.Ephemeral = true
 		st.IdleTimeout = strings.TrimSpace(string(b))
-		if _, err := os.Stat(filepath.Join(LifecycleDir, "ready")); err != nil {
+		if b, err := os.ReadFile(filepath.Join(LifecycleDir, "ready")); err != nil {
 			st.Booting = true
+		} else if v := strings.TrimSpace(string(b)); v != "" && v != "0" {
+			st.BootFailed = v
 		}
 		// A pending interruption drains the VM even with no session open to
 		// see it, so no new job is placed on it.
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if n := SpotNotice(ctx); n != "" {
+		if st.Draining {
+			// already draining: nothing more a notice could change
+		} else if n := SpotNotice(ctx); n != "" {
 			st.SpotNotice = n
 			if !st.Draining {
 				markDraining(root, n)
@@ -151,12 +156,17 @@ func Unlock(w io.Writer, root string, token int, all bool) error {
 		if h.ChildPGID > 0 && groupAlive(h.ChildPGID) {
 			killGroup(h.ChildPGID, 3*time.Second)
 		}
-		if h.HelperPID > 1 {
+		// Only signal a PID that is still a spotexec helper (a stale record's
+		// PID may have been reused by something else), and give it time to
+		// clean up (its container) before forcing it.
+		if h.HelperPID > 1 && isHelperProcess(h.HelperPID) {
 			_ = syscall.Kill(h.HelperPID, syscall.SIGTERM)
-			for i := 0; i < 40 && syscall.Kill(h.HelperPID, 0) == nil; i++ {
+			for i := 0; i < 200 && syscall.Kill(h.HelperPID, 0) == nil; i++ {
 				time.Sleep(50 * time.Millisecond)
 			}
-			_ = syscall.Kill(h.HelperPID, syscall.SIGKILL)
+			if syscall.Kill(h.HelperPID, 0) == nil && isHelperProcess(h.HelperPID) {
+				_ = syscall.Kill(h.HelperPID, syscall.SIGKILL)
+			}
 		}
 		fmt.Fprintf(w, "released token %d (held by %s pid %d: %s)\n", h.Token, h.Client.Host, h.Client.PID, h.Client.Command)
 		n++
@@ -232,14 +242,32 @@ func Prune(w io.Writer, root string, maxAge time.Duration, dryRun bool) error {
 		}
 	}
 	if d, err := probeDocker(context.Background()); err == nil && !dryRun {
-		hours := strconv.Itoa(int(maxAge.Hours()))
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		out, _ := runShell(ctx, d.cmd("image prune -af --filter until="+hours+"h")+" ; "+d.cmd("builder prune -f --filter until="+hours+"h"))
-		cancel()
-		if t := strings.TrimSpace(string(out)); t != "" {
-			fmt.Fprintf(w, "docker: %s\n", firstLines(t, 2))
+		if len(readHolders(l)) > 0 {
+			// A session may be between preparing its image and running it.
+			fmt.Fprintln(w, "docker: skipped image prune while slots are in use")
+		} else {
+			mins := strconv.Itoa(max(1, int(maxAge.Minutes())))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			out, _ := runShell(ctx, d.cmd("image prune -af --filter until="+mins+"m")+" ; "+d.cmd("builder prune -f --filter until="+mins+"m"))
+			cancel()
+			if t := strings.TrimSpace(string(out)); t != "" {
+				fmt.Fprintf(w, "docker: %s\n", firstLines(t, 2))
+			}
 		}
 	}
 	fmt.Fprintf(w, "%d item(s) %s\n", freed, map[bool]string{true: "would be removed", false: "removed"}[dryRun])
 	return nil
+}
+
+// isHelperProcess reports whether pid is alive and (where /proc exists) is a
+// spotexec helper.
+func isHelperProcess(pid int) bool {
+	if syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return !os.IsNotExist(err) || runtime.GOOS != "linux"
+	}
+	return strings.Contains(string(b), "spotexec-helper")
 }

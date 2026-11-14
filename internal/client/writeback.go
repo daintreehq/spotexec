@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -30,6 +31,7 @@ type WritebackResult struct {
 	Deleted     []string
 	Conflicts   []string
 	Ignored     int
+	Refused     []string // paths the runner reported that may not be written
 	ConflictDir string
 }
 
@@ -55,12 +57,25 @@ func (a version) eq(b version) bool {
 	return a.id == b.id && a.mode == b.mode
 }
 
+// blocked is a local state that matches nothing (a directory where a file
+// is expected, or a path through a symlink): the path becomes a conflict.
+var blocked = version{exists: true, id: "!blocked"}
+
 func localVersion(root, rel string) (version, error) {
-	full := filepath.Join(root, filepath.FromSlash(rel))
+	full, err := fsid.SafeJoin(root, rel) // never read through a symlinked parent
+	if err != nil {
+		if errors.Is(err, syscall.ENOTDIR) {
+			return version{}, nil // a parent is now a file: the path is gone
+		}
+		return blocked, nil
+	}
+	if fi, err := os.Lstat(full); err == nil && fi.IsDir() {
+		return blocked, nil
+	}
 	id, mode, _, err := fsid.Path(full)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return version{}, nil
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return version{}, nil // gone, or its parent is now a file
 		}
 		return version{}, err
 	}
@@ -79,8 +94,36 @@ func localVersion(root, rel string) (version, error) {
 func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string) (WritebackResult, error) {
 	var wb WritebackResult
 	// Created (non-manifest) files only come back if not ignored locally.
-	var createdPaths []string
+	// The runner's report is not trusted: changed or deleted paths must be
+	// files we uploaded, and nothing may land in .git or .spotexec.
+	refuse := func(p string) {
+		wb.Refused = append(wb.Refused, p)
+	}
+	var changed, created []protocol.Entry
+	var deleted []string
+	for _, c := range r.Changed {
+		if _, ok := m.ByPath[c.Path]; !ok || reservedPath(c.Path, ws.Git) {
+			refuse(c.Path)
+			continue
+		}
+		changed = append(changed, c)
+	}
 	for _, c := range r.Created {
+		if _, err := fsid.CleanRel(c.Path); err != nil || reservedPath(c.Path, ws.Git) {
+			refuse(c.Path)
+			continue
+		}
+		created = append(created, c)
+	}
+	for _, d := range r.Deleted {
+		if _, ok := m.ByPath[d]; !ok || reservedPath(d, ws.Git) {
+			refuse(d)
+			continue
+		}
+		deleted = append(deleted, d)
+	}
+	var createdPaths []string
+	for _, c := range created {
 		createdPaths = append(createdPaths, c.Path)
 	}
 	ignored, err := m.CheckIgnored(ctx, createdPaths)
@@ -89,11 +132,11 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	}
 	remote := map[string]version{}
 	var fetch, accept []string
-	for _, c := range r.Changed {
+	for _, c := range changed {
 		remote[c.Path] = version{true, c.ID, c.Mode}
 		fetch = append(fetch, c.Path)
 	}
-	for _, c := range r.Created {
+	for _, c := range created {
 		if ignored[c.Path] {
 			wb.Ignored++
 			continue
@@ -102,7 +145,7 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		fetch = append(fetch, c.Path)
 		accept = append(accept, c.Path)
 	}
-	for _, d := range r.Deleted {
+	for _, d := range deleted {
 		remote[d] = version{}
 	}
 	if len(remote) == 0 {
@@ -134,6 +177,9 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		default:
 			return nil
 		}
+		if v, ok := remote[h.Name]; !ok || !v.exists {
+			return nil // not something we asked for
+		}
 		files[h.Name] = rf
 		return nil
 	}); err != nil {
@@ -142,7 +188,7 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 
 	// Serialize cooperating spotexec write-backs into this worktree.
 	lockDir := conflictBase(ws)
-	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
 		return wb, err
 	}
 	unlock, err := lockFile(filepath.Join(lockDir, "writeback.lock"))
@@ -225,15 +271,18 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		}
 	}
 
-	for _, p := range paths {
+	// Deletions first, deepest first, then the emptied directories are
+	// pruned, then writes: a directory replaced by a file (or the reverse)
+	// is applied in an order that works.
+	apply := func(p string) error {
 		if handled[p] {
-			continue
+			return nil
 		}
 		want := remote[p]
 		rf, fetched := files[p]
 		if want.exists {
 			if !fetched {
-				continue // vanished remotely between diff and fetch
+				return nil // vanished remotely between diff and fetch
 			}
 			want = version{true, rf.id, rf.mode} // trust bytes actually received
 		}
@@ -243,42 +292,70 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		}
 		local, err := localVersion(ws.Root, p)
 		if err != nil {
-			return wb, err
+			return err
 		}
 		switch {
 		case local.eq(want):
-			continue
+			return nil
 		case local.eq(base):
 			if want.exists {
 				err := writeLocal(ws.Root, p, rf, &local)
-				if errors.Is(err, errChangedUnderUs) {
+				// Changed under us, or the way is blocked (a file where a
+				// directory is needed, kept because of a local edit): keep
+				// the local side, stash the remote one.
+				if errors.Is(err, errChangedUnderUs) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) {
 					if err := stashConflict(wb.ConflictDir, p, want, rf); err != nil {
-						return wb, err
+						return err
 					}
 					wb.Conflicts = append(wb.Conflicts, p)
-					continue
+					return nil
 				}
 				if err != nil {
-					return wb, fmt.Errorf("%s: %w", p, err)
+					return fmt.Errorf("%s: %w", p, err)
 				}
 				wb.Applied = append(wb.Applied, p)
 				m.Update(protocol.Entry{Path: p, ID: rf.id, Mode: rf.mode, Size: int64(len(rf.data))})
 			} else {
 				full, err := fsid.SafeJoin(ws.Root, p)
 				if err != nil {
-					return wb, err
+					return err
 				}
 				if err := os.Remove(full); err != nil && !errors.Is(err, fs.ErrNotExist) {
-					return wb, err
+					return err
 				}
 				wb.Deleted = append(wb.Deleted, p)
 				removedDirs = append(removedDirs, path.Dir(p))
 			}
 		default:
 			if err := stashConflict(wb.ConflictDir, p, want, rf); err != nil {
-				return wb, err
+				return err
 			}
 			wb.Conflicts = append(wb.Conflicts, p)
+		}
+		return nil
+	}
+	var dels, writes []string
+	for _, p := range paths {
+		if handled[p] {
+			continue
+		}
+		if remote[p].exists {
+			writes = append(writes, p)
+		} else {
+			dels = append(dels, p)
+		}
+	}
+	sort.SliceStable(dels, func(i, j int) bool { return strings.Count(dels[i], "/") > strings.Count(dels[j], "/") })
+	for _, p := range dels {
+		if err := apply(p); err != nil {
+			return wb, err
+		}
+	}
+	pruneEmptyDirs(ws.Root, removedDirs)
+	removedDirs = nil
+	for _, p := range writes {
+		if err := apply(p); err != nil {
+			return wb, err
 		}
 	}
 	pruneEmptyDirs(ws.Root, removedDirs)
@@ -298,15 +375,21 @@ func stashConflict(dir, p string, want version, rf remoteFile) error {
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
 			return err
 		}
-		return os.WriteFile(full, []byte("deleted by the remote command\n"), 0o644)
+		return os.WriteFile(full, []byte("deleted by the remote command\n"), 0o600)
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return writeLocal(dir, p, rf, nil)
+	err := writeLocal(dir, p, rf, nil)
+	if err != nil && (errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST)) {
+		// A directory/file collision inside the stash itself (a path that
+		// was a directory and is now a file): keep it beside, renamed.
+		return writeLocal(dir, p+".remote", rf, nil)
+	}
+	return err
 }
 
 var errChangedUnderUs = errors.New("file changed during write-back")
@@ -427,7 +510,10 @@ func lockFile(p string) (func(), error) {
 // Source files are never touched: a pulled path that Git tracks, or that Git
 // would not ignore, is skipped (write-back owns those, with its conflict
 // checks).
-func PullArtifacts(ctx context.Context, s *transport.Session, root string, patterns []string) (int, error) {
+//
+// ws is the worktree (for the write-back lock); root is where files go (the
+// worktree root, or --dest).
+func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, root string, patterns []string) (int, error) {
 	if err := s.Conn.Send(protocol.TypePull, protocol.Pull{Patterns: patterns}); err != nil {
 		return 0, err
 	}
@@ -436,8 +522,65 @@ func PullArtifacts(ctx context.Context, s *transport.Session, root string, patte
 		return 0, err
 	}
 	var listed protocol.Need
-	_ = env.Unmarshal(&listed)
-	protected := protectedPaths(ctx, root, listed.Paths)
+	if err := env.Unmarshal(&listed); err != nil {
+		return 0, fmt.Errorf("pull: bad listing from runner: %w", err)
+	}
+	// Only paths the runner listed, that match what was asked for, and that
+	// are not reserved, may be written; the rest of the stream is ignored.
+	allowed := map[string]bool{}
+	var candidates []string
+	for _, p := range listed.Paths {
+		if _, err := fsid.CleanRel(p); err != nil || reservedPath(p, ws.Git) || !pullMatches(patterns, p) {
+			continue
+		}
+		allowed[p] = true
+		candidates = append(candidates, p)
+	}
+	// Judge each path by where it will land: under --dest inside the
+	// worktree, that's dest/<path>; outside the worktree, nothing is source.
+	// (root is resolved like ws.Root, so relative and symlinked spellings of
+	// the same directory compare equal.)
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
+	}
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
+	}
+	protected := map[string]bool{}
+	rel, relErr := filepath.Rel(ws.Root, root)
+	if relErr != nil {
+		return 0, fmt.Errorf("pull: can't place %s relative to the worktree: %w", root, relErr)
+	}
+	if rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") && reservedPath(filepath.ToSlash(rel), ws.Git) {
+		return 0, fmt.Errorf("pull: refusing to write into %s", rel)
+	}
+	if rel != ".." && !strings.HasPrefix(rel, "../") {
+		prefix := ""
+		if rel != "." {
+			prefix = filepath.ToSlash(rel) + "/"
+		}
+		landing := make([]string, len(candidates))
+		for i, p := range candidates {
+			landing[i] = prefix + p
+		}
+		prot, err := protectedPaths(ctx, ws.Root, landing)
+		if err != nil {
+			return 0, err
+		}
+		for _, p := range candidates {
+			protected[p] = prot[prefix+p]
+		}
+	}
+	// Serialise with write-back into the same worktree.
+	lockDir := conflictBase(ws)
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		return 0, err
+	}
+	unlock, err := lockFile(filepath.Join(lockDir, "writeback.lock"))
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	var skipped []string
 	defer func() {
 		if len(skipped) > 0 {
@@ -446,6 +589,13 @@ func PullArtifacts(ctx context.Context, s *transport.Session, root string, patte
 	}()
 	n := 0
 	err = readTar(s.Blob(ctx), func(h *tar.Header, rd io.Reader) error {
+		if !allowed[h.Name] {
+			return nil
+		}
+		if protected[h.Name] {
+			skipped = append(skipped, h.Name)
+			return nil
+		}
 		rf := remoteFile{}
 		switch h.Typeflag {
 		case tar.TypeSymlink:
@@ -465,24 +615,28 @@ func PullArtifacts(ctx context.Context, s *transport.Session, root string, patte
 		if fi, err := os.Lstat(filepath.Join(root, filepath.FromSlash(h.Name))); err == nil && fi.IsDir() {
 			return nil
 		}
-		if protected[h.Name] {
-			skipped = append(skipped, h.Name)
-			return nil
-		}
 		n++
 		return writeLocal(root, h.Name, rf, nil)
 	})
 	return n, err
 }
 
-// protectedPaths returns the paths Git tracks or would not ignore.
-func protectedPaths(ctx context.Context, root string, paths []string) map[string]bool {
+// protectedPaths returns the paths Git tracks or would not ignore. Outside a
+// git worktree nothing is tracked, so pulled outputs (already limited to the
+// requested patterns) may be written. If git can't answer for a git
+// worktree (for example safe.directory), it fails closed.
+func protectedPaths(ctx context.Context, root string, paths []string) (map[string]bool, error) {
 	out := map[string]bool{}
 	if len(paths) == 0 {
-		return out
+		return out, nil
 	}
-	if _, err := exec.Command("git", "-C", root, "rev-parse", "--git-dir").Output(); err != nil {
-		return out // not a git worktree: nothing to protect against
+	if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+		if _, err := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "--git-dir").Output(); err != nil {
+			return out, nil // not a git worktree: nothing tracked to protect
+		}
+	}
+	if _, err := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "--git-dir").Output(); err != nil {
+		return nil, fmt.Errorf("pull: git can't read this worktree (%v); refusing to write", err)
 	}
 	var in bytes.Buffer
 	for _, p := range paths {
@@ -498,7 +652,7 @@ func protectedPaths(ctx context.Context, root string, paths []string) map[string
 		for _, p := range paths {
 			out[p] = true
 		}
-		return out
+		return out, nil
 	}
 	for _, p := range bytes.Split(ib, []byte{0}) {
 		if len(p) > 0 {
@@ -511,17 +665,24 @@ func protectedPaths(ctx context.Context, root string, paths []string) map[string
 		for _, p := range paths { // cannot tell: protect everything
 			out[p] = true
 		}
-		return out
+		return out, nil
+	}
+	// macOS folds case: dist/readme.md would overwrite tracked dist/README.md.
+	fold := func(p string) string {
+		if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			return strings.ToLower(p)
+		}
+		return p
 	}
 	for _, p := range bytes.Split(b, []byte{0}) {
 		if len(p) > 0 {
-			tracked[string(p)] = true
+			tracked[fold(string(p))] = true
 		}
 	}
 	for _, p := range paths {
-		if tracked[p] || !ign[p] {
+		if tracked[fold(p)] || !ign[p] {
 			out[p] = true
 		}
 	}
-	return out
+	return out, nil
 }

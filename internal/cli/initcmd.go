@@ -181,11 +181,18 @@ func detectProject(root string) (string, []string) {
 				if s == "format" {
 					name = "fmt"
 				}
-				add(name, run+s+" {args}")
+				if pm == "npm" {
+					add(name, run+s+" -- {args}") // npm run needs -- before script flags
+				} else {
+					add(name, run+s+" {args}")
+				}
 			}
 		}
 		if _, ok := tasks["typecheck"]; !ok && exists(root, "tsconfig.json") {
-			add("typecheck", pm+" exec tsc --noEmit")
+			add("typecheck", map[string]string{
+				"npm": "npx tsc --noEmit", "pnpm": "pnpm exec tsc --noEmit",
+				"yarn": "yarn tsc --noEmit", "bun": "bunx tsc --noEmit",
+			}[pm])
 		}
 	}
 	switch {
@@ -291,9 +298,21 @@ func cmdHook() *cobra.Command {
 			if codex {
 				p := filepath.Join(ws.Root, "AGENTS.md")
 				b, _ := os.ReadFile(p)
-				if strings.Contains(string(b), "offloads heavy commands to remote runners with spotexec") {
+				has := strings.Contains(string(b), "offloads heavy commands to remote runners with spotexec")
+				switch {
+				case uninstall && has:
+					nb := strings.Replace(string(b), hooks.AgentsSnippet, "", 1)
+					if nb == string(b) {
+						fmt.Printf("%s: the spotexec section was edited; remove it by hand\n", p)
+					} else if err := os.WriteFile(p, []byte(strings.TrimRight(nb, "\n")+"\n"), 0o644); err != nil {
+						return err
+					} else {
+						fmt.Printf("removed the spotexec section from %s\n", p)
+					}
+				case uninstall:
+				case has:
 					fmt.Printf("%s already has the spotexec section\n", p)
-				} else if !uninstall {
+				default:
 					f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 					if err != nil {
 						return err
@@ -323,9 +342,10 @@ func cmdHook() *cobra.Command {
 		},
 	}
 	check := &cobra.Command{
-		Use:   "check <command>",
-		Short: "Show whether the hook would offload a command line",
-		Args:  cobra.MinimumNArgs(1),
+		Use:                "check <command>",
+		Short:              "Show whether the hook would offload a command line",
+		Args:               cobra.MinimumNArgs(1),
+		DisableFlagParsing: true, // the command's own flags (pytest -x) are not ours
 		RunE: func(cmd *cobra.Command, args []string) error {
 			wd, _ := os.Getwd()
 			l, err := load(wd)
@@ -337,11 +357,21 @@ func cmdHook() *cobra.Command {
 				return err
 			}
 			line := strings.Join(args, " ")
-			if d.ShouldOffload(line) {
+			// The same decision the hook makes (project opt-in, disabled,
+			// cd outside the repository).
+			switch {
+			case l.cfg.Project.Path == "":
+				fmt.Println("local (no .spotexec.toml: the hook only offloads in projects that opt in)")
+			case l.cfg.Project.Hook.Disabled:
+				fmt.Println("local ([hook] disabled = true)")
+			case !d.ShouldOffload(line):
+				fmt.Println("local")
+			case !hooks.CdsInside(line, wd):
+				fmt.Println("local (cd leaves the repository)")
+			default:
 				fmt.Println("offload:", hooks.Wrap("spotexec", line))
 				return nil
 			}
-			fmt.Println("local")
 			return errors.New("not offloaded")
 		},
 	}

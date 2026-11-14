@@ -35,11 +35,16 @@ func main() {
 	case "rpc":
 		// SIGHUP/SIGTERM (sshd teardown, unlock) close stdin semantics: exit
 		// via the normal path so locks and child groups are cleaned up.
+		// SIGPIPE is ignored, so a write to a dead client (or to a child
+		// that exited early) fails with EPIPE and takes the normal exit
+		// path. Termination signals clean up and exit directly: closing a
+		// blocking stdin would not wake the pending read.
+		signal.Ignore(syscall.SIGPIPE)
 		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT, syscall.SIGPIPE)
+		signal.Notify(sig, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
 		go func() {
 			<-sig
-			os.Stdin.Close()
+			helper.Shutdown(143)
 		}()
 		if err := helper.Serve(os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "spotexec-helper:", err)

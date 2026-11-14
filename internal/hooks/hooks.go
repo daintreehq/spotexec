@@ -32,18 +32,25 @@ var DefaultPatterns = []string{
 	`^go (test|vet|build)\b`,
 	`^(make|just) (test|check|lint|build|ci)\b`,
 	`^(bundle exec )?(rspec|rake test|rails test)\b`,
-	`^(mvn|\./mvnw|gradle|\./gradlew) `,
+	`^(mvn|\./mvnw)( -[\w.=-]+)* (clean )?(test|verify|compile|test-compile|package|checkstyle:check|spotless:check)\b`,
+	`^(gradle|\./gradlew)( -[\w.=-]+)* (clean )?(test|check|build|compileJava|compileKotlin|lint|spotlessCheck)\b`,
 }
 
 // DefaultExclude keeps watch modes, dev servers and anything already wrapped
 // local.
+//
+// Words are matched as whole command words, not inside paths: a test file
+// under ~/dev/ or src/watch.test.ts is not a dev server.
 var DefaultExclude = []string{
-	`--watch\b`, `\bwatch\b`, `\bdev\b`, `\bserve\b`, `--ui\b`, `\b(sx|spotexec)\b`,
+	`--watch\b`, `(^|\s|:)(watch|dev|serve|start)(\s|:|$)`, `--ui\b`, `(^|\s)sx(\s|$)`, `(^|[\s/])spotexec(\s|$)`,
+	// The agent's explicit opt-out for one command.
+	`(^|\s)SPOTEXEC_LOCAL=1(\s|$)`,
 }
 
 var (
-	cdSeg  = regexp.MustCompile(`^cd\s+\S+$`)
-	envSeg = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+`)
+	trailingMerge = regexp.MustCompile(`\s+2>&1$`)
+	cdSeg         = regexp.MustCompile(`^cd\s+\S+$`)
+	envSeg        = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+`)
 )
 
 // Decider decides which commands to offload.
@@ -77,7 +84,9 @@ func NewDecider(h config.Hook) (*Decider, error) {
 // harmless prefix (cd, env assignment); pipes, redirects into files,
 // subshells, background jobs and anything else keep the command local.
 func (d *Decider) ShouldOffload(command string) bool {
-	c := strings.TrimSpace(command)
+	// A trailing 2>&1 (agents add it to nearly everything) only merges the
+	// streams: harmless, and it stays part of the offloaded command.
+	c := strings.TrimSpace(trailingMerge.ReplaceAllString(strings.TrimSpace(command), ""))
 	if c == "" || strings.ContainsAny(c, "|<>`$(){}\n&") && !onlyAndAnd(c) {
 		return false
 	}
@@ -167,6 +176,10 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 	if err != nil || !d.ShouldOffload(cmd) {
 		return
 	}
+	// `cd` must stay inside this repository: sx syncs only this worktree.
+	if !cdsInside(cmd, dir) {
+		return
+	}
 	if h.WhenLoadAbove > 0 {
 		if l, err := LoadPerCPU(); err != nil || l < h.WhenLoadAbove {
 			return
@@ -177,7 +190,7 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 		writeJSON(out, map[string]any{"hookSpecificOutput": map[string]any{
 			"hookEventName":            "PreToolUse",
 			"permissionDecision":       "deny",
-			"permissionDecisionReason": "This project offloads heavy commands to remote runners. Re-run it as: " + wrapped,
+			"permissionDecisionReason": "This project offloads heavy commands to remote runners. Re-run it as: " + wrapped + " (or prefix SPOTEXEC_LOCAL=1 if it must run on this machine, e.g. it needs local services)",
 		}})
 		return
 	}
@@ -190,6 +203,52 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 		"hookEventName": "PreToolUse",
 		"updatedInput":  newInput,
 	}})
+}
+
+// CdsInside reports whether every `cd` stays in the repository (see cdsInside).
+func CdsInside(command, dir string) bool { return cdsInside(command, dir) }
+
+// cdsInside reports whether every `cd` in the command stays within the git
+// worktree (or project directory) containing dir, following the cds in order.
+func cdsInside(command, dir string) bool {
+	root := dir
+	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
+		root = strings.TrimSpace(string(out))
+	}
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
+	}
+	cur := dir
+	if r, err := filepath.EvalSymlinks(cur); err == nil {
+		cur = r
+	}
+	for _, seg := range splitSegments(command) {
+		seg = strings.TrimSpace(envSeg.ReplaceAllString(strings.TrimSpace(seg), ""))
+		if !cdSeg.MatchString(seg) {
+			continue
+		}
+		target := strings.TrimSpace(strings.TrimPrefix(seg, "cd"))
+		// Unwrap one level of matching quotes; anything still quoted or
+		// escaped is too clever to reason about: keep it local.
+		if len(target) >= 2 && (target[0] == '"' || target[0] == '\'') && target[len(target)-1] == target[0] {
+			target = target[1 : len(target)-1]
+		}
+		if target == "" || strings.ContainsAny(target, "'\"\\$`") || strings.HasPrefix(target, "~") || strings.HasPrefix(target, "-") {
+			return false
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(cur, target)
+		}
+		target = filepath.Clean(target)
+		if r, err := filepath.EvalSymlinks(target); err == nil {
+			target = r
+		}
+		if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+			return false
+		}
+		cur = target
+	}
+	return true
 }
 
 func writeJSON(w io.Writer, v any) {

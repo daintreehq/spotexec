@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/spotexec/spotexec/internal/fsid"
 	"github.com/spotexec/spotexec/internal/protocol"
@@ -76,13 +77,25 @@ func (s *Session) takeSnapshot(skip []string) snapshot {
 		if _, ok := snap.sig[rel]; ok {
 			continue
 		}
-		fi, err := os.Lstat(filepath.Join(s.workspace, filepath.FromSlash(rel)))
+		// A parent replaced by a symlink (or a file) means the path is gone
+		// from the workspace: never follow it out of the workspace.
+		full, err := fsid.SafeJoin(s.workspace, rel)
+		if err != nil {
+			// Through a symlink, or a parent became a file: gone. Anything
+			// else (a directory made unreadable) is unknown, not deleted.
+			if !errors.Is(err, fsid.ErrSymlinkParent) && !errors.Is(err, syscall.ENOTDIR) {
+				snap.unknown[rel] = true
+			}
+			continue
+		}
+		fi, err := os.Lstat(full)
 		switch {
 		case err == nil:
 			if sg, ok := sigOf(fi); ok {
 				snap.sig[rel] = sg
 			}
-		case !errors.Is(err, fs.ErrNotExist):
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+		default:
 			snap.unknown[rel] = true
 		}
 	}
@@ -107,7 +120,17 @@ func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []
 		if st.sig() == sg {
 			continue
 		}
-		id, mode, size, err := fsid.Path(filepath.Join(s.workspace, filepath.FromSlash(rel)))
+		full, err := fsid.SafeJoin(s.workspace, rel)
+		if err != nil {
+			if errors.Is(err, fsid.ErrSymlinkParent) || errors.Is(err, syscall.ENOTDIR) {
+				deleted = append(deleted, rel)
+				delete(s.stored, rel)
+			} else {
+				unverified = append(unverified, rel)
+			}
+			continue
+		}
+		id, mode, size, err := fsid.Path(full)
 		if err != nil {
 			unverified = append(unverified, rel)
 			continue
@@ -129,7 +152,11 @@ func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []
 			truncated = true
 			break
 		}
-		id, mode, size, err := fsid.Path(filepath.Join(s.workspace, filepath.FromSlash(rel)))
+		full, err := fsid.SafeJoin(s.workspace, rel) // also rejects names a client can't use
+		if err != nil {
+			continue
+		}
+		id, mode, size, err := fsid.Path(full)
 		if err != nil {
 			unverified = append(unverified, rel)
 			continue

@@ -351,26 +351,55 @@ func (s *Session) stageContext(m protocol.Image) (string, string, func(), error)
 		if ign.Excluded(inner) {
 			continue
 		}
+		// Every hashed file must be staged: an image missing one would be
+		// pushed under a tag that claims to include it.
 		src, err := fsid.SafeJoin(s.workspace, rel)
 		if err != nil {
-			continue
+			cleanup()
+			return "", "", nil, perr(protocol.CodeImageFailed, "build context file %s: %v", rel, err)
 		}
 		dst, err := fsid.PrepareParent(dir, inner)
 		if err != nil {
 			cleanup()
 			return "", "", nil, err
 		}
+		// Symlinks are recreated as links (link(2) follows them on macOS,
+		// which would copy a file from outside the workspace into the image).
+		fi, err := os.Lstat(src)
+		if err != nil {
+			cleanup()
+			return "", "", nil, perr(protocol.CodeImageFailed, "build context file %s is missing from the workspace: %v", rel, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(src)
+			if err == nil {
+				err = os.Symlink(target, dst)
+			}
+			if err != nil {
+				cleanup()
+				return "", "", nil, fmt.Errorf("staging %s: %v", rel, err)
+			}
+			continue
+		}
 		if err := os.Link(src, dst); err != nil {
-			if out, cerr := exec.Command("cp", "-P", src, dst).CombinedOutput(); cerr != nil {
+			if out, cerr := exec.Command("cp", "-p", src, dst).CombinedOutput(); cerr != nil {
 				cleanup()
 				return "", "", nil, fmt.Errorf("staging %s: %v: %s", rel, cerr, out)
 			}
 		}
 	}
+	if _, ok := s.stored[m.Dockerfile]; !ok {
+		cleanup()
+		return "", "", nil, perr(protocol.CodeImageFailed, "dockerfile %s is not in the synced files", m.Dockerfile)
+	}
 	df, err := fsid.SafeJoin(s.workspace, m.Dockerfile)
 	if err != nil {
 		cleanup()
 		return "", "", nil, err
+	}
+	if fi, err := os.Lstat(df); err != nil || !fi.Mode().IsRegular() {
+		cleanup()
+		return "", "", nil, perr(protocol.CodeImageFailed, "dockerfile %s must be a regular file (not a symlink)", m.Dockerfile)
 	}
 	b, err := os.ReadFile(df)
 	if err != nil {
@@ -382,8 +411,14 @@ func (s *Session) stageContext(m protocol.Image) (string, string, func(), error)
 		cleanup()
 		return "", "", nil, err
 	}
-	if ign, err := os.ReadFile(df + ".dockerignore"); err == nil {
-		_ = os.WriteFile(dockerfile+".dockerignore", ign, 0o644)
+	// The companion ignore file only if it was synced (as the client hashed),
+	// and as BuildKit would use it on top of our staging.
+	if _, ok := s.stored[m.Dockerfile+".dockerignore"]; ok {
+		if fi, err := os.Lstat(df + ".dockerignore"); err == nil && fi.Mode().IsRegular() {
+			if ign, err := os.ReadFile(df + ".dockerignore"); err == nil {
+				_ = os.WriteFile(dockerfile+".dockerignore", ign, 0o644)
+			}
+		}
 	}
 	return dir, dockerfile, cleanup, nil
 }
@@ -394,14 +429,16 @@ func normContext(ctx, dockerfile string) (string, error) {
 	if c == "" {
 		c = path.Dir(dockerfile)
 	}
-	c = strings.Trim(path.Clean("/"+c), "/") // "./app/" -> "app", "." -> ""
-	if c == "" {
+	// Validate before cleaning: "/"+".." would silently become the root.
+	c = strings.TrimSuffix(strings.TrimPrefix(c, "./"), "/")
+	if c == "" || c == "." {
 		return "", nil
 	}
-	if _, err := fsid.CleanRel(c); err != nil {
-		return "", err
+	clean, err := fsid.CleanRel(c)
+	if err != nil {
+		return "", perr(protocol.CodeImageFailed, "container.context %q must stay inside the repository", ctx)
 	}
-	return c, nil
+	return clean, nil
 }
 
 // waitLock takes an exclusive lock, polling while the client is alive.
@@ -546,9 +583,6 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	id := strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	name := s.containerPrefix() + id
 	scriptPath := filepath.Join(runDir, id+".sh")
-	if err := os.WriteFile(scriptPath, []byte(script+"\n"), 0o644); err != nil {
-		return "", nil, nil, err
-	}
 	// The task environment goes to the container only (never into the
 	// docker client's own environment, where e.g. DOCKER_HOST would
 	// redirect `docker run` itself): single-line values via a 0600
@@ -562,7 +596,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if k == "" || strings.ContainsAny(k, "= \n") {
+		if !envKeyRe.MatchString(k) {
 			continue
 		}
 		if strings.ContainsAny(env[k], "\n\r") {
@@ -574,6 +608,18 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	if err := os.WriteFile(envPath, []byte(envb.String()), 0o600); err != nil {
 		return "", nil, nil, err
 	}
+	// Multi-line values (PEM keys, JSON credentials) can't go in the
+	// env-file and must not go on the docker command line (visible in ps):
+	// the 0600 run script exports them.
+	var sb strings.Builder
+	for _, kv := range multi {
+		k, v, _ := strings.Cut(kv, "=")
+		sb.WriteString("export " + k + "=" + shq(v) + "\n")
+	}
+	sb.WriteString(script + "\n")
+	if err := os.WriteFile(scriptPath, []byte(sb.String()), 0o600); err != nil {
+		return "", nil, nil, err
+	}
 	args := []string{
 		"run", "--rm", "--init", "--name", name, "--network", "host",
 		"-v", s.workspace + ":" + s.workspace,
@@ -581,12 +627,17 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		"--env-file", envPath,
 		"-w", dir, "--entrypoint", "/bin/sh",
 	}
-	for _, kv := range multi {
-		args = append(args, "-e", kv)
-	}
+
 	if !run.Root {
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
 			"-v", home+":/home/spotexec", "-e", "HOME=/home/spotexec")
+	}
+	for _, o := range run.Options {
+		if bad := forbiddenOption(o); bad != "" {
+			// These would change what spotexec relies on to stop, find and
+			// clean up the container, or who it runs as (use container.user).
+			return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
+		}
 	}
 	args = append(args, run.Options...)
 	args = append(args, run.Image, "-c",
@@ -608,8 +659,15 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		os.Remove(envPath)
 		if run.Root {
 			// Root-created files would block later cleanup/hydration and
-			// write-back reads: give the workspace back to the runner user.
-			_, _ = runShell(ctx, "sudo -n chown -R "+strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid())+" "+shq(s.workspace)+" 2>/dev/null")
+			// write-back reads: give them back to the runner user. Only files
+			// with another owner are touched (chown -R would bump every
+			// file's ctime and make untouched files look changed), and it
+			// runs through Docker itself, so no host sudo is needed.
+			u, g := strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid())
+			fix := "find " + shq(s.workspace) + " \\( ! -user " + u + " -o ! -group " + g + " \\) -exec chown -h " + u + ":" + g + " {} +"
+			if _, err := runShell(ctx, d.cmd("run --rm --user 0:0 --network none --entrypoint /bin/sh -v "+shq(s.workspace+":"+s.workspace)+" "+shq(run.Image)+" -c "+shq(fix))+" >/dev/null 2>&1"); err != nil {
+				_, _ = runShell(ctx, "sudo -n "+fix+" 2>/dev/null")
+			}
 		}
 		return nil
 	}
@@ -620,7 +678,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 func removeContainer(ctx context.Context, d dockerRunner, name string) error {
 	for attempt := 0; attempt < 3; attempt++ {
 		_, _ = runShell(ctx, d.cmd("rm -f "+shq(name))+" >/dev/null 2>&1")
-		out, err := runShell(ctx, d.cmd("ps -aq --filter "+shq("name=^"+name+"$")))
+		out, err := runShell(ctx, d.cmd("ps -aq --filter "+shq("name=^"+name+"$"))+" 2>/dev/null")
 		if err == nil && strings.TrimSpace(string(out)) == "" {
 			return nil
 		}
@@ -657,4 +715,25 @@ func (s *Session) removeContainers(prefixOnly bool) {
 
 func shq(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// forbiddenOption returns the docker run flag in o that container.options
+// may not set ("" if none). Clustered short flags count: in "-itd" the d
+// detaches, in "-iu" the u sets the user.
+func forbiddenOption(o string) string {
+	if o == "--" {
+		return "--"
+	}
+	for _, long := range []string{"--name", "--detach", "--entrypoint", "--user", "--rm", "--workdir"} {
+		if o == long || strings.HasPrefix(o, long+"=") {
+			return long
+		}
+	}
+	if len(o) > 1 && o[0] == '-' && o[1] != '-' {
+		rest := strings.TrimLeft(o[1:], "itPq") // boolean shorthands
+		if rest != "" && strings.ContainsRune("duw", rune(rest[0])) {
+			return "-" + rest[:1]
+		}
+	}
+	return ""
 }

@@ -23,30 +23,33 @@ takes part in scheduling, and every VM shuts itself down.
 1. **Static runners first.** `ssh` runners in the pool are tried in priority
    order, without blocking.
 2. **Known instances.** The fleet's instance list is read from the local cache
-   (`pool.json`). It is refreshed from the cloud API when older than 30s, or
-   after any failure. Running instances are tried most-recently-used first
-   with a non-blocking acquire.
-   - Packing work onto busy instances lets the others go idle and terminate:
-     the pool scales in without any coordinator.
+   (`pool.json`). It is refreshed from the cloud API when older than 8s, or
+   after any failure. Running instances are tried oldest first (ties broken
+   by instance ID) with a non-blocking acquire.
+   - Packing work onto the oldest instances lets the newest go idle and
+     terminate: the pool scales in without any coordinator.
    - An instance that refuses with `RUNNER_DRAINING` is marked draining and
      skipped.
    - An instance that cannot be reached is dropped from the cache.
-3. **Scale out.** If every slot is busy, under `pool.lock`:
-   - **Join a pending launch.** If an instance being launched still has
-     unclaimed slots (its claims are below `max_slots`), claim one and wait
-     for that instance.
-   - **Launch a new instance.** Otherwise, if live instances (running +
-     pending, not draining) number fewer than `max_instances`, write a
-     *launch claim*, launch, and wait for it to come up. Other agents that
-     arrive meanwhile join this pending launch instead of launching their own.
-   - Claims record the claimant's PID, so a dead `sx` frees its claim.
-4. **Queue.** At `max_instances`, poll every runner and instance about once a
-   second until a slot frees or `queue_timeout` expires.
+3. **Queue and scale out.** If every slot is busy, the job takes a ticket in
+   a fair local queue (priority, then arrival; `queue.go`) and registers as
+   demand on each fleet (a waiter file under `waiters/`). Under `pool.lock`,
+   `Plan` launches only while waiting demand exceeds the capacity already
+   starting (the launch ledger in `pool.json`), up to `max_instances`.
+   - Lower-priority fleets only launch for demand the higher-priority ones
+     can't cover.
+   - Ledger entries record the launching PID, so a dead `sx` frees its
+     reservation; an ambiguous launch (the request may have created an
+     instance) keeps its reservation until listings can show it.
+   - A failed launch backs the fleet off for 20s.
+4. **Wait.** Tickets near the head of the queue probe instances about every
+   0.5-2.5s (the head most often) until a slot frees or `queue_timeout`
+   expires.
 
 ## Scale in
 
 Each VM's watchdog (a systemd timer installed by cloud-init) powers it off
-after `idle_timeout` (default 5m) without activity. It only does so when no
+after `idle_timeout` (default 10m) without activity. It only does so when no
 session holds the lifecycle lock. Because instances launch with
 `InstanceInitiatedShutdownBehavior=terminate`, powering off terminates the
 instance.
@@ -65,11 +68,13 @@ The helper polls IMDSv2 every 5s for the whole session:
 - `spot/instance-action` (about 2 minutes' notice): the helper marks the VM
   draining and sends `spot_interruption` to the CLI.
 
-On `spot_interruption` the CLI immediately acquires a **replacement slot** in
-the background, excluding the dying VM. A launch may be needed for that. Then:
+On `spot_interruption` the CLI immediately checks for **replacement
+capacity** in the background, excluding the dying VM: it probes for a free
+slot (without keeping it) and registers demand, so a launch starts if one is
+needed. The optional pool manager (`spotexec daemon`) also replaces a
+noticed warm instance within the notice. Then:
 
-- **The job finishes on the dying VM:** the replacement lease is released and
-  the result is used normally.
+- **The job finishes on the dying VM:** the result is used normally.
 - **The VM dies first (connection lost):** the whole run (sync, deps, exec,
   write-back) is replayed on the replacement slot. Nothing was written back
   locally from the lost attempt, so a replay is safe for anything that is
@@ -98,4 +103,4 @@ on the local machine:
 - queueing at capacity;
 - idle scale-in to zero;
 - reallocation after an interruption;
-- rebalance draining.
+- rebalance recommendations staying advisory.

@@ -19,11 +19,14 @@ func TestShouldOffload(t *testing.T) {
 		"pnpm test", "pnpm vitest run src/a.test.ts", "npx prettier --write .", "pytest -x tests/",
 		"cargo test", "go test ./...", "cd packages/api && pnpm test", "CI=1 pnpm run lint",
 		"pnpm tsc --noEmit", "uv run pytest", "npm run test:unit",
+		"pytest /Users/me/dev/app/tests", "pnpm test 2>&1", "cd pkg && go test ./... 2>&1", "pnpm vitest run src/watch.test.ts", "./gradlew test", "mvn -q verify",
 	}
 	no := []string{
 		"git status", "ls -la", "rg foo", "pnpm dev", "pnpm vitest --watch", "pnpm test | tee out.txt",
 		"pnpm test > out.txt", "pnpm test && git commit -m x", "sx pnpm test", "echo $(pnpm test)",
 		"pnpm install", "pnpm test &", "",
+		"SPOTEXEC_LOCAL=1 pytest", "mvn deploy", "./gradlew bootRun", "pnpm run dev", "npm run serve",
+		"pnpm test:watch", "npm run lint:watch", "/usr/local/bin/spotexec run -- pnpm test",
 	}
 	for _, c := range yes {
 		if !d.ShouldOffload(c) {
@@ -87,5 +90,26 @@ func TestInstallIdempotent(t *testing.T) {
 	}
 	if ok, _ := UninstallClaude(p); !ok {
 		t.Fatal("uninstall failed")
+	}
+}
+
+func TestCdsInside(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "pkg")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for cmd, want := range map[string]bool{
+		"cd pkg && pnpm test":          true,
+		"cd " + root + " && pnpm test": true,
+		"cd " + sub + " && pnpm test":  true,
+		"cd .. && pnpm test":           false,
+		"cd /tmp && pytest":            false,
+		"cd ~/x && pytest":             false,
+		"pnpm test":                    true,
+	} {
+		if got := cdsInside(cmd, root); got != want {
+			t.Errorf("cdsInside(%q) = %v, want %v", cmd, got, want)
+		}
 	}
 }

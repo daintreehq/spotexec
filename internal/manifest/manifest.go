@@ -13,10 +13,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/spotexec/spotexec/internal/fsid"
 	"github.com/spotexec/spotexec/internal/ignore"
@@ -25,10 +27,18 @@ import (
 
 // BuiltinExcludes are never synced from untracked/non-Git sources. Tracked
 // files are always synced unless the user excludes them explicitly.
+//
+// .git and .spotexec match files too (a linked worktree's .git is a file
+// holding a local path). target is anchored: only a top-level Rust/Maven
+// build dir is assumed to be output; a source directory named "target"
+// elsewhere is not.
 var BuiltinExcludes = []string{
-	".git/", "node_modules/", ".venv/", "venv/", "__pycache__/", ".next/", ".turbo/",
-	"target/", ".spotexec/", ".DS_Store", ".pytest_cache/", ".mypy_cache/", ".gradle/",
+	".git", "node_modules/", ".venv/", "venv/", "__pycache__/", ".next/", ".turbo/",
+	"/target/", ".spotexec", ".DS_Store", ".pytest_cache/", ".mypy_cache/", ".gradle/",
+	".spotexec-tmp-*",
 }
+
+var textAttr = regexp.MustCompile(`(^|\s)-?(text|crlf)(=|\s|$)`)
 
 // HeavyDirs are skipped by the remote post-run walk (they are build outputs
 // or dependency trees, never source).
@@ -66,7 +76,9 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		return nil, err
 	}
 	for _, p := range o.Protect {
-		user.Add(strings.TrimSuffix(p, "/") + "/")
+		// cache_dirs are paths from the repository root: anchor them, or
+		// "build" would also drop a tracked cmd/build/main.go.
+		user.Add("/" + strings.Trim(strings.TrimPrefix(p, "./"), "/") + "/")
 	}
 	m.Matcher = user
 	builtin := ignore.New(BuiltinExcludes...)
@@ -176,11 +188,16 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		go func(i int, c cand) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			full := filepath.Join(o.Root, filepath.FromSlash(c.path))
+			// A parent directory replaced by a symlink (unstaged) must not
+			// make us read, and upload, files from outside the worktree.
+			full, err := fsid.SafeJoin(o.Root, c.path)
+			if err != nil {
+				return // reached through a symlink or an invalid name: skip
+			}
 			fi, err := os.Lstat(full)
 			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					return // deleted in the worktree
+				if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+					return // deleted in the worktree (or its directory became a file)
 				}
 				errs[i] = err
 				return
@@ -193,12 +210,15 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 			if c.indexID != "" && mode != fsid.ModeSymlink {
 				e.ID = c.indexID
 			} else {
-				id, _, size, err := fsid.Path(full)
+				id, m2, size, err := fsid.Path(full)
 				if err != nil {
+					if errors.Is(err, fs.ErrNotExist) {
+						return // vanished while scanning
+					}
 					errs[i] = err
 					return
 				}
-				e.ID, e.Size = id, size
+				e.ID, e.Size, e.Mode = id, size, m2
 			}
 			entries[i], keep[i] = e, true
 		}(i, c)
@@ -327,8 +347,11 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 			return false
 		}
 		s := string(b)
+		// text / crlf attributes convert line endings between the index
+		// and the worktree, so index IDs don't describe worktree bytes.
 		return strings.Contains(s, "filter=") || strings.Contains(s, "eol=") ||
-			strings.Contains(s, "working-tree-encoding") || strings.Contains(s, "ident")
+			strings.Contains(s, "working-tree-encoding") || strings.Contains(s, "ident") ||
+			textAttr.MatchString(s)
 	}
 	for p := range staged {
 		if p == ".gitattributes" || strings.HasSuffix(p, "/.gitattributes") {

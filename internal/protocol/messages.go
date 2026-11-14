@@ -32,6 +32,7 @@ const (
 const (
 	CodeDraining     = "RUNNER_DRAINING"
 	CodeBooting      = "RUNNER_BOOTING"
+	CodeBootFailed   = "BOOTSTRAP_FAILED"
 	CodeQueueTimeout = "QUEUE_TIMEOUT"
 	CodeBadRequest   = "BAD_REQUEST"
 	CodeInternal     = "INTERNAL"

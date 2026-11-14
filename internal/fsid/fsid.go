@@ -8,6 +8,7 @@ package fsid
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // File modes, as in Git.
@@ -104,6 +106,11 @@ func CleanRel(p string) (string, error) {
 		if seg == "" || seg == "." || seg == ".." {
 			return "", fmt.Errorf("invalid path %q", p)
 		}
+		// Never a git directory, in any case (macOS folds .GIT into .git):
+		// files there are code that runs on whoever uses the repository.
+		if strings.EqualFold(seg, ".git") {
+			return "", fmt.Errorf("invalid path %q (inside .git)", p)
+		}
 	}
 	return filepath.FromSlash(p), nil
 }
@@ -111,6 +118,9 @@ func CleanRel(p string) (string, error) {
 // SafeJoin joins root and a wire path, and verifies that no existing ancestor
 // directory between root and the target is a symlink (which could redirect a
 // write outside root).
+// ErrSymlinkParent: a parent directory of the path is a symlink.
+var ErrSymlinkParent = errors.New("parent directory is a symlink")
+
 func SafeJoin(root, rel string) (string, error) {
 	r, err := CleanRel(rel)
 	if err != nil {
@@ -132,10 +142,10 @@ func SafeJoin(root, rel string) (string, error) {
 			return "", err
 		}
 		if fi.Mode()&fs.ModeSymlink != 0 {
-			return "", fmt.Errorf("refusing to write %q through symlinked directory %q", rel, dir)
+			return "", fmt.Errorf("refusing to use %q through symlinked directory %q: %w", rel, dir, ErrSymlinkParent)
 		}
 		if !fi.IsDir() {
-			return "", fmt.Errorf("refusing to write %q: %q is not a directory", rel, dir)
+			return "", fmt.Errorf("refusing to use %q: %q is not a directory: %w", rel, dir, syscall.ENOTDIR)
 		}
 	}
 	return full, nil

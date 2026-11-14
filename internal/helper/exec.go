@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,26 +20,74 @@ import (
 
 func shellPath() (string, []string) {
 	if p, err := exec.LookPath("bash"); err == nil {
-		return p, []string{"-lc"}
+		return p, []string{"-c"}
 	}
-	return "/bin/sh", []string{"-lc"}
+	return "/bin/sh", []string{"-c"}
 }
 
-// buildEnv returns the helper's environment overlaid with extra.
-func buildEnv(extra map[string]string) []string {
-	env := map[string]string{}
-	for _, kv := range os.Environ() {
-		k, v, _ := strings.Cut(kv, "=")
-		env[k] = v
+// Login profiles load toolchains (mise, nvm, rbenv, conda), so they are
+// sourced like a login shell would, but silently (a banner must not end up
+// in the command's output), and before spotexec's own environment and
+// working directory are applied (Ubuntu's /etc/profile resets PATH).
+//
+// A profile that exits would otherwise end the run with "success" before the
+// command ran: the EXIT trap turns that into a failure. Options a profile
+// sets (-e, -u, -x) and positional parameters are reset afterwards.
+const profilePrelude = `trap 'echo "spotexec: a login profile exited the shell before the command ran" >&2; exit 125' EXIT
+{ [ -r /etc/profile ] && . /etc/profile
+if [ -n "${BASH_VERSION:-}" ]; then
+  if [ -r "${HOME:-/nonexistent}/.bash_profile" ]; then . "$HOME/.bash_profile"
+  elif [ -r "${HOME:-/nonexistent}/.bash_login" ]; then . "$HOME/.bash_login"
+  elif [ -r "${HOME:-/nonexistent}/.profile" ]; then . "$HOME/.profile"; fi
+elif [ -r "${HOME:-/nonexistent}/.profile" ]; then . "$HOME/.profile"; fi
+} </dev/null >/dev/null 2>&1
+trap - EXIT
+set +e +u +x
+set --
+`
+
+var envKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// wrapScript applies the profile prelude, then the job's environment (from
+// envFile: values never go on a command line, where ps would show them),
+// then changes to dir and runs script.
+func wrapScript(script, dir, envFile string) string {
+	var b strings.Builder
+	b.WriteString(profilePrelude)
+	if envFile != "" {
+		b.WriteString(". " + shq(envFile) + "\n")
 	}
-	for k, v := range extra {
-		env[k] = v
+	b.WriteString("cd " + shq(dir) + " || exit 1\n")
+	b.WriteString(script)
+	return b.String()
+}
+
+// writeEnvFile writes env as shell exports to a private temp file.
+func writeEnvFile(env map[string]string) (string, error) {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		if envKeyRe.MatchString(k) {
+			keys = append(keys, k)
+		}
 	}
-	out := make([]string, 0, len(env))
-	for k, v := range env {
-		out = append(out, k+"="+v)
+	if len(keys) == 0 {
+		return "", nil
 	}
-	return out
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString("export " + k + "=" + shq(env[k]) + "\n")
+	}
+	f, err := os.CreateTemp("", "spotexec-env-*") // 0600
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), f.Close()
 }
 
 // runProc spawns script in dir as its own process group, streams its output
@@ -54,9 +104,18 @@ type procResult struct {
 
 func (s *Session) runProc(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool) procResult {
 	shell, args := shellPath()
-	cmd := exec.Command(shell, append(args, script)...)
+	envFile, err := writeEnvFile(env)
+	if err != nil {
+		return procResult{code: 127, startErr: err}
+	}
+	if envFile != "" {
+		defer os.Remove(envFile)
+	}
+	cmd := exec.Command(shell, append(args, wrapScript(script, dir, envFile))...)
 	cmd.Dir = dir
-	cmd.Env = buildEnv(env)
+	// The helper's own environment: the job's is applied after the login
+	// profiles (a [env] HOME must not redirect where profiles are read).
+	cmd.Env = os.Environ()
 	cmd.SysProcAttr = childSysProcAttr()
 	devnull, _ := os.Open(os.DevNull)
 	if devnull != nil {

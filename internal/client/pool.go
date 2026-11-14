@@ -74,12 +74,7 @@ func NewPool(r *config.Runner, f provider.Fleet) *Pool {
 }
 
 // SlotsPerInstance is the planning capacity of one instance.
-func (p *Pool) SlotsPerInstance() int {
-	if p.R.MaxSlots > 0 {
-		return p.R.MaxSlots
-	}
-	return 4
-}
+func (p *Pool) SlotsPerInstance() int { return slotsOf(p.R) }
 
 // with runs fn under pool.lock with the current state, saving it afterwards.
 func (p *Pool) with(fn func(st *poolState) error) error {
@@ -166,7 +161,18 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	lctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	insts, err := p.Fleet.List(lctx)
+	if err != nil && force {
+		// A forced refresh (status, the pool manager) wants the truth, not
+		// a cached view it might act on.
+		return err
+	}
 	if err != nil {
+		// Expired or missing credentials won't fix themselves: say so now
+		// instead of waiting out the queue on a cached view.
+		var ce *provider.CredentialError
+		if errors.As(err, &ce) {
+			return err
+		}
 		if !st.ListedAt.IsZero() {
 			// Serve the cached view and back off, rather than letting every
 			// waiting agent retry the API (throttling) or give up.
@@ -551,7 +557,7 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 				}
 			}
 			st.BackoffUntil, st.LastLaunchErr = time.Now().Add(launchBackoff), firstLine(err.Error())
-			st.ListedAt = time.Time{}
+			st.ListedAt = staleListing(st.ListedAt)
 			return nil
 		})
 		return in, err
@@ -562,21 +568,30 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 				st.Launches[i].InstanceID = in.ID
 			}
 		}
-		st.ListedAt = time.Time{} // force the next caller to re-list
+		st.ListedAt = staleListing(st.ListedAt) // force the next caller to re-list
 		return nil
 	})
 	recorded = true
 	launchesInFlight.Done()
 	ran, err := p.Fleet.WaitRunning(ctx, in.ID, log)
 	if err != nil && ctx.Err() == nil {
-		// Reclaimed or broken while booting: stop counting it as capacity.
+		// Reclaimed or broken while booting (a bad volume key, an instant
+		// Spot reclaim, no public IP): end it so it can't linger unusable,
+		// stop counting it, and back off like any failed launch, so nothing
+		// relaunches in a tight loop.
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		terr := p.Fleet.Terminate(tctx, in.ID)
+		cancel()
 		_ = p.with(func(st *poolState) error {
 			for i := range st.Launches {
-				if st.Launches[i].ID == id {
+				// Only free the reservation once the instance is surely going
+				// away; otherwise it still counts until listings show it.
+				if st.Launches[i].ID == id && terr == nil {
 					st.Launches[i].Failed = true
 				}
 			}
-			st.ListedAt = time.Time{}
+			st.BackoffUntil, st.LastLaunchErr = time.Now().Add(launchBackoff), firstLine(err.Error())
+			st.ListedAt = staleListing(st.ListedAt)
 			return nil
 		})
 	}
@@ -724,4 +739,13 @@ type poolView struct {
 	Launching     int
 	Demand        int
 	LastLaunchErr string
+}
+
+// staleListing forces the next refresh to re-list while keeping the cached
+// view usable as a fallback if that listing fails (a zero time would not).
+func staleListing(t time.Time) time.Time {
+	if t.IsZero() {
+		return t
+	}
+	return time.Unix(1, 0)
 }

@@ -46,11 +46,13 @@ func redact(err error) error {
 	if err == nil {
 		return nil
 	}
+	msg := err.Error()
 	var ue *url.Error
 	if errors.As(err, &ue) {
-		return fmt.Errorf("%s %s: %v", ue.Op, stripQuery(ue.URL), ue.Err)
+		msg = fmt.Sprintf("%s %s: %v", ue.Op, stripQuery(ue.URL), ue.Err)
 	}
-	return errors.New(querySecrets.ReplaceAllString(err.Error(), "?…"))
+	// Also scrub anything nested in the message (a redirect's URL...).
+	return errors.New(querySecrets.ReplaceAllString(msg, "?…"))
 }
 
 func stripQuery(u string) string {
@@ -90,6 +92,7 @@ func cacheRestore(ctx context.Context, root, url, dst string) (bool, error) {
 		_ = os.RemoveAll(stage)
 		return false, errors.New("cached archive has no valid .ready marker")
 	}
+
 	_ = os.RemoveAll(dst)
 	return true, os.Rename(stage, dst)
 }

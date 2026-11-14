@@ -33,6 +33,10 @@ type Session struct {
 	frames   chan protocol.Frame
 	readErr  atomic.Value // error
 	lastSeen atomic.Int64
+	// owned is the work root while this session holds a slot (read by the
+	// heartbeat goroutine, so not s.tokens / s.layout directly).
+	owned atomic.Pointer[string]
+	relMu sync.Mutex
 
 	lifecycle   *flock
 	tokens      []*flock
@@ -54,8 +58,33 @@ type Session struct {
 
 // Serve runs the RPC loop on stdin/stdout until the client says bye or goes
 // away. All locks are released on return.
+// current is the session being served (one per helper process), for
+// Shutdown.
+var current atomic.Pointer[Session]
+
+// Shutdown ends the process after cleaning up what the session owns (its
+// command's process group, containers, slot locks): used on SIGTERM/SIGHUP,
+// when a blocked read of stdin can't be interrupted.
+func Shutdown(code int) {
+	if s := current.Load(); s != nil {
+		if pg := int(s.child.Load()); pg > 0 {
+			killGroup(pg, 2*time.Second)
+		}
+		if s.workspace != "" {
+			reapWorkspace(s.workspace, 2*time.Second)
+		}
+		s.removeContainers(false)
+		s.release()
+	}
+	os.Exit(code)
+}
+
 func Serve(in io.Reader, out io.Writer) error {
-	s := &Session{c: protocol.NewConn(in, out), frames: make(chan protocol.Frame, 64)}
+	s := &Session{frames: make(chan protocol.Frame, 64)}
+	// Liveness counts bytes arriving, so a large manifest still streaming
+	// over a slow link is not mistaken for a silent client.
+	s.c = protocol.NewConn(protocol.ProgressReader{R: in, OnRead: func() { s.lastSeen.Store(time.Now().UnixNano()) }}, out)
+	current.Store(s)
 	s.lastSeen.Store(time.Now().UnixNano())
 	go s.readLoop()
 	defer s.release()
@@ -72,8 +101,8 @@ func Serve(in io.Reader, out io.Writer) error {
 			case <-t.C:
 				// Only owned work counts as activity: probes and idle
 				// sessions must not keep an idle VM alive.
-				if len(s.tokens) > 0 {
-					touchActivity(s.layout.Root)
+				if root := s.owned.Load(); root != nil {
+					touchActivity(*root)
 				}
 				_ = s.c.Send(protocol.TypeHeartbeat, nil)
 			}
@@ -171,6 +200,7 @@ func (s *Session) lastResort() {
 				reapWorkspace(s.workspace, 2*time.Second)
 			}
 			s.removeContainers(false)
+			s.release()
 			os.Exit(4)
 		}
 	}
@@ -261,8 +291,15 @@ func (s *Session) hello(h protocol.Hello) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	// Private to the runner user: synced source and commands live here.
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return err
+	}
+	_ = os.Chmod(root, 0o700)
+	// Resolved, so process cleanup (which matches /proc/<pid>/cwd, always a
+	// resolved path) and output path rewriting see the same paths.
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
 	}
 	s.layout = Layout{Root: root}
 	return s.c.Send(protocol.TypeHelloOK, protocol.HelloOK{
@@ -273,6 +310,11 @@ func (s *Session) hello(h protocol.Hello) error {
 
 // release drops every lock (also on abnormal exit).
 func (s *Session) release() {
+	s.owned.Store(nil)
+	// Shutdown (a signal) and Serve's own exit may both get here: the
+	// second waits for the first to finish rather than exiting mid-release.
+	s.relMu.Lock()
+	defer s.relMu.Unlock()
 	if s.exiting.Swap(true) {
 		return
 	}

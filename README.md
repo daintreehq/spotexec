@@ -410,7 +410,13 @@ Every job gets these environment variables:
 - `SPOTEXEC_SLOT`
 - `SPOTEXEC_PORT_BASE` (20000 + slot × 1000; use it to keep test servers from colliding)
 - `COMPOSE_PROJECT_NAME=sx_<repo>_sNN`
-- `SPOTEXEC_RUNNER`, `SPOTEXEC_RUN_ID`, `SPOTEXEC_WORKSPACE`
+- `SPOTEXEC_RUNNER`, `SPOTEXEC_WORKSPACE` (the remote checkout's absolute path)
+- `SPOTEXEC_CPUS` (this job's share of the machine) and `SPOTEXEC_SLOTS`
+- `SPOTEXEC_RUN_ID` and `SPOTEXEC_ATTEMPT`. A run whose runner is lost before
+  its result arrives (a Spot reclaim) is replayed once with the same run ID
+  and `SPOTEXEC_ATTEMPT=2`. The command may have run to completion the first
+  time, so commands with outside side effects (deploys, publishing) should
+  dedupe on `SPOTEXEC_RUN_ID` or pass `--no-retry`.
 
 Slot numbers are host-wide, so ports never collide even across different repos.
 
@@ -438,7 +444,10 @@ remote workspace.
 `~/.claude/settings.json`). Heavy Bash commands are rewritten in place to
 `spotexec run -- '<cmd>'`:
 - **Offloaded:** tests, `tsc`, linters, formatters, builds.
-- **Kept local:** `git`, `ls`, `rg`, dev servers, watch modes, pipes, redirects, background jobs.
+- **Kept local:** `git`, `ls`, `rg`, dev servers, watch modes, pipes, redirects, background jobs,
+  and anything that `cd`s outside the repository.
+- **Opt-out per command:** prefix it with `SPOTEXEC_LOCAL=1` (for example a test that needs a
+  database on `localhost`).
 
 The rewrite only happens in projects with a `.spotexec.toml`. It does not
 auto-approve anything; your normal permission rules apply to the rewritten
@@ -517,7 +526,7 @@ ignored outputs you want.
 
 ```sh
 make test     # unit tests
-make e2e      # builds, starts an Ubuntu SSH container, runs scripts/e2e.sh
+make e2e      # builds, then runs all three suites below
 scripts/e2e-pool.sh     # Spot pool scenarios on the Docker fleet simulator
 scripts/e2e-daemon.sh   # pool manager scenarios on the simulator
 ```

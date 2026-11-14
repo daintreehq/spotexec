@@ -18,17 +18,19 @@ import (
 
 // Session is a live RPC channel to spotexec-helper.
 type Session struct {
-	Conn   *protocol.Conn
-	Hello  protocol.HelloOK
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stderr *lockedBuf
-	frames chan protocol.Frame
-	errMu  sync.Mutex
-	err    error
-	done   chan struct{}
-	once   sync.Once
-	seen   atomic.Int64
+	Conn    *protocol.Conn
+	Hello   protocol.HelloOK
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	stderr  *lockedBuf
+	frames  chan protocol.Frame
+	errMu   sync.Mutex
+	err     error
+	done    chan struct{}
+	closing chan struct{} // closed by Close/Abort: stop delivering frames
+	stopped sync.Once
+	once    sync.Once
+	seen    atomic.Int64
 	// OnEvent receives helper events that arrive while waiting for replies.
 	OnEvent func(protocol.Event)
 }
@@ -63,11 +65,13 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 		return nil, err
 	}
 	s, err := c.open(ctx, path)
-	if err != nil && !IsConnError(err) {
+	if err != nil && !IsConnError(err) && ctx.Err() == nil {
 		// Stale marker (helper removed remotely, or work_root wiped): reinstall.
 		c.ForgetHelper()
 		if path, err2 := c.EnsureHelper(ctx, true); err2 == nil {
 			s, err = c.open(ctx, path)
+		} else {
+			err = err2 // why the reinstall failed is the useful error
 		}
 	}
 	return s, err
@@ -83,12 +87,12 @@ func (c *Client) open(ctx context.Context, path string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cmd: cmd, stdin: stdin, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{})}
+	s := &Session{cmd: cmd, stdin: stdin, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{})}
 	cmd.Stderr = s.stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	s.Conn = protocol.NewConn(stdout, stdin)
+	s.Conn = protocol.NewConn(protocol.ProgressReader{R: stdout, OnRead: func() { s.seen.Store(time.Now().UnixNano()) }}, stdin)
 	s.seen.Store(time.Now().UnixNano())
 	go s.readLoop()
 	go s.heartbeat()
@@ -96,15 +100,41 @@ func (c *Client) open(ctx context.Context, path string) (*Session, error) {
 		s.Close()
 		return nil, s.wrap(err)
 	}
-	hctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	// Shorter than the callers' own probe timeouts (20-30s), so a wedged
+	// master is detected and dropped here rather than by their deadline.
+	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	env, err := s.Expect(hctx, protocol.TypeHelloOK)
 	if err != nil {
-		s.Close()
-		if s.exitCode() == 255 {
-			return nil, &ConnError{Target: c.T.String(), Msg: s.stderr.String(), Err: err}
+		if ctx.Err() != nil {
+			s.Abort()
+			return nil, ctx.Err()
 		}
-		return nil, err
+		var re *RemoteError
+		if errors.As(err, &re) {
+			s.Close() // the helper answered: report what it said
+			return nil, err
+		}
+		s.Close()
+		switch code := s.exitCode(); {
+		case code == 0:
+			// The helper started and ended cleanly but no handshake (stray
+			// output from a shell profile, or an incompatible helper): not
+			// a connection problem, so Open may reinstall it.
+			return nil, s.wrap(err)
+		case code == 255:
+			return nil, &ConnError{Target: c.T.String(), Msg: s.stderr.String(), Err: err}
+		case code > 0:
+			// ssh connected but the helper didn't start (missing after a
+			// wiped work_root, wrong architecture on a reused address...):
+			// not a connection error, so Open reinstalls it.
+			return nil, &helperStartError{code: code, stderr: strings.TrimSpace(s.stderr.String())}
+		default:
+			// No answer and no exit: a wedged link. Drop the master so the
+			// next attempt dials afresh.
+			c.CloseMaster()
+			return nil, &ConnError{Target: c.T.String(), Msg: "no handshake from the helper", Err: err}
+		}
 	}
 	if err := env.Unmarshal(&s.Hello); err != nil {
 		s.Close()
@@ -141,8 +171,23 @@ func (s *Session) readLoop() {
 				continue
 			}
 		}
-		s.frames <- f
+		// Once the session is closing nobody reads frames: discard them, but
+		// keep reading to EOF so the ssh process is reaped and done closes.
+		select {
+		case s.frames <- f:
+		case <-s.closing:
+		}
 	}
+}
+
+// helperStartError: ssh worked but the helper binary could not run.
+type helperStartError struct {
+	code   int
+	stderr string
+}
+
+func (e *helperStartError) Error() string {
+	return fmt.Sprintf("helper did not start (exit %d): %s", e.code, e.stderr)
 }
 
 func (s *Session) heartbeat() {
@@ -241,7 +286,30 @@ func (s *Session) Expect(ctx context.Context, want ...string) (protocol.Envelope
 
 // Blob returns a reader over the next tar blob stream.
 func (s *Session) Blob(ctx context.Context) *protocol.BlobReader {
-	return &protocol.BlobReader{Next: func() (protocol.Frame, error) { return s.Next(ctx) }}
+	return &protocol.BlobReader{Next: func() (protocol.Frame, error) { return s.Next(ctx) }, Other: func(f protocol.Frame) error {
+		// Messages interleaved with a blob: events (a spot notice during
+		// write-back) are delivered; an error ends the stream.
+		if f.Kind != protocol.KindMsg {
+			return nil
+		}
+		env, err := protocol.Decode(f)
+		if err != nil {
+			return err
+		}
+		switch env.Type {
+		case protocol.TypeEvent:
+			var ev protocol.Event
+			_ = env.Unmarshal(&ev)
+			if s.OnEvent != nil {
+				s.OnEvent(ev)
+			}
+		case protocol.TypeError:
+			var em protocol.ErrorMsg
+			_ = env.Unmarshal(&em)
+			return &RemoteError{em}
+		}
+		return nil
+	}}
 }
 
 // Dead reports whether the SSH channel has closed.
@@ -255,11 +323,19 @@ func (s *Session) Dead() bool {
 }
 
 // LastSeen is when the helper last sent anything (heartbeats included).
-func (s *Session) LastSeen() time.Time { return time.Unix(0, s.seen.Load()) }
+// While our own frame buffer is backed up (we're not reading fast enough,
+// e.g. output piped into a paused pager), the helper is evidently alive.
+func (s *Session) LastSeen() time.Time {
+	if len(s.frames) >= cap(s.frames)/2 {
+		return time.Now()
+	}
+	return time.Unix(0, s.seen.Load())
+}
 
 // Close ends the session (releasing the remote slot). The deadline is armed
 // before any protocol write so a wedged channel cannot hang the caller.
 func (s *Session) Close() {
+	s.stopped.Do(func() { close(s.closing) })
 	s.once.Do(func() {
 		go func() {
 			_ = s.Conn.Send(protocol.TypeBye, nil)
@@ -276,6 +352,7 @@ func (s *Session) Close() {
 // Abort tears the SSH channel down immediately; the helper sees EOF,
 // terminates any command and releases the slot.
 func (s *Session) Abort() {
+	s.stopped.Do(func() { close(s.closing) })
 	s.kill()
 }
 

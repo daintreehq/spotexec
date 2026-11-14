@@ -34,6 +34,8 @@ vet:
 
 e2e: build
 	./scripts/e2e.sh
+	./scripts/e2e-pool.sh
+	./scripts/e2e-daemon.sh
 
 clean:
 	rm -f bin/spotexec bin/sx $(EMBED_DIR)/spotexec-helper-*.gz

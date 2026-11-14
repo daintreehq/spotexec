@@ -24,7 +24,7 @@ type SSH struct {
 func (s *SSH) Runner() *config.Runner { return s.r }
 
 func (s *SSH) target(host string) Target {
-	return Target{Host: host, IdentityFile: config.ExpandHome(s.r.IdentityFile), Options: s.r.SSHOptions}
+	return Target{Host: host, User: s.r.User, IdentityFile: config.ExpandHome(s.r.IdentityFile), Options: s.r.SSHOptions}
 }
 
 func (s *SSH) Status(ctx context.Context) (Info, error) {
@@ -93,7 +93,7 @@ func resolveSSH(ctx context.Context, dest string, opts []string) (string, error)
 	for _, o := range opts {
 		args = append(args, "-o", o)
 	}
-	out, err := exec.CommandContext(cctx, "ssh", append(args, dest)...).Output()
+	out, err := exec.CommandContext(cctx, "ssh", append(args, "--", dest)...).Output()
 	if err != nil {
 		return "", fmt.Errorf("ssh -G %s: %w", dest, err)
 	}

@@ -36,9 +36,15 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 			} `json:"repositories"`
 		}
 		err := a.ecr(ctx, "DescribeRepositories", map[string]any{"repositoryNames": []string{name}}, &desc)
+		policy := `{"rules":[{"rulePriority":1,"description":"keep the newest 10 spotexec images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}`
 		switch {
 		case err == nil && len(desc.Repositories) > 0:
 			uri = desc.Repositories[0].URI
+			// (Re)apply the expiry rule: a first run that created the
+			// repository may have failed before setting it.
+			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": policy}, nil); err != nil {
+				return nil, fmt.Errorf("ECR lifecycle policy for %s: %w", name, err)
+			}
 		case err == nil || strings.Contains(err.Error(), "RepositoryNotFoundException"):
 			var created struct {
 				Repository struct {
@@ -52,7 +58,6 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 				return nil, fmt.Errorf("creating ECR repository %s: %w", name, err)
 			}
 			uri = created.Repository.URI
-			policy := `{"rules":[{"rulePriority":1,"description":"keep the newest 10 spotexec images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}`
 			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": policy}, nil); err != nil {
 				return nil, fmt.Errorf("ECR lifecycle policy for %s: %w", name, err)
 			}

@@ -185,6 +185,11 @@ func (c *awsClient) query(ctx context.Context, service, version, action string, 
 			c.creds.invalidate()
 			continue
 		}
+		if isExpiredCreds(ae.Code) || ae.Code == "AuthFailure" {
+			// Still rejected with fresh credentials: no retry or cached
+			// view will help, so callers stop and say so.
+			return nil, &CredentialError{ae}
+		}
 		if classifyAWSError(ae) != errRetryable {
 			return nil, ae
 		}
@@ -198,7 +203,7 @@ func (c *awsClient) ec2(ctx context.Context, action string, params url.Values) (
 
 func isExpiredCreds(code string) bool {
 	switch code {
-	case "ExpiredToken", "ExpiredTokenException", "RequestExpired", "InvalidClientTokenId", "UnrecognizedClientException":
+	case "ExpiredToken", "ExpiredTokenException", "RequestExpired", "InvalidClientTokenId", "UnrecognizedClientException", "AuthFailure":
 		return true
 	}
 	return false
