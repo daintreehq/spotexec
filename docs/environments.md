@@ -53,7 +53,7 @@ dockerfile = ".spotexec/Dockerfile"   # built on the runner; or:
 # timeout = "20m"                     # pull/build limit
 ```
 
-- **Paths and ports.** Write-back, path rewriting and snapshots work unchanged. Containers use host networking, so `SPOTEXEC_PORT_BASE` still applies.
+- **Paths and ports.** Write-back, path rewriting and snapshots work unchanged. Containers use host networking, so `SPOTEXEC_PORT_BASE` still applies, and they resolve names from the runner's `/etc/hosts` (on `aws-spot` VMs, `localhost` is both `127.0.0.1` and `::1`).
 - **Ownership.** With `user = "root"`, files the container creates are given back to the runner user when it exits. If the run is aborted first (client gone, `spotexec unlock`), the slot's next run does it before starting.
 - **Control.** Docker always runs as the runner user, so Ctrl-C and timeouts can always stop a container. `container.options` may not set `--name`, `--rm`, `--detach`, `--entrypoint`, `--user` or `--workdir`, because spotexec relies on those to find, stop and clean up containers.
 - **Caching.** The dependency cache is keyed by the image's immutable ID, so a moving tag like `node:22` never restores modules built for an older image.

@@ -47,3 +47,55 @@ func TestRenderRootUserKeepsKeyLogin(t *testing.T) {
 		t.Fatal("root runner user would be refused by PermitRootLogin no")
 	}
 }
+
+// localhost must resolve to ::1 as well as 127.0.0.1 (as on macOS and CI
+// runners), added once, and only when the VM has an IPv6 loopback.
+func TestRenderMapsLocalhostToIPv6Loopback(t *testing.T) {
+	s, err := Render(Options{User: "ubuntu", PublicKey: "ssh-ed25519 AAAA test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(s, "# ---- 3. localhost on IPv6 too ----")
+	end := strings.Index(s, "# ---- 4. User bootstrap ----")
+	if start < 0 || end < start {
+		t.Fatal("user-data has no localhost section before the user bootstrap")
+	}
+	block := s[start:end]
+	const lo6 = "00000000000000000000000000000001 01 80 10 80       lo\n"
+	const ubuntu = "127.0.0.1 localhost\n\n# The following lines are desirable for IPv6 capable hosts\n::1 ip6-localhost ip6-loopback\nfe00::0 ip6-localnet\nff02::1 ip6-allnodes\n"
+	for _, tc := range []struct {
+		name, hosts, inet6, want string
+	}{
+		{"ubuntu", ubuntu, lo6, strings.Replace(ubuntu, "::1 ip6-localhost", "::1 localhost ip6-localhost", 1)},
+		{"already mapped", "127.0.0.1 localhost\n::1\tlocalhost ip6-localhost ip6-loopback\n", lo6, "127.0.0.1 localhost\n::1\tlocalhost ip6-localhost ip6-loopback\n"},
+		{"mapped later on the line", "127.0.0.1 localhost\n::1 ip6-localhost localhost\n", lo6, "127.0.0.1 localhost\n::1 ip6-localhost localhost\n"},
+		{"only in a comment", "127.0.0.1 localhost\n::1 ip6-localhost # localhost\n", lo6, "127.0.0.1 localhost\n::1 localhost ip6-localhost # localhost\n"},
+		{"no ::1 line", "127.0.0.1 localhost\n", lo6, "127.0.0.1 localhost\n::1 localhost\n"},
+		{"no trailing newline", "127.0.0.1 localhost", lo6, "127.0.0.1 localhost\n::1 localhost\n"},
+		{"no IPv6 loopback", ubuntu, "", ubuntu},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			hosts, inet6 := filepath.Join(dir, "hosts"), filepath.Join(dir, "if_inet6")
+			if err := os.WriteFile(hosts, []byte(tc.hosts), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(inet6, []byte(tc.inet6), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			script := strings.NewReplacer("/etc/hosts", hosts, "/proc/net/if_inet6", inet6).Replace(block)
+			for run := 1; run <= 2; run++ { // the second run must change nothing
+				if out, err := exec.Command("bash", "-c", "set -u\n"+script).CombinedOutput(); err != nil {
+					t.Fatalf("run %d: %v: %s", run, err, out)
+				}
+				got, _ := os.ReadFile(hosts)
+				if string(got) != tc.want {
+					t.Fatalf("run %d: /etc/hosts =\n%q\nwant\n%q", run, got, tc.want)
+				}
+			}
+			if _, err := os.Stat(hosts + ".sx"); err == nil {
+				t.Fatal("temporary hosts file left behind")
+			}
+		})
+	}
+}
