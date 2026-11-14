@@ -529,12 +529,24 @@ func (p *Pool) Reset() {
 var launchesInFlight sync.WaitGroup
 
 // WaitLaunches blocks (up to max) until in-flight launches are recorded.
-func WaitLaunches(max time.Duration) {
+func WaitLaunches(max time.Duration) { WaitLaunchesSaying(max, nil) }
+
+// WaitLaunchesSaying is WaitLaunches that calls say once if the wait passes
+// a second, so a finished command doesn't seem to hang.
+func WaitLaunchesSaying(max time.Duration, say func()) {
 	done := make(chan struct{})
 	go func() { launchesInFlight.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(max):
+		return
+	case <-time.After(time.Second):
+		if say != nil {
+			say()
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(max - time.Second):
 	}
 }
 

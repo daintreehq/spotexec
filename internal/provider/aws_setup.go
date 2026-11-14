@@ -417,6 +417,7 @@ func callerIdentity(ctx context.Context, c *awsClient) (account, arn string, err
 
 type accessKey struct {
 	ID      string `xml:"AccessKeyId"`
+	Status  string `xml:"Status"`
 	Created string `xml:"CreateDate"`
 }
 
@@ -704,4 +705,140 @@ func orDash(s string) string {
 		return "unknown"
 	}
 	return s
+}
+
+// Machine is one machine's spotexec IAM user, as seen from the account.
+type Machine struct {
+	User      string
+	Host      string // from the spotexec-host tag
+	MachineID string // from the spotexec-machine tag
+	Created   string
+	Keys      []MachineKey
+	VMs       int // live spotexec instances this machine owns, in the regions asked about
+	This      bool
+}
+
+// MachineKey is one access key and when it was last used.
+type MachineKey struct {
+	ID, Status, Created, LastUsed string
+}
+
+// ListMachines lists the IAM users under /spotexec/ with their keys and the
+// spotexec VMs each machine has running in regions.
+func ListMachines(ctx context.Context, adminProfile string, regions []string) ([]Machine, error) {
+	s := &AWSUserSetup{}
+	admin := s.client("us-east-1", &awsCredResolver{profile: adminProfile})
+	b, err := admin.query(ctx, "iam", iamAPIVersion, "ListUsers", url.Values{"PathPrefix": {iamUserPath}, "MaxItems": {"1000"}})
+	if err != nil {
+		return nil, iamHint(fmt.Errorf("listing spotexec's IAM users: %w", err))
+	}
+	var v struct {
+		Users []struct {
+			Name    string `xml:"UserName"`
+			Created string `xml:"CreateDate"`
+		} `xml:"ListUsersResult>Users>member"`
+	}
+	if err := xml.Unmarshal(b, &v); err != nil {
+		return nil, err
+	}
+	me, _ := ownerID()
+	vms := map[string]int{}
+	for _, region := range regions {
+		for _, in := range spotexecInstances(ctx, s.client(region, admin.creds)) {
+			vms[in.tag(tagOwner)]++
+		}
+	}
+	var out []Machine
+	for _, u := range v.Users {
+		m := Machine{User: u.Name, Created: u.Created}
+		if gu, err := getUser(ctx, admin, u.Name); err == nil {
+			m.Host, m.MachineID = gu.Tags["spotexec-host"], gu.Tags[tagMachine]
+		}
+		m.This = m.MachineID != "" && m.MachineID == me
+		m.VMs = vms[m.MachineID]
+		if keys, err := listAccessKeys(ctx, admin, u.Name); err == nil {
+			for _, k := range keys {
+				mk := MachineKey{ID: k.ID, Status: k.Status, Created: k.Created, LastUsed: "never"}
+				if lb, err := admin.query(ctx, "iam", iamAPIVersion, "GetAccessKeyLastUsed", url.Values{"AccessKeyId": {k.ID}}); err == nil {
+					if d := xmlFirst(lb, "GetAccessKeyLastUsedResult>AccessKeyLastUsed>LastUsedDate"); d != "" {
+						mk.LastUsed = d
+					}
+				}
+				m.Keys = append(m.Keys, mk)
+			}
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// spotexecInstances lists live spotexec instances in one region (any owner).
+func spotexecInstances(ctx context.Context, c *awsClient) []ec2Instance {
+	p := url.Values{"Filter.1.Name": {"tag-key"}, "Filter.1.Value.1": {tagRunner},
+		"Filter.2.Name": {"instance-state-name"}, "Filter.2.Value.1": {"pending"}, "Filter.2.Value.2": {"running"}}
+	var out []ec2Instance
+	for page := 0; page < 20; page++ {
+		b, err := c.ec2(ctx, "DescribeInstances", p)
+		if err != nil {
+			return out
+		}
+		ins, next, err := parseDescribeInstances(b)
+		if err != nil {
+			return out
+		}
+		out = append(out, ins...)
+		if next == "" {
+			break
+		}
+		p.Set("NextToken", next)
+	}
+	return out
+}
+
+// RevokeMachine deletes a machine's spotexec IAM user (its keys and policy
+// first, so the key stops working at once) and terminates the VMs that
+// machine owns in regions. user is the IAM user name.
+func RevokeMachine(ctx context.Context, adminProfile, user string, regions []string, log func(string, ...any)) error {
+	s := &AWSUserSetup{}
+	admin := s.client("us-east-1", &awsCredResolver{profile: adminProfile})
+	u, err := getUser(ctx, admin, user)
+	if err != nil {
+		return iamHint(fmt.Errorf("IAM user %s: %w", user, err))
+	}
+	if !strings.HasSuffix(u.ARN, ":user"+iamUserPath+user) {
+		return fmt.Errorf("IAM user %s wasn't created by spotexec (%s); not touching it", user, u.ARN)
+	}
+	keys, err := listAccessKeys(ctx, admin, user)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if err := deleteAccessKey(ctx, admin, user, k.ID); err != nil {
+			return err
+		}
+		log("deleted access key %s", k.ID)
+	}
+	if _, err := admin.query(ctx, "iam", iamAPIVersion, "DeleteUserPolicy", url.Values{"UserName": {user}, "PolicyName": {"spotexec"}}); err != nil && awsCode(err) != "NoSuchEntity" {
+		return iamHint(fmt.Errorf("deleting %s's policy: %w", user, err))
+	}
+	if _, err := admin.query(ctx, "iam", iamAPIVersion, "DeleteUser", url.Values{"UserName": {user}}); err != nil {
+		return iamHint(fmt.Errorf("deleting IAM user %s: %w", user, err))
+	}
+	log("deleted IAM user %s", user)
+	if m := u.Tags[tagMachine]; m != "" {
+		for _, region := range regions {
+			c := s.client(region, admin.creds)
+			for _, in := range spotexecInstances(ctx, c) {
+				if in.tag(tagOwner) != m {
+					continue
+				}
+				if _, err := c.ec2(ctx, "TerminateInstances", url.Values{"InstanceId.1": {in.InstanceID}}); err != nil {
+					log("warning: couldn't terminate %s in %s: %v", in.InstanceID, region, err)
+					continue
+				}
+				log("terminated %s (%s) in %s", in.InstanceID, in.tag(tagRunner), region)
+			}
+		}
+	}
+	return nil
 }

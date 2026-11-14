@@ -398,6 +398,31 @@ func LoadPerCPU() (float64, error) {
 	return l / float64(runtime.NumCPU()), nil
 }
 
+// HasClaude reports whether a Claude Code settings file has the hook.
+func HasClaude(settingsPath string) bool {
+	b, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return false
+	}
+	var settings map[string]any
+	if json.Unmarshal(b, &settings) != nil {
+		return false
+	}
+	hooks, _ := settings["hooks"].(map[string]any)
+	pre, _ := hooks["PreToolUse"].([]any)
+	for _, e := range pre {
+		em, _ := e.(map[string]any)
+		hs, _ := em["hooks"].([]any)
+		for _, h := range hs {
+			hm, _ := h.(map[string]any)
+			if c, _ := hm["command"].(string); strings.Contains(c, "hook claude") && strings.Contains(c, "spotexec") || strings.HasSuffix(c, "sx hook claude") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // InstallClaude adds the PreToolUse hook to a Claude Code settings file,
 // preserving everything else. It is idempotent.
 func InstallClaude(settingsPath, hookCmd string) (bool, error) {

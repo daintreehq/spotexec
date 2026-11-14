@@ -42,10 +42,14 @@ type AcquireRequest struct {
 	QueueTimeout time.Duration
 	PreferSlot   int
 	OnlySlot     bool // wait for PreferSlot instead of taking another slot
-	Rep          ui.Reporter
-	NoBoot       bool            // never launch fleet instances
-	Priority     int             // queue priority (higher first)
-	Exclude      map[string]bool // fleet instance IDs to avoid (e.g. one being reclaimed)
+	// PreferInstance is the VM this worktree ran on last: tried first among
+	// its fleet's VMs, since its slot already holds the worktree's files and
+	// build caches.
+	PreferInstance string
+	Rep            ui.Reporter
+	NoBoot         bool            // never launch fleet instances
+	Priority       int             // queue priority (higher first)
+	Exclude        map[string]bool // fleet instance IDs to avoid (e.g. one being reclaimed)
 }
 
 // Connect opens a helper session on a known target.
@@ -181,6 +185,14 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			}
 			if !req.NoBoot || usable > 0 {
 				reachable++ // a fleet can always grow (or is growing)
+			}
+			if req.PreferInstance != "" {
+				for i, in := range cands {
+					if in.ID == req.PreferInstance && i > 0 {
+						cands = append([]provider.Instance{in}, append(append([]provider.Instance{}, cands[:i]...), cands[i+1:]...)...)
+						break
+					}
+				}
 			}
 			fleetCands[m] = cands
 			window += usable * m.pool.SlotsPerInstance()

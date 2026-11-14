@@ -315,7 +315,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 func (f *runFlags) execute(l *loaded, s runSpec) int {
 	// A scale-out started by this process must record its instance ID before
 	// we exit, or the pool could lose track of it for a while.
-	defer client.WaitLaunches(90 * time.Second)
+	defer waitLaunches()
 	f.applyEnv()
 	if f.sync != "" && f.sync != "auto" && f.sync != "in" && f.sync != "none" {
 		fmt.Fprintf(os.Stderr, "spotexec: --sync must be auto, in or none\n")
@@ -439,7 +439,7 @@ func taskCommand(run string, args []string) string {
 // runTask executes a named task (possibly a parallel fan-out).
 func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	t := l.cfg.Project.Tasks[name]
-	defer client.WaitLaunches(90 * time.Second)
+	defer waitLaunches()
 	if len(t.Parallel) == 0 {
 		cmd := buildTaskLine(l, t.Run, args)
 		return f.execute(l, runSpec{label: name, command: cmd, display: name + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool, priority: t.Priority})
@@ -584,3 +584,11 @@ func (t *taskReporter) Event(name string, fields map[string]any) {
 func (t *taskReporter) Status(string, ...any) {}
 func (t *taskReporter) Clear()                {}
 func (t *taskReporter) Done(string, bool)     {}
+
+// waitLaunches lets a VM launch this process started record its instance
+// ID before exiting (or the fleet could lose track of it for a while).
+func waitLaunches() {
+	client.WaitLaunchesSaying(90*time.Second, func() {
+		fmt.Fprintln(os.Stderr, "sx: finishing a VM launch this run started (a few seconds; the command's result is above)")
+	})
+}

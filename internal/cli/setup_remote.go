@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/BurntSushi/toml"
+
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/provider"
 )
@@ -33,9 +35,17 @@ type remoteSetup struct {
 	profile      string
 	rotate       bool
 	noVPC        bool
+	noHooks      bool
 	aws          bool
 	ctlDir       string
+	out          io.Writer // this host's output (buffered when hosts run in parallel)
+	// The AWS sign-in passed to each host's setup, resolved once.
+	adminEnv []string
+	adminARN string
+	adminErr error
 }
+
+func (r *remoteSetup) printf(format string, args ...any) { fmt.Fprintf(r.out, format, args...) }
 
 const remotePath = `PATH="/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:$PATH"; export PATH; `
 
@@ -77,7 +87,7 @@ func (r *remoteSetup) stream(ctx context.Context, script string, stdin io.Reader
 	go func() {
 		sc := bufio.NewScanner(pr)
 		for sc.Scan() {
-			fmt.Println("    " + sc.Text())
+			r.printf("%s\n", "    "+sc.Text())
 		}
 		close(done)
 	}()
@@ -150,7 +160,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 		if i.brew == "" {
 			return "", "", errors.New("Homebrew isn't installed there (use --install release)")
 		}
-		fmt.Println("  installing spotexec with Homebrew (latest)…")
+		r.printf("%s\n", "  installing spotexec with Homebrew (latest)…")
 		out, err := r.run(ctx, `brew update --quiet >/dev/null 2>&1; `+
 			`if brew list --versions spotexec >/dev/null 2>&1; then verb=upgrade; else verb=install; fi; `+
 			`out=$(brew "$verb" daintreehq/tap/spotexec 2>&1); rc=$?; `+
@@ -162,7 +172,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 		if err != nil {
 			why := brewError(out + err.Error())
 			if r.install == "auto" {
-				fmt.Printf("  Homebrew couldn't install it (%s); using the release binary instead\n", why)
+				r.printf("  Homebrew couldn't install it (%s); using the release binary instead\n", why)
 				r.install = "release"
 				return r.installSpotexec(ctx, i)
 			}
@@ -170,7 +180,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 		}
 		for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
 			if l != "" {
-				fmt.Println("  " + l)
+				r.printf("%s\n", "  "+l)
 			}
 		}
 		return "spotexec", "Homebrew", nil
@@ -180,7 +190,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 			return "", "", err
 		}
 		url := fmt.Sprintf("https://github.com/daintreehq/spotexec/releases/download/%s/spotexec_%s_%s_%s.tar.gz", tag, strings.TrimPrefix(tag, "v"), i.os, i.arch)
-		fmt.Printf("  installing spotexec %s into ~/.local/bin…\n", tag)
+		r.printf("  installing spotexec %s into ~/.local/bin…\n", tag)
 		if _, err := r.run(ctx, `set -e; mkdir -p "$HOME/.local/bin"; t=$(mktemp -d); `+
 			`curl -fsSL `+shq(url)+` | tar -xz -C "$t" spotexec; mv "$t/spotexec" "$HOME/.local/bin/spotexec"; rmdir "$t"; `+
 			`ln -sf spotexec "$HOME/.local/bin/sx"`, nil); err != nil {
@@ -200,7 +210,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 			return "", "", err
 		}
 		defer f.Close()
-		fmt.Printf("  copying this spotexec (%s) into ~/.local/bin…\n", Version)
+		r.printf("  copying this spotexec (%s) into ~/.local/bin…\n", Version)
 		if _, err := r.run(ctx, `set -e; mkdir -p "$HOME/.local/bin"; cat > "$HOME/.local/bin/.spotexec.tmp"; `+
 			`chmod 755 "$HOME/.local/bin/.spotexec.tmp"; mv "$HOME/.local/bin/.spotexec.tmp" "$HOME/.local/bin/spotexec"; `+
 			`ln -sf spotexec "$HOME/.local/bin/sx"`, f); err != nil {
@@ -218,7 +228,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 
 // do sets up one host.
 func (r *remoteSetup) do(ctx context.Context) error {
-	fmt.Printf("\n→ %s\n", r.host)
+	r.printf("\n→ %s\n", r.host)
 	i, err := r.probe(ctx)
 	if err != nil {
 		return err
@@ -238,7 +248,7 @@ func (r *remoteSetup) do(ctx context.Context) error {
 	if strings.Contains(ver, "NO-SETUP") {
 		return fmt.Errorf("%s there has no `setup` command; it needs spotexec 0.2.0 or later", strings.TrimSpace(strings.Split(ver, "\n")[0]))
 	}
-	fmt.Printf("  ✓ %s (%s)\n", strings.TrimSpace(strings.Split(ver, "\n")[0]), how)
+	r.printf("  ✓ %s (%s)\n", strings.TrimSpace(strings.Split(ver, "\n")[0]), how)
 
 	// The runner config, keeping a backup of a different one. SSH keys and
 	// the owner id stay per machine (each machine owns its own VMs).
@@ -255,30 +265,35 @@ func (r *remoteSetup) do(ctx context.Context) error {
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	for _, l := range lines[:len(lines)-1] {
-		fmt.Println("  " + l)
+		r.printf("%s\n", "  "+l)
 	}
-	fmt.Printf("  ✓ copied the runner config to %s\n", lines[len(lines)-1])
+	r.printf("  ✓ copied the runner config to %s\n", lines[len(lines)-1])
 
-	if !r.aws {
-		return nil
-	}
-	// Run setup there with this machine's AWS sign-in (passed on stdin, so
-	// it never appears in a command line), creating that machine's own user.
-	env, arn, err := provider.AdminSession(ctx, r.adminProfile)
-	if err != nil {
-		// A machine that already has its key needs no admin session; one
-		// that doesn't will say so.
-		env = []string{"", "", ""}
-		fmt.Printf("  checking AWS access there (not signed in to AWS here, so it can't create a key: %v)…\n", firstLine(err.Error()))
-	} else {
-		fmt.Printf("  setting up AWS access there (as %s)…\n", arn)
-	}
+	// Run setup there: with AWS runners, using this machine's AWS sign-in
+	// (passed on stdin, so it never appears in a command line) to create
+	// that machine's own user; the Claude Code hook too, like here.
+	env := []string{"", "", ""}
 	flags := " --yes --profile " + shq(r.profile)
+	if r.aws {
+		if r.adminErr != nil {
+			// A machine that already has its key needs no admin session; one
+			// that doesn't will say so.
+			r.printf("  checking AWS access there (not signed in to AWS here, so it can't create a key: %v)…\n", firstLine(r.adminErr.Error()))
+		} else {
+			env = r.adminEnv
+			r.printf("  setting up AWS access there (as %s)…\n", r.adminARN)
+		}
+	} else {
+		flags += " --skip-aws"
+	}
 	if r.rotate {
 		flags += " --rotate"
 	}
 	if r.noVPC {
 		flags += " --no-vpc"
+	}
+	if r.noHooks {
+		flags += " --no-hooks"
 	}
 	script := `IFS= read -r k; IFS= read -r s; IFS= read -r t; ` +
 		`AWS_ACCESS_KEY_ID="$k" AWS_SECRET_ACCESS_KEY="$s" AWS_SESSION_TOKEN="$t" AWS_PROFILE= AWS_DEFAULT_PROFILE= SPOTEXEC_SETUP_NESTED=1 ` +
@@ -327,7 +342,8 @@ func (r *remoteSetup) close() {
 	_ = exec.Command("ssh", "-o", "ControlPath="+filepath.Join(r.ctlDir, "%C"), "-O", "exit", r.host).Run()
 }
 
-// setupHosts sets up each host in turn and reports a summary.
+// setupHosts sets up the hosts, four at a time, printing each one's output
+// as a block when it finishes, and records them in the machine list.
 func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
 	// /tmp, not $TMPDIR: a socket path must stay under ~104 bytes.
 	dir, err := os.MkdirTemp("/tmp", "sx-")
@@ -338,23 +354,120 @@ func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	var failed []string
-	for _, h := range hosts {
-		r := base
-		r.host, r.ctlDir = h, dir
-		err := r.do(ctx)
-		r.close()
-		if err != nil {
-			fmt.Printf("  ✗ %s: %v\n", h, err)
-			failed = append(failed, h)
-			continue
-		}
-		fmt.Printf("  ✓ %s is ready: run `sx <command>` in a project there\n", h)
+	if base.aws {
+		base.adminEnv, base.adminARN, base.adminErr = provider.AdminSession(ctx, base.adminProfile)
 	}
+	if len(hosts) > 1 {
+		fmt.Printf("\nSetting up %s…\n", strings.Join(hosts, ", "))
+	}
+	var mu sync.Mutex
+	var failed []string
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for _, h := range hosts {
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			var buf bytes.Buffer
+			r := base
+			r.host, r.ctlDir, r.out = h, dir, &buf
+			if len(hosts) == 1 {
+				r.out = os.Stdout // one host: stream it
+			}
+			err := r.do(ctx)
+			r.close()
+			if err != nil {
+				r.printf("  ✗ %s: %v\n", h, err)
+			} else {
+				r.printf("  ✓ %s is ready: run `sx <command>` in a project there\n", h)
+				rememberMachine(h)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			os.Stdout.Write(buf.Bytes())
+			if err != nil {
+				failed = append(failed, h)
+			}
+		}(h)
+	}
+	wg.Wait()
 	if len(failed) > 0 {
+		sort.Strings(failed)
 		return fmt.Errorf("setup failed on %s", strings.Join(failed, ", "))
 	}
 	return nil
+}
+
+// The machines setup has set up from here, so `setup --all` can update them
+// and the picker can show them.
+type machineList struct {
+	Machines []savedMachine `toml:"machine"`
+}
+
+type savedMachine struct {
+	Host      string    `toml:"host"`
+	LastSetup time.Time `toml:"last_setup"`
+	Version   string    `toml:"version"`
+}
+
+var machinesMu sync.Mutex
+
+func machinesPath() string { return filepath.Join(config.Dir(), "machines.toml") }
+
+func loadMachines() []savedMachine {
+	var m machineList
+	if _, err := toml.DecodeFile(machinesPath(), &m); err != nil {
+		return nil
+	}
+	return m.Machines
+}
+
+func saveMachines(ms []savedMachine) error {
+	var b bytes.Buffer
+	b.WriteString("# Machines `spotexec setup` has set up from here; `spotexec setup --all` updates them.\n")
+	if err := toml.NewEncoder(&b).Encode(machineList{Machines: ms}); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(config.Dir(), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(machinesPath(), b.Bytes(), 0o600)
+}
+
+func rememberMachine(host string) {
+	machinesMu.Lock()
+	defer machinesMu.Unlock()
+	ms := loadMachines()
+	found := false
+	for i := range ms {
+		if strings.EqualFold(ms[i].Host, host) {
+			ms[i].LastSetup, ms[i].Version, found = time.Now().UTC().Truncate(time.Second), Version, true
+		}
+	}
+	if !found {
+		ms = append(ms, savedMachine{Host: host, LastSetup: time.Now().UTC().Truncate(time.Second), Version: Version})
+	}
+	_ = saveMachines(ms)
+}
+
+func forgetMachine(match func(host string) bool) []string {
+	machinesMu.Lock()
+	defer machinesMu.Unlock()
+	var keep []savedMachine
+	var gone []string
+	for _, m := range loadMachines() {
+		if match(m.Host) {
+			gone = append(gone, m.Host)
+		} else {
+			keep = append(keep, m)
+		}
+	}
+	if len(gone) > 0 {
+		_ = saveMachines(keep)
+	}
+	return gone
 }
 
 // discoverHosts lists machines that look reachable over SSH: Bonjour
@@ -372,6 +485,9 @@ func discoverHosts(ctx context.Context) []string {
 		}
 		seen[k] = true
 		out = append(out, h)
+	}
+	for _, m := range loadMachines() {
+		add(m.Host) // set up before: listed first
 	}
 	var bonjour []string
 	if _, err := exec.LookPath("dns-sd"); err == nil {
@@ -472,9 +588,17 @@ func isSelf(h string) bool {
 func chooseHosts(found []string, in *bufio.Reader) []string {
 	fmt.Println("\nSet up other machines too? spotexec installs itself there over SSH, copies this config, and gives each machine its own AWS key.")
 	if len(found) > 0 {
-		fmt.Println("Found on your network and in ~/.ssh/config:")
+		fmt.Println("Found on your network, in ~/.ssh/config, and set up before:")
+		saved := map[string]savedMachine{}
+		for _, m := range loadMachines() {
+			saved[strings.ToLower(m.Host)] = m
+		}
 		for i, h := range found {
-			fmt.Printf("  %2d. %s\n", i+1, h)
+			note := ""
+			if m, ok := saved[strings.ToLower(h)]; ok {
+				note = fmt.Sprintf("   (set up %s, spotexec %s)", m.LastSetup.Local().Format("Jan 2"), m.Version)
+			}
+			fmt.Printf("  %2d. %s%s\n", i+1, h, note)
 		}
 		fmt.Print("Numbers, `all`, or host names, separated by spaces (Enter to skip): ")
 	} else {

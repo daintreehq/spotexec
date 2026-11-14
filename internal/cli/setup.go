@@ -2,24 +2,30 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/hooks"
 	"github.com/daintreehq/spotexec/internal/provider"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 func cmdSetup() *cobra.Command {
 	var profile, adminProfile, user, install string
-	var yes, rotate, skipAWS, printPolicy, noVPC bool
+	var yes, rotate, skipAWS, printPolicy, noVPC, noHooks, all, list bool
+	var revoke string
 	c := &cobra.Command{
 		Use:   "setup [host...]",
 		Short: "First-time setup: runner config, plus a dedicated AWS user so you only sign in once",
@@ -47,6 +53,12 @@ and keeps a working key. --rotate replaces the key.
 			if printPolicy {
 				fmt.Println(provider.SpotexecPolicy)
 				return nil
+			}
+			if list {
+				return listMachines(cmd.Context(), adminProfile)
+			}
+			if revoke != "" {
+				return revokeMachine(cmd.Context(), adminProfile, revoke, yes)
 			}
 			setupLocal := func() (bool, error) {
 				p := config.GlobalPath()
@@ -163,14 +175,25 @@ and keeps a working key. --rotate replaces the key.
 			if err != nil {
 				return err
 			}
+			hookOn := setupClaudeHook(yes, noHooks)
 			hosts := args
-			if len(hosts) == 0 && !yes && ui.IsTerminal(os.Stdin) && ui.IsTerminal(os.Stdout) {
+			if all {
+				for _, m := range loadMachines() {
+					if !containsFold(hosts, m.Host) {
+						hosts = append(hosts, m.Host)
+					}
+				}
+				if len(hosts) == 0 {
+					fmt.Println("  no other machines have been set up from here yet")
+				}
+			}
+			if len(hosts) == 0 && !all && !yes && ui.IsTerminal(os.Stdin) && ui.IsTerminal(os.Stdout) {
 				hosts = chooseHosts(discoverHosts(cmd.Context()), bufio.NewReader(os.Stdin))
 			}
 			if len(hosts) > 0 {
 				if err := setupHosts(cmd.Context(), hosts, remoteSetup{
 					install: install, adminProfile: adminProfile, profile: profile,
-					rotate: rotate, noVPC: noVPC, aws: hasAWS,
+					rotate: rotate, noVPC: noVPC, aws: hasAWS, noHooks: noHooks || !hookOn,
 				}); err != nil {
 					return err
 				}
@@ -185,6 +208,10 @@ and keeps a working key. --rotate replaces the key.
 	c.Flags().BoolVarP(&yes, "yes", "y", false, "don't ask for confirmation")
 	c.Flags().BoolVar(&rotate, "rotate", false, "replace the access key even if the current one works")
 	c.Flags().BoolVar(&skipAWS, "skip-aws", false, "only write the runner config")
+	c.Flags().BoolVar(&all, "all", false, "also update every machine set up from here before (config, spotexec version, AWS policy)")
+	c.Flags().BoolVar(&list, "list", false, "list every machine's spotexec IAM user, keys and running VMs, then exit")
+	c.Flags().StringVar(&revoke, "revoke", "", "delete a machine's IAM user and keys and terminate its VMs (host or IAM user name), then exit")
+	c.Flags().BoolVar(&noHooks, "no-hooks", false, "don't install the Claude Code hook")
 	c.Flags().BoolVar(&noVPC, "no-vpc", false, "don't create a default VPC when the region has none")
 	c.Flags().StringVar(&install, "install", "auto", "how to install spotexec on other machines: auto, brew, release, copy (this binary) or none")
 	c.Flags().BoolVar(&printPolicy, "print-policy", false, "print the IAM policy spotexec needs and exit")
@@ -353,4 +380,173 @@ func setRunnerProfileText(text string, runners []string, profile string) (string
 		return "", fmt.Errorf("couldn't find [runners.%s]", strings.Join(missing, "], [runners."))
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+// setupClaudeHook installs the Claude Code hook for all projects when Claude
+// Code is on this machine, asking first in a terminal. It reports whether the
+// hook is installed afterwards.
+func setupClaudeHook(yes, skip bool) bool {
+	home, _ := os.UserHomeDir()
+	p := filepath.Join(home, ".claude", "settings.json")
+	if hooks.HasClaude(p) {
+		fmt.Printf("✓ Claude Code hook in %s\n", p)
+		return true
+	}
+	if skip {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude")); err != nil {
+		if _, err := exec.LookPath("claude"); err != nil {
+			return false // no Claude Code here
+		}
+	}
+	if !yes {
+		if !ui.IsTerminal(os.Stdin) {
+			return false
+		}
+		fmt.Print("\nInstall the Claude Code hook for all your projects? Agents' heavy commands (tests, linters, builds)\nthen run on your runners; it only acts in projects with a .spotexec.toml. [Y/n] ")
+		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		if a := strings.ToLower(strings.TrimSpace(line)); a != "" && a != "y" && a != "yes" {
+			return false
+		}
+	}
+	if _, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
+		fmt.Printf("! couldn't install the Claude Code hook: %v\n", err)
+		return false
+	}
+	fmt.Printf("✓ installed the Claude Code hook in %s\n", p)
+	fmt.Println("  Permission rules now see `spotexec run -- <cmd>`: allow `Bash(spotexec run:*)` if you pre-approve test commands.")
+	return true
+}
+
+func containsFold(list []string, s string) bool {
+	for _, x := range list {
+		if strings.EqualFold(x, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// awsRegions lists the regions the configured AWS runners use.
+func awsRegions() []string {
+	g, err := config.LoadGlobal()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, r := range awsRunners(g) {
+		if !containsFold(out, r.Region) {
+			out = append(out, r.Region)
+		}
+	}
+	return out
+}
+
+func listMachines(ctx context.Context, adminProfile string) error {
+	regions := awsRegions()
+	ms, err := provider.ListMachines(ctx, adminProfile, regions)
+	if err != nil {
+		return err
+	}
+	if len(ms) == 0 {
+		fmt.Println("no spotexec IAM users in this account yet (run `spotexec setup`)")
+		return nil
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(tw, "IAM USER\tHOST\tKEY\tKEY CREATED\tLAST USED\tVMS\n")
+	for _, m := range ms {
+		name := m.User
+		if m.This {
+			name += " (this machine)"
+		}
+		key, created, used := "none", "-", "-"
+		if len(m.Keys) > 0 {
+			k := m.Keys[len(m.Keys)-1]
+			key, created, used = k.ID, shortDate(k.Created), shortDate(k.LastUsed)
+			if len(m.Keys) > 1 {
+				key += fmt.Sprintf(" (+%d)", len(m.Keys)-1)
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\n", name, orDash(m.Host), key, created, used, m.VMs)
+	}
+	tw.Flush()
+	if len(regions) > 0 {
+		fmt.Printf("\nVMs counted in %s. Revoke a machine: spotexec setup --revoke <host or user>\n", strings.Join(regions, ", "))
+	}
+	return nil
+}
+
+func shortDate(s string) string {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.Local().Format("2006-01-02 15:04")
+	}
+	return s
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) error {
+	regions := awsRegions()
+	ms, err := provider.ListMachines(ctx, adminProfile, regions)
+	if err != nil {
+		return err
+	}
+	short := strings.ToLower(strings.Split(strings.TrimPrefix(target, "spotexec-"), ".")[0])
+	if i := strings.LastIndex(short, "@"); i >= 0 {
+		short = short[i+1:]
+	}
+	var hit *provider.Machine
+	for i, m := range ms {
+		if strings.EqualFold(m.User, target) || strings.EqualFold(m.Host, short) || strings.EqualFold(m.User, "spotexec-"+short) {
+			if hit != nil {
+				return fmt.Errorf("%q matches both %s and %s; name the IAM user", target, hit.User, m.User)
+			}
+			hit = &ms[i]
+		}
+	}
+	if hit == nil {
+		return fmt.Errorf("no spotexec IAM user matches %q (see spotexec setup --list)", target)
+	}
+	what := fmt.Sprintf("IAM user %s (host %s) and its %d key(s)", hit.User, orDash(hit.Host), len(hit.Keys))
+	if hit.VMs > 0 {
+		what += fmt.Sprintf(", and terminate its %d running VM(s)", hit.VMs)
+	}
+	if hit.This {
+		what += ". This is THIS machine: spotexec stops working here until you run `spotexec setup` again"
+	}
+	if !yes {
+		if !ui.IsTerminal(os.Stdin) {
+			return fmt.Errorf("would delete %s; re-run with --yes to go ahead", what)
+		}
+		fmt.Printf("Delete %s? [y/N] ", what)
+		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
+			return exitWith(1)
+		}
+	}
+	if err := provider.RevokeMachine(ctx, adminProfile, hit.User, regions, func(f string, a ...any) { fmt.Printf("  "+f+"\n", a...) }); err != nil {
+		return err
+	}
+	gone := forgetMachine(func(h string) bool {
+		hs := strings.ToLower(strings.Split(h, ".")[0])
+		if i := strings.LastIndex(hs, "@"); i >= 0 {
+			hs = hs[i+1:]
+		}
+		return hs == strings.ToLower(hit.Host) || hs == short
+	})
+	fmt.Printf("✓ revoked %s", hit.User)
+	if len(gone) > 0 {
+		fmt.Printf(" and removed %s from the machine list", strings.Join(gone, ", "))
+	}
+	fmt.Println()
+	if !hit.This {
+		fmt.Println("  Its key no longer works. On that machine, delete the [spotexec] section of ~/.aws/credentials.")
+	}
+	return nil
 }

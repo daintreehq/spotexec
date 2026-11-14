@@ -209,6 +209,14 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// Without a sync the slot's files are not ours: don't claim ownership.
 	base.KeepOwner = o.Sync == "none"
 	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority}
+	// Recently used here: go back to that VM while it has room (warm files
+	// and build caches). After a while, let work consolidate onto the
+	// oldest VMs again so younger ones can idle out.
+	if fi, err := os.Stat(lastRunPath(ws)); err == nil && time.Since(fi.ModTime()) < 10*time.Minute {
+		if lr, err := LoadLastRun(ws); err == nil {
+			req.PreferInstance = lr.InstanceID
+		}
+	}
 	var lease *Lease
 	if o.PreferLast || o.SameSlot {
 		// exec runs without syncing, so it must land in exactly the slot that
