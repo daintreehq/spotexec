@@ -110,7 +110,7 @@ Numbers, `all`, or host names, separated by spaces (Enter to skip): 1 2
 
 For each machine, over one SSH connection (any SSH destination works, including `user@host` and `~/.ssh/config` aliases; key login is easiest, but a password prompt is fine):
 
-1. **Installs spotexec.** With Homebrew there, it runs `brew install daintreehq/tap/spotexec`, or `brew upgrade` if spotexec is already installed. Without Homebrew, it downloads the latest release binary into `~/.local/bin` (add that to `PATH`). `--install brew|release|copy|none` picks the method; `copy` sends this machine's own binary, for a machine of the same OS and architecture.
+1. **Installs spotexec.** With Homebrew there, it runs `brew install daintreehq/tap/spotexec`, or `brew upgrade` if spotexec is already installed. Without Homebrew, or when Homebrew refuses (for example because the machine's Xcode Command Line Tools are out of date), it downloads the latest release binary into `~/.local/bin` instead, and says how to add that to `PATH` if it isn't there. `--install brew|release|copy|none` picks the method; `copy` sends this machine's own binary, for a machine of the same OS and architecture.
 2. **Copies the runner config** to `~/.config/spotexec/config.toml` there. A different existing config is first saved as `config.toml.bak-<time>`.
 3. **Sets up AWS access**, for configs with AWS runners. It runs `spotexec setup` on that machine using your AWS sign-in here. The temporary credentials go over the SSH connection's input, so they never appear in a command line and are never saved there. That machine gets **its own** IAM user, `spotexec-<its hostname>`, and key. It also gets the same checks as this one.
 

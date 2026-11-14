@@ -151,13 +151,27 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 			return "", "", errors.New("Homebrew isn't installed there (use --install release)")
 		}
 		fmt.Println("  installing spotexec with Homebrew (latest)…")
-		if err := r.stream(ctx, `brew update --quiet >/dev/null 2>&1; `+
-			`if brew list --versions spotexec >/dev/null 2>&1; then brew upgrade daintreehq/tap/spotexec 2>&1 | tail -3; `+
-			`else brew install daintreehq/tap/spotexec 2>&1 | tail -3; fi; brew list --versions spotexec >/dev/null; `+
+		out, err := r.run(ctx, `brew update --quiet >/dev/null 2>&1; `+
+			`if brew list --versions spotexec >/dev/null 2>&1; then verb=upgrade; else verb=install; fi; `+
+			`out=$(brew "$verb" daintreehq/tap/spotexec 2>&1); rc=$?; `+
+			`if ! brew list --versions spotexec >/dev/null 2>&1; then printf '%s\n' "$out" | tail -n 20; exit 1; fi; `+
+			`[ $rc -eq 0 ] || echo "warning: brew $verb failed; keeping the installed version: $(printf '%s\n' "$out" | grep -m1 '^Error')"; `+
 			// An earlier copy in ~/.local/bin would shadow Homebrew's.
 			`if [ -f "$HOME/.local/bin/spotexec" ]; then rm -f "$HOME/.local/bin/spotexec"; `+
-			`[ -L "$HOME/.local/bin/sx" ] && rm -f "$HOME/.local/bin/sx"; echo "removed an older spotexec from ~/.local/bin"; fi`, nil); err != nil {
-			return "", "", fmt.Errorf("brew install failed: %w", err)
+			`[ -L "$HOME/.local/bin/sx" ] && rm -f "$HOME/.local/bin/sx"; echo "removed an older spotexec from ~/.local/bin"; fi`, nil)
+		if err != nil {
+			why := brewError(out + err.Error())
+			if r.install == "auto" {
+				fmt.Printf("  Homebrew couldn't install it (%s); using the release binary instead\n", why)
+				r.install = "release"
+				return r.installSpotexec(ctx, i)
+			}
+			return "", "", fmt.Errorf("brew install failed: %s", why)
+		}
+		for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+			if l != "" {
+				fmt.Println("  " + l)
+			}
 		}
 		return "spotexec", "Homebrew", nil
 	case "release":
@@ -172,7 +186,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 			`ln -sf spotexec "$HOME/.local/bin/sx"`, nil); err != nil {
 			return "", "", fmt.Errorf("downloading %s: %w", url, err)
 		}
-		return "$HOME/.local/bin/spotexec", "release " + tag + ", ~/.local/bin (add it to PATH)", nil
+		return "$HOME/.local/bin/spotexec", "release " + tag + " in ~/.local/bin" + r.pathHint(ctx), nil
 	case "copy":
 		if i.os != runtime.GOOS || i.arch != runtime.GOARCH {
 			return "", "", fmt.Errorf("--install copy needs the same platform (this is %s/%s, that is %s/%s)", runtime.GOOS, runtime.GOARCH, i.os, i.arch)
@@ -192,7 +206,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 			`ln -sf spotexec "$HOME/.local/bin/sx"`, f); err != nil {
 			return "", "", err
 		}
-		return "$HOME/.local/bin/spotexec", "copied from this machine, ~/.local/bin", nil
+		return "$HOME/.local/bin/spotexec", "copied from this machine into ~/.local/bin" + r.pathHint(ctx), nil
 	case "none":
 		if i.spotexec == "" {
 			return "", "", errors.New("spotexec isn't installed there (drop --install none)")
@@ -213,9 +227,13 @@ func (r *remoteSetup) do(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ver, err := r.run(ctx, bin+` version && `+bin+` setup --help >/dev/null 2>&1 || echo NO-SETUP`, nil)
+	ver, err := r.run(ctx, `command -v `+bin+` >/dev/null || { echo NOT-INSTALLED; exit 0; }; `+
+		bin+` version && { `+bin+` setup --help >/dev/null 2>&1 || echo NO-SETUP; }`, nil)
 	if err != nil {
 		return fmt.Errorf("spotexec doesn't run there: %w", err)
+	}
+	if strings.Contains(ver, "NOT-INSTALLED") {
+		return errors.New("spotexec isn't installed there")
 	}
 	if strings.Contains(ver, "NO-SETUP") {
 		return fmt.Errorf("%s there has no `setup` command; it needs spotexec 0.2.0 or later", strings.TrimSpace(strings.Split(ver, "\n")[0]))
@@ -269,6 +287,32 @@ func (r *remoteSetup) do(ctx context.Context) error {
 		return fmt.Errorf("spotexec setup failed there: %w", err)
 	}
 	return nil
+}
+
+// brewError picks Homebrew's error line out of its output.
+func brewError(out string) string {
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "Error:") {
+			return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(l), "Error:"))
+		}
+	}
+	return firstLine(strings.TrimSpace(out))
+}
+
+// pathHint says how to put ~/.local/bin on PATH when a login shell there
+// doesn't have it.
+func (r *remoteSetup) pathHint(ctx context.Context) string {
+	out, err := r.run(ctx, `"${SHELL:-/bin/sh}" -lc 'echo ":$PATH:"' 2>/dev/null`, nil)
+	if err != nil || strings.Contains(out, "/.local/bin:") {
+		return ""
+	}
+	rc := "~/.profile"
+	if sh, _ := r.run(ctx, `echo "$SHELL"`, nil); strings.HasSuffix(strings.TrimSpace(sh), "zsh") {
+		rc = "~/.zprofile"
+	} else if strings.HasSuffix(strings.TrimSpace(sh), "bash") {
+		rc = "~/.bash_profile"
+	}
+	return fmt.Sprintf("; it isn't on PATH there yet: echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> %s", rc)
 }
 
 func firstLine(s string) string {
