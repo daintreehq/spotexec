@@ -196,10 +196,56 @@ func buildCommand(ws *client.Workspace, args []string) string {
 		return rewriteRoot(args[0], ws.Root, toRoot, true)
 	}
 	q := make([]string, len(args))
+	assigning := true
 	for i, a := range args {
+		// Leading NAME=value words stay environment assignments: quoting
+		// them whole would make bash run "NAME=value" as a command. The
+		// value is quoted on its own, and since the shell expands it, a
+		// worktree path in it can become the absolute remote one.
+		if name, value, ok := envAssignment(a); ok && assigning {
+			q[i] = name + "=" + quoteValue(value, ws.Root)
+			continue
+		}
+		assigning = false
 		q[i] = transport.ShellQuote(rewriteRoot(a, ws.Root, toRoot, false))
 	}
 	return strings.Join(q, " ")
+}
+
+// quoteValue shell-quotes an assignment's value, with each worktree path in
+// it (matched before quoting) turned into the remote workspace's.
+func quoteValue(v, root string) string {
+	var b strings.Builder
+	last := 0
+	for i := 0; i+len(root) <= len(v); i++ {
+		if strings.HasPrefix(v[i:], root) && boundaryBefore(v, i) && boundaryAfter(v, i+len(root)) {
+			if i > last {
+				b.WriteString(transport.ShellQuote(v[last:i]))
+			}
+			b.WriteString(`"${SPOTEXEC_WORKSPACE:?}"`)
+			last = i + len(root)
+			i = last - 1
+		}
+	}
+	if last < len(v) || last == 0 {
+		b.WriteString(transport.ShellQuote(v[last:]))
+	}
+	return b.String()
+}
+
+// envAssignment splits a NAME=value word whose name is a valid shell
+// variable name.
+func envAssignment(s string) (name, value string, ok bool) {
+	name, value, ok = strings.Cut(s, "=")
+	if !ok || name == "" {
+		return "", "", false
+	}
+	for i, c := range name {
+		if !(c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || i > 0 && c >= '0' && c <= '9') {
+			return "", "", false
+		}
+	}
+	return name, value, true
 }
 
 // rewriteRoot replaces root where it appears as a whole path (followed by

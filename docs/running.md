@@ -9,7 +9,7 @@ sx --same-slot <command>              # run on the same VM and slot as this work
 
 `sx` only runs things: every word after its flags is a command or one of this project's tasks, never a spotexec subcommand, so `sx build` runs your `build` task and `sx status` runs a program called `status`. Manage runners with `spotexec` (`spotexec status`, `spotexec doctor`, …), and use `sx -h` for the run flags and this project's tasks. `spotexec <command>` (or `spotexec -- <command>`) also runs a command, as long as it isn't named like a subcommand.
 
-`sx` stops reading its own flags at the first word that isn't one, so `sx pnpm vitest run --watch=false` passes everything after `pnpm` through unchanged. Several arguments are shell-quoted one by one. A single argument runs as a shell line, as in `sx 'pnpm lint && pnpm test'`. Absolute paths under your worktree are mapped to the remote workspace.
+`sx` stops reading its own flags at the first word that isn't one, so `sx pnpm vitest run --watch=false` passes everything after `pnpm` through unchanged. Several arguments are shell-quoted one by one, except leading `NAME=value` words, which stay environment assignments whatever the value holds: `sx NODE_OPTIONS="--max-old-space-size=8192 --no-warnings" pnpm test`. A single argument runs as a shell line, as in `sx 'pnpm lint && pnpm test'`. Absolute paths under your worktree are mapped to the remote workspace.
 
 The synced project is the enclosing Git worktree, or the nearest directory with a `.spotexec.toml`. Anywhere else, spotexec refuses to sync: it won't upload, say, your home directory with `~/.aws` and `~/.ssh` in it. Run `spotexec init` to mark a non-Git directory as a project, or use `--sync none`.
 
