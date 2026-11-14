@@ -213,8 +213,8 @@ func parseSharedCredentials(sc *bufio.Scanner, profile, src string) (awsCreds, e
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(strings.TrimPrefix(strings.Trim(line, "[]"), "profile "))
+		if name, ok := iniHeader(line); ok {
+			section = name // verbatim, as the AWS CLI matches it
 			continue
 		}
 		if section != profile {

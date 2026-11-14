@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -401,6 +402,83 @@ func TestUpsertINISection(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(real); string(b) != "[profile a]\nregion = r\n" {
 		t.Fatalf("got %q", b)
+	}
+}
+
+// Section headers may carry a trailing comment, as the AWS CLI allows: an
+// upsert must find its own section and never run into (and rewrite) the next.
+func TestINIHeaderComments(t *testing.T) {
+	for _, c := range []struct {
+		line, name string
+		ok         bool
+	}{
+		{"[work]", "work", true},
+		{"[work] # prod keys", "work", true},
+		{"[profile  work] ; note", "profile  work", true},
+		{"[ spotexec ]#x", " spotexec ", true},
+		{"[]", "", false},
+		{"# [work]", "", false},
+		{"key = [v]", "", false},
+	} {
+		if name, ok := iniHeader(c.line); name != c.name || ok != c.ok {
+			t.Errorf("iniHeader(%q) = %q, %v", c.line, name, ok)
+		}
+	}
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "credentials")
+	// [spotexec] followed by a commented header: work's keys must survive.
+	os.WriteFile(p, []byte("[spotexec]\naws_access_key_id = OLD\n\n[work] # prod keys\naws_access_key_id = AKWORK\naws_secret_access_key = w\n"), 0o600)
+	if err := upsertINISection(p, "spotexec", [][2]string{{"aws_access_key_id", "NEW"}, {"aws_secret_access_key", "S"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	want := "[spotexec]\naws_access_key_id = NEW\naws_secret_access_key = S\n\n[work] # prod keys\naws_access_key_id = AKWORK\naws_secret_access_key = w\n"
+	if string(b) != want {
+		t.Fatalf("got:\n%s", b)
+	}
+	if c, err := parseSharedCredentials(bufio.NewScanner(strings.NewReader(string(b))), "work", "creds"); err != nil || c.AccessKeyID != "AKWORK" {
+		t.Fatalf("work after upsert: %+v %v", c, err)
+	}
+
+	// A commented [spotexec] header is updated in place, not duplicated.
+	os.WriteFile(p, []byte("[default]\nregion = x\n\n[spotexec] # spotexec's machine key\naws_access_key_id = OLD\naws_secret_access_key = O\n"), 0o600)
+	if err := upsertINISection(p, "spotexec", [][2]string{{"aws_access_key_id", "NEW"}, {"aws_secret_access_key", "S"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(p)
+	want = "[default]\nregion = x\n\n[spotexec] # spotexec's machine key\naws_access_key_id = NEW\naws_secret_access_key = S\n"
+	if string(b) != want {
+		t.Fatalf("got:\n%s", b)
+	}
+	if c, err := parseSharedCredentials(bufio.NewScanner(strings.NewReader(string(b))), "spotexec", "creds"); err != nil || c.AccessKeyID != "NEW" {
+		t.Fatalf("spotexec after upsert: %+v %v", c, err)
+	}
+
+	// Credentials section names are matched verbatim, as the AWS CLI does:
+	// "[team  prod]" and "[ spotexec ]" are other profiles, left untouched.
+	os.WriteFile(p, []byte("[team prod]\naws_access_key_id = A1\naws_secret_access_key = a\n[team  prod] # two spaces\naws_access_key_id = A2\naws_secret_access_key = b\n[ spotexec ]#x\naws_access_key_id = KEEP\n"), 0o600)
+	if err := upsertINISection(p, "spotexec", [][2]string{{"aws_access_key_id", "NEW"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(p)
+	if !strings.HasSuffix(string(b), "[ spotexec ]#x\naws_access_key_id = KEEP\n\n[spotexec]\naws_access_key_id = NEW\n") {
+		t.Fatalf("got:\n%s", b)
+	}
+	for name, want := range map[string]string{"team prod": "A1", "team  prod": "A2"} {
+		if c, err := parseSharedCredentials(bufio.NewScanner(strings.NewReader(string(b))), name, "creds"); err != nil || c.AccessKeyID != want {
+			t.Fatalf("%q: %+v %v", name, c, err)
+		}
+	}
+
+	// The config readers see commented headers too.
+	cfg := filepath.Join(dir, "config")
+	os.WriteFile(cfg, []byte("[profile spotexec] # machine key\nsso_session = corp\n[profile other] # x\nregion = r\n"), 0o600)
+	if vals, err := readINISection(cfg, "profile spotexec"); err != nil || vals["sso_session"] != "corp" || vals["region"] != "" {
+		t.Fatalf("readINISection: %v %v", vals, err)
+	}
+	if vals, err := readINI(cfg, "profile other"); err != nil || vals["region"] != "r" || vals["sso_session"] != "" {
+		t.Fatalf("readINI: %v %v", vals, err)
 	}
 }
 

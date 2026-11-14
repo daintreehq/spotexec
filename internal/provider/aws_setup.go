@@ -524,7 +524,7 @@ func readINISection(path, section string) (map[string]string, error) {
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if name, ok := iniHeader(line); ok {
-			in = name == section
+			in = configSectionName(name) == section
 			continue
 		}
 		if !in || line == "" || line[0] == '#' || line[0] == ';' {
@@ -537,11 +537,31 @@ func readINISection(path, section string) (map[string]string, error) {
 	return vals, sc.Err()
 }
 
+// iniHeader parses a (trimmed) section header line the way the AWS CLI's
+// INI parser does: the name is everything between "[" and the last "]" on
+// the line, so a trailing comment ("[work] # prod keys") is ignored rather
+// than making the line a non-header. The name is returned as written: the
+// AWS CLI compares credentials sections verbatim.
 func iniHeader(line string) (string, bool) {
-	if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-		return strings.Join(strings.Fields(line[1:len(line)-1]), " "), true
+	if !strings.HasPrefix(line, "[") {
+		return "", false
 	}
-	return "", false
+	end := strings.LastIndex(line, "]")
+	if end < 2 {
+		return "", false
+	}
+	return line[1:end], true
+}
+
+// configSectionName normalises a ~/.aws/config section name the way the
+// AWS CLI reads "profile" sections ("profile  x" is profile x).
+func configSectionName(raw string) string { return strings.Join(strings.Fields(raw), " ") }
+
+// sameINISection reports whether header names section: verbatim (as the
+// AWS CLI matches credentials sections), or with "profile" sections'
+// whitespace normalised.
+func sameINISection(header, section string) bool {
+	return header == section || (strings.HasPrefix(section, "profile ") && configSectionName(header) == section)
 }
 
 // upsertINISection sets keys in [section] of an AWS-style INI file, keeping
@@ -571,7 +591,7 @@ func upsertINISection(path, section string, set [][2]string, drop []string) erro
 			end = i
 			break
 		}
-		if name == section {
+		if sameINISection(name, section) {
 			start = i
 		}
 	}
