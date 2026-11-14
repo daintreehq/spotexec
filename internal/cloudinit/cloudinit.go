@@ -122,11 +122,13 @@ systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependenc
 
 # ---- 2. SSH access for the spotexec-managed key ----
 # Many agents may connect at once; the default MaxStartups (10:30:100) would
-# drop some handshakes.
+# drop some handshakes. Every run from one machine shares its ControlMaster
+# connection, so MaxSessions (default 10 channels per connection) must allow
+# all slots plus status probes and helper uploads.
 if [ -d /etc/ssh/sshd_config.d ]; then
   # ClientAlive: a vanished client (laptop asleep) is dropped in ~90s, so its
   # session stops holding the lifecycle lock and the idle clock can run.
-  printf 'MaxStartups 100:30:200\nClientAliveInterval 30\nClientAliveCountMax 3\n' > /etc/ssh/sshd_config.d/60-spotexec.conf
+  printf 'MaxStartups 100:30:200\nMaxSessions 256\nClientAliveInterval 30\nClientAliveCountMax 3\n' > /etc/ssh/sshd_config.d/60-spotexec.conf
   systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
 fi
 U={{.User}}
