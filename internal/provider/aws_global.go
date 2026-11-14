@@ -500,6 +500,9 @@ func shortOfCapacity(code string) bool {
 
 const notEnabledWhy = "not enabled in this AWS account (or not a region): enable it in the AWS console under Account > AWS Regions, or remove it from regions"
 
+// errHeld marks a region that still holds something billable.
+var errHeld = errors.New("region still holds instances")
+
 // managedRegions are the placement regions plus any region that may still
 // hold an instance (e.g. one since removed from the config).
 func (g *AWSGlobal) managedRegions(ctx context.Context) ([]string, error) {
@@ -874,12 +877,19 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 	}); err != nil {
 		return nil, err
 	}
+	// A region that holds something, or that couldn't be checked, stays
+	// listed until it's clear.
 	held := map[string]bool{}
-	for _, rg := range check {
-		if n, err := g.Regional(rg).leftovers(ctx); err != nil || n > 0 {
-			delete(empty, rg)
-			held[rg] = true
+	for rg := range eachRegion(ctx, check, func(ctx context.Context, rg string) error {
+		if n, err := g.Regional(rg).leftovers(ctx); err != nil {
+			return err
+		} else if n > 0 {
+			return errHeld
 		}
+		return nil
+	}) {
+		delete(empty, rg)
+		held[rg] = true
 	}
 	if err := g.withState(func(st *placementState) {
 		for rg := range held {

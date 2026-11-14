@@ -820,36 +820,45 @@ func (a *AWSSpot) LockBake() (unlock func(), err error) {
 	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
-// leftovers counts this runner's instances in the region that aren't
-// schedulable but still bill: fleet VMs that are stopping or stopped, and
-// bake builders in any live state.
+// leftovers counts this runner's instances in the region that still bill:
+// fleet VMs in any live state (stopped ones included) and bake builders.
+// One call covers both, since both carry this machine's owner tag.
 func (a *AWSSpot) leftovers(ctx context.Context) (int, error) {
-	fleet, err := a.describe(ctx, "pending", "running", "stopping", "stopped", "shutting-down")
-	if err != nil {
-		return 0, err
-	}
 	owner, err := a.ownerTag()
 	if err != nil {
 		return 0, err
 	}
-	p := url.Values{}
-	p.Set("Filter.1.Name", "tag:"+tagBake)
-	p.Set("Filter.1.Value.1", a.r.Name)
-	p.Set("Filter.2.Name", "tag:"+tagOwner)
-	p.Set("Filter.2.Value.1", owner)
-	p.Set("Filter.3.Name", "instance-state-name")
-	for i, st := range []string{"pending", "running", "stopping", "stopped", "shutting-down"} {
-		p.Set("Filter.3.Value."+strconv.Itoa(i+1), st)
+	n, token := 0, ""
+	for {
+		p := url.Values{}
+		p.Set("Filter.1.Name", "tag:"+tagOwner)
+		p.Set("Filter.1.Value.1", owner)
+		p.Set("Filter.2.Name", "instance-state-name")
+		for i, st := range []string{"pending", "running", "stopping", "stopped", "shutting-down"} {
+			p.Set("Filter.2.Value."+strconv.Itoa(i+1), st)
+		}
+		p.Set("MaxResults", "100")
+		if token != "" {
+			p.Set("NextToken", token)
+		}
+		b, err := a.api.ec2(ctx, "DescribeInstances", p)
+		if err != nil {
+			return 0, err
+		}
+		insts, next, err := parseDescribeInstances(b)
+		if err != nil {
+			return 0, err
+		}
+		for _, i := range insts {
+			if i.tag(tagOwner) == owner && (i.tag(tagRunner) == a.r.Name || i.tag(tagBake) == a.r.Name) {
+				n++
+			}
+		}
+		if next == "" {
+			return n, nil
+		}
+		token = next
 	}
-	b, err := a.api.ec2(ctx, "DescribeInstances", p)
-	if err != nil {
-		return 0, err
-	}
-	builders, _, err := parseDescribeInstances(b)
-	if err != nil {
-		return 0, err
-	}
-	return len(fleet) + len(builders), nil
 }
 
 // SweepBuilders terminates leftover bake builders of this runner (stopped,
