@@ -607,13 +607,10 @@ func remoteHelper(cmd *cobra.Command, names []string, single bool, args ...strin
 				continue
 			}
 			ids := want[r.Name]
-			if allOf[r.Name] {
-				ids = nil
-			}
 			found := map[string]bool{}
 			n := 0
 			for _, in := range insts {
-				if in.State == provider.StateRunning && in.Target.Host != "" && (len(ids) == 0 || ids[in.ID]) {
+				if in.State == provider.StateRunning && in.Target.Host != "" && (allOf[r.Name] || len(ids) == 0 || ids[in.ID]) {
 					targets = append(targets, target{r.Name + "/" + in.ID, in.Target, r})
 					found[in.ID] = true
 					n++

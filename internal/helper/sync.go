@@ -455,7 +455,7 @@ func (s *Session) pull(p protocol.Pull) error {
 				}
 				rel, err := filepath.Rel(s.workspace, fp)
 				if err == nil {
-					if _, err := fsid.CleanRel(filepath.ToSlash(rel)); err == nil {
+					if _, err := fsid.SafeJoin(s.workspace, filepath.ToSlash(rel)); err == nil {
 						files = append(files, filepath.ToSlash(rel))
 					}
 				}

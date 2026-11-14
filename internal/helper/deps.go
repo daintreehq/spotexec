@@ -35,22 +35,34 @@ func depsKey(ws string, d protocol.Deps) (string, error) {
 // never a synced (source) file: a broad pattern like "vendor/*" may match
 // tracked files, which are not dependency output.
 func (s *Session) clearCacheDirs(base string, patterns []string) error {
-	return clearCacheDirs(base, patterns, s.holdsSynced)
+	return clearCacheDirs(base, patterns, s.syncedIndex())
 }
 
 // holdsSynced reports whether rel is, contains, or lies inside a synced
-// (source) file: dependency handling must never replace those.
-func (s *Session) holdsSynced(rel string) bool {
+// (source) file: dependency handling must never replace those. It answers
+// from an index of synced files and their directories, built once per call
+// site (see syncedIndex), in O(depth).
+func (s *Session) holdsSynced(rel string) bool { return s.syncedIndex()(rel) }
+
+func (s *Session) syncedIndex() func(string) bool {
 	s.loadStored()
-	if _, ok := s.stored[rel]; ok {
-		return true
-	}
+	dirs := map[string]bool{}
 	for p := range s.stored {
-		if strings.HasPrefix(p, rel+"/") || strings.HasPrefix(rel, p+"/") {
-			return true
+		for d := path.Dir(p); d != "." && d != "/" && !dirs[d]; d = path.Dir(d) {
+			dirs[d] = true
 		}
 	}
-	return false
+	return func(rel string) bool {
+		if _, ok := s.stored[rel]; ok || dirs[rel] {
+			return true // a synced file, or a directory holding some
+		}
+		for d := path.Dir(rel); d != "." && d != "/"; d = path.Dir(d) {
+			if _, ok := s.stored[d]; ok {
+				return true // inside a path that is a synced file
+			}
+		}
+		return false
+	}
 }
 
 func clearCacheDirs(base string, patterns []string, synced func(string) bool) error {
@@ -262,10 +274,15 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		return perr(protocol.CodeDepsFailed, "%s", msg)
 	}
 	var dirs []string
-	for _, rel := range expandCacheDirs(s.workspace, d.CacheDirs) {
-		if !s.holdsSynced(rel) { // source files are never cached output
+	synced := s.syncedIndex()
+	all := expandCacheDirs(s.workspace, d.CacheDirs)
+	for _, rel := range all {
+		if !synced(rel) { // source files are never cached output
 			dirs = append(dirs, rel)
 		}
+	}
+	if len(all) > 0 && len(dirs) == 0 {
+		return perr(protocol.CodeDepsFailed, "every cache_dirs match holds tracked source files (e.g. %s): point cache_dirs at the installed dependencies only", all[0])
 	}
 	tmp := fmt.Sprintf("%s.tmp-%d", cacheRoot, os.Getpid())
 	_ = os.RemoveAll(tmp)
@@ -299,6 +316,7 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 		return "", err
 	}
 	method := "none"
+	synced := s.syncedIndex()
 	for _, rel := range strings.Split(strings.TrimSpace(string(b)), "\n") {
 		if rel == "" {
 			continue
@@ -312,7 +330,7 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if s.holdsSynced(rel) {
+		if synced(rel) {
 			continue // source files live here: never overwrite them
 		}
 		if fi, err := os.Lstat(src); err != nil || !fi.IsDir() {

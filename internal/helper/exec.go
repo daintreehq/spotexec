@@ -112,6 +112,18 @@ type procResult struct {
 }
 
 func (s *Session) runProc(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool) procResult {
+	pr := s.runProc1(script, dir, env, timeout, grace, spotWatch)
+	if s.stopping.Load() {
+		// Shut down under us (SIGTERM/SIGHUP, the VM going away): what ran
+		// was killed by us. Report nothing (no result, no error, no cache
+		// built from a half-finished install) so the client sees the runner
+		// as lost; Shutdown exits the process.
+		select {}
+	}
+	return pr
+}
+
+func (s *Session) runProc1(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool) procResult {
 	shell, args := shellPath()
 	envDir := filepath.Join(s.layout.Root, "tmp")
 	if s.layout.Root == "" {
@@ -323,12 +335,6 @@ func (s *Session) exec(e protocol.Exec) error {
 		script, runEnv, cleanup = host, hostEnv, c
 	}
 	pr := s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch)
-	if s.stopping.Load() {
-		// The helper is being shut down (SIGTERM/SIGHUP: VM going away,
-		// unlock): the command was killed by us, not finished. Report
-		// nothing, so the client treats the runner as lost (and can replay).
-		select {}
-	}
 	// The container must be gone before we snapshot the workspace: a
 	// container we can't remove could still be writing into it.
 	if err := cleanup(); err != nil {

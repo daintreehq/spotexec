@@ -236,6 +236,8 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	if _, err := exec.LookPath("docker"); err == nil {
 		s.repoID = a.RepoID
 		s.removeContainers(true)
+		// Script/env files of runs whose helper died (they can hold secrets).
+		_ = os.RemoveAll(filepath.Join(s.slotDir, "run"))
 	}
 	holder.Token = s.tokenIdxAt(0)
 	s.writeHolder(holder)
@@ -268,6 +270,9 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 }
 
 func (s *Session) rollbackAcquire() {
+	if s.stopping.Load() {
+		select {} // Shutdown is releasing everything and will exit
+	}
 	s.owned.Store(nil)
 	s.relMu.Lock() // not concurrently with a shutdown's release
 	defer s.relMu.Unlock()

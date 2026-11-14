@@ -270,9 +270,11 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			delete(fl.seen, id)
 			delete(fl.noticed, id)
 			delete(fl.bootFailed, id)
-			d.mu.Lock()
-			delete(fl.counted, id)
-			d.mu.Unlock()
+			if !view.BootFailed[id] { // still remembered: keep it counted once
+				d.mu.Lock()
+				delete(fl.counted, id)
+				d.mu.Unlock()
+			}
 		}
 	}
 
@@ -422,8 +424,8 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// A bootstrap failure an sx client found (it drained the VM): count it
 	// and end the VM now rather than letting it idle out.
 	for id := range view.BootFailed {
+		d.countFailure(fl, id) // once per instance (counted)
 		if listed[id] && fl.killing[id] == "" {
-			d.countFailure(fl, id)
 			d.terminate(ctx, fl, id, "bootstrap_script failed", false)
 		}
 	}

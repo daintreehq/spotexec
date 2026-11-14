@@ -129,11 +129,14 @@ func (c *Client) open(ctx context.Context, path string) (*Session, error) {
 			// The helper started and ended cleanly but no handshake (stray
 			// output from a shell profile, or an incompatible helper): not
 			// a connection problem, so Open may reinstall it.
-			s.errMu.Lock()
-			rerr := s.err
-			s.errMu.Unlock()
-			if rerr == nil || errors.Is(rerr, io.EOF) {
-				rerr = io.ErrUnexpectedEOF
+			rerr := err
+			if IsConnError(rerr) { // the channel closed: use the read error underneath
+				s.errMu.Lock()
+				rerr = s.err
+				s.errMu.Unlock()
+				if rerr == nil || errors.Is(rerr, io.EOF) {
+					rerr = io.ErrUnexpectedEOF
+				}
 			}
 			return nil, fmt.Errorf("helper ended without a handshake: %w", s.wrap(rerr))
 		case code == 255:

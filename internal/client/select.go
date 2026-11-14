@@ -317,6 +317,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
 			}
+			if id := m.pool.BootFailure(); id != "" && d.Live == 0 && d.Pending == 0 && len(members) == 1 {
+				return nil, fmt.Errorf("%s: bootstrap_script failed on %s, so no new VMs are launched for an hour: fix bootstrap_script (the VM's /var/log/spotexec-bootstrap.log has the output), then `spotexec down %s` to clear it", m.r.Name, id, m.r.Name)
+			}
 			if d.Launch && !provisioning[d.ID] {
 				provisioning[d.ID] = true
 				req.Rep.Event("scale_out", map[string]any{"runner": m.r.Name, "launch_id": d.ID, "demand": d.Demand, "instances": d.Live})

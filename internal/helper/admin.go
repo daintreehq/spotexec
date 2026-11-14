@@ -197,6 +197,9 @@ func Prune(w io.Writer, root string, maxAge time.Duration, dryRun bool) error {
 				live++
 				continue
 			}
+			if !dryRun {
+				_ = os.RemoveAll(filepath.Join(dir, "run")) // stale run scripts (may hold secrets)
+			}
 			if time.Unix(ss.LastUsed, 0).Before(cutoff) {
 				fmt.Fprintf(w, "remove slot %s/%s\n", r.Name(), sd.Name())
 				if !dryRun {

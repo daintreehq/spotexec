@@ -362,12 +362,13 @@ func runLocal(l *loaded, command string) int {
 	// The command was written for the runner: worktree paths in it were
 	// rewritten to ${SPOTEXEC_WORKSPACE}, which here is the worktree itself
 	// (unset, "rm -rf ${SPOTEXEC_WORKSPACE}/tmp" would mean /tmp).
-	cmd.Env = os.Environ()
+	// Defaults, then the project's [env] (which may override them, as on a
+	// runner), then what must hold here.
+	cmd.Env = append(os.Environ(), "CI=true", "SPOTEXEC_CPUS="+strconv.Itoa(runtime.NumCPU()), "SPOTEXEC_SLOTS=1", "SPOTEXEC_SLOT=0", "SPOTEXEC_PORT_BASE=20000")
 	for k, v := range l.cfg.Project.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	cmd.Env = append(cmd.Env, "SPOTEXEC=1", "CI=true", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1",
-		"SPOTEXEC_CPUS="+strconv.Itoa(runtime.NumCPU()), "SPOTEXEC_SLOTS=1", "SPOTEXEC_SLOT=0", "SPOTEXEC_PORT_BASE=20000")
+	cmd.Env = append(cmd.Env, "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError

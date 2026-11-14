@@ -347,7 +347,7 @@ func cmdHook() *cobra.Command {
 		Args:               cobra.MinimumNArgs(1),
 		DisableFlagParsing: true, // the command's own flags (pytest -x) are not ours
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) == 1 && isHelpFlag(args[0]) {
+			if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
 				return cmd.Help()
 			}
 			wd, _ := os.Getwd()

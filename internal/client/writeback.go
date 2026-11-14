@@ -371,14 +371,25 @@ func conflictBase(ws *Workspace) string {
 
 func stashConflict(dir, p string, want version, rf remoteFile) error {
 	if !want.exists {
-		full, err := fsid.SafeJoin(dir, p+".deleted")
-		if err != nil {
-			return err
+		mark := []byte("deleted by the remote command\n")
+		err := func() error {
+			full, err := fsid.SafeJoin(dir, p+".deleted")
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+				return err
+			}
+			return os.WriteFile(full, mark, 0o600)
+		}()
+		if err != nil && (errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST)) {
+			// Something in the stash is in the way: flatten the name.
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return err
+			}
+			err = os.WriteFile(filepath.Join(dir, strings.ReplaceAll(p, "/", "__")+".deleted"), mark, 0o600)
 		}
-		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
-			return err
-		}
-		return os.WriteFile(full, []byte("deleted by the remote command\n"), 0o600)
+		return err
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -563,26 +574,48 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	if rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") && reservedPath(filepath.ToSlash(rel), ws.Git) {
 		return 0, fmt.Errorf("pull: refusing to write into %s", rel)
 	}
+	if common, err := exec.CommandContext(ctx, "git", "-C", ws.Root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output(); err == nil {
+		// Linked worktrees keep hooks in the common git dir.
+		if c := resolveExisting(strings.TrimSpace(string(common))); root == c || strings.HasPrefix(root, c+string(filepath.Separator)) {
+			return 0, fmt.Errorf("pull: refusing to write into the git directory")
+		}
+	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return 0, err
 	}
-	if rel != ".." && !strings.HasPrefix(rel, "../") {
-		prefix := ""
-		if rel != "." {
-			prefix = filepath.ToSlash(rel) + "/"
+	// Each path is judged where it lands: inside this worktree against its
+	// git; anywhere else against whatever repository is there (a sibling
+	// worktree's tracked files deserve the same protection).
+	var inWS, outWS []string
+	landing := map[string]string{}
+	for _, p := range candidates {
+		full := filepath.Join(root, filepath.FromSlash(p))
+		if lr, err := filepath.Rel(ws.Root, full); err == nil && lr != ".." && !strings.HasPrefix(lr, "../") {
+			landing[p] = filepath.ToSlash(lr)
+			inWS = append(inWS, landing[p])
+		} else {
+			outWS = append(outWS, p)
 		}
-		landing := make([]string, len(candidates))
-		for i, p := range candidates {
-			landing[i] = prefix + p
-		}
-		prot, err := protectedPaths(ctx, ws.Root, landing)
+	}
+	if len(inWS) > 0 {
+		prot, err := protectedPaths(ctx, ws.Root, inWS)
 		if err != nil {
 			return 0, err
 		}
-		for _, p := range candidates {
-			protected[p] = prot[prefix+p]
+		for p, l := range landing {
+			protected[p] = prot[l]
 		}
 	}
+	if len(outWS) > 0 {
+		prot, err := protectedPaths(ctx, root, outWS)
+		if err != nil {
+			return 0, err
+		}
+		for _, p := range outWS {
+			protected[p] = prot[p]
+		}
+	}
+	_ = rel
 	// Serialise with write-back into the same worktree.
 	lockDir := conflictBase(ws)
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {

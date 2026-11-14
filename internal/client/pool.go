@@ -49,6 +49,7 @@ type note struct {
 	ReadyAt      time.Time `json:"ready_at,omitempty"`
 	SawFull      bool      `json:"saw_full,omitempty"` // observed with every slot taken
 	BootFailed   bool      `json:"boot_failed,omitempty"`
+	BootFailedAt time.Time `json:"boot_failed_at,omitempty"`
 }
 
 type launchRec struct {
@@ -196,8 +197,10 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	for _, in := range insts {
 		live[in.ID] = true
 	}
-	for id := range st.Notes {
-		if !live[id] {
+	for id, n := range st.Notes {
+		// A bootstrap failure is remembered for an hour after its VM is
+		// gone: it says the runner's setup is broken, not just that VM.
+		if !live[id] && !(n.BootFailed && time.Since(n.BootFailedAt) < time.Hour) {
 			delete(st.Notes, id)
 		}
 	}
@@ -300,6 +303,9 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 			n.Draining = true
 		case OutBootFailed:
 			n.Draining, n.BootFailed = true, true
+			if n.BootFailedAt.IsZero() {
+				n.BootFailedAt = now
+			}
 		case OutBooting:
 			n.BusyUntil = now.Add(2 * time.Second)
 		case OutUnreachable:
@@ -384,7 +390,16 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			}
 		}
 		d.Live = usable
+		bootFailed := ""
+		for id, n := range st.Notes {
+			if n.BootFailed && time.Since(n.BootFailedAt) < time.Hour {
+				bootFailed = id
+			}
+		}
 		switch {
+		case bootFailed != "":
+			// Another VM would run the same broken setup.
+			d.Reason = "bootstrap_script failed on " + bootFailed + " (fix it, or wait an hour before new launches)"
 		case d.Demand <= 0:
 			d.Reason = "demand covered by higher-priority runners"
 		case d.Demand <= d.Capacity:
@@ -756,4 +771,18 @@ func staleListing(t time.Time) time.Time {
 		return t
 	}
 	return time.Unix(1, 0)
+}
+
+// BootFailure reports a recent bootstrap failure on this fleet ("" if none).
+func (p *Pool) BootFailure() string {
+	out := ""
+	_ = p.with(func(st *poolState) error {
+		for id, n := range st.Notes {
+			if n.BootFailed && time.Since(n.BootFailedAt) < time.Hour {
+				out = id
+			}
+		}
+		return nil
+	})
+	return out
 }

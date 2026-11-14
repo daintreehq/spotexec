@@ -722,23 +722,35 @@ func ExpandHome(p string) string {
 }
 
 // embeddedArgs reports a {args} that is not a shell word of its own (for
-// example inside "pytest {args}"), where "$@" can't be substituted safely.
-// {args}, "{args}" and '{args}' are fine when they start and end at word
-// boundaries outside any quotes.
+// example inside "pytest {args}", or escaped), where "$@" can't be
+// substituted safely. {args}, "{args}" and '{args}' are fine when they stand
+// alone between word boundaries outside quotes; comments are skipped.
 func embeddedArgs(run string) bool {
 	const ph = "{args}"
 	bound := func(c byte) bool { return strings.IndexByte(" \t\n;&|()", c) >= 0 }
-	inS, inD := false, false
+	inS, inD, atBound := false, false, true
 	for i := 0; i < len(run); i++ {
 		c := run[i]
 		if !inS && !inD {
-			for _, form := range []string{ph, `"` + ph + `"`, "'" + ph + "'"} {
-				if strings.HasPrefix(run[i:], form) {
+			if atBound && c == '#' { // a comment: to the end of the line
+				for i < len(run) && run[i] != '\n' {
+					i++
+				}
+				atBound = true
+				continue
+			}
+			if atBound {
+				matched := false
+				for _, form := range []string{ph, `"` + ph + `"`, "'" + ph + "'"} {
 					end := i + len(form)
-					if (i == 0 || bound(run[i-1])) && (end == len(run) || bound(run[end])) {
-						i = end - 1
-						goto next
+					if strings.HasPrefix(run[i:], form) && (end == len(run) || bound(run[end])) {
+						i, matched = end-1, true
+						break
 					}
+				}
+				if matched {
+					atBound = false
+					continue
 				}
 			}
 		}
@@ -746,14 +758,19 @@ func embeddedArgs(run string) bool {
 			return true // inside quotes, or glued to other text
 		}
 		switch {
-		case c == '\\' && !inS && i+1 < len(run):
+		case c == '\\' && !inS:
+			if strings.HasPrefix(run[i+1:], ph) {
+				return true // an escaped placeholder
+			}
 			i++
+			atBound = false
+			continue
 		case c == '\'' && !inD:
 			inS = !inS
 		case c == '"' && !inS:
 			inD = !inD
 		}
-	next:
+		atBound = !inS && !inD && bound(c)
 	}
 	return false
 }

@@ -45,7 +45,15 @@ func New(t provider.Target, workRoot string) *Client {
 // controlDir holds ControlMaster sockets. OpenSSH appends 17 bytes to the
 // path while binding and macOS limits socket paths to 104 bytes, so a long
 // (or missing) home falls back to a short per-user directory in /tmp.
-func controlDir() string { return controlDirOnce() }
+// controlDir is re-checked on every call: a long-running process (the
+// daemon) must survive the directory being cleaned away (tmp reapers).
+func controlDir() string {
+	d := controlDirOnce()
+	if _, err := os.Stat(d); err != nil {
+		_ = os.MkdirAll(d, 0o700)
+	}
+	return d
+}
 
 var controlDirOnce = sync.OnceValue(func() string {
 	home, _ := os.UserHomeDir()

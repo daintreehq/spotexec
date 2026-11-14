@@ -76,6 +76,9 @@ func Shutdown(code int) {
 			reapWorkspace(s.workspace, 2*time.Second)
 		}
 		s.removeContainers(false)
+		if s.slotDir != "" {
+			_ = os.RemoveAll(filepath.Join(s.slotDir, "run"))
+		}
 		s.release()
 	}
 	os.Exit(code)
@@ -133,6 +136,9 @@ func Serve(in io.Reader, out io.Writer) error {
 		if err := s.dispatch(env); err != nil {
 			if errors.Is(err, errBye) {
 				return nil
+			}
+			if s.stopping.Load() {
+				select {} // shutting down: no error reply (it would block a replay)
 			}
 			var pe *protoError
 			if errors.As(err, &pe) {
