@@ -37,6 +37,7 @@ type Session struct {
 	// heartbeat goroutine, so not s.tokens / s.layout directly).
 	owned    atomic.Pointer[string]
 	relMu    sync.Mutex
+	procMu   sync.Mutex  // held while a process or container is being started
 	stopping atomic.Bool // Shutdown/lastResort own cleanup and exit
 
 	lifecycle   *flock
@@ -69,6 +70,8 @@ var current atomic.Pointer[Session]
 func Shutdown(code int) {
 	if s := current.Load(); s != nil {
 		s.stopping.Store(true)
+		s.procMu.Lock() // wait out a start in progress; none begins after this
+		s.procMu.Unlock()
 		if pg := int(s.child.Load()); pg > 0 {
 			killGroup(pg, 2*time.Second)
 		}
@@ -210,6 +213,8 @@ func (s *Session) lastResort() {
 		time.Sleep(5 * time.Second)
 		if time.Since(time.Unix(0, s.lastSeen.Load())) > ClientTimeout+30*time.Second {
 			s.stopping.Store(true)
+			s.procMu.Lock()
+			s.procMu.Unlock()
 			if pg := int(s.child.Load()); pg > 0 {
 				killGroup(pg, 2*time.Second)
 			}
@@ -217,6 +222,9 @@ func (s *Session) lastResort() {
 				reapWorkspace(s.workspace, 2*time.Second)
 			}
 			s.removeContainers(false)
+			if s.slotDir != "" {
+				_ = os.RemoveAll(filepath.Join(s.slotDir, "run"))
+			}
 			s.release()
 			os.Exit(4)
 		}

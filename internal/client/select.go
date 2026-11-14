@@ -289,10 +289,13 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		// each covering only what the fleets before it are not launching.
 		status := ""
 		covered := 0
+		blocked, fleets := 0, 0
+		var bootErr error
 		for _, m := range members {
 			if m.pool == nil {
 				continue
 			}
+			fleets++
 			if req.NoBoot {
 				continue // can't grow: don't signal demand others would launch for
 			}
@@ -317,8 +320,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
 			}
-			if id := m.pool.BootFailure(); id != "" && d.Live == 0 && d.Pending == 0 && len(members) == 1 {
-				return nil, fmt.Errorf("%s: bootstrap_script failed on %s, so no new VMs are launched for an hour: fix bootstrap_script (the VM's /var/log/spotexec-bootstrap.log has the output), then `spotexec down %s` to clear it", m.r.Name, id, m.r.Name)
+			if id := m.pool.BootFailure(); id != "" && d.Live == 0 && d.Pending == 0 {
+				blocked++
+				bootErr = fmt.Errorf("%s: bootstrap_script failed on %s, so no new VMs are launched for an hour: fix bootstrap_script (the VM's /var/log/spotexec-bootstrap.log has the output), then `spotexec down %s` to clear it", m.r.Name, id, m.r.Name)
 			}
 			if d.Launch && !provisioning[d.ID] {
 				provisioning[d.ID] = true
@@ -337,6 +341,11 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			} else if status == "" && d.Demand > 0 {
 				status = fmt.Sprintf("%s: %s", m.r.Name, d.Reason)
 			}
+		}
+		// Nothing can ever serve this request: every runner is a fleet whose
+		// setup just failed (static runners would still be worth waiting for).
+		if bootErr != nil && blocked == fleets && fleets == len(members) {
+			return nil, bootErr
 		}
 		if status == "" {
 			status = "all slots busy (" + describeHolders(lastHolders) + ")"

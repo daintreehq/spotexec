@@ -443,6 +443,11 @@ func (s *Session) pull(p protocol.Pull) error {
 			return perr(protocol.CodeBadRequest, "bad pull pattern %q: %v", pat, err)
 		}
 		for _, m := range matches {
+			if rel, err := filepath.Rel(s.workspace, m); err != nil {
+				continue
+			} else if _, err := fsid.SafeJoin(s.workspace, filepath.ToSlash(rel)); err != nil {
+				continue // reached through a symlink: don't walk wherever it points
+			}
 			_ = filepath.WalkDir(m, func(fp string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return nil

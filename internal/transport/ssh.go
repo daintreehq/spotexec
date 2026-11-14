@@ -46,36 +46,49 @@ func New(t provider.Target, workRoot string) *Client {
 // path while binding and macOS limits socket paths to 104 bytes, so a long
 // (or missing) home falls back to a short per-user directory in /tmp.
 // controlDir is re-checked on every call: a long-running process (the
-// daemon) must survive the directory being cleaned away (tmp reapers).
-func controlDir() string {
-	d := controlDirOnce()
-	if _, err := os.Stat(d); err != nil {
-		_ = os.MkdirAll(d, 0o700)
-	}
-	return d
-}
+// daemon) must survive the directory being cleaned away, and in shared /tmp
+// it must still be ours (a reaper may delete it and another user recreate
+// it).
+var (
+	ctlMu  sync.Mutex
+	ctlDir string
+)
 
-var controlDirOnce = sync.OnceValue(func() string {
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, ".cache", "spotexec", "cm")
-	if home != "" && len(dir)+17+17 <= 100 {
-		_ = os.MkdirAll(dir, 0o700)
-		return dir
-	}
-	// /tmp is shared: use the per-user dir only if it's really ours and
-	// private; otherwise a fresh private one (short, under /tmp).
-	dir = filepath.Join("/tmp", fmt.Sprintf("sx-cm-%d", os.Getuid()))
-	_ = os.Mkdir(dir, 0o700)
-	if fi, err := os.Lstat(dir); err == nil && fi.IsDir() {
-		if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) == os.Getuid() && os.Chmod(dir, 0o700) == nil {
-			return dir
+func controlDir() string {
+	ctlMu.Lock()
+	defer ctlMu.Unlock()
+	if ctlDir == "" {
+		home, _ := os.UserHomeDir()
+		if d := filepath.Join(home, ".cache", "spotexec", "cm"); home != "" && len(d)+17+17 <= 100 {
+			ctlDir = d
+		} else {
+			ctlDir = filepath.Join("/tmp", fmt.Sprintf("sx-cm-%d", os.Getuid()))
 		}
 	}
-	if d, err := os.MkdirTemp("/tmp", "sx-cm-"); err == nil {
-		return d
+	if !strings.HasPrefix(ctlDir, "/tmp/") {
+		_ = os.MkdirAll(ctlDir, 0o700)
+		return ctlDir
 	}
-	return os.TempDir()
-})
+	if privateDir(ctlDir) {
+		return ctlDir
+	}
+	if d, err := os.MkdirTemp("/tmp", "sx-cm-"); err == nil {
+		ctlDir = d
+	}
+	return ctlDir
+}
+
+// privateDir makes sure dir exists, is a real directory (not a symlink),
+// owned by us, mode 0700.
+func privateDir(dir string) bool {
+	_ = os.Mkdir(dir, 0o700)
+	fi, err := os.Lstat(dir)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Getuid() && os.Chmod(dir, 0o700) == nil
+}
 
 func (c *Client) baseArgs(master string) []string {
 	a := []string{

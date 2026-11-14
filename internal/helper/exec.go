@@ -124,6 +124,22 @@ func (s *Session) runProc(script, dir string, env map[string]string, timeout, gr
 }
 
 func (s *Session) runProc1(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool) procResult {
+	// Starting a process (and its env file) is atomic with respect to
+	// Shutdown: it either sees the child and kills it, or we see it
+	// stopping and never start.
+	s.procMu.Lock()
+	if s.stopping.Load() {
+		s.procMu.Unlock()
+		select {}
+	}
+	locked := true
+	unlockProc := func() {
+		if locked {
+			locked = false
+			s.procMu.Unlock()
+		}
+	}
+	defer unlockProc()
 	shell, args := shellPath()
 	envDir := filepath.Join(s.layout.Root, "tmp")
 	if s.layout.Root == "" {
@@ -168,6 +184,7 @@ func (s *Session) runProc1(script, dir string, env map[string]string, timeout, g
 	pgid := cmd.Process.Pid
 	s.setChildPGID(pgid)
 	s.child.Store(int64(pgid))
+	unlockProc()
 	defer s.child.Store(0)
 	_ = s.c.Send(protocol.TypeStarted, protocol.Started{PID: pgid})
 

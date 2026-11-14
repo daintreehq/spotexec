@@ -485,6 +485,11 @@ func (p *Pool) EnsureMin(ctx context.Context, min int) ([]string, error) {
 		if time.Now().Before(st.BackoffUntil) || total >= 2*p.R.MaxInstances {
 			return nil
 		}
+		for _, n := range st.Notes {
+			if n.BootFailed && time.Since(n.BootFailedAt) < time.Hour {
+				return nil // the setup is broken: don't warm more of it
+			}
+		}
 		for usable < min && usable < p.R.MaxInstances && total < 2*p.R.MaxInstances {
 			var b [6]byte
 			_, _ = rand.Read(b[:])

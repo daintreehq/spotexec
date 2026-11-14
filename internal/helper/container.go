@@ -581,6 +581,12 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 			return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
 		}
 	}
+	s.procMu.Lock()
+	if s.stopping.Load() {
+		s.procMu.Unlock()
+		select {}
+	}
+	defer s.procMu.Unlock()
 	runDir := filepath.Join(s.slotDir, "run")
 	home := filepath.Join(s.slotDir, "home")
 	for _, dd := range []string{runDir, home} {

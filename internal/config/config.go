@@ -733,9 +733,14 @@ func embeddedArgs(run string) bool {
 		c := run[i]
 		if !inS && !inD {
 			if atBound && c == '#' { // a comment: to the end of the line
-				for i < len(run) && run[i] != '\n' {
-					i++
+				end := strings.IndexByte(run[i:], '\n')
+				if end < 0 {
+					end = len(run) - i
 				}
+				if strings.Contains(run[i:i+end], ph) {
+					return true // tasks don't strip comments: "$@" would land in it
+				}
+				i += end
 				atBound = true
 				continue
 			}
@@ -761,6 +766,11 @@ func embeddedArgs(run string) bool {
 		case c == '\\' && !inS:
 			if strings.HasPrefix(run[i+1:], ph) {
 				return true // an escaped placeholder
+			}
+			if i+1 < len(run) && run[i+1] == '\n' {
+				i++ // a line continuation: still between words
+				atBound = true
+				continue
 			}
 			i++
 			atBound = false

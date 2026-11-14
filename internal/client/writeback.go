@@ -382,12 +382,20 @@ func stashConflict(dir, p string, want version, rf remoteFile) error {
 			}
 			return os.WriteFile(full, mark, 0o600)
 		}()
-		if err != nil && (errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST)) {
-			// Something in the stash is in the way: flatten the name.
+		if err != nil && stashCollision(err) {
+			// Something in the stash is in the way: a fresh flattened name.
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return err
 			}
-			err = os.WriteFile(filepath.Join(dir, strings.ReplaceAll(p, "/", "__")+".deleted"), mark, 0o600)
+			f, err := os.CreateTemp(dir, strings.ReplaceAll(p, "/", "__")+".deleted-*")
+			if err != nil {
+				return err
+			}
+			_, err = f.Write(mark)
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
+			return err
 		}
 		return err
 	}
@@ -395,13 +403,25 @@ func stashConflict(dir, p string, want version, rf remoteFile) error {
 		return err
 	}
 	err := writeLocal(dir, p, rf, nil)
-	if err != nil && (errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST)) {
+	if err != nil && stashCollision(err) {
 		// A directory/file collision inside the stash itself (a path that
 		// was a directory and is now a file): keep it at the top of the
-		// stash under a flattened name, where nothing can be in the way.
-		return writeLocal(dir, strings.ReplaceAll(p, "/", "__")+".remote", rf, nil)
+		// stash under a flattened name nothing else uses.
+		base := strings.ReplaceAll(p, "/", "__") + ".remote"
+		name := base
+		for i := 2; ; i++ {
+			if _, err := os.Lstat(filepath.Join(dir, name)); errors.Is(err, fs.ErrNotExist) {
+				break
+			}
+			name = fmt.Sprintf("%s.%d", base, i)
+		}
+		return writeLocal(dir, name, rf, nil)
 	}
 	return err
+}
+
+func stashCollision(err error) bool {
+	return errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) || errors.Is(err, fsid.ErrSymlinkParent)
 }
 
 var errChangedUnderUs = errors.New("file changed during write-back")
@@ -574,9 +594,26 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	if rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") && reservedPath(filepath.ToSlash(rel), ws.Git) {
 		return 0, fmt.Errorf("pull: refusing to write into %s", rel)
 	}
-	if common, err := exec.CommandContext(ctx, "git", "-C", ws.Root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output(); err == nil {
-		// Linked worktrees keep hooks in the common git dir.
-		if c := resolveExisting(strings.TrimSpace(string(common))); root == c || strings.HasPrefix(root, c+string(filepath.Separator)) {
+	// The git directories of this worktree (linked worktrees keep hooks in
+	// the common one): nothing may land inside them.
+	var gitDirs []string
+	for _, arg := range []string{"--git-dir", "--git-common-dir"} {
+		if out, err := exec.CommandContext(ctx, "git", "-C", ws.Root, "rev-parse", arg).Output(); err == nil {
+			d := strings.TrimSpace(string(out))
+			if !filepath.IsAbs(d) {
+				d = filepath.Join(ws.Root, d)
+			}
+			gitDirs = append(gitDirs, resolveExisting(d))
+		}
+	}
+	under := func(p, dir string) bool {
+		if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			p, dir = strings.ToLower(p), strings.ToLower(dir)
+		}
+		return p == dir || strings.HasPrefix(p, dir+string(filepath.Separator))
+	}
+	for _, g := range gitDirs {
+		if under(root, g) {
 			return 0, fmt.Errorf("pull: refusing to write into the git directory")
 		}
 	}
@@ -606,13 +643,28 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 			protected[p] = prot[l]
 		}
 	}
-	if len(outWS) > 0 {
-		prot, err := protectedPaths(ctx, root, outWS)
-		if err != nil {
-			return 0, err
+	// Outside this worktree, anything inside some git repository (a sibling
+	// worktree, a bare repo) is someone's source: left alone.
+	inRepo := map[string]bool{}
+	for _, p := range outWS {
+		dir := resolveExisting(filepath.Dir(filepath.Join(root, filepath.FromSlash(p))))
+		for !dirExists(dir) && filepath.Dir(dir) != dir {
+			dir = filepath.Dir(dir)
 		}
-		for _, p := range outWS {
-			protected[p] = prot[p]
+		v, ok := inRepo[dir]
+		if !ok {
+			err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--git-dir").Run()
+			v = err == nil
+			inRepo[dir] = v
+		}
+		protected[p] = v
+	}
+	for _, p := range candidates {
+		full := resolveExisting(filepath.Join(root, filepath.FromSlash(p)))
+		for _, g := range gitDirs {
+			if under(full, g) {
+				protected[p] = true // an in-tree git dir (a gitfile pointing inside)
+			}
 		}
 	}
 	_ = rel
@@ -730,6 +782,11 @@ func protectedPaths(ctx context.Context, root string, paths []string) (map[strin
 		}
 	}
 	return out, nil
+}
+
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 // resolveExisting resolves symlinks in the deepest existing ancestor of p
