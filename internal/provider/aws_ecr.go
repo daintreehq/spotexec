@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/protocol"
 )
@@ -26,8 +27,12 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 	name := "spotexec/" + ecrName(repoID)
 	marker := filepath.Join(a.dir, "ecr-"+a.r.Region+"-"+a.r.Profile+"-"+strings.ReplaceAll(name, "/", "_"))
 	uri := ""
-	if b, err := os.ReadFile(marker); err == nil {
-		uri = strings.TrimSpace(string(b))
+	// The cached URI saves two API calls per image, but expires: a deleted
+	// repository must be recreated, or every push would fail.
+	if fi, err := os.Stat(marker); err == nil && time.Since(fi.ModTime()) < time.Hour {
+		if b, err := os.ReadFile(marker); err == nil {
+			uri = strings.TrimSpace(string(b))
+		}
 	}
 	if uri == "" {
 		var desc struct {
