@@ -69,7 +69,11 @@ var accountResolver = func(profile string) *awsCredResolver { return &awsCredRes
 var accountEndpoints map[string]string
 
 func accountClient(region string, creds *awsCredResolver) *awsClient {
-	return &awsClient{region: region, creds: creds, http: &http.Client{Timeout: 60 * time.Second}, endpoints: accountEndpoints}
+	ep := map[string]string{"iam": "https://iam.amazonaws.com/"}
+	for k, v := range accountEndpoints {
+		ep[k] = v
+	}
+	return &awsClient{region: region, creds: creds, http: &http.Client{Timeout: 60 * time.Second}, endpoints: ep}
 }
 
 // FindAccountInstances lists every spotexec instance, whichever machine

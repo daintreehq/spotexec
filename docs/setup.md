@@ -173,15 +173,16 @@ spotexec down -A --machine studio-02    # stop one machine's VMs (asks first)
 spotexec setup --revoke studio-01       # or the IAM user name, spotexec-studio-01
 ```
 
-The machine can be named by its IAM user (an exact name always selects that user), by a destination you set it up with (`builder`, `me@studio-01.local`), or by its host name. When two machines share a host name, name the IAM user. This deletes the machine's access keys, its policy and its IAM user, so its key stops working at once. It also terminates the machine's VMs and removes every machine-list entry that reached it, aliases included. Entries recorded by spotexec versions before machine IDs, which it can't place, are listed for you to check. On the machine itself, you can then delete the `[spotexec]` section of `~/.aws/credentials` and `[profile spotexec]` in `~/.aws/config`.
+The machine can be named by its IAM user (an exact name always selects that user), by a destination you set it up with (`builder`, `me@studio-01.local`), or by its host name. When two machines share a host name, name the IAM user. This deactivates the machine's access keys, so its key stops working at once, then terminates the machine's VMs (stopped ones and `image bake` builders too) in the regions your AWS runners use, and only then deletes its keys, policy and IAM user and removes every machine-list entry that reached it, aliases included. Entries recorded by spotexec versions before machine IDs, which it can't place, are listed for you to check. If a region can't be searched or a VM can't be terminated, it says so, exits non-zero and keeps the IAM user and the machine-list entries, so running `--revoke` again finishes the cleanup. On the machine itself, you can then delete the `[spotexec]` section of `~/.aws/credentials` and `[profile spotexec]` in `~/.aws/config`.
 
-By hand, the equivalent is:
+By hand, with an administrator's sign-in: deactivate the keys first, so the machine can't launch anything more; then terminate its VMs (`spotexec down -A --machine studio-01`, which searches your AWS runners' regions) and wait until `spotexec status -A` shows none of them; only then delete the keys, policy and user:
 
 ```sh
 U=spotexec-studio-01
-for k in $(aws iam list-access-keys --user-name "$U" --query 'AccessKeyMetadata[].AccessKeyId' --output text); do
-  aws iam delete-access-key --user-name "$U" --access-key-id "$k"
-done
+KEYS=$(aws iam list-access-keys --user-name "$U" --query 'AccessKeyMetadata[].AccessKeyId' --output text)
+for k in $KEYS; do aws iam update-access-key --user-name "$U" --access-key-id "$k" --status Inactive; done
+spotexec down -A --machine studio-01 --yes && spotexec status -A    # repeat until none of its VMs are left
+for k in $KEYS; do aws iam delete-access-key --user-name "$U" --access-key-id "$k"; done
 aws iam delete-user-policy --user-name "$U" --policy-name spotexec
 aws iam delete-user --user-name "$U"
 ```

@@ -732,6 +732,11 @@ func rosterMatch(e savedMachine, hit provider.Machine, ms []provider.Machine, ta
 }
 
 func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) error {
+	// The runner config says where to look for the machine's VMs: don't
+	// revoke blind because it couldn't be read.
+	if _, err := config.LoadGlobal(); err != nil {
+		return fmt.Errorf("reading the runner config (it says which regions to search for the machine's VMs): %w", err)
+	}
 	regions := awsRegions()
 	ms, err := provider.ListMachines(ctx, adminProfile, regions)
 	if err != nil {
@@ -743,7 +748,7 @@ func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) e
 	}
 	what := fmt.Sprintf("IAM user %s (host %s) and its %d key(s)", hit.User, orDash(hit.Host), len(hit.Keys))
 	if hit.VMs > 0 {
-		what += fmt.Sprintf(", and terminate its %d running VM(s)", hit.VMs)
+		what += fmt.Sprintf(", and terminate its %d VM(s) (stopped ones and bake builders included)", hit.VMs)
 	}
 	if hit.This {
 		what += ". This is THIS machine: spotexec stops working here until you run `spotexec setup` again"

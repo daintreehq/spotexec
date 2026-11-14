@@ -935,7 +935,7 @@ type Machine struct {
 	MachineID string // from the spotexec-machine tag
 	Created   string
 	Keys      []MachineKey
-	VMs       int // live spotexec instances this machine owns, in the regions asked about
+	VMs       int // spotexec instances (VMs and bake builders, any state but terminated) this machine owns, in the regions asked about
 	This      bool
 }
 
@@ -947,8 +947,7 @@ type MachineKey struct {
 // ListMachines lists the IAM users under /spotexec/ with their keys and the
 // spotexec VMs each machine has running in regions.
 func ListMachines(ctx context.Context, adminProfile string, regions []string) ([]Machine, error) {
-	s := &AWSUserSetup{}
-	admin := s.client("us-east-1", &awsCredResolver{profile: adminProfile})
+	admin := accountClient("us-east-1", accountResolver(adminProfile))
 	b, err := admin.query(ctx, "iam", iamAPIVersion, "ListUsers", url.Values{"PathPrefix": {iamUserPath}, "MaxItems": {"1000"}})
 	if err != nil {
 		return nil, iamHint(fmt.Errorf("listing spotexec's IAM users: %w", err))
@@ -964,10 +963,8 @@ func ListMachines(ctx context.Context, adminProfile string, regions []string) ([
 	}
 	me, _ := ownerID()
 	vms := map[string]int{}
-	for _, region := range regions {
-		for _, in := range spotexecInstances(ctx, s.client(region, admin.creds)) {
-			vms[in.tag(tagOwner)]++
-		}
+	for _, in := range FindAccountInstances(ctx, adminScopes(adminProfile, regions)).Instances {
+		vms[in.Owner]++
 	}
 	var out []Machine
 	for _, u := range v.Users {
@@ -993,35 +990,27 @@ func ListMachines(ctx context.Context, adminProfile string, regions []string) ([
 	return out, nil
 }
 
-// spotexecInstances lists live spotexec instances in one region (any owner).
-func spotexecInstances(ctx context.Context, c *awsClient) []ec2Instance {
-	p := url.Values{"Filter.1.Name": {"tag-key"}, "Filter.1.Value.1": {tagRunner},
-		"Filter.2.Name": {"instance-state-name"}, "Filter.2.Value.1": {"pending"}, "Filter.2.Value.2": {"running"}}
-	var out []ec2Instance
-	for page := 0; page < 20; page++ {
-		b, err := c.ec2(ctx, "DescribeInstances", p)
-		if err != nil {
-			return out
-		}
-		ins, next, err := parseDescribeInstances(b)
-		if err != nil {
-			return out
-		}
-		out = append(out, ins...)
-		if next == "" {
-			break
-		}
-		p.Set("NextToken", next)
+// adminScopes searches regions with the admin profile.
+func adminScopes(profile string, regions []string) []AccountScope {
+	var out []AccountScope
+	for _, r := range regions {
+		out = append(out, AccountScope{Region: r, Profile: profile})
 	}
 	return out
 }
 
-// RevokeMachine deletes a machine's spotexec IAM user (its keys and policy
-// first, so the key stops working at once) and terminates the VMs that
-// machine owns in regions. user is the IAM user name.
+// RevokeMachine cuts a machine off and cleans up after it. In order:
+//  1. its access keys are deactivated, so it can't launch anything more;
+//  2. its VMs (fleet VMs and bake builders, in any state but terminated)
+//     are terminated in regions, found by the owner ID on its IAM user;
+//  3. only then are its keys, policy and IAM user deleted.
+//
+// If any region can't be searched or any VM terminated, it stops before
+// step 3 and returns an error: the user (the only link to the machine's
+// owner ID) is kept, so running it again finishes the job. user is the IAM
+// user name.
 func RevokeMachine(ctx context.Context, adminProfile, user string, regions []string, log func(string, ...any)) error {
-	s := &AWSUserSetup{}
-	admin := s.client("us-east-1", &awsCredResolver{profile: adminProfile})
+	admin := accountClient("us-east-1", accountResolver(adminProfile))
 	u, err := getUser(ctx, admin, user)
 	if err != nil {
 		return iamHint(fmt.Errorf("IAM user %s: %w", user, err))
@@ -1033,6 +1022,27 @@ func RevokeMachine(ctx context.Context, adminProfile, user string, regions []str
 	if err != nil {
 		return err
 	}
+	for _, k := range keys {
+		if k.Status == "Inactive" {
+			continue
+		}
+		if _, err := admin.query(ctx, "iam", iamAPIVersion, "UpdateAccessKey", url.Values{"UserName": {user}, "AccessKeyId": {k.ID}, "Status": {"Inactive"}}); err != nil {
+			return iamHint(fmt.Errorf("deactivating access key %s: %w", k.ID, err))
+		}
+		log("deactivated access key %s", k.ID)
+	}
+
+	m := u.Tags[tagMachine]
+	if m == "" {
+		return fmt.Errorf("IAM user %s has no %s tag (it was made by an older spotexec), so its VMs can't be identified; its keys are now deactivated and the user was kept. Tag it with that machine's owner ID (the contents of ~/.config/spotexec/owner-id there): `aws iam tag-user --user-name %s --tags Key=%s,Value=<owner-id>`, then run `spotexec setup --revoke %s` again", user, tagMachine, user, tagMachine, user)
+	}
+	if len(regions) == 0 {
+		return fmt.Errorf("no regions to search for %s's VMs (no AWS runners configured here); its keys are now deactivated, and IAM user %s was kept", user, user)
+	}
+	if err := stopMachineVMs(ctx, adminProfile, m, regions, log); err != nil {
+		return fmt.Errorf("%w; IAM user %s was kept (its keys are deactivated) so its VMs can still be found: fix this and run `spotexec setup --revoke %s` again", err, user, user)
+	}
+
 	for _, k := range keys {
 		if err := deleteAccessKey(ctx, admin, user, k.ID); err != nil {
 			return err
@@ -1046,20 +1056,100 @@ func RevokeMachine(ctx context.Context, adminProfile, user string, regions []str
 		return iamHint(fmt.Errorf("deleting IAM user %s: %w", user, err))
 	}
 	log("deleted IAM user %s", user)
-	if m := u.Tags[tagMachine]; m != "" {
-		for _, region := range regions {
-			c := s.client(region, admin.creds)
-			for _, in := range spotexecInstances(ctx, c) {
-				if in.tag(tagOwner) != m {
-					continue
-				}
-				if _, err := c.ec2(ctx, "TerminateInstances", url.Values{"InstanceId.1": {in.InstanceID}}); err != nil {
-					log("warning: couldn't terminate %s in %s: %v", in.InstanceID, region, err)
-					continue
-				}
-				log("terminated %s (%s) in %s", in.InstanceID, in.tag(tagRunner), region)
+	return nil
+}
+
+// How long revoking waits for a machine's VMs to be gone, how often it
+// looks again, and how long the search must stay empty before it's
+// believed (EC2 listings are eventually consistent; tests shorten these).
+var (
+	revokeWait   = 10 * time.Minute
+	revokeSettle = 10 * time.Second
+	revokeQuiet  = 30 * time.Second
+)
+
+// stopMachineVMs terminates every spotexec instance owned by machine m and
+// waits until none is left: the search must stay empty for revokeQuiet
+// (so a launch the machine's key got in just before it was deactivated
+// still turns up), and every instance it asked to terminate must be seen
+// terminated, not merely missing from a listing.
+func stopMachineVMs(ctx context.Context, adminProfile, m string, regions []string, log func(string, ...any)) error {
+	deadline := time.Now().Add(revokeWait)
+	asked := map[string]AccountInstance{}
+	var quietSince time.Time
+	for {
+		search := FindAccountInstances(ctx, adminScopes(adminProfile, regions))
+		var errs, left []string
+		listed := map[string]bool{}
+		for _, in := range search.Instances {
+			if in.Owner != m {
+				continue
+			}
+			listed[in.ID] = true
+			left = append(left, in.ID)
+			if in.State == "shutting-down" {
+				continue
+			}
+			kind := "VM"
+			if in.Builder {
+				kind = "bake builder"
+			}
+			if err := TerminateAccountInstance(ctx, in); err != nil {
+				errs = append(errs, fmt.Sprintf("couldn't terminate %s %s in %s: %v", kind, in.ID, in.Region, err))
+				continue
+			}
+			if _, ok := asked[in.ID]; !ok {
+				asked[in.ID] = in
+				log("terminating %s %s (%s, %s) in %s", kind, in.ID, in.Runner, in.State, in.Region)
 			}
 		}
+		// One that dropped out of the listing must be seen terminated.
+		for id, in := range asked {
+			if listed[id] {
+				continue
+			}
+			if st, err := instanceState(ctx, in); err != nil || st != "terminated" {
+				left = append(left, id)
+			} else {
+				delete(asked, id)
+			}
+		}
+		if err := search.Err(); err != nil {
+			errs = append(errs, err.Error())
+		}
+		if len(errs) > 0 {
+			return errors.New(strings.Join(errs, "; "))
+		}
+		now := time.Now()
+		switch {
+		case len(left) > 0:
+			quietSince = time.Time{}
+		case quietSince.IsZero():
+			quietSince = now
+		case now.Sub(quietSince) >= revokeQuiet:
+			return nil
+		}
+		if now.After(deadline) {
+			return fmt.Errorf("%s still not terminated after %s", strings.Join(left, ", "), revokeWait)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(revokeSettle):
+		}
 	}
-	return nil
+}
+
+// instanceState looks one instance up by ID, through the profile that
+// found it.
+func instanceState(ctx context.Context, in AccountInstance) (string, error) {
+	b, err := accountClient(in.Region, accountResolver(in.Profile)).ec2(ctx, "DescribeInstances", url.Values{"InstanceId.1": {in.ID}})
+	if err != nil {
+		return "", err
+	}
+	ins, _, err := parseDescribeInstances(b)
+	if err != nil || len(ins) == 0 {
+		return "", fmt.Errorf("%s not found", in.ID)
+	}
+	return ins[0].State, nil
 }
