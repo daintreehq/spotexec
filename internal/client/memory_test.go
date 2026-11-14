@@ -89,8 +89,8 @@ func TestWaitIfRunning(t *testing.T) {
 }
 
 func TestOOMMessage(t *testing.T) {
-	if m := oomMessage(3584); !strings.Contains(m, "3.5 GiB") || !strings.Contains(m, "--exclusive") {
-		t.Errorf("spotexec's limit: %q", m)
+	if m := oomMessage(14950); !strings.Contains(m, "14.6 GiB") || !strings.Contains(m, "--exclusive") {
+		t.Errorf("spotexec's pool: %q", m)
 	}
 	if m := oomMessage(0); !strings.Contains(m, "container.options") {
 		t.Errorf("user's limit: %q", m)

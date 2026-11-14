@@ -1169,13 +1169,14 @@ func instanceRunning(lease *Lease) bool {
 	return false
 }
 
-// oomMessage explains an OOM_KILLED result; limitMB is the limit spotexec
-// set, 0 when container.options set it.
+// oomMessage explains an OOM_KILLED result; limitMB is the memory pool's
+// cap, 0 when the container wasn't in the pool (container.options set a
+// limit of its own).
 func oomMessage(limitMB int64) string {
 	if limitMB <= 0 {
 		return "the command ran out of memory: the kernel killed a process in its container for exceeding the container's memory limit (set in container.options)"
 	}
-	return fmt.Sprintf("the command ran out of memory: the kernel killed a process in its container for exceeding this slot's memory share (%.1f GiB). Use --exclusive or fewer max_slots for more, or make it use less", float64(limitMB)/1024)
+	return fmt.Sprintf("the command ran out of memory: the jobs sharing the runner reached the memory set aside for them (%.1f GiB), and the kernel killed the largest process, in this command's container. Use --exclusive to have the whole VM, fewer max_slots, or make it use less", float64(limitMB)/1024)
 }
 
 // cpuShare is the number of CPUs one job should use on a host.

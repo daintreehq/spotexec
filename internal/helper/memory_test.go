@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"errors"
 	"runtime"
 	"slices"
 	"strconv"
@@ -60,19 +61,38 @@ func TestMemOption(t *testing.T) {
 	}
 }
 
-func memHostOf(total int64) memHost { return memHost{total: total, docker: total} }
+func memHostOf(total int64) memHost {
+	return memHost{total: total, docker: total, driver: "systemd", v2: true, ours: true}
+}
+
+func TestPoolLimit(t *testing.T) {
+	// About a c7a.2xlarge: under 16 GiB, so 1/16 reserved.
+	total := int64(15)*gb + 600<<20
+	if got := poolLimit(total); got != (total-total/16)&^(1<<20-1) {
+		t.Errorf("15.6 GiB: %d MiB", got>>20)
+	}
+	if got := poolLimit(64 * gb); got != 62*gb {
+		t.Errorf("64 GiB: %d MiB, want 2 GiB reserved", got>>20)
+	}
+}
 
 func TestPlanMemory(t *testing.T) {
-	if l, note := planMemory(memHostOf(16*gb), 4, false, nil); l != memShare(16*gb, 4, false) || note != "" {
-		t.Errorf("plain: (%d, %q)", l, note)
+	if l, note := planMemory(memHostOf(16*gb), false, nil); l != poolLimit(16*gb) || note != "" {
+		t.Errorf("shared slot: (%d, %q)", l, note)
 	}
 	docker := memHostOf(16 * gb)
 	docker.docker = 16*gb - 200<<20 // Docker rounds what it prints
-	if l, note := planMemory(docker, 4, false, nil); l == 0 || note != "" {
+	if l, note := planMemory(docker, false, nil); l == 0 || note != "" {
 		t.Errorf("docker's rounding refused: (%d, %q)", l, note)
 	}
-	if l, note := planMemory(memHostOf(16*gb), 4, false, []string{"-m", "8g"}); l != 0 || note != "" {
-		t.Errorf("user limit: (%d, %q)", l, note)
+	// Alone on the machine, or with the user's own limit: no limit, nothing to note.
+	for name, c := range map[string]struct {
+		alone bool
+		opts  []string
+	}{"exclusive or one slot": {true, nil}, "user -m": {false, []string{"-m", "8g"}}, "user cgroup parent": {false, []string{"--cgroup-parent=/x"}}} {
+		if l, note := planMemory(memHostOf(16*gb), c.alone, c.opts); l != 0 || note != "" {
+			t.Errorf("%s: (%d, %q)", name, l, note)
+		}
 	}
 	unknown := memHost{why: "the runner isn't Linux"}
 	desktop := memHostOf(16 * gb)
@@ -83,6 +103,12 @@ func TestPlanMemory(t *testing.T) {
 	noSupport.noLimit = true
 	remote := memHostOf(16 * gb)
 	remote.remote = "DOCKER_HOST points at another machine"
+	notOurs := memHostOf(16 * gb)
+	notOurs.ours = false
+	v1 := memHostOf(16 * gb)
+	v1.v2 = false
+	driver := memHostOf(16 * gb)
+	driver.driver = ""
 	for _, c := range []struct {
 		name string
 		h    memHost
@@ -93,8 +119,11 @@ func TestPlanMemory(t *testing.T) {
 		{"docker silent", noInfo, "doesn't say how much memory"},
 		{"no support", noSupport, "no memory limit support"},
 		{"remote", remote, "DOCKER_HOST"},
+		{"someone else's machine", notOurs, "not a spotexec VM"},
+		{"cgroup v1", v1, "cgroup v2"},
+		{"unknown driver", driver, "cgroup driver"},
 	} {
-		if l, note := planMemory(c.h, 4, false, nil); l != 0 || !strings.Contains(note, c.note) {
+		if l, note := planMemory(c.h, false, nil); l != 0 || !strings.Contains(note, c.note) {
 			t.Errorf("%s: (%d, %q), want no limit and a note containing %q", c.name, l, note, c.note)
 		}
 	}
@@ -102,17 +131,23 @@ func TestPlanMemory(t *testing.T) {
 
 func TestReadMemHost(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "")
-	info := " Context:    default\n CPUs: 8\n Total Memory: 15.33GiB\n"
+	info := " Context:    default\n CPUs: 8\n Total Memory: 15.33GiB\n Cgroup Driver: systemd\n Cgroup Version: 2\n"
 	h := readMemHost(info)
 	v := 15.33
 	if want := int64(v * gb); h.docker != want {
 		t.Errorf("docker %d, want %d", h.docker, want)
 	}
-	if h.noLimit || h.noSwapLimit || h.remote != "" {
+	if h.noLimit || h.remote != "" || h.driver != "systemd" || !h.v2 {
 		t.Errorf("%+v", h)
 	}
-	if h := readMemHost(info + "WARNING: No memory limit support\nWARNING: No swap limit support\n"); !h.noLimit || !h.noSwapLimit {
-		t.Errorf("warnings not seen: %+v", h)
+	if h := readMemHost(strings.Replace(info, "Version: 2", "Version: 1", 1)); h.v2 {
+		t.Error("cgroup v1 read as v2")
+	}
+	if h := readMemHost(info + "WARNING: No memory limit support\n"); !h.noLimit {
+		t.Errorf("warning not seen: %+v", h)
+	}
+	if h := readMemHost(info + "WARNING: Running in rootless-mode without cgroups.\n"); !h.noLimit {
+		t.Errorf("rootless without cgroups not seen: %+v", h)
 	}
 	if h := readMemHost(" Total Memory: 512MiB\n"); h.docker != 512<<20 {
 		t.Errorf("MiB: %d", h.docker)
@@ -138,48 +173,88 @@ func TestPSIAvg10(t *testing.T) {
 	}
 }
 
-// User memory options and unknown hosts set no limit; an unknown host is
-// noted once per session.
-func TestMemoryArgsQuiet(t *testing.T) {
+// A job alone on the machine (--exclusive, a single slot) or with its own
+// memory options gets no memory constraint at all, on any OS: nothing that
+// a runtime could size itself from (Node's heap), and no pool either.
+func TestMemoryArgsAloneHasNoConstraint(t *testing.T) {
+	stubPool(t, true, nil)
 	out := &syncBuf{}
-	s := &Session{c: protocol.NewConn(strings.NewReader(""), out), maxSlots: 4, tokens: []*flock{nil}, tokenIdx: 1}
-	if got := s.memoryArgs(&protocol.ContainerRun{Options: []string{"--memory=2g"}}, dockerRunner{}); got != nil || s.memLimit != 0 {
-		t.Fatalf("user --memory: %v, limit %d", got, s.memLimit)
-	}
-	if out.b.Len() != 0 {
-		t.Fatalf("event for a user limit: %s", out.b.String())
-	}
-	for range 2 {
-		if got := s.memoryArgs(&protocol.ContainerRun{}, dockerRunner{}); got != nil {
-			t.Fatalf("unknown daemon memory: %v", got)
+	for name, s := range map[string]*Session{
+		"--exclusive":   {acq: protocol.Acquire{Exclusive: true}, maxSlots: 4, tokens: []*flock{nil, nil, nil, nil}, tokenIdx: 1},
+		"one slot":      {maxSlots: 1, tokens: []*flock{nil}, tokenIdx: 1},
+		"user --memory": {maxSlots: 4, tokens: []*flock{nil}, tokenIdx: 2},
+	} {
+		s.c = protocol.NewConn(strings.NewReader(""), out)
+		run := &protocol.ContainerRun{}
+		if name == "user --memory" {
+			run.Options = []string{"--memory=2g"}
+		}
+		if got := s.memoryArgs(run, dockerRunner{info: linuxInfo()}); got != nil || s.memLimit != 0 {
+			t.Errorf("%s: %v, limit %d", name, got, s.memLimit)
 		}
 	}
-	if n := strings.Count(out.b.String(), "container_memory"); n != 1 {
-		t.Fatalf("%d container_memory events, want 1", n)
+	if out.b.Len() != 0 {
+		t.Fatalf("events for runs that weren't due a limit: %s", out.b.String())
 	}
 }
 
-func TestMemoryArgsOnLinux(t *testing.T) {
+// stubPool makes the host look like a spotexec VM (or not) and replaces
+// the cgroup setup, which needs root.
+func stubPool(t *testing.T, ours bool, err error) *[]int64 {
+	oldVM, oldPool := spotexecVM, ensurePool
+	t.Cleanup(func() { spotexecVM, ensurePool = oldVM, oldPool })
+	var calls []int64
+	spotexecVM = func() bool { return ours }
+	ensurePool = func(_, driver string, limit int64) (string, error) {
+		calls = append(calls, limit)
+		if err != nil {
+			return "", err
+		}
+		if driver == "systemd" {
+			return "spotexec.slice", nil
+		}
+		return "/spotexec", nil
+	}
+	return &calls
+}
+
+func linuxInfo() string {
+	return " Context:    default\n Total Memory: " + strconv.FormatFloat(float64(hostMemTotal())/gb, 'f', 4, 64) + "GiB\n Cgroup Driver: systemd\n Cgroup Version: 2\n"
+}
+
+// A shared slot's container goes in the pool, and gets no limit of its own.
+func TestMemoryArgsSharedSlotUsesPool(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("reads /proc/meminfo")
 	}
 	t.Setenv("DOCKER_HOST", "")
-	total := hostMemTotal()
-	info := " Context:    default\n Total Memory: " + strconv.FormatFloat(float64(total)/gb, 'f', 4, 64) + "GiB\n"
-	s := &Session{maxSlots: 4, tokens: []*flock{nil}, tokenIdx: 1}
-	v := strconv.FormatInt(memShare(total, 4, false)>>20, 10) + "m"
-	if got := s.memoryArgs(&protocol.ContainerRun{}, dockerRunner{info: info}); !slices.Equal(got, []string{"--memory", v, "--memory-swap", v}) {
-		t.Fatalf("got %v, want --memory and --memory-swap %s", got, v)
+	calls := stubPool(t, true, nil)
+	s := &Session{maxSlots: 4, tokens: []*flock{nil}, tokenIdx: 2}
+	got := s.memoryArgs(&protocol.ContainerRun{}, dockerRunner{info: linuxInfo()})
+	if !slices.Equal(got, []string{"--cgroup-parent", "spotexec.slice"}) {
+		t.Fatalf("got %v, want only the pool's --cgroup-parent", got)
 	}
-	if s.memLimit != memShare(total, 4, false) {
-		t.Fatalf("limit recorded as %d", s.memLimit)
+	if want := poolLimit(hostMemTotal()); s.memLimit != want || len(*calls) != 1 || (*calls)[0] != want {
+		t.Fatalf("limit %d, pool set to %v; want %d", s.memLimit, *calls, want)
 	}
-	if got := s.memoryArgs(&protocol.ContainerRun{}, dockerRunner{info: info + "WARNING: No swap limit support\n"}); !slices.Equal(got, []string{"--memory", v}) {
-		t.Fatalf("without swap accounting: %v", got)
+	if got := s.memoryArgs(&protocol.ContainerRun{}, dockerRunner{info: strings.Replace(linuxInfo(), "systemd", "cgroupfs", 1)}); !slices.Equal(got, []string{"--cgroup-parent", "/spotexec"}) {
+		t.Fatalf("cgroupfs: %v", got)
 	}
-	s.acq.Exclusive = true
-	if got := s.memoryArgs(&protocol.ContainerRun{}, dockerRunner{info: info}); got[1] != strconv.FormatInt(memShare(total, 4, true)>>20, 10)+"m" {
-		t.Fatalf("exclusive: %v", got)
+}
+
+// A pool that can't be set up, or a host that isn't ours, leaves the run
+// unlimited, noted once.
+func TestMemoryArgsFailOpen(t *testing.T) {
+	stubPool(t, true, errors.New("sudo: a password is required"))
+	out := &syncBuf{}
+	s := &Session{c: protocol.NewConn(strings.NewReader(""), out), maxSlots: 4, tokens: []*flock{nil}, tokenIdx: 1}
+	for range 2 {
+		if got := s.memoryArgs(&protocol.ContainerRun{}, dockerRunner{info: linuxInfo()}); got != nil || s.memLimit != 0 {
+			t.Fatalf("got %v, limit %d", got, s.memLimit)
+		}
+	}
+	if n := strings.Count(out.b.String(), "container_memory"); n != 1 {
+		t.Fatalf("%d container_memory events, want 1: %s", n, out.b.String())
 	}
 }
 

@@ -297,9 +297,9 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		if pr.timedOut {
 			msg = "install command timed out"
 		} else if d.Container != nil && pr.startErr == nil && s.containerOOMKilled() {
-			msg += ": out of memory, the kernel killed a process in its container for exceeding the container's memory limit"
+			msg += ": out of memory, the kernel killed a process in its container"
 			if s.memLimit > 0 {
-				msg += fmt.Sprintf(" (%s, this slot's share of the runner; use --exclusive or fewer max_slots)", gib(s.memLimit))
+				msg += fmt.Sprintf(" when the jobs sharing the runner reached the memory set aside for them (%s); use --exclusive or fewer max_slots", gib(s.memLimit))
 			}
 		}
 		return perr(protocol.CodeDepsFailed, "%s", msg)
