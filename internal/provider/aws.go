@@ -982,11 +982,15 @@ func HostLabel() string {
 	return strings.Split(h, ".")[0]
 }
 
-// AccountInstance is a live spotexec VM launched by any machine.
+// AccountInstance is a spotexec instance (a fleet VM or an image-bake
+// builder) launched by any machine, and where it was found.
 type AccountInstance struct {
 	ID       string    `json:"id"`
+	Account  string    `json:"account,omitempty"`
 	Region   string    `json:"region"`
+	Profile  string    `json:"profile,omitempty"` // the AWS profile it was found (and is terminated) through
 	Runner   string    `json:"runner"`
+	Builder  bool      `json:"builder,omitempty"` // an `image bake` builder, not part of the fleet
 	Host     string    `json:"host,omitempty"`
 	Owner    string    `json:"owner"`
 	Type     string    `json:"type"`
@@ -995,52 +999,4 @@ type AccountInstance struct {
 	IP       string    `json:"ip,omitempty"`
 	Launched time.Time `json:"launched"`
 	Mine     bool      `json:"mine"`
-}
-
-// AccountInstances lists every live spotexec VM in this runner's region,
-// whichever machine launched it.
-func (a *AWSSpot) AccountInstances(ctx context.Context) ([]AccountInstance, error) {
-	me, _ := ownerID()
-	p := url.Values{"Filter.1.Name": {"tag-key"}, "Filter.1.Value.1": {tagRunner},
-		"Filter.2.Name": {"instance-state-name"}, "Filter.2.Value.1": {"pending"}, "Filter.2.Value.2": {"running"}, "Filter.2.Value.3": {"stopping"}, "Filter.2.Value.4": {"stopped"}}
-	var out []AccountInstance
-	for page := 0; page < 20; page++ {
-		b, err := a.api.ec2(ctx, "DescribeInstances", p)
-		if err != nil {
-			return out, err
-		}
-		ins, next, err := parseDescribeInstances(b)
-		if err != nil {
-			return out, err
-		}
-		for _, in := range ins {
-			market := "on-demand"
-			if in.Lifecycle == "spot" {
-				market = "spot"
-			}
-			out = append(out, AccountInstance{ID: in.InstanceID, Region: a.r.Region, Runner: in.tag(tagRunner), Host: in.tag(tagHost),
-				Owner: in.tag(tagOwner), Type: in.InstanceType, Market: market, State: in.State, IP: in.IPAddress,
-				Launched: in.launched(), Mine: in.tag(tagOwner) == me})
-		}
-		if next == "" {
-			break
-		}
-		p.Set("NextToken", next)
-	}
-	return out, nil
-}
-
-// TerminateAccountInstance terminates a spotexec VM whichever machine owns
-// it (it must carry the spotexec runner tag).
-func (a *AWSSpot) TerminateAccountInstance(ctx context.Context, id string) error {
-	b, err := a.api.ec2(ctx, "DescribeInstances", url.Values{"InstanceId.1": {id}})
-	if err != nil {
-		return err
-	}
-	ins, _, err := parseDescribeInstances(b)
-	if err != nil || len(ins) == 0 || ins[0].tag(tagRunner) == "" {
-		return fmt.Errorf("%s is not a spotexec instance", id)
-	}
-	_, err = a.api.ec2(ctx, "TerminateInstances", url.Values{"InstanceId.1": {id}})
-	return err
 }

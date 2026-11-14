@@ -281,7 +281,7 @@ The fleet shuts itself down without your laptop. One case is not covered: a VM w
 - an **AWS Budgets** alert;
 - an **EventBridge** rule that terminates `spotexec-runner`-tagged instances older than N hours.
 
-`spotexec status` lists pending and running instances only. Stopped instances (whose volumes still bill) don't appear there; `spotexec down` terminates them along with the rest.
+`spotexec status` lists pending and running instances only. Stopped instances (whose volumes still bill) don't appear there; `spotexec down` terminates them along with the rest. `spotexec status -A` lists every spotexec instance in any state but terminated, including `image bake` builders, and `spotexec down -A` terminates them. Both search the regions (and profiles) your AWS runners use, say which, and fail if a region couldn't be listed.
 
 ## The life of a Spot VM
 

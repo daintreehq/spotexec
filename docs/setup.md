@@ -150,11 +150,11 @@ spotexec-gregs-mac (this machine)  gregs-mac  AKIA…YEAW          2026-11-14 07
 ```
 
 ```sh
-spotexec status -A                      # every spotexec VM in the account, by machine
+spotexec status -A                      # every spotexec VM (any machine, any state), by machine
 spotexec down -A --machine studio-02    # stop one machine's VMs (asks first)
 ```
 
-`setup --list` and `--revoke` need an administrator's AWS sign-in; `status -A` and `down -A` work with the machine's own key.
+`setup --list` and `--revoke` need an administrator's AWS sign-in; `status -A` and `down -A` work with the machine's own key. "The account" there means the regions and profiles your AWS runners use: both commands include stopped VMs and `image bake` builders, name the regions and accounts they searched, terminate each VM through the profile that found it, and exit non-zero if a region couldn't be listed or a VM couldn't be terminated.
 
 ## Credentials and keys
 

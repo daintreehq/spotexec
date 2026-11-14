@@ -208,15 +208,16 @@ func cmdStatus() *cobra.Command {
 				return err
 			}
 			if everyone {
-				ins, err := accountInstances(cmd.Context(), cfg)
+				res := findAccountInstances(cmd.Context(), accountScopes(cfg))
 				if asJSON {
-					if err != nil {
+					if err := json.NewEncoder(os.Stdout).Encode(res); err != nil {
 						return err
 					}
-					return json.NewEncoder(os.Stdout).Encode(ins)
+					return res.Err()
 				}
-				printAccountInstances(ins)
-				return err
+				printAccountInstances(res.Instances)
+				printSearched(res)
+				return res.Err()
 			}
 			rs, err := selectRunners(cfg, args)
 			if err != nil {
@@ -234,7 +235,7 @@ func cmdStatus() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&asJSON, "json", false, "JSON output")
-	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "every spotexec VM in the account, whichever machine launched it")
+	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "every spotexec VM (bake builders and stopped VMs too), whichever machine launched it, in the regions and profiles your AWS runners use")
 	return c
 }
 
@@ -484,7 +485,7 @@ func cmdDown() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&all, "all", false, "terminate every ephemeral runner")
-	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "terminate spotexec VMs launched by any machine (with --machine: only that one's)")
+	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "terminate spotexec VMs (bake builders and stopped VMs too) launched by any machine, in the regions and profiles your AWS runners use (with --machine: only that one's)")
 	c.Flags().StringVar(&machine, "machine", "", "only VMs launched by this machine (its name in `status -A`)")
 	c.Flags().BoolVarP(&yes, "yes", "y", false, "don't ask before terminating other machines' VMs")
 	return c
@@ -965,47 +966,48 @@ func parseAge(s string) (time.Duration, error) {
 	return d, nil
 }
 
-// accountInstances lists every spotexec VM in the regions (and accounts)
-// the AWS runners use, deduplicated.
-func accountInstances(ctx context.Context, cfg *config.Config) ([]provider.AccountInstance, error) {
-	seen := map[string]bool{}
-	var out []provider.AccountInstance
-	var errs []string
+// The account-wide discovery and termination (tests replace them).
+var (
+	findAccountInstances     = provider.FindAccountInstances
+	terminateAccountInstance = provider.TerminateAccountInstance
+)
+
+// accountScopes is every (region, profile) the AWS runners use: "the
+// account" for status -A and down -A means these.
+func accountScopes(cfg *config.Config) []provider.AccountScope {
+	var out []provider.AccountScope
+	seen := map[provider.AccountScope]bool{}
 	for _, r := range cfg.Global.Runners {
-		if r.Type != config.TypeAWSSpot || seen[r.Region+"\x00"+r.Profile] {
+		sc := provider.AccountScope{Region: r.Region, Profile: r.Profile}
+		if r.Type != config.TypeAWSSpot || seen[sc] {
 			continue
 		}
-		seen[r.Region+"\x00"+r.Profile] = true
-		p, err := provider.New(r)
-		if err != nil {
-			errs = append(errs, err.Error())
-			continue
-		}
-		a, ok := p.(*provider.AWSSpot)
-		if !ok {
-			continue
-		}
-		ins, err := a.AccountInstances(ctx)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", r.Region, err))
-		}
-		for _, in := range ins {
-			if !seen[in.ID] {
-				seen[in.ID] = true
-				out = append(out, in)
-			}
-		}
+		seen[sc] = true
+		out = append(out, sc)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Host != out[j].Host {
-			return out[i].Host < out[j].Host
+		if out[i].Region != out[j].Region {
+			return out[i].Region < out[j].Region
 		}
-		return out[i].Launched.Before(out[j].Launched)
+		return out[i].Profile < out[j].Profile
 	})
-	if len(errs) > 0 {
-		return out, errors.New(strings.Join(errs, "; "))
+	return out
+}
+
+// printSearched says where the search looked, and what it couldn't list.
+func printSearched(res *provider.AccountSearch) {
+	if len(res.Searched) == 0 && len(res.Failed) == 0 {
+		fmt.Println("no AWS runners configured, so no account to search")
+		return
 	}
-	return out, nil
+	var where []string
+	for _, sc := range res.Searched {
+		where = append(where, sc.String())
+	}
+	if len(where) > 0 {
+		fmt.Printf("searched %s (the regions your AWS runners use)\n", strings.Join(where, ", "))
+	}
+	// Regions that couldn't be listed come back as the command's error.
 }
 
 func machineName(in provider.AccountInstance) string {
@@ -1025,33 +1027,42 @@ func printAccountInstances(ins []provider.AccountInstance) {
 		return
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "MACHINE\tRUNNER\tINSTANCE\tTYPE\tMARKET\tSTATE\tUP\tREGION")
+	fmt.Fprintln(tw, "MACHINE\tRUNNER\tINSTANCE\tTYPE\tMARKET\tSTATE\tUP\tREGION\tACCOUNT")
 	per := map[string]int{}
 	for _, in := range ins {
 		per[machineName(in)]++
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", machineName(in), in.Runner, in.ID, in.Type, in.Market, in.State, ui.Dur(time.Since(in.Launched).Round(time.Minute)), in.Region)
+		runner := in.Runner
+		if in.Builder {
+			runner += " (bake builder)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", machineName(in), runner, in.ID, in.Type, in.Market, in.State, ui.Dur(time.Since(in.Launched).Round(time.Minute)), in.Region, in.Account)
 	}
 	tw.Flush()
 	fmt.Printf("\n%d VM(s) across %d machine(s). Stop one machine's VMs: spotexec down -A --machine <name>\n", len(ins), len(per))
 }
 
-// downAccount terminates spotexec VMs launched by any machine (or by one).
+// downAccount terminates spotexec VMs (fleet VMs and bake builders, in any
+// state) launched by any machine (or by one), each through the profile that
+// found it. It fails when any region couldn't be listed or any VM
+// terminated, so "done" means done.
 func downAccount(ctx context.Context, cfg *config.Config, machine string, yes bool) error {
-	ins, err := accountInstances(ctx, cfg)
-	if err != nil && len(ins) == 0 {
-		return err
-	}
+	res := findAccountInstances(ctx, accountScopes(cfg))
 	short := strings.Split(machine, ".")[0]
 	var pick []provider.AccountInstance
-	for _, in := range ins {
+	for _, in := range res.Instances {
+		if in.State == "shutting-down" {
+			continue // already terminating
+		}
 		if machine == "" || strings.EqualFold(in.Host, machine) || strings.EqualFold(in.Host, short) || strings.HasPrefix(in.Owner, machine) {
 			pick = append(pick, in)
 		}
 	}
 	if len(pick) == 0 {
 		fmt.Println("no matching spotexec VMs")
-		return nil
+		printSearched(res)
+		return res.Err()
 	}
+	printSearched(res)
 	others := 0
 	for _, in := range pick {
 		if !in.Mine {
@@ -1073,28 +1084,16 @@ func downAccount(ctx context.Context, cfg *config.Config, machine string, yes bo
 			return exitWith(1)
 		}
 	}
-	byRegion := map[string]*provider.AWSSpot{}
-	for _, r := range cfg.Global.Runners {
-		if r.Type != config.TypeAWSSpot || byRegion[r.Region] != nil {
-			continue
-		}
-		if p, err := provider.New(r); err == nil {
-			if a, ok := p.(*provider.AWSSpot); ok {
-				byRegion[r.Region] = a
-			}
-		}
-	}
 	var errs []string
 	for _, in := range pick {
-		a := byRegion[in.Region]
-		if a == nil {
+		if err := terminateAccountInstance(ctx, in); err != nil {
+			errs = append(errs, fmt.Sprintf("couldn't terminate %s in %s: %v", in.ID, in.Region, err))
 			continue
 		}
-		if err := a.TerminateAccountInstance(ctx, in.ID); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", in.ID, err))
-			continue
-		}
-		fmt.Printf("terminated %s (%s, %s)\n", in.ID, machineName(in), in.Runner)
+		fmt.Printf("terminated %s (%s, %s, %s)\n", in.ID, machineName(in), in.Runner, in.Region)
+	}
+	if err := res.Err(); err != nil {
+		errs = append(errs, err.Error()+" (VMs there were not terminated)")
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
