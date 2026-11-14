@@ -18,7 +18,7 @@ spotexec down [runner...] [--all]            terminate fleet VMs (and leftover b
 spotexec down -A [--machine NAME]            terminate VMs any machine launched (or one machine's)
 spotexec daemon start|stop|run               optional pool manager
 spotexec daemon status [--json]              what the pool manager sees and has done
-spotexec container init [--path P] [--force] scaffold a Dockerfile and wire it into .spotexec.toml
+spotexec container init [--path P] [--force] [--yes] scaffold a Dockerfile and wire it into .spotexec.toml
 spotexec container build [run flags]         build the project image on a runner now (ECR on AWS)
 spotexec image bake [runner] [--pull IMG]    bake an AMI from the runner's bootstrap
 spotexec image list [runner]                 baked AMIs from every machine: base image, age, maker, which is in use
@@ -28,7 +28,7 @@ spotexec setup --list | --revoke HOST        every machine's IAM user and VMs; r
 spotexec doctor [runner...]                  verify config, SSH, helper, credentials, network, quota
 spotexec unlock [runner[/id]] (--slot N | --all)
 spotexec prune [runner[/id]...] [--older-than 7d] [--dry-run]
-spotexec init [--global] [--force]           generate configs
+spotexec init [--global] [--force] [--yes]   generate configs
 spotexec hook install [--claude] [--codex] [--shared|--global] [--uninstall]
 spotexec hook check '<command>'              show whether the hook offloads a command
 spotexec cloud-init [runner]                 print the first-boot user-data

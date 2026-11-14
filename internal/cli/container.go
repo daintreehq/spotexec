@@ -21,7 +21,7 @@ const defaultDockerfile = ".spotexec/Dockerfile"
 func cmdContainer() *cobra.Command {
 	c := &cobra.Command{Use: "container", Short: "Project container image: scaffold a Dockerfile and build it on a runner"}
 
-	var force bool
+	var force, yes bool
 	var dfPath string
 	initC := &cobra.Command{
 		Use:   "init",
@@ -33,10 +33,14 @@ func cmdContainer() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := checkProjectDir(ws, yes); err != nil {
+				return err
+			}
 			return containerInit(ws, dfPath, force)
 		},
 	}
 	initC.Flags().BoolVar(&force, "force", false, "overwrite an existing Dockerfile")
+	initC.Flags().BoolVar(&yes, "yes", false, "mark a directory that isn't a Git repository without asking")
 	initC.Flags().StringVar(&dfPath, "path", defaultDockerfile, "repo-relative path of the Dockerfile to write")
 
 	var f runFlags

@@ -168,3 +168,87 @@ func TestCheckIgnoredHonoursInclude(t *testing.T) {
 		}
 	}
 }
+
+// Credential directories never sync from untracked or non-Git sources,
+// whatever the config says; a file Git tracks is the user's choice.
+func TestCredentialDirsNeverSync(t *testing.T) {
+	creds := []string{".aws/credentials", ".ssh/id_ed25519", ".gnupg/private-keys-v1.d/k.key", "sub/.ssh/id_rsa", ".SSH/id_rsa"}
+	root := t.TempDir()
+	writeTree(t, root, append([]string{"src/a.txt"}, creds...)...)
+	// Even an include root (the container's context) can't lift them.
+	m, err := Build(context.Background(), Options{Root: root, Include: []string{".ssh", ".aws/credentials"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := paths(m); got != "src/a.txt" {
+		t.Errorf("non-git: synced %q", got)
+	}
+	ign, err := m.CheckIgnored(context.Background(), []string{".ssh/new_key", "src/new.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ign[".ssh/new_key"] || ign["src/new.txt"] {
+		t.Errorf("CheckIgnored = %v", ign)
+	}
+
+	gitIn(t, root, "init", "-q")
+	gitIn(t, root, "add", "-f", "--", "sub/.ssh/id_rsa")
+	m, err = Build(context.Background(), Options{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := paths(m); got != "src/a.txt sub/.ssh/id_rsa" {
+		t.Errorf("git: synced %q, want the tracked file and src/a.txt only", got)
+	}
+}
+
+// A .spotexec.toml in the home directory doesn't make it a project.
+func TestRootIgnoresHomeMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeTree(t, home, ".spotexec.toml", "sub/x.txt", "proj/.spotexec.toml")
+	sub := filepath.Join(home, "sub")
+	if r, git := Root(sub); git || r != sub {
+		t.Errorf("Root(sub) = %s, %v; want sub itself", r, git)
+	}
+	proj := filepath.Join(home, "proj")
+	if r, _ := Root(filepath.Join(proj)); r != proj {
+		t.Errorf("Root(proj) = %s", r)
+	}
+}
+
+// A project rooted in (or below) a credential directory syncs nothing
+// untracked, whatever the options say.
+func TestCredentialRootSyncsNothing(t *testing.T) {
+	for _, sub := range []string{".ssh", ".aws/sso", ".GnuPG"} {
+		root := filepath.Join(t.TempDir(), sub)
+		writeTree(t, root, "id_ed25519", "keys/x")
+		for _, source := range []string{"", "directory"} {
+			m, err := Build(context.Background(), Options{Root: root, Source: source, Include: []string{"id_ed25519", "keys"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := paths(m); got != "" {
+				t.Errorf("%s (source %q): synced %q", sub, source, got)
+			}
+		}
+	}
+}
+
+// The same through a symlinked ~/.ssh.
+func TestSymlinkedCredentialRootSyncsNothing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	keys := filepath.Join(home, "privatekeys")
+	writeTree(t, keys, "id_ed25519")
+	if err := os.Symlink(keys, filepath.Join(home, ".ssh")); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Build(context.Background(), Options{Root: keys, Include: []string{"id_ed25519"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := paths(m); got != "" {
+		t.Errorf("synced %q", got)
+	}
+}

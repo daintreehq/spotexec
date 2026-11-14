@@ -14,6 +14,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/hooks"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 const globalTemplate = `# spotexec global runner config (personal; never committed).
@@ -65,7 +66,7 @@ usermod -aG docker ubuntu
 `
 
 func cmdInit() *cobra.Command {
-	var global, force bool
+	var global, force, yes bool
 	c := &cobra.Command{
 		Use:   "init",
 		Short: "Generate .spotexec.toml for this repo (or --global runner config)",
@@ -85,6 +86,9 @@ func cmdInit() *cobra.Command {
 			wd, _ := os.Getwd()
 			ws, err := client.Resolve(wd)
 			if err != nil {
+				return err
+			}
+			if err := checkProjectDir(ws, yes); err != nil {
 				return err
 			}
 			p := filepath.Join(ws.Root, ".spotexec.toml")
@@ -107,7 +111,30 @@ func cmdInit() *cobra.Command {
 	}
 	c.Flags().BoolVar(&global, "global", false, "write an example ~/.config/spotexec/config.toml")
 	c.Flags().BoolVar(&force, "force", false, "overwrite an existing file")
+	c.Flags().BoolVar(&yes, "yes", false, "mark a directory that isn't a Git repository without asking")
 	return c
+}
+
+// checkProjectDir refuses to make the home directory or / a project, and
+// asks before marking a directory that isn't a Git worktree: every file
+// under it would sync to runners.
+func checkProjectDir(ws *client.Workspace, yes bool) error {
+	if config.NeverProject(ws.Root) {
+		return fmt.Errorf("%s is your home directory, / or a credential directory, which spotexec never syncs (they hold ~/.aws, ~/.ssh and more): cd into the project's repository and run this again", ws.Root)
+	}
+	if ws.Git || ws.Marked || yes {
+		return nil
+	}
+	if !ui.IsTerminal(os.Stdin) {
+		return fmt.Errorf("%s is not in a Git repository, so every file under it would sync to runners: cd into the project's repository, or pass --yes if this directory is the project", ws.Root)
+	}
+	fmt.Printf("%s is not in a Git repository: every file under it (apart from [sync].exclude and built-in excludes such as node_modules/) will sync to runners.\nMake it a spotexec project? [y/N] ", ws.Root)
+	var a string
+	fmt.Scanln(&a)
+	if a = strings.ToLower(strings.TrimSpace(a)); a != "y" && a != "yes" {
+		return errors.New("nothing written: cd into the project's repository first")
+	}
+	return nil
 }
 
 // writeGlobalTemplate writes the example global config with the detected

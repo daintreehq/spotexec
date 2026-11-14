@@ -135,6 +135,9 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		return Result{}, infra(err)
 	}
 	if !ws.Marked && o.Sync != "none" && !o.PreferLast {
+		if config.NeverProject(ws.Root) {
+			return Result{}, infra(fmt.Errorf("spotexec never syncs %s: it is your home directory, / or a credential directory (~/.aws, ~/.ssh); cd into a project, or pass --sync none", ws.Root))
+		}
 		return Result{}, infra(fmt.Errorf("%s is not in a Git repository and has no .spotexec.toml, so spotexec won't sync it; run `spotexec init` there to mark it as a project, or pass --sync none", ws.Root))
 	}
 	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}}

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -247,5 +248,43 @@ func TestImageTagNonGitProject(t *testing.T) {
 	_, err = imageTag(m, ".spotexec/Dockerfile", "", "linux/amd64", read)
 	if err == nil || strings.Contains(err.Error(), "git add") || !strings.Contains(err.Error(), "exclude") {
 		t.Fatalf("want an exclude error without a git hint, got %v", err)
+	}
+}
+
+// sx in the home directory refuses to sync it, even with a leftover
+// ~/.spotexec.toml.
+func TestRunRefusesHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, ".spotexec.toml"), []byte("version = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := Resolve(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Marked {
+		t.Fatal("home resolved as a marked project")
+	}
+	_, err = Run(context.Background(), nil, ws, Options{Sync: "auto", Writeback: "always"})
+	if err == nil || !strings.Contains(err.Error(), "never syncs") {
+		t.Fatalf("want a refusal, got %v", err)
+	}
+	// A home directory that is a Git worktree (dotfiles), from a child.
+	if out, err := exec.Command("git", "-C", home, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	child := filepath.Join(home, "notes")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if ws, err = Resolve(child); err != nil {
+		t.Fatal(err)
+	}
+	if !ws.Git || ws.Marked {
+		t.Fatalf("git home: git=%v marked=%v, want git and unmarked", ws.Git, ws.Marked)
+	}
+	if _, err = Run(context.Background(), nil, ws, Options{Sync: "auto", Writeback: "always"}); err == nil || !strings.Contains(err.Error(), "never syncs") {
+		t.Fatalf("git home: want a refusal, got %v", err)
 	}
 }

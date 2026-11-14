@@ -393,11 +393,66 @@ func archForInstanceType(t string) string {
 // ArchForInstanceType is exported for providers.
 func ArchForInstanceType(t string) string { return archForInstanceType(t) }
 
+// CredentialDirs never sync from untracked or non-Git sources, and no
+// directory inside one is ever a project.
+var CredentialDirs = []string{".aws", ".ssh", ".gnupg"}
+
+// NeverProject reports whether dir is the home directory, the filesystem
+// root, or inside a credential directory (~/.ssh, even reached through a
+// symlink). None of them is ever a project: syncing them would upload
+// ~/.aws, ~/.ssh and the like, so a .spotexec.toml (or Git worktree) there
+// is ignored and `spotexec init` refuses to write one. Directories are
+// compared by identity, so another spelling of home (/Users/ME on a
+// case-insensitive disk) is still home.
+func NeverProject(dir string) bool {
+	d := filepath.Clean(dir)
+	if r, err := filepath.EvalSymlinks(d); err == nil {
+		d = r
+	}
+	if d == filepath.Dir(d) {
+		return true
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(d), "/") {
+		for _, c := range CredentialDirs {
+			if strings.EqualFold(seg, c) {
+				return true
+			}
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	hi, herr := os.Stat(home)
+	var creds []os.FileInfo
+	for _, c := range CredentialDirs {
+		if fi, err := os.Stat(filepath.Join(home, c)); err == nil && fi.IsDir() {
+			creds = append(creds, fi)
+		}
+	}
+	for a := d; ; a = filepath.Dir(a) {
+		if fi, err := os.Stat(a); err == nil {
+			if a == d && herr == nil && os.SameFile(fi, hi) {
+				return true
+			}
+			for _, c := range creds {
+				if os.SameFile(fi, c) {
+					return true
+				}
+			}
+		}
+		if a == filepath.Dir(a) {
+			return false
+		}
+	}
+}
+
 // FindProject walks up from dir to find .spotexec.toml, stopping at root.
+// One in the home directory or / does not count (see NeverProject).
 func FindProject(dir, root string) string {
 	for d := dir; ; d = filepath.Dir(d) {
 		p := filepath.Join(d, ".spotexec.toml")
-		if _, err := os.Stat(p); err == nil {
+		if _, err := os.Stat(p); err == nil && !NeverProject(d) {
 			return p
 		}
 		if d == root || d == filepath.Dir(d) {

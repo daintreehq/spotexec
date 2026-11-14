@@ -21,6 +21,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/ignore"
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -39,11 +40,12 @@ var BuiltinExcludes = []string{
 	".spotexec-tmp-*",
 }
 
-// NeverSync is never synced from untracked/non-Git sources, not even where
-// Options.Include lifts the built-in excludes: spotexec's own state in a
-// non-Git project's .spotexec/ (write-back lock, stashed conflicts). It is
-// matched case-insensitively, as macOS and Windows filesystems resolve it.
-var NeverSync = []string{"/.spotexec/conflicts/", "/.spotexec/writeback.lock"}
+// NeverSync is never synced from untracked/non-Git sources, whatever the
+// project config says (not even where Options.Include lifts the built-in
+// excludes): credential directories, and spotexec's own state in a non-Git
+// project's .spotexec/ (write-back lock, stashed conflicts). It is matched
+// case-insensitively, as macOS and Windows filesystems resolve it.
+var NeverSync = append(append([]string{}, config.CredentialDirs...), "/.spotexec/conflicts/", "/.spotexec/writeback.lock")
 
 var textAttr = regexp.MustCompile(`(^|\s)-?(text|crlf)(=|\s|$)`)
 
@@ -97,6 +99,9 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 	}
 	m.Matcher = user
 	builtin := newSpotExcluder(o.Include)
+	// A root inside a credential directory (or the home directory) syncs
+	// nothing Git doesn't track; Resolve never marks one as a project.
+	builtin.all = config.NeverProject(o.Root)
 	m.spot = builtin
 
 	useGit := o.Source != "directory" && isGitWorktree(ctx, o.Root)
@@ -462,7 +467,8 @@ func must(s string, err error) string {
 }
 
 // Root resolves the worktree root containing dir: the Git toplevel when inside
-// a repository, else the directory holding .spotexec.toml, else dir itself.
+// a repository, else the directory holding .spotexec.toml (never the home
+// directory or /, see config.NeverProject), else dir itself.
 func Root(dir string) (string, bool) {
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
 	if err == nil {
@@ -473,7 +479,7 @@ func Root(dir string) (string, bool) {
 		return r, true
 	}
 	for d := dir; ; d = filepath.Dir(d) {
-		if _, err := os.Stat(filepath.Join(d, ".spotexec.toml")); err == nil {
+		if _, err := os.Stat(filepath.Join(d, ".spotexec.toml")); err == nil && !config.NeverProject(d) {
 			return d, false
 		}
 		if d == filepath.Dir(d) {
@@ -557,6 +563,7 @@ func (m *Manifest) CheckIgnored(ctx context.Context, paths []string) (map[string
 type spotExcluder struct {
 	builtin, never *ignore.Matcher
 	include        []string // cleaned repo-relative roots
+	all            bool     // exclude everything (see config.NeverProject)
 }
 
 func newSpotExcluder(include []string) *spotExcluder {
@@ -573,7 +580,7 @@ func newSpotExcluder(include []string) *spotExcluder {
 
 // Match reports whether the slash-separated relative path is excluded.
 func (x *spotExcluder) Match(p string, isDir bool) bool {
-	if x.never.Match(strings.ToLower(p), isDir) {
+	if x.all || x.never.Match(strings.ToLower(p), isDir) {
 		return true
 	}
 	best := ""
