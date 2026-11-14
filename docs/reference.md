@@ -10,7 +10,7 @@ sx --same-slot [flags] <cmd>                 run in this worktree's last slot (s
 spotexec exec [flags] -- <cmd>               same as sx --same-slot --sync none -- <cmd>
 spotexec tasks                               list tasks from .spotexec.toml
 spotexec sync [flags]                        pre-sync a slot (and build the container image, install deps)
-spotexec sync-plan [--json]                  dry-run the sync: files, bytes, largest files, exclusions
+spotexec sync-plan [--json]                  dry-run the sync: files, bytes, largest files, exclusions, deps key files
 spotexec pull <glob>... [--dest DIR]         copy gitignored files from the last slot
 spotexec status [runner...] [--json] [-A]    runners, instances, slot holders, idle timers (-A: every machine's VMs and builders, Spot quota use; with --json, {"instances", "searched", "failed", "spot_quotas"})
 spotexec monitor [runner...] [--interval 2s] live load and burn-rate dashboard

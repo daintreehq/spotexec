@@ -140,7 +140,7 @@ pull_artifacts = ["coverage/"] # gitignored outputs copied back after every run
 # source = "git"               # git | directory (default: git when in a worktree)
 
 [deps]
-lockfiles = ["pnpm-lock.yaml"]
+lockfiles = ["pnpm-lock.yaml", "packages/*/package.json"]   # the cache key; globs allowed
 install = "pnpm install --frozen-lockfile"
 cache_dirs = ["node_modules", "packages/*/node_modules"]
 hydrate = "auto"               # auto (reflink, else copy) | reflink | copy | hardlink
@@ -162,6 +162,20 @@ fail_fast = false
 [hook]
 when_load_above = 0.6          # agents offload only when the laptop is busy
 ```
+
+### Dependencies
+
+| Key | Meaning |
+| --- | --- |
+| `lockfiles` | Repo-relative files whose contents key the [dependency cache](environments.md#dependency-cache). Required with `install`. Entries may be globs (see below). |
+| `install` | Command that installs dependencies into `cache_dirs` when the cache misses. |
+| `cache_dirs` | Directories cached and restored per slot. Globs are single-level (`packages/*/node_modules`). |
+| `hydrate` | How a cache is restored into a slot: `auto` (reflink, else copy), `reflink`, `copy` or `hardlink`. |
+| `timeout` | Cap on the install command. |
+
+A `lockfiles` entry containing `*`, `?` or `[` is a pattern, matched one path segment at a time: `*` and `?` never cross a `/`, `[a-z]` is a character class, and a segment that is exactly `**` matches any number of directories, including none (`electron/native/*/src/**`, `**/package.json`). Unlike `--pull` and `pull_artifacts`, `**` is recursive here, because lockfile patterns are matched against the list of files spotexec syncs rather than the runner's filesystem. Every pattern must stay inside the repository (no leading `/`, no `..`, nothing in `.git`).
+
+Patterns are expanded once per run, on your machine, against the files synced to the slot: ignored, excluded and `cache_dirs` files never match, nor do symlinks. The key hashes the sorted, deduplicated list of matches plus any literal entries, and that exact list is what the runner reads, so a new workspace or native addon joins the key as soon as it is synced. A pattern that matches nothing is a warning (`DEPS_LOCKFILES`), since an empty directory of addons is legitimate; a literal path that is missing is still an error, as is a list that matches no file at all. `spotexec sync-plan` prints the expanded list. Configs without patterns keep their existing cache key.
 
 ### Tasks
 

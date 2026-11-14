@@ -343,7 +343,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	// 5. Dependencies.
 	if p.Deps.Install != "" && !o.NoDeps && o.Sync != "none" {
-		if err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun, imageID); err != nil {
+		if err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun, imageID, m); err != nil {
 			return res, infra(err), lostRunner(lease, err)
 		}
 	}
@@ -810,6 +810,22 @@ func syncIn(ctx context.Context, s *transport.Session, m *manifest.Manifest, pro
 	return syn, nil
 }
 
+// DepsLockfiles expands the deps.lockfiles patterns against the synced
+// regular files in m (see depskey.Expand). It returns the concrete list to
+// hash and the patterns that matched nothing.
+func DepsLockfiles(m *manifest.Manifest, entries []string) ([]string, []string, error) {
+	var files []string
+	if m != nil {
+		files = make([]string, 0, len(m.ByPath))
+		for p, e := range m.ByPath {
+			if e.Mode != fsid.ModeSymlink {
+				files = append(files, p)
+			}
+		}
+	}
+	return depskey.Expand(entries, files)
+}
+
 // addLocalTar adds one file and returns the entry for exactly what was sent.
 func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 	fi, err := os.Lstat(full)
@@ -842,10 +858,21 @@ func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 	return protocol.Entry{Path: name, ID: fsid.Bytes(b), Mode: emode, Size: int64(len(b))}, err
 }
 
-func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string) error {
-	lockfiles := p.Deps.Lockfiles
-	if len(lockfiles) == 0 {
+func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string, m *manifest.Manifest) error {
+	if len(p.Deps.Lockfiles) == 0 {
 		return errors.New("deps.install is set but deps.lockfiles is empty")
+	}
+	// The runner hashes exactly this list: it never expands patterns itself,
+	// so both sides key the cache on the same files.
+	lockfiles, unmatched, err := DepsLockfiles(m, p.Deps.Lockfiles)
+	if err != nil {
+		return err
+	}
+	for _, pat := range unmatched {
+		o.Rep.Warn("DEPS_LOCKFILES", "deps.lockfiles pattern %q matches no synced file, so it adds nothing to the dependency cache key", pat)
+	}
+	if len(lockfiles) == 0 {
+		return errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
 	}
 	o.Rep.Status("%s · checking dependency cache", label)
 	t := time.Now()

@@ -818,7 +818,7 @@ func cmdSyncPlan() *cobra.Command {
 	var asJSON bool
 	c := &cobra.Command{
 		Use:   "sync-plan",
-		Short: "Dry-run: show what would be synced (file count, bytes, largest files, exclusions)",
+		Short: "Dry-run: show what would be synced (file count, bytes, largest files, exclusions, dependency key files)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load("")
 			if err != nil {
@@ -830,11 +830,21 @@ func cmdSyncPlan() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			var lockfiles, unmatched []string
+			if p.Deps.Install != "" {
+				if lockfiles, unmatched, err = client.DepsLockfiles(m, p.Deps.Lockfiles); err != nil {
+					return err
+				}
+			}
 			if asJSON {
-				return json.NewEncoder(os.Stdout).Encode(map[string]any{
+				out := map[string]any{
 					"root": m.Root, "git": m.Git, "files": len(m.Entries), "bytes": m.Bytes,
 					"fingerprint": m.Fingerprint, "excluded": m.Excluded, "repo_id": l.ws.RepoID,
-				})
+				}
+				if p.Deps.Install != "" {
+					out["deps_lockfiles"], out["deps_unmatched"] = lockfiles, unmatched
+				}
+				return json.NewEncoder(os.Stdout).Encode(out)
 			}
 			fmt.Printf("root:         %s (%s)\n", m.Root, map[bool]string{true: "git working set", false: "directory walk"}[m.Git])
 			fmt.Printf("repo id:      %s\n", l.ws.RepoID)
@@ -864,6 +874,15 @@ func cmdSyncPlan() *cobra.Command {
 				fmt.Println("largest:")
 				for i := 0; i < len(ents) && i < 10; i++ {
 					fmt.Printf("  %10s  %s\n", ui.Bytes(ents[i].s), ents[i].p)
+				}
+			}
+			if p.Deps.Install != "" {
+				fmt.Printf("deps key:     %d lockfiles\n", len(lockfiles))
+				for _, f := range lockfiles {
+					fmt.Printf("  %s\n", f)
+				}
+				for _, pat := range unmatched {
+					fmt.Printf("  ! %s matches no synced file\n", pat)
 				}
 			}
 			switch {
