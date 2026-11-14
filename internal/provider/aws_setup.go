@@ -193,6 +193,12 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		return res, nil
 	}
 	res.Account = acct
+	// Settle the name before asking: another machine may already use it.
+	if existing == nil && s.UserName == "" {
+		if u, err := getUser(ctx, admin, name); err == nil && u.Tags[tagMachine] != machine {
+			name = suffixName(s.DefaultName, machine)
+		}
+	}
 	plan := AWSSetupPlan{Account: acct, AdminARN: adminARN, UserName: name}
 	for _, region := range s.VPCRegions {
 		if b, err := s.client(region, admin.creds).ec2(ctx, "DescribeVpcs", url.Values{"Filter.1.Name": {"isDefault"}, "Filter.1.Value.1": {"true"}}); err == nil && xmlFirst(b, "vpcSet>item>vpcId") == "" {
@@ -217,11 +223,12 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 	// 1. The user, under /spotexec/ and tagged with this machine's id. A
 	// name another machine already uses (same hostname) gets a suffix, so
 	// setting up one machine can never touch another's key.
-	host, _ := os.Hostname()
+	host := HostLabel()
 	owned := false
+	hostTag := host // what the user's spotexec-host tag says
 	for attempt := 0; ; attempt++ {
 		p := url.Values{"UserName": {name}, "Path": {iamUserPath}}
-		for i, kv := range [][2]string{{"spotexec-managed", "true"}, {tagMachine, machine}, {"spotexec-host", strings.Split(host, ".")[0]}} {
+		for i, kv := range [][2]string{{"spotexec-managed", "true"}, {tagMachine, machine}, {"spotexec-host", host}} {
 			p.Set(fmt.Sprintf("Tags.member.%d.Key", i+1), kv[0])
 			p.Set(fmt.Sprintf("Tags.member.%d.Value", i+1), kv[1])
 		}
@@ -243,6 +250,7 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 			return nil, fmt.Errorf("IAM user %s already exists and wasn't created by spotexec (%s); pass --user to pick another name", name, u.ARN)
 		}
 		tag := u.Tags[tagMachine]
+		hostTag = u.Tags["spotexec-host"]
 		switch {
 		case tag == machine:
 			owned = true
@@ -250,7 +258,8 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 			// Made by an older spotexec; this machine's profile signs in as
 			// it, so it's ours: label it.
 			if _, err := admin.query(ctx, "iam", iamAPIVersion, "TagUser", url.Values{"UserName": {name},
-				"Tags.member.1.Key": {tagMachine}, "Tags.member.1.Value": {machine}}); err == nil {
+				"Tags.member.1.Key": {tagMachine}, "Tags.member.1.Value": {machine},
+				"Tags.member.2.Key": {"spotexec-host"}, "Tags.member.2.Value": {host}}); err == nil {
 				owned = true
 			}
 		case existing == nil && s.UserName == "" && attempt == 0:
@@ -265,6 +274,11 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		}
 		s.logf("IAM user %s exists", name)
 		break
+	}
+	if owned && hostTag != host {
+		// Keep the label current (a renamed machine, or an older user).
+		_, _ = admin.query(ctx, "iam", iamAPIVersion, "TagUser", url.Values{"UserName": {name},
+			"Tags.member.1.Key": {"spotexec-host"}, "Tags.member.1.Value": {host}})
 	}
 
 	// 2. Its policy (inline, so re-running replaces it with this version's).

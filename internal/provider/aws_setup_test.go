@@ -117,6 +117,10 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 			f.users[v.Get("UserName")] = u
 			fmt.Fprintf(w, `<CreateUserResponse><CreateUserResult><User><Arn>%s</Arn></User></CreateUserResult></CreateUserResponse>`, arn(v.Get("UserName")))
 		case "GetUser":
+			if user() == nil {
+				iamErr(404, "NoSuchEntity")
+				return
+			}
 			var tags strings.Builder
 			for k, val := range user().tags {
 				fmt.Fprintf(&tags, `<member><Key>%s</Key><Value>%s</Value></member>`, k, val)
@@ -349,6 +353,7 @@ func TestAWSUserSetupRefusals(t *testing.T) {
 	})
 	t.Run("user not made by spotexec", func(t *testing.T) {
 		s, _, _ := newSetupEnv(t, &fakeIAM{users: map[string]*fakeUser{"spotexec-test": {path: "/", tags: map[string]string{}}}})
+		s.UserName = "spotexec-test" // asked for by name: refuse rather than adopt it
 		_, err := s.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "wasn't created by spotexec") {
 			t.Fatalf("err = %v", err)

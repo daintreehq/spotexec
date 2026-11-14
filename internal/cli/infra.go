@@ -997,6 +997,9 @@ func downAccount(ctx context.Context, cfg *config.Config, machine string, yes bo
 	}
 	if others > 0 && !yes {
 		if !ui.IsTerminal(os.Stdin) {
+			if others == 1 {
+				return errors.New("one of these VMs belongs to another machine; re-run with --yes to terminate it")
+			}
 			return fmt.Errorf("%d of these VMs belong to other machines; re-run with --yes to terminate them", others)
 		}
 		printAccountInstances(pick)
