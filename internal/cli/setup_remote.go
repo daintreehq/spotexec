@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,11 +45,14 @@ type remoteSetup struct {
 	adminEnv []string
 	adminARN string
 	adminErr error
+	// The newest release, looked up once.
+	latestTag string
+	latestErr error
 }
 
 func (r *remoteSetup) printf(format string, args ...any) { fmt.Fprintf(r.out, format, args...) }
 
-const remotePath = `PATH="/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:$PATH"; export PATH; `
+var remotePath = `PATH="/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:$PATH"; export PATH; `
 
 func shq(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
@@ -79,16 +83,23 @@ func checkSSHHosts(hosts []string) error {
 	return nil
 }
 
+// sshArgs runs script with /bin/sh there, exactly as given.
 func (r *remoteSetup) sshArgs(script string) []string {
 	// "--" ends option parsing, so the host is never read as an option.
 	return []string{
 		"-o", "ControlMaster=auto", "-o", "ControlPath=" + filepath.Join(r.ctlDir, "%C"), "-o", "ControlPersist=120",
-		"-o", "ConnectTimeout=15", "--", r.host, "/bin/sh -c " + shq(remotePath+script),
+		"-o", "ConnectTimeout=15", "--", r.host, "/bin/sh -c " + shq(script),
 	}
 }
 
-// run runs a shell script on the host, returning its stdout.
+// run runs a shell script on the host, with the usual install locations on
+// PATH, returning its stdout.
 func (r *remoteSetup) run(ctx context.Context, script string, stdin io.Reader) (string, error) {
+	return r.runAsIs(ctx, remotePath+script, stdin)
+}
+
+// runAsIs is run without the PATH additions.
+func (r *remoteSetup) runAsIs(ctx context.Context, script string, stdin io.Reader) (string, error) {
 	cmd := exec.CommandContext(ctx, "ssh", r.sshArgs(script)...)
 	cmd.Stdin = stdin
 	var out, errb bytes.Buffer
@@ -108,7 +119,7 @@ func (r *remoteSetup) run(ctx context.Context, script string, stdin io.Reader) (
 
 // stream runs a script, printing its output indented as it arrives.
 func (r *remoteSetup) stream(ctx context.Context, script string, stdin io.Reader) error {
-	cmd := exec.CommandContext(ctx, "ssh", r.sshArgs(script)...)
+	cmd := exec.CommandContext(ctx, "ssh", r.sshArgs(remotePath+script)...)
 	cmd.Stdin = stdin
 	pr, pw := io.Pipe()
 	cmd.Stdout, cmd.Stderr = pw, pw
@@ -160,7 +171,7 @@ func (r *remoteSetup) probe(ctx context.Context) (remoteInfo, error) {
 }
 
 // latestRelease returns the newest release tag (e.g. "v0.2.0").
-func latestRelease(ctx context.Context) (string, error) {
+var latestRelease = func(ctx context.Context) (string, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, "https://github.com/daintreehq/spotexec/releases/latest", nil)
 	c := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := c.Do(req)
@@ -175,8 +186,85 @@ func latestRelease(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("can't find the latest release (HTTP %d)", resp.StatusCode)
 }
 
-// installSpotexec installs or upgrades spotexec and returns its path.
-func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string, string, error) {
+// latest returns the newest release tag, looked up once per host.
+func (r *remoteSetup) latest(ctx context.Context) (string, error) {
+	if r.latestTag == "" && r.latestErr == nil {
+		r.latestTag, r.latestErr = latestRelease(ctx)
+	}
+	return r.latestTag, r.latestErr
+}
+
+// versionOf picks the version out of `spotexec version` output ("" if none).
+func versionOf(out string) string {
+	v := ""
+	for _, l := range strings.Split(out, "\n") {
+		if s, ok := strings.CutPrefix(strings.TrimSpace(l), "spotexec "); ok {
+			v = strings.TrimSpace(s)
+		}
+	}
+	return v
+}
+
+// compareVersions compares two spotexec versions: releases ("0.3.0") and
+// builds between them (`git describe`: "v0.3.0-5-gabc123", which is newer
+// than 0.3.0). ok is false when either can't be placed, such as "dev" or a
+// modified build.
+func compareVersions(a, b string) (cmp int, ok bool) {
+	pa, oka := parseVersion(a)
+	pb, okb := parseVersion(b)
+	if !oka || !okb {
+		return 0, false
+	}
+	for i := range pa {
+		if pa[i] != pb[i] {
+			if pa[i] > pb[i] {
+				return 1, true
+			}
+			return -1, true
+		}
+	}
+	return 0, true
+}
+
+// parseVersion reads X.Y.Z, with `git describe`'s "-N-gHASH" as a fourth
+// part.
+func parseVersion(v string) ([4]int, bool) {
+	var p [4]int
+	v = strings.TrimPrefix(v, "v")
+	base, rest, _ := strings.Cut(v, "-")
+	f := strings.Split(base, ".")
+	if len(f) != 3 {
+		return p, false
+	}
+	if rest != "" {
+		n, hash, ok := strings.Cut(rest, "-")
+		if !ok || !strings.HasPrefix(hash, "g") || strings.Contains(hash, "-") {
+			return p, false // a pre-release or a modified ("-dirty") build
+		}
+		f = append(f, n)
+	}
+	for i, s := range f {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 0 {
+			return p, false
+		}
+		p[i] = n
+	}
+	return p, true
+}
+
+// installed is a spotexec installed on a host.
+type installed struct {
+	bin  string // the shell word that runs it there
+	dir  string // its directory, as a PATH entry in a shell profile
+	how  string // how it was installed
+	want string // the version it must report ("" when that isn't known)
+}
+
+const localBin = `"$HOME/.local/bin/spotexec"`
+
+// installSpotexec installs or upgrades spotexec.
+func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (installed, error) {
 	mode := r.install
 	if mode == "auto" {
 		mode = "release"
@@ -187,72 +275,158 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (string
 	switch mode {
 	case "brew":
 		if i.brew == "" {
-			return "", "", errors.New("Homebrew isn't installed there (use --install release)")
+			return installed{}, errors.New("Homebrew isn't installed there (use --install release)")
+		}
+		want := ""
+		if tag, err := r.latest(ctx); err == nil {
+			want = strings.TrimPrefix(tag, "v")
 		}
 		r.printf("%s\n", "  installing spotexec with Homebrew (latest)…")
 		out, err := r.run(ctx, `brew update --quiet >/dev/null 2>&1; `+
 			`if brew list --versions spotexec >/dev/null 2>&1; then verb=upgrade; else verb=install; fi; `+
-			`out=$(brew "$verb" daintreehq/tap/spotexec 2>&1); rc=$?; `+
-			`if ! brew list --versions spotexec >/dev/null 2>&1; then printf '%s\n' "$out" | tail -n 20; exit 1; fi; `+
-			`[ $rc -eq 0 ] || echo "warning: brew $verb failed; keeping the installed version: $(printf '%s\n' "$out" | grep -m1 '^Error')"; `+
-			// An earlier copy in ~/.local/bin would shadow Homebrew's.
-			`if [ -f "$HOME/.local/bin/spotexec" ]; then rm -f "$HOME/.local/bin/spotexec"; `+
-			`[ -L "$HOME/.local/bin/sx" ] && rm -f "$HOME/.local/bin/sx"; echo "removed an older spotexec from ~/.local/bin"; fi`, nil)
+			`out=$(brew "$verb" daintreehq/tap/spotexec 2>&1) || { printf '%s\n' "$out" | tail -n 20; exit 1; }; `+
+			`p="$(brew --prefix)/bin/spotexec"; echo "path=$p"; "$p" version 2>&1 | head -n 1`, nil)
+		path, got := "", ""
+		if err == nil {
+			for _, l := range strings.Split(out, "\n") {
+				if s, ok := strings.CutPrefix(l, "path="); ok {
+					path = s
+				}
+			}
+			switch got = versionOf(out); {
+			case path == "" || got == "":
+				err = fmt.Errorf("Homebrew's spotexec doesn't run: %s", firstLine(strings.TrimSpace(out)))
+			case want != "" && got != want:
+				err = fmt.Errorf("Homebrew installed spotexec %s, not the latest release (%s)", got, want)
+			}
+		} else {
+			err = errors.New(brewError(out + err.Error()))
+		}
 		if err != nil {
-			why := brewError(out + err.Error())
 			if r.install == "auto" {
-				r.printf("  Homebrew couldn't install it (%s); using the release binary instead\n", why)
+				r.printf("  Homebrew couldn't install it (%v); using the release binary instead\n", err)
 				r.install = "release"
 				return r.installSpotexec(ctx, i)
 			}
-			return "", "", fmt.Errorf("brew install failed: %s", why)
+			return installed{}, fmt.Errorf("brew install failed: %v", err)
 		}
-		for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
-			if l != "" {
-				r.printf("%s\n", "  "+l)
+		// Homebrew's copy works and is current: an earlier one in
+		// ~/.local/bin would shadow it, unless that one is newer still.
+		old, _ := r.run(ctx, `f="$HOME/.local/bin/spotexec"; if [ -f "$f" ]; then echo present; "$f" version 2>/dev/null | head -n 1; fi`, nil)
+		if strings.HasPrefix(old, "present") {
+			// Only one known to be no newer goes.
+			v := versionOf(old)
+			if c, ok := compareVersions(v, got); !ok || c > 0 {
+				r.printf("  kept spotexec %s in ~/.local/bin (not older than Homebrew's)\n", orDash(v))
+			} else if _, err := r.run(ctx, `rm -f "$HOME/.local/bin/spotexec"; if [ -L "$HOME/.local/bin/sx" ]; then rm -f "$HOME/.local/bin/sx"; fi`, nil); err == nil {
+				r.printf("  removed an older spotexec from ~/.local/bin\n")
 			}
 		}
-		return "spotexec", "Homebrew", nil
+		return installed{bin: shq(path), dir: filepath.Dir(path), how: "Homebrew", want: got}, nil
 	case "release":
-		tag, err := latestRelease(ctx)
+		tag, err := r.latest(ctx)
 		if err != nil {
-			return "", "", err
+			return installed{}, err
 		}
-		url := fmt.Sprintf("https://github.com/daintreehq/spotexec/releases/download/%s/spotexec_%s_%s_%s.tar.gz", tag, strings.TrimPrefix(tag, "v"), i.os, i.arch)
+		want := strings.TrimPrefix(tag, "v")
+		// A newer build already there (a development copy) stays.
+		old, _ := r.run(ctx, `f="$HOME/.local/bin/spotexec"; if [ -x "$f" ]; then "$f" version 2>/dev/null | head -n 1; fi`, nil)
+		if v := versionOf(old); v != "" {
+			if c, ok := compareVersions(v, want); ok && c > 0 {
+				return installed{bin: localBin, dir: "$HOME/.local/bin", how: "kept, newer than release " + tag, want: v}, nil
+			}
+		}
+		url := fmt.Sprintf("https://github.com/daintreehq/spotexec/releases/download/%s/spotexec_%s_%s_%s.tar.gz", tag, want, i.os, i.arch)
 		r.printf("  installing spotexec %s into ~/.local/bin…\n", tag)
-		if _, err := r.run(ctx, `set -e; mkdir -p "$HOME/.local/bin"; t=$(mktemp -d); `+
-			`curl -fsSL `+shq(url)+` | tar -xz -C "$t" spotexec; mv "$t/spotexec" "$HOME/.local/bin/spotexec"; rmdir "$t"; `+
-			`ln -sf spotexec "$HOME/.local/bin/sx"`, nil); err != nil {
-			return "", "", fmt.Errorf("downloading %s: %w", url, err)
+		// Unpacked next to the old one and checked before it is replaced.
+		if _, err := r.run(ctx, `set -e; d="$HOME/.local/bin"; mkdir -p "$d"; t=$(mktemp -d "$d/.spotexec-install.XXXXXX"); trap 'rm -rf "$t"' EXIT; `+
+			`curl -fsSL `+shq(url)+` | tar -xz -C "$t" spotexec; `+
+			`v=$("$t/spotexec" version 2>&1) && [ "$v" = `+shq("spotexec "+want)+` ] || { echo "the downloaded spotexec doesn't run: $v" >&2; exit 1; }; `+
+			`mv -f "$t/spotexec" "$d/spotexec"; ln -sf spotexec "$d/sx"`, nil); err != nil {
+			return installed{}, fmt.Errorf("downloading %s: %w", url, err)
 		}
-		return "$HOME/.local/bin/spotexec", "release " + tag + " in ~/.local/bin" + r.pathHint(ctx), nil
+		return installed{bin: localBin, dir: "$HOME/.local/bin", how: "release " + tag + " in ~/.local/bin", want: want}, nil
 	case "copy":
 		if i.os != runtime.GOOS || i.arch != runtime.GOARCH {
-			return "", "", fmt.Errorf("--install copy needs the same platform (this is %s/%s, that is %s/%s)", runtime.GOOS, runtime.GOARCH, i.os, i.arch)
+			return installed{}, fmt.Errorf("--install copy needs the same platform (this is %s/%s, that is %s/%s)", runtime.GOOS, runtime.GOARCH, i.os, i.arch)
 		}
 		self, err := os.Executable()
 		if err != nil {
-			return "", "", err
+			return installed{}, err
 		}
 		f, err := os.Open(self)
 		if err != nil {
-			return "", "", err
+			return installed{}, err
 		}
 		defer f.Close()
 		r.printf("  copying this spotexec (%s) into ~/.local/bin…\n", Version)
 		if _, err := r.run(ctx, `set -e; mkdir -p "$HOME/.local/bin"; cat > "$HOME/.local/bin/.spotexec.tmp"; `+
 			`chmod 755 "$HOME/.local/bin/.spotexec.tmp"; mv "$HOME/.local/bin/.spotexec.tmp" "$HOME/.local/bin/spotexec"; `+
 			`ln -sf spotexec "$HOME/.local/bin/sx"`, f); err != nil {
-			return "", "", err
+			return installed{}, err
 		}
-		return "$HOME/.local/bin/spotexec", "copied from this machine into ~/.local/bin" + r.pathHint(ctx), nil
+		return installed{bin: localBin, dir: "$HOME/.local/bin", how: "copied from this machine into ~/.local/bin", want: Version}, nil
 	case "none":
 		if i.spotexec == "" {
-			return "", "", errors.New("spotexec isn't installed there (drop --install none)")
+			return installed{}, errors.New("spotexec isn't installed there (drop --install none)")
 		}
-		return i.spotexec, "already installed", nil
+		return installed{bin: shq(i.spotexec), dir: filepath.Dir(i.spotexec), how: "already installed"}, nil
 	}
-	return "", "", fmt.Errorf("--install must be auto, brew, release, copy or none (got %q)", r.install)
+	return installed{}, fmt.Errorf("--install must be auto, brew, release, copy or none (got %q)", r.install)
+}
+
+// notReadyError marks a host that was set up but where spotexec can't be
+// used from a fresh shell yet.
+type notReadyError struct{ msg string }
+
+func (e *notReadyError) Error() string { return e.msg }
+
+// checkLoginShell confirms that a fresh login shell there finds spotexec and
+// sx, and runs the version just installed.
+func (r *remoteSetup) checkLoginShell(ctx context.Context, dir, want string) error {
+	// The PATH a new terminal there gets (not setup's own additions), read
+	// with `env` so any shell's syntax works; the checks then run in sh.
+	out, err := r.runAsIs(ctx, `sh="${SHELL:-/bin/sh}"; case "$sh" in *csh) e=$("$sh" -c env </dev/null 2>/dev/null) ;; `+
+		`*) e=$("$sh" -lc env </dev/null 2>/dev/null) ;; esac; `+
+		`PATH=$(printf '%s\n' "$e" | sed -n 's/^PATH=//p' | tail -n 1); `+
+		`[ -n "$PATH" ] || { echo "@@nopath="; exit 0; }; export PATH; `+
+		`echo "@@spotexec=$(command -v spotexec)"; echo "@@sx=$(command -v sx)"; `+
+		`if v=$(spotexec version 2>&1); then echo "@@version=$v"; fi; if v=$(sx --version 2>&1); then echo "@@sxversion=$v"; fi`, nil)
+	if err != nil {
+		return &notReadyError{fmt.Sprintf("can't check a login shell there: %v", err)}
+	}
+	if strings.Contains(out, "@@nopath=") {
+		return &notReadyError{"a login shell there doesn't start (`$SHELL -l`)"}
+	}
+	v := map[string]string{}
+	for _, l := range strings.Split(out, "\n") {
+		if k, val, ok := strings.Cut(strings.TrimPrefix(l, "@@"), "="); ok && strings.HasPrefix(l, "@@") {
+			v[k] = strings.TrimSpace(val)
+		}
+	}
+	got := versionOf(v["version"])
+	switch {
+	case v["spotexec"] == "":
+		return &notReadyError{"a login shell there doesn't find spotexec" + r.pathHint(ctx, dir)}
+	case want != "" && got != want:
+		what := "spotexec " + got
+		if got == "" {
+			what = "a spotexec that doesn't run"
+		}
+		msg := fmt.Sprintf("a login shell there runs %s (%s), not spotexec %s", v["spotexec"], what, want)
+		if strings.Contains(v["spotexec"], "brew") || strings.HasPrefix(v["spotexec"], "/opt/homebrew/") || strings.HasPrefix(v["spotexec"], "/usr/local/") {
+			msg += "; fix Homebrew there (`brew doctor`) and run `brew upgrade spotexec`, or remove its copy with `brew uninstall spotexec`"
+		} else {
+			msg += "; remove that copy, or put the new one's directory first on PATH"
+		}
+		return &notReadyError{msg}
+	case v["sx"] == "":
+		return &notReadyError{fmt.Sprintf("a login shell there finds %s but not sx: ln -s spotexec %s", v["spotexec"], shq(filepath.Join(filepath.Dir(v["spotexec"]), "sx")))}
+	case versionOf(v["sxversion"]) != got:
+		return &notReadyError{fmt.Sprintf("a login shell there runs sx from %s, which isn't this spotexec (%s): remove it, or ln -sf spotexec %s",
+			v["sx"], orDash(v["sxversion"]), shq(filepath.Join(filepath.Dir(v["spotexec"]), "sx")))}
+	}
+	return nil
 }
 
 // do sets up one host.
@@ -262,10 +436,11 @@ func (r *remoteSetup) do(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	bin, how, err := r.installSpotexec(ctx, i)
+	in, err := r.installSpotexec(ctx, i)
 	if err != nil {
 		return err
 	}
+	bin := in.bin
 	ver, err := r.run(ctx, `command -v `+bin+` >/dev/null || { echo NOT-INSTALLED; exit 0; }; `+
 		bin+` version && { `+bin+` setup --help >/dev/null 2>&1 || echo NO-SETUP; }`, nil)
 	if err != nil {
@@ -274,10 +449,15 @@ func (r *remoteSetup) do(ctx context.Context) error {
 	if strings.Contains(ver, "NOT-INSTALLED") {
 		return errors.New("spotexec isn't installed there")
 	}
+	got := versionOf(ver)
+	if in.want != "" && got != in.want {
+		// An older one may not understand the flags passed below.
+		return fmt.Errorf("spotexec there reports version %q, not %s as installed", got, in.want)
+	}
 	if strings.Contains(ver, "NO-SETUP") {
 		return fmt.Errorf("%s there has no `setup` command; it needs spotexec 0.2.0 or later", strings.TrimSpace(strings.Split(ver, "\n")[0]))
 	}
-	r.printf("  ✓ %s (%s)\n", strings.TrimSpace(strings.Split(ver, "\n")[0]), how)
+	r.printf("  ✓ %s (%s)\n", strings.TrimSpace(strings.Split(ver, "\n")[0]), in.how)
 
 	// The runner config, keeping a backup of a different one. SSH keys and
 	// the owner id stay per machine (each machine owns its own VMs).
@@ -330,7 +510,7 @@ func (r *remoteSetup) do(ctx context.Context) error {
 	if err := r.stream(ctx, script, strings.NewReader(strings.Join(env, "\n")+"\n")); err != nil {
 		return fmt.Errorf("spotexec setup failed there: %w", err)
 	}
-	return nil
+	return r.checkLoginShell(ctx, in.dir, got)
 }
 
 // brewError picks Homebrew's error line out of its output.
@@ -343,20 +523,21 @@ func brewError(out string) string {
 	return firstLine(strings.TrimSpace(out))
 }
 
-// pathHint says how to put ~/.local/bin on PATH when a login shell there
-// doesn't have it.
-func (r *remoteSetup) pathHint(ctx context.Context) string {
-	out, err := r.run(ctx, `"${SHELL:-/bin/sh}" -lc 'echo ":$PATH:"' 2>/dev/null`, nil)
-	if err != nil || strings.Contains(out, "/.local/bin:") {
-		return ""
-	}
+// pathHint says how to put dir on PATH for a login shell there.
+func (r *remoteSetup) pathHint(ctx context.Context, dir string) string {
 	rc := "~/.profile"
-	if sh, _ := r.run(ctx, `echo "$SHELL"`, nil); strings.HasSuffix(strings.TrimSpace(sh), "zsh") {
+	sh, _ := r.run(ctx, `echo "$SHELL"`, nil)
+	switch sh = strings.TrimSpace(sh); {
+	case strings.HasSuffix(sh, "fish"):
+		return fmt.Sprintf("; add it to PATH there: fish -c 'fish_add_path %s'", dir)
+	case strings.HasSuffix(sh, "csh"):
+		return fmt.Sprintf("; add it to PATH there: echo 'set path = (%s $path)' >> ~/.cshrc", dir)
+	case strings.HasSuffix(sh, "zsh"):
 		rc = "~/.zprofile"
-	} else if strings.HasSuffix(strings.TrimSpace(sh), "bash") {
+	case strings.HasSuffix(sh, "bash"):
 		rc = "~/.bash_profile"
 	}
-	return fmt.Sprintf("; it isn't on PATH there yet: echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> %s", rc)
+	return fmt.Sprintf("; add it to PATH there: echo 'export PATH=\"%s:$PATH\"' >> %s", dir, rc)
 }
 
 func firstLine(s string) string {
@@ -410,7 +591,13 @@ func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
 			}
 			err := r.do(ctx)
 			r.close()
-			if err != nil {
+			var notReady *notReadyError
+			if errors.As(err, &notReady) {
+				// Set up, but not usable from a fresh shell yet: remembered,
+				// so `setup --all` checks it again.
+				r.printf("  ✗ %s isn't ready: %v\n", h, err)
+				rememberMachine(h)
+			} else if err != nil {
 				r.printf("  ✗ %s: %v\n", h, err)
 			} else {
 				r.printf("  ✓ %s is ready: run `sx <command>` in a project there\n", h)
