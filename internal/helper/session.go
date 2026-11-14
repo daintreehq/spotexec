@@ -49,6 +49,8 @@ type Session struct {
 	repoID      string
 	state       SlotState
 	acq         protocol.Acquire
+	maxSlots    int  // the slot count acquire used (max_slots, or automatic)
+	cpusNoted   bool // the container_cpus event was sent
 	stored      map[string]storedEntry
 	exiting     atomic.Bool
 	child       atomic.Int64 // running command's process group, if any

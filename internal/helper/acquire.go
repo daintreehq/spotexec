@@ -293,6 +293,7 @@ capacity:
 	holder.Token = s.tokenIdxAt(0)
 	s.writeHolder(holder)
 	s.acq = a
+	s.maxSlots = max
 	s.state = loadSlotState(s.slotDir)
 	if s.state.Sweep {
 		s.sweepPending()
