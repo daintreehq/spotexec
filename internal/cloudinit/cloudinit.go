@@ -37,6 +37,13 @@ type Options struct {
 	UserBootstrap    string        // runs as User (login shell) after BootstrapScript
 }
 
+// Background apt jobs (unattended-upgrades, apt-daily) are stopped at boot:
+// they would hold the dpkg lock against the bootstrap and the user's
+// commands. VMs are short-lived (max_lifetime), so OS updates come from the
+// image instead: an unbaked VM boots Canonical's current Ubuntu image, and a
+// bake applies security updates when it is made and stops being used once a
+// newer base image has been out a week, or after 30 days (see
+// provider.BakeMaxAge).
 var tmpl = template.Must(template.New("ud").Parse(`#!/bin/bash
 # spotexec ephemeral runner bootstrap (generated). Safe to read: it arms an
 # idle watchdog first, then authorizes the spotexec SSH key, then runs the
@@ -154,6 +161,7 @@ fi
 touch "$D/activity"
 exec 8<"$D/lifecycle.lock"
 flock -s 8
+# No background apt (see the note in cloudinit.go): updates come with the image.
 systemctl stop unattended-upgrades.service apt-daily.service apt-daily-upgrade.service >/dev/null 2>&1 || true
 systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 status=0

@@ -76,10 +76,16 @@ spotexec image list aws
 spotexec image clear aws
 ```
 
-`image bake` boots an on-demand builder and runs `bootstrap_script`. It installs Docker and buildx, pre-pulls the project's public container image (`--pull IMAGE` adds more), and runs `user_bootstrap_script`. Then it sanitizes the instance (cloud-init state, SSH host keys, logs, the watchdog) and snapshots it.
+`image bake` boots an on-demand builder from the current Ubuntu image and runs `bootstrap_script`. It installs Docker and buildx, applies the Ubuntu security updates published since that image, pre-pulls the project's public container image (`--pull IMAGE` adds more), and runs `user_bootstrap_script`. Then it sanitizes the instance (cloud-init state, SSH host keys, logs, the watchdog) and snapshots it. It usually takes 10 to 15 minutes, plus your bootstrap.
 
 From then on the fleet boots from the newest bake whose bootstrap hash matches, and skips the bootstrap, so a new VM is ready in roughly bare boot time. The per-instance setup (watchdog, SSH key, timers) still runs on every VM.
 
 Bakes are shared across machines. A bake holds no keys or machine state, so every machine whose runner has the same name and bootstrap uses it, and with the config copied by `spotexec setup`, one `image bake` speeds up the whole stack. `image list` and `image clear` show and delete only this machine's own bakes.
 
-Changing either bootstrap script, `arch` or `user` makes old bakes stop matching; run `image bake` again. Only the two newest bakes per runner are kept, and older images and their snapshots are deleted.
+Changing either bootstrap script, `arch` or `user` makes old bakes stop matching; run `image bake` again.
+
+VMs don't run OS updates (they're short-lived, and apt would compete with your commands), so a bake keeps the packages of the day it was made. Each bake records the Ubuntu image it was built from, and a bake goes stale:
+- **When Canonical publishes a newer base image**, the bake is still used but reported as stale, for a week. After that, new VMs stop using it. (A bake made by an older spotexec, which didn't record its base, gets the same week.)
+- **After 30 days**, new VMs stop using it whatever the base.
+
+A VM that skips a stale bake boots the current Ubuntu image and runs the full bootstrap, as if there were no bake, so it is up to date but slower to start. Run `image bake` again to get fast boots back. `spotexec doctor` and `image list` show each bake's base image and age, and say when it is stale. Without a usable bake (and unless the runner pins an `ami`), VMs boot the current Ubuntu image. Only the two newest bakes per runner are kept, and older images and their snapshots are deleted.

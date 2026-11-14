@@ -283,6 +283,7 @@ type ec2Tag struct {
 
 type ec2Instance struct {
 	InstanceID   string   `xml:"instanceId"`
+	ImageID      string   `xml:"imageId"`
 	InstanceType string   `xml:"instanceType"`
 	LaunchTime   string   `xml:"launchTime"`
 	IPAddress    string   `xml:"ipAddress"`

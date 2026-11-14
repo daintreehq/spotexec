@@ -457,17 +457,26 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 		opts.IdleTimeout = opts.MaxLifetime
 	} else if a.r.AMI == "" || a.r.AMI == "auto" {
 		// A baked image with this runner's bootstrap already applied?
-		if id, dev, size, created, err := a.findBake(ctx); err == nil && id != "" {
-			ami, rootDev = id, dev
-			opts.BootstrapScript, opts.UserBootstrap = "", ""
-			if size > volume {
-				volume = size // can't launch with a volume smaller than the image's snapshot
-			}
-			if age := time.Since(created); !created.IsZero() && age > 30*24*time.Hour {
-				// The OS inside doesn't get security updates until re-baked.
-				log("using baked image %s (%d days old: run `spotexec image bake %s` to pick up OS updates)", id, int(age.Hours()/24), a.r.Name)
-			} else {
-				log("using baked image %s", id)
+		if b, err := a.findBake(ctx); err == nil && b != nil {
+			switch {
+			case b.Expired:
+				// Its OS packages are too old: boot the current Ubuntu image
+				// and run the bootstrap instead.
+				log("not using baked image %s: %s; booting the current Ubuntu image (run `spotexec image bake %s`)", b.ID, b.Stale, a.r.Name)
+			default:
+				ami, rootDev = b.ID, b.img.RootDevice
+				opts.BootstrapScript, opts.UserBootstrap = "", ""
+				if size := b.img.rootSize(); size > volume {
+					volume = size // can't launch with a volume smaller than the image's snapshot
+				}
+				switch {
+				case b.Stale != "":
+					log("using baked image %s (stale: %s; run `spotexec image bake %s`)", b.ID, b.Stale, a.r.Name)
+				case b.CheckErr != "":
+					log("using baked image %s (%s)", b.ID, b.CheckErr)
+				default:
+					log("using baked image %s", b.ID)
+				}
 			}
 		}
 	}
@@ -851,6 +860,7 @@ func (a *AWSSpot) Doctor(ctx context.Context) []Check {
 		}
 	}
 	out = append(out, Check{Name: "console", OK: true, Msg: where})
+	out = append(out, a.bakeCheck(ctx))
 	for _, t := range a.r.InstanceTypes {
 		if strings.HasPrefix(t, "t2.") || strings.HasPrefix(t, "t3.") || strings.HasPrefix(t, "t3a.") || strings.HasPrefix(t, "t4g.") {
 			out = append(out, Check{Name: "instance types", OK: true, Msg: "note: " + t + " is burstable; sustained CPU on spot t-family instances bills surplus credits. Prefer c7a/m7a/c6a."})

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -141,17 +143,15 @@ func cmdImage() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			lines, err := a.Bakes(cmd.Context())
+			bakes, err := a.Bakes(cmd.Context())
 			if err != nil {
 				return err
 			}
-			if len(lines) == 0 {
+			if len(bakes) == 0 {
 				fmt.Printf("%s: no baked images (bootstrap hash %s); run `spotexec image bake %s`\n", r.Name, a.BakeHash(), r.Name)
 				return nil
 			}
-			for _, l := range lines {
-				fmt.Println(l)
-			}
+			printBakes(os.Stdout, r.Name, bakes, time.Now())
 			return nil
 		},
 	}
@@ -174,3 +174,44 @@ func cmdImage() *cobra.Command {
 }
 
 var _ = errors.New
+
+// printBakes shows a runner's bakes: age, base image, bootstrap, and
+// whether new VMs boot from it (or why not).
+func printBakes(w io.Writer, runner string, bakes []provider.Bake, now time.Time) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "IMAGE\tCREATED\tAGE\tBASE IMAGE\tBOOTSTRAP\tSTATUS")
+	stale := false
+	for _, b := range bakes {
+		base := b.Base
+		if base == "" {
+			base = "-"
+		}
+		boot := b.Hash
+		if b.Current {
+			boot += " (current)"
+		}
+		var status string
+		switch {
+		case b.InUse && b.Stale != "":
+			status, stale = "in use, stale: "+b.Stale, true
+		case b.InUse:
+			status = "in use"
+		case b.Expired:
+			status = "expired: " + b.Stale
+			stale = stale || b.Current
+		case b.Stale != "":
+			status = "stale: " + b.Stale
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", b.ID, b.Created.Local().Format("2006-01-02"), provider.AgeText(b.Age(now)), base, boot, status)
+	}
+	tw.Flush()
+	for _, b := range bakes {
+		if b.CheckErr != "" {
+			fmt.Fprintf(w, "note: %s; bakes were judged by age only\n", b.CheckErr)
+			break
+		}
+	}
+	if stale {
+		fmt.Fprintf(w, "run `spotexec image bake %s` to pick up the current Ubuntu image and security updates\n", runner)
+	}
+}
