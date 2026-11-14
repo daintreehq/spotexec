@@ -145,6 +145,23 @@ docker exec "$NAME" bash -c 'mkdir -p /home/dev/.cache/spotexec/tmp && chmod 000
 docker exec "$NAME" chmod 700 /home/dev/.cache/spotexec/tmp
 check "a command the runner can't start exits 125" "[ $code = 125 ] && test ! -e never.txt && grep -q 'could not be started' $WORK/se.err"
 
+echo "== stale SSH master (laptop sleep)"
+# Freeze the server end of the persisted master: the master process still
+# answers -O check, but nothing gets through it, as after a laptop sleep.
+# The second time the helper isn't known to be installed (a new CLI version),
+# so the install's first command is what meets the dead master.
+for case in session install; do
+  "$SX" -q true
+  [ "$case" = install ] && rm -rf "$HOME/.cache/spotexec/helpers"
+  WEDGED=$(docker exec "$NAME" pgrep -f 'sshd: dev' | tr '\n' ' ')
+  docker exec "$NAME" kill -STOP $WEDGED
+  t0=$(date +%s)
+  "$SX" --json 'echo alive' >"$WORK/w.out" 2>"$WORK/w.err" && code=0 || code=$?
+  t1=$(date +%s)
+  docker exec "$NAME" kill -CONT $WEDGED; docker exec "$NAME" kill $WEDGED 2>/dev/null || true
+  check "a dead reused master is replaced ($case): the run reconnects and succeeds" "[ -n '$WEDGED' ] && [ $code = 0 ] && grep -qx alive $WORK/w.out && [ $((t1-t0)) -lt 20 ]"
+done
+
 echo "== conflicts"
 ("$SX" --json 'sleep 2; echo remote > src/a.txt' >/dev/null 2>"$WORK/conf.err") &
 sleep 1; echo "local edit" > src/a.txt; wait

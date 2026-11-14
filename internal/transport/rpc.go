@@ -55,21 +55,62 @@ func (l *lockedBuf) String() string {
 	return strings.TrimSpace(l.b.String())
 }
 
+// Handshake timeouts. Both are shorter than the callers' own probe timeouts
+// (30s), so a wedged link is detected and replaced here rather than by
+// their deadline. A reused master normally answers in milliseconds; one that
+// doesn't is most likely dead (the laptop slept or changed networks while it
+// persisted), so it gets less time before Open dials afresh.
+var (
+	handshakeTimeout       = 10 * time.Second
+	reusedHandshakeTimeout = 5 * time.Second
+)
+
 // Open starts `spotexec-helper rpc` over SSH and performs the handshake.
 func (c *Client) Open(ctx context.Context) (*Session, error) {
-	if err := c.EnsureMaster(ctx); err != nil {
-		return nil, err
-	}
-	path, err := c.EnsureHelper(ctx, false)
+	pid, dialed, err := c.ensureMaster(ctx)
 	if err != nil {
 		return nil, err
 	}
-	s, err := c.open(ctx, path)
+	s, err := c.openHelper(ctx, dialed)
+	if err == nil || !IsConnError(err) || ctx.Err() != nil {
+		return s, err
+	}
+	// The master answered `-O check` but couldn't carry a session. The check
+	// only asks the local master process, which outlives its connection:
+	// after a sleep or a network change it is still "alive" but nothing
+	// gets through. Retire it so the next attempt dials afresh, and if it
+	// was an old one, dial now and try once more.
+	c.dropMaster(pid)
+	if dialed {
+		return nil, err
+	}
+	if pid, _, err = c.ensureMaster(ctx); err != nil {
+		return nil, err
+	}
+	s, err = c.openHelper(ctx, true)
+	if err != nil && IsConnError(err) && ctx.Err() == nil {
+		c.dropMaster(pid)
+	}
+	return s, err
+}
+
+// openHelper installs the helper if needed and opens a session on it.
+// fresh says the master was just dialed (so it is known to be live).
+func (c *Client) openHelper(ctx context.Context, fresh bool) (*Session, error) {
+	probe, hs := probeTimeout, handshakeTimeout
+	if !fresh {
+		probe, hs = reusedHandshakeTimeout, reusedHandshakeTimeout
+	}
+	path, err := c.ensureHelper(ctx, false, probe)
+	if err != nil {
+		return nil, err
+	}
+	s, err := c.open(ctx, path, hs)
 	if err != nil && !IsConnError(err) && ctx.Err() == nil {
 		// Stale marker (helper removed remotely, or work_root wiped): reinstall.
 		c.ForgetHelper()
-		if path, err2 := c.EnsureHelper(ctx, true); err2 == nil {
-			s, err = c.open(ctx, path)
+		if path, err2 := c.ensureHelper(ctx, true, probe); err2 == nil {
+			s, err = c.open(ctx, path, hs)
 		} else {
 			err = err2 // why the reinstall failed is the useful error
 		}
@@ -77,7 +118,7 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 	return s, err
 }
 
-func (c *Client) open(ctx context.Context, path string) (*Session, error) {
+func (c *Client) open(ctx context.Context, path string, handshake time.Duration) (*Session, error) {
 	cmd := exec.Command("ssh", c.Args("exec "+path+" rpc")...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -100,9 +141,7 @@ func (c *Client) open(ctx context.Context, path string) (*Session, error) {
 		s.Close()
 		return nil, s.wrap(err)
 	}
-	// Shorter than the callers' own probe timeouts (20-30s), so a wedged
-	// master is detected and dropped here rather than by their deadline.
-	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	hctx, cancel := context.WithTimeout(ctx, handshake)
 	defer cancel()
 	env, err := s.Expect(hctx, protocol.TypeHelloOK)
 	if err != nil {
@@ -118,9 +157,8 @@ func (c *Client) open(ctx context.Context, path string) (*Session, error) {
 		if errors.Is(err, context.DeadlineExceeded) {
 			// No handshake in time while our caller still waits: a wedged
 			// link. Don't Close (Bye would let a slow helper exit 0 and look
-			// broken); drop the master so the next attempt dials afresh.
+			// broken); Open replaces the master.
 			s.Abort()
-			c.CloseMaster()
 			return nil, &ConnError{Target: c.T.String(), Msg: "no handshake from the helper", Err: err}
 		}
 		s.Close()
@@ -147,9 +185,8 @@ func (c *Client) open(ctx context.Context, path string) (*Session, error) {
 			// not a connection error, so Open reinstalls it.
 			return nil, &helperStartError{code: code, stderr: strings.TrimSpace(s.stderr.String())}
 		default:
-			// No answer and no exit: a wedged link. Drop the master so the
-			// next attempt dials afresh.
-			c.CloseMaster()
+			// No answer and no exit: a wedged link (Open replaces the
+			// master).
 			return nil, &ConnError{Target: c.T.String(), Msg: "no handshake from the helper", Err: err}
 		}
 	}

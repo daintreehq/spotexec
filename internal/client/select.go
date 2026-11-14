@@ -417,7 +417,9 @@ func (m *member) probeStatic(ctx context.Context, req AcquireRequest) (*Lease, [
 }
 
 func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provider.Instance) (*Lease, []protocol.Holder, Outcome) {
-	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	// Room for Open to find a dead reused master (5s), dial afresh (up to
+	// 10s) and still handshake: a reconnect must not read as unreachable.
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	lease, holders, err := tryAcquire(cctx, req, m.r, m.p, in.Target, false)
 	switch {

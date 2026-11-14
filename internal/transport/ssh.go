@@ -27,6 +27,10 @@ import (
 // ControlPersist keeps the master connection alive between runs.
 const ControlPersist = "15m"
 
+// muxTimeout bounds a control command (-O check/stop/exit). They only talk
+// to the local master process, so this is generous.
+const muxTimeout = 5 * time.Second
+
 // Client runs commands on one target.
 type Client struct {
 	T        provider.Target
@@ -146,49 +150,84 @@ func (c *Client) Args(remoteCmd string) []string {
 	return append(append(c.baseArgs("no"), "--", c.T.Host), remoteCmd)
 }
 
-// MasterAlive reports whether a control master is up.
+// MasterAlive reports whether a control master is up. It only asks the
+// local master process: a master whose connection died (the laptop slept or
+// changed networks) still answers. Open finds those out and replaces them.
 func (c *Client) MasterAlive(ctx context.Context) bool {
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "check", "--", c.T.Host)
-	return cmd.Run() == nil
+	_, ok := c.masterPID(ctx)
+	return ok
 }
 
-// EnsureMaster starts the control master if needed. The master is started
-// with -f -N and file-backed stderr: a backgrounded master inheriting our
-// pipes would otherwise hold them open and hang every caller.
+// masterPID asks the control master whether it is running, and its pid (0
+// if ssh didn't say).
+func (c *Client) masterPID(ctx context.Context) (int, bool) {
+	ctx, cancel := context.WithTimeout(ctx, muxTimeout)
+	defer cancel()
+	var errb bytes.Buffer
+	cmd := exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "check", "--", c.T.Host)
+	cmd.Stderr = &errb
+	if cmd.Run() != nil {
+		return 0, false
+	}
+	// "Master running (pid=12345)"
+	_, after, _ := strings.Cut(errb.String(), "(pid=")
+	pid, _ := strconv.Atoi(strings.TrimRight(strings.TrimSpace(after), ")"))
+	return pid, true
+}
+
+// lockMaster serializes starting and retiring this target's master across
+// processes. Without flock (some network filesystems) it goes unlocked.
+func (c *Client) lockMaster(ctx context.Context) (func(), error) {
+	lf, err := os.OpenFile(c.ctlPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return func() {}, nil
+	}
+	for {
+		err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() { _ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN); lf.Close() }, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			lf.Close()
+			return func() {}, nil
+		}
+		select {
+		case <-ctx.Done():
+			lf.Close()
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// EnsureMaster starts the control master if needed.
 func (c *Client) EnsureMaster(ctx context.Context) error {
-	if c.MasterAlive(ctx) {
-		return nil
+	_, _, err := c.ensureMaster(ctx)
+	return err
+}
+
+// ensureMaster starts the control master if needed. It returns the master's
+// pid (0 if unknown) and whether it dialed a new connection (false: an
+// existing master is reused). The master is started with -f -N and
+// file-backed stderr: a backgrounded master inheriting our pipes would
+// otherwise hold them open and hang every caller.
+func (c *Client) ensureMaster(ctx context.Context) (int, bool, error) {
+	if pid, ok := c.masterPID(ctx); ok {
+		return pid, false, nil
 	}
 	// One process starts the master; the others wait and reuse it. (Racing
 	// starters lose the socket bind and leave stray `ssh -N` processes.)
-	if lf, err := os.OpenFile(c.ctlPath+".lock", os.O_CREATE|os.O_RDWR, 0o600); err == nil {
-		defer lf.Close()
-		locked := false
-		for {
-			err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-			if err == nil {
-				locked = true
-				break
-			}
-			if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
-				break // no flock here (some network filesystems): go unlocked
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
-		if locked {
-			defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
-			if c.MasterAlive(ctx) {
-				return nil
-			}
-		}
+	unlock, err := c.lockMaster(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	defer unlock()
+	if pid, ok := c.masterPID(ctx); ok {
+		return pid, false, nil
 	}
 	errf, err := os.CreateTemp("", "spotexec-ssh-*.err")
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	defer os.Remove(errf.Name())
 	defer errf.Close()
@@ -198,14 +237,37 @@ func (c *Client) EnsureMaster(ctx context.Context) error {
 	cmd.Stderr = errf
 	if err := cmd.Run(); err != nil {
 		b, _ := os.ReadFile(errf.Name())
-		return &ConnError{Target: c.T.String(), Msg: strings.TrimSpace(string(b)), Err: err}
+		return 0, false, &ConnError{Target: c.T.String(), Msg: strings.TrimSpace(string(b)), Err: err}
 	}
-	return nil
+	pid, _ := c.masterPID(ctx)
+	return pid, true, nil
 }
 
-// CloseMaster stops the control master.
+// CloseMaster stops the control master, ending every session on it.
 func (c *Client) CloseMaster() {
-	_ = exec.Command("ssh", "-o", "ControlPath="+c.ctlPath, "-O", "exit", "--", c.T.Host).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), muxTimeout)
+	defer cancel()
+	_ = exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "exit", "--", c.T.Host).Run()
+}
+
+// dropMaster retires the master with this pid (0: whichever is running)
+// after it failed to open a session: it stops accepting new sessions and
+// frees the control path at once, so the next attempt dials afresh. Unlike
+// CloseMaster it leaves sessions already on it alone: if the master was only
+// slow, other runs using it carry on, and if it is dead its own keepalives
+// end it. A master another run has already put in its place is kept.
+func (c *Client) dropMaster(pid int) {
+	ctx, cancel := context.WithTimeout(context.Background(), muxTimeout)
+	defer cancel()
+	unlock, err := c.lockMaster(ctx)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	if cur, ok := c.masterPID(ctx); !ok || (pid != 0 && cur != 0 && cur != pid) {
+		return
+	}
+	_ = exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "stop", "--", c.T.Host).Run()
 }
 
 // ConnError is an SSH-level failure (exit 255 or master start failure).
@@ -226,6 +288,10 @@ func (e *ConnError) Error() string {
 func (c *Client) Run(ctx context.Context, remoteCmd string, stdin io.Reader) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "ssh", c.Args(remoteCmd)...)
 	cmd.Stdin = stdin
+	// A session on a master hands its descriptors to the master, so killing
+	// the client (on ctx's deadline) doesn't close our pipes while the
+	// master holds a stuck channel: don't wait on them for long.
+	cmd.WaitDelay = 2 * time.Second
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -309,9 +375,19 @@ func markerPath(c *Client, hash string) string {
 	return filepath.Join(home, ".cache", "spotexec", "helpers", hex.EncodeToString(h[:])[:20])
 }
 
+// probeTimeout bounds the first remote command of a helper install, which
+// may dial a new connection (ConnectTimeout=10 by default).
+var probeTimeout = 20 * time.Second
+
 // EnsureHelper makes sure the right helper is installed and returns the
 // remote command prefix that invokes it.
 func (c *Client) EnsureHelper(ctx context.Context, force bool) (string, error) {
+	return c.ensureHelper(ctx, force, probeTimeout)
+}
+
+// ensureHelper is EnsureHelper with a bound on the first remote command:
+// over a reused master it is short, so a dead one is found out quickly.
+func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Duration) (string, error) {
 	// Fast path: we've installed this exact helper on this host before.
 	// The marker records the remote platform and the hash we installed; it
 	// is only trusted if this binary still embeds that exact helper, so an
@@ -328,8 +404,16 @@ func (c *Client) EnsureHelper(ctx context.Context, force bool) (string, error) {
 			}
 		}
 	}
-	out, err := c.Run(ctx, "uname -sm", nil)
+	// The first command through the master doubles as a liveness probe: a
+	// dead connection must fail (and be replaced by Open) rather than hang.
+	pctx, cancel := context.WithTimeout(ctx, probe)
+	out, err := c.Run(pctx, "uname -sm", nil)
+	timedOut := errors.Is(pctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+	cancel()
 	if err != nil {
+		if timedOut {
+			return "", &ConnError{Target: c.T.String(), Msg: "no answer from the runner", Err: context.DeadlineExceeded}
+		}
 		return "", err
 	}
 	plat, err := parseUname(string(out))
