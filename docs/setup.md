@@ -78,7 +78,7 @@ hosts = ["me@192.168.1.50", "me@homelab.tailnet.ts.net"]   # same machine, two r
 max_slots = 4
 ```
 
-**AWS Spot, which scales to zero.** `spotexec setup` handles credentials and permissions. The [AWS guide](aws.md) covers choosing a region, quotas, networking and doing each step by hand. VMs boot plain Ubuntu 24.04, so give them your toolchain: install it with `bootstrap_script` / `user_bootstrap_script` (see [configuring the runner](aws.md#7-configure-the-runner)), or per repository with a [project container](environments.md#project-containers) (`spotexec container init`).
+**AWS Spot, which scales to zero.** `spotexec setup` handles credentials and permissions. The [AWS guide](aws.md) covers choosing a region, quotas, networking and doing each step by hand. VMs boot plain Ubuntu 24.04, so each repository brings its toolchain in a [project container](environments.md#project-containers), which `spotexec init` sets up when it detects one. Installing it on the VMs with `bootstrap_script` / `user_bootstrap_script` instead (see [configuring the runner](aws.md#7-configure-the-runner)) needs `init --no-container`.
 
 ```toml
 version = 1

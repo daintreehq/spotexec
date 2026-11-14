@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -503,6 +504,7 @@ func cmdDoctor() *cobra.Command {
 				}
 				fmt.Printf("%s %-28s %s\n", mark, name, msg)
 			}
+			warn := func(name, msg string) { fmt.Printf("\x1b[33m!\x1b[0m %-28s %s\n", name, msg) }
 			for _, bin := range []string{"ssh", "git"} {
 				p, err := exec.LookPath(bin)
 				check(bin, err == nil, p)
@@ -527,6 +529,7 @@ func cmdDoctor() *cobra.Command {
 				}
 				check("project config", true, src)
 				check("workspace", true, fmt.Sprintf("%s (repo id %s)", l.ws.Root, l.ws.RepoID))
+				doctorContainer(l, args, check, warn)
 			} else {
 				check("project config", false, err.Error())
 			}
@@ -580,6 +583,40 @@ func cmdDoctor() *cobra.Command {
 			}
 			return nil
 		},
+	}
+}
+
+// doctorContainer reports the project's container: the image it runs in,
+// or, for a project with a toolchain but no container, that AWS VMs (among
+// the runners doctor checks, else the project's pool) boot without it.
+func doctorContainer(l *loaded, runners []string, check func(string, bool, string), warn func(string, string)) {
+	c := l.cfg.Project.Container
+	switch {
+	case c.Image != "":
+		check("container", true, "image "+c.Image)
+	case c.Dockerfile != "":
+		if _, err := os.Stat(filepath.Join(l.ws.Root, filepath.FromSlash(c.Dockerfile))); err != nil {
+			check("container", false, c.Dockerfile+" is missing (`spotexec container init` writes it)")
+			return
+		}
+		check("container", true, c.Dockerfile+" (the first sx builds it; `spotexec container build` builds it now)")
+	default:
+		_, stack, _ := scaffoldDockerfile(l.ws.Root)
+		rs, err := l.cfg.Pool(nil)
+		if len(runners) > 0 {
+			rs, err = selectRunners(l.cfg, runners)
+		}
+		ephemeral := false
+		if err == nil {
+			for _, r := range rs {
+				ephemeral = ephemeral || r.Ephemeral()
+			}
+		}
+		if stack != "" && ephemeral {
+			warn("container", "none, but this is a "+stack+" project and AWS VMs boot without it: run `spotexec container init`, or install it with bootstrap_script")
+			return
+		}
+		check("container", true, "none (commands use the runner's own toolchain)")
 	}
 }
 

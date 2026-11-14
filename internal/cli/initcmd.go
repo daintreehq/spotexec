@@ -67,10 +67,19 @@ usermod -aG docker ubuntu
 `
 
 func cmdInit() *cobra.Command {
-	var global, force, yes bool
+	var global, force, yes, noContainer bool
 	c := &cobra.Command{
 		Use:   "init",
-		Short: "Generate .spotexec.toml for this repo (or --global runner config)",
+		Short: "Generate .spotexec.toml for this repo, and a container for its toolchain (or --global runner config)",
+		Long: `Generate .spotexec.toml for this repository: dependency caching and tasks
+detected from its lockfiles and scripts.
+
+When it detects a language toolchain (Node.js or Bun, Python, Go, Rust, Java),
+init also writes .spotexec/Dockerfile, pinned to the versions the repository
+declares (.nvmrc, packageManager, .python-version, go.mod, rust-toolchain, ...),
+and points [container] at it: AWS VMs boot plain Ubuntu, and every command runs
+in that image. --no-container keeps commands on the runner's own toolchain, as
+does a setup whose runners are all SSH machines.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if global {
 				p := config.GlobalPath()
@@ -104,6 +113,9 @@ func cmdInit() *cobra.Command {
 			for _, n := range notes {
 				fmt.Println("  " + n)
 			}
+			if err := initContainer(ws, noContainer); err != nil {
+				return err
+			}
 			if _, err := os.Stat(config.GlobalPath()); err != nil {
 				fmt.Println("no runners configured yet: run `spotexec setup`")
 			}
@@ -113,7 +125,49 @@ func cmdInit() *cobra.Command {
 	c.Flags().BoolVar(&global, "global", false, "write an example ~/.config/spotexec/config.toml")
 	c.Flags().BoolVar(&force, "force", false, "overwrite an existing file")
 	c.Flags().BoolVar(&yes, "yes", false, "mark a directory that isn't a Git repository without asking")
+	c.Flags().BoolVar(&noContainer, "no-container", false, "don't set up a project container: commands use the runner's own toolchain")
 	return c
+}
+
+// initContainer sets up the project container when init detects a
+// toolchain: AWS VMs boot without one, and the image pins it exactly.
+func initContainer(ws *client.Workspace, skip bool) error {
+	_, stack, _ := scaffoldDockerfile(ws.Root)
+	switch {
+	case stack == "":
+		fmt.Println("no language toolchain detected, so commands use the runner's own tools; `spotexec container init` sets up a container image")
+		return nil
+	case skip:
+		fmt.Printf("%s project, no container (--no-container): commands use the runner's own toolchain, which AWS VMs only have if bootstrap_script installs it\n", stack)
+		return nil
+	case sshRunnersOnly():
+		fmt.Printf("%s project; your runners are SSH machines, so commands use their own toolchain (`spotexec container init` runs them in a container instead)\n", stack)
+		return nil
+	}
+	if _, err := os.Lstat(filepath.Join(ws.Root, filepath.FromSlash(defaultDockerfile))); err == nil {
+		msg, err := wireContainer(filepath.Join(ws.Root, ".spotexec.toml"), defaultDockerfile)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("kept the existing %s (`spotexec container init --force` rewrites it for %s)\n%s\n", defaultDockerfile, stack, msg)
+		return nil
+	}
+	return containerInit(ws, defaultDockerfile, false)
+}
+
+// sshRunnersOnly reports whether every configured runner is an SSH
+// machine, which runs commands with its own toolchain.
+func sshRunnersOnly() bool {
+	g, err := config.LoadGlobal()
+	if err != nil || len(g.Runners) == 0 {
+		return false
+	}
+	for _, r := range g.Runners {
+		if r.Ephemeral() {
+			return false
+		}
+	}
+	return true
 }
 
 // checkProjectDir refuses to make the home directory or / a project, and
@@ -162,32 +216,29 @@ func detectProject(root string) (string, []string) {
 	b.WriteString("version = 1\ntimeout = \"5m\"\nenv_allow = [\"NODE_OPTIONS\", \"TZ\"]\n\n")
 	b.WriteString("[sync]\nmode = \"auto\"          # write back files the command changed (prettier --write, vitest -u, codegen)\nwriteback = \"always\"\nexclude = [\".env*\", \"*.pem\", \"*.key\"]\npull_artifacts = []     # e.g. [\"coverage/\"]\n\n")
 
-	pm := ""
+	// The same package manager the project container installs.
+	pm, pmVer := jsPackageManager(root, readPackageJSON(root))
 	switch {
-	case exists(root, "pnpm-lock.yaml"):
-		pm = "pnpm"
+	case pm == "pnpm" && exists(root, "pnpm-lock.yaml"):
 		dirs := `["node_modules"]`
 		if exists(root, "pnpm-workspace.yaml") {
 			dirs = `["node_modules", "packages/*/node_modules", "apps/*/node_modules"]`
 			notes = append(notes, "pnpm workspace detected: adjust deps.cache_dirs globs to your package folders")
 		}
 		fmt.Fprintf(&b, "[deps]\nlockfiles = [\"pnpm-lock.yaml\"]\ninstall = \"pnpm install --frozen-lockfile\"\ncache_dirs = %s\n\n", dirs)
-	case exists(root, "bun.lock") || exists(root, "bun.lockb"):
-		pm = "bun"
+	case pm == "bun" && (exists(root, "bun.lock") || exists(root, "bun.lockb")):
 		lf := "bun.lock"
 		if !exists(root, lf) {
 			lf = "bun.lockb"
 		}
 		fmt.Fprintf(&b, "[deps]\nlockfiles = [%q]\ninstall = \"bun install --frozen-lockfile\"\ncache_dirs = [\"node_modules\"]\n\n", lf)
-	case exists(root, "yarn.lock"):
-		pm = "yarn"
+	case pm == "yarn" && exists(root, "yarn.lock"):
 		inst := "yarn install --frozen-lockfile"
-		if exists(root, ".yarnrc.yml") {
+		if exists(root, ".yarnrc.yml") || (pmVer != "" && !strings.HasPrefix(pmVer, "1.")) {
 			inst = "yarn install --immutable"
 		}
 		fmt.Fprintf(&b, "[deps]\nlockfiles = [\"yarn.lock\"]\ninstall = %q\ncache_dirs = [\"node_modules\"]\n\n", inst)
-	case exists(root, "package-lock.json"):
-		pm = "npm"
+	case pm == "npm" && exists(root, "package-lock.json"):
 		b.WriteString("[deps]\nlockfiles = [\"package-lock.json\"]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\n\n")
 	case exists(root, "uv.lock"):
 		b.WriteString("[deps]\nlockfiles = [\"uv.lock\"]\ninstall = \"uv sync --frozen\"\ncache_dirs = [\".venv\"]\n\n")

@@ -131,12 +131,13 @@ To use both, list both in `default_pool` and give the homelab the lower `priorit
 
 ```sh
 cd ~/code/my-app
-spotexec init              # writes .spotexec.toml: lockfiles, tasks
-spotexec container init    # the toolchain as a Dockerfile, for AWS VMs
-spotexec doctor            # checks config, SSH, AWS, quota
+spotexec init              # writes .spotexec.toml (lockfiles, tasks) and .spotexec/Dockerfile (your toolchain)
+spotexec doctor            # checks config, SSH, AWS, quota, the container
 ```
 
-The runner needs your toolchain (`node`, `pnpm`, `go` and so on). AWS VMs boot plain Ubuntu, so give them a [project container](docs/environments.md#project-containers) or a runner `bootstrap_script`. On an SSH machine you can skip `container init` if the toolchain is on `PATH` in bash's login profile (`~/.bash_profile` or `~/.profile`, not `~/.zprofile`), or set by [`remote_path_setup`](docs/configuration.md).
+The runner needs your toolchain (`node`, `pnpm`, `go` and so on), and AWS VMs boot plain Ubuntu. So when `init` detects one (Node.js or Bun, Python, Go, Rust, Java), it also writes a [project container](docs/environments.md#project-containers): a Dockerfile pinned to the versions your repository declares (`.nvmrc`, `packageManager`, `.python-version`, `go.mod`, ...). Every command runs in it, and the first `sx` builds it. Commit `.spotexec/Dockerfile` with `.spotexec.toml`.
+
+If your runners are all SSH machines, `init` leaves the container out and commands use the machine's own toolchain: it must be on `PATH` in bash's login profile (`~/.bash_profile` or `~/.profile`, not `~/.zprofile`), or set by [`remote_path_setup`](docs/configuration.md). `spotexec init --no-container` does the same anywhere; AWS VMs then need the toolchain in the runner's `bootstrap_script`.
 
 ### 3. Run
 

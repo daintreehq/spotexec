@@ -28,7 +28,7 @@ spotexec setup --list | --revoke HOST        every machine's IAM user and VMs; r
 spotexec doctor [runner...]                  verify config, SSH, helper, credentials, network, quota
 spotexec unlock [runner[/id]] (--slot N | --all)
 spotexec prune [runner[/id]...] [--older-than 7d] [--dry-run]
-spotexec init [--global] [--force] [--yes]   generate configs
+spotexec init [--global] [--force] [--yes] [--no-container]  .spotexec.toml and the project container (or the runner config)
 spotexec hook install [--claude] [--codex] [--shared|--global] [--uninstall]
 spotexec hook check '<command>'              show whether the hook offloads a command
 spotexec cloud-init [runner]                 print the first-boot user-data
@@ -49,7 +49,7 @@ spotexec version
 | `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
 | `.spotexec.toml`, `.spotexecignore` | Project config and extra sync excludes. |
 | `<git-dir>/spotexec/conflicts/` | Remote versions of files that conflicted on write-back (`.spotexec/conflicts/` outside Git). |
-| `.spotexec/Dockerfile` | Project image from `spotexec container init`. |
+| `.spotexec/Dockerfile` | Project image from `spotexec init` or `spotexec container init`. |
 | `~/.cache/spotexec/` | Local SSH ControlMaster sockets (`cm/`) and helper install markers. |
 | Runner: `~/.cache/spotexec/` | Helper binary, slots, dependency caches (`work_root`). |
 | Runner: `/var/tmp/spotexec/`, `/var/log/spotexec-bootstrap.log` | Lifecycle state and bootstrap log on ephemeral VMs. |

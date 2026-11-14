@@ -3,27 +3,32 @@
 
 `[container]` runs every command, and the dependency install, inside a Docker image on the runner. The image carries the project's toolchain, so the runner itself only needs Docker; on AWS, spotexec installs Docker for you.
 
-### Scaffold, edit, build
+### Set up, edit, build
+
+`spotexec init` sets up the container for you when it detects a language toolchain (Node.js or Bun, Python, Go, Rust, Java): it writes `.spotexec/Dockerfile` and points `[container]` at it. AWS VMs boot plain Ubuntu, so this is how they get your toolchain. It skips the container with `--no-container`, when every configured runner is an SSH machine (which uses its own toolchain), and when it finds no toolchain. `spotexec doctor` warns about a toolchain project with no container on an AWS pool.
 
 ```sh
-spotexec container init              # writes .spotexec/Dockerfile and adds [container] to .spotexec.toml (creating it if needed)
+spotexec init                        # .spotexec.toml, plus .spotexec/Dockerfile for a detected toolchain
+spotexec container init              # or just the Dockerfile and [container] (creating .spotexec.toml if needed)
 $EDITOR .spotexec/Dockerfile         # add the system packages and tools your commands need
 spotexec container build -r aws      # build it on a runner now; on AWS, push it to ECR
-sx pnpm test                         # every command now runs in the image
+sx pnpm test                         # every command runs in the image (the first one builds it if needed)
 ```
 
-`container init` detects the stack and writes a commented Dockerfile with a pinned base image:
+The Dockerfile is commented and pinned as precisely as the repository allows:
 
 | Stack | Base image |
 | --- | --- |
-| Node.js (npm, pnpm, Yarn) | `node:<major>-bookworm`. The major version comes from `.nvmrc`, `.node-version` or `engines.node`; pnpm is pinned from `packageManager`. |
-| Bun | `oven/bun:1` |
-| Python with uv | `ghcr.io/astral-sh/uv:python<x.y>-bookworm`, with the version from `.python-version` |
-| Python | `python:<x.y>-bookworm` |
-| Go | `golang:<x.y>-bookworm`, with the version from `go.mod` |
+| Node.js (npm, pnpm, Yarn) | `node:<version>-bookworm`. The version comes from `.node-version`, `.nvmrc` (including `lts/<name>`), `.tool-versions` or `volta.node`, exact where they give one, else the major of `engines.node`, else 24. The package manager is pinned from `packageManager`: pnpm and npm with `npm install -g`, Yarn through Corepack. Without one, pnpm's major follows the lockfile format and Yarn is 1. |
+| Bun | `oven/bun:<version>`, from `packageManager`, `.bun-version` or `.tool-versions`, else `1` |
+| Python with uv | `python:<version>-bookworm` plus the `uv` binary. The version comes from `.python-version` or `.tool-versions` (exact where given), else the lower bound of `requires-python`, else 3.12. uv is pinned when `[tool.uv] required-version` names one version. |
+| Python | `python:<version>-bookworm`, found the same way |
+| Go | `golang:<version>-bookworm`, from go.mod's `toolchain` line, else its `go` line |
 | Rust | `rust:<version>-bookworm`, with a numeric version from `rust-toolchain(.toml)` (otherwise `1`), plus clippy and rustfmt |
-| Maven / Gradle | `eclipse-temurin:21-jdk`, plus `maven` when there's no `./mvnw` (Gradle projects use `./gradlew`) |
-| Anything else | `ubuntu:24.04` with build-essential |
+| Maven / Gradle | `eclipse-temurin:<major>-jdk`, from `.java-version`, `.sdkmanrc`, `.tool-versions`, or the build's release / toolchain setting, else 21; plus `maven` when there's no `./mvnw` (Gradle projects use `./gradlew`) |
+| Anything else | `ubuntu:24.04` with build-essential (`container init` only) |
+
+The image is built on the first toolchain in that order. When the repository also has a `go.mod` or a `uv.lock`, Go, or uv with its Python, is added to the image too; any other toolchain it uses is named in a comment and in the command's output, for you to add. The `[deps]` install that `init` writes uses the same package manager as the image (`packageManager` wins over a leftover lockfile).
 
 The runner builds from the synced copy. The configured Dockerfile, its `<Dockerfile>.dockerignore` and the files in its directory and build context always sync, whether or not Git tracks or ignores them and even though `.spotexec/` is otherwise skipped, so this works in non-Git projects and with `sync.source = "directory"`. (A build context of `.` is the whole project, synced by the usual rules.) Inside them the usual exclusions still apply: `sync.exclude`, `.spotexecignore`, `deps.cache_dirs`, and built-in ones such as `node_modules/`. `spotexec sync-plan` shows what is sent. Commit the Dockerfile so everyone runs in the same image. `--path` writes it elsewhere, and `--force` overwrites an existing one.
 

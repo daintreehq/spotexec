@@ -129,7 +129,7 @@ hydrate = "auto"               # auto (reflink, else copy) | reflink | copy | ha
 # timeout = "20m"
 
 [container]                    # optional; see "Project containers"
-dockerfile = ".spotexec/Dockerfile"   # written by `spotexec container init`
+dockerfile = ".spotexec/Dockerfile"   # written by `spotexec init` or `spotexec container init`
 
 [tasks.test]
 run = "pnpm vitest run --minWorkers=1 --maxWorkers=$SPOTEXEC_CPUS {args}"

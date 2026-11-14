@@ -12,16 +12,44 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		files map[string]string
 		from  string
 		has   string
+		stack string
 	}{
-		{map[string]string{"package.json": `{"packageManager":"pnpm@9.15.0+sha512.abc","engines":{"node":">=20"}}`, "pnpm-lock.yaml": ""}, "FROM node:20-bookworm", "pnpm@9.15.0 "},
-		{map[string]string{"package.json": `{}`, "package-lock.json": "", ".nvmrc": "v18.19.0\n"}, "FROM node:18-bookworm", ""},
-		{map[string]string{"package.json": `{}`, "bun.lock": ""}, "FROM oven/bun:1", "git"},
-		{map[string]string{"uv.lock": "", ".python-version": "3.11.4\n"}, "FROM ghcr.io/astral-sh/uv:python3.11-bookworm", "UV_PYTHON_DOWNLOADS"},
-		{map[string]string{"go.mod": "module x\n\ngo 1.25.3\n"}, "FROM golang:1.25-bookworm", "GOMODCACHE=/home/spotexec"},
-		{map[string]string{"Cargo.toml": "", "rust-toolchain.toml": "[toolchain]\nchannel = \"1.83.0\"\n"}, "FROM rust:1.83.0-bookworm", "CARGO_HOME=/home/spotexec"},
-		{map[string]string{"pom.xml": ""}, "FROM eclipse-temurin:21-jdk", "git maven"},
-		{map[string]string{"build.gradle.kts": ""}, "FROM eclipse-temurin:21-jdk", ""},
-		{map[string]string{}, "FROM ubuntu:24.04", "build-essential"},
+		{map[string]string{"package.json": `{"packageManager":"pnpm@9.15.0+sha512.abc","engines":{"node":">=20"}}`, "pnpm-lock.yaml": ""}, "FROM node:20-bookworm", "pnpm@9.15.0 ", "Node.js 20, pnpm 9.15.0"},
+		{map[string]string{"package.json": `{}`, "package-lock.json": "", ".nvmrc": "v18.19.0\n"}, "FROM node:18.19.0-bookworm", "", "Node.js 18.19.0"},
+		{map[string]string{"package.json": `{}`, "package-lock.json": "", ".nvmrc": "lts/iron\n"}, "FROM node:20-bookworm", "", "Node.js 20"},
+		{map[string]string{"package.json": `{}`, "package-lock.json": "", ".nvmrc": "lts/*"}, "FROM node:lts-bookworm", "", "Node.js lts"},
+		{map[string]string{"package.json": `{"volta":{"node":"22.11.0"}}`, "package-lock.json": ""}, "FROM node:22.11.0-bookworm", "", "Node.js 22.11.0"},
+		{map[string]string{"package.json": `{"engines":{"node":"20.17.0"}}`, "package-lock.json": ""}, "FROM node:20.17.0-bookworm", "", "Node.js 20.17.0"},
+		{map[string]string{"package.json": `{}`, "package-lock.json": "", ".tool-versions": "nodejs 21.7.3\npython 3.12.1\n"}, "FROM node:21.7.3-bookworm", "", "Node.js 21.7.3"},
+		{map[string]string{"package.json": `{"packageManager":"npm@10.8.2"}`, "package-lock.json": ""}, "FROM node:24-bookworm", "npm@10.8.2", "Node.js 24, npm 10.8.2"},
+		{map[string]string{"package.json": `{"packageManager":"yarn@4.5.1"}`, "yarn.lock": "", ".node-version": "20.11.1"}, "FROM node:20.11.1-bookworm", "corepack install -g yarn@4.5.1", "Node.js 20.11.1, Yarn 4.5.1"},
+		{map[string]string{"package.json": `{}`, "yarn.lock": ""}, "FROM node:24-bookworm", "yarn@1 ", "Node.js 24, Yarn"},
+		{map[string]string{"package.json": `{}`, "pnpm-lock.yaml": "lockfileVersion: '9.0'\n"}, "FROM node:24-bookworm", "pnpm@10 ", "Node.js 24, pnpm 10"},
+		{map[string]string{"package.json": `{}`, "pnpm-lock.yaml": "lockfileVersion: '6.0'\n"}, "FROM node:24-bookworm", "pnpm@8 ", "Node.js 24, pnpm 8"},
+		{map[string]string{"package.json": `{}`, "bun.lock": ""}, "FROM oven/bun:1", "git", "Bun 1"},
+		{map[string]string{"package.json": `{"packageManager":"bun@1.1.38"}`, "bun.lock": ""}, "FROM oven/bun:1.1.38", "", "Bun 1.1.38"},
+		{map[string]string{"uv.lock": "", ".python-version": "3.11.4\n"}, "FROM python:3.11.4-bookworm", "COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx", "Python 3.11.4, uv"},
+		{map[string]string{"uv.lock": "", "pyproject.toml": "[project]\nrequires-python = \">=3.10\"\n[tool.uv]\nrequired-version = \"==0.5.4\"\n"}, "FROM python:3.10-bookworm", "ghcr.io/astral-sh/uv:0.5.4 ", "Python 3.10, uv"},
+		{map[string]string{"requirements.txt": ""}, "FROM python:3.12-bookworm", "", "Python 3.12"},
+		{map[string]string{"go.mod": "module x\n\ngo 1.25.3\n"}, "FROM golang:1.25.3-bookworm", "GOMODCACHE=/home/spotexec", "Go 1.25.3"},
+		{map[string]string{"go.mod": "module x\n\ngo 1.22\n\ntoolchain go1.23.4\n"}, "FROM golang:1.23.4-bookworm", "", "Go 1.23.4"},
+		{map[string]string{"Cargo.toml": "", "rust-toolchain.toml": "[toolchain]\nchannel = \"1.83.0\"\n"}, "FROM rust:1.83.0-bookworm", "CARGO_HOME=/home/spotexec", "Rust 1.83.0"},
+		{map[string]string{"pom.xml": "<properties><maven.compiler.release>17</maven.compiler.release></properties>"}, "FROM eclipse-temurin:17-jdk", "git maven", "Java 17, Maven"},
+		{map[string]string{"build.gradle.kts": "java { toolchain { languageVersion = JavaLanguageVersion.of(23) } }"}, "FROM eclipse-temurin:23-jdk", "", "Java 23, Gradle wrapper"},
+		{map[string]string{"pom.xml": "", "mvnw": "", ".sdkmanrc": "java=21.0.2-tem\n"}, "FROM eclipse-temurin:21-jdk", "", "Java 21, Maven wrapper"},
+		{map[string]string{".java-version": "1.8.0_402\n", "build.gradle": ""}, "FROM eclipse-temurin:8-jdk", "", "Java 8, Gradle wrapper"},
+		{map[string]string{"go.mod": "module x\n\ngo 1.24.2 // minimum\n\ntoolchain go1.25.4 // pinned\n"}, "FROM golang:1.25.4-bookworm", "", "Go 1.25.4"},
+		{map[string]string{"uv.lock": "", "pyproject.toml": "[project]\nrequires-python = \"==3.11.*\"\n"}, "FROM python:3.11-bookworm", "", "Python 3.11, uv"},
+		{map[string]string{"uv.lock": "", "pyproject.toml": "[project]\nrequires-python = \"~=3.10.2\"\n"}, "FROM python:3.10-bookworm", "", "Python 3.10, uv"},
+		// packageManager wins over a leftover lockfile, here and in detectProject.
+		{map[string]string{"package.json": `{"packageManager":"yarn@4.5.1"}`, "pnpm-lock.yaml": "", "yarn.lock": ""}, "FROM node:24-bookworm", "corepack install -g yarn@4.5.1", "Node.js 24, Yarn 4.5.1"},
+		// A Go module with package.json tooling gets Go too; uv likewise.
+		{map[string]string{"go.mod": "module x\n\ngo 1.25.3\n", "package.json": `{}`, "package-lock.json": ""}, "FROM node:24-bookworm", "COPY --from=golang:1.25.3-bookworm /usr/local/go /usr/local/go", "Node.js 24 + Go 1.25.3"},
+		{map[string]string{"package.json": `{}`, "pnpm-lock.yaml": "lockfileVersion: '9.0'\n", "uv.lock": "", ".python-version": "3.12.7"}, "FROM node:24-bookworm", "RUN uv python install 3.12.7", "Node.js 24, pnpm 10 + uv, Python 3.12.7"},
+		{map[string]string{"package.json": `{"packageManager":"pnpm@9.15.0"}`, "pnpm-lock.yaml": "", "bun.lock": ""}, "FROM node:24-bookworm", "pnpm@9.15.0", "Node.js 24, pnpm 9.15.0"},
+		{map[string]string{"uv.lock": "", "pyproject.toml": "[project]\nrequires-python = \"==3.12.7\"\n"}, "FROM python:3.12.7-bookworm", "", "Python 3.12.7, uv"},
+		{map[string]string{"Cargo.toml": "", "package.json": `{}`}, "FROM node:24-bookworm", "also uses Rust", "Node.js 24"},
+		{map[string]string{}, "FROM ubuntu:24.04", "build-essential", ""},
 	}
 	for _, c := range cases {
 		root := t.TempDir()
@@ -30,9 +58,9 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		body, stack := scaffoldDockerfile(root)
-		if !strings.Contains(body, "\n"+c.from+"\n") || !strings.Contains(body, c.has) {
-			t.Errorf("%v (%s): want %q and %q in:\n%s", c.files, stack, c.from, c.has, body)
+		body, stack, _ := scaffoldDockerfile(root)
+		if !strings.Contains(body, "\n"+c.from+"\n") || !strings.Contains(body, c.has) || stack != c.stack {
+			t.Errorf("%v: stack %q (want %q); want %q and %q in:\n%s", c.files, stack, c.stack, c.from, c.has, body)
 		}
 		if strings.Count(body, "\nFROM ") != 1 {
 			t.Errorf("%s: want exactly one FROM", stack)
@@ -62,5 +90,17 @@ func TestWireContainer(t *testing.T) {
 	msg, _ = wireContainer(p, ".spotexec/Dockerfile")
 	if b3, _ := os.ReadFile(p); string(b3) != "[container]\nimage = \"node:22\"\n" || !strings.Contains(msg, "remove image") {
 		t.Fatalf("edited an existing table: %s", msg)
+	}
+}
+
+// The [deps] install uses the package manager the container installs.
+func TestDetectProjectFollowsPackageManager(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"packageManager":"yarn@4.5.1","scripts":{"test":"vitest"}}`), 0o644)
+	os.WriteFile(filepath.Join(root, "pnpm-lock.yaml"), nil, 0o644)
+	os.WriteFile(filepath.Join(root, "yarn.lock"), nil, 0o644)
+	body, _ := detectProject(root)
+	if !strings.Contains(body, `install = "yarn install --immutable"`) || !strings.Contains(body, `run = "yarn run test {args}"`) || strings.Contains(body, "pnpm") {
+		t.Fatalf("detectProject ignored packageManager:\n%s", body)
 	}
 }
