@@ -45,6 +45,7 @@ type remoteSetup struct {
 	adminEnv []string
 	adminARN string
 	adminErr error
+	fellBack bool // auto install fell back from Homebrew to the release
 	// The newest release, looked up once.
 	latestTag string
 	latestErr error
@@ -344,7 +345,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 		if err != nil {
 			if r.install == "auto" {
 				r.printf("  Homebrew couldn't install it (%v); using the release binary instead\n", err)
-				r.install = "release"
+				r.install, r.fellBack = "release", true
 				return r.installSpotexec(ctx, i)
 			}
 			return installed{}, fmt.Errorf("brew install failed: %v", err)
@@ -503,8 +504,12 @@ func (r *remoteSetup) do(ctx context.Context) error {
 		return err
 	}
 	bin := in.bin
+	setupProbe := ""
+	if r.aws {
+		setupProbe = " --admin-from-env"
+	}
 	ver, err := r.run(ctx, `command -v `+bin+` >/dev/null || { echo NOT-INSTALLED; exit 0; }; `+
-		bin+` version && { `+bin+` setup --help >/dev/null 2>&1 || echo NO-SETUP; }`, nil)
+		bin+` version && { `+bin+` setup`+setupProbe+` --help >/dev/null 2>&1 || echo NO-SETUP; }`, nil)
 	if err != nil {
 		return fmt.Errorf("spotexec doesn't run there: %w", err)
 	}
@@ -512,6 +517,11 @@ func (r *remoteSetup) do(ctx context.Context) error {
 		return errors.New("spotexec isn't installed there")
 	}
 	got := versionOf(ver)
+	if r.aws && strings.Contains(ver, "NO-SETUP") {
+		// Too old for --admin-from-env, so it could fall back to its own
+		// AWS login.
+		return fmt.Errorf("%s there is too old to be set up from here; let setup upgrade it (drop --install none)", strings.TrimSpace(strings.Split(ver, "\n")[0]))
+	}
 	if in.want != "" && got != in.want {
 		// An older one may not understand the flags passed below.
 		return fmt.Errorf("spotexec there reports version %q, not %s as installed", got, in.want)
@@ -546,6 +556,8 @@ func (r *remoteSetup) do(ctx context.Context) error {
 	env := []string{"", "", ""}
 	flags := " --yes --profile " + shq(r.profile)
 	if r.aws {
+		// Only the session passed here, never that machine's own AWS login.
+		flags += " --admin-from-env"
 		if r.adminErr != nil {
 			// A machine that already has its key needs no admin session; one
 			// that doesn't will say so.
@@ -570,9 +582,55 @@ func (r *remoteSetup) do(ctx context.Context) error {
 		`AWS_ACCESS_KEY_ID="$k" AWS_SECRET_ACCESS_KEY="$s" AWS_SESSION_TOKEN="$t" AWS_PROFILE= AWS_DEFAULT_PROFILE= SPOTEXEC_SETUP_NESTED=1 ` +
 		`exec ` + bin + ` setup` + flags
 	if err := r.stream(ctx, script, strings.NewReader(strings.Join(env, "\n")+"\n")); err != nil {
+		if r.aws && r.adminErr != nil {
+			return fmt.Errorf("spotexec setup failed there: %w\n    if it needs a new AWS key: sign in to AWS here (%s), then run `%s`", err, r.signInHint(), r.retryCommand())
+		}
 		return fmt.Errorf("spotexec setup failed there: %w", err)
 	}
 	return r.checkLoginShell(ctx, in.dir, got)
+}
+
+// signInHint says how to sign in to AWS here for the admin profile.
+func (r *remoteSetup) signInHint() string {
+	if r.adminProfile == "" {
+		return "`aws login` or `aws sso login`"
+	}
+	p := " --profile " + shq(r.adminProfile)
+	return "`aws login" + p + "` or `aws sso login" + p + "`"
+}
+
+// retryCommand is the command that sets this host up again with the same
+// choices.
+func (r *remoteSetup) retryCommand() string {
+	c := "spotexec setup"
+	if r.adminProfile != "" {
+		c += " --admin-profile " + shq(r.adminProfile)
+	}
+	if r.profile != "spotexec" {
+		c += " --profile " + shq(r.profile)
+	}
+	if r.install != "auto" && !r.fellBack {
+		c += " --install " + r.install
+	}
+	for _, f := range []struct {
+		on   bool
+		flag string
+	}{{r.rotate, " --rotate"}, {r.noVPC, " --no-vpc"}, {r.noHooks, " --no-hooks"}} {
+		if f.on {
+			c += f.flag
+		}
+	}
+	return c + " " + shellWord(r.host)
+}
+
+var plainWord = regexp.MustCompile(`^[A-Za-z0-9@%+=:,./_-]+$`)
+
+// shellWord quotes s for a shell when it needs it.
+func shellWord(s string) string {
+	if plainWord.MatchString(s) {
+		return s
+	}
+	return shq(s)
 }
 
 // brewError picks Homebrew's error line out of its output.
@@ -614,6 +672,8 @@ func (r *remoteSetup) close() {
 	_ = exec.Command("ssh", "-o", "ControlPath="+filepath.Join(r.ctlDir, "%C"), "-O", "exit", "--", r.host).Run()
 }
 
+var adminSession = provider.AdminSession // tests
+
 // setupHosts sets up the hosts, four at a time, printing each one's output
 // as a block when it finishes, and records them in the machine list.
 func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
@@ -630,7 +690,12 @@ func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
 	}
 	defer os.RemoveAll(dir)
 	if base.aws {
-		base.adminEnv, base.adminARN, base.adminErr = provider.AdminSession(ctx, base.adminProfile)
+		base.adminEnv, base.adminARN, base.adminErr = adminSession(ctx, base.adminProfile)
+		if base.adminErr == nil && strings.Contains(base.adminARN, ":user/spotexec/") {
+			// A machine's own spotexec user can't manage IAM users: setting
+			// up others with it would only fail on AccessDenied.
+			base.adminEnv, base.adminErr = nil, fmt.Errorf("signed in as %s, spotexec's own user here, which can't manage IAM users", base.adminARN)
+		}
 	}
 	if len(hosts) > 1 {
 		fmt.Printf("\nSetting up %s…\n", strings.Join(hosts, ", "))

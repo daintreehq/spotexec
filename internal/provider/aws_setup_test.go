@@ -419,3 +419,44 @@ func TestPolicyMatchesREADME(t *testing.T) {
 		t.Fatal("docs/aws.md policy differs from SpotexecPolicy")
 	}
 }
+
+// Setup run from another machine acts only with the session that machine
+// passed, never this machine's own AWS login.
+func TestAWSUserSetupAdminFromEnv(t *testing.T) {
+	f := &fakeIAM{}
+	s, creds, _ := newSetupEnv(t, f)
+	s.AdminFromEnv = true
+	// This machine's own login could manage IAM users...
+	if err := os.WriteFile(creds, []byte("[default]\naws_access_key_id = AKIADMIN\naws_secret_access_key = admin-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_PROFILE", "default")
+	// ...but nothing was passed.
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	_, err := s.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no AWS sign-in was passed") {
+		t.Fatalf("err = %v", err)
+	}
+	if f.count("CreateUser") != 0 || f.count("GetCallerIdentity") != 0 {
+		t.Fatalf("calls %v", f.calls)
+	}
+
+	// A machine whose key still works is refreshed without one.
+	f.users = map[string]*fakeUser{"spotexec-test": {path: "/spotexec/", tags: map[string]string{tagMachine: testMachine}}}
+	f.keys = map[string]fakeKey{"AKMINE": {"spotexec-test", "2025-01-01T00:00:00Z"}}
+	if err := os.WriteFile(creds, []byte("[default]\naws_access_key_id = AKIADMIN\naws_secret_access_key = admin-secret\n[spotexec]\naws_access_key_id = AKMINE\naws_secret_access_key = x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Run(context.Background())
+	if err != nil || !res.AlreadyReady || !res.PolicyStale || f.count("PutUserPolicy") != 0 {
+		t.Fatalf("%+v %v, calls %v", res, err, f.calls)
+	}
+
+	// With the passed session, the policy is refreshed.
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIADMIN")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "admin-secret")
+	if res, err := s.Run(context.Background()); err != nil || res.PolicyStale || f.count("PutUserPolicy") != 1 {
+		t.Fatalf("%+v %v, calls %v", res, err, f.calls)
+	}
+}

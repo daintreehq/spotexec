@@ -59,6 +59,7 @@ const iamUserPath = "/spotexec/"
 // without interactive sign-ins. It is idempotent.
 type AWSUserSetup struct {
 	AdminProfile string   // profile with IAM rights; "" = AWS_PROFILE / env / default
+	AdminFromEnv bool     // the admin session is only AWS_ACCESS_KEY_ID etc. (setup run from another machine)
 	Profile      string   // AWS CLI profile to write (e.g. "spotexec")
 	UserName     string   // IAM user name; "" = keep the profile's spotexec user, else DefaultName
 	DefaultName  string   // e.g. spotexec-<hostname>
@@ -170,7 +171,7 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		name = s.DefaultName
 	}
 
-	admin := s.client("us-east-1", &awsCredResolver{profile: s.AdminProfile})
+	admin := s.client("us-east-1", &awsCredResolver{profile: s.AdminProfile, envOnly: s.AdminFromEnv})
 	acct, adminARN, adminErr := callerIdentity(ctx, admin)
 	if adminErr != nil {
 		if existing != nil && !s.Rotate {

@@ -47,7 +47,13 @@ const fakeSpotexec = `#!/bin/sh
 v=$(cat "$(dirname "$0")/.version" 2>/dev/null || echo VERSION)
 case "$1" in
   version|--version) echo "spotexec $v" ;;
-  setup) [ "$2" = --help ] && exit 0; echo "remote setup $*"; echo "admin key: ${AWS_ACCESS_KEY_ID:-none}" ;;
+  setup)
+    for a; do
+      if [ "$a" = --admin-from-env ] && [ -f "$FAKE/old-spotexec" ]; then echo "Error: unknown flag: $a" >&2; exit 1; fi
+    done
+    for a; do [ "$a" = --help ] && exit 0; done
+    echo "remote setup $*"; echo "admin key: ${AWS_ACCESS_KEY_ID:-none}"
+    if [ -f "$FAKE/setup-fails" ]; then exit 1; fi ;;
 esac
 `
 
@@ -570,5 +576,98 @@ func TestParseChecksums(t *testing.T) {
 	got := parseChecksums(h + "  spotexec_0.3.0_linux_amd64.tar.gz\n" + strings.ToUpper(h) + " *b.tar.gz\nnot a line\n" + "abc  short.tar.gz\n")
 	if len(got) != 2 || got["spotexec_0.3.0_linux_amd64.tar.gz"] != h || got["b.tar.gz"] != h {
 		t.Fatalf("%v", got)
+	}
+}
+
+// Remote setup passes only this machine's session, and says how to get one
+// when a host needs it.
+func TestRemoteSetupAdminSession(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+	f.localInstalled("0.3.0")
+	withLatest(t, "v0.3.0")
+	r := f.setup()
+	r.aws, r.adminEnv, r.adminARN = true, []string{"AKIAHERE", "secret", "token"}, "arn:aws:iam::1:user/me"
+	if err := r.do(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	if out := f.out.String(); !strings.Contains(out, "--admin-from-env") || !strings.Contains(out, "admin key: AKIAHERE") {
+		t.Fatalf("output:\n%s", out)
+	}
+	// Not signed in here: nothing is passed, and a failure says what to do.
+	f.out.Reset()
+	r = f.setup()
+	r.aws, r.adminErr, r.adminProfile = true, errors.New("token expired"), "admin"
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIALEAK")
+	f.write("setup-fails", "", 0o644)
+	r.profile, r.noVPC = "team", true
+	err := r.do(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "`aws sso login --profile 'admin'`") || !strings.Contains(err.Error(), "`spotexec setup --admin-profile 'admin' --profile 'team' --no-vpc box`") {
+		t.Fatalf("err = %v", err)
+	}
+	if out := f.out.String(); !strings.Contains(out, "--admin-from-env") || !strings.Contains(out, "admin key: none") {
+		t.Fatalf("output:\n%s", out)
+	}
+}
+
+// A remote spotexec too old for --admin-from-env isn't run with AWS.
+func TestRemoteSetupTooOld(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+	f.localInstalled("0.2.0")
+	f.write("old-spotexec", "", 0o644)
+	r := f.setup()
+	r.install, r.aws = "none", true
+	if err := r.do(context.Background()); err == nil || !strings.Contains(err.Error(), "too old") {
+		t.Fatalf("err = %v\n%s", err, f.out.String())
+	}
+	if strings.Contains(f.out.String(), "remote setup") {
+		t.Fatalf("ran setup:\n%s", f.out.String())
+	}
+	// Without AWS runners it's fine.
+	r = f.setup()
+	r.install = "none"
+	if err := r.do(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+}
+
+// A session that is a machine's own spotexec user isn't passed on: it can't
+// manage IAM users.
+func TestSetupHostsSpotexecUserSession(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+	f.localInstalled("0.3.0")
+	withLatest(t, "v0.3.0")
+	old := adminSession
+	adminSession = func(context.Context, string) ([]string, string, error) {
+		return []string{"AKIASPOTEXEC", "s", ""}, "arn:aws:iam::1:user/spotexec/spotexec-here", nil
+	}
+	t.Cleanup(func() { adminSession = old })
+	out := captureStdout(t, func() {
+		if err := setupHosts(context.Background(), []string{"box"}, remoteSetup{install: "auto", profile: "spotexec", aws: true}); err != nil {
+			t.Error(err)
+		}
+	})
+	if !strings.Contains(out, "can't manage IAM users") || !strings.Contains(out, "admin key: none") {
+		t.Fatalf("output:\n%s", out)
+	}
+}
+
+func TestRetryCommand(t *testing.T) {
+	for _, c := range []struct {
+		r    remoteSetup
+		want string
+	}{
+		{remoteSetup{host: "box", install: "auto", profile: "spotexec"}, "spotexec setup box"},
+		{remoteSetup{host: "box", install: "release", profile: "spotexec"}, "spotexec setup --install release box"},
+		{remoteSetup{host: "box", install: "release", fellBack: true, profile: "spotexec"}, "spotexec setup box"},
+		{remoteSetup{host: "me@box", install: "copy", profile: "team", adminProfile: "adm", rotate: true, noVPC: true, noHooks: true},
+			"spotexec setup --admin-profile 'adm' --profile 'team' --install copy --rotate --no-vpc --no-hooks me@box"},
+		{remoteSetup{host: "[2001:db8::1]", install: "auto", profile: "spotexec"}, "spotexec setup '[2001:db8::1]'"},
+	} {
+		if got := c.r.retryCommand(); got != c.want {
+			t.Errorf("retryCommand() = %q, want %q", got, c.want)
+		}
 	}
 }

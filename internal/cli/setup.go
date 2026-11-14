@@ -24,7 +24,7 @@ import (
 
 func cmdSetup() *cobra.Command {
 	var profile, adminProfile, user, install string
-	var yes, rotate, skipAWS, printPolicy, noVPC, noHooks, all, list, bake bool
+	var yes, rotate, skipAWS, printPolicy, noVPC, noHooks, all, list, bake, adminFromEnv bool
 	var revoke string
 	c := &cobra.Command{
 		Use:   "setup [host...]",
@@ -112,7 +112,7 @@ and keeps a working key. --rotate replaces the key.
 					}
 				}
 				s := &provider.AWSUserSetup{
-					AdminProfile: adminProfile, Profile: profile, UserName: user, DefaultName: defaultIAMUser(), Region: region, Rotate: rotate,
+					AdminProfile: adminProfile, AdminFromEnv: adminFromEnv, Profile: profile, UserName: user, DefaultName: defaultIAMUser(), Region: region, Rotate: rotate,
 					VPCRegions: vpcRegions, QuotaRegions: regions,
 					Log: func(f string, a ...any) { fmt.Printf("  "+f+"\n", a...) },
 					Confirm: func(plan provider.AWSSetupPlan) bool {
@@ -236,6 +236,10 @@ and keeps a working key. --rotate replaces the key.
 	c.Flags().StringVar(&install, "install", "auto", "how to install spotexec on other machines: auto, brew, release, copy (this binary) or none")
 	c.Flags().BoolVar(&printPolicy, "print-policy", false, "print the IAM policy spotexec needs and exit")
 	c.Flags().BoolVar(&bake, "bake", false, "bake runner images at the end without asking (setup otherwise offers it, except with --yes)")
+	// Set by `spotexec setup <host>` on the other machine: the admin session
+	// is only what it passed in AWS_* variables, never that machine's own.
+	c.Flags().BoolVar(&adminFromEnv, "admin-from-env", false, "use only the AWS credentials in AWS_ACCESS_KEY_ID etc. to manage IAM users")
+	_ = c.Flags().MarkHidden("admin-from-env")
 	return c
 }
 
