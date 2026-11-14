@@ -72,6 +72,8 @@ Every command gets:
 
 Plus anything in `env_allow` (copied from your environment) and `env` (fixed values). Outside a project container, before each command the runner sources the login profile (`/etc/profile`, then `~/.bash_profile`, `~/.bash_login` or `~/.profile`) and then `remote_path_setup`.
 
+On `aws-spot` VMs, `localhost` resolves to both `127.0.0.1` and `::1`, as on macOS and GitHub's hosted runners. Stock Ubuntu maps it to `127.0.0.1` only, which breaks a test that binds a server to `::1` and dials `localhost`. Project containers share the VM's `/etc/hosts`. `ssh` runners are your own machines, and spotexec leaves their `/etc/hosts` alone.
+
 ## Exit codes
 
 | Code | Meaning |
