@@ -4,12 +4,28 @@
 sx [flags] <command> [args...]        # run a command remotely
 sx [flags] -- <command> [args...]     # same, when the command is named like a subcommand
 sx <task> [args...]                   # named task from .spotexec.toml
-spotexec exec -- <command>            # reuse the last slot, without syncing
+sx --same-slot <command>              # run on the same VM and slot as this worktree's last run
 ```
 
 `sx` stops reading its own flags at the first word that isn't one, so `sx pnpm vitest run --watch=false` passes everything after `pnpm` through unchanged. Several arguments are shell-quoted one by one. A single argument runs as a shell line, as in `sx 'pnpm lint && pnpm test'`. Absolute paths under your worktree are mapped to the remote workspace.
 
 The synced project is the enclosing Git worktree, or the nearest directory with a `.spotexec.toml`. Anywhere else, spotexec refuses to sync: it won't upload, say, your home directory with `~/.aws` and `~/.ssh` in it. Run `spotexec init` to mark a non-Git directory as a project, or use `--sync none`.
+
+## Coming back to the same machine
+
+Plain `sx` takes the first free slot. It prefers the one that already holds this worktree's files, so reruns usually land on the same VM, but that isn't guaranteed: the slot may be busy with another worktree, or the VM may have shut down after `idle_timeout`.
+
+When the machine's state matters, use `--same-slot`. It syncs, runs and writes back as usual, but only in the slot this worktree used last, waiting for it if it's busy. That's the slot `spotexec status` shows and `spotexec pull` reads from. A typical agent loop:
+
+```sh
+sx pnpm test                                   # fails: libvips is missing
+sx --same-slot 'sudo apt-get install -y libvips-dev'
+sx --same-slot pnpm test                       # same VM, so libvips is there
+```
+
+If that VM is gone, `--same-slot` fails (exit `125`) and says so, rather than running somewhere the package isn't installed. For anything you'd need on every VM, put it in the [project container](environments.md#project-containers) or the runner's `bootstrap_script`. Set `SPOTEXEC_SAME_SLOT=1` to make every `sx` in a shell behave this way.
+
+`--same-slot --sync none` skips the sync and the write-back, and runs on whatever is in the slot, for poking around after a failure. `spotexec exec -- <command>` is the same thing.
 
 ## Run flags
 
@@ -20,6 +36,7 @@ The synced project is the enclosing Git worktree, or the nearest directory with 
 | `--sync auto\|in\|none` | `auto` syncs and writes back; `in` syncs and discards changes; `none` runs on whatever the slot has. |
 | `--writeback always\|on-success\|never` | When changes come back. |
 | `-r, --runner NAME` / `--pool A,B` | Restrict where the command may run. |
+| `--same-slot` | Run in this worktree's last slot (same VM), waiting if it's busy. See [above](#coming-back-to-the-same-machine). |
 | `--exclusive` | Take every slot on a machine (the job gets all its CPUs). |
 | `--priority N` | Queue priority when every slot is busy (higher first). |
 | `--no-boot` | Never launch VMs for this command; use only what is running. |

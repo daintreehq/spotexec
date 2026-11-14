@@ -138,6 +138,15 @@ echo "== pull, exec, status, unlock"
 check "pull fetches gitignored artifacts" "grep -qx report coverage/index.html"
 "$SX" exec --json 'ls node_modules' >"$WORK/e.out" 2>&1 || true
 check "exec reuses the last slot without syncing" "grep -q is-number $WORK/e.out && ! grep -q sync_in $WORK/e.out"
+"$SX" --json 'true' >/dev/null 2>"$WORK/ss0.err" || true
+S1=$(grep slot_acquired "$WORK/ss0.err" | grep -o '"workspace_slot":[0-9]*' | tail -1)
+("$SX" -q --same-slot 'sleep 4' &) ; sleep 1.5
+printf 'local edit\n' > src/same.txt
+"$SX" --json --same-slot 'cat src/same.txt; echo pinned > pinned.txt' >"$WORK/ss.out" 2>"$WORK/ss.err" || true
+check "--same-slot waits for its own slot, syncs and writes back" "[ -n '$S1' ] && grep slot_acquired $WORK/ss.err | grep -q '$S1' && grep -Eq '\"waited_ms\":[1-9][0-9]{3}' $WORK/ss.err && grep -q 'local edit' $WORK/ss.out && grep -qx pinned pinned.txt"
+"$SX" --json --same-slot --sync none 'cat pinned.txt' >"$WORK/ss2.out" 2>&1 || true
+check "--same-slot --sync none is exec" "grep -qx pinned $WORK/ss2.out && ! grep -q sync_in $WORK/ss2.out"
+rm -f pinned.txt src/same.txt
 ("$SX" -q 'sleep 20' &) ; sleep 1
 "$SX" status >"$WORK/s.out" 2>&1 || true
 check "status shows the holder" "grep -q 'sleep 20' $WORK/s.out"

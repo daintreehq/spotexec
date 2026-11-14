@@ -5,7 +5,8 @@
 sx [flags] <command...>                      run remotely (shorthand for `spotexec run --`)
 sx <task> [args...]                          named task; parallel tasks fan out across slots
 spotexec run [flags] -- <cmd>                sync, run, write back
-spotexec exec [flags] -- <cmd>               run in the last slot without syncing
+sx --same-slot [flags] <cmd>                 run in this worktree's last slot (same VM)
+spotexec exec [flags] -- <cmd>               same as sx --same-slot --sync none
 spotexec tasks                               list tasks from .spotexec.toml
 spotexec sync [flags]                        pre-sync a slot (and build the container image, install deps)
 spotexec sync-plan [--json]                  dry-run the sync: files, bytes, largest files, exclusions

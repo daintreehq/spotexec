@@ -157,7 +157,7 @@ func cmdExec() *cobra.Command {
 	var f runFlags
 	c := &cobra.Command{
 		Use:   "exec [flags] -- <command> [args...]",
-		Short: "Run in the last-used slot without syncing first",
+		Short: "Run in the last-used slot without syncing first (same as sx --same-slot --sync none)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load(f.dir)

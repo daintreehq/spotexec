@@ -44,6 +44,7 @@ type runFlags struct {
 	dir           string
 	noRetry       bool
 	priority      int
+	sameSlot      bool
 }
 
 func (f *runFlags) register(fs *pflag.FlagSet) {
@@ -66,6 +67,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.StringVarP(&f.dir, "dir", "C", "", "run as if started in this directory")
 	fs.BoolVar(&f.noRetry, "no-retry", false, "do not replay the run if its runner is lost (spot reclaim)")
 	fs.IntVar(&f.priority, "priority", 0, "queue priority when every slot is busy (higher runs first)")
+	fs.BoolVar(&f.sameSlot, "same-slot", false, "run in the slot (same VM) this worktree last used, waiting if it's busy; with --sync none, skip the sync")
 }
 
 func (f *runFlags) reporter() (ui.Reporter, error) {
@@ -96,6 +98,9 @@ func (f *runFlags) applyEnv() {
 	}
 	if os.Getenv("SPOTEXEC_JSON") == "1" {
 		f.json = true
+	}
+	if os.Getenv("SPOTEXEC_SAME_SLOT") == "1" {
+		f.sameSlot = true
 	}
 	if f.priority == 0 {
 		if n, err := strconv.Atoi(os.Getenv("SPOTEXEC_PRIORITY")); err == nil {
@@ -285,6 +290,15 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 	}
 	if f.runner != "" {
 		o.Pool = []string{f.runner}
+	}
+	if f.sameSlot {
+		// Without a sync, --same-slot is exec: the slot must still hold
+		// this worktree's files, and nothing comes back.
+		if o.Sync == "none" {
+			o.PreferLast = true
+		} else {
+			o.SameSlot = true
+		}
 	}
 	return o
 }

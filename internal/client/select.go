@@ -41,6 +41,7 @@ type AcquireRequest struct {
 	Base         protocol.Acquire // RepoID, WorktreeKey, Fingerprint, Client, Exclusive
 	QueueTimeout time.Duration
 	PreferSlot   int
+	OnlySlot     bool // wait for PreferSlot instead of taking another slot
 	Rep          ui.Reporter
 	NoBoot       bool            // never launch fleet instances
 	Priority     int             // queue priority (higher first)
@@ -517,6 +518,7 @@ func tryAcquire(ctx context.Context, req AcquireRequest, r *config.Runner, p pro
 	a.Wait = wait
 	a.QueueMS = req.QueueTimeout.Milliseconds()
 	a.PreferSlot = req.PreferSlot
+	a.OnlySlot = req.OnlySlot
 	a.SpotWatch = r.Ephemeral()
 	if err := s.Conn.Send(protocol.TypeAcquire, a); err != nil {
 		s.Close()
@@ -591,20 +593,34 @@ func WaitReady(ctx context.Context, r *config.Runner, t provider.Target, rep ui.
 }
 
 // AcquireSlot re-acquires the exact workspace slot of a previous run (for
-// exec and pull), waiting if it is busy. It fails unless the slot still holds
-// this worktree's files.
-func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *config.Runner, lr *LastRun, rep ui.Reporter, host, display string, exclusive bool, queue time.Duration) (*Lease, error) {
+// exec, pull and --same-slot), waiting if it is busy. Unless the caller is
+// about to sync (syncing), it fails when the slot no longer holds this
+// worktree's files.
+func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *config.Runner, lr *LastRun, rep ui.Reporter, host, display string, exclusive bool, queue time.Duration, syncing bool, fingerprint string) (*Lease, error) {
 	p, err := provider.New(r)
 	if err != nil {
 		return nil, err
+	}
+	// A VM that has shut down would only fail after an SSH timeout: ask the
+	// cloud first.
+	if f, ok := p.(provider.Fleet); ok && lr.InstanceID != "" {
+		if live, err := f.List(ctx); err == nil {
+			found := false
+			for _, in := range live {
+				found = found || in.ID == lr.InstanceID
+			}
+			if !found {
+				return nil, fmt.Errorf("%w: %s, which held it, has shut down (idle_timeout or Spot reclaim)", ErrSlotGone, lr.InstanceID)
+			}
+		}
 	}
 	if queue <= 0 {
 		queue = cfg.Project.QueueTimeout.Duration
 	}
 	req := AcquireRequest{
-		Base: protocol.Acquire{RepoID: ws.RepoID, WorktreeKey: ws.WorktreeKey, Exclusive: exclusive, KeepOwner: true,
+		Base: protocol.Acquire{RepoID: ws.RepoID, WorktreeKey: ws.WorktreeKey, Fingerprint: fingerprint, Exclusive: exclusive, KeepOwner: !syncing,
 			Client: protocol.ClientInfo{Host: host, PID: os.Getpid(), Worktree: ws.Root, Command: display}},
-		QueueTimeout: queue, PreferSlot: lr.Slot, Rep: rep,
+		QueueTimeout: queue, PreferSlot: lr.Slot, OnlySlot: true, Rep: rep,
 	}
 	lease, _, err := tryAcquire(ctx, req, r, p, lr.Target, true)
 	if err != nil {
@@ -615,9 +631,12 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 		lease.Close()
 		return nil, fmt.Errorf("slot %d on %s is in use by another run; try again shortly", lr.Slot, r.Name)
 	}
-	if lease.Acq.PrevWorktreeKey != ws.WorktreeKey {
+	if !syncing && lease.Acq.PrevWorktreeKey != ws.WorktreeKey {
 		lease.Close()
-		return nil, fmt.Errorf("slot %d on %s now holds another worktree's files; use `spotexec run` (which syncs) instead", lr.Slot, r.Name)
+		return nil, fmt.Errorf("slot %d on %s now holds another worktree's files; run `sx --same-slot <command>` (which syncs) instead", lr.Slot, r.Name)
 	}
 	return lease, nil
 }
+
+// ErrSlotGone means the slot a worktree last used no longer exists.
+var ErrSlotGone = errors.New("the slot is gone")

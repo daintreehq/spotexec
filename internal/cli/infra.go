@@ -808,7 +808,7 @@ func cmdPull() *cobra.Command {
 			defer stop()
 			rep, _ := ui.New(ui.ModeAuto, os.Stderr, "")
 			host, _ := os.Hostname()
-			lease, err := client.AcquireSlot(ctx, l.cfg, l.ws, r, lr, rep, host, "(pull)", false, 0)
+			lease, err := client.AcquireSlot(ctx, l.cfg, l.ws, r, lr, rep, host, "(pull)", false, 0, false, "")
 			if err != nil {
 				return err
 			}

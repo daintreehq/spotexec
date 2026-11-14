@@ -85,6 +85,7 @@ type Acquire struct {
 	QueueMS     int64      `json:"queue_ms"`
 	Client      ClientInfo `json:"client"`
 	PreferSlot  int        `json:"prefer_slot,omitempty"`
+	OnlySlot    bool       `json:"only_slot,omitempty"`  // wait for PreferSlot rather than take another
 	KeepOwner   bool       `json:"keep_owner,omitempty"` // don't claim the slot (exec/pull)
 	SpotWatch   bool       `json:"spot_watch,omitempty"` // watch for spot interruption / rebalance notices
 }

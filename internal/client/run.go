@@ -59,7 +59,8 @@ type Options struct {
 	Pull           []string
 	NoDeps         bool
 	ForceLargeSync bool
-	PreferLast     bool // exec: reuse last runner+slot
+	PreferLast     bool // exec: reuse last runner+slot without syncing
+	SameSlot       bool // --same-slot: sync and run in this worktree's last slot
 	Stdout         io.Writer
 	Stderr         io.Writer
 	Rep            ui.Reporter
@@ -131,7 +132,7 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
 		reached = reached || res.Runner != ""
 		res.Reached = reached
-		retryable := lost != "" && o.RetryPreempt && ctx.Err() == nil && o.Sync != "none" && !o.PreferLast && att.n < 2
+		retryable := lost != "" && o.RetryPreempt && ctx.Err() == nil && o.Sync != "none" && !o.PreferLast && !o.SameSlot && att.n < 2
 		if !retryable {
 			return res, err
 		}
@@ -209,21 +210,26 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	base.KeepOwner = o.Sync == "none"
 	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority}
 	var lease *Lease
-	if o.PreferLast {
+	if o.PreferLast || o.SameSlot {
 		// exec runs without syncing, so it must land in exactly the slot that
-		// holds this worktree's files.
+		// holds this worktree's files; --same-slot syncs, but wants the same
+		// machine state (whatever the last commands installed there).
 		lr, err := LoadLastRun(ws)
 		if err != nil {
-			return res, infra(errors.New("no previous run from this worktree; use `spotexec run` first")), ""
+			return res, infra(errors.New("no previous run from this worktree to return to; run `sx <command>` first")), ""
 		}
 		r, err := cfg.Runner(lr.Runner)
 		if err != nil {
 			return res, infra(err), ""
 		}
 		host, _ := os.Hostname()
-		lease, err = AcquireSlot(ctx, cfg, ws, r, lr, o.Rep, host, o.Display, o.Exclusive, o.QueueTimeout)
+		fp := ""
+		if o.SameSlot {
+			fp = base.Fingerprint
+		}
+		lease, err = AcquireSlot(ctx, cfg, ws, r, lr, o.Rep, host, o.Display, o.Exclusive, o.QueueTimeout, o.SameSlot && o.Sync != "none", fp)
 		if err != nil {
-			return res, infra(err), ""
+			return res, infra(fmt.Errorf("can't return to this worktree's last slot (%s slot %d%s): %w", lr.Runner, lr.Slot, instanceSuffix(lr.InstanceID), err)), ""
 		}
 	} else {
 		lease, err = Acquire(ctx, req)
@@ -288,6 +294,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	var crun *protocol.ContainerRun
 	imageID := ""
 	if p.Container.Enabled() {
+		if o.SameSlot || o.PreferLast {
+			o.Rep.Warn("CONTAINER_FRESH", "this project runs in a container, which starts fresh each run: files in the workspace and $HOME carry over, but system packages installed by an earlier run don't (add them to %s)", orDefault(p.Container.Dockerfile, "the image"))
+		}
 		ref, id, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
 		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
@@ -376,7 +385,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}()
 	onSpot := func() {
-		if lease.InstanceID == "" || !(o.RetryPreempt && att.n < 2 && o.Sync != "none" && !o.PreferLast) {
+		if lease.InstanceID == "" || !(o.RetryPreempt && att.n < 2 && o.Sync != "none" && !o.PreferLast && !o.SameSlot) {
 			return
 		}
 		f, ok := lease.Provider.(provider.Fleet)
@@ -986,4 +995,18 @@ func toolchainFor(r *config.Runner, crun *protocol.ContainerRun) string {
 		return "container"
 	}
 	return depskey.Toolchain(r.Type, r.AMI, r.Arch, r.Image, r.BootstrapScript, r.UserBootstrap, r.RemotePathSetup)
+}
+
+func instanceSuffix(id string) string {
+	if id == "" {
+		return ""
+	}
+	return ", instance " + id
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }

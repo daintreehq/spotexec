@@ -157,7 +157,6 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	waited := time.Since(start)
 	touchActivity(s.layout.Root)
 
 	// Pick a workspace slot. Preference: an explicitly requested slot, then a
@@ -199,6 +198,16 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 		order = append(order, c.n)
 	}
 	slotDeadline := time.Now().Add(30 * time.Second)
+	only := a.OnlySlot && a.PreferSlot >= 1 && a.PreferSlot <= max
+	if only {
+		// exec, pull and --same-slot need that exact workspace: wait for it
+		// (as long as the queue allows) rather than take another.
+		order = []int{a.PreferSlot}
+		slotDeadline = deadline
+		if a.QueueMS <= 0 {
+			slotDeadline = time.Now().Add(24 * time.Hour)
+		}
+	}
 	for s.slotLock == nil {
 		for _, n := range order {
 			dir := s.layout.Slot(a.RepoID, n)
@@ -213,9 +222,23 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 			}
 		}
 		if s.slotLock == nil {
-			// Only possible if max_slots differs between clients.
+			// Otherwise only possible if max_slots differs between clients.
 			if time.Now().After(slotDeadline) {
+				if only {
+					return perr(protocol.CodeQueueTimeout, "workspace slot %d stayed busy for %s", a.PreferSlot, time.Since(start).Round(time.Second))
+				}
 				return perr(protocol.CodeQueueTimeout, "no free workspace slot for repo %s", a.RepoID)
+			}
+			if only {
+				if s.clientGone() {
+					return perr(protocol.CodeInternal, "client went away while queued")
+				}
+				if time.Since(lastNotice) > 2*time.Second {
+					lastNotice = time.Now()
+					if err := s.c.Send(protocol.TypeWaiting, protocol.Waiting{Holders: readHolders(s.layout)}); err != nil {
+						return err
+					}
+				}
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
@@ -265,7 +288,7 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	s.owned.Store(&root)
 	return s.c.Send(protocol.TypeAcquired, protocol.Acquired{
 		Token: holder.Token, Slot: holder.Slot, Workspace: s.workspace,
-		FingerprintMatch: match, WaitedMS: waited.Milliseconds(), MaxSlots: max, PrevWorktreeKey: prevKey,
+		FingerprintMatch: match, WaitedMS: time.Since(start).Milliseconds(), MaxSlots: max, PrevWorktreeKey: prevKey,
 	})
 }
 
