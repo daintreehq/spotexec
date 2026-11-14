@@ -70,3 +70,34 @@ func TestCheckProjectDir(t *testing.T) {
 		t.Errorf("git repo: %v", err)
 	}
 }
+
+// The written region follows the profile setup signs in with, read from
+// the AWS config file without the AWS CLI.
+func TestWriteGlobalTemplateRegion(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "aws-config")
+	os.WriteFile(cfg, []byte("[default]\nregion = us-west-2\n[profile work]\nsso_session = corp\nregion = eu-west-1\n"), 0o600)
+	t.Setenv("AWS_CONFIG_FILE", cfg)
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("PATH", dir) // no aws CLI
+	for _, c := range []struct{ profile, env, want string }{
+		{"work", "", "eu-west-1"},
+		{"", "work", "eu-west-1"},
+		{"", "", "us-west-2"},
+		{"nosuch", "", "us-east-1"},
+	} {
+		t.Setenv("AWS_PROFILE", c.env)
+		p := filepath.Join(dir, "config.toml")
+		os.Remove(p)
+		region, why, err := writeGlobalTemplate(p, c.profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := os.ReadFile(p)
+		if region != c.want || !strings.Contains(string(b), `region = "`+c.want+`"`) || why == "" {
+			t.Errorf("profile %q (AWS_PROFILE %q): region %q (%s), want %q", c.profile, c.env, region, why, c.want)
+		}
+	}
+}

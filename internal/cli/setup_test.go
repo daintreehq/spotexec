@@ -150,7 +150,7 @@ func TestSetRunnerProfileTemplate(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "config.toml")
 	t.Setenv("SPOTEXEC_CONFIG", p)
-	if _, err := writeGlobalTemplate(p); err != nil {
+	if _, _, err := writeGlobalTemplate(p, ""); err != nil {
 		t.Fatal(err)
 	}
 	g, err := config.LoadGlobal()

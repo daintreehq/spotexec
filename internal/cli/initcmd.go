@@ -14,6 +14,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/hooks"
+	"github.com/daintreehq/spotexec/internal/provider"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
 
@@ -76,11 +77,11 @@ func cmdInit() *cobra.Command {
 				if _, err := os.Stat(p); err == nil && !force {
 					return fmt.Errorf("%s exists (use --force to overwrite)", p)
 				}
-				region, err := writeGlobalTemplate(p)
+				region, why, err := writeGlobalTemplate(p, "")
 				if err != nil {
 					return err
 				}
-				fmt.Printf("wrote %s (region %s)\nnext: `spotexec setup` (AWS access that doesn't expire), then `spotexec init` in a repo, then `sx <command>`\n", p, region)
+				fmt.Printf("wrote %s (region %s, %s)\nnext: `spotexec setup` (AWS access that doesn't expire), then `spotexec init` in a repo, then `sx <command>`\n", p, region, why)
 				return nil
 			}
 			wd, _ := os.Getwd()
@@ -137,14 +138,15 @@ func checkProjectDir(ws *client.Workspace, yes bool) error {
 	return nil
 }
 
-// writeGlobalTemplate writes the example global config with the detected
-// AWS region and returns that region.
-func writeGlobalTemplate(p string) (string, error) {
+// writeGlobalTemplate writes the example global config with the region
+// detected for AWS profile (see detectRegion), and returns that region and
+// where it came from.
+func writeGlobalTemplate(p, profile string) (region, why string, err error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return "", err
+		return "", "", err
 	}
-	region := detectRegion()
-	return region, os.WriteFile(p, []byte(strings.ReplaceAll(globalTemplate, "{{REGION}}", region)), 0o644)
+	region, why = detectRegion(profile)
+	return region, why, os.WriteFile(p, []byte(strings.ReplaceAll(globalTemplate, "{{REGION}}", region)), 0o644)
 }
 
 func exists(root, name string) bool {
@@ -444,20 +446,16 @@ func transportQuote(s string) string {
 	return s
 }
 
-// detectRegion picks the AWS region for a new config: AWS_REGION,
-// AWS_DEFAULT_REGION, the AWS CLI's configured region, or us-east-1.
-func detectRegion() string {
-	for _, k := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
+// detectRegion picks the AWS region for a new config the way the AWS CLI
+// would for profile (empty: AWS_PROFILE, else default), reading the AWS
+// config files directly: AWS_REGION, AWS_DEFAULT_REGION, the profile's
+// region, else us-east-1. why says which, for the user.
+func detectRegion(profile string) (region, why string) {
+	r, from := provider.ProfileRegion(profile)
+	if r != "" {
+		return r, "from " + from
 	}
-	if out, err := exec.Command("aws", "configure", "get", "region").Output(); err == nil {
-		if r := strings.TrimSpace(string(out)); r != "" {
-			return r
-		}
-	}
-	return "us-east-1"
+	return "us-east-1", "the default: " + from
 }
 
 func belowLoad(threshold float64) bool {

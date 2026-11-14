@@ -23,7 +23,7 @@ aws login                      # or aws sso login / aws configure: an identity t
 spotexec setup
 ```
 
-1. **Runner config.** If `~/.config/spotexec/config.toml` doesn't exist, setup writes a starting one with a single `aws` runner in your AWS CLI's default region. An existing config is left as it is.
+1. **Runner config.** If `~/.config/spotexec/config.toml` doesn't exist, setup writes a starting one with a single `aws` runner in the region of the AWS profile it signs in with (`AWS_REGION` or `AWS_DEFAULT_REGION`, else that profile's `region` in `~/.aws/config`, else `us-east-1`), and says which it picked. An existing config is left as it is.
 2. **AWS access**, for each `aws-spot` runner. Setup shows what it's about to do and asks before changing anything, then:
    - creates an IAM user for this machine, `spotexec-<hostname>` (path `/spotexec/`), with only [spotexec's permissions](aws.md#3-grant-permissions) as an inline policy. The user is tagged with this machine's permanent ID, so two Macs that share a hostname each get their own user (the second gets a suffix), and a machine whose hostname changes keeps its user;
    - creates an access key for that user and saves it as the AWS CLI profile `spotexec` (`~/.aws/credentials`, mode 600, with the region in `~/.aws/config`). It waits until the key works and checks that nothing else in `~/.aws` overrides it, then deletes any older keys the user has;

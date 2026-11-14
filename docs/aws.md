@@ -127,7 +127,7 @@ A runner's region comes from, in order:
 3. `AWS_DEFAULT_REGION`;
 4. `us-east-1`.
 
-The `region` in your `~/.aws/config` profile is **not** used, so set `region` on the runner explicitly.
+The `region` in your `~/.aws/config` profile is **not** used at run time, so set `region` on the runner explicitly. When `spotexec setup` (or `spotexec init --global`) writes a new config, it fills `region` in the same order the AWS CLI uses: `AWS_REGION`, `AWS_DEFAULT_REGION`, then the `region` of the profile setup signs in with (`--admin-profile`, else `AWS_PROFILE`, else `default`; SSO profiles included), read from `~/.aws/config` (or `~/.aws/credentials`) without needing the AWS CLI, and `us-east-1` when none is set. It prints which one it used.
 
 Pick the region that is:
 - **Closest to you.** Every run makes several SSH round trips (handshake, sync, streaming output, write-back). A nearby region keeps small commands under a second of overhead.

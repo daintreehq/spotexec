@@ -71,11 +71,11 @@ and keeps a working key. --rotate replaces the key.
 			setupLocal := func() (bool, error) {
 				p := config.GlobalPath()
 				if _, err := os.Stat(p); err != nil {
-					region, err := writeGlobalTemplate(p)
+					region, why, err := writeGlobalTemplate(p, adminProfile)
 					if err != nil {
 						return false, err
 					}
-					fmt.Printf("✓ wrote %s (an aws runner in %s; edit it any time)\n", p, region)
+					fmt.Printf("✓ wrote %s (an aws runner in %s, %s; edit it any time)\n", p, region, why)
 				} else {
 					fmt.Printf("✓ runner config %s\n", p)
 				}
