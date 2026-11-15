@@ -309,10 +309,12 @@ type placementState struct {
 	WarmProfile string               `json:"warm_profile,omitempty"`
 	RTT         map[string]rttSample `json:"rtt,omitempty"` // region -> measured round trip
 	// Evidence: what lookups found in each region's account-wide caches
-	// (bakes, the dependency cache, images), under profile
-	// EvidenceProfile (see warmth).
+	// (bakes, the dependency cache, images), for the profile and account
+	// EvidenceProfile (see warmth). BakesForgotAt: when a bake was last
+	// made or removed here; bake lookups begun before it are dropped.
 	Evidence        map[string]evidence `json:"evidence,omitempty"`
 	EvidenceProfile string              `json:"evidence_profile,omitempty"`
+	BakesForgotAt   time.Time           `json:"bakes_forgot_at,omitempty"`
 	// Discovered: every managed region has been listed once. Until then
 	// (first use, an upgrade from single-region, a lost state file) listings
 	// cover them all rather than trusting Active.

@@ -23,9 +23,9 @@ var (
 			Boot:  provider.ColdPart{Cost: 0.0183, Why: "no bake of the runner"},
 			Deps:  provider.ColdPart{Cost: 0.0365, Why: "no dependency archive for the project"},
 			Image: provider.ColdPart{Cost: 0.0183, Why: "no image of the project"}}},
-		optionKey(slowOpt): {Score: 0.2862, Compute: 0.03, Speed: 0.103, Cold: 0.0687, Distance: 0.0845, RelSpeed: 0.9091, RTTMS: 440, ColdParts: &provider.ColdParts{
+		optionKey(slowOpt): {Score: 0.2518, Compute: 0.03, Speed: 0.103, Cold: 0.0343, Distance: 0.0845, RelSpeed: 0.9091, RTTMS: 440, ColdParts: &provider.ColdParts{
 			Boot:  provider.ColdPart{Warm: true, Why: "a bake of the runner"},
-			Deps:  provider.ColdPart{Cost: 0.0687, Why: "no dependency archive for the project"},
+			Deps:  provider.ColdPart{Cost: 0.0343, Why: "no dependency archive for the project"},
 			Image: provider.ColdPart{Warm: true, Why: "the project's image"}}},
 	}
 	model = &provider.RunCostModel{WaitCost: 1, HorizonMinutes: 60, ColdMinutes: 4, BootMinutes: 1, DepsMinutes: 2, ImageMinutes: 1, WarmDays: 7, WarmAfterMin: 10, GenSpeedup: 1.1, RoundTrips: 300, SpeedByGen: true, Regions: true}
@@ -62,7 +62,7 @@ func TestPricesShowRunCostBreakdown(t *testing.T) {
 	for i, want := range []string{
 		"→ us-east-1 us-east-1a m7a.2xlarge 0.100 0.100 - warm - next launch",
 		"eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.169 - +0.073 boot,deps,image -",
-		"ap-south-2 ap-south-2a m6a.2xlarge 0.030 0.286 +0.103 +0.069 deps +0.085",
+		"ap-south-2 ap-south-2a m6a.2xlarge 0.030 0.252 +0.103 +0.034 deps +0.085",
 	} {
 		if got := strings.Join(strings.Fields(lines[2+i]), " "); got != want {
 			t.Errorf("row %d: %q, want %q", i+1, got, want)
@@ -108,6 +108,10 @@ func TestPricesJSONRunCost(t *testing.T) {
 	}
 	if err := json.Unmarshal(b.Bytes(), &got); err != nil {
 		t.Fatal(err)
+	}
+	// The parts' keys, as scripts read them.
+	if out := b.String(); !strings.Contains(out, `"cold_parts": {`) || !strings.Contains(out, `"dependencies": {`) || !strings.Contains(out, `"cold_deps_minutes": 2`) {
+		t.Fatalf("json keys: %s", out)
 	}
 	if got.Order != "run_cost" || !reflect.DeepEqual(got.Model, model) || len(got.Prices) != 3 {
 		t.Fatalf("json: %s", b.String())

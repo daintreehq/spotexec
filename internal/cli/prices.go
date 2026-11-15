@@ -82,19 +82,28 @@ func cmdPrices() *cobra.Command {
 // r from here would check regions for, and its name (nil outside one, or
 // when r doesn't launch across regions).
 func pricesProject(ctx context.Context, r *config.Runner) (*provider.Project, string) {
-	if !r.MultiRegion() {
-		return nil, ""
+	if !r.MultiRegion() || r.LaunchOrder != config.LaunchRunCost {
+		return nil, "" // nothing weighs it
 	}
 	l, err := load("")
-	if err != nil || l.cfg.Project == nil || l.cfg.Project.Path == "" {
+	if err != nil || l.cfg.Project == nil || !l.ws.Marked {
 		return nil, ""
 	}
 	p := l.cfg.Project
-	m, err := manifest.Build(ctx, client.ManifestOptions(l.ws.Root, p))
-	if err != nil {
+	if p.Sync.Mode == "none" {
+		return nil, "" // a run syncs nothing, so its launches check nothing
+	}
+	var m *manifest.Manifest
+	if client.PlacementNeedsManifest(p) {
+		if m, err = manifest.Build(ctx, client.ManifestOptions(l.ws.Root, p)); err != nil {
+			return nil, ""
+		}
+	}
+	pj := client.PlacementProject(p, l.ws, m, false, r)
+	if pj == nil {
 		return nil, ""
 	}
-	return client.PlacementProject(p, l.ws, m, false, r), l.ws.RepoName
+	return pj, l.ws.RepoName
 }
 
 // pricesView is what `spotexec prices` shows.

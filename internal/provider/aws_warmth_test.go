@@ -105,21 +105,35 @@ func TestWarmthProjectDepsByExactKey(t *testing.T) {
 // archive keyed by that region's own image.
 func TestWarmthProjectImage(t *testing.T) {
 	g, f := twoRegionEnv(t, "0.100", "0.096", nil)
-	f.images = map[string]map[string]string{"r-one-1": {"t-old": "sha256:old"}, "r-two-1": {"t1": "sha256:two"}}
-	f.cached = map[string]map[string]bool{"r-two-1": {"repo1/k-sha256:two.tar": true}, "r-one-1": {"repo1/k-sha256:old.tar": true}}
+	// Each region built its own image of tag t1, so each has its own ID;
+	// r-one-1's cache holds only an archive keyed by r-two-1's image.
+	f.images = map[string]map[string]string{"r-one-1": {"t1": "sha256:one"}, "r-two-1": {"t1": "sha256:two"}}
+	f.cached = map[string]map[string]bool{"r-two-1": {"repo1/k-sha256:two.tar": true}, "r-one-1": {"repo1/k-sha256:two.tar": true}}
 	pj := &Project{RepoID: "repo1", Image: true, ImageTag: "t1", Deps: true,
 		DepsKeyFor: func(id string) (string, error) { return "k-" + id, nil }}
 	k := rankFor(t, g, pj)
 	one, two := costIn(t, k, "r-one-1"), costIn(t, k, "r-two-1")
-	if one.ColdParts.Paid() != "deps,image" || one.ColdParts.Image.Why != "no image of the project" ||
-		!strings.Contains(one.ColdParts.Deps.Why, "no image of the project") {
-		t.Fatalf("older image only: %+v", *one.ColdParts)
+	if one.ColdParts.Paid() != "deps" || !one.ColdParts.Image.Warm || one.ColdParts.Deps.Why != "no dependency archive for the project" {
+		t.Fatalf("image, but no archive for it: %+v", *one.ColdParts)
 	}
 	if !two.Warm || two.ColdParts.Image.Why != "the project's image" || two.ColdParts.Deps.Why != "the project's dependency archive" {
 		t.Fatalf("image and archive held: %+v", *two.ColdParts)
 	}
 	if c := f.callsOf("BatchGetImage"); len(c) != 2 || !strings.Contains(c[0], "spotexec/repo1:t1") {
 		t.Fatalf("ECR calls %v", c)
+	}
+	if c := strings.Join(f.callsOf("s3"), "\n"); !strings.Contains(c, "r-one-1 HEAD s3 spotexec-cache-123456789012-r-one-1/repo1/k-sha256:one.tar") {
+		t.Fatalf("S3 calls %s", c)
+	}
+	// An older tag only is no image: nor its archive.
+	f.mu.Lock()
+	f.images["r-one-1"] = map[string]string{"t-old": "sha256:old"}
+	f.mu.Unlock()
+	now := time.Now().Add(evidenceTTL + time.Minute)
+	g.now = func() time.Time { return now }
+	if c := costIn(t, rankFor(t, g, pj), "r-one-1"); c.ColdParts.Paid() != "deps,image" || c.ColdParts.Image.Why != "no image of the project" ||
+		!strings.Contains(c.ColdParts.Deps.Why, "no image of the project") {
+		t.Fatalf("older image only: %+v", *c.ColdParts)
 	}
 	// No repository at all is cold too.
 	g2, f2 := twoRegionEnv(t, "0.100", "0.096", nil)
@@ -144,14 +158,22 @@ func TestWarmthLookupFailureFallsBackToHistory(t *testing.T) {
 	}
 	resetCalls(f)
 	rankFor(t, g, pj)
-	if n := len(f.callsOf("BatchGetImage")); n != 0 {
-		t.Fatalf("retried at once: %d", n)
+	if n, m := len(f.callsOf("BatchGetImage")), len(f.callsOf("HEAD s3")); n+m != 0 {
+		t.Fatalf("retried at once: %d ECR, %d S3", n, m)
 	}
+	// Once it answers, the answer counts, also without history.
+	f.mu.Lock()
+	f.cacheErr, f.imageErr = nil, nil
+	f.cached = map[string]map[string]bool{"r-one-1": {"repo1/k1.tar": true}}
+	f.mu.Unlock()
 	now := time.Now().Add(evidenceRetry + time.Second)
 	g.now = func() time.Time { return now }
-	rankFor(t, g, pj)
-	if n := len(f.callsOf("BatchGetImage")); n != 1 {
-		t.Fatalf("not retried after evidenceRetry: %d", n)
+	c = costIn(t, rankFor(t, g, pj), "r-one-1")
+	if n, m := len(f.callsOf("BatchGetImage")), len(f.callsOf("HEAD s3")); n != 1 || m != 1 {
+		t.Fatalf("not retried after evidenceRetry: %d ECR, %d S3", n, m)
+	}
+	if !c.ColdParts.Deps.Warm || c.ColdParts.Deps.Why != "the project's dependency archive" || c.ColdParts.Image.Warm || c.ColdParts.Image.Why != "no image of the project" {
+		t.Fatalf("after recovery: %+v", *c.ColdParts)
 	}
 }
 

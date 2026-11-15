@@ -65,6 +65,22 @@ func TestPlacementProjectKeys(t *testing.T) {
 	if got, err := pj.DepsKeyFor("sha256:abc"); err != nil || got != want {
 		t.Fatalf("key for image: %s %v, want %s", got, err, want)
 	}
+	ctrSpec.Image = "sha256:def"
+	want2, _ := depskey.Key(root, ctrSpec)
+	if got, _ := pj.DepsKeyFor("sha256:def"); got != want2 || want2 == want {
+		t.Fatalf("key for another image: %s, want %s", got, want2)
+	}
+	// Another arch: another tag, as the run computes it on that VM.
+	r.Arch = "amd64"
+	tag64, _ := imageTag(m, "Dockerfile", "", "linux/amd64", readFrom(root))
+	if pj := PlacementProject(p, ws, m, false, r); pj.ImageTag != tag64 || tag64 == tag {
+		t.Fatalf("amd64 tag %s, want %s", pj.ImageTag, tag64)
+	}
+	r.Arch = "arm64"
+	// Without the manifest the keys are unknown, but still needed.
+	if pj := PlacementProject(p, ws, nil, false, r); !pj.Image || pj.ImageTag != "" || !pj.Deps || pj.DepsKeyFor != nil {
+		t.Fatalf("no manifest: %+v", pj)
+	}
 
 	// A pulled image: nothing to build, and the key isn't known in advance.
 	p.Container = config.Container{Image: "node:22"}

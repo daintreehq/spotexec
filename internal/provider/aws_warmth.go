@@ -129,15 +129,23 @@ func (g *AWSGlobal) warmth(ctx context.Context, t PriceTable, refresh bool) map[
 		}
 	}
 	sort.Strings(regions)
-	proj := projectOf(ctx)
-	pinned := g.r.AMI != "" && g.r.AMI != "auto"
+	started := time.Now() // against ForgetBakeWarmth, which runs on the wall clock
 	now := g.clock()
+	lctx, cancel := context.WithTimeout(ctx, warmthBudget)
+	defer cancel()
+	// Answers belong to the account, not the profile's name: the same
+	// profile (or none) can point at another account. Unknown: nothing is
+	// kept.
+	scope := ""
+	if acct, err := g.home().accountID(lctx); err == nil {
+		scope = g.r.Profile + "|" + acct
+	}
 	cached := map[string]evidence{}
 	_ = g.withState(func(st *placementState) {
-		if st.EvidenceProfile != g.r.Profile {
-			st.Evidence, st.EvidenceProfile = nil, g.r.Profile // another account's
+		if st.EvidenceProfile != scope {
+			st.Evidence, st.EvidenceProfile = nil, scope
 		}
-		if refresh {
+		if refresh || scope == "" {
 			return
 		}
 		for k, e := range st.Evidence {
@@ -148,8 +156,7 @@ func (g *AWSGlobal) warmth(ctx context.Context, t PriceTable, refresh bool) map[
 	})
 	var mu sync.Mutex
 	looked := map[string]evidence{}
-	out := map[string]regionWarmth{}
-	lookup := func(key string, fn func() evidence) evidence {
+	live := func(key string, fn func() evidence) evidence {
 		if e, ok := cached[key]; ok {
 			return e
 		}
@@ -160,62 +167,20 @@ func (g *AWSGlobal) warmth(ctx context.Context, t PriceTable, refresh bool) map[
 		mu.Unlock()
 		return e
 	}
-	failed := func(err error) evidence { return evidence{Err: firstLineOf([]byte(err.Error()))} }
-	lctx, cancel := context.WithTimeout(ctx, warmthBudget)
-	defer cancel()
+	// First what is known without asking, for every region: a region the
+	// budget runs out before keeps its cached answers and unused parts.
+	cachedOnly := func(key string, _ func() evidence) evidence {
+		if e, ok := cached[key]; ok {
+			return e
+		}
+		return evidence{Err: "not looked up in time"}
+	}
+	out := map[string]regionWarmth{}
+	for _, rg := range regions {
+		out[rg] = g.regionWarmth(lctx, rg, cachedOnly, now)
+	}
 	_ = eachRegion(lctx, regions, func(ctx context.Context, rg string) error {
-		a := g.Regional(rg)
-		var w regionWarmth
-		if pinned {
-			w.boot = partSeen{partLacks, "the runner's ami is pinned: no bake is used"}
-		} else {
-			e := lookup(strings.Join([]string{"bake", rg, g.r.Name, a.BakeHash(), a.ec2Arch()}, "|"), func() evidence {
-				b, err := a.findBake(ctx)
-				switch {
-				case err != nil:
-					return failed(err)
-				case b == nil:
-					return evidence{}
-				case b.Expired:
-					return evidence{Why: "the bake of the runner here is too old to use (" + b.Stale + ")"}
-				}
-				return evidence{Has: true, ID: b.ID, Until: b.usableUntil()}
-			})
-			w.boot = e.seen("a bake of the runner", "no bake of the runner", now)
-		}
-		switch {
-		case proj == nil:
-		case !proj.Image:
-			w.image = partSeen{state: partUnused}
-		case proj.ImageTag != "":
-			e := lookup(strings.Join([]string{"image", rg, ecrName(proj.RepoID), proj.ImageTag}, "|"), func() evidence {
-				id, err := a.projectImage(ctx, proj.RepoID, proj.ImageTag)
-				if err != nil {
-					return failed(err)
-				}
-				return evidence{Has: id != "", ID: id}
-			})
-			w.image = e.seen("the project's image", "no image of the project", now)
-			if proj.Deps && proj.DepsKey == "" && proj.DepsKeyFor != nil {
-				switch w.image.state {
-				case partHas:
-					if key, err := proj.DepsKeyFor(e.ID); err == nil {
-						w.deps = g.depsSeen(ctx, a, lookup, failed, proj.RepoID, key, now)
-					}
-				case partLacks:
-					// The image built here will be new, and so will the
-					// dependency archive keyed by it.
-					w.deps = partSeen{partLacks, "no image of the project, so no dependency archive for it"}
-				}
-			}
-		}
-		switch {
-		case proj == nil:
-		case !proj.Deps:
-			w.deps = partSeen{state: partUnused}
-		case proj.DepsKey != "":
-			w.deps = g.depsSeen(ctx, a, lookup, failed, proj.RepoID, proj.DepsKey, now)
-		}
+		w := g.regionWarmth(ctx, rg, live, now)
 		mu.Lock()
 		out[rg] = w
 		mu.Unlock()
@@ -224,12 +189,15 @@ func (g *AWSGlobal) warmth(ctx context.Context, t PriceTable, refresh bool) map[
 	// A lookup cut short by the budget or a cancelled launch says nothing
 	// about the region: only answers are kept.
 	_ = g.withState(func(st *placementState) {
-		if st.EvidenceProfile != g.r.Profile {
+		if scope == "" || st.EvidenceProfile != scope {
 			return
 		}
 		for k, e := range looked {
 			if e.Err != "" && lctx.Err() != nil {
 				continue
+			}
+			if strings.HasPrefix(k, "bake|") && st.BakesForgotAt.After(started) {
+				continue // a bake was made or removed while this looked
 			}
 			if st.Evidence == nil {
 				st.Evidence = map[string]evidence{}
@@ -242,11 +210,77 @@ func (g *AWSGlobal) warmth(ctx context.Context, t PriceTable, refresh bool) map[
 	return out
 }
 
-func (g *AWSGlobal) depsSeen(ctx context.Context, a *AWSSpot, lookup func(string, func() evidence) evidence, failed func(error) evidence, repoID, key string, now time.Time) partSeen {
+// lookupFn answers one lookup by key, from the cache or by calling fn.
+type lookupFn func(key string, fn func() evidence) evidence
+
+func failedLookup(err error) evidence { return evidence{Err: firstLineOf([]byte(err.Error()))} }
+
+// regionWarmth is what region rg holds for the project in ctx.
+func (g *AWSGlobal) regionWarmth(ctx context.Context, rg string, lookup lookupFn, now time.Time) regionWarmth {
+	proj := projectOf(ctx)
+	a := g.Regional(rg)
+	var w regionWarmth
+	if g.r.AMI != "" && g.r.AMI != "auto" {
+		w.boot = partSeen{partLacks, "the runner's ami is pinned: no bake is used"}
+	} else {
+		e := lookup(strings.Join([]string{"bake", rg, g.r.Name, a.BakeHash(), a.ec2Arch()}, "|"), func() evidence {
+			b, err := a.findBake(ctx)
+			switch {
+			case err != nil:
+				return failedLookup(err)
+			case b == nil:
+				return evidence{}
+			case b.Expired:
+				return evidence{Why: "the bake of the runner here is too old to use (" + b.Stale + ")"}
+			case b.CheckErr != "":
+				// Whether a newer base retires it is unknown: ask again soon.
+				return evidence{Err: b.CheckErr}
+			}
+			return evidence{Has: true, ID: b.ID, Until: b.usableUntil()}
+		})
+		w.boot = e.seen("a bake of the runner", "no bake of the runner", now)
+	}
+	switch {
+	case proj == nil:
+	case !proj.Image:
+		w.image = partSeen{state: partUnused}
+	case proj.ImageTag != "":
+		e := lookup(strings.Join([]string{"image", rg, ecrName(proj.RepoID), proj.ImageTag}, "|"), func() evidence {
+			id, err := a.projectImage(ctx, proj.RepoID, proj.ImageTag)
+			if err != nil {
+				return failedLookup(err)
+			}
+			return evidence{Has: id != "", ID: id}
+		})
+		w.image = e.seen("the project's image", "no image of the project", now)
+		if proj.Deps && proj.DepsKey == "" && proj.DepsKeyFor != nil {
+			switch w.image.state {
+			case partHas:
+				if key, err := proj.DepsKeyFor(e.ID); err == nil {
+					w.deps = g.depsSeen(ctx, a, lookup, proj.RepoID, key, now)
+				}
+			case partLacks:
+				// The image built here will be new, and so will the
+				// dependency archive keyed by it.
+				w.deps = partSeen{partLacks, "no image of the project, so no dependency archive for it"}
+			}
+		}
+	}
+	switch {
+	case proj == nil:
+	case !proj.Deps:
+		w.deps = partSeen{state: partUnused}
+	case proj.DepsKey != "":
+		w.deps = g.depsSeen(ctx, a, lookup, proj.RepoID, proj.DepsKey, now)
+	}
+	return w
+}
+
+func (g *AWSGlobal) depsSeen(ctx context.Context, a *AWSSpot, lookup lookupFn, repoID, key string, now time.Time) partSeen {
 	e := lookup(strings.Join([]string{"deps", a.r.Region, g.r.CacheBucket, repoID, key}, "|"), func() evidence {
 		has, err := a.hasCacheEntry(ctx, repoID, key)
 		if err != nil {
-			return failed(err)
+			return failedLookup(err)
 		}
 		return evidence{Has: has}
 	})
@@ -269,6 +303,7 @@ func ForgetBakeWarmth(r *config.Runner) {
 		return
 	}
 	_ = g.withState(func(st *placementState) {
+		st.BakesForgotAt = time.Now()
 		for k := range st.Evidence {
 			if strings.HasPrefix(k, "bake|") {
 				delete(st.Evidence, k)

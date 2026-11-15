@@ -10,10 +10,11 @@ import (
 // PlacementProject is what a launch of runner r for this run looks for in
 // each region (see provider.Project): the keys the run's dependency archive
 // and image will have there, computed as the run computes them. Nil when
-// placement doesn't weigh it (r doesn't launch across regions) or nothing
-// is synced; a key that can't be computed is left for VM history to judge.
+// placement doesn't weigh it (r doesn't launch across regions); callers
+// pass none for a run that syncs nothing. A key that can't be computed
+// (m is nil) is left for VM history to judge.
 func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, noDeps bool, r *config.Runner) *provider.Project {
-	if p == nil || ws == nil || m == nil || r.Type != config.TypeAWSSpot || !r.MultiRegion() {
+	if p == nil || ws == nil || r.Type != config.TypeAWSSpot || !r.MultiRegion() {
 		return nil
 	}
 	// AWS VMs are Linux; the runner's arch is the Go name the helper reports.
@@ -22,7 +23,9 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 	c := p.Container
 	if c.Enabled() && c.Image == "" {
 		pj.Image = true
-		if tag, err := imageTag(m, c.Dockerfile, c.Context, goos+"/"+arch, readFrom(ws.Root)); err == nil {
+		if m == nil {
+			// unknown without the manifest
+		} else if tag, err := imageTag(m, c.Dockerfile, c.Context, goos+"/"+arch, readFrom(ws.Root)); err == nil {
 			pj.ImageTag = tag
 		}
 	}
@@ -30,6 +33,9 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 		return pj
 	}
 	pj.Deps = true
+	if m == nil {
+		return pj
+	}
 	lockfiles, _, err := DepsLockfiles(m, p.Deps.Lockfiles)
 	if err != nil || len(lockfiles) == 0 {
 		return pj
@@ -52,4 +58,10 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 		}
 	}
 	return pj
+}
+
+// PlacementNeedsManifest reports whether PlacementProject needs the
+// project's manifest: for a dependency key or an image tag.
+func PlacementNeedsManifest(p *config.Project) bool {
+	return p.Deps.Install != "" || p.Container.Enabled() && p.Container.Image == ""
 }
