@@ -27,7 +27,7 @@ import (
 // bind-mounted at the same absolute path, so path rewriting, snapshots and
 // write-back work exactly as on the host. Commands run as the runner user by
 // default (files keep the right owner), with host networking (per-slot port
-// ranges still apply).
+// ranges still apply) unless container.network is "private" (networkArgs).
 //
 // Docker is always driven as the runner user (directly, or via `sg docker`
 // when the docker group was granted after this login), never via sudo: the
@@ -694,13 +694,13 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		os.Remove(envPath)
 		return "", nil, nil, err
 	}
-	args := []string{
-		"run", "--rm", "--init", "--name", name, "--network", "host",
-		"-v", s.workspace + ":" + s.workspace,
-		"-v", scriptPath + ":/tmp/spotexec-run.sh:ro",
+	args := append([]string{"run", "--rm", "--init", "--name", name}, networkArgs(run)...)
+	args = append(args,
+		"-v", s.workspace+":"+s.workspace,
+		"-v", scriptPath+":/tmp/spotexec-run.sh:ro",
 		"--env-file", envPath,
 		"-w", dir, "--entrypoint", "/bin/sh",
-	}
+	)
 
 	if !run.Root {
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
@@ -747,6 +747,25 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		return nil
 	}
 	return host, nil, cleanup, nil
+}
+
+// networkArgs picks the container's network. By default it is the
+// runner's own (host networking: SPOTEXEC_PORT_BASE ranges apply, and
+// services on the runner are reachable). "private" gives each run a
+// network namespace of its own on Docker's default bridge, so fixed ports
+// (a test server on 3000, a suite's own Postgres on 5432) can't collide
+// with, or reach, another slot's; outbound traffic still goes through NAT.
+// A --network or --net in container.options wins: the user decides.
+func networkArgs(run *protocol.ContainerRun) []string {
+	for _, f := range dockerFlags(run.Options) {
+		if f == "--network" || f == "--net" {
+			return nil
+		}
+	}
+	if run.Network == "private" {
+		return []string{"--network", "bridge"}
+	}
+	return []string{"--network", "host"}
 }
 
 // rootRunMarker, in a slot directory, names the image of a root container

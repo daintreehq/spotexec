@@ -396,7 +396,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
 		}
-		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root"}
+		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root", Network: p.Container.Network}
 		imageID = id
 		lastRun.Image = ref
 		res.Image = ref

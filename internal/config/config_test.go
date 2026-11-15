@@ -311,6 +311,30 @@ func TestDepsLockfilePatternsValidated(t *testing.T) {
 	}
 }
 
+func TestContainerNetworkValidated(t *testing.T) {
+	for network, ok := range map[string]bool{
+		"":        true,
+		"host":    true,
+		"private": true,
+		"bridge":  false,
+		"Private": false,
+	} {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		body := "[container]\nimage = \"node:22\"\n"
+		if network != "" {
+			body += "network = \"" + network + "\"\n"
+		}
+		os.WriteFile(pp, []byte(body), 0o644)
+		p, err := LoadProject(pp)
+		if (err == nil) != ok {
+			t.Errorf("%q: err = %v, want ok=%v", network, err, ok)
+		}
+		if err == nil && p.Container.Network != network {
+			t.Errorf("%q: loaded %q", network, p.Container.Network)
+		}
+	}
+}
+
 func TestInstanceRequirements(t *testing.T) {
 	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nvcpus = 8\nmin_memory_gib = 32\n")
 	if err != nil {
