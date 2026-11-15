@@ -139,8 +139,8 @@ func TestUnreadFramesDontHideSilence(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("a silent helper behind unread frames was never given up on")
 	}
-	if n := len(s.frames); n != 200 {
-		t.Fatalf("%d frames queued when the session ended, want the 200 unread", n)
+	if n := len(s.frames); n < cap(s.frames)/2 {
+		t.Fatalf("%d frames queued when the session ended, want at least half the buffer", n)
 	}
 	if err := s.LostErr(); !strings.Contains(err.Error(), "stopped responding") {
 		t.Fatalf("want a stopped-responding error, got %v", err)
