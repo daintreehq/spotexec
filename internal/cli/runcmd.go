@@ -584,9 +584,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	if res.DepsInstalled > 0 {
 		summary += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(res.DepsInstalled))
 	}
-	if n := len(res.Mutated) + len(res.Deleted); n > 0 {
-		summary += fmt.Sprintf(" · pulled %d modified file%s", n, plural(n))
-	}
+	summary += writebackNote(len(res.Mutated), len(res.Deleted))
 	summary += conflictNote(len(res.Conflicts))
 	if res.HeldFiles > 0 {
 		summary += fmt.Sprintf(" · held %d new file%s (%s) in the slot", res.HeldFiles, plural(res.HeldFiles), ui.Bytes(res.HeldBytes))
@@ -614,6 +612,20 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 func (f *runFlags) executeLast(l *loaded, s runSpec) int {
 	s.preferLast = true
 	return f.execute(l, s)
+}
+
+// writebackNote is the summary's account of the write-back, as sync_out
+// has it: the files written here (new or changed, mutated_files) and the
+// files deleted here (deleted_files).
+func writebackNote(written, deleted int) string {
+	s := ""
+	if written > 0 {
+		s += fmt.Sprintf(" · pulled %d file%s", written, plural(written))
+	}
+	if deleted > 0 {
+		s += fmt.Sprintf(" · deleted %d file%s", deleted, plural(deleted))
+	}
+	return s
 }
 
 func plural(n int) string {

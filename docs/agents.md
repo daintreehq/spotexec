@@ -10,8 +10,10 @@ An agent reads everything on stderr, so when stderr isn't a terminal `sx` keeps 
 ```console
 $ sx pnpm prettier --write src 2>&1 | cat
 src/index.ts 41ms
-sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
+sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 file
 ```
+
+`pulled N files` counts the files write-back wrote here, new or changed (`mutated_files` in the `sync_out` event), and `deleted N files` the ones the command deleted that write-back removed here (`deleted_files`); a file renamed counts in both.
 
 Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)). When you edit a file while a run that changes it is still going, write-back keeps your version: the summary line then counts it (`· 1 conflict`), as does `conflict_count` in the `result` event with `--json` or `SPOTEXEC_AGENT=1`, but the exit status stays the command's own, `0` when it succeeded. Set `SPOTEXEC_FAIL_ON_CONFLICT=1` (or pass `--fail-on-conflict`) to have an otherwise successful run exit `122` instead, so a harness that only checks the exit status sees that the command's changes didn't all land.
 

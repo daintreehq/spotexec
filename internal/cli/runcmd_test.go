@@ -120,3 +120,23 @@ func TestTaskSetupOptOut(t *testing.T) {
 		t.Error("setup skipped by default")
 	}
 }
+
+// The summary says what came back as the sync_out event does: files
+// written (new or changed) and files deleted, not all of them "modified"
+// (#123).
+func TestWritebackNote(t *testing.T) {
+	for _, c := range []struct {
+		written, deleted int
+		want             string
+	}{
+		{0, 0, ""},
+		{1, 0, " · pulled 1 file"},
+		{1201, 0, " · pulled 1201 files"},
+		{0, 1, " · deleted 1 file"},
+		{3, 2, " · pulled 3 files · deleted 2 files"},
+	} {
+		if got := writebackNote(c.written, c.deleted); got != c.want {
+			t.Errorf("writebackNote(%d, %d) = %q, want %q", c.written, c.deleted, got, c.want)
+		}
+	}
+}
