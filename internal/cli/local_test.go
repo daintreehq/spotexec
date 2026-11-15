@@ -511,8 +511,11 @@ func TestRunLocalSetupInterrupted(t *testing.T) {
 // written while the command ran; an empty pipe, as an agent harness may
 // pass, is not.
 func TestPipedStdinIsFlaggedNotForwarded(t *testing.T) {
+	// The command signals it is running, then waits (up to 30s) for the
+	// input to have been written.
+	const handshake = "touch started && for i in $(seq 600); do [ -e release ] && break; sleep 0.05; done"
 	dir := project(t, "[tasks.l]\nrun = \"cat > l.out\"\n[tasks.t]\nrun = \"true\"\n[tasks.v]\nparallel = [\"l\", \"t\"]\n"+
-		"[tasks.w]\nrun = \"touch started && sleep 1\"\n[tasks.vw]\nparallel = [\"w\", \"t\"]\n")
+		"[tasks.w]\nrun = '"+handshake+"'\n[tasks.vw]\nparallel = [\"w\", \"t\"]\n")
 	cfg := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(cfg, []byte("version = 1\n[runners.a]\ntype = \"ssh\"\nhosts = [\"nobody@127.0.0.1\"]\nssh_options = [\"Port=1\"]\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -555,27 +558,38 @@ func TestPipedStdinIsFlaggedNotForwarded(t *testing.T) {
 	}
 	// Input written only once the command is running, as `git diff | sx`
 	// may: seen by the look after the run.
-	for _, args := range [][]string{{"--", "touch started && sleep 1"}, {"vw"}} {
-		started := filepath.Join(dir, "started")
+	for _, args := range [][]string{{"--", handshake}, {"vw"}} {
+		started, release := filepath.Join(dir, "started"), filepath.Join(dir, "release")
 		_ = os.Remove(started)
+		_ = os.Remove(release)
 		r, w, err := os.Pipe()
 		if err != nil {
 			t.Fatal(err)
 		}
+		stop, wrote := make(chan struct{}), make(chan bool, 1)
 		go func() {
 			defer w.Close()
-			for range 200 {
+			for {
+				select {
+				case <-stop:
+					wrote <- false
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
 				if _, err := os.Stat(started); err == nil {
-					_, _ = w.Write([]byte("late\n"))
+					_, err := w.Write([]byte("late\n"))
+					_ = os.WriteFile(release, nil, 0o644)
+					wrote <- err == nil
 					return
 				}
-				time.Sleep(10 * time.Millisecond)
 			}
 		}()
 		code, stderr := runMainStdin(t, r, "sx", append(append([]string{}, flags...), args...)...)
+		close(stop)
+		ok := <-wrote
 		_ = r.Close()
-		if code != 0 {
-			t.Fatalf("%v: exit %d, stderr %q", args, code, stderr)
+		if code != 0 || !ok {
+			t.Fatalf("%v: exit %d, input written %v, stderr %q", args, code, ok, stderr)
 		}
 		if n := strings.Count(stderr, warning); n != 1 {
 			t.Errorf("%v, input written while it ran: want one STDIN_IGNORED warning, got %d: %q", args, n, stderr)
