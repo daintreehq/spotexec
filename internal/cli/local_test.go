@@ -383,6 +383,40 @@ func TestInterruptedTaskSummary(t *testing.T) {
 		`^sx: unit · interrupted · \S+ · exit 130$`)
 }
 
+func TestGroupedTaskPrintsEachPartAsOneBlock(t *testing.T) {
+	// Each part writes to stderr (which runMain captures) with pauses, so
+	// live output would interleave.
+	dir := project(t, `[tasks.a]
+run = "for i in 1 2 3; do echo a$i >&2; sleep 0.2; done"
+[tasks.b]
+run = "sleep 0.1; for i in 1 2 3; do echo b$i >&2; sleep 0.2; done; exit 4"
+[tasks.v]
+parallel = ["a", "b"]
+group = true
+`)
+	cfg := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfg, []byte("version = 1\n[runners.a]\ntype = \"ssh\"\nhosts = [\"nobody@127.0.0.1\"]\nssh_options = [\"Port=1\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTEXEC_CONFIG", cfg)
+	t.Setenv("HOME", t.TempDir())
+	code, stderr := runMain(t, "sx", "-C", dir, "--fallback-local", "--queue-timeout", "5s", "v")
+	if code != 4 {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	// Each block is whole, and its summary follows it at once.
+	for _, want := range []string{"[a] a1\n[a] a2\n[a] a3\nsx: a · ", "[b] b1\n[b] b2\n[b] b3\nsx: b · "} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr lacks %q: %q", want, stderr)
+		}
+	}
+	// --group=false beats the task's setting: live, interleaved lines.
+	_, stderr = runMain(t, "sx", "-C", dir, "--group=false", "--fallback-local", "--queue-timeout", "5s", "v")
+	if strings.Contains(stderr, "[a] a1\n[a] a2\n") || !strings.Contains(stderr, "[a] a1\n") {
+		t.Errorf("--group=false still grouped: %q", stderr)
+	}
+}
+
 type lockedBuf struct {
 	mu sync.Mutex
 	b  bytes.Buffer
