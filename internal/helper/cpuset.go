@@ -45,7 +45,7 @@ func cpuOption(opts []string) string {
 // separate argument): every other flag consumes the next argument unless
 // it is written --flag=value.
 var dockerBoolFlags = []string{"--rm", "--init", "--privileged", "--read-only", "--tty", "--interactive", "--detach",
-	"--oom-kill-disable", "--no-healthcheck", "--publish-all", "--quiet", "--sig-proxy", "--help", "--disable-content-trust", "-t", "-i", "-d", "-P", "-q"}
+	"--oom-kill-disable", "--no-healthcheck", "--publish-all", "--quiet", "--sig-proxy", "--help", "--disable-content-trust", "--use-api-socket", "-t", "-i", "-d", "-P", "-q"}
 
 // dockerFlags lists the flags a docker run argument list sets, by name
 // (--memory, -m), skipping the values flags consume, so a value such as

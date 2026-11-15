@@ -22,6 +22,9 @@ func TestNetworkArgs(t *testing.T) {
 		{"", []string{"--network=mynet"}, nil},
 		{"", []string{"--net=bridge"}, nil},
 		{"private", []string{"--net", "host"}, nil},
+		// Boolean flags take no value, so the network flag after one counts.
+		{"", []string{"--use-api-socket", "--network", "mynet"}, nil},
+		{"private", []string{"--init", "--net", "none"}, nil},
 		// A value that looks like the flag isn't the flag.
 		{"", []string{"--label", "--network"}, []string{"--network", "host"}},
 	} {
