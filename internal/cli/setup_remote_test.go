@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/daintreehq/spotexec/internal/hooks"
 )
 
 // fakeHost runs remote setup's scripts on this machine: a stub ssh runs the
@@ -53,7 +55,12 @@ case "$1" in
     for a; do
       if [ "$a" = --admin-from-env ] && [ -f "$FAKE/old-spotexec" ]; then echo "Error: unknown flag: $a" >&2; exit 1; fi
     done
-    for a; do [ "$a" = --help ] && exit 0; done
+    for a; do
+      if [ "$a" = --help ]; then
+        [ -f "$FAKE/old-hooks" ] || echo "      --hooks      install the Claude Code hook without asking"
+        echo "      --no-hooks   don't offer the Claude Code hook"; exit 0
+      fi
+    done
     echo "remote setup $*"; echo "admin key: ${AWS_ACCESS_KEY_ID:-none}"
     if [ -f "$FAKE/setup-fails" ]; then exit 1; fi ;;
 esac
@@ -676,6 +683,7 @@ func TestRetryCommand(t *testing.T) {
 		{remoteSetup{host: "box", install: "release", fellBack: true, profile: "spotexec"}, "spotexec setup box"},
 		{remoteSetup{host: "me@box", install: "copy", profile: "team", adminProfile: "adm", rotate: true, noVPC: true, noHooks: true},
 			"spotexec setup --admin-profile 'adm' --profile 'team' --install copy --rotate --no-vpc --no-hooks me@box"},
+		{remoteSetup{host: "box", install: "auto", profile: "spotexec", hooks: true}, "spotexec setup --hooks box"},
 		{remoteSetup{host: "[2001:db8::1]", install: "auto", profile: "spotexec"}, "spotexec setup '[2001:db8::1]'"},
 	} {
 		if got := c.r.retryCommand(); got != c.want {
@@ -702,8 +710,8 @@ func TestSetupHostsConnectsFirst(t *testing.T) {
 	if !strings.Contains(out, "✓ a is ready") || !strings.Contains(out, "✓ b is ready") || !strings.Contains(out, "✗ gone: can't connect over SSH") {
 		t.Fatalf("output:\n%s", out)
 	}
-	if strings.Contains(out, "--no-hooks") {
-		t.Fatalf("--no-hooks passed:\n%s", out)
+	if strings.Contains(out, "--no-hooks") || strings.Contains(out, "--hooks") {
+		t.Fatalf("a hook flag passed:\n%s", out)
 	}
 	b, _ := os.ReadFile(filepath.Join(f.dir, "ssh.log"))
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
@@ -748,14 +756,81 @@ func TestRemoteSetupPathsWithSpaces(t *testing.T) {
 	if err := r.do(context.Background()); err != nil || !strings.Contains(f.out.String(), "--no-hooks") {
 		t.Fatalf("%v\n%s", err, f.out.String())
 	}
+	// A hook asked for here is asked for there.
+	r = f.setup()
+	r.install, r.hooks = "none", true
+	f.out.Reset()
+	if err := r.do(context.Background()); err != nil || !strings.Contains(f.out.String(), "--yes --profile spotexec --skip-aws --hooks") {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
 }
 
-// Without Claude Code here, the hook isn't turned down for other machines.
+// Without Claude Code here, the hook isn't turned down for other machines,
+// and --hooks still asks for it there.
 func TestSetupClaudeHookNotHere(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("PATH", "/usr/bin:/bin")
-	if setupClaudeHook(true, false) || setupClaudeHook(false, false) || setupClaudeHook(false, true) {
-		t.Fatal("reported as declined")
+	captureStdout(t, func() {
+		for _, c := range [][3]bool{{true, false, false}, {false, false, false}, {false, false, true}} {
+			if in, declined := setupClaudeHook(c[0], c[1], c[2]); in || declined {
+				t.Errorf("setupClaudeHook%v = %v, %v", c, in, declined)
+			}
+		}
+		if in, _ := setupClaudeHook(true, true, false); !in {
+			t.Error("--hooks not passed on")
+		}
+	})
+	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), ".claude", "settings.json")); err == nil {
+		t.Fatal("installed without Claude Code")
+	}
+}
+
+// The hook is opt-in: --yes and a run without a terminal leave it out, and
+// only --hooks (or a yes when asked) installs it.
+func TestSetupClaudeHookOptIn(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("SPOTEXEC_SETUP_NESTED", "")
+	if err := os.Mkdir(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := filepath.Join(home, ".claude", "settings.json")
+	out := captureStdout(t, func() {
+		for _, yes := range []bool{true, false} { // tests have no terminal on stdin
+			if in, declined := setupClaudeHook(yes, false, false); in || declined {
+				t.Errorf("yes=%v: %v, %v", yes, in, declined)
+			}
+		}
+	})
+	if _, err := os.Stat(settings); err == nil {
+		t.Fatalf("installed without --hooks:\n%s", out)
+	}
+	if !strings.Contains(out, "spotexec setup --hooks") {
+		t.Fatalf("no hint:\n%s", out)
+	}
+	// Nested in another machine's setup, that machine says what to do.
+	t.Setenv("SPOTEXEC_SETUP_NESTED", "1")
+	if out := captureStdout(t, func() { setupClaudeHook(true, false, false) }); strings.Contains(out, "--hooks") {
+		t.Fatalf("hint in nested setup:\n%s", out)
+	}
+	out = captureStdout(t, func() {
+		if in, declined := setupClaudeHook(true, true, false); !in || declined {
+			t.Errorf("--hooks: %v, %v", in, declined)
+		}
+	})
+	if !hooks.HasClaude(settings) || !strings.Contains(out, "✓ installed the Claude Code hook") {
+		t.Fatalf("--hooks didn't install it:\n%s", out)
+	}
+	// Once installed, a plain run leaves it and doesn't pass it on.
+	out = captureStdout(t, func() {
+		if in, _ := setupClaudeHook(true, false, false); in {
+			t.Error("passed on without --hooks")
+		}
+	})
+	if !hooks.HasClaude(settings) || !strings.Contains(out, "✓ Claude Code hook in") {
+		t.Fatalf("output:\n%s", out)
 	}
 }
 
@@ -778,5 +853,117 @@ func TestSetupHostsRecordsIdentity(t *testing.T) {
 	h, _ := os.Hostname()
 	if len(ms) != 1 || ms[0].Host != "builder" || ms[0].MachineID != "aaaa-1111" || ms[0].Hostname != h {
 		t.Fatalf("machines %+v", ms)
+	}
+}
+
+// claudeHome isolates Claude Code's settings in a fresh home that has
+// Claude Code, optionally with PreToolUse hook commands already there.
+func claudeHome(t *testing.T, commands ...string) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("SPOTEXEC_SETUP_NESTED", "")
+	p := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) > 0 {
+		var hs []string
+		for _, c := range commands {
+			hs = append(hs, `{"type":"command","command":"`+c+`"}`)
+		}
+		b := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[` + strings.Join(hs, ",") + `]}]}}`
+		if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return p
+}
+
+// In a terminal the question defaults to no, and only a yes installs.
+func TestSetupClaudeHookPrompt(t *testing.T) {
+	for _, c := range []struct {
+		answer            string
+		yes               bool
+		installed, asked  bool
+		optedIn, declined bool
+	}{
+		{"\n", false, false, true, false, true},
+		{"n\n", false, false, true, false, true},
+		{"", false, false, true, false, true}, // EOF
+		{"y\n", false, true, true, true, false},
+		{"YES\n", false, true, true, true, false},
+		{"y\n", true, false, false, false, false}, // --yes doesn't ask
+	} {
+		settings := claudeHome(t)
+		var in, declined bool
+		out := captureStdout(t, func() {
+			in, declined = setupClaudeHookFrom(c.yes, false, false, true, strings.NewReader(c.answer))
+		})
+		if in != c.optedIn || declined != c.declined || hooks.HasClaude(settings) != c.installed || strings.Contains(out, "[y/N]") != c.asked {
+			t.Errorf("%q yes=%v: optedIn %v, declined %v, installed %v\n%s", c.answer, c.yes, in, declined, hooks.HasClaude(settings), out)
+		}
+	}
+}
+
+// --no-hooks neither installs the hook nor touches an installed one, which
+// is otherwise kept current.
+func TestSetupClaudeHookMaintenance(t *testing.T) {
+	settings := claudeHome(t)
+	captureStdout(t, func() { setupClaudeHookFrom(false, false, true, true, strings.NewReader("y\n")) })
+	if _, err := os.Stat(settings); err == nil {
+		t.Fatal("--no-hooks installed it")
+	}
+	// v0.2.0's hook, and RTK's beside spotexec's, which setup chains.
+	for _, old := range [][]string{{"sx hook claude"}, {"spotexec hook claude", "rtk hook claude"}} {
+		settings = claudeHome(t, old...)
+		before, _ := os.ReadFile(settings)
+		captureStdout(t, func() { setupClaudeHookFrom(true, false, true, false, nil) })
+		if after, _ := os.ReadFile(settings); string(after) != string(before) {
+			t.Fatalf("%s: --no-hooks changed it:\n%s", old, after)
+		}
+		var in bool
+		out := captureStdout(t, func() { in, _ = setupClaudeHookFrom(true, false, false, false, nil) })
+		after, _ := os.ReadFile(settings)
+		if in || string(after) == string(before) || hooks.HasLegacyClaude(settings) || !strings.Contains(out, "✓") {
+			t.Fatalf("%s: optedIn %v, not kept current:\n%s\n%s", old, in, after, out)
+		}
+		// Asked for here, an installed hook is asked for on other machines.
+		if in, _ := setupClaudeHookFrom(true, true, false, false, nil); !in {
+			t.Fatalf("%s: --hooks not passed on", old)
+		}
+	}
+}
+
+func TestSetupHooksFlagsConflict(t *testing.T) {
+	for _, args := range [][]string{{"--hooks", "--no-hooks"}, {"--hooks", "--no-hooks", "--print-policy"}} {
+		c := cmdSetup()
+		c.SetArgs(args)
+		c.SetOut(io.Discard)
+		c.SetErr(io.Discard)
+		if err := c.Execute(); err == nil || !strings.Contains(err.Error(), "can't be used together") {
+			t.Errorf("%v: err = %v", args, err)
+		}
+	}
+}
+
+// A spotexec there from before the hook was opt-in would install it with
+// --yes and doesn't know --hooks.
+func TestRemoteSetupOldHookDefault(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+	f.localInstalled("0.3.0")
+	f.write("old-hooks", "", 0o644)
+	for _, c := range []struct {
+		hooks bool
+		want  string
+	}{{false, "--skip-aws --no-hooks\n"}, {true, "--skip-aws\n"}} {
+		r := f.setup()
+		r.install, r.hooks = "none", c.hooks
+		f.out.Reset()
+		if err := r.do(context.Background()); err != nil || !strings.Contains(f.out.String(), c.want) {
+			t.Fatalf("hooks=%v: %v\n%s", c.hooks, err, f.out.String())
+		}
 	}
 }

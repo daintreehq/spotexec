@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +26,7 @@ import (
 
 func cmdSetup() *cobra.Command {
 	var profile, adminProfile, user, install string
-	var yes, rotate, skipAWS, printPolicy, noVPC, noHooks, all, list, bake, adminFromEnv bool
+	var yes, rotate, skipAWS, printPolicy, noVPC, noHooks, wantHooks, all, list, bake, adminFromEnv bool
 	var revoke string
 	c := &cobra.Command{
 		Use:   "setup [host...]",
@@ -43,8 +44,10 @@ func cmdSetup() *cobra.Command {
    checks the Spot vCPU quota, and offers to request more when not even one
    VM fits.
 
-3. If Claude Code is installed, offers its hook, so agents' heavy commands
-   run on your runners (--no-hooks skips it).
+3. If Claude Code is installed, offers its hook, which rewrites agents'
+   heavy commands to run on your runners. It is installed only when you
+   say yes (the default is no) or pass --hooks; --yes alone doesn't. An
+   installed hook is kept up to date unless you pass --no-hooks.
 
 4. Sets up other machines over SSH: the hosts you name, or (interactively)
    the ones you pick from those found on your network and in ~/.ssh/config.
@@ -63,6 +66,9 @@ and keeps a working key. --rotate replaces the key.
   spotexec setup studio-01.local mini-01  this machine, then those two`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if wantHooks && noHooks {
+				return fmt.Errorf("--hooks and --no-hooks can't be used together")
+			}
 			if printPolicy {
 				fmt.Println(provider.SpotexecPolicy)
 				return nil
@@ -249,7 +255,7 @@ and keeps a working key. --rotate replaces the key.
 			if err != nil {
 				return err
 			}
-			hookDeclined := setupClaudeHook(yes, noHooks)
+			hookOptedIn, hookDeclined := setupClaudeHook(yes, wantHooks, noHooks)
 			hosts := args
 			if all {
 				for _, m := range loadMachines() {
@@ -268,8 +274,9 @@ and keeps a working key. --rotate replaces the key.
 				if err := setupHosts(cmd.Context(), hosts, remoteSetup{
 					install: install, adminProfile: adminProfile, profile: profile,
 					rotate: rotate, noVPC: noVPC, aws: hasAWS,
-					// Each machine installs the hook if it has Claude Code,
-					// unless it was turned down here.
+					// Other machines get the hook (if they have Claude
+					// Code) only when it was asked for here.
+					hooks:   hookOptedIn,
 					noHooks: noHooks || hookDeclined,
 				}); err != nil {
 					return err
@@ -300,7 +307,8 @@ and keeps a working key. --rotate replaces the key.
 	c.Flags().BoolVar(&all, "all", false, "also update every machine set up from here before (config, spotexec version, AWS policy)")
 	c.Flags().BoolVar(&list, "list", false, "list every machine's spotexec IAM user, keys and running VMs, then exit")
 	c.Flags().StringVar(&revoke, "revoke", "", "delete a machine's IAM user and keys and terminate its VMs (host or IAM user name), then exit")
-	c.Flags().BoolVar(&noHooks, "no-hooks", false, "don't install the Claude Code hook")
+	c.Flags().BoolVar(&wantHooks, "hooks", false, "install the Claude Code hook without asking (also on the other machines)")
+	c.Flags().BoolVar(&noHooks, "no-hooks", false, "don't offer the Claude Code hook or update an installed one")
 	c.Flags().BoolVar(&noVPC, "no-vpc", false, "don't create a default VPC when the region has none")
 	c.Flags().StringVar(&install, "install", "auto", "how to install spotexec on other machines: auto, brew, release, copy (this binary) or none")
 	c.Flags().BoolVar(&printPolicy, "print-policy", false, "print the IAM policy spotexec needs and exit")
@@ -570,10 +578,19 @@ func setRunnerProfileText(text string, runners []string, profile string) (string
 	return strings.Join(lines, "\n"), nil
 }
 
-// setupClaudeHook installs the Claude Code hook for all projects when Claude
-// Code is on this machine, asking first in a terminal. It reports whether
-// the user turned the hook down when asked.
-func setupClaudeHook(yes, skip bool) (declined bool) {
+// setupClaudeHook keeps an installed Claude Code hook current and installs
+// it for all projects only when asked to: with --hooks (want), or when the
+// user says yes in a terminal, where the answer defaults to no. --yes never
+// installs it, since it rewrites commands in every project. It reports
+// whether the hook was asked for, so other machines get it too, and whether
+// the user turned it down when asked.
+func setupClaudeHook(yes, want, skip bool) (optedIn, declined bool) {
+	return setupClaudeHookFrom(yes, want, skip, ui.IsTerminal(os.Stdin), os.Stdin)
+}
+
+// setupClaudeHookFrom is setupClaudeHook with the answer to its question
+// read from in, which is a terminal when interactive is true.
+func setupClaudeHookFrom(yes, want, skip, interactive bool, in io.Reader) (optedIn, declined bool) {
 	home, _ := os.UserHomeDir()
 	p := hooks.GlobalSettings()
 	if !skip && hooks.HasLegacyClaude(p) {
@@ -582,7 +599,7 @@ func setupClaudeHook(yes, skip bool) (declined bool) {
 			fmt.Printf("! couldn't update the Claude Code hook: %v\n", err)
 		} else {
 			fmt.Printf("✓ updated the Claude Code hook in %s to call spotexec\n", p)
-			return true
+			return want, false
 		}
 	}
 	if !skip && hooks.HasRTK(p) && hooks.HasClaude(p) {
@@ -592,34 +609,42 @@ func setupClaudeHook(yes, skip bool) (declined bool) {
 		} else {
 			fmt.Printf("✓ chained RTK's hook behind spotexec's in %s\n", p)
 		}
-		return false
+		return want, false
 	}
 	if hooks.HasClaude(p) {
 		fmt.Printf("✓ Claude Code hook in %s\n", p)
-		return false
+		return want, false
 	}
 	if skip {
-		return false
+		return false, false
 	}
 	if _, err := os.Stat(filepath.Join(home, ".claude")); err != nil {
 		if _, err := exec.LookPath("claude"); err != nil {
-			return false // no Claude Code here
+			if want {
+				fmt.Println("  Claude Code isn't installed here, so there's no hook to install")
+			}
+			// Other machines may still have it.
+			return want, false
 		}
 	}
-	if !yes {
-		if !ui.IsTerminal(os.Stdin) {
-			return false
+	if !want {
+		if yes || !interactive {
+			if os.Getenv("SPOTEXEC_SETUP_NESTED") != "" {
+				return false, false // the machine running this setup decides
+			}
+			fmt.Println("  Claude Code hook not installed (`spotexec setup --hooks` or `spotexec hook install --claude --global` adds it)")
+			return false, false
 		}
-		fmt.Print("\nInstall the Claude Code hook for all your projects? Agents' heavy commands (tests, linters, builds)\nthen run on your runners; it only acts in projects with a .spotexec.toml. [Y/n] ")
-		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-		if a := strings.ToLower(strings.TrimSpace(line)); a != "" && a != "y" && a != "yes" {
-			return true
+		fmt.Print("\nInstall the Claude Code hook for all your projects? It rewrites agents' heavy commands (tests, linters,\nbuilds) to run on your runners, in projects with a .spotexec.toml. Without it, run them with `sx`. [y/N] ")
+		line, _ := bufio.NewReader(in).ReadString('\n')
+		if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
+			return false, true
 		}
 	}
 	rtk := hooks.HasRTK(p)
 	if _, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
 		fmt.Printf("! couldn't install the Claude Code hook: %v\n", err)
-		return false
+		return true, false
 	}
 	if rtk {
 		fmt.Printf("✓ installed the Claude Code hook in %s, with RTK's hook chained behind it\n", p)
@@ -627,7 +652,7 @@ func setupClaudeHook(yes, skip bool) (declined bool) {
 		fmt.Printf("✓ installed the Claude Code hook in %s\n", p)
 	}
 	fmt.Println("  Permission rules now see `spotexec run -- <cmd>`: allow `Bash(spotexec run:*)` if you pre-approve test commands.")
-	return false
+	return true, false
 }
 
 func containsFold(list []string, s string) bool {

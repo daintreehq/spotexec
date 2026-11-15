@@ -25,7 +25,7 @@ spotexec image bake [runner] [--pull IMG]    bake an AMI from the runner's boots
 spotexec image list [runner]                 baked AMIs from every machine: base image, age, maker, which is in use (every region a runner uses, or --region R)
 spotexec image clear [runner] [--all]        delete this machine's and this bootstrap's bakes (--all: every machine's; every region a runner uses, or --region R)
 spotexec prices [runner] [--refresh] [--json] current Spot prices of the runner's instance types in every zone of its region(s), cheapest first; marks where the next VM launches
-spotexec setup [host...] [--all] [--bake]    set up this machine (config, AWS user and key, hooks), then others over SSH; offer a bake
+spotexec setup [host...] [--all] [--bake] [--hooks]  set up this machine (config, AWS user and key; the hook only if asked), then others over SSH; offer a bake
 spotexec setup --list | --revoke HOST        every machine's IAM user and VMs; revoke one
 spotexec teardown [--dry-run] [--region R]   remove everything spotexec created in the AWS account (admin)
 spotexec supported [-C DIR]                  print true (exit 0) if sx can run from here, else false (exit 1)

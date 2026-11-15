@@ -88,14 +88,14 @@ The `[hook]` table tunes it:
 - `mode = "block"` denies the command with instructions, instead of rewriting it;
 - `disabled = true` turns it off.
 
-A hook that v0.2.0 installed as `sx hook claude` still works the same way; `spotexec setup` and `spotexec hook install` rewrite it in place to call `spotexec`.
+A hook that v0.2.0 installed as `sx hook claude` still works the same way; `spotexec setup` (unless `--no-hooks`) and `spotexec hook install` rewrite it in place to call `spotexec`.
 
 ### With RTK
 
 [RTK](https://github.com/rtk-ai/rtk) compacts command output for agents with a PreToolUse hook of its own, `rtk hook claude`, which rewrites many of the same commands (`cargo test` to `rtk cargo test`). Claude Code runs every matching hook on the original command and doesn't say which rewrite wins. With both hooks installed side by side, a test run would either stay local or come back uncompacted, whichever hook won.
 
 So only one hook decides:
-- **Chained.** `spotexec hook install` and `spotexec setup` find RTK's hook in the settings file they install into and chain it behind spotexec's, in place: `spotexec hook claude --then 'rtk hook claude'`. spotexec decides first. Every command it doesn't offload goes to RTK unchanged, and so does every command outside a project with a `.spotexec.toml`. `--uninstall` puts RTK's own hook back. RTK doesn't recognise the chained form, so it may say `No hook installed — run rtk init -g` even though `rtk verify` passes. If `rtk init -g` adds RTK's hook again, run `spotexec hook install --claude --global` to fold it back into the chain.
+- **Chained.** `spotexec hook install`, and `spotexec setup` when it installs or keeps up spotexec's hook (not with `--no-hooks`), find RTK's hook in the settings file they install into and chain it behind spotexec's, in place: `spotexec hook claude --then 'rtk hook claude'`. spotexec decides first. Every command it doesn't offload goes to RTK unchanged, and so does every command outside a project with a `.spotexec.toml`. `--uninstall` puts RTK's own hook back. RTK doesn't recognise the chained form, so it may say `No hook installed — run rtk init -g` even though `rtk verify` passes. If `rtk init -g` adds RTK's hook again, run `spotexec hook install --claude --global` to fold it back into the chain.
 - **Not chained.** RTK's hook may be in a different file, say `~/.claude/settings.json` when spotexec's is in the project. Then a command RTK would also rewrite is denied, and the reason tells the agent to run the offloaded form, which RTK leaves alone. The first denial in a session tells you which `spotexec hook install` command chains them. `spotexec hook check` shows when this would happen.
 
 Where RTK is in use, offloaded output is still compacted. `rtk pipe` runs on this machine once the command finishes, through `spotexec run --rtk-filter <filter>`. The exit code stays the command's own, and spotexec's warnings and summary still reach stderr. If the command fails, the output ends with `[full output: <path>]` (the last 20 are kept). If RTK fails, the output is printed unfiltered with an `RTK_FILTER` warning. The hook adds `--rtk-filter` only for the commands whose raw output RTK's filters are known to read correctly:
