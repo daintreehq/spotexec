@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -900,6 +901,47 @@ func TestGlobalExpiredRegionKeptForStoppedAndBuilders(t *testing.T) {
 	}
 	if got := active(t, g); got != "r-three-1,r-two-1" {
 		t.Fatalf("regions with billable leftovers were forgotten: %q", got)
+	}
+}
+
+// Bakes of one runner in different regions run side by side; a second
+// bake in the same region is refused, and a sweep skips only the regions
+// with a bake in progress.
+func TestBakeLockPerRegion(t *testing.T) {
+	f := &fakeRegionsEC2{builders: map[string]bool{"r-one-1": true, "r-two-1": true}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	unlockOne, err := g.Regional("r-one-1").LockBake()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlockTwo, err := g.Regional("r-two-1").LockBake()
+	if err != nil {
+		t.Fatalf("a bake in another region was refused: %v", err)
+	}
+	if _, err := g.Regional("r-one-1").LockBake(); err == nil || !strings.Contains(err.Error(), "r-one-1") {
+		t.Fatalf("a second bake in the same region: %v", err)
+	}
+	// An older spotexec (one lock per runner) still running, e.g. its pool
+	// manager, can't sweep while a bake runs, nor bake alongside.
+	legacy := filepath.Join(os.Getenv("SPOTEXEC_STATE_DIR"), "bake", "g.lock")
+	if unlock, err := flockFile(legacy, syscall.LOCK_EX); err == nil {
+		unlock()
+		t.Fatal("an older version's runner-wide lock was free during a bake")
+	}
+	unlockTwo()
+
+	g.sweepBuilders(context.Background(), []string{"r-one-1", "r-two-1"}, t.Logf)
+	if got := f.callsOf("TerminateInstances"); len(got) != 1 || got[0] != "r-two-1 TerminateInstances i-builder" {
+		t.Fatalf("sweep terminated %v; want only r-two-1's builder", got)
+	}
+	unlockOne()
+	unlockOld, err := flockFile(legacy, syscall.LOCK_EX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlockOld()
+	if _, err := g.Regional("r-two-1").LockBake(); err == nil {
+		t.Fatal("bake started while an older version's bake holds the runner-wide lock")
 	}
 }
 

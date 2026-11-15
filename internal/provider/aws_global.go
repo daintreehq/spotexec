@@ -1576,13 +1576,8 @@ func (g *AWSGlobal) SweepBuilders(ctx context.Context, log Logger) {
 }
 
 func (g *AWSGlobal) sweepBuilders(ctx context.Context, regions []string, log Logger) {
-	unlock, err := g.home().LockBake()
-	if err != nil {
-		return // a bake is running here; its builder is not leftover
-	}
-	defer unlock()
 	eachRegion(ctx, regions, func(ctx context.Context, rg string) error {
-		g.Regional(rg).sweepBuilders(ctx, log)
+		g.Regional(rg).SweepBuilders(ctx, log) // skips a region with a bake running
 		return nil
 	})
 }

@@ -802,20 +802,47 @@ func (a *AWSSpot) ClearBakes(ctx context.Context, all bool) (ClearResult, error)
 	return res, nil
 }
 
-// LockBake takes this runner's bake lock (non-blocking) for the duration of
-// a bake. A builder whose bake still holds the lock is never swept.
+// LockBake takes the bake lock of this runner in this region (non-blocking)
+// for the duration of a bake, so bakes in other regions can run at the same
+// time. A builder whose bake still holds the lock is never swept.
 func (a *AWSSpot) LockBake() (unlock func(), err error) {
 	dir := filepath.Join(config.StateDir(), "bake")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(dir, a.r.Name+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	busy := fmt.Errorf("a bake for %s in %s is already running on this machine", a.r.Name, a.r.Region)
+	// Shared on the runner-wide lock that versions before per-region locks
+	// take exclusively: their bakes and sweeps (an older pool manager still
+	// running) and ours keep excluding each other.
+	legacy, err := flockFile(filepath.Join(dir, a.r.Name+".lock"), syscall.LOCK_SH)
+	if err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, busy
+		}
+		return nil, err
+	}
+	// "@" appears in neither runner names nor regions.
+	f, err := flockFile(filepath.Join(dir, a.r.Name+"@"+a.r.Region+".lock"), syscall.LOCK_EX)
+	if err != nil {
+		legacy()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, busy
+		}
+		return nil, err
+	}
+	return func() { f(); legacy() }, nil
+}
+
+// flockFile takes a non-blocking flock of kind how on path (created if
+// missing) and returns its release.
+func flockFile(path string, how int) (unlock func(), err error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("a bake for %s is already running on this machine", a.r.Name)
+		return nil, err
 	}
 	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
@@ -861,8 +888,9 @@ func (a *AWSSpot) leftovers(ctx context.Context) (int, error) {
 	}
 }
 
-// SweepBuilders terminates leftover bake builders of this runner (stopped,
-// or older than four hours) unless a bake on this machine is in progress: a
+// SweepBuilders terminates leftover bake builders of this runner in this
+// region (stopped, or older than four hours) unless a bake of it there on
+// this machine is in progress: a
 // CLI that died mid-bake must not leave one billing. Called by `spotexec
 // down`, the pool manager, and each bake (which holds the lock: see
 // sweepBuilders).
