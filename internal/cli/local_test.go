@@ -507,10 +507,12 @@ func TestRunLocalSetupInterrupted(t *testing.T) {
 }
 
 // Input piped into sx doesn't reach the command (stdin is /dev/null there
-// too), so it is flagged once; an empty pipe, as an agent harness may pass,
-// and a sync are not.
+// too), so it is flagged once, whether it was there before the run or only
+// written while the command ran; an empty pipe, as an agent harness may
+// pass, is not.
 func TestPipedStdinIsFlaggedNotForwarded(t *testing.T) {
-	dir := project(t, "[tasks.l]\nrun = \"cat > l.out\"\n[tasks.t]\nrun = \"true\"\n[tasks.v]\nparallel = [\"l\", \"t\"]\n")
+	dir := project(t, "[tasks.l]\nrun = \"cat > l.out\"\n[tasks.t]\nrun = \"true\"\n[tasks.v]\nparallel = [\"l\", \"t\"]\n"+
+		"[tasks.w]\nrun = \"touch started && sleep 1\"\n[tasks.vw]\nparallel = [\"w\", \"t\"]\n")
 	cfg := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(cfg, []byte("version = 1\n[runners.a]\ntype = \"ssh\"\nhosts = [\"nobody@127.0.0.1\"]\nssh_options = [\"Port=1\"]\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -529,22 +531,55 @@ func TestPipedStdinIsFlaggedNotForwarded(t *testing.T) {
 		t.Cleanup(func() { _ = r.Close() })
 		return r
 	}
-	for _, args := range [][]string{{"--", "cat"}, {"v"}} {
-		all := append([]string{"-C", dir, "--fallback-local", "--queue-timeout", "5s"}, args...)
+	const warning = "stdin has input, but the command doesn't get it"
+	flags := []string{"-C", dir, "--fallback-local", "--queue-timeout", "5s"}
+	for _, c := range []struct {
+		args []string
+		out  string
+	}{{[]string{"--", "cat > s.out"}, "s.out"}, {[]string{"v"}, "l.out"}} {
+		all := append(append([]string{}, flags...), c.args...)
 		code, stderr := runMainStdin(t, pipe("x y\n"), "sx", all...)
 		if code != 0 {
-			t.Fatalf("%v: exit %d, stderr %q", args, code, stderr)
+			t.Fatalf("%v: exit %d, stderr %q", c.args, code, stderr)
 		}
-		if n := strings.Count(stderr, "stdin has input, but the command doesn't get it"); n != 1 {
-			t.Errorf("%v: want one STDIN_IGNORED warning, got %d: %q", args, n, stderr)
+		if n := strings.Count(stderr, warning); n != 1 {
+			t.Errorf("%v: want one STDIN_IGNORED warning, got %d: %q", c.args, n, stderr)
+		}
+		if b, err := os.ReadFile(filepath.Join(dir, c.out)); err != nil || len(b) != 0 {
+			t.Errorf("%v: the command read stdin: %q, %v", c.args, b, err)
 		}
 		code, stderr = runMainStdin(t, pipe(""), "sx", all...)
 		if code != 0 || strings.Contains(stderr, "stdin") {
-			t.Errorf("%v with an empty pipe: exit %d, stderr %q", args, code, stderr)
+			t.Errorf("%v with an empty pipe: exit %d, stderr %q", c.args, code, stderr)
 		}
 	}
-	if b, err := os.ReadFile(filepath.Join(dir, "l.out")); err != nil || len(b) != 0 {
-		t.Errorf("the task read stdin: %q, %v", b, err)
+	// Input written only once the command is running, as `git diff | sx`
+	// may: seen by the look after the run.
+	for _, args := range [][]string{{"--", "touch started && sleep 1"}, {"vw"}} {
+		started := filepath.Join(dir, "started")
+		_ = os.Remove(started)
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			defer w.Close()
+			for range 200 {
+				if _, err := os.Stat(started); err == nil {
+					_, _ = w.Write([]byte("late\n"))
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+		code, stderr := runMainStdin(t, r, "sx", append(append([]string{}, flags...), args...)...)
+		_ = r.Close()
+		if code != 0 {
+			t.Fatalf("%v: exit %d, stderr %q", args, code, stderr)
+		}
+		if n := strings.Count(stderr, warning); n != 1 {
+			t.Errorf("%v, input written while it ran: want one STDIN_IGNORED warning, got %d: %q", args, n, stderr)
+		}
 	}
 	code, stderr := runMainStdin(t, pipe("x y\n"), "sx", "-C", dir, "--json", "--fallback-local", "--queue-timeout", "5s", "--", "true")
 	if code != 0 || !strings.Contains(stderr, `"code":"STDIN_IGNORED"`) {

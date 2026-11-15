@@ -198,13 +198,16 @@ func TestStdinReporterWarnsBeforeResult(t *testing.T) {
 	rec := &warnRecorder{}
 	n := &stdinNotice{in: r}
 	rep := n.reporter(rec)
-	rep.Event("start", nil)
 	if _, err := w.Write([]byte("late")); err != nil { // written while the command ran
 		t.Fatal(err)
 	}
+	rep.Event("exec", nil) // only the result event looks
+	if len(rec.warnings) != 0 {
+		t.Fatalf("warned on a non-result event: %v", rec.log)
+	}
 	rep.Event("result", nil)
 	n.check(rec) // the check after the run: already warned
-	want := "event start,warn STDIN_IGNORED,event result"
+	want := "event exec,warn STDIN_IGNORED,event result"
 	if got := strings.Join(rec.log, ","); got != want {
 		t.Fatalf("got %s, want %s", got, want)
 	}

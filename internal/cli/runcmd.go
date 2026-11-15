@@ -704,9 +704,9 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	}()
 	failOnce := sync.Once{}
 	var wg sync.WaitGroup
-	// Every part has a command; before and after they run, nothing else
-	// prints.
-	stdin := newStdinNotice(name)
+	// Every part has a command (whatever the task is called); before and
+	// after they run, nothing else prints.
+	stdin := &stdinNotice{in: os.Stdin}
 	stdin.check(rep)
 	start := time.Now()
 	for i, part := range parts {
