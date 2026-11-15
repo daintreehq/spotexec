@@ -23,7 +23,7 @@ parent directory, up to the repository root), spotexec syncs its workspace
 (not your home directory, / or a credential directory), there is a runner to
 run on, and the checks a run makes on the local files pass: the working set is
 within the file-count limit, a container built from a Dockerfile has its build
-inputs synced, and deps.lockfiles match a synced file and stay inside the
+inputs synced, and deps.lockfiles name at least one lockfile, none outside the
 repository. Whether a runner is reachable, the transfer fits, and the image
 builds and dependencies install, only a run finds out.
 It exits 0 when true and 1 when false, so scripts and agents can use either:
