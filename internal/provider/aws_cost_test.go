@@ -23,8 +23,8 @@ func TestInstancePricesPerVM(t *testing.T) {
 		{ID: "i-3", Spot: true, Region: "r-one-1", Zone: "r-one-1a", Type: "m7a.2xlarge"}, // not in instance_types
 		{ID: "i-4", Spot: true, Region: "r-two-1", Zone: "r-two-1c", Type: "c7a.2xlarge"},
 		{ID: "i-5", Spot: false, Region: "r-one-1", Zone: "r-one-1a", Type: "c6a.2xlarge"}, // on-demand fallback
-		{ID: "i-6", Spot: true, Region: "r-one-1", Type: "c6a.2xlarge"},                     // zone unknown
-		{ID: "i-7", Spot: true, Region: "r-two-1", Zone: "r-two-1a", Type: "c7a.2xlarge"},   // no price in that zone
+		{ID: "i-6", Spot: true, Region: "r-one-1", Type: "c6a.2xlarge"},                    // zone unknown
+		{ID: "i-7", Spot: true, Region: "r-two-1", Zone: "r-two-1a", Type: "c7a.2xlarge"},  // no price in that zone
 	}
 	got := p.Prices(context.Background(), insts)
 	want := map[string]float64{"i-1": 0.129, "i-2": 0.15, "i-3": 0.331, "i-4": 0.2}
