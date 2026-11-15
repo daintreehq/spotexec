@@ -20,21 +20,25 @@ var groupMemCap = 8 << 20
 // after Flush pass straight through, prefixed, so nothing is lost. Every
 // Group of a run shares emit, the lock guarding the destinations.
 type Group struct {
-	mu      sync.Mutex // this part's held output
-	emit    *sync.Mutex
-	out     [2]io.Writer
-	prefix  []byte
-	mid     [2]bool
-	mem     bytes.Buffer // frames, until it outgrows groupMemCap
-	spill   *os.File     // frames, after that
-	size    int64        // bytes of whole frames held
-	err     error        // the first failure to hold output
-	flushed bool
+	mu     sync.Mutex // this part's held output
+	emit   *sync.Mutex
+	out    [2]io.Writer
+	prefix []byte
+	mid    [2]bool
+	mem    bytes.Buffer // frames, until it outgrows groupMemCap
+	spill  *os.File     // frames, after that
+	size   int64        // bytes of whole frames held
+	err    error        // the first failure to hold output
+	live   bool         // held output printed: writes pass straight through
+	ended  bool         // Flush has run
 }
 
-// A frame is one write: the stream (0 stdout, 1 stderr), its length as a
-// big-endian uint32, then the bytes.
+// A frame is one write (or a piece of one): the stream (0 stdout, 1
+// stderr), its length as a big-endian uint32, then the bytes.
 const frameHeader = 5
+
+// maxFrame bounds a frame's length well inside its uint32.
+var maxFrame = 1 << 30
 
 // NewGroup builds a Group printing to stdout and stderr under lock emit.
 func NewGroup(stdout, stderr io.Writer, prefix string, emit *sync.Mutex) *Group {
@@ -58,28 +62,40 @@ func (g *Group) write(stream byte, b []byte) (int, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	data := prefixLines(b, g.prefix, &g.mid[stream])
-	if !g.flushed {
+	if !g.live {
 		err := g.hold(stream, data)
 		if err == nil {
 			return len(b), nil
 		}
 		// Output that can't be held is printed rather than lost: what is
-		// held goes out now, and this part's output is live from here on.
+		// held goes out now, then this write, and the part is live from
+		// here on, its unfinished lines left as they are.
 		g.err = err
-		g.flushLocked(nil)
+		g.emit.Lock()
+		defer g.emit.Unlock()
+		g.drain()
+	} else {
+		g.emit.Lock()
+		defer g.emit.Unlock()
 	}
-	g.emit.Lock()
-	defer g.emit.Unlock()
 	_, err := g.out[stream].Write(data)
 	return len(b), err
 }
 
-// hold appends one frame, moving the held output to a temporary file once it
-// outgrows memory.
+// hold appends data as frames, moving the held output to a temporary file
+// once it outgrows memory.
 func (g *Group) hold(stream byte, data []byte) error {
-	if len(data) == 0 {
-		return nil
+	for len(data) > 0 {
+		n := min(len(data), maxFrame)
+		if err := g.holdFrame(stream, data[:n]); err != nil {
+			return err
+		}
+		data = data[n:]
 	}
+	return nil
+}
+
+func (g *Group) holdFrame(stream byte, data []byte) error {
 	frame := make([]byte, frameHeader, frameHeader+len(data))
 	frame[0] = stream
 	binary.BigEndian.PutUint32(frame[1:], uint32(len(data)))
@@ -116,73 +132,86 @@ func (g *Group) hold(stream byte, data []byte) error {
 // Flush prints everything held as one block, ending any unfinished line, then
 // calls after (when not nil) still holding the output lock, so a summary can
 // follow its block with nothing in between. Later writes pass straight
-// through. It returns the first failure to hold or print the output, and is
-// safe to call more than once.
+// through. It returns the first failure to hold the output (which was then
+// printed as it came); like the live output, a destination that can't be
+// written to is not an error. after runs on every call; the rest only once.
 func (g *Group) Flush(after func()) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	err := g.flushLocked(after)
-	if g.err != nil {
-		return g.err
-	}
-	return err
-}
-
-func (g *Group) flushLocked(after func()) error {
 	g.emit.Lock()
 	defer g.emit.Unlock()
+	if !g.ended {
+		g.ended = true
+		g.drain()
+		for i, mid := range g.mid {
+			if mid {
+				g.mid[i] = false
+				g.out[i].Write([]byte{'\n'})
+			}
+		}
+	}
 	if after != nil {
-		defer after()
+		after()
 	}
-	if g.flushed {
-		return nil
+	return g.err
+}
+
+// drain prints the held output, frees it and makes the Group live. Both
+// locks are held.
+func (g *Group) drain() {
+	if g.live {
+		return
 	}
-	g.flushed = true
-	err := g.replay()
+	g.live = true
+	g.replay()
 	if g.spill != nil {
 		g.spill.Close()
 	}
 	g.mem, g.spill, g.size = bytes.Buffer{}, nil, 0
-	for i, mid := range g.mid {
-		if mid {
-			g.mid[i] = false
-			if _, werr := g.out[i].Write([]byte{'\n'}); err == nil {
-				err = werr
-			}
-		}
-	}
-	return err
 }
 
-func (g *Group) replay() error {
+// replay prints the held frames. A destination that fails stops receiving,
+// but the other stream still gets its share.
+func (g *Group) replay() {
 	var r io.Reader = &g.mem
 	if g.spill != nil {
 		if _, err := g.spill.Seek(0, io.SeekStart); err != nil {
-			return err
+			return
 		}
 		r = bufio.NewReader(g.spill)
 	}
 	r = io.LimitReader(r, g.size)
 	// Consecutive frames for one stream go out together; switching streams
 	// first sends what the other has, keeping their order.
-	w := [2]*bufio.Writer{bufio.NewWriterSize(g.out[0], 64<<10), bufio.NewWriterSize(g.out[1], 64<<10)}
+	var w [2]*bufio.Writer
+	for i := range w {
+		w[i] = bufio.NewWriterSize(&stickyWriter{w: g.out[i]}, 64<<10)
+	}
 	var h [frameHeader]byte
 	for {
-		if _, err := io.ReadFull(r, h[:]); err == io.EOF {
+		if _, err := io.ReadFull(r, h[:]); err != nil {
 			break
-		} else if err != nil {
-			return err
 		}
 		s := h[0] & 1
-		if err := w[1-s].Flush(); err != nil {
-			return err
-		}
+		w[1-s].Flush()
 		if _, err := io.CopyN(w[s], r, int64(binary.BigEndian.Uint32(h[1:]))); err != nil {
-			return err
+			break
 		}
 	}
-	if err := w[0].Flush(); err != nil {
-		return err
+	w[0].Flush()
+	w[1].Flush()
+}
+
+// stickyWriter drops everything after its first failed write, so one broken
+// destination doesn't stop the other stream's replay.
+type stickyWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (s *stickyWriter) Write(b []byte) (int, error) {
+	if s.err == nil {
+		_, s.err = s.w.Write(b)
 	}
-	return w[1].Flush()
+	return len(b), nil
 }

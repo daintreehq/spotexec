@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -121,14 +122,49 @@ func TestGroupPrintsWhatItCantHold(t *testing.T) {
 		t.Fatalf("printed before the cap: %q", tp.log)
 	}
 	// Past the cap the temporary file can't be made: what was held goes out,
-	// then the rest as it comes.
-	g.Stderr().Write([]byte("two two two two\n"))
+	// then the rest as it comes, an unfinished line continuing unprefixed.
+	g.Stderr().Write([]byte("two"))
+	g.Stderr().Write([]byte(" more\n"))
 	g.Stdout().Write([]byte("three\n"))
-	if got, want := tp.text(), "out:[x] one\nerr:[x] two two two two\nout:[x] three\n"; got != want {
-		t.Fatalf("got %q want %q", got, want)
-	}
 	if err := g.Flush(nil); err == nil {
 		t.Error("Flush didn't report the failure to hold output")
+	}
+	if got, want := tp.text(), "out:[x] one\nerr:[x] twoerr: more\nout:[x] three\n"; got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestGroupBrokenDestinationSparesTheOther(t *testing.T) {
+	var mu sync.Mutex
+	var errs strings.Builder
+	broken := writerFunc(func([]byte) (int, error) { return 0, io.ErrClosedPipe })
+	g := NewGroup(broken, &errs, "[x] ", &mu)
+	g.Stdout().Write([]byte("progress\n"))
+	g.Stderr().Write([]byte("failure 1\n"))
+	g.Stdout().Write([]byte("more\n"))
+	g.Stderr().Write([]byte("failure 2\n"))
+	if err := g.Flush(nil); err != nil {
+		t.Errorf("a destination failing is not a failure to hold: %v", err)
+	}
+	if got := errs.String(); got != "[x] failure 1\n[x] failure 2\n" {
+		t.Fatalf("stderr got %q", got)
+	}
+}
+
+func TestGroupSplitsHugeWritesIntoFrames(t *testing.T) {
+	defer func(n int) { maxFrame = n }(maxFrame)
+	maxFrame = 4
+	var tp tape
+	var mu sync.Mutex
+	g := NewGroup(tapeStream{&tp, "out"}, tapeStream{&tp, "err"}, "[h] ", &mu)
+	// One write longer than a frame is held as several, and replays whole.
+	g.Stdout().Write([]byte("0123456789\nab\n"))
+	if want := int64(6*frameHeader + len("[h] 0123456789\n[h] ab\n")); g.size != want {
+		t.Errorf("held %d bytes, want %d (six frames)", g.size, want)
+	}
+	g.Flush(nil)
+	if got, want := tp.text(), "out:[h] 0123456789\n[h] ab\n"; got != want {
+		t.Fatalf("got %q want %q", got, want)
 	}
 }
 
@@ -137,29 +173,33 @@ func TestGroupConcurrentParts(t *testing.T) {
 	groupMemCap = 256 // some parts spill, some don't
 	var mu sync.Mutex
 	var out strings.Builder
-	w := writerFunc(func(b []byte) (int, error) { return out.Write(b) })
+	w := writerFunc(func(b []byte) (int, error) { return out.Write(b) }) // under mu
 	var wg sync.WaitGroup
 	for p := range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			g := NewGroup(w, w, fmt.Sprintf("[%d] ", p), &mu)
+			// Alternating streams: a block is many destination writes.
 			for i := range 20 * (p + 1) {
-				fmt.Fprintf(g.Stdout(), "%d\n", i)
+				if i%2 == 0 {
+					fmt.Fprintf(g.Stdout(), "%d\n", i)
+				} else {
+					fmt.Fprintf(g.Stderr(), "%d\n", i)
+				}
 			}
 			g.Flush(nil)
 		}()
 	}
 	wg.Wait()
-	// Each part's lines are one contiguous run, in order.
+	// Each part's lines are one contiguous, complete run, in order.
 	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	for i := 0; i < len(lines); {
 		part, _, _ := strings.Cut(lines[i], " ")
-		if seen[part] {
+		if _, ok := seen[part]; ok {
 			t.Fatalf("part %s printed in two blocks", part)
 		}
-		seen[part] = true
 		n := 0
 		for ; i < len(lines) && strings.HasPrefix(lines[i], part+" "); i++ {
 			if want := fmt.Sprintf("%s %d", part, n); lines[i] != want {
@@ -167,9 +207,12 @@ func TestGroupConcurrentParts(t *testing.T) {
 			}
 			n++
 		}
+		seen[part] = n
 	}
-	if len(seen) != 8 {
-		t.Fatalf("got %d blocks", len(seen))
+	for p := range 8 {
+		if n := seen[fmt.Sprintf("[%d]", p)]; n != 20*(p+1) {
+			t.Errorf("part %d printed %d lines, want %d", p, n, 20*(p+1))
+		}
 	}
 }
 

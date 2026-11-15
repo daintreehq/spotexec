@@ -384,12 +384,12 @@ func TestInterruptedTaskSummary(t *testing.T) {
 }
 
 func TestGroupedTaskPrintsEachPartAsOneBlock(t *testing.T) {
-	// Each part writes to stderr (which runMain captures) with pauses, so
-	// live output would interleave.
+	// Each part writes to stderr (which runMain captures), taking turns
+	// through marker files, so live output interleaves a1, b1, a2.
 	dir := project(t, `[tasks.a]
-run = "for i in 1 2 3; do echo a$i >&2; sleep 0.2; done"
+run = "echo a1 >&2; sleep 0.1; touch a.mark; for i in $(seq 100); do [ -e b.mark ] && break; sleep 0.05; done; echo a2 >&2; echo a3 >&2"
 [tasks.b]
-run = "sleep 0.1; for i in 1 2 3; do echo b$i >&2; sleep 0.2; done; exit 4"
+run = "for i in $(seq 100); do [ -e a.mark ] && break; sleep 0.05; done; echo b1 >&2; sleep 0.1; touch b.mark; echo b2 >&2; echo b3 >&2; exit 4"
 [tasks.v]
 parallel = ["a", "b"]
 group = true
@@ -411,8 +411,10 @@ group = true
 		}
 	}
 	// --group=false beats the task's setting: live, interleaved lines.
+	os.Remove(filepath.Join(dir, "a.mark"))
+	os.Remove(filepath.Join(dir, "b.mark"))
 	_, stderr = runMain(t, "sx", "-C", dir, "--group=false", "--fallback-local", "--queue-timeout", "5s", "v")
-	if strings.Contains(stderr, "[a] a1\n[a] a2\n") || !strings.Contains(stderr, "[a] a1\n") {
+	if !strings.Contains(stderr, "[a] a1\n[b] b1\n") {
 		t.Errorf("--group=false still grouped: %q", stderr)
 	}
 }
