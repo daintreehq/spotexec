@@ -15,6 +15,16 @@ sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
 
 Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)).
 
+## Checking for spotexec
+
+`spotexec supported` prints `true` and exits 0 when a run from the current directory would reach a runner: the project has a valid `.spotexec.toml` (here or above, up to the repository root), it isn't in a directory spotexec never syncs (your home directory, `/` or a credential directory), and a runner is configured for it. Otherwise it prints `false` and exits 1, so an agent or script can choose between `sx` and running locally:
+
+```sh
+if spotexec supported >/dev/null; then sx pnpm test; else pnpm test; fi
+```
+
+`-C DIR` checks another directory. To find out why it says `false`, run `spotexec doctor` from that directory.
+
 ## Same machine, next command
 
 Each `sx` may land on a different VM. When an agent needs the machine it just used (it installed a package there), it adds `-s` (`--same-slot`): `sx -s pnpm test`. To look at files a failed run left in the slot without syncing (a synced run removes files that weren't written back), use `sx -s --sync none 'cat out.log'` or `spotexec exec`. See [coming back to the same machine](running.md#coming-back-to-the-same-machine). The `AGENTS.md` snippet from `hook install --codex` tells agents this.

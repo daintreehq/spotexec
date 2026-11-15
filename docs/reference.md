@@ -28,6 +28,7 @@ spotexec prices [runner] [--refresh] [--json] current Spot prices of the runner'
 spotexec setup [host...] [--all] [--bake]    set up this machine (config, AWS user and key, hooks), then others over SSH; offer a bake
 spotexec setup --list | --revoke HOST        every machine's IAM user and VMs; revoke one
 spotexec teardown [--dry-run] [--region R]   remove everything spotexec created in the AWS account (admin)
+spotexec supported [-C DIR]                  print true (exit 0) if sx can run from here, else false (exit 1)
 spotexec doctor [runner...]                  verify config, SSH, helper, credentials, network, quota
 spotexec unlock [runner[/id]] (--slot N | --all)
 spotexec prune [runner[/id]...] [--older-than 7d] [--dry-run]
