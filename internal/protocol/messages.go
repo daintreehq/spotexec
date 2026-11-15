@@ -198,6 +198,9 @@ type ContainerRun struct {
 	// Network is "private" for a network namespace of the run's own
 	// (Docker's default bridge); anything else is the runner's (host).
 	Network string `json:"network,omitempty"`
+	// Docker gives the command a Docker socket (scoped to the run) so it
+	// can start containers of its own.
+	Docker bool `json:"docker,omitempty"`
 }
 
 // RegistryAuth is a short-lived login for the image registry (ECR).
