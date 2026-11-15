@@ -1107,6 +1107,7 @@ func TestGlobalLaunchRegions(t *testing.T) {
 		"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.09"}},
 		"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.01"}},
 		"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.06"}, {"r-three-1b", "c7a.2xlarge", "0.03"}},
+		"r-off-1":   {{"r-off-1a", "c7a.2xlarge", "0.001"}}, // cheapest, but not enabled
 	}}
 	g := newGlobalEnv(t, f, config.AllRegions)
 	g.r.LaunchOrder = config.LaunchCheapest
@@ -1143,5 +1144,44 @@ func TestLaunchRegionsWithEnvOnly(t *testing.T) {
 		MaxLifetime: config.Duration{Duration: time.Hour}, BootTimeout: config.Duration{Duration: time.Minute}, IdleTimeout: config.Duration{Duration: time.Minute}}
 	if _, err := LaunchRegionsWith(context.Background(), r, "", true); !errors.Is(err, errNoPassedSession) {
 		t.Fatalf("err %v", err)
+	}
+}
+
+// firstRegions keeps the first three distinct regions in launch order (not
+// price order).
+func TestFirstRegions(t *testing.T) {
+	k := Ranking{Prices: []SpotPrice{
+		{Region: "r-b", Price: "0.09"}, {Region: "r-a", Price: "0.01"}, {Region: "r-b", Price: "0.02"},
+		{Region: "r-d", Price: "0.05"}, {Region: "r-c", Price: "0.03"},
+	}}
+	if got := strings.Join(firstRegions(k), ","); got != "r-b,r-a,r-d" {
+		t.Fatalf("first regions %s", got)
+	}
+	if got := firstRegions(Ranking{}); len(got) != 0 {
+		t.Fatalf("first regions %v", got)
+	}
+}
+
+// Setup ranks with the admin session as the runner would launch: its own
+// profile's warm regions count, and nothing the other session reads is
+// cached in the runner's placement state.
+func TestLaunchRegionsAsKeepsRunnerState(t *testing.T) {
+	g, f := twoRegionEnv(t, "0.100", "0.096", func(r *config.Runner) { r.Profile = "spotexec" })
+	warmUp(t, g, f, "r-one-1")
+	path := filepath.Join(g.dir, "placement.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKADMIN", SecretAccessKey: "secret"}}
+	got, err := g.launchRegionsAs(context.Background(), admin)
+	if err != nil || strings.Join(got, ",") != "r-one-1,r-two-1" {
+		t.Fatalf("launch regions %v, %v (want the warm r-one-1 first)", got, err)
+	}
+	if after, _ := os.ReadFile(path); string(after) != string(before) {
+		t.Fatal("ranking with the admin session changed the runner's placement state")
+	}
+	if g.r.Profile != "spotexec" {
+		t.Fatalf("profile %q", g.r.Profile)
 	}
 }

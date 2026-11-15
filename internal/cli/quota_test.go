@@ -228,6 +228,20 @@ func TestQuotaFitsMultiRegion(t *testing.T) {
 			t.Fatalf("fits %+v, want %+v", fits, want)
 		}
 	}
+	// A runner the map leaves out is fitted in its own region; a listed
+	// runner only where its launches go (an enabled listed region).
+	single := &config.Runner{Name: "one", Type: config.TypeAWSSpot, Region: "us-east-1", MaxInstances: 2, InstanceTypes: []string{"c7a.xlarge"}}
+	fits = quotaFits([]*config.Runner{rs[1], single}, map[string][]string{"two": {"us-west-2"}}, map[string]float64{"us-east-1": 640, "us-west-2": 64, "eu-west-1": 32})
+	if len(fits) != 2 || fits[0] != (provider.QuotaFit{Region: "us-west-2", Quota: 64, OneVM: 4, Fleet: 4}) ||
+		fits[1] != (provider.QuotaFit{Region: "us-east-1", Quota: 640, OneVM: 4, Fleet: 8}) {
+		t.Fatalf("fits %+v", fits)
+	}
+	// Other instance families count where the runner launches, not at home.
+	gpu := &config.Runner{Name: "gpu", Type: config.TypeAWSSpot, Region: "us-east-1", Regions: []string{config.AllRegions}, MaxInstances: 1, InstanceTypes: []string{"c7a.xlarge", "g5.xlarge"}}
+	fits = quotaFits([]*config.Runner{gpu}, map[string][]string{"gpu": {"eu-west-1"}}, map[string]float64{"eu-west-1": 32})
+	if len(fits) != 1 || fits[0].Region != "eu-west-1" || !fits[0].Others {
+		t.Fatalf("fits %+v", fits)
+	}
 	// An any-region runner whose launch regions couldn't be ranked is
 	// checked nowhere, not in its home region.
 	if fits := quotaFits(rs[:1], map[string][]string{"all": nil}, map[string]float64{"us-east-1": 640}); len(fits) != 0 {

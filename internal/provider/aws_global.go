@@ -1775,17 +1775,34 @@ func (g *AWSGlobal) LaunchRegions(ctx context.Context) ([]string, error) {
 // ("" is the default chain), or with envOnly only the AWS_* variables
 // passed from the machine running setup.
 func LaunchRegionsWith(ctx context.Context, r *config.Runner, profile string, envOnly bool) ([]string, error) {
-	c := *r
-	c.Profile = profile
-	p, err := NewAWSGlobal(&c)
+	p, err := NewAWSGlobal(r)
 	if err != nil {
 		return nil, err
 	}
-	g := p.(*AWSGlobal)
-	g.creds = &awsCredResolver{profile: profile, envOnly: envOnly}
-	return g.LaunchRegions(ctx)
+	return p.(*AWSGlobal).launchRegionsAs(ctx, &awsCredResolver{profile: profile, envOnly: envOnly})
 }
 
+// launchRegionsAs ranks g's regions with other credentials. It ranks as
+// the runner would (its own profile names its warm regions), but against a
+// copy of its placement state: what another session reads (its account's
+// enabled regions, its prices) must never be cached as the runner's.
+func (g *AWSGlobal) launchRegionsAs(ctx context.Context, creds *awsCredResolver) ([]string, error) {
+	tmp, err := os.MkdirTemp("", "spotexec-rank-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmp)
+	switch b, err := os.ReadFile(filepath.Join(g.dir, "placement.json")); {
+	case err == nil:
+		if err := os.WriteFile(filepath.Join(tmp, "placement.json"), b, 0o600); err != nil {
+			return nil, err
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return nil, err
+	}
+	c := &AWSGlobal{r: g.r, creds: creds, dir: tmp, regional: map[string]*AWSSpot{}, legacy: g.legacy, single: g.single, endpoints: g.endpoints, now: g.now}
+	return c.LaunchRegions(ctx)
+}
 // priceCheck is doctor's finding on where a single-region runner's next
 // VM would go.
 func (a *AWSSpot) priceCheck(ctx context.Context) Check {
