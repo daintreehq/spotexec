@@ -571,12 +571,31 @@ func (m *member) provision(ctx context.Context, id string, rep ui.Reporter) {
 	}
 	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.r.BootTimeout.Duration+time.Minute)
 	defer cancel()
-	in, err := m.pool.ProvisionHeld(pctx, id, logf)
+	launched := func(in provider.Instance) {
+		// Where the launch went and why that option won, as soon as it's
+		// known (the scale_out event comes before the choice).
+		rep.Event("instance_launched", placed(map[string]any{"runner": m.r.Name, "launch_id": id, "instance_id": in.ID}, in))
+	}
+	in, err := m.pool.ProvisionHeldThen(pctx, id, logf, launched)
 	if err != nil {
 		rep.Warn("LAUNCH_FAILED", "%s: %v", m.r.Name, firstLine(err.Error()))
 		return
 	}
-	rep.Event("instance_running", map[string]any{"runner": m.r.Name, "instance_id": in.ID, "host": in.Target.String()})
+	rep.Event("instance_running", placed(map[string]any{"runner": m.r.Name, "launch_id": id, "instance_id": in.ID, "host": in.Target.String()}, in))
+}
+
+// placed adds where an instance is, and why it launched there, to an
+// event's fields.
+func placed(ev map[string]any, in provider.Instance) map[string]any {
+	for k, v := range map[string]string{"region": in.Region, "zone": in.Zone, "type": in.Type} {
+		if v != "" {
+			ev[k] = v
+		}
+	}
+	if in.Placement != nil {
+		ev["placement"] = in.Placement
+	}
+	return ev
 }
 
 func isCode(err error, code string) bool {

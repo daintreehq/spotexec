@@ -413,7 +413,7 @@ func TestInstanceRequirements(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := g.Runners["aws"]
-	if !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.Arch != "amd64" || r.MinGeneration != DefaultMinGeneration || r.LaunchOrder != LaunchCheapest {
+	if !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.Arch != "amd64" || r.MinGeneration != DefaultMinGeneration || r.LaunchOrder != LaunchRunCost || r.WaitCostPerHour() != DefaultWaitCost {
 		t.Fatalf("vcpus runner: %+v", r)
 	}
 	g, err = loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nvcpus = 8\narch = \"arm64\"\ninstance_types = [\"m*g*\", \"c7g.2xlarge\"]\nexclude_instance_types = [\"*d.*\"]\nmin_generation = 7\n")
@@ -445,6 +445,13 @@ func TestInstanceRequirements(t *testing.T) {
 		"bad launch order":          "launch_order = \"random\"\n",
 		"listed without types":      "vcpus = 8\nlaunch_order = \"listed\"\n",
 		"listed list with no types": "instance_types = []\nvcpus = 4\nlaunch_order = \"listed\"\n",
+		"negative wait_cost":        "wait_cost = -1\n",
+		"nan wait_cost":             "wait_cost = nan\n",
+		"infinite wait_cost":        "wait_cost = inf\n",
+		"-infinite wait_cost":       "wait_cost = -inf\n",
+		"huge wait_cost":            "wait_cost = 10001\n",
+		"wordy wait_cost":           "wait_cost = \"a lot\"\n",
+		"boolean wait_cost":         "wait_cost = true\n",
 	} {
 		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\n"+body); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -466,6 +473,73 @@ func TestMatchType(t *testing.T) {
 		if got := MatchType(c.p, c.t); got != c.ok {
 			t.Errorf("MatchType(%q, %q) = %v", c.p, c.t, got)
 		}
+	}
+}
+
+// wait_cost takes a number or a dollar string, and an explicit 0 is kept
+// (launch costs then count only the Spot bill).
+func TestWaitCost(t *testing.T) {
+	if DefaultWaitCost != 1 {
+		t.Fatalf("documented default is $1/h, not %g", DefaultWaitCost)
+	}
+	for body, want := range map[string]float64{
+		"":                        1,
+		"wait_cost = 10000\n":     10000,
+		"wait_cost = 0\n":         0,
+		"wait_cost = 3\n":         3,
+		"wait_cost = 0.25\n":      0.25,
+		"wait_cost = \"$12.5\"\n": 12.5,
+		"wait_cost = \"2\"\n":     2,
+	} {
+		g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n"+body)
+		if err != nil {
+			t.Fatalf("%q: %v", body, err)
+		}
+		r := g.Runners["aws"]
+		if got := r.WaitCostPerHour(); got != want {
+			t.Errorf("%q: wait cost %g, want %g", body, got, want)
+		}
+		// A fixed list defaults to run_cost too (it ranks by price in one
+		// region anyway).
+		if r.LaunchOrder != LaunchRunCost {
+			t.Errorf("%q: launch order %q", body, r.LaunchOrder)
+		}
+		// It encodes back to what was set ("" when unset).
+		b, _ := r.WaitCost.MarshalText()
+		var back Dollars
+		if r.WaitCost.Set {
+			if err := back.UnmarshalText(b); err != nil || back != r.WaitCost {
+				t.Errorf("%q: round trip %q -> %+v (%v)", body, b, back, err)
+			}
+		} else if len(b) != 0 {
+			t.Errorf("unset encodes as %q", b)
+		}
+	}
+	// A project runner inherits it, and may override it.
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwait_cost = 5\nlaunch_order = \"cheapest\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte("version = 1\n[runners.same]\nextends = \"aws\"\nvcpus = 8\n[runners.batch]\nextends = \"aws\"\nwait_cost = 0\n"), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Global: g, Project: p}
+	if err := c.MergeProjectRunners(); err != nil {
+		t.Fatal(err)
+	}
+	// Switching to vcpus keeps an inherited cheapest (only "listed" needs the
+	// list it drops).
+	if r := c.Global.Runners["same"]; r.WaitCostPerHour() != 5 || r.LaunchOrder != LaunchCheapest {
+		t.Fatalf("same: %+v", r)
+	}
+	if r := c.Global.Runners["batch"]; r.WaitCostPerHour() != 0 || !r.WaitCost.Set {
+		t.Fatalf("batch: %+v", r)
+	}
+	if g.Runners["aws"].WaitCostPerHour() != 5 {
+		t.Fatal("base runner must not be modified")
 	}
 }
 
@@ -497,7 +571,7 @@ min_memory_gib = 32
 	if err := c.MergeProjectRunners(); err != nil {
 		t.Fatal(err)
 	}
-	if r := c.Global.Runners["big"]; !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.MinMemoryGiB != 32 || r.LaunchOrder != LaunchCheapest {
+	if r := c.Global.Runners["big"]; !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.MinMemoryGiB != 32 || r.LaunchOrder != LaunchRunCost {
 		t.Fatalf("big: %+v", r)
 	}
 	if r := c.Global.Runners["listed"]; r.ByRequirements() || r.MinGeneration != 0 || len(r.ExcludeInstanceTypes) != 0 || r.InstanceTypes[0] != "c7a.2xlarge" {

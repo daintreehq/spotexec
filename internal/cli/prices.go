@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -18,13 +19,14 @@ import (
 )
 
 // cmdPrices shows where an aws-spot runner's next instance would launch:
-// the current Spot price of each instance type in each zone of its regions.
+// the current Spot price of each instance type in each zone of its regions,
+// in launch order.
 func cmdPrices() *cobra.Command {
 	var asJSON, refresh bool
 	var limit int
 	c := &cobra.Command{
 		Use:   "prices [runner]",
-		Short: "Show current Spot prices across an AWS runner's regions, cheapest (where the next VM launches) first",
+		Short: "Show current Spot prices across an AWS runner's regions, in launch order (where the next VM launches first), with what the ranking added",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadGlobal()
@@ -51,94 +53,13 @@ func cmdPrices() *cobra.Command {
 			if err != nil && len(t.Prices) == 0 {
 				return err
 			}
-			cool := g.Cooldowns(t.Prices)
-			held := g.HeldBack(t.Prices) // a VM there was recently reclaimed
-			maxPrice, _ := strconv.ParseFloat(r.MaxPrice, 64)
-			next, hasNext := g.NextLaunch(t)
+			k := g.Rank(t)
+			v := pricesView{r: r, t: t, k: k, cool: g.Cooldowns(t.Prices), held: g.HeldBack(t.Prices)}
+			v.next, v.hasNext = g.NextLaunch(t)
 			if asJSON {
-				type row struct {
-					provider.SpotPrice
-					MemoryMiB int    `json:"memory_mib,omitempty"`
-					Next      bool   `json:"next,omitempty"`
-					Skipped   string `json:"skipped,omitempty"`
-					HeldBack  string `json:"held_back,omitempty"`
-				}
-				rows := make([]row, 0, len(t.Prices))
-				for _, sp := range t.Prices {
-					why := cool[sp.Region+"/"+sp.Zone+"/"+sp.Type]
-					if why == "" && maxPrice > 0 && sp.USD() > maxPrice {
-						why = "above max_price"
-					}
-					rows = append(rows, row{sp, t.MemoryMiB[sp.Type], hasNext && sp == next, why, held[sp.Region+"/"+sp.Zone+"/"+sp.Type]})
-				}
-				enc := json.NewEncoder(os.Stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(map[string]any{"runner": r.Name, "fetched_at": t.At, "regions": t.Regions, "unpriced": t.Unpriced, "prices": rows})
+				return v.writeJSON(os.Stdout)
 			}
-			age := "just now"
-			if t.Cached {
-				age = ui.Dur(time.Since(t.At).Round(time.Second)) + " ago; --refresh to update"
-			}
-			what := strings.Join(r.InstanceTypes, ", ")
-			if r.ByRequirements() {
-				what = fmt.Sprintf("the %d instance type(s) with %s", len(t.MemoryMiB), provider.DescribeRequirements(r))
-				if len(r.InstanceTypes) > 0 {
-					what += " among " + strings.Join(r.InstanceTypes, ", ")
-				}
-			}
-			fmt.Printf("%s: Linux Spot prices for %s in %d region(s) (fetched %s)\n", r.Name, what, len(t.Regions), age)
-			if r.SubnetID != "" && len(t.Prices) > 0 {
-				fmt.Printf("subnet_id %s is in %s, so only that zone is used.\n", r.SubnetID, t.Prices[0].Zone)
-			}
-			tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			if r.ByRequirements() {
-				fmt.Fprintln(tw, "\tREGION\tZONE\tTYPE\tMEMORY\tUSD/HOUR\t")
-			} else {
-				fmt.Fprintln(tw, "\tREGION\tZONE\tTYPE\tUSD/HOUR\t")
-			}
-			for i, sp := range t.Prices {
-				if limit > 0 && i == limit {
-					fmt.Fprintf(tw, "\t… %d more (--limit 0 for all)\t\t\t\t\n", len(t.Prices)-limit)
-					break
-				}
-				mark, note := " ", ""
-				if why := cool[sp.Region+"/"+sp.Zone+"/"+sp.Type]; why != "" {
-					note = "skipped for now: " + why
-				} else if maxPrice > 0 && sp.USD() > maxPrice {
-					note = "above max_price " + r.MaxPrice
-				} else if hasNext && sp == next {
-					mark, note = "→", "next launch"
-					if why := held[sp.Region+"/"+sp.Zone+"/"+sp.Type]; why != "" {
-						note += " (every other option is skipped; " + why + ")"
-					}
-				} else if why := held[sp.Region+"/"+sp.Zone+"/"+sp.Type]; why != "" {
-					note = "held back: " + why
-				}
-				typ := sp.Type
-				if r.ByRequirements() {
-					typ += fmt.Sprintf("\t%g GiB", float64(t.MemoryMiB[sp.Type])/1024)
-				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", mark, sp.Region, sp.Zone, typ, sp.Price, note)
-			}
-			tw.Flush()
-			if len(t.Unpriced) > 0 {
-				var keys []string
-				for k := range t.Unpriced {
-					keys = append(keys, k)
-				}
-				sort.Strings(keys)
-				fmt.Printf("\nNot used:\n")
-				for _, k := range keys {
-					fmt.Printf("  %s: %s\n", k, t.Unpriced[k])
-				}
-			}
-			if r.LaunchOrder == config.LaunchListed {
-				fmt.Printf("\nlaunch_order = \"listed\": instance_types are tried in the listed order, each in its cheapest zone first.\n")
-			}
-			if !r.MultiRegion() {
-				fmt.Printf("\n%s uses only %s. To launch wherever Spot is cheapest, set regions = [\"all\"] (or a list) instead of region.\n", r.Name, r.Region)
-			}
-			fmt.Println("\nPrices are Spot compute only; the disk and public IPv4 address add a little per hour, about the same everywhere.")
+			v.writeText(os.Stdout, limit)
 			return nil
 		},
 	}
@@ -146,4 +67,161 @@ func cmdPrices() *cobra.Command {
 	c.Flags().BoolVar(&refresh, "refresh", false, "fetch fresh prices instead of using the 15-minute cache")
 	c.Flags().IntVar(&limit, "limit", 20, "rows to show (0: all)")
 	return c
+}
+
+// pricesView is what `spotexec prices` shows.
+type pricesView struct {
+	r       *config.Runner
+	t       provider.PriceTable
+	k       provider.Ranking // the options in launch order
+	cool    map[string]string
+	held    map[string]string // held back after a Spot interruption
+	next    provider.SpotPrice
+	hasNext bool
+}
+
+func optionKey(sp provider.SpotPrice) string { return sp.Region + "/" + sp.Zone + "/" + sp.Type }
+
+func (v pricesView) writeJSON(w io.Writer) error {
+	type row struct {
+		provider.SpotPrice
+		MemoryMiB int    `json:"memory_mib,omitempty"`
+		Next      bool   `json:"next,omitempty"`
+		Skipped   string `json:"skipped,omitempty"`
+		HeldBack  string `json:"held_back,omitempty"`
+		// RunCost: the option's score and what each factor added (USD for
+		// an hour of work; launch_order = "run_cost").
+		RunCost *provider.RunCost `json:"run_cost,omitempty"`
+	}
+	maxPrice, _ := strconv.ParseFloat(v.r.MaxPrice, 64)
+	rows := make([]row, 0, len(v.k.Prices))
+	for _, sp := range v.k.Prices {
+		why := v.cool[optionKey(sp)]
+		if why == "" && maxPrice > 0 && sp.USD() > maxPrice {
+			why = "above max_price"
+		}
+		rw := row{SpotPrice: sp, MemoryMiB: v.t.MemoryMiB[sp.Type], Next: v.hasNext && sp == v.next, Skipped: why, HeldBack: v.held[optionKey(sp)]}
+		if c, ok := v.k.CostOf(sp); ok {
+			rw.RunCost = &c
+		}
+		rows = append(rows, rw)
+	}
+	out := map[string]any{"runner": v.r.Name, "fetched_at": v.t.At, "regions": v.t.Regions, "unpriced": v.t.Unpriced,
+		"launch_order": v.k.Order, "prices": rows}
+	if v.k.Model != nil {
+		out["run_cost_model"] = v.k.Model
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+// added formats what a factor added to an option's score ("-": nothing).
+func added(usd float64) string {
+	if usd < 0.0005 {
+		return "-"
+	}
+	return fmt.Sprintf("+%.3f", usd)
+}
+
+func (v pricesView) writeText(w io.Writer, limit int) {
+	r, t, k := v.r, v.t, v.k
+	age := "just now"
+	if t.Cached {
+		age = ui.Dur(time.Since(t.At).Round(time.Second)) + " ago; --refresh to update"
+	}
+	what := strings.Join(r.InstanceTypes, ", ")
+	if r.ByRequirements() {
+		what = fmt.Sprintf("the %d instance type(s) with %s", len(t.MemoryMiB), provider.DescribeRequirements(r))
+		if len(r.InstanceTypes) > 0 {
+			what += " among " + strings.Join(r.InstanceTypes, ", ")
+		}
+	}
+	fmt.Fprintf(w, "%s: Linux Spot prices for %s in %d region(s) (fetched %s)\n", r.Name, what, len(t.Regions), age)
+	if r.SubnetID != "" && len(t.Prices) > 0 {
+		fmt.Fprintf(w, "subnet_id %s is in %s, so only that zone is used.\n", r.SubnetID, t.Prices[0].Zone)
+	}
+	maxPrice, _ := strconv.ParseFloat(r.MaxPrice, 64)
+	runCost := k.Order == config.LaunchRunCost
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	head := "\tREGION\tZONE\tTYPE\t"
+	if r.ByRequirements() {
+		head += "MEMORY\t"
+	}
+	head += "USD/HOUR\t"
+	if runCost {
+		head += "RUN COST\tSPEED\tCOLD\tDISTANCE\t"
+	}
+	fmt.Fprintln(tw, head)
+	for i, sp := range k.Prices {
+		if limit > 0 && i == limit {
+			fmt.Fprintf(tw, "\t… %d more (--limit 0 for all)\n", len(k.Prices)-limit)
+			break
+		}
+		mark, note := " ", ""
+		if why := v.cool[optionKey(sp)]; why != "" {
+			note = "skipped for now: " + why
+		} else if maxPrice > 0 && sp.USD() > maxPrice {
+			note = "above max_price " + r.MaxPrice
+		} else if v.hasNext && sp == v.next {
+			mark, note = "→", "next launch"
+			if why := v.held[optionKey(sp)]; why != "" {
+				note += " (every other option is skipped; " + why + ")"
+			}
+		} else if why := v.held[optionKey(sp)]; why != "" {
+			note = "held back: " + why
+		}
+		row := fmt.Sprintf("%s\t%s\t%s\t%s\t", mark, sp.Region, sp.Zone, sp.Type)
+		if r.ByRequirements() {
+			row += fmt.Sprintf("%g GiB\t", float64(t.MemoryMiB[sp.Type])/1024)
+		}
+		row += sp.Price + "\t"
+		if c, ok := k.CostOf(sp); runCost && ok {
+			cold := added(c.Cold)
+			if c.Warm {
+				cold = "warm"
+			}
+			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t", c.Score, added(c.Speed), cold, added(c.Distance))
+		}
+		fmt.Fprintln(tw, row+note)
+	}
+	tw.Flush()
+	if len(t.Unpriced) > 0 {
+		var keys []string
+		for rg := range t.Unpriced {
+			keys = append(keys, rg)
+		}
+		sort.Strings(keys)
+		fmt.Fprintf(w, "\nNot used:\n")
+		for _, rg := range keys {
+			fmt.Fprintf(w, "  %s: %s\n", rg, t.Unpriced[rg])
+		}
+	}
+	switch {
+	case runCost:
+		m := k.Model
+		var factors []string
+		if m.SpeedByGen {
+			factors = append(factors, fmt.Sprintf("a slower type (each instance generation counts as %.0f%% faster per vCPU)", (m.GenSpeedup-1)*100))
+		}
+		if m.Regions {
+			factors = append(factors, fmt.Sprintf("a cold region (%g minutes; warm: a VM of %s was up %g minutes or more there in the last %g days)", m.ColdMinutes, r.Name, m.WarmAfterMin, m.WarmDays),
+				fmt.Sprintf("a farther region (%d round trips at the measured TCP connect time)", m.RoundTrips))
+		}
+		added := "nothing else differs between these options"
+		switch n := len(factors); {
+		case n == 1:
+			added = "the VM time and waiting that " + factors[0] + " adds"
+		case n > 1:
+			added = "the VM time and waiting that " + strings.Join(factors[:n-1], ", ") + " or " + factors[n-1] + " adds"
+		}
+		fmt.Fprintf(w, "\nlaunch_order = \"run_cost\": ranked by the expected cost of an hour of work (RUN COST, USD): its Spot bill, plus %s, with waiting valued at $%g/h (wait_cost). VMs reclaimed in a zone rank last for a while. launch_order = \"cheapest\" ranks by price alone.\n",
+			added, m.WaitCost)
+	case r.LaunchOrder == config.LaunchListed:
+		fmt.Fprintf(w, "\nlaunch_order = \"listed\": instance_types are tried in the listed order, each in its cheapest zone first.\n")
+	}
+	if !r.MultiRegion() {
+		fmt.Fprintf(w, "\n%s uses only %s. To launch in whichever region costs least, set regions = [\"all\"] (or a list) instead of region.\n", r.Name, r.Region)
+	}
+	fmt.Fprintln(w, "\nPrices are Spot compute only; the disk and public IPv4 address add a little per hour, about the same everywhere.")
 }

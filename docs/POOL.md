@@ -64,6 +64,10 @@ takes part in scheduling, and every VM shuts itself down.
    - Ledger entries record the launching PID, so a dead `sx` frees its
      reservation; an ambiguous launch (the request may have created an
      instance) keeps its reservation until listings can show it.
+   - Where an `aws-spot` launch goes (region, zone, type) is the provider's
+     ranking, by default the [expected cost of the run](aws.md#rank-by-the-cost-of-the-run);
+     the launch's reason is reported on the `instance_launched` and
+     `instance_running` events, with the `launch_id` of its `scale_out`.
    - A failed launch backs the fleet off for 20s.
    - A launch refused by the account's vCPU quota (not a capacity shortage)
      holds further launches until one of the fleet's VMs ends or five

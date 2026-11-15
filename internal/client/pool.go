@@ -755,6 +755,12 @@ func ReleaseLaunch() { launchesInFlight.Done() }
 
 // ProvisionHeld is Provision for a caller that already called HoldLaunch.
 func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger) (provider.Instance, error) {
+	return p.ProvisionHeldThen(ctx, id, log, nil)
+}
+
+// ProvisionHeldThen is ProvisionHeld, calling launched (if set) as soon as
+// the launch request succeeds, before waiting for the VM to run.
+func (p *Pool) ProvisionHeldThen(ctx context.Context, id string, log provider.Logger, launched func(provider.Instance)) (provider.Instance, error) {
 	recorded := false
 	defer func() {
 		if !recorded {
@@ -805,6 +811,9 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 		st.ListedAt = staleListing(st.ListedAt) // force the next caller to re-list
 		return nil
 	})
+	if launched != nil {
+		launched(in) // before the hold ends, so an exiting process still reports it
+	}
 	recorded = true
 	launchesInFlight.Done()
 	ran, err := p.Fleet.WaitRunning(ctx, in.ID, log)
@@ -835,6 +844,12 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 	if err != nil {
 		// The launched instance, so a caller can still find (or end) it.
 		return in, err
+	}
+	if ran.Placement == nil {
+		ran.Placement = in.Placement // why it launched there, for the instance_running event
+	}
+	if ran.Zone == "" {
+		ran.Zone = in.Zone
 	}
 	return ran, err
 }

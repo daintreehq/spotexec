@@ -35,6 +35,45 @@ func (d *Duration) UnmarshalText(b []byte) error {
 
 func (d Duration) MarshalText() ([]byte, error) { return []byte(d.String()), nil }
 
+// Dollars is an amount in US dollars, written as a number (1.5) or a
+// numeric string ("1.50", "$1.50"). Set tells an explicit 0 from unset.
+type Dollars struct {
+	V   float64
+	Set bool
+}
+
+func (d *Dollars) UnmarshalText(b []byte) error {
+	s := strings.TrimPrefix(strings.TrimSpace(string(b)), "$")
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return fmt.Errorf("invalid amount %q (want US dollars, such as 1.50)", string(b))
+	}
+	d.V, d.Set = v, true
+	return nil
+}
+
+// UnmarshalTOML takes unquoted numbers too.
+func (d *Dollars) UnmarshalTOML(v any) error {
+	switch v := v.(type) {
+	case string:
+		return d.UnmarshalText([]byte(v))
+	case int64:
+		d.V, d.Set = float64(v), true
+		return nil
+	case float64:
+		d.V, d.Set = v, true
+		return nil
+	}
+	return fmt.Errorf("invalid amount %v (want US dollars, such as 1.50)", v)
+}
+
+func (d Dollars) MarshalText() ([]byte, error) {
+	if !d.Set {
+		return nil, nil
+	}
+	return []byte(strconv.FormatFloat(d.V, 'f', -1, 64)), nil
+}
+
 // Bytes is a size in bytes, written as a plain integer or with a binary unit:
 // "512KB", "100MB", "1.5GB" (KiB, MiB and GiB spell the same).
 type Bytes int64
@@ -137,7 +176,7 @@ type Runner struct {
 
 	// aws-spot
 	Region  string   `toml:"region"`
-	Regions []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
+	Regions []string `toml:"regions"` // several regions, or ["all"]: launch where the run is expected to cost least
 	// ExcludeRegions: with regions = ["all"], enabled regions never to launch in.
 	ExcludeRegions []string `toml:"exclude_regions"`
 	Profile        string   `toml:"profile"`
@@ -149,7 +188,7 @@ type Runner struct {
 	MinMemoryGiB         float64  `toml:"min_memory_gib"`
 	MinGeneration        int      `toml:"min_generation"`
 	ExcludeInstanceTypes []string `toml:"exclude_instance_types"`
-	LaunchOrder          string   `toml:"launch_order"` // cheapest (default) | listed
+	LaunchOrder          string   `toml:"launch_order"` // run_cost (default) | cheapest | listed
 	MaxPrice             string   `toml:"max_price"`
 	AMI                  string   `toml:"ami"`
 	Arch                 string   `toml:"arch"` // amd64|arm64 (derived from instance types if empty)
@@ -160,6 +199,7 @@ type Runner struct {
 	User                 string   `toml:"user"`
 	OnDemandFallback     bool     `toml:"on_demand_fallback"`
 	CacheBucket          string   `toml:"cache_bucket"` // shared dependency cache: "auto" (default), a bucket name, or "off"
+	WaitCost             Dollars  `toml:"wait_cost"`    // USD an hour of waiting is worth against the Spot bill (run_cost); default DefaultWaitCost
 
 	// fleets (aws-spot, sim)
 	MaxInstances int `toml:"max_instances"`
@@ -184,9 +224,24 @@ func (r *Runner) AnyRegion() bool {
 
 // Launch orders.
 const (
-	LaunchCheapest = "cheapest"
+	// LaunchRunCost ranks by the expected cost of the work, counting the
+	// waiting a cold region, a slower type or a distant region adds.
+	LaunchRunCost  = "run_cost"
+	LaunchCheapest = "cheapest" // the Spot price alone
 	LaunchListed   = "listed"
 )
+
+// DefaultWaitCost is what an hour of waiting is worth, in USD, unless a
+// runner sets wait_cost: more than an 8-vCPU Spot VM costs for an hour.
+const DefaultWaitCost = 1.0
+
+// WaitCostPerHour is the runner's wait_cost, or DefaultWaitCost.
+func (r *Runner) WaitCostPerHour() float64 {
+	if r.WaitCost.Set {
+		return r.WaitCost.V
+	}
+	return DefaultWaitCost
+}
 
 // DefaultMinGeneration is the oldest instance generation a vcpus-based
 // runner considers: older ones are still "current" to AWS, but markedly
@@ -524,7 +579,7 @@ func (r *Runner) applyDefaults() error {
 			r.MinGeneration = DefaultMinGeneration
 		}
 		if r.LaunchOrder == "" {
-			r.LaunchOrder = LaunchCheapest
+			r.LaunchOrder = LaunchRunCost
 		}
 		if r.User == "" {
 			r.User = "ubuntu"
@@ -670,13 +725,16 @@ func (r *Runner) validateTypes() error {
 		return fmt.Errorf("min_generation must not be negative (got %d)", r.MinGeneration)
 	}
 	switch r.LaunchOrder {
-	case LaunchCheapest:
+	case LaunchRunCost, LaunchCheapest:
 	case LaunchListed:
 		if len(r.InstanceTypes) == 0 {
 			return errors.New(`launch_order = "listed" needs instance_types (the order to try)`)
 		}
 	default:
-		return fmt.Errorf("launch_order must be %q or %q (got %q)", LaunchCheapest, LaunchListed, r.LaunchOrder)
+		return fmt.Errorf("launch_order must be %q, %q or %q (got %q)", LaunchRunCost, LaunchCheapest, LaunchListed, r.LaunchOrder)
+	}
+	if w := r.WaitCost.V; r.WaitCost.Set && (w < 0 || w > 1e4 || math.IsNaN(w) || math.IsInf(w, 0)) {
+		return fmt.Errorf("wait_cost must be between 0 and 10000 US dollars per hour of waiting (got %g)", w)
 	}
 	return nil
 }
@@ -1094,7 +1152,9 @@ func (c *Config) MergeProjectRunners() error {
 		}
 		if setsReqs && !setsTypes {
 			base.InstanceTypes = nil
-			if !p.md.IsDefined("runners", name, "launch_order") {
+			// "listed" needs the list just dropped; run_cost and cheapest
+			// carry over.
+			if !p.md.IsDefined("runners", name, "launch_order") && base.LaunchOrder == LaunchListed {
 				base.LaunchOrder = ""
 			}
 		}

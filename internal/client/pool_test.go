@@ -25,6 +25,9 @@ type fakeFleet struct {
 	slowRunning bool
 	// goneOnWait: WaitRunning reports the instance gone (reclaimed).
 	goneOnWait bool
+	// placement: what Launch says about where it launched (WaitRunning,
+	// like a cloud listing, doesn't know).
+	placement *provider.Placement
 }
 
 func (f *fakeFleet) Runner() *config.Runner                        { return f.r }
@@ -51,6 +54,11 @@ func (f *fakeFleet) Launch(context.Context, provider.Logger) (provider.Instance,
 	f.n++
 	in := provider.Instance{ID: "i-" + string(rune('a'+f.n)), State: provider.StateRunning, LaunchedAt: time.Now(), Target: provider.Target{Host: "192.0.2.1"}}
 	f.insts = append(f.insts, in)
+	if f.placement != nil {
+		// As a cloud answers a launch: pending, no address yet, but where
+		// and why.
+		in.Placement, in.Zone, in.State, in.Target = f.placement, "zone-a", provider.StatePending, provider.Target{}
+	}
 	return in, nil
 }
 
@@ -463,5 +471,89 @@ func TestMismatchedInstancesAreReplacedForDemand(t *testing.T) {
 	}
 	if d := planOnce(t, p2); d.Launch || d.Pending != 2 {
 		t.Fatalf("after the config matches again: %+v", d)
+	}
+}
+
+// Why a VM launched where it did survives the wait for it to run, so the
+// instance_running event can say so.
+func TestProvisionKeepsPlacement(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 2)
+	f.placement = &provider.Placement{Order: "run_cost", Rank: 1, Of: 3, Why: "lowest expected run cost"}
+	ids, _ := p.EnsureMin(ctx, 1)
+	in, err := p.Provision(ctx, ids[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Placement != f.placement || in.Zone != "zone-a" || in.Target.Host == "" || in.State != provider.StateRunning {
+		t.Fatalf("provisioned %+v", in)
+	}
+}
+
+type namedEvents struct {
+	nopRep
+	mu     sync.Mutex
+	fields map[string]map[string]any
+}
+
+func (e *namedEvents) Event(name string, f map[string]any) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.fields == nil {
+		e.fields = map[string]map[string]any{}
+	}
+	e.fields[name] = f
+}
+
+// A launch says where it went and why as soon as it's made, and again when
+// the VM runs, under the launch_id of its scale_out.
+func TestProvisionEventsSayWhereAndWhy(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 2)
+	f.placement = &provider.Placement{Order: "run_cost", Rank: 2, Of: 3, Why: "#2 by run cost; passed over: 1 above max_price"}
+	ids, _ := p.EnsureMin(ctx, 1)
+	m := &member{r: p.R, pool: p}
+	rep := &namedEvents{}
+	HoldLaunch()
+	m.provision(ctx, ids[0], rep)
+	for _, name := range []string{"instance_launched", "instance_running"} {
+		ev := rep.fields[name]
+		if ev == nil || ev["launch_id"] != ids[0] || ev["zone"] != "zone-a" || ev["placement"] != f.placement || ev["runner"] != "fake" {
+			t.Fatalf("%s: %v", name, ev)
+		}
+		if _, ok := ev["region"]; ok {
+			t.Fatalf("%s: empty region reported: %v", name, ev)
+		}
+	}
+	if rep.fields["instance_running"]["host"] != "192.0.2.1" {
+		t.Fatalf("instance_running: %v", rep.fields["instance_running"])
+	}
+}
+
+// A process exiting right after a launch (WaitLaunches) still reports it.
+func TestWaitLaunchesCoversLaunchedEvent(t *testing.T) {
+	ctx := context.Background()
+	p, _ := testPool(t, 2)
+	ids, _ := p.EnsureMin(ctx, 1)
+	release := make(chan struct{})
+	inCallback := make(chan struct{})
+	HoldLaunch()
+	go p.ProvisionHeldThen(ctx, ids[0], nil, func(provider.Instance) {
+		close(inCallback)
+		<-release
+	})
+	<-inCallback
+	waited := make(chan struct{})
+	go func() { WaitLaunches(time.Minute); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("WaitLaunches returned before the launch was reported")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("WaitLaunches never returned")
 	}
 }

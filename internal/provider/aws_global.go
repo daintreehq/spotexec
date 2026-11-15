@@ -30,9 +30,9 @@ const (
 
 // AWSGlobal is one logical aws-spot fleet spread over several regions
 // (regions = [...] or ["all"]). Each region is served by an ordinary
-// regional AWSSpot; AWSGlobal decides where new instances go (the cheapest
-// current Spot price among the runner's instance types, falling back down
-// the ranking on capacity or quota errors) and routes per-instance
+// regional AWSSpot; AWSGlobal decides where new instances go (by
+// launch_order: by default the lowest expected cost of the run, see Rank;
+// falling back down the ranking on capacity or quota errors) and routes per-instance
 // operations to the region that holds the instance. max_instances is
 // enforced by the client pool across all regions together.
 //
@@ -302,6 +302,12 @@ type placementState struct {
 	Where     map[string]placedAt  `json:"where,omitempty"`     // instance ID -> region (a routing cache)
 	Cooldown  map[string]cooldown  `json:"cooldown,omitempty"`  // "region", "zone:<zone>", "region/zone/type" or "reclaimed:region/zone/type"
 	Reclaimed map[string]time.Time `json:"reclaimed,omitempty"` // instance ID -> when its Spot interruption was recorded
+	// Warm: region -> when a VM of this runner was last seen there, running
+	// for warmAfter or more (under profile WarmProfile), so its caches are
+	// likely there too.
+	Warm        map[string]time.Time `json:"warm,omitempty"`
+	WarmProfile string               `json:"warm_profile,omitempty"`
+	RTT         map[string]rttSample `json:"rtt,omitempty"` // region -> measured round trip
 	// Discovered: every managed region has been listed once. Until then
 	// (first use, an upgrade from single-region, a lost state file) listings
 	// cover them all rather than trusting Active.
@@ -347,6 +353,7 @@ func (g *AWSGlobal) withState(fn func(st *placementState)) error {
 	}
 	fn(st)
 	now := g.clock()
+	forgetOld(st, now)
 	for k, v := range st.Where {
 		if now.After(v.Until) {
 			delete(st.Where, k)
@@ -386,6 +393,7 @@ func (g *AWSGlobal) remember(ins []Instance) error {
 		return nil
 	}
 	return g.withState(func(st *placementState) {
+		g.sawRunning(st, ins, g.clock())
 		for _, in := range ins {
 			launched := in.LaunchedAt
 			if launched.IsZero() {
@@ -828,6 +836,7 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 	}
 	_ = g.withState(func(st *placementState) {
 		st.Prices, st.PricedAt, st.PricedFor, st.Unpriced, st.PricedMem = all, now, key, t.Unpriced, mem
+		saveRTTs(st, regions)
 	})
 	return t, nil
 }
@@ -1084,7 +1093,8 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 	return out, nil
 }
 
-// Launch starts one instance at the cheapest Spot price it can get.
+// Launch starts one instance at the first option in launch order (see Rank)
+// that it can get.
 func (g *AWSGlobal) Launch(ctx context.Context, log Logger) (Instance, error) {
 	if log == nil {
 		log = func(string, ...any) {}
@@ -1146,7 +1156,8 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		// In one region with a fixed list, prices only order the attempts
 		// (and an older IAM policy may not allow reading them): try the
 		// types in the listed order instead.
-		log("can't compare Spot prices (%s); trying instance_types in order", firstLineOfErr(err))
+		why := fmt.Sprintf("can't compare Spot prices (%s); trying instance_types in order", firstLineOfErr(err))
+		log("%s", why)
 		a := g.home()
 		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{beforeSend: g.mark(a.r.Region)})
 		if err != nil {
@@ -1154,6 +1165,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		}
 		in := a.instance(inst)
 		g.record(in)
+		in.Placement = &Placement{Order: config.LaunchListed, Why: why}
 		return in, nil
 	}
 	cool := g.cooldowns(t.Prices)
@@ -1185,13 +1197,27 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		return false
 	}
 	attempts := 0
-	// Options whose VMs were recently reclaimed go last.
-	for _, rank := range heldLast(t.Prices, g.heldBack(t.Prices)) {
-		c := t.Prices[rank]
-		if skipRegion[c.Region] != "" || skipZone[c.Zone] || quotaSkipped(c) || (maxPrice > 0 && c.USD() > maxPrice) {
+	var ahead passedOver // what happened to the options before the one launched
+	// In launch order (by run cost unless launch_order says otherwise),
+	// options whose VMs were recently reclaimed last.
+	k := g.Rank(t)
+	for rank, c := range k.Prices {
+		switch {
+		case skipRegion[c.Region] != "":
+			ahead.add("in a region skipped")
+			continue
+		case skipZone[c.Zone]:
+			ahead.add("in a zone skipped")
+			continue
+		case quotaSkipped(c):
+			ahead.add("over the region's quota")
+			continue
+		case maxPrice > 0 && c.USD() > maxPrice:
+			ahead.add("above max_price")
 			continue
 		}
 		if cd, ok := cool[poolKey(c)]; ok {
+			ahead.add("cooling down")
 			switch {
 			case cd.Transient:
 				otherFailure = true // may have cleared since
@@ -1218,7 +1244,12 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 				in.Zone = c.Zone
 			}
 			g.record(in)
-			log("launched spot %s instance %s in %s at $%s/h (%s)", c.Type, in.ID, c.Zone, c.Price, priceNote(t, rank))
+			why := placementWhy(t, k, rank, ahead)
+			in.Placement = &Placement{Order: k.Order, Rank: rank + 1, Of: len(k.Prices), Price: c.Price, Why: why}
+			if rc, ok := k.CostOf(c); ok {
+				in.Placement.Cost = &rc
+			}
+			log("launched spot %s instance %s in %s at $%s/h (%s)", c.Type, in.ID, c.Zone, c.Price, why)
 			return in, nil
 		}
 		var ce *CredentialError
@@ -1314,6 +1345,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			return Instance{}, fmt.Errorf("%s: %w", c.Region, err)
 		}
 		tried = append(tried, c.Type+"@"+c.Zone+": "+code)
+		ahead.add("refused (" + code + ")")
 	}
 	// A region that couldn't be priced just now (a timeout, throttling)
 	// might have had room.
@@ -1346,6 +1378,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			if err == nil {
 				in := a.instance(inst)
 				g.record(in)
+				in.Placement = &Placement{Order: "on_demand", Why: "on_demand_fallback: no Spot option could launch"}
 				return in, nil
 			}
 			var ce *CredentialError
@@ -1389,14 +1422,6 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		return Instance{}, fmt.Errorf("every Spot option in %s is cooling down after recent capacity or quota failures; retry in a few minutes (`spotexec prices %s` shows them)", g.Where(), g.r.Name)
 	}
 	return Instance{}, fmt.Errorf("no Spot capacity in the %d cheapest options (%s); %s, or set on_demand_fallback = true", len(tried), strings.Join(tried, ", "), widenHint(g.r))
-}
-
-func priceNote(t PriceTable, rank int) string {
-	where := plural(len(t.Prices), "option") + " in " + plural(len(t.Regions)-len(t.Unpriced), "region")
-	if rank == 0 {
-		return "cheapest of " + where
-	}
-	return fmt.Sprintf("#%d by price of %s; cheaper ones failed, are cooling down or had a VM reclaimed", rank+1, where)
 }
 
 func plural(n int, s string) string {
@@ -1671,16 +1696,20 @@ func (g *AWSGlobal) Doctor(ctx context.Context) []Check {
 	if err != nil {
 		return append(out, Check{Name: "spot prices", Msg: err.Error()})
 	}
-	best := t.Prices[0]
-	out = append(out, Check{Name: "spot prices", OK: true, Msg: g.nextLaunch(t)})
+	k := g.Rank(t)
+	best := k.Prices[0]
+	out = append(out, Check{Name: "spot prices", OK: true, Msg: g.nextLaunchIn(t, k)})
+	if c, ok := rankingCheck(k); ok {
+		out = append(out, c)
+	}
 	if len(t.Unpriced) > 0 {
 		out = append(out, Check{Name: "unpriced regions", OK: true, Msg: "not used: " + summarize(t.Unpriced, 4)})
 	}
 	// Quota and network matter where launches will actually go: the
-	// cheapest few regions. A region the account has never used often
-	// has a tiny Spot quota.
+	// first few regions in launch order. A region the account has never
+	// used often has a tiny Spot quota.
 	var top []string
-	for _, p := range t.Prices {
+	for _, p := range k.Prices {
 		if !contains(top, p.Region) {
 			top = append(top, p.Region)
 		}
@@ -1716,7 +1745,12 @@ func (a *AWSSpot) priceCheck(ctx context.Context) Check {
 	t, err := g.Prices(ctx, true)
 	switch {
 	case err == nil:
-		return Check{Name: "spot prices", OK: true, Msg: g.nextLaunch(t)}
+		k := g.Rank(t)
+		msg := g.nextLaunchIn(t, k)
+		if c, ok := rankingCheck(k); ok {
+			msg += "; " + c.Msg
+		}
+		return Check{Name: "spot prices", OK: true, Msg: msg}
 	case a.r.ByRequirements():
 		return Check{Name: "spot prices", Msg: err.Error()}
 	}
@@ -1727,10 +1761,13 @@ func (a *AWSSpot) priceCheck(ctx context.Context) Check {
 // launch order that isn't cooling down or above max_price, those held back
 // after a Spot interruption last.
 func (g *AWSGlobal) NextLaunch(t PriceTable) (SpotPrice, bool) {
-	cool := g.cooldowns(t.Prices)
+	return g.nextIn(g.Rank(t))
+}
+
+func (g *AWSGlobal) nextIn(k Ranking) (SpotPrice, bool) {
+	cool := g.cooldowns(k.Prices)
 	maxPrice, _ := strconv.ParseFloat(g.r.MaxPrice, 64)
-	for _, i := range heldLast(t.Prices, g.heldBack(t.Prices)) {
-		p := t.Prices[i]
+	for _, p := range k.Prices {
 		if _, ok := cool[poolKey(p)]; ok || (maxPrice > 0 && p.USD() > maxPrice) {
 			continue
 		}
@@ -1739,8 +1776,8 @@ func (g *AWSGlobal) NextLaunch(t PriceTable) (SpotPrice, bool) {
 	return SpotPrice{}, false
 }
 
-// nextLaunch describes where the next VM goes, for doctor.
-func (g *AWSGlobal) nextLaunch(t PriceTable) string {
+// nextLaunchIn describes where the next VM goes, for doctor.
+func (g *AWSGlobal) nextLaunchIn(t PriceTable, k Ranking) string {
 	what := plural(len(t.Prices), "option")
 	if !g.oneRegion() {
 		what += " in " + plural(len(t.Regions)-len(t.Unpriced), "region")
@@ -1749,7 +1786,7 @@ func (g *AWSGlobal) nextLaunch(t PriceTable) string {
 		what += fmt.Sprintf(", %s matching %s", plural(len(t.MemoryMiB), "instance type"), describeRequirements(g.r))
 	}
 	list := fmt.Sprintf("`spotexec prices %s` lists them", g.r.Name)
-	p, ok := g.NextLaunch(t)
+	p, ok := g.nextIn(k)
 	if !ok {
 		return fmt.Sprintf("every option is cooling down or above max_price (%s; %s)", what, list)
 	}
@@ -1758,10 +1795,34 @@ func (g *AWSGlobal) nextLaunch(t PriceTable) string {
 		mem = fmt.Sprintf(" (%g GiB)", float64(m)/1024)
 	}
 	order := "cheapest first"
-	if g.r.LaunchOrder == config.LaunchListed {
+	switch k.Order {
+	case config.LaunchListed:
 		order = "instance_types in order, cheapest zone first"
+	case config.LaunchRunCost:
+		order = fmt.Sprintf("lowest expected run cost first, waiting valued at $%g/h", k.Model.WaitCost)
 	}
 	return fmt.Sprintf("next launch: %s%s in %s at $%s/h (%s; %s; %s)", p.Type, mem, p.Zone, p.Price, what, order, list)
+}
+
+// rankingCheck is doctor's view of the run-cost ranking: the first few
+// options and what each factor added to their Spot price.
+func rankingCheck(k Ranking) (Check, bool) {
+	if k.Order != config.LaunchRunCost || len(k.Prices) == 0 {
+		return Check{}, false
+	}
+	var parts []string
+	for i, p := range k.Prices {
+		if i == 3 {
+			break
+		}
+		rc, _ := k.CostOf(p)
+		s := fmt.Sprintf("%d. %s in %s at $%s/h: %s", i+1, p.Type, p.Zone, p.Price, rc.Summary())
+		if k.HeldBack(p) {
+			s += "; held back after a Spot interruption"
+		}
+		parts = append(parts, s)
+	}
+	return Check{Name: "launch ranking", OK: true, Msg: strings.Join(parts, " · ")}, true
 }
 
 func permHint(err error) string {
