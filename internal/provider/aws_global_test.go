@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -1168,18 +1169,37 @@ func TestFirstRegions(t *testing.T) {
 func TestLaunchRegionsAsKeepsRunnerState(t *testing.T) {
 	g, f := twoRegionEnv(t, "0.100", "0.096", func(r *config.Runner) { r.Profile = "spotexec" })
 	warmUp(t, g, f, "r-one-1")
-	path := filepath.Join(g.dir, "placement.json")
-	before, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+	snapshot := func() map[string]string {
+		out := map[string]string{}
+		ents, err := os.ReadDir(g.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range ents {
+			b, _ := os.ReadFile(filepath.Join(g.dir, e.Name()))
+			out[e.Name()] = string(b)
+		}
+		return out
 	}
+	before := snapshot()
 	admin := &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKADMIN", SecretAccessKey: "secret"}}
 	got, err := g.launchRegionsAs(context.Background(), admin)
 	if err != nil || strings.Join(got, ",") != "r-one-1,r-two-1" {
 		t.Fatalf("launch regions %v, %v (want the warm r-one-1 first)", got, err)
 	}
-	if after, _ := os.ReadFile(path); string(after) != string(before) {
-		t.Fatal("ranking with the admin session changed the runner's placement state")
+	if after := snapshot(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("ranking with the admin session changed the runner's state: %v", after)
+	}
+	// A vcpus runner discovers instance types per region: those caches
+	// stay out of the runner's state too.
+	g.r.InstanceTypes, g.r.VCPUs = nil, 8
+	f.types = map[string][]string{"r-one-1": {typeXML("c7a.2xlarge", 8, 16, "x86_64", "")}, "r-two-1": {typeXML("c7a.2xlarge", 8, 16, "x86_64", "")}}
+	before = snapshot()
+	if _, err := g.launchRegionsAs(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	if after := snapshot(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("ranking a vcpus runner with the admin session changed the runner's state: %v", after)
 	}
 	if g.r.Profile != "spotexec" {
 		t.Fatalf("profile %q", g.r.Profile)

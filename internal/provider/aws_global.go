@@ -211,6 +211,7 @@ func (g *AWSGlobal) Regional(region string) *AWSSpot {
 	rc := *g.r
 	rc.Region, rc.Regions = region, nil
 	a := newAWSSpot(&rc, g.creds)
+	a.dir = g.dir // its caches live with the runner's placement state
 	a.placed = !g.oneRegion()
 	if g.endpoints != nil {
 		a.api.endpoints = g.endpoints(region)
@@ -1785,7 +1786,8 @@ func LaunchRegionsWith(ctx context.Context, r *config.Runner, profile string, en
 // launchRegionsAs ranks g's regions with other credentials. It ranks as
 // the runner would (its own profile names its warm regions), but against a
 // copy of its placement state: what another session reads (its account's
-// enabled regions, its prices) must never be cached as the runner's.
+// enabled regions, prices and instance types) must never be cached as the
+// runner's.
 func (g *AWSGlobal) launchRegionsAs(ctx context.Context, creds *awsCredResolver) ([]string, error) {
 	tmp, err := os.MkdirTemp("", "spotexec-rank-")
 	if err != nil {
