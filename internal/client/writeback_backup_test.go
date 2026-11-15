@@ -115,7 +115,7 @@ func (f wbFixture) apply(t *testing.T, dels []string, writes map[string]string) 
 		files[p] = rf
 	}
 	var wb WritebackResult
-	if err := applyWriteback(context.Background(), f.ws, f.m, remote, files, "run-1", &wb); err != nil {
+	if err := applyWriteback(context.Background(), f.ws, f.m, remote, files, nil, "run-1", &wb); err != nil {
 		t.Fatal(err)
 	}
 	return wb

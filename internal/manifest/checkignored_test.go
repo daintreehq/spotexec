@@ -51,16 +51,27 @@ func TestCheckIgnoredPathBeyondSymlink(t *testing.T) {
 	if err := os.Symlink(t.TempDir(), filepath.Join(dir, "docs")); err != nil {
 		t.Fatal(err)
 	}
+	// Every ancestor counts, not just the first.
+	if err := os.MkdirAll(filepath.Join(dir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(dir, "nested", "docs")); err != nil {
+		t.Fatal(err)
+	}
+	// A file where a directory would be: git still judges it.
+	if err := os.WriteFile(filepath.Join(dir, "gen"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	m, err := Build(ctx, Options{Root: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ign, err := m.CheckIgnored(ctx, []string{"docs/evil.txt", "docs/sub/x.log", "dist/app.js", "src/a.go"})
+	ign, err := m.CheckIgnored(ctx, []string{"docs/evil.txt", "docs/sub/x.log", "nested/docs/y.log", "gen/out.log", "dist/app.js", "src/a.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ign["dist/app.js"] || ign["src/a.go"] || ign["docs/evil.txt"] || ign["docs/sub/x.log"] {
+	if !ign["dist/app.js"] || !ign["gen/out.log"] || ign["src/a.go"] || ign["docs/evil.txt"] || ign["docs/sub/x.log"] || ign["nested/docs/y.log"] {
 		t.Fatalf("ignored = %v", ign)
 	}
 	// Nothing left for git to judge.
