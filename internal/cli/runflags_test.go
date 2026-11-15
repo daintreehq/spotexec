@@ -246,6 +246,11 @@ func TestSameSlotIgnoresUnavailableProjectPool(t *testing.T) {
 	if code != client.ExitInfra || !strings.Contains(stderr, `unknown runner "gone"`) {
 		t.Errorf("--same-slot: exit %d, stderr %q", code, stderr)
 	}
+	// An explicit pool must still be valid, even with the last runner in it.
+	code, stderr = runMain(t, "spotexec", "exec", "-C", dir, "--pool", "typo,gone", "--", "true")
+	if code != client.ExitInfra || !strings.Contains(stderr, `unknown runner "typo"`) {
+		t.Errorf("exec --pool typo,gone: exit %d, stderr %q", code, stderr)
+	}
 	// An ordinary run selects the pool and says what's missing.
 	code, stderr = runMain(t, "sx", "-C", dir, "true")
 	if code != client.ExitInfra || !strings.Contains(stderr, `"aws-big"`) || !strings.Contains(stderr, `extends "aws"`) {

@@ -32,7 +32,14 @@ type accountStatus struct {
 func spotQuotas(ctx context.Context, cfg *config.Config) []regionQuota {
 	seen := map[string]bool{}
 	out := []regionQuota{}
-	for _, name := range cfg.RunnerNames() {
+	// Every runner in the account, including one a project runner masks:
+	// the quota is the account's, whatever this repository selects.
+	names := make([]string, 0, len(cfg.Global.Runners))
+	for name := range cfg.Global.Runners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		r := cfg.Global.Runners[name]
 		if r == nil || r.Type != config.TypeAWSSpot || seen[r.Region+"\x00"+r.Profile] {
 			continue
