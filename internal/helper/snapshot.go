@@ -108,9 +108,10 @@ func (s *Session) takeSnapshot(skip []string) snapshot {
 // files are compared by content ID against the verified baseline, so a tool
 // that rewrites identical bytes produces no mutation.
 //
-// overflow lists the created paths beyond MaxCreated (not reported, but
-// still tracked for cleanup).
-func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []string, created []protocol.Entry, truncated bool, unverified, overflow []string) {
+// unreported lists created paths the result leaves out but the slot still
+// tracks for cleanup: those beyond MaxCreated, and those named so that no
+// client could use them (a backslash, .git in another case).
+func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []string, created []protocol.Entry, truncated bool, unverified, unreported []string) {
 	for rel, st := range s.stored {
 		if post.unknown[rel] {
 			unverified = append(unverified, rel)
@@ -155,11 +156,16 @@ func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []
 		}
 		full, err := fsid.SafeJoin(s.workspace, rel) // also rejects names a client can't use
 		if err != nil {
+			// Such a name never goes back, but it stays in the slot, where
+			// every later command would see it, until a sync removes it.
+			if _, cerr := fsid.CleanRel(rel); cerr != nil {
+				unreported = append(unreported, rel)
+			}
 			continue
 		}
 		if len(created) >= MaxCreated {
 			truncated = true
-			overflow = append(overflow, rel)
+			unreported = append(unreported, rel)
 			continue
 		}
 		id, mode, size, err := fsid.Path(full)

@@ -141,6 +141,48 @@ func SafeJoin(root, rel string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return joinUnder(root, r, rel)
+}
+
+// SlotRel validates a slash-separated path that a runner's own workspace
+// produced (a file a run created there), and returns it in OS form. Unlike
+// CleanRel it accepts names no worktree may hold, such as a backslash or a
+// ".Git" directory, which a case-sensitive runner keeps as ordinary files:
+// they never travel back, but the slot still has to clean them up. It
+// refuses what could leave the workspace (absolute paths, "..", empty
+// segments, NUL) and any path inside a directory named exactly .git, where
+// the slot's seeded repository lives and which a run's snapshot never
+// enters.
+func SlotRel(p string) (string, error) {
+	if p == "" || strings.HasPrefix(p, "/") || strings.ContainsRune(p, 0) {
+		return "", fmt.Errorf("invalid path %q", p)
+	}
+	segs := strings.Split(p, "/")
+	for i, seg := range segs {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", fmt.Errorf("invalid path %q", p)
+		}
+		if i < len(segs)-1 && seg == ".git" {
+			return "", fmt.Errorf("invalid path %q (inside .git)", p)
+		}
+	}
+	return filepath.FromSlash(p), nil
+}
+
+// SlotJoin is SafeJoin for a path the runner's workspace produced (see
+// SlotRel). It is only for runner workspaces, which are POSIX: a
+// backslash is an ordinary character there.
+func SlotJoin(root, rel string) (string, error) {
+	r, err := SlotRel(rel)
+	if err != nil {
+		return "", err
+	}
+	return joinUnder(root, r, rel)
+}
+
+// joinUnder joins root and the OS-form relative path r, refusing an
+// existing ancestor that is a symlink or not a directory.
+func joinUnder(root, r, rel string) (string, error) {
 	full := filepath.Join(root, r)
 	dir := root
 	parts := strings.Split(filepath.Dir(r), string(filepath.Separator))
