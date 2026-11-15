@@ -529,6 +529,16 @@ func TestProjectRunnerExtendsType(t *testing.T) {
 		t.Fatalf("unavailable: %v", u)
 	}
 
+	// A named runner of the wrong type, and no other: say so.
+	g2, _ := loadGlobalText(t, "[runners.aws]\ntype = \"ssh\"\nhost = \"box\"\n")
+	c, err = mergeProject(t, g2, fleet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Runner("aws-big"); err == nil || !strings.Contains(err.Error(), `your runner "aws" is ssh, and you have no aws-spot runner`) {
+		t.Fatalf("wrong-type reason: %v", err)
+	}
+
 	// An unsupported type is the repository's mistake: a config error.
 	if _, err := mergeProject(t, g, "[runners.x]\nextends_type = \"aws\"\n"); err == nil || !strings.Contains(err.Error(), "extends_type must be") {
 		t.Fatalf("bad extends_type: %v", err)
@@ -541,10 +551,12 @@ func TestUnavailableProjectRunnerStillValidated(t *testing.T) {
 		t.Fatal(err)
 	}
 	for body, want := range map[string]string{
-		"[runners.big]\nextends = \"aws\"\nmax_slotz = 1\n":     "unknown keys",
-		"[runners.big]\nextends = \"aws\"\nprofile = \"x\"\n":   "can only be set in the global config",
-		"[runners.big]\nextends = \"aws\"\nmax_slots = \"x\"\n": "runner \"big\"",
-		"pool = [\"nope\"]\n[runners.big]\nextends = \"aws\"\n": "pool references unknown runner \"nope\"",
+		"[runners.big]\nextends = \"aws\"\nmax_slotz = 1\n":                    "unknown keys",
+		"[runners.big]\nextends = \"aws\"\nprofile = \"x\"\n":                  "can only be set in the global config",
+		"[runners.big]\nextends = \"aws\"\nmax_slots = \"x\"\n":                "runner \"big\"",
+		"pool = [\"nope\"]\n[runners.big]\nextends = \"aws\"\n":                "pool references unknown runner \"nope\"",
+		"[runners.big]\nextends = \"aws\"\nmax_slots = -1\n":                   "max_slots must be between",
+		"[runners.big]\nextends_type = \"aws-spot\"\nidle_timeout = \"-1m\"\n": "idle_timeout must not be negative",
 	} {
 		if _, err := mergeProject(t, g, body); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: want %q, got %v", body, want, err)
@@ -576,6 +588,15 @@ func TestUnavailableProjectRunnerMasksSameName(t *testing.T) {
 	if _, err := c.Runner("spot"); err == nil || !strings.Contains(err.Error(), `extends "aws"`) {
 		t.Fatalf("the user's own spot is not the project's spot: %v", err)
 	}
+	if names := c.RunnerNames(); len(names) != 1 || names[0] != "homelab" {
+		t.Fatalf("the masked name must not be enumerated: %v", names)
+	}
+	if rs, err := c.Pool(nil); err != nil || len(rs) != 1 || rs[0].Name != "homelab" {
+		t.Fatalf("the implicit pool must skip the masked name: %v %v", rs, err)
+	}
+	if c.Global.Runners["spot"] == nil {
+		t.Fatal("the user's own runner must stay known for account-wide commands")
+	}
 	// Without extends, the same name is the base and the override applies.
 	g, _ = loadGlobalText(t, "[runners.spot]\ntype = \"ssh\"\nhost = \"small\"\n")
 	c, err = mergeProject(t, g, "[runners.spot]\nmax_slots = 3\n")
@@ -592,5 +613,11 @@ func TestUnavailableProjectRunnerMasksSameName(t *testing.T) {
 	}
 	if _, err := c.Runner("studio"); err == nil || !strings.Contains(err.Error(), "extends or extends_type") {
 		t.Fatalf("override of a missing runner: %v", err)
+	}
+}
+
+func TestGlobalRejectsExtendsType(t *testing.T) {
+	if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nextends_type = \"sim\"\n"); err == nil || !strings.Contains(err.Error(), "extends_type is for runners in a project") {
+		t.Fatalf("got %v", err)
 	}
 }

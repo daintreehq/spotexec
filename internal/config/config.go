@@ -321,6 +321,9 @@ func LoadGlobal() (*Global, error) {
 	}
 	for name, r := range g.Runners {
 		r.Name = name
+		if md.IsDefined("runners", name, "extends_type") {
+			return nil, fmt.Errorf("%s: runner %q: extends_type is for runners in a project's .spotexec.toml", g.Path, name)
+		}
 		if md.IsDefined("runners", name, "region") && md.IsDefined("runners", name, "regions") {
 			return nil, fmt.Errorf("%s: runner %q: set region or regions, not both", g.Path, name)
 		}
@@ -863,15 +866,21 @@ func (c *Config) MergeProjectRunners() error {
 		if probe.ExtendsType != "" && !oneOf(probe.ExtendsType, TypeSSH, TypeAWSSpot, TypeSim) {
 			return fmt.Errorf("%s: runner %q: extends_type must be %s, %s or %s (got %q)", p.Path, name, TypeSSH, TypeAWSSpot, TypeSim, probe.ExtendsType)
 		}
+		// The checks that don't depend on the base (slots, durations) hold
+		// whether or not this user has one; the rest run once it's merged.
+		if err := probe.validate(); err != nil {
+			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
+		}
 		g, err := c.projectBase(global, name, probe)
 		if err != nil {
 			if c.Unavailable == nil {
 				c.Unavailable = map[string]error{}
 			}
-			c.Unavailable[name] = err
 			// A global runner of the same name is not what the project meant:
-			// selecting it must not quietly run on the wrong machine.
-			delete(c.Global.Runners, name)
+			// Runner and RunnerNames hide it, so selecting the name can't
+			// quietly run on the wrong machine. It stays in Global.Runners for
+			// what spans the account (status -A, down -A, quotas).
+			c.Unavailable[name] = err
 			continue
 		}
 		base := *g
@@ -943,6 +952,7 @@ func (c *Config) projectBase(global map[string]*Runner, name string, probe Runne
 	if g, ok := global[want]; ok && (probe.ExtendsType == "" || g.Type == probe.ExtendsType) {
 		return g, nil
 	}
+	named := global[want]
 	var matches []string
 	if probe.ExtendsType != "" {
 		for n, g := range global {
@@ -974,14 +984,17 @@ func (c *Config) projectBase(global map[string]*Runner, name string, probe Runne
 	case len(matches) > 1:
 		return nil, fmt.Errorf("%s can use any of your %s runners, and you have several (%s): list the one to use in default_pool in %s",
 			what, probe.ExtendsType, strings.Join(matches, ", "), c.Global.Path)
+	case named != nil:
+		return nil, fmt.Errorf("%s needs a %s runner: your runner %q is %s, and you have no %s runner (%s): add one to %s",
+			what, probe.ExtendsType, want, named.Type, probe.ExtendsType, have, c.Global.Path)
 	case probe.ExtendsType != "" && probe.Extends != "":
-		return nil, fmt.Errorf("%s needs your runner %q or any %s runner, and you have neither (%s): add one to %s, or pick another runner with -r",
+		return nil, fmt.Errorf("%s needs your runner %q or any %s runner, and you have neither (%s): add one to %s",
 			what, probe.Extends, probe.ExtendsType, have, c.Global.Path)
 	case probe.ExtendsType != "":
-		return nil, fmt.Errorf("%s needs one of your %s runners, and you have none (%s): add one to %s, or pick another runner with -r",
+		return nil, fmt.Errorf("%s needs one of your %s runners, and you have none (%s): add one to %s",
 			what, probe.ExtendsType, have, c.Global.Path)
 	case probe.Extends != "":
-		return nil, fmt.Errorf("%s extends %q, which isn't one of your runners (%s): add a runner named %q to %s, or pick another runner with -r",
+		return nil, fmt.Errorf("%s extends %q, which isn't one of your runners (%s): add a runner named %q to %s",
 			what, probe.Extends, have, probe.Extends, c.Global.Path)
 	}
 	return nil, fmt.Errorf("%s overrides your runner %q, which you don't have (%s); a project runner builds on one of yours with extends or extends_type",
@@ -1028,11 +1041,14 @@ func (c *Config) Pool(override []string) ([]*Runner, error) {
 	return out, nil
 }
 
-// RunnerNames lists configured runner names.
+// RunnerNames lists configured runner names, without the project runners
+// this user's runners can't back.
 func (c *Config) RunnerNames() []string {
 	var n []string
 	for k := range c.Global.Runners {
-		n = append(n, k)
+		if c.Unavailable[k] == nil {
+			n = append(n, k)
+		}
 	}
 	sort.Strings(n)
 	return n
