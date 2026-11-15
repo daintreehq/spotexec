@@ -18,10 +18,13 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/depskey"
@@ -663,6 +666,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		// reported either way.
 		reportConflicts(o.Rep, wb.Stashed, runID)
 		reportSafety(o.Rep, wb, runID)
+		reportOutsideLinks(o.Rep, wb.OutsideLinks, runID)
 		res.BackedUp, res.BackupDir, res.Held = wb.BackedUp, wb.BackupDir, wb.Held
 		res.Conflicts = wb.Conflicts
 		if err != nil {
@@ -721,6 +725,29 @@ func keepLastRun(ws *Workspace, o Options, lr LastRun, res *Result) {
 	if !o.DeferLastRun {
 		saveLastRun(ws, lr)
 	}
+}
+
+// reportOutsideLinks warns about symlinks write-back created or retargeted
+// to point outside the worktree: local tools and agents reading one read
+// whatever it points at, such as a file under ~/.ssh.
+func reportOutsideLinks(rep ui.Reporter, links []Link, runID string) {
+	for _, l := range links {
+		where := "outside the worktree"
+		if strings.HasPrefix(l.Target, "/") {
+			where = "an absolute path"
+		}
+		rep.Warn("WRITEBACK_SYMLINK", "the remote command made %s a symlink to %s, %s; anything reading it here reads that instead (delete it if you didn't expect it)", printable(l.Path), printable(l.Target), where)
+		rep.Event("outside_symlink", map[string]any{"path": l.Path, "target": l.Target, "run_id": runID})
+	}
+}
+
+// printable quotes s when it holds anything a terminal could act on (a
+// runner chooses link names and targets).
+func printable(s string) string {
+	if !utf8.ValidString(s) || strings.IndexFunc(s, func(r rune) bool { return !unicode.IsPrint(r) }) >= 0 {
+		return strconv.Quote(s)
+	}
+	return s
 }
 
 // reportConflicts says, for each write-back conflict or name collision,

@@ -45,6 +45,16 @@ type WritebackResult struct {
 	// project's own config or most of its files (HeldWhy says which).
 	Held    []string
 	HeldWhy string
+	// OutsideLinks are the symlinks write-back created or retargeted that
+	// point outside the worktree: an absolute target, or one that climbs
+	// above the root. They are applied, and reported.
+	OutsideLinks []Link
+}
+
+// Link is a symlink in the worktree and its target, as written.
+type Link struct {
+	Path   string `json:"path"`   // worktree-relative
+	Target string `json:"target"` // the link's contents
 }
 
 // Conflict is a path where your local edit was kept and the remote version
@@ -299,6 +309,15 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 	sort.Strings(paths)
 	var removedDirs []string
 	handled := map[string]bool{}
+	// Symlinks written into the worktree, judged once every write is done
+	// (a link may lead out through another link applied after it).
+	var links []Link
+	appliedLink := func(p string, rf remoteFile) {
+		if rf.mode == fsid.ModeSymlink {
+			links = append(links, Link{Path: p, Target: rf.link})
+		}
+	}
+	defer func() { wb.OutsideLinks = outsideLinks(ws.Root, links) }()
 
 	// Case-only renames (foo -> Foo) on a case-insensitive filesystem (the
 	// macOS default): both names resolve to one file, so applying "create Foo"
@@ -369,6 +388,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				}
 			}
 			wb.Applied = append(wb.Applied, q)
+			appliedLink(q, rf)
 			wb.Deleted = append(wb.Deleted, del)
 			m.Update(protocol.Entry{Path: q, ID: rf.id, Mode: rf.mode, Size: int64(len(rf.data))})
 			break
@@ -430,6 +450,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 					return fmt.Errorf("%s: %w", p, err)
 				}
 				wb.Applied = append(wb.Applied, p)
+				appliedLink(p, rf)
 				m.Update(protocol.Entry{Path: p, ID: rf.id, Mode: rf.mode, Size: int64(len(rf.data))})
 			} else {
 				full, err := fsid.SafeJoin(ws.Root, p)
@@ -664,6 +685,108 @@ func onDiskName(root, rel string) (string, bool) {
 		dir = filepath.Join(dir, name)
 	}
 	return strings.Join(out, "/"), true
+}
+
+// outsideLinks returns the links that point outside root: an absolute
+// target, a relative one that climbs above root from the link's directory,
+// or one that leads outside it on disk through another symlink (even when
+// its final target doesn't exist yet).
+func outsideLinks(root string, links []Link) []Link {
+	var out []Link
+	realRoot := resolveExisting(root)
+	rootInfo, rootErr := os.Stat(realRoot)
+	for _, l := range links {
+		if linkEscapes(l.Path, l.Target) {
+			out = append(out, l)
+			continue
+		}
+		full, err := fsid.SafeJoin(root, l.Path)
+		if err != nil {
+			continue
+		}
+		if t, err := os.Readlink(full); err != nil || t != l.Target {
+			continue // no longer the link that was written
+		}
+		dir, err := filepath.EvalSymlinks(filepath.Dir(full))
+		if err != nil {
+			continue
+		}
+		hops := 0
+		r, ok := followLink(dir, l.Target, &hops)
+		if ok && !within(r, realRoot, rootInfo, rootErr == nil) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// followLink is where target, read from a link in the resolved directory
+// dir, leads: every existing symlink on the way is followed (so ".." after
+// one means its target's parent, as for the kernel), and a missing
+// remainder is kept as written. false: a loop, or a link that can't be read.
+func followLink(dir, target string, hops *int) (string, bool) {
+	cur := dir
+	if strings.HasPrefix(target, "/") {
+		cur = "/"
+	}
+	for _, c := range strings.Split(target, "/") {
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, c)
+		fi, err := os.Lstat(next)
+		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+		if *hops++; *hops > 40 {
+			return "", false
+		}
+		t, err := os.Readlink(next)
+		if err != nil {
+			return "", false
+		}
+		r, ok := followLink(cur, t, hops)
+		if !ok {
+			return "", false
+		}
+		cur = r
+	}
+	return cur, true
+}
+
+// linkEscapes reports whether a link at the worktree-relative path p with
+// the given target points outside the worktree, judged by its text alone.
+func linkEscapes(p, target string) bool {
+	if filepath.IsAbs(target) || strings.HasPrefix(target, "/") {
+		return true
+	}
+	t := path.Clean(path.Join(path.Dir(p), target))
+	return t == ".." || strings.HasPrefix(t, "../")
+}
+
+// within reports whether p is dir or inside it: by its spelling, or by an
+// existing ancestor being dir itself (another spelling of it, as on a
+// case-insensitive filesystem).
+func within(p, dir string, dirInfo fs.FileInfo, haveInfo bool) bool {
+	if p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, string(filepath.Separator))+string(filepath.Separator)) {
+		return true
+	}
+	if !haveInfo {
+		return false
+	}
+	for d := p; ; d = filepath.Dir(d) {
+		if fi, err := os.Stat(d); err == nil && os.SameFile(fi, dirInfo) {
+			return true
+		}
+		if filepath.Dir(d) == d {
+			return false
+		}
+	}
 }
 
 func conflictBase(ws *Workspace) string {
