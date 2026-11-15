@@ -86,27 +86,41 @@ type poolState struct {
 	QuotaErr  string    `json:"quota_error,omitempty"`
 	QuotaAt   time.Time `json:"quota_at,omitempty"`
 	QuotaLive int       `json:"quota_live,omitempty"` // instances listed when it was refused
+	// QuotaErr is instead every Spot price being above max_price, which
+	// waiting won't fix either.
+	QuotaPrice bool `json:"quota_price,omitempty"`
 	// The requirements (provider.MatchKey) the notes' Mismatch reasons
 	// were judged against.
 	MatchKey string `json:"match_key,omitempty"`
 }
 
-// quotaBlocked reports the quota refusal that still holds launches back
-// ("" if none) for a process waiting since `since` (zero: always waiting).
+// quotaBlocked reports the quota (or max_price) refusal that still holds
+// launches back ("" if none) for a process waiting since `since` (zero:
+// always waiting).
 //
 // It holds for quotaRetry, or until one of the fleet's VMs ends and frees
 // quota. When the fleet had no VM at all, it holds only for processes
 // already waiting when it happened (they fail, or wait for another runner
 // without retrying); a run that starts later tries once more, since the
-// quota may have been raised meanwhile.
+// quota may have been raised meanwhile. A max_price refusal is always
+// retried by a later run: the config may have changed, and finding every
+// price above the cap again costs no launch request.
 func (st *poolState) quotaBlocked(since time.Time) string {
 	if st.QuotaErr == "" || time.Since(st.QuotaAt) > quotaRetry || st.vmCount() < st.QuotaLive {
 		return ""
 	}
-	if st.QuotaLive == 0 && !st.QuotaAt.After(since) {
+	if (st.QuotaLive == 0 || st.QuotaPrice) && !st.QuotaAt.After(since) {
 		return ""
 	}
 	return st.QuotaErr
+}
+
+// blockedReason is Plan's reason while quotaBlocked holds launches back.
+func blockedReason(price bool) string {
+	if price {
+		return "every Spot price is above max_price, so no new VMs; waiting for a slot on running ones"
+	}
+	return "at the account's vCPU quota, so no new VMs; waiting for a slot on running ones"
 }
 
 // vmCount is the fleet's VMs holding quota: listed instances (draining ones
@@ -465,8 +479,9 @@ type LaunchDecision struct {
 	Live     int // usable instances (not draining)
 	Demand   int
 	Capacity int // pending slots
-	// QuotaErr is set while the account's vCPU quota blocks launches: the
-	// fleet can only serve from the VMs it already has.
+	// QuotaErr is set while the account's vCPU quota (or max_price, below
+	// every Spot price) blocks launches: the fleet can only serve from the
+	// VMs it already has.
 	QuotaErr string
 }
 
@@ -544,9 +559,9 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		case usable >= p.R.MaxInstances:
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
 		case total >= 2*p.R.MaxInstances:
-			d.Reason = "too many draining instances still alive"
+			d.Reason = liveCapReason(st, p.R.MaxInstances)
 		case d.QuotaErr != "":
-			d.Reason = "at the account's vCPU quota, so no new VMs; waiting for a slot on running ones"
+			d.Reason = blockedReason(st.QuotaPrice)
 		case time.Now().Before(st.BackoffUntil):
 			d.Reason = "backing off after a failed launch: " + st.LastLaunchErr
 		default:
@@ -560,6 +575,40 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		return nil
 	})
 	return d, err
+}
+
+// liveCapReason explains launches held by the cap on live VMs (twice
+// max_instances): the VMs out of service that haven't ended yet, counted
+// as draining or outdated (the states `spotexec status` names).
+func liveCapReason(st *poolState, maxInstances int) string {
+	outdated, draining := 0, 0
+	for _, in := range st.Instances {
+		switch n := st.Notes[in.ID]; {
+		case n == nil:
+		case n.Draining:
+			draining++
+		case n.Mismatch != "":
+			outdated++
+		}
+	}
+	vms := func(n int, state string) string {
+		if n == 1 {
+			return "1 " + state + " VM"
+		}
+		return fmt.Sprintf("%d %s VMs", n, state)
+	}
+	var held []string
+	if outdated > 0 {
+		held = append(held, vms(outdated, "outdated"))
+	}
+	if draining > 0 {
+		held = append(held, vms(draining, "draining"))
+	}
+	if len(held) == 0 {
+		held = append(held, "VMs")
+	}
+	return fmt.Sprintf("waiting for %s to end: launches pause at %d live VMs (twice max_instances)",
+		strings.Join(held, " and "), 2*maxInstances)
 }
 
 // Reserve records up to n launches regardless of waiting demand (spotexec
@@ -706,6 +755,12 @@ func ReleaseLaunch() { launchesInFlight.Done() }
 
 // ProvisionHeld is Provision for a caller that already called HoldLaunch.
 func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger) (provider.Instance, error) {
+	return p.ProvisionHeldThen(ctx, id, log, nil)
+}
+
+// ProvisionHeldThen is ProvisionHeld, calling launched (if set) as soon as
+// the launch request succeeds, before waiting for the VM to run.
+func (p *Pool) ProvisionHeldThen(ctx context.Context, id string, log provider.Logger, launched func(provider.Instance)) (provider.Instance, error) {
 	recorded := false
 	defer func() {
 		if !recorded {
@@ -716,10 +771,13 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 	if err != nil {
 		ambiguous := errors.Is(err, provider.ErrLaunchAmbiguous)
 		var qe *provider.QuotaError
+		var pe *provider.PriceCapError
 		quota := errors.As(err, &qe)
+		price := !quota && errors.As(err, &pe)
 		_ = p.with(func(st *poolState) error {
-			if quota {
+			if quota || price {
 				st.QuotaErr, st.QuotaAt, st.QuotaLive = err.Error(), time.Now(), st.vmCount()
+				st.QuotaPrice = price
 			}
 			for i := range st.Launches {
 				// An ambiguous failure (the request may have created an
@@ -749,10 +807,13 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 			}
 		}
 		// There was room after all.
-		st.QuotaErr, st.QuotaAt, st.QuotaLive = "", time.Time{}, 0
+		st.QuotaErr, st.QuotaAt, st.QuotaLive, st.QuotaPrice = "", time.Time{}, 0, false
 		st.ListedAt = staleListing(st.ListedAt) // force the next caller to re-list
 		return nil
 	})
+	if launched != nil {
+		launched(in) // before the hold ends, so an exiting process still reports it
+	}
 	recorded = true
 	launchesInFlight.Done()
 	ran, err := p.Fleet.WaitRunning(ctx, in.ID, log)
@@ -783,6 +844,12 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 	if err != nil {
 		// The launched instance, so a caller can still find (or end) it.
 		return in, err
+	}
+	if ran.Placement == nil {
+		ran.Placement = in.Placement // why it launched there, for the instance_running event
+	}
+	if ran.Zone == "" {
+		ran.Zone = in.Zone
 	}
 	return ran, err
 }

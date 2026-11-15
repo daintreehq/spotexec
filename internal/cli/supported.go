@@ -24,8 +24,10 @@ parent directory, up to the repository root), spotexec syncs its workspace
 run on, and the checks a run makes on the local files pass: the working set is
 within the file-count limit, a container built from a Dockerfile has its build
 inputs synced, and deps.lockfiles name at least one lockfile, none outside the
-repository. Whether a runner is reachable, the transfer fits, and the image
-builds and dependencies install, only a run finds out.
+repository and none missing here (unless under a symlinked directory, in a
+cache_dirs directory or ignored, where the runner may have it). Whether a
+runner is reachable, the transfer fits, and the image builds and dependencies
+install, only a run finds out.
 It exits 0 when true and 1 when false, so scripts and agents can use either:
 
   spotexec supported            # true
@@ -106,6 +108,9 @@ func supported(ctx context.Context, dir string) error {
 	}
 	// SPOTEXEC_SAME_SLOT without a sync makes a plain sx exec, which reuses
 	// the image this worktree last built (runFlags.options).
-	sameSlot := os.Getenv("SPOTEXEC_SAME_SLOT") == "1"
+	sameSlot, err := envBool("SPOTEXEC_SAME_SLOT")
+	if err != nil {
+		return err
+	}
 	return client.Preflight(ctx, l.cfg.Project, l.ws, client.Options{Sync: mode, PreferLast: sameSlot && mode == "none"})
 }

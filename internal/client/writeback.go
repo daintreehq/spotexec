@@ -208,6 +208,25 @@ func writeback(ctx context.Context, fetchFiles fetchFunc, ws *Workspace, m *mani
 			return wb, err
 		}
 	}
+	// .git directories the run made below the root never come back. One
+	// whose directory is ignored here stays in the slot, like any build
+	// output; the rest are refused, and the next sync removes them.
+	if len(r.GitDirs) > 0 {
+		var dirs, probes []string
+		for _, p := range r.GitDirs {
+			if probe, ok := gitDirProbe(ws, m, p); ok {
+				dirs, probes = append(dirs, p), append(probes, probe)
+			} else {
+				refuse(p)
+			}
+		}
+		ign, err := m.CheckIgnored(ctx, probes)
+		for i, p := range dirs {
+			if err != nil || !ign[probes[i]] {
+				refuse(p)
+			}
+		}
+	}
 	var fresh []protocol.Entry // created and not ignored: new files coming back
 	for _, c := range created {
 		if ignored[c.Path] {
@@ -326,7 +345,8 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		return err
 	}
 	defer unlock()
-	wb.ConflictDir = filepath.Join(lockDir, "conflicts", runID)
+	wb.ConflictDir = filepath.Join(keepBase(ws), "conflicts", runID)
+	pruneKept(ws, time.Now())
 	synced := len(m.ByPath)
 
 	// save backs up the local version of p, about to be deleted or replaced,
@@ -336,7 +356,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		if !local.exists || committed.has(p, local) {
 			return nil
 		}
-		dir := filepath.Join(lockDir, "backup", runID)
+		dir := filepath.Join(keepBase(ws), "backup", runID)
 		if _, err := backupLocal(ws.Root, dir, p, local); err != nil {
 			return err
 		}
@@ -535,7 +555,18 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		}
 	}
 	sort.SliceStable(dels, func(i, j int) bool { return strings.Count(dels[i], "/") > strings.Count(dels[j], "/") })
-	if dels, err = holdDeletions(ws.Root, m, dels, synced, wb); err != nil {
+	// A deletion loses nothing when git has the file committed or the run
+	// wrote the same content back under another path (a move).
+	cameBack := map[string]bool{}
+	for p, rf := range files {
+		if !unjudged[p] { // may yet turn out ignored, and stay remote
+			cameBack[rf.id] = true
+		}
+	}
+	recoverable := func(p string, local version) bool {
+		return cameBack[local.id] || committed.has(p, local)
+	}
+	if dels, err = holdDeletions(ws.Root, m, dels, synced, recoverable, wb); err != nil {
 		return err
 	}
 	for _, p := range dels {
@@ -560,11 +591,12 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 
 // holdDeletions keeps back the deletions a run should not make on its own:
 // the project's own root .spotexec.toml or .gitignore, or, when the run
-// deleted most of the synced files, all of them. Only deletions that would
-// apply count (the local file still matches what was uploaded). It returns
-// the deletions to go ahead with.
-func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int, wb *WritebackResult) ([]string, error) {
-	var live, protected []string
+// deleted most of the synced files, all of them that recoverable can't give
+// back (so a restructuring move, or deleting committed files, applies).
+// Only deletions that would apply count (the local file still matches what
+// was uploaded). It returns the deletions to go ahead with.
+func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int, recoverable func(string, version) bool, wb *WritebackResult) ([]string, error) {
+	var lost, protected []string
 	for _, p := range dels {
 		e, ok := m.ByPath[p]
 		if !ok {
@@ -577,16 +609,18 @@ func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int,
 		if !local.exists || !local.eq(version{true, e.ID, e.Mode}) {
 			continue
 		}
-		live = append(live, p)
 		if protectedPath(p) {
 			protected = append(protected, p)
+		}
+		if !recoverable(p, local) {
+			lost = append(lost, p)
 		}
 	}
 	hold := protected
 	switch {
-	case massDeletion(len(live), synced):
-		hold = live
-		wb.HeldWhy = fmt.Sprintf("the run deleted %d of the %d synced files", len(live), synced)
+	case massDeletion(len(lost), synced):
+		hold = append(append([]string{}, lost...), protected...)
+		wb.HeldWhy = fmt.Sprintf("the run deleted %d of the %d synced files with no committed or moved copy", len(lost), synced)
 	case len(protected) > 0:
 		wb.HeldWhy = "the run deleted the project's own " + strings.Join(protected, " and ")
 	default:
@@ -594,9 +628,11 @@ func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int,
 	}
 	held := map[string]bool{}
 	for _, p := range hold {
-		held[p] = true
+		if !held[p] { // a protected file may be lost too
+			held[p] = true
+			wb.Held = append(wb.Held, p)
+		}
 	}
-	wb.Held = append(wb.Held, hold...)
 	sort.Strings(wb.Held)
 	var keep []string
 	for _, p := range dels {
@@ -853,6 +889,16 @@ func conflictBase(ws *Workspace) string {
 		return filepath.Join(ws.GitDir, "spotexec")
 	}
 	return filepath.Join(ws.Root, ".spotexec")
+}
+
+// keepBase is where backups and conflict copies go: the repository's common
+// git dir, which outlives a linked worktree (git worktree remove deletes the
+// worktree's own git dir).
+func keepBase(ws *Workspace) string {
+	if ws.CommonGitDir != "" {
+		return filepath.Join(ws.CommonGitDir, "spotexec")
+	}
+	return conflictBase(ws)
 }
 
 // stashConflict saves the remote version of p under dir and returns where it
@@ -1165,7 +1211,10 @@ func lockHolder() string {
 //
 // heldOnly (pull --held) writes nothing but held files, whatever else the
 // patterns reach.
-func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool) (int, error) {
+//
+// A symlink it writes that points outside the worktree is reported to rep
+// as write-back reports one; runID, when known, is the run that made it.
+func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool, rep ui.Reporter, runID string) (int, error) {
 	if err := s.Conn.Send(protocol.TypePull, protocol.Pull{Patterns: patterns}); err != nil {
 		return 0, err
 	}
@@ -1177,12 +1226,12 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	if err := env.Unmarshal(&listed); err != nil {
 		return 0, fmt.Errorf("pull: bad listing from runner: %w", err)
 	}
-	return applyPull(ctx, ws, root, patterns, held, heldOnly, listed.Paths, s.Blob(ctx))
+	return applyPull(ctx, ws, root, patterns, held, heldOnly, listed.Paths, s.Blob(ctx), rep, runID)
 }
 
 // applyPull writes the files of blob (a gzip'd tar) that the runner listed
 // and that patterns asked for, under the rules of PullArtifacts.
-func applyPull(ctx context.Context, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool, listed []string, blob io.Reader) (int, error) {
+func applyPull(ctx context.Context, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool, listed []string, blob io.Reader, rep ui.Reporter, runID string) (int, error) {
 	// Only paths the runner listed, that match what was asked for, and that
 	// are not reserved, may be written; the rest of the stream is ignored.
 	allowed := map[string]bool{}
@@ -1314,6 +1363,15 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 		return 0, err
 	}
 	defer unlock()
+	// Symlinks written, judged once every file is in place (a link may
+	// lead out through another pulled after it).
+	var links []Link
+	appliedLink := func(p string, rf remoteFile) {
+		if rf.mode == fsid.ModeSymlink {
+			links = append(links, Link{Path: p, Target: rf.link})
+		}
+	}
+	defer func() { reportOutsideLinks(rep, pulledOutsideLinks(ws.Root, root, links), runID) }()
 	var skipped, kept, stale []string
 	defer func() {
 		if len(skipped) > 0 {
@@ -1377,6 +1435,7 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 			}
 			if err == nil {
 				n++
+				appliedLink(h.Name, rf)
 			}
 			return err
 		}
@@ -1384,9 +1443,35 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 			return nil
 		}
 		n++
-		return writeLocal(root, h.Name, rf, nil)
+		if err := writeLocal(root, h.Name, rf, nil); err != nil {
+			return err
+		}
+		appliedLink(h.Name, rf)
+		return nil
 	})
 	return n, err
+}
+
+// pulledOutsideLinks returns the pulled links (named relative to root) that
+// point outside the worktree, judged where they landed: against the
+// worktree when root is inside it, named relative to the worktree; against
+// root when it is elsewhere (--dest), named by full path.
+func pulledOutsideLinks(wsRoot, root string, links []Link) []Link {
+	if len(links) == 0 {
+		return nil
+	}
+	if rel, err := filepath.Rel(wsRoot, root); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+		in := make([]Link, len(links))
+		for i, l := range links {
+			in[i] = Link{Path: path.Join(filepath.ToSlash(rel), l.Path), Target: l.Target}
+		}
+		return outsideLinks(wsRoot, in)
+	}
+	out := outsideLinks(root, links)
+	for i := range out {
+		out[i].Path = filepath.Join(root, filepath.FromSlash(out[i].Path))
+	}
+	return out
 }
 
 // Why a pulled path is protected (0: it isn't).

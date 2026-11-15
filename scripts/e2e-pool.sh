@@ -218,6 +218,40 @@ check "restored files are the cached ones" "[ \"\$(cat $WORK/d2.out)\" = \"$FIRS
 echo "lock-v2" > deps.lock
 "$SX" --json 'cat vendor/marker' >"$WORK/d3.out" 2>"$WORK/d3.err"
 check "a lockfile change misses the cache and reinstalls" "grep -q '\"built\":true' $WORK/d3.err"
+
+echo "== a sharded task on a cold cache installs once; the other shards wait and restore it (#139)"
+cleanup; sleep 1
+echo "lock-v3" > deps.lock
+sed -i.bak 's/sleep 4"/sleep 8"/' .spotexec.toml && rm -f .spotexec.toml.bak
+cat >> .spotexec.toml <<'EOF2'
+[tasks.shardy]
+run = "cat vendor/marker"
+shards = 3
+exclusive = true
+EOF2
+git add -A && git commit -qm shardy
+# Warm VMs, so every shard reaches its dependencies while the first installs.
+"$SX" up "$RUNNER" --count 3 >/dev/null 2>&1
+"$SX" --json shardy >"$WORK/d4.out" 2>"$WORK/d4.err"; rc=$?
+deps4() { grep '"event":"deps"' "$WORK/d4.err"; }
+check "every shard ran" "[ $rc = 0 ] && [ \$(grep -c installed-on- $WORK/d4.out) = 3 ]"
+check "one shard installed; the others restored its upload" "[ \$(deps4 | grep -c '\"built\":true') = 1 ] && [ \$(deps4 | grep -c '\"restored\":true') = 2 ]"
+check "the installing shard waited for its upload to finish" "deps4 | grep '\"built\":true' | grep -q '\"uploaded\":true'"
+check "the other shards said they waited for it" "[ \$(grep '\"event\":\"deps_wait\"' $WORK/d4.err | grep -c 'another part of this run (shardy ') = 2 ] && [ \$(deps4 | grep '\"restored\":true' | grep -c '\"waited_ms\"') = 2 ]"
+check "every shard has the same install" "[ \$(sed 's/^\[[^]]*\] //' $WORK/d4.out | sort -u | wc -l | tr -d ' ') = 1 ]"
+
+echo "== two runs at once on a cold cache: one installs, the other waits for it and says so (#139)"
+cleanup; sleep 1
+echo "lock-v4" > deps.lock
+"$SX" up "$RUNNER" --count 2 >/dev/null 2>&1
+"$SX" --json --exclusive 'cat vendor/marker' >"$WORK/d5.out" 2>"$WORK/d5.err" &
+P=$!
+"$SX" --json --exclusive 'cat vendor/marker' >"$WORK/d6.out" 2>"$WORK/d6.err"; rc6=$?
+wait $P; rc5=$?
+both() { cat "$WORK/d5.err" "$WORK/d6.err"; }
+check "both ran with the same install" "[ $rc5 = 0 ] && [ $rc6 = 0 ] && [ -s $WORK/d5.out ] && [ \"\$(cat $WORK/d5.out)\" = \"\$(cat $WORK/d6.out)\" ]"
+check "only one of them installed" "[ \$(both | grep '\"event\":\"deps\"' | grep -c '\"built\":true') = 1 ]"
+check "the other waited for it, naming it, and restored it" "both | grep '\"event\":\"deps_wait\"' | grep -q 'another run on this machine (' && both | grep '\"event\":\"deps\"' | grep '\"restored\":true' | grep -q '\"waited_ms\"'"
 cd "$REPO"
 
 echo "== spotexec up ends a VM that fails to get ready"

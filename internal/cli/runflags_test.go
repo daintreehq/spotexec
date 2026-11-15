@@ -107,6 +107,48 @@ func TestFailOnConflictOptIn(t *testing.T) {
 	}
 }
 
+// Boolean variables take the usual spellings, in any case, and refuse
+// anything else rather than ignore it (#126).
+func TestBoolEnvSpellings(t *testing.T) {
+	vars := map[string]func(*runFlags) bool{
+		"SPOTEXEC_JSON":             func(f *runFlags) bool { return f.json },
+		"SPOTEXEC_SAME_SLOT":        func(f *runFlags) bool { return f.sameSlot },
+		"SPOTEXEC_FAIL_ON_CONFLICT": func(f *runFlags) bool { return f.failConflict },
+	}
+	flags := map[string]string{"SPOTEXEC_JSON": "--json=false", "SPOTEXEC_SAME_SLOT": "--same-slot=false", "SPOTEXEC_FAIL_ON_CONFLICT": "--fail-on-conflict=false"}
+	for name, get := range vars {
+		for k := range vars {
+			t.Setenv(k, "")
+		}
+		for v, want := range map[string]bool{"1": true, "true": true, "TRUE": true, "Yes": true, "yes": true, "0": false, "false": false, "False": false, "no": false, "NO": false, "": false} {
+			t.Setenv(name, v)
+			f := parsed(t)
+			if err := f.validate(); err != nil || get(f) != want {
+				t.Errorf("%s=%q: got %v (%v), want %v", name, v, get(f), err, want)
+			}
+		}
+		for _, v := range []string{"on", "2", "y", " true", "enable"} {
+			t.Setenv(name, v)
+			f := parsed(t)
+			if err := f.validate(); err == nil || !strings.Contains(err.Error(), name) || get(f) {
+				t.Errorf("%s=%q: got %v (%v), want refused", name, v, get(f), err)
+			}
+			// An explicit flag beats the variable, whatever its value.
+			if err := parsed(t, flags[name]).validate(); err != nil {
+				t.Errorf("%s with %s=%q: %v", flags[name], name, v, err)
+			}
+		}
+		t.Setenv(name, "")
+	}
+	// Any output flag beats SPOTEXEC_JSON.
+	t.Setenv("SPOTEXEC_JSON", "on")
+	for _, flag := range []string{"--pretty", "-q", "--json"} {
+		if err := parsed(t, flag).validate(); err != nil {
+			t.Errorf("%s with SPOTEXEC_JSON=on: %v", flag, err)
+		}
+	}
+}
+
 func TestSyncAndExecPinTheirSyncMode(t *testing.T) {
 	l := testLoaded()
 	t.Setenv("SPOTEXEC_SYNC", "none")
@@ -138,7 +180,49 @@ func TestValidateRejectsUnknownValues(t *testing.T) {
 		t.Error("SPOTEXEC_WRITEBACK_OVER=bogus accepted")
 	}
 	t.Setenv("SPOTEXEC_WRITEBACK_OVER", "")
-	for _, args := range [][]string{{"--writeback", "on-success", "--sync", "in"}, {"--writeback", "never"}, {"--writeback-over", "warn"}, {"--writeback-over", "hold"}, {}} {
+	// A zero or negative timeout has no meaning: refused, never the default.
+	for _, args := range [][]string{{"--timeout", "0"}, {"--timeout=0s"}, {"--timeout", "-1s"}} {
+		if err := parsed(t, args...).validate(); err == nil || !strings.Contains(err.Error(), "--timeout must be positive") {
+			t.Errorf("%v: %v", args, err)
+		}
+	}
+	for _, v := range []string{"0", "0s", "-5m"} {
+		t.Setenv("SPOTEXEC_TIMEOUT", v)
+		if err := parsed(t).validate(); err == nil || !strings.Contains(err.Error(), "SPOTEXEC_TIMEOUT must be positive") {
+			t.Errorf("SPOTEXEC_TIMEOUT=%s: %v", v, err)
+		}
+	}
+	// The flag beats the variable, whatever its value.
+	if err := parsed(t, "--timeout", "1m").validate(); err != nil {
+		t.Errorf("--timeout 1m with SPOTEXEC_TIMEOUT=-5m: %v", err)
+	}
+	// A value that doesn't parse is refused, naming the variable, rather
+	// than dropped for the default (#125).
+	for _, v := range []string{"abc", "5x", "15", " "} {
+		t.Setenv("SPOTEXEC_TIMEOUT", v)
+		if err := parsed(t).validate(); err == nil || !strings.Contains(err.Error(), "SPOTEXEC_TIMEOUT") {
+			t.Errorf("SPOTEXEC_TIMEOUT=%q: %v", v, err)
+		}
+		if err := parsed(t, "--timeout", "1m").validate(); err != nil {
+			t.Errorf("--timeout 1m with SPOTEXEC_TIMEOUT=%q: %v", v, err)
+		}
+	}
+	t.Setenv("SPOTEXEC_TIMEOUT", "")
+	for _, v := range []string{"abc", "1.5", "high", " "} {
+		t.Setenv("SPOTEXEC_PRIORITY", v)
+		if err := parsed(t).validate(); err == nil || !strings.Contains(err.Error(), "SPOTEXEC_PRIORITY") {
+			t.Errorf("SPOTEXEC_PRIORITY=%q: %v", v, err)
+		}
+		if err := parsed(t, "--priority", "3").validate(); err != nil {
+			t.Errorf("--priority 3 with SPOTEXEC_PRIORITY=%q: %v", v, err)
+		}
+	}
+	t.Setenv("SPOTEXEC_PRIORITY", "-2")
+	if f := parsed(t); f.validate() != nil || f.priority != -2 || !f.prioritySet {
+		t.Errorf("SPOTEXEC_PRIORITY=-2: %+v", f)
+	}
+	t.Setenv("SPOTEXEC_PRIORITY", "")
+	for _, args := range [][]string{{"--writeback", "on-success", "--sync", "in"}, {"--writeback", "never"}, {"--writeback-over", "warn"}, {"--writeback-over", "hold"}, {"--timeout", "1ns"}, {}} {
 		if err := parsed(t, args...).validate(); err != nil {
 			t.Errorf("%v rejected: %v", args, err)
 		}
@@ -213,12 +297,24 @@ func TestBadRunValuesExit125BeforeAnyRunner(t *testing.T) {
 		{"sx", []string{"-C", dir, "--writeback=", "rm", "important.txt"}, "--writeback needs a value"},
 		{"sx", []string{"-C", dir, "--writeback=", "verify"}, "--writeback needs a value"},
 		{"sx", []string{"-C", dir, "--pool=", "true"}, "--pool needs a value"},
+		{"sx", []string{"-C", dir, "--timeout", "0", "true"}, "--timeout must be positive"},
+		{"sx", []string{"-C", dir, "--timeout", "-1s", "verify"}, "--timeout must be positive"},
+		{"spotexec", []string{"run", "-C", dir, "--timeout=0", "--", "true"}, "--timeout must be positive"},
 	}
 	for _, c := range cases {
 		code, stderr := runMain(t, c.name, c.args...)
 		if code != client.ExitInfra || !strings.Contains(stderr, c.want) {
 			t.Errorf("%s %v: exit %d, stderr %q", c.name, c.args, code, stderr)
 		}
+	}
+	for _, v := range []string{"SPOTEXEC_TIMEOUT", "SPOTEXEC_PRIORITY", "SPOTEXEC_JSON", "SPOTEXEC_SAME_SLOT", "SPOTEXEC_FAIL_ON_CONFLICT"} {
+		t.Setenv(v, "abc")
+		for _, args := range [][]string{{"-C", dir, "true"}, {"-C", dir, "verify"}} {
+			if code, stderr := runMain(t, "sx", args...); code != client.ExitInfra || !strings.Contains(stderr, v) {
+				t.Errorf("%s=abc sx %v: exit %d, stderr %q", v, args, code, stderr)
+			}
+		}
+		t.Setenv(v, "")
 	}
 }
 
@@ -321,10 +417,57 @@ func TestUsageAndConfigFailuresExit125(t *testing.T) {
 	}
 }
 
+// An empty or blank command, or none at all, is a usage error: nothing is
+// synced or run, and the exit isn't a passing 0 (#131).
+func TestEmptyCommandIsAUsageError(t *testing.T) {
+	dir := project(t, "")
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"sx", []string{"-C", dir, ""}, "empty command"},
+		{"sx", []string{"-C", dir, "   "}, "empty command"},
+		{"sx", []string{"-C", dir, " \t\n"}, "empty command"},
+		{"sx", []string{"-C", dir, "", " "}, "empty command"},
+		{"sx", []string{"-C", dir, "--", ""}, "empty command"},
+		{"sx", nil, "Usage:"},
+		{"sx", []string{"--"}, "missing command"},
+		{"sx", []string{"-C", dir, "--"}, "missing command"},
+		{"spotexec", []string{"-C", dir, ""}, "empty command"},
+		{"spotexec", []string{""}, "empty command"},
+		{"spotexec", []string{"--", " "}, "empty command"},
+		{"spotexec", []string{"--"}, "missing command"},
+		{"spotexec", []string{"run", "-C", dir, "--", ""}, "empty command"},
+		{"spotexec", []string{"run", "-C", dir, "  "}, "empty command"},
+		{"spotexec", []string{"exec", "-C", dir, "--", ""}, "empty command"},
+		{"spotexec", []string{"run", "-C", dir, "--"}, "missing command"},
+	}
+	// A task whose command comes out empty is refused too, every part
+	// before any of them runs.
+	tasks := project(t, "[tasks.lint]\nrun = \"true\"\n[tasks.blank]\nrun = \"  \"\n[tasks.fwd]\nrun = \"{args}\"\n[tasks.all]\nparallel = [\"lint\", \"fwd\"]\n[tasks.split]\nrun = \"'{args}'\"\nshards = 2\n")
+	for _, task := range []string{"blank", "fwd", "all", "split"} {
+		cases = append(cases, struct {
+			name string
+			args []string
+			want string
+		}{"sx", []string{"-C", tasks, task}, "empty command"})
+	}
+	for _, c := range cases {
+		code, stderr := runMain(t, c.name, c.args...)
+		if code != client.ExitInfra || !strings.Contains(stderr, c.want) {
+			t.Errorf("%s %q: exit %d, stderr %q", c.name, c.args, code, stderr)
+		}
+	}
+}
+
 func TestHelpFormsStillWork(t *testing.T) {
 	for _, a := range []string{"-h", "--help", "--help=true", "--version", "--version=true"} {
 		if code, stderr := runMain(t, "spotexec", a); code != 0 {
 			t.Errorf("spotexec %s: exit %d (stderr %q)", a, code, stderr)
+		}
+		if code, stderr := runMain(t, "sx", a); code != 0 {
+			t.Errorf("sx %s: exit %d (stderr %q)", a, code, stderr)
 		}
 	}
 }

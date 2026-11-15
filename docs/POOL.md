@@ -39,8 +39,8 @@ takes part in scheduling, and every VM shuts itself down.
      skipped.
    - An instance that no longer satisfies the runner's current requirements
      (its type left `instance_types`, or no longer meets `vcpus`,
-     `min_memory_gib`, `min_generation` or `exclude_instance_types` after a
-     config change) is skipped and stops counting as capacity, so waiting
+     `min_memory_gib`, `min_generation` or `exclude_instance_types`, or its
+     region left `regions`, after a config change) is skipped and stops counting as capacity, so waiting
      jobs get a matching replacement and it idles out. Unlike draining this
      is judged again whenever the config changes: reverting the change puts
      it back in service. A failed type lookup never retires an instance.
@@ -58,15 +58,26 @@ takes part in scheduling, and every VM shuts itself down.
    starting (the launch ledger in `pool.json`), up to `max_instances`.
    - Lower-priority fleets only launch for demand the higher-priority ones
      can't cover.
+   - Draining and outdated VMs don't count toward `max_instances`, but
+     launches pause while twice `max_instances` VMs are alive, until some
+     end; the wait reason counts the draining and outdated VMs holding them.
    - Ledger entries record the launching PID, so a dead `sx` frees its
      reservation; an ambiguous launch (the request may have created an
      instance) keeps its reservation until listings can show it.
+   - Where an `aws-spot` launch goes (region, zone, type) is the provider's
+     ranking, by default the [expected cost of the run](aws.md#rank-by-the-cost-of-the-run);
+     the launch's reason is reported on the `instance_launched` and
+     `instance_running` events, with the `launch_id` of its `scale_out`.
    - A failed launch backs the fleet off for 20s.
    - A launch refused by the account's vCPU quota (not a capacity shortage)
      holds further launches until one of the fleet's VMs ends or five
      minutes pass, so queued jobs wait for the running VMs. With no VM
      running and no static runner in the pool, the job fails at once with
      the quota increase command.
+   - A launch that finds every Spot price above `max_price` holds back
+     launches for the jobs already waiting the same way, and with no VM
+     running the job fails at once, naming the cap and the cheapest
+     current price. A job that starts later checks the prices again.
 4. **Wait.** Tickets near the head of the queue probe instances about every
    0.5-2.5s (the head most often) until a slot frees or `queue_timeout`
    expires.
@@ -99,8 +110,10 @@ The helper polls IMDSv2 every 5s for the whole session:
 - `spot/instance-action` (about 2 minutes' notice): the helper marks the VM
   draining and sends `spot_interruption` to the CLI.
 
-On `spot_interruption` the CLI immediately checks for **replacement
-capacity** in the background, excluding the dying VM: it probes for a free
+On `spot_interruption` the CLI records that the VM's zone and instance type
+were reclaimed (new launches rank them last for a while; the pool manager
+does the same for notices it finds on idle VMs) and immediately checks for
+**replacement capacity** in the background, excluding the dying VM: it probes for a free
 slot (without keeping it) and registers demand, so a launch starts if one is
 needed. The optional pool manager (`spotexec daemon`) also replaces a
 noticed warm instance within the notice. Then:

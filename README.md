@@ -175,7 +175,7 @@ Away from a terminal, `sx` stays quiet. The command's own output passes through 
 ```text
 $ sx pnpm prettier --write src 2>&1 | cat
 src/index.ts 41ms
-sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
+sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 file
 ```
 
 To have agents use the fleet without being told, install the hook for your harness:

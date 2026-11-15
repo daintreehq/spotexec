@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -425,7 +426,7 @@ func TestPullHeldFiles(t *testing.T) {
 	listed := []string{"gen/f1.txt", "gen/f2.txt", "gen/f3.txt", "gen/f4.txt", "src/a.go"}
 	pull := func(root string, held HeldFiles) int {
 		t.Helper()
-		n, err := applyPull(context.Background(), ws, root, []string{"gen", "src"}, held, false, listed, tarOf(t, slot))
+		n, err := applyPull(context.Background(), ws, root, []string{"gen", "src"}, held, false, listed, tarOf(t, slot), &recordingReporter{}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -492,7 +493,7 @@ func TestPullHeldFilesStayGuarded(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		n, err := applyPull(context.Background(), ws, dir, pats, sel, true, listed, tarOf(t, slot))
+		n, err := applyPull(context.Background(), ws, dir, pats, sel, true, listed, tarOf(t, slot), &recordingReporter{}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -506,5 +507,116 @@ func TestPullHeldFilesStayGuarded(t *testing.T) {
 	}
 	if read("gen/occupied.txt") != "mine\n" || read("gen/stale.txt") != "" || read("gen/mode.txt") != "" {
 		t.Fatalf("guards lapsed for ignored held files: occupied %q stale %q mode %q", read("gen/occupied.txt"), read("gen/stale.txt"), read("gen/mode.txt"))
+	}
+}
+
+// A pull that writes a symlink pointing outside the worktree warns as
+// write-back does, whether the link was held or is an ignored output, and
+// judges each link where it lands.
+func TestPullWarnsOnOutsideLinks(t *testing.T) {
+	dir := gitRepo(t, map[string]string{".gitignore": "ignored/\n", "README": "r\n"})
+	ws := &Workspace{Root: dir, Git: true, GitDir: filepath.Join(dir, ".git")}
+	// In this order: via is written before the link it leads out through,
+	// so it is only caught when links are judged after every write.
+	links := [][2]string{
+		{"x", "/etc"},                         // held: not ignored
+		{"ignored/via", "keys/id_ed25519"},    // out through ignored/keys
+		{"ignored/keys", "/home/ubuntu/.ssh"}, // absolute
+		{"ignored/up", "../../../.."},         // climbs above the root
+		{"ignored/readme", "../README"},       // inside the worktree
+		{"ignored/sib", "readme"},             // inside, through ignored/readme
+		{"ignored/back", "../../../README"},   // out of the worktree, but not from ignored/out/ignored/
+		{"ignored/check", "bridge/file"},      // out only where ignored/bridge leads out
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
+	listed := make([]string, 0, len(links))
+	for _, l := range links {
+		if err := tw.WriteHeader(&tar.Header{Name: l[0], Typeflag: tar.TypeSymlink, Linkname: l[1], Mode: 0o777}); err != nil {
+			t.Fatal(err)
+		}
+		listed = append(listed, l[0])
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	blob := buf.Bytes()
+	held := HeldFiles{"x": {Path: "x", ID: fsid.Bytes([]byte("/etc")), Mode: fsid.ModeSymlink}}
+	pull := func(root string, pats []string, heldOnly bool, runID string) *recordingReporter {
+		t.Helper()
+		rec := &recordingReporter{}
+		if _, err := applyPull(context.Background(), ws, root, pats, held, heldOnly, listed, bytes.NewReader(blob), rec, runID); err != nil {
+			t.Fatal(err)
+		}
+		return rec
+	}
+	reported := func(rec *recordingReporter) string {
+		var out []string
+		for _, ev := range rec.byName("outside_symlink") {
+			out = append(out, ev["path"].(string)+" -> "+ev["target"].(string))
+		}
+		sort.Strings(out)
+		return strings.Join(out, ", ")
+	}
+
+	// pull --held: the held link to /etc, warned about.
+	rec := pull(dir, []string{"x"}, true, "")
+	if got := reported(rec); got != "x -> /etc" {
+		t.Fatalf("pull --held reported %q", got)
+	}
+	if t2, _ := os.Readlink(filepath.Join(dir, "x")); t2 != "/etc" {
+		t.Fatalf("held link not pulled: %q", t2)
+	}
+	if len(rec.warnings) != 1 || !strings.HasPrefix(rec.warnings[0], "WRITEBACK_SYMLINK: ") || !strings.Contains(rec.warnings[0], "x a symlink to /etc,") {
+		t.Fatalf("warnings %v", rec.warnings)
+	}
+	if _, ok := rec.byName("outside_symlink")[0]["run_id"]; ok {
+		t.Error("a pull with no run id reported one")
+	}
+
+	// Ignored outputs: only the links that lead out.
+	rec = pull(dir, []string{"ignored"}, false, "run1")
+	if got, want := reported(rec), "ignored/back -> ../../../README, ignored/keys -> /home/ubuntu/.ssh, ignored/up -> ../../../.., ignored/via -> keys/id_ed25519"; got != want {
+		t.Fatalf("pull reported %q, want %q", got, want)
+	}
+	for _, ev := range rec.byName("outside_symlink") {
+		if ev["run_id"] != "run1" {
+			t.Fatalf("event %v without the run's id", ev)
+		}
+	}
+	if len(rec.warnings) != 4 {
+		t.Fatalf("warnings %v", rec.warnings)
+	}
+
+	// --dest inside the worktree: judged against the worktree, named where
+	// they landed (../../../README from ignored/out/ignored/ is still inside).
+	rec = pull(filepath.Join(dir, "ignored", "out"), []string{"ignored"}, false, "")
+	if got, want := reported(rec), "ignored/out/ignored/keys -> /home/ubuntu/.ssh, ignored/out/ignored/up -> ../../../.., ignored/out/ignored/via -> keys/id_ed25519"; got != want {
+		t.Fatalf("pull into a dest in the worktree reported %q, want %q", got, want)
+	}
+
+	// --dest elsewhere: judged against the destination, named by full path.
+	dest, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dest, "ignored"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(dest, "ignored", "bridge")); err != nil {
+		t.Fatal(err)
+	}
+	rec = pull(dest, []string{"ignored"}, false, "")
+	want := filepath.Join(dest, "ignored", "back") + " -> ../../../README, " +
+		filepath.Join(dest, "ignored", "check") + " -> bridge/file, " +
+		filepath.Join(dest, "ignored", "keys") + " -> /home/ubuntu/.ssh, " +
+		filepath.Join(dest, "ignored", "up") + " -> ../../../.., " +
+		filepath.Join(dest, "ignored", "via") + " -> keys/id_ed25519"
+	if got := reported(rec); got != want {
+		t.Fatalf("pull into an outside dest reported %q, want %q", got, want)
 	}
 }

@@ -80,6 +80,8 @@ type runnerStatus struct {
 	// current requirements: it takes no new runs and idles out.
 	Mismatch string `json:"mismatch,omitempty"`
 	r        *config.Runner
+	// reclaimed records a Spot interruption notice the VM reports.
+	reclaimed func()
 }
 
 const (
@@ -220,8 +222,12 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			mismatch := fleetMismatches(ctx, f, insts)
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
-				rows = append(rows, runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
-					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}})
+				st := runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
+					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}}
+				if rc, ok := f.(provider.Reclaimer); ok {
+					st.reclaimed = func() { rc.Reclaimed(in) }
+				}
+				rows = append(rows, st)
 			}
 			continue
 		}
@@ -267,6 +273,11 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				return
 			}
 			st.Helper = &hs
+			// Asking marks the VM draining, so later asks (the pool
+			// manager's) no longer see the notice: record it here too.
+			if hs.SpotNotice != "" && st.reclaimed != nil {
+				st.reclaimed()
+			}
 		}()
 	}
 	wg.Wait()
@@ -718,6 +729,7 @@ func cmdDoctor() *cobra.Command {
 				}
 				check("workspace", true, fmt.Sprintf("%s (repo id %s)", l.ws.Root, l.ws.RepoID))
 				doctorContainer(l, args, check, warn)
+				doctorDeps(cmd.Context(), l, check)
 			} else {
 				check("project config", false, err.Error())
 			}
@@ -772,6 +784,25 @@ func cmdDoctor() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// doctorDeps fails deps.lockfiles that every synced run's dependency install
+// would fail on, such as a literal entry missing here (as `spotexec
+// supported` does).
+func doctorDeps(ctx context.Context, l *loaded, check func(string, bool, string)) {
+	d := l.cfg.Project.Deps
+	mode := l.cfg.Project.Sync.Mode
+	if v := os.Getenv("SPOTEXEC_SYNC"); v != "" {
+		mode = v
+	}
+	if d.Install == "" || mode == "none" {
+		return
+	}
+	if err := client.CheckDeps(ctx, l.cfg.Project, l.ws); err != nil {
+		check("deps lockfiles", false, err.Error())
+		return
+	}
+	check("deps lockfiles", true, strings.Join(d.Lockfiles, ", "))
 }
 
 // doctorContainer reports the project's container: the image it runs in,
@@ -1074,9 +1105,32 @@ func cmdSyncPlan() *cobra.Command {
 	return c
 }
 
+// pullMode picks pull's output mode: --json (either way) beats
+// SPOTEXEC_JSON, read as a run reads it, and --json=false beats
+// SPOTEXEC_AGENT=1.
+func pullMode(asJSON, jsonSet bool) (ui.Mode, error) {
+	if jsonSet {
+		if asJSON {
+			return ui.ModeJSON, nil
+		}
+		if os.Getenv("SPOTEXEC_AGENT") == "1" {
+			return ui.ModePlain, nil
+		}
+		return ui.ModeAuto, nil
+	}
+	envJSON, err := envBool("SPOTEXEC_JSON")
+	if err != nil {
+		return ui.ModeAuto, err
+	}
+	if envJSON {
+		return ui.ModeJSON, nil
+	}
+	return ui.ModeAuto, nil
+}
+
 func cmdPull() *cobra.Command {
 	var dest string
-	var held bool
+	var held, asJSON bool
 	c := &cobra.Command{
 		Use:   "pull <remote-glob>... | --held [<glob>...]",
 		Short: "Pull gitignored artifacts (e.g. coverage/), or held write-back files, from the last-used slot",
@@ -1087,6 +1141,10 @@ func cmdPull() *cobra.Command {
 			return cobra.MinimumNArgs(1)(cmd, args)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			mode, err := pullMode(asJSON, cmd.Flags().Changed("json"))
+			if err != nil {
+				return err
+			}
 			l, err := load("")
 			if err != nil {
 				return err
@@ -1107,7 +1165,7 @@ func cmdPull() *cobra.Command {
 			}
 			ctx, _, stop := signals()
 			defer stop()
-			rep, _ := ui.New(ui.ModeAuto, os.Stderr, "")
+			rep, _ := ui.New(mode, os.Stderr, "")
 			host, _ := os.Hostname()
 			lease, err := client.AcquireSlot(ctx, l.cfg, l.ws, r, lr, rep, host, client.PullDisplay, false, 0, false, "")
 			if err != nil {
@@ -1118,14 +1176,16 @@ func cmdPull() *cobra.Command {
 			if dest != "" {
 				root = dest // created by PullArtifacts once validated
 			}
-			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args, heldFiles, held)
+			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args, heldFiles, held, rep, "")
 			if err != nil {
 				return err
 			}
+			rep.Event("pull", map[string]any{"patterns": args, "files": n})
 			rep.Done(fmt.Sprintf("pulled %d file%s from %s", n, plural(n), r.Name), true)
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&asJSON, "json", false, "NDJSON events on stderr (warnings, links pulled out of the worktree, the pull)")
 	c.Flags().StringVar(&dest, "dest", "", "write under this directory instead of the worktree root")
 	c.Flags().BoolVar(&held, "held", false, "pull the new files the last run's write-back held in the slot (over the write-back limit); globs narrow them")
 	return c

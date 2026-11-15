@@ -20,13 +20,17 @@ import (
 
 // Workspace identifies the local worktree being run from.
 type Workspace struct {
-	Root        string // canonical worktree root
-	Git         bool
-	GitDir      string // per-worktree git dir (conflicts live here)
-	RepoID      string // shared across worktrees of the same repo
-	RepoName    string
-	WorktreeKey string // unique per host+worktree
-	Cwd         string // cwd relative to Root ("." at root)
+	Root   string // canonical worktree root
+	Git    bool
+	GitDir string // per-worktree git dir (the write-back lock lives here)
+	// CommonGitDir is the git dir every worktree of the repository shares
+	// (GitDir itself outside linked worktrees). Backups and conflict copies
+	// live here, so removing a linked worktree doesn't take them with it.
+	CommonGitDir string
+	RepoID       string // shared across worktrees of the same repo
+	RepoName     string
+	WorktreeKey  string // unique per host+worktree
+	Cwd          string // cwd relative to Root ("." at root)
 	// Marked: Root is a Git worktree or holds a .spotexec.toml (the home
 	// directory, / and credential directories never count, Git or not). Otherwise it is just the directory
 	// spotexec was started in, which must not be synced wholesale (it may
@@ -59,6 +63,7 @@ func Resolve(dir string) (*Workspace, error) {
 	name := filepath.Base(root)
 	if isGit {
 		w.GitDir, _ = manifest.GitDir(root)
+		w.CommonGitDir = commonGitDir(root, w.GitDir)
 		if out, err := exec.Command("git", "-C", root, "config", "--get", "remote.origin.url").Output(); err == nil {
 			if u := normalizeRemote(strings.TrimSpace(string(out))); u != "" {
 				ident = u
@@ -88,6 +93,28 @@ func Resolve(dir string) (*Workspace, error) {
 	k := sha256.Sum256([]byte(host + "\x00" + root))
 	w.WorktreeKey = hex.EncodeToString(k[:])[:8]
 	return w, nil
+}
+
+// commonGitDir is the repository's common git dir for the worktree at root,
+// or gitDir when git can't say.
+func commonGitDir(root, gitDir string) string {
+	// --path-format=absolute (git 2.31+) gives the canonical path; older git
+	// echoes the unknown option back, and prints the dir relative to root.
+	out, err := exec.Command("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil || strings.Contains(strings.TrimSpace(string(out)), "\n") {
+		out, err = exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output()
+	}
+	if err != nil {
+		return gitDir
+	}
+	d := strings.TrimSpace(string(out))
+	if d == "" {
+		return gitDir
+	}
+	if !filepath.IsAbs(d) {
+		d = filepath.Join(root, d)
+	}
+	return d
 }
 
 // normalizeRemote strips scheme, credentials and .git so https and ssh
@@ -153,7 +180,7 @@ func saveLastRun(w *Workspace, lr LastRun) {
 
 // ManifestOptions are the manifest.Build options for project p rooted at
 // root. A container's Dockerfile, its companion .dockerignore and its build
-// context sync even inside built-in excludes such as .spotexec/, Git or
+// context sync even inside built-in excludes or Git-ignored paths, Git or
 // not: the runner builds the image from the synced copy.
 func ManifestOptions(root string, p *config.Project) manifest.Options {
 	o := manifest.Options{Root: root, Exclude: p.Sync.Exclude, Source: p.Sync.Source, Protect: p.Deps.CacheDirs}

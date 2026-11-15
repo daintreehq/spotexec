@@ -272,16 +272,17 @@ func TestWritebackMassDeletionGuard(t *testing.T) {
 		{8, 4, false}, // fewer than the minimum
 		{25, 25, true},
 	} {
-		committed := map[string]string{}
+		// Uncommitted work: only a backup would give it back.
+		local := map[string]string{}
 		var dels []string
 		for i := 0; i < c.files; i++ {
 			p := fmt.Sprintf("src/f%02d.txt", i)
-			committed[p] = p
+			local[p] = p
 			if i < c.dels {
 				dels = append(dels, p)
 			}
 		}
-		f := newWBFixture(t, true, committed, nil)
+		f := newWBFixture(t, true, nil, local)
 		wb := f.apply(t, dels, nil)
 		held, deleted := strings.Join(wb.Held, ","), strings.Join(wb.Deleted, ",")
 		if c.held && (held != strings.Join(dels, ",") || deleted != "") || !c.held && (held != "" || deleted != strings.Join(dels, ",")) {
@@ -296,6 +297,129 @@ func TestWritebackMassDeletionGuard(t *testing.T) {
 		} else {
 			gone(t, f.ws.Root, dels...)
 		}
+	}
+}
+
+// A restructuring is not a mass deletion: deletions git can undo, or whose
+// content comes back under another path (a move), apply; the guard holds
+// only the deletions of work that would otherwise be lost.
+func TestWritebackMassDeletionGuardAllowsMovesAndCommitted(t *testing.T) {
+	names := func(n int) (map[string]string, []string) {
+		files, dels := map[string]string{}, []string(nil)
+		for i := 0; i < n; i++ {
+			p := fmt.Sprintf("f%02d.txt", i)
+			files[p], dels = "body of "+p, append(dels, p)
+		}
+		return files, dels
+	}
+	moves := func(files map[string]string, dels []string) map[string]string {
+		w := map[string]string{}
+		for _, p := range dels {
+			w["lib/"+p] = files[p]
+		}
+		return w
+	}
+
+	// mkdir lib && mv f*.txt lib/: 11 of 13 committed files moved.
+	committed, dels := names(11)
+	committed["keep1"], committed["keep2"] = "k1", "k2"
+	f := newWBFixture(t, true, committed, nil)
+	wb := f.apply(t, dels, moves(committed, dels))
+	if len(wb.Held) != 0 || len(wb.Deleted) != len(dels) {
+		t.Fatalf("committed move: held %q, deleted %q", wb.Held, wb.Deleted)
+	}
+	gone(t, f.ws.Root, dels...)
+	if got := readOr(filepath.Join(f.ws.Root, "lib", "f00.txt")); got != "body of f00.txt" {
+		t.Errorf("moved file %q", got)
+	}
+
+	// The same move outside Git: nothing is committed, but every deleted
+	// file's content comes back under lib/.
+	local, dels := names(11)
+	local["keep1"], local["keep2"] = "k1", "k2"
+	f = newWBFixture(t, false, local, nil)
+	wb = f.apply(t, dels, moves(local, dels))
+	if len(wb.Held) != 0 || len(wb.Deleted) != len(dels) {
+		t.Fatalf("move outside git: held %q, deleted %q", wb.Held, wb.Deleted)
+	}
+	gone(t, f.ws.Root, dels...)
+
+	// Deleting most committed files outright: git can give them back.
+	f = newWBFixture(t, true, committed, nil)
+	wb = f.apply(t, dels, nil)
+	if len(wb.Held) != 0 || len(wb.Deleted) != len(dels) {
+		t.Fatalf("committed deletion: held %q, deleted %q", wb.Held, wb.Deleted)
+	}
+
+	// A move whose new copies differ (rewritten as they moved) gives the
+	// old content back nowhere: still a mass deletion.
+	f = newWBFixture(t, false, local, nil)
+	changed := map[string]string{}
+	for _, p := range dels {
+		changed["lib/"+p] = "rewritten " + p
+	}
+	wb = f.apply(t, dels, changed)
+	if strings.Join(wb.Held, ",") != strings.Join(dels, ",") || len(wb.Deleted) != 0 {
+		t.Fatalf("rewritten move: held %q, deleted %q", wb.Held, wb.Deleted)
+	}
+
+	// Recoverable deletions don't count toward the threshold: 5 lost of 11
+	// synced is under half, so nothing is held even with 11 deleted.
+	committed, cdels := names(6)
+	ulocal := map[string]string{"u1": "u1", "u2": "u2", "u3": "u3", "u4": "u4", "u5": "u5"}
+	udels := []string{"u1", "u2", "u3", "u4", "u5"}
+	f = newWBFixture(t, true, committed, ulocal)
+	wb = f.apply(t, append(append([]string{}, cdels...), udels...), nil)
+	if len(wb.Held) != 0 || len(wb.Deleted) != 11 {
+		t.Fatalf("under threshold: held %q, deleted %q", wb.Held, wb.Deleted)
+	}
+
+	// Outside Git: 5 moved and 5 lost of 10 synced. Only the lost are held.
+	local, mdels := names(5)
+	for p, b := range ulocal {
+		local[p] = b
+	}
+	f = newWBFixture(t, false, local, nil)
+	wb = f.apply(t, append(append([]string{}, mdels...), udels...), moves(local, mdels))
+	if strings.Join(wb.Held, ",") != strings.Join(udels, ",") || len(wb.Deleted) != len(mdels) {
+		t.Fatalf("moved and lost: held %q, deleted %q", wb.Held, wb.Deleted)
+	}
+	gone(t, f.ws.Root, mdels...)
+
+	// Mixed: committed deletions apply, while the 5 deletions of
+	// uncommitted work (5 of 10 synced) are held.
+	committed, cdels = names(5)
+	f = newWBFixture(t, true, committed, ulocal)
+	wb = f.apply(t, append(append([]string{}, cdels...), udels...), nil)
+	if strings.Join(wb.Held, ",") != strings.Join(udels, ",") {
+		t.Fatalf("mixed: held %q, want %q", wb.Held, udels)
+	}
+	if len(wb.Deleted) != len(cdels) {
+		t.Errorf("mixed: deleted %q, want %q", wb.Deleted, cdels)
+	}
+	gone(t, f.ws.Root, cdels...)
+	for _, p := range udels {
+		if _, err := os.Lstat(filepath.Join(f.ws.Root, p)); err != nil {
+			t.Errorf("mixed: held %s was deleted", p)
+		}
+	}
+	if !strings.Contains(wb.HeldWhy, "5 of the 10") {
+		t.Errorf("mixed: reason %q", wb.HeldWhy)
+	}
+
+	// The project's own .gitignore is held whatever else happens, and
+	// named once when it is among the lost files too.
+	local, dels = names(5)
+	local[".gitignore"] = "x\n"
+	f = newWBFixture(t, false, local, nil)
+	wb = f.apply(t, append(dels, ".gitignore"), nil)
+	if got, want := strings.Join(wb.Held, ","), ".gitignore,"+strings.Join(dels, ","); got != want {
+		t.Errorf("protected and lost: held %q, want %q", got, want)
+	}
+	f = newWBFixture(t, true, local, nil)
+	wb = f.apply(t, append(dels, ".gitignore"), nil)
+	if got := strings.Join(wb.Held, ","); got != ".gitignore" || len(wb.Deleted) != len(dels) {
+		t.Errorf("committed with .gitignore: held %q, deleted %q", got, wb.Deleted)
 	}
 }
 

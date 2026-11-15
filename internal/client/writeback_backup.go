@@ -21,8 +21,9 @@ import (
 )
 
 // Mass-deletion guard: a write-back that would delete at least
-// massDeleteMin files and at least half of the synced files holds all its
-// deletions back. Deleting the project's own root .spotexec.toml or
+// massDeleteMin files and at least half of the synced files, counting only
+// files neither committed nor moved (their content written back under
+// another path), holds those deletions back. Deleting the project's own root .spotexec.toml or
 // .gitignore is always held back.
 const massDeleteMin = 5
 

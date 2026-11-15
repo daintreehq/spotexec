@@ -193,7 +193,18 @@ func TestRegions(t *testing.T) {
 			t.Errorf("%s with regions: %v", ok, err)
 		}
 	}
+	g, err = loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregions = [\"all\"]\nexclude_regions = [\"ap-south-2\", \"me-central-1\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := g.Runners["aws"]; !r.AnyRegion() || strings.Join(r.ExcludeRegions, ",") != "ap-south-2,me-central-1" {
+		t.Fatalf("all but some: %+v", r)
+	}
 	for name, body := range map[string]string{
+		"exclude, list":      "regions = [\"us-east-1\", \"us-east-2\"]\nexclude_regions = [\"us-east-2\"]\n",
+		"exclude, region":    "region = \"us-east-1\"\nexclude_regions = [\"us-east-2\"]\n",
+		"exclude invalid":    "regions = [\"all\"]\nexclude_regions = [\"mars\"]\n",
+		"exclude all":        "regions = [\"all\"]\nexclude_regions = [\"all\"]\n",
 		"region and regions": "region = \"us-east-1\"\nregions = [\"us-east-1\", \"us-east-2\"]\n",
 		"all plus a region":  "regions = [\"all\", \"us-east-1\"]\n",
 		"invalid region":     "regions = [\"us-east-1\", \"mars\"]\n",
@@ -226,6 +237,13 @@ func TestProjectCannotSetRegions(t *testing.T) {
 	if err := (&Config{Global: g, Project: p}).MergeProjectRunners(); err == nil || !strings.Contains(err.Error(), `"regions" can only be set in the global config`) {
 		t.Fatalf("a repository must not widen where code runs: %v", err)
 	}
+	os.WriteFile(pp, []byte("version = 1\n[runners.aws2]\nextends = \"aws\"\nexclude_regions = []\n"), 0o644)
+	if p, err = LoadProject(pp); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Config{Global: g, Project: p}).MergeProjectRunners(); err == nil || !strings.Contains(err.Error(), `"exclude_regions" can only be set in the global config`) {
+		t.Fatalf("a repository must not widen where code runs: %v", err)
+	}
 	// Extending a multi-region runner keeps its regions.
 	os.WriteFile(pp, []byte("version = 1\n[runners.big]\nextends = \"aws\"\nmax_slots = 1\n"), 0o644)
 	p, _ = LoadProject(pp)
@@ -240,6 +258,31 @@ func TestProjectCannotSetRegions(t *testing.T) {
 	r.Regions[0] = "changed"
 	if g.Runners["aws"].Regions[0] != "eu-north-1" {
 		t.Fatal("extending must copy the region list")
+	}
+}
+
+func TestExtendKeepsExcludedRegions(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregions = [\"all\"]\nexclude_regions = [\"ap-south-2\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte("version = 1\n[runners.big]\nextends = \"aws\"\nmax_slots = 1\n"), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Global: g, Project: p}
+	if err := c.MergeProjectRunners(); err != nil {
+		t.Fatal(err)
+	}
+	r := c.Global.Runners["big"]
+	if !r.AnyRegion() || strings.Join(r.ExcludeRegions, ",") != "ap-south-2" {
+		t.Fatalf("extended: %+v", r)
+	}
+	r.ExcludeRegions[0] = "changed"
+	if g.Runners["aws"].ExcludeRegions[0] != "ap-south-2" {
+		t.Fatal("extending must copy exclude_regions")
 	}
 }
 
@@ -370,7 +413,7 @@ func TestInstanceRequirements(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := g.Runners["aws"]
-	if !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.Arch != "amd64" || r.MinGeneration != DefaultMinGeneration || r.LaunchOrder != LaunchCheapest {
+	if !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.Arch != "amd64" || r.MinGeneration != DefaultMinGeneration || r.LaunchOrder != LaunchRunCost || r.WaitCostPerHour() != DefaultWaitCost {
 		t.Fatalf("vcpus runner: %+v", r)
 	}
 	g, err = loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nvcpus = 8\narch = \"arm64\"\ninstance_types = [\"m*g*\", \"c7g.2xlarge\"]\nexclude_instance_types = [\"*d.*\"]\nmin_generation = 7\n")
@@ -402,6 +445,13 @@ func TestInstanceRequirements(t *testing.T) {
 		"bad launch order":          "launch_order = \"random\"\n",
 		"listed without types":      "vcpus = 8\nlaunch_order = \"listed\"\n",
 		"listed list with no types": "instance_types = []\nvcpus = 4\nlaunch_order = \"listed\"\n",
+		"negative wait_cost":        "wait_cost = -1\n",
+		"nan wait_cost":             "wait_cost = nan\n",
+		"infinite wait_cost":        "wait_cost = inf\n",
+		"-infinite wait_cost":       "wait_cost = -inf\n",
+		"huge wait_cost":            "wait_cost = 10001\n",
+		"wordy wait_cost":           "wait_cost = \"a lot\"\n",
+		"boolean wait_cost":         "wait_cost = true\n",
 	} {
 		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\n"+body); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -423,6 +473,73 @@ func TestMatchType(t *testing.T) {
 		if got := MatchType(c.p, c.t); got != c.ok {
 			t.Errorf("MatchType(%q, %q) = %v", c.p, c.t, got)
 		}
+	}
+}
+
+// wait_cost takes a number or a dollar string, and an explicit 0 is kept
+// (launch costs then count only the Spot bill).
+func TestWaitCost(t *testing.T) {
+	if DefaultWaitCost != 1 {
+		t.Fatalf("documented default is $1/h, not %g", DefaultWaitCost)
+	}
+	for body, want := range map[string]float64{
+		"":                        1,
+		"wait_cost = 10000\n":     10000,
+		"wait_cost = 0\n":         0,
+		"wait_cost = 3\n":         3,
+		"wait_cost = 0.25\n":      0.25,
+		"wait_cost = \"$12.5\"\n": 12.5,
+		"wait_cost = \"2\"\n":     2,
+	} {
+		g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n"+body)
+		if err != nil {
+			t.Fatalf("%q: %v", body, err)
+		}
+		r := g.Runners["aws"]
+		if got := r.WaitCostPerHour(); got != want {
+			t.Errorf("%q: wait cost %g, want %g", body, got, want)
+		}
+		// A fixed list defaults to run_cost too (it ranks by price in one
+		// region anyway).
+		if r.LaunchOrder != LaunchRunCost {
+			t.Errorf("%q: launch order %q", body, r.LaunchOrder)
+		}
+		// It encodes back to what was set ("" when unset).
+		b, _ := r.WaitCost.MarshalText()
+		var back Dollars
+		if r.WaitCost.Set {
+			if err := back.UnmarshalText(b); err != nil || back != r.WaitCost {
+				t.Errorf("%q: round trip %q -> %+v (%v)", body, b, back, err)
+			}
+		} else if len(b) != 0 {
+			t.Errorf("unset encodes as %q", b)
+		}
+	}
+	// A project runner inherits it, and may override it.
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwait_cost = 5\nlaunch_order = \"cheapest\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte("version = 1\n[runners.same]\nextends = \"aws\"\nvcpus = 8\n[runners.batch]\nextends = \"aws\"\nwait_cost = 0\n"), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Global: g, Project: p}
+	if err := c.MergeProjectRunners(); err != nil {
+		t.Fatal(err)
+	}
+	// Switching to vcpus keeps an inherited cheapest (only "listed" needs the
+	// list it drops).
+	if r := c.Global.Runners["same"]; r.WaitCostPerHour() != 5 || r.LaunchOrder != LaunchCheapest {
+		t.Fatalf("same: %+v", r)
+	}
+	if r := c.Global.Runners["batch"]; r.WaitCostPerHour() != 0 || !r.WaitCost.Set {
+		t.Fatalf("batch: %+v", r)
+	}
+	if g.Runners["aws"].WaitCostPerHour() != 5 {
+		t.Fatal("base runner must not be modified")
 	}
 }
 
@@ -454,7 +571,7 @@ min_memory_gib = 32
 	if err := c.MergeProjectRunners(); err != nil {
 		t.Fatal(err)
 	}
-	if r := c.Global.Runners["big"]; !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.MinMemoryGiB != 32 || r.LaunchOrder != LaunchCheapest {
+	if r := c.Global.Runners["big"]; !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.MinMemoryGiB != 32 || r.LaunchOrder != LaunchRunCost {
 		t.Fatalf("big: %+v", r)
 	}
 	if r := c.Global.Runners["listed"]; r.ByRequirements() || r.MinGeneration != 0 || len(r.ExcludeInstanceTypes) != 0 || r.InstanceTypes[0] != "c7a.2xlarge" {
@@ -795,7 +912,7 @@ func TestWritebackLimits(t *testing.T) {
 }
 
 func TestParseBytes(t *testing.T) {
-	for in, want := range map[string]int64{"0": 0, "512": 512, "512B": 512, "4KB": 4096, "4k": 4096, "100MB": 100 << 20, "100 MiB": 100 << 20, "2GB": 2 << 30, "0.5MB": 512 << 10} {
+	for in, want := range map[string]int64{"0": 0, "0.0": 0, "0KB": 0, "512": 512, "512B": 512, "4KB": 4096, "4k": 4096, "100MB": 100 << 20, "100 MiB": 100 << 20, "2GB": 2 << 30, "0.5MB": 512 << 10, "1.5": 1, "1": 1, "1B": 1, "0.0009765625KB": 1, "-0": 0, "0e5": 0} {
 		if got, err := ParseBytes(in); err != nil || got != want {
 			t.Errorf("ParseBytes(%q) = %d, %v; want %d", in, got, err, want)
 		}
@@ -804,5 +921,79 @@ func TestParseBytes(t *testing.T) {
 		if _, err := ParseBytes(in); err == nil {
 			t.Errorf("ParseBytes(%q) accepted", in)
 		}
+	}
+	// Below one byte would truncate to 0, which turns a limit off: only an
+	// explicit zero may do that.
+	// (1e-400 underflows to 0 when parsed, but isn't zero.)
+	for _, in := range []string{"0.4", "+0.4", "0.4B", "0.0001KB", "1e-10GB", "0.999", "1e-400", "1e-400GB", "-1e-400", "0x1p-2000"} {
+		if _, err := ParseBytes(in); err == nil || !strings.Contains(err.Error(), "below one byte") {
+			t.Errorf("ParseBytes(%q) = %v, want a below-one-byte error", in, err)
+		}
+	}
+	// In the config, that is an error on load, quoted or not.
+	for v, want := range map[string]int64{`"0.4"`: -1, `0.4`: -1, `0.0000001`: -1, `0.9999999`: -1, `0`: 0, `0.0`: 0, `2048`: 2048, `"2KB"`: 2048, `1024.0`: 1024} {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		if err := os.WriteFile(pp, []byte("version = 1\n[sync]\nwriteback_max_bytes = "+v+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		p, err := LoadProject(pp)
+		switch {
+		case want < 0:
+			if err == nil || !strings.Contains(err.Error(), "below one byte") {
+				t.Errorf("writeback_max_bytes = %s loaded: %v", v, err)
+			}
+		case err != nil || int64(p.Sync.WritebackMaxBytes) != want:
+			t.Errorf("writeback_max_bytes = %s: %v, %v; want %d", v, p, err, want)
+		}
+	}
+}
+
+func TestConfigVersion(t *testing.T) {
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	const upgrade = "; upgrade spotexec to use this config"
+	for _, tc := range []struct {
+		name, body string
+		want       string // the error after the path; empty: accepted
+	}{
+		{"current", "version = 1\n", ""},
+		{"absent", "", ""},
+		{"newer", "version = 2\n", "version = 2 isn't supported (supported: 1)" + upgrade},
+		// A newer format's keys are unknown here: the version says why.
+		{"newer with new keys", "version = 3\nnew_key = true\n", "version = 3 isn't supported (supported: 1)" + upgrade},
+		// The decoder reads Version as version, so the check must too.
+		{"mixed case", "Version = 2\n", "version = 2 isn't supported (supported: 1)" + upgrade},
+		{"zero", "version = 0\n", "version = 0 isn't supported (supported: 1)"},
+		{"negative", "version = -1\n", "version = -1 isn't supported (supported: 1)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			gp := filepath.Join(dir, "global.toml")
+			if err := os.WriteFile(gp, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("SPOTEXEC_CONFIG", gp)
+			_, gerr := LoadGlobal()
+			pp := filepath.Join(dir, ".spotexec.toml")
+			if err := os.WriteFile(pp, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, perr := LoadProject(pp)
+			cerr := CheckVersion(pp)
+			for which, c := range map[string]struct {
+				path string
+				err  error
+			}{"global": {gp, gerr}, "project": {pp, perr}, "CheckVersion": {pp, cerr}} {
+				if tc.want == "" {
+					if c.err != nil {
+						t.Errorf("%s: %v", which, c.err)
+					}
+					continue
+				}
+				if want := c.path + ": " + tc.want; c.err == nil || c.err.Error() != want {
+					t.Errorf("%s: got %v, want %s", which, c.err, want)
+				}
+			}
+		})
 	}
 }

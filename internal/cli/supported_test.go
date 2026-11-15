@@ -193,6 +193,11 @@ func TestSupported(t *testing.T) {
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\nnot_a_key = true\n")
 			return d
 		}, false},
+		{"project config from a newer spotexec", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 2\n")
+			return d
+		}, false},
 		{"no runners", "", func(t *testing.T) string {
 			d := initRepo(t)
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n")
@@ -257,6 +262,42 @@ func TestSupported(t *testing.T) {
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"../outside.lock\"]\n")
 			return d
 		}, false},
+		{"deps lockfile literal missing", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"*.lock\", \"api/package-lock.json\"]\n")
+			putFile(t, filepath.Join(d, "yarn.lock"), "{}\n")
+			putFile(t, filepath.Join(d, "api", "index.js"), "\n")
+			return d
+		}, false},
+		// The runner may reach these, so they are left to it.
+		{"deps lockfile literal under a symlink", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"shared/lib/package-lock.json\"]\n")
+			if err := os.Symlink(t.TempDir(), filepath.Join(d, "shared")); err != nil {
+				t.Fatal(err)
+			}
+			return d
+		}, true},
+		{"deps lockfile literal in a cache dir", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"/node_modules/\", \"packages/*/node_modules\"]\nlockfiles = [\"node_modules/.package-lock.json\", \"packages/a/node_modules/.yarn-state.yml\"]\n")
+			return d
+		}, true},
+		// An ignored file an earlier run made stays in the slot.
+		{"deps lockfile literal ignored", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"generated/package-lock.json\"]\n")
+			putFile(t, filepath.Join(d, ".gitignore"), "generated/\n")
+			return d
+		}, true},
+		// ...but not one below a synced file: the next sync clears it.
+		{"deps lockfile literal ignored below a synced file", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"gen/deps.lock\"]\n")
+			putFile(t, filepath.Join(d, ".gitignore"), "*.lock\n")
+			putFile(t, filepath.Join(d, "gen"), "a file\n")
+			return d
+		}, false},
 		{"deps lockfile literal synced", sshRunner, func(t *testing.T) string {
 			d := initRepo(t)
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"package-lock.json\"]\n")
@@ -270,6 +311,19 @@ func TestSupported(t *testing.T) {
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[container]\ndockerfile = \"Dockerfile\"\n")
 			return d
 		}, true},
+		{"container dockerfile, exec through SPOTEXEC_SAME_SLOT=True", sshRunner, func(t *testing.T) string {
+			t.Setenv("SPOTEXEC_SAME_SLOT", "True")
+			t.Setenv("SPOTEXEC_SYNC", "none")
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[container]\ndockerfile = \"Dockerfile\"\n")
+			return d
+		}, true},
+		{"SPOTEXEC_SAME_SLOT is not a boolean", sshRunner, func(t *testing.T) string {
+			t.Setenv("SPOTEXEC_SAME_SLOT", "on")
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n")
+			return d
+		}, false},
 		{"container image needs no local files", sshRunner, func(t *testing.T) string {
 			d := initRepo(t)
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[container]\nimage = \"alpine\"\n")
@@ -284,16 +338,20 @@ func TestSupported(t *testing.T) {
 	// Why the cases that check what a run checks on the local files are
 	// false: each must fail for its own reason, not an earlier one.
 	reasons := map[string]string{
-		"container dockerfile missing":                 `container.dockerfile ".spotexec/Missing" is not in the synced working set`,
-		"container dockerfile excluded from sync":      "excludes it",
-		"container dockerfile is a symlink":            "not a symlink",
-		"container dockerfile without a sync":          "needs a synced workspace",
-		"container context outside the repository":     "container.context",
-		"deps lockfiles match nothing":                 "deps.lockfiles matches no synced file",
-		"deps lockfile literal outside the repository": "deps.lockfiles: ",
-		"broken project config":                        ".spotexec.toml: unknown keys",
-		"no project config":                            "has no .spotexec.toml",
-		"pool names an unknown runner":                 "nope",
+		"container dockerfile missing":                      `container.dockerfile ".spotexec/Missing" is not in the synced working set`,
+		"container dockerfile excluded from sync":           "excludes it",
+		"container dockerfile is a symlink":                 "not a symlink",
+		"container dockerfile without a sync":               "needs a synced workspace",
+		"container context outside the repository":          "container.context",
+		"deps lockfiles match nothing":                      "deps.lockfiles matches no synced file",
+		"deps lockfile literal outside the repository":      "deps.lockfiles: ",
+		"deps lockfile literal missing":                     "deps.lockfiles: api/package-lock.json doesn't exist",
+		"deps lockfile literal ignored below a synced file": "deps.lockfiles: gen/deps.lock doesn't exist",
+		"broken project config":                             ".spotexec.toml: unknown keys",
+		"project config from a newer spotexec":              "version = 2 isn't supported (supported: 1)",
+		"no project config":                                 "has no .spotexec.toml",
+		"pool names an unknown runner":                      "nope",
+		"SPOTEXEC_SAME_SLOT is not a boolean":               "SPOTEXEC_SAME_SLOT must be",
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

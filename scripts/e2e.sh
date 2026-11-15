@@ -129,6 +129,15 @@ docker exec "$NAME" pkill -KILL -f 'spotexec-helper.* rpc' && killed=1 || killed
 wait $P || true
 run 'test -e died.txt && echo leaked || echo clean' || true
 check "a file created by a run whose helper died is removed by the next synced run" "[ $remote = 1 ] && [ $killed = 1 ] && grep -qx clean $WORK/last.out"
+run 'mkdir -p only/.git; echo y > only/.git/config' || true
+check "write-back names a .git directory a run made below the root" "ev 'WRITEBACK_REFUSED.*only/\.git' | grep -q ."
+run 'mkdir -p sub/.git deep/x/.git dist/clone/.git; echo y > sub/.git/config; echo r > deep/x/.git/HEAD; echo n > deep/x/file; echo c > dist/clone/.git/HEAD; test -e only/.git && echo leaked-only' || true
+check "the next synced run removes it" "! grep -q leaked-only $WORK/last.out"
+check "nested .git directories never come back, their neighbours do" "test ! -e sub/.git && test ! -e deep/x/.git && test -f deep/x/file"
+check "write-back names each one, but not one in an ignored directory" "ev 'WRITEBACK_REFUSED.*deep/x/\.git, sub/\.git' | grep -q . && ! ev 'WRITEBACK_REFUSED.*dist/clone' | grep -q ."
+run 'for d in sub/.git deep/x/.git; do test -e $d && echo leaked-$d; done; test -e dist/clone/.git && echo kept; echo checked' || true
+check "the next synced run removes them, and keeps the ignored one" "grep -qx checked $WORK/last.out && ! grep -q leaked $WORK/last.out && grep -qx kept $WORK/last.out"
+rm -rf deep
 run 'mkdir -p dist; echo o > dist/only.js' || true
 run true
 check "a run that only creates ignored outputs keeps the fingerprint shortcut" "ev fingerprint_hit | grep -q ."

@@ -2,7 +2,9 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -32,7 +34,7 @@ command too, unless it is named like one of the commands below.
 // subcommands that take precedence over the shorthand form.
 var subcommands = map[string]bool{
 	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
-	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
+	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true, "backups": true,
 	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
 	"completion": true, "sim": true, "image": true, "prices": true, "daemon": true, "container": true, "setup": true, "teardown": true, "supported": true, "__complete": true, "__completeNoDesc": true,
 }
@@ -69,7 +71,7 @@ func MainAs(name string, args []string) int {
 		if len(rest) > 0 && (dashed || !subcommands[rest[0]]) {
 			return shorthand(&f, rest, dashed)
 		}
-		if len(rest) == 0 && fs.NFlag() > 0 {
+		if len(rest) == 0 && (fs.NFlag() > 0 || dashed) {
 			fmt.Fprintln(os.Stderr, "spotexec: missing command")
 			return client.ExitInfra
 		}
@@ -107,7 +109,26 @@ func exitWith(code int) error {
 	return exitCode(code)
 }
 
+// checkCommand rejects a run with no command, or only blank words: an empty
+// remote shell line would run nothing and exit 0, which reads as a pass
+// (sx "$CMD" with CMD unset).
+func checkCommand(args []string) error {
+	if len(args) == 0 {
+		return errors.New("missing command")
+	}
+	for _, a := range args {
+		if strings.TrimSpace(a) != "" {
+			return nil
+		}
+	}
+	return errors.New("empty command")
+}
+
 func shorthand(f *runFlags, rest []string, dashed bool) int {
+	if err := checkCommand(rest); err != nil {
+		fmt.Fprintln(os.Stderr, "spotexec:", err)
+		return client.ExitInfra
+	}
 	l, err := load(f.dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "spotexec:", err)
@@ -141,7 +162,7 @@ func newRoot() *cobra.Command {
 	}
 	root.AddCommand(
 		cmdRun(), cmdExec(), cmdSync(), cmdSyncPlan(), cmdPull(), cmdStatus(), cmdMonitor(),
-		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdInit(), cmdHook(),
+		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdBackups(), cmdInit(), cmdHook(),
 		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdPrices(), cmdDaemon(), cmdContainer(), cmdSetup(), cmdTeardown(), cmdSupported(),
 	)
 	root.SetVersionTemplate("spotexec {{.Version}}\n") // as `spotexec version` and `sx --version`
@@ -175,13 +196,17 @@ func cmdRun() *cobra.Command {
 	f.register(c.Flags())
 	// A bad flag must not look like the command's own exit 1 or 2.
 	c.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return infraExit(err) })
-	c.Args = func(cmd *cobra.Command, args []string) error {
-		if len(args) == 0 {
-			return infraExit(fmt.Errorf("missing command"))
-		}
-		return nil
-	}
+	c.Args = commandArgs
 	return c
+}
+
+// commandArgs is run's and exec's argument check: a command that isn't
+// empty, or exit 125.
+func commandArgs(_ *cobra.Command, args []string) error {
+	if err := checkCommand(args); err != nil {
+		return infraExit(err)
+	}
+	return nil
 }
 
 func cmdExec() *cobra.Command {
@@ -202,12 +227,7 @@ func cmdExec() *cobra.Command {
 	f.register(c.Flags())
 	// A bad flag must not look like the command's own exit 1 or 2.
 	c.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return infraExit(err) })
-	c.Args = func(cmd *cobra.Command, args []string) error {
-		if len(args) == 0 {
-			return infraExit(fmt.Errorf("missing command"))
-		}
-		return nil
-	}
+	c.Args = commandArgs
 	return c
 }
 
@@ -261,9 +281,14 @@ func sxMain(args []string) int {
 	case *version:
 		fmt.Println("spotexec", Version)
 		return 0
-	case *help || len(rest) == 0 && fs.NFlag() == 0:
-		sxHelp(fs, f.dir)
+	case *help:
+		sxHelp(os.Stdout, fs, f.dir)
 		return 0
+	case len(args) == 0:
+		// No command is a usage error, even with the help printed: a
+		// script whose command came out empty must not see a pass.
+		sxHelp(os.Stderr, fs, f.dir)
+		return client.ExitInfra
 	case len(rest) == 0:
 		fmt.Fprintln(os.Stderr, "sx: missing command (sx -h for usage)")
 		return client.ExitInfra
@@ -271,8 +296,8 @@ func sxMain(args []string) int {
 	return shorthand(&f, rest, fs.ArgsLenAtDash() == 0)
 }
 
-func sxHelp(fs *pflag.FlagSet, dir string) {
-	fmt.Printf(`sx runs a command from this worktree on a remote runner: it syncs the
+func sxHelp(w io.Writer, fs *pflag.FlagSet, dir string) {
+	fmt.Fprintf(w, `sx runs a command from this worktree on a remote runner: it syncs the
 worktree, runs the command there, streams its output, and writes the files it
 changed back here.
 
@@ -294,9 +319,9 @@ doctor, down, …); see spotexec -h.
 			names = append(names, n)
 		}
 		sort.Strings(names)
-		fmt.Println("\nTasks in this project:")
+		fmt.Fprintln(w, "\nTasks in this project:")
 		for _, n := range names {
-			fmt.Printf("  %-18s %s\n", n, l.cfg.Project.Tasks[n].Describe())
+			fmt.Fprintf(w, "  %-18s %s\n", n, l.cfg.Project.Tasks[n].Describe())
 		}
 	}
 }

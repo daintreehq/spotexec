@@ -490,8 +490,9 @@ func (s *Session) exec(e protocol.Exec) error {
 		post := s.takeSnapshot(e.Skip)
 		var unreported []string
 		res.Changed, res.Deleted, res.Created, res.Truncated, res.Unverified, unreported = s.diff(pre, post)
+		res.GitDirs = newGitDirs(pre, post)
 		res.SnapshotMS = time.Since(t).Milliseconds()
-		s.state.Pending = s.pendingAfter(res.Created, res.Unverified, unreported)
+		s.state.Pending = s.pendingAfter(res.Created, res.Unverified, append(unreported, res.GitDirs...))
 		s.state.Sweep, s.state.SweepSkip = false, nil
 		if err := s.saveStored(); err != nil {
 			return err

@@ -134,6 +134,9 @@ func (c *awsClient) do(ctx context.Context, service, contentType string, extra m
 	if err != nil {
 		return 0, nil, err
 	}
+	if _, overridden := c.endpoints[service]; service == "ec2" && !overridden {
+		ctx = traceConnect(ctx, c.region) // how far the region is (see RunCost)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(service), bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, err

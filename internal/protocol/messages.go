@@ -36,6 +36,8 @@ const (
 	TypeGitNeed     = "git_need"
 	TypeGitSeeded   = "git_seeded"
 	TypeGitDrop     = "git_drop" // no body, no reply: remove a .git an earlier seed left in the slot
+	TypeShareWait   = "share_wait"
+	TypeShareDone   = "share_done"
 )
 
 // MaxSlots caps slots per machine, explicit (max_slots) or automatic
@@ -224,6 +226,9 @@ type Image struct {
 	// WaitPush pushes a fresh build to Registry before replying (instead of
 	// in the background), so a push failure is reported.
 	WaitPush bool `json:"wait_push,omitempty"`
+	// Probe uses an image already on the runner or in Registry, but never
+	// builds one: a miss is reported as ImageResult.Missing.
+	Probe bool `json:"probe,omitempty"`
 }
 
 // ImageResult reports the local image reference to run.
@@ -234,6 +239,7 @@ type ImageResult struct {
 	Built           bool   `json:"built"`
 	Pushing         bool   `json:"pushing"`
 	Pushed          bool   `json:"pushed,omitempty"`
+	Missing         bool   `json:"missing,omitempty"` // Probe: neither on the runner nor in the registry
 	InstalledDocker bool   `json:"installed_docker"`
 	MS              int64  `json:"ms"`
 }
@@ -256,6 +262,10 @@ type Deps struct {
 	Toolchain string        `json:"toolchain,omitempty"` // part of the key (see depskey.Toolchain)
 	CacheGet  string        `json:"cache_get,omitempty"`
 	CachePut  string        `json:"cache_put,omitempty"`
+	// Probe hydrates from the runner's own cache or restores from the
+	// shared one, but never installs: a miss is reported as
+	// DepsResult.Missing.
+	Probe bool `json:"probe,omitempty"`
 }
 
 // DepsResult reports hydration.
@@ -265,8 +275,30 @@ type DepsResult struct {
 	Restored bool   `json:"restored"`  // fetched from the shared cache instead of installing
 	Uploaded bool   `json:"uploading"` // a background upload to the shared cache started
 	Hydrated bool   `json:"hydrated"`
+	Missing  bool   `json:"missing,omitempty"` // Probe: nothing to restore, an install is needed
 	Method   string `json:"method"`
 	MS       int64  `json:"ms"`
+}
+
+// ShareWait asks the helper to wait for the background transfer this
+// session started for Kind (ShareDeps: the dependency cache upload;
+// ShareImage: the image push), so the runs waiting for it can fetch it.
+type ShareWait struct {
+	Kind      string `json:"kind"`
+	TimeoutMS int64  `json:"timeout_ms"`
+}
+
+// ShareWait kinds.
+const (
+	ShareDeps  = "deps"
+	ShareImage = "image"
+)
+
+// ShareDone answers ShareWait: whether the transfer finished and succeeded.
+type ShareDone struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"` // why not
+	MS      int64  `json:"ms"`
 }
 
 // Exec runs a command in the slot workspace.
@@ -307,6 +339,9 @@ type Result struct {
 	Changed    []Entry  `json:"changed,omitempty"` // manifest files with new content/mode
 	Deleted    []string `json:"deleted,omitempty"` // manifest files removed
 	Created    []Entry  `json:"created,omitempty"` // non-manifest files created/changed
+	// GitDirs are the .git directories below the root the run created:
+	// never written back, and removed by the next sync unless ignored.
+	GitDirs    []string `json:"git_dirs,omitempty"`
 	Truncated  bool     `json:"truncated,omitempty"`
 	Unverified []string `json:"unverified,omitempty"` // paths that could not be read after the run
 	SnapshotMS int64    `json:"snapshot_ms"`
