@@ -39,6 +39,7 @@ A parallel or sharded task's parts run in several slots at once, so `--same-slot
 | `--queue-timeout D` | How long to wait for a free slot (default `10m`, or the project `queue_timeout`). |
 | `--sync auto\|in\|none` | `auto` syncs and writes back; `in` syncs and discards changes; `none` runs on whatever the slot has. |
 | `--writeback always\|on-success\|never` | When changes come back. |
+| `--fail-on-conflict` | Exit `122` when the command succeeded but write-back kept a local edit over one of its changes (`SYNC_CONFLICT`), so a caller that only reads the exit status knows the changes didn't all land. Also `SPOTEXEC_FAIL_ON_CONFLICT=1`. See [write-back](#write-back-and-artifacts). |
 | `-r, --runner NAME` / `--pool A,B` | Restrict where the command may run. |
 | `--same-slot` | Run in this worktree's last slot (same VM), waiting if it's busy. See [above](#coming-back-to-the-same-machine). |
 | `--exclusive` | Take every slot on a machine (the job gets all its CPUs). |
@@ -98,6 +99,7 @@ The runner itself needs `git` installed, even when commands run in a project con
 | --- | --- |
 | *command's own* | The remote command's exit status, passed through. |
 | `1` | Also: the project's [`[setup]`](configuration.md#setup) failed (`SETUP_FAILED`), so the command never ran. |
+| `122` | With `--fail-on-conflict` (or `SPOTEXEC_FAIL_ON_CONFLICT=1`) only: the command exited `0`, but write-back kept your version of at least one file it changed (`SYNC_CONFLICT`). A command that failed, timed out or was interrupted keeps its own code. In a parallel or sharded task the part counts as failed, so `fail_fast` stops the rest. |
 | `124` | The command hit `--timeout`, or `[setup]` hit its timeout. |
 | `125` | spotexec itself failed: no runner, SSH, sync, bootstrap, or the runner couldn't start the command at all. In a parallel or sharded task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". A Spot VM lost mid-run is replayed once on another slot (unless `--no-retry`), but not when its heartbeats showed it out of memory (`MEMORY_PRESSURE`), or when EC2 still reports it running and it gave no Spot notice (`RUNNER_UNRESPONSIVE`): the run may be what overloaded it, and replayed it could take another VM's jobs down with it. |
 | `128+N` | The command died from signal N. An `OOM_KILLED` warning (with `137`, SIGKILL, when the killed process was the command itself) means the kernel killed a process in the command's container because the VM's jobs together reached their [memory pool](environments.md#settings)'s cap and it was the largest (or, outside the pool, because the container reached a memory limit set in `container.options`, or the whole VM ran out): the command ran out of memory, and the run isn't replayed. `134` (SIGABRT) with `JavaScript heap out of memory` or `Ineffective mark-compacts near heap limit` in the output is Node's own heap limit, not the machine's: raise `--max-old-space-size`. |
@@ -112,6 +114,8 @@ The manifest records the Git blob ID of every synced file: the **baseline**. Aft
 | Equals the remote result | Nothing to do. |
 | Equals the baseline | The remote version is applied atomically (temp file, then rename). Your file keeps its permissions; only an executable-bit change made remotely comes back. |
 | Anything else | You edited it during the run. **Your file is kept**, the remote version is saved to `<git-dir>/spotexec/conflicts/<run-id>/<path>`, and a `SYNC_CONFLICT` warning gives a ready-to-run `git diff --no-index` command comparing your file with the remote version. With `--json`, a `conflict` event carries both paths and that command. |
+
+The summary line counts the conflicts (`· 1 conflict`), and every `result` event carries `conflict_count` (a parallel or sharded task's also has each part's in `parts`). The exit status is still the command's own, since its other changes did land; with `--fail-on-conflict` a run that would have exited `0` exits `122` instead. A conflict never rolls back what was applied.
 
 Before write-back deletes or replaces a local file, it checks whether Git could give that version back: HEAD holds the same path with the same content and mode. If not (an untracked file, an uncommitted or staged edit, or any file outside Git), your version is first copied to `<git-dir>/spotexec/backup/<run-id>/<path>` (`.spotexec/backup/<run-id>/` outside Git), and a `WRITEBACK_BACKUP` warning says where. So a remote `git checkout -- .`, `git clean` or `rm -rf` never takes work that exists only on this machine. With `--json`, a `backup` event lists the files and the directory. Backups, like conflicts, stay until you remove them.
 

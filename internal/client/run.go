@@ -37,6 +37,9 @@ const (
 	ExitInfra       = 125
 	ExitTimeout     = 124
 	ExitInterrupted = 130 // Ctrl-C, SIGTERM or SIGHUP
+	// ExitWritebackConflict: with Options.FailOnConflict, the command
+	// succeeded but write-back kept a local edit over one of its changes.
+	ExitWritebackConflict = 122
 )
 
 // Large-sync guardrails.
@@ -76,6 +79,10 @@ type Options struct {
 	SyncOnly       bool // stop after sync + deps (spotexec sync)
 	WaitPush       bool // push a freshly built image before returning (container build)
 	Priority       int  // queue priority when every slot is busy (higher first)
+	// FailOnConflict turns a successful run whose write-back conflicted
+	// into ExitWritebackConflict, so its exit status says the changes
+	// didn't all land.
+	FailOnConflict bool
 	// Env is set for the command over the project's env (a shard's
 	// SPOTEXEC_SHARD and SPOTEXEC_SHARDS).
 	Env map[string]string
@@ -476,7 +483,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	if o.SyncOnly {
 		res.Duration = time.Since(start)
-		o.Rep.Event("result", map[string]any{"exit_code": 0, "duration_ms": res.Duration.Milliseconds(), "runner": r.Name, "slot": res.Slot, "sync_only": true})
+		o.Rep.Event("result", map[string]any{"exit_code": 0, "duration_ms": res.Duration.Milliseconds(), "runner": r.Name, "slot": res.Slot, "sync_only": true, "conflict_count": 0})
 		return res, nil, ""
 	}
 
@@ -657,12 +664,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		reportConflicts(o.Rep, wb.Stashed, runID)
 		reportSafety(o.Rep, wb, runID)
 		res.BackedUp, res.BackupDir, res.Held = wb.BackedUp, wb.BackupDir, wb.Held
+		res.Conflicts = wb.Conflicts
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
 			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)), ""
 		}
-		res.Mutated, res.Deleted, res.Conflicts = wb.Applied, wb.Deleted, wb.Conflicts
+		res.Mutated, res.Deleted = wb.Applied, wb.Deleted
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "duration_ms": time.Since(t).Milliseconds()})
 		if len(wb.Refused) > 0 {
 			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
@@ -685,8 +693,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		o.Rep.Event("pull", map[string]any{"patterns": pulls, "files": n})
 	}
 	checkCanceled()
+	res.ExitCode = conflictExit(res, o.FailOnConflict)
 	res.Duration = time.Since(start)
-	ev := map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot}
+	ev := map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot, "conflict_count": len(res.Conflicts)}
 	if res.OOMKilled {
 		ev["oom_killed"] = true
 	}
@@ -832,6 +841,17 @@ func shutdownRunner(l *Lease) string {
 		return l.InstanceID
 	}
 	return "static"
+}
+
+// conflictExit is the run's exit code once write-back is done: with
+// failOnConflict, a command that succeeded but whose changes didn't all come
+// back (a SYNC_CONFLICT kept the local file) exits ExitWritebackConflict. A
+// command that failed, timed out or was interrupted keeps its own code.
+func conflictExit(res Result, failOnConflict bool) int {
+	if failOnConflict && len(res.Conflicts) > 0 && res.ExitCode == 0 && !res.Canceled && !res.TimedOut && !res.SetupFailed {
+		return ExitWritebackConflict
+	}
+	return res.ExitCode
 }
 
 func wantWriteback(policy string, code int) bool {

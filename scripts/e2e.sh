@@ -179,13 +179,24 @@ for case in session install; do
 done
 
 echo "== conflicts"
-("$SX" --json 'sleep 2; echo remote > src/a.txt' >/dev/null 2>"$WORK/conf.err") &
+("$SX" --json 'sleep 2; echo remote > src/a.txt' >/dev/null 2>"$WORK/conf.err" && c=0 || c=$?; echo $c >"$WORK/conf.code") &
 sleep 1; echo "local edit" > src/a.txt; wait
+check "a conflict alone keeps the command's exit 0" "[ \$(cat $WORK/conf.code) = 0 ]"
+check "the result event counts the conflict" "grep '\"event\":\"result\"' $WORK/conf.err | grep -q '\"conflict_count\":1'"
 check "concurrent local edit is kept" "grep -qx 'local edit' src/a.txt"
 check "remote version stashed" "ls .git/spotexec/conflicts/*/src/a.txt >/dev/null 2>&1"
 check "SYNC_CONFLICT reported" "grep -q SYNC_CONFLICT $WORK/conf.err"
 D=$(grep '"event":"conflict"' "$WORK/conf.err" | sed 's/.*"diff":"\([^"]*\)".*/\1/' | head -1)
 check "the conflict event's diff command shows the remote change" "[ -n \"\$D\" ] && { eval \"\$D\" || true; } | grep -qx '+remote'"
+("$SX" --json --fail-on-conflict 'sleep 2; echo remote2 > src/a.txt' >/dev/null 2>"$WORK/conf2.err" && c=0 || c=$?; echo $c >"$WORK/conf2.code") &
+sleep 1; echo "local edit 2" > src/a.txt; wait
+check "--fail-on-conflict: a successful run whose write-back conflicted exits 122, and its result says so" "[ \$(cat $WORK/conf2.code) = 122 ] && grep -qx 'local edit 2' src/a.txt && grep '\"event\":\"result\"' $WORK/conf2.err | grep '\"conflict_count\":1' | grep -q '\"exit_code\":122'"
+(SPOTEXEC_FAIL_ON_CONFLICT=1 "$SX" -q 'sleep 2; echo remote3 > src/a.txt' >/dev/null 2>&1 && c=0 || c=$?; echo $c >"$WORK/conf3.code") &
+sleep 1; echo "local edit 3" > src/a.txt; wait
+check "SPOTEXEC_FAIL_ON_CONFLICT=1 turns it on" "[ \$(cat $WORK/conf3.code) = 122 ] && grep -qx 'local edit 3' src/a.txt"
+(SPOTEXEC_FAIL_ON_CONFLICT=1 "$SX" --json --writeback always 'sleep 2; echo remote4 > src/a.txt; exit 3' >/dev/null 2>"$WORK/conf4.err" && c=0 || c=$?; echo $c >"$WORK/conf4.code") &
+sleep 1; echo "local edit 4" > src/a.txt; wait
+check "a failed command that conflicted keeps its own exit code" "[ \$(cat $WORK/conf4.code) = 3 ] && grep -qx 'local edit 4' src/a.txt && grep '\"event\":\"result\"' $WORK/conf4.err | grep -q '\"conflict_count\":1'"
 
 echo "== concurrency (max_slots=3, 4 jobs)"
 for i in 1 2 3 4; do "$SX" --json "sleep 1.5; echo slot=\$SPOTEXEC_SLOT" >"$WORK/p$i.out" 2>"$WORK/p$i.err" & done; wait

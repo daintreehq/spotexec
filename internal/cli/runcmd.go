@@ -47,6 +47,7 @@ type runFlags struct {
 	sameSlot      bool
 	group         bool
 	rtkFilter     string
+	failConflict  bool
 	fs            *pflag.FlagSet // to tell explicit flags from defaults
 }
 
@@ -74,6 +75,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.IntVar(&f.priority, "priority", 0, "queue priority when every slot is busy (higher runs first)")
 	fs.BoolVarP(&f.sameSlot, "same-slot", "s", false, "run in the slot (same VM) this worktree last used, waiting if it's busy; with --sync none, skip the sync")
 	fs.StringVar(&f.rtkFilter, "rtk-filter", "", "compact stdout with RTK once the command ends (rtk pipe -f `NAME`): cargo-test for cargo test, go-test for go test -json; the full output is kept when it fails")
+	fs.BoolVar(&f.failConflict, "fail-on-conflict", false, fmt.Sprintf("exit %d when the command succeeded but write-back kept a local edit over one of its changes (SYNC_CONFLICT)", client.ExitWritebackConflict))
 	fs.BoolVar(&f.group, "group", false, "parallel and sharded tasks: print each part's output as one block when it finishes (default with SPOTEXEC_AGENT=1 when stdout isn't a terminal)")
 }
 
@@ -122,6 +124,9 @@ func (f *runFlags) applyEnv() {
 	}
 	if os.Getenv("SPOTEXEC_SAME_SLOT") == "1" && !f.changed("same-slot") {
 		f.sameSlot = true
+	}
+	if os.Getenv("SPOTEXEC_FAIL_ON_CONFLICT") == "1" && !f.changed("fail-on-conflict") {
+		f.failConflict = true
 	}
 	if f.changed("priority") {
 		f.prioritySet = true
@@ -390,7 +395,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 		ForceLargeSync: f.forceLarge, Stdout: stdout, Stderr: stderr, Rep: rep, Interrupt: intr,
 		Label: s.label, RetryPreempt: !f.noRetry, NoBoot: f.noBoot,
 		PreferLast: s.preferLast, SyncOnly: s.syncOnly, WaitPush: s.waitPush, Priority: s.priority,
-		Env: s.env,
+		Env: s.env, FailOnConflict: f.failConflict,
 	}
 	if f.prioritySet {
 		o.Priority = f.priority
@@ -509,9 +514,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	if n := len(res.Mutated) + len(res.Deleted); n > 0 {
 		summary += fmt.Sprintf(" · pulled %d modified file%s", n, plural(n))
 	}
-	if len(res.Conflicts) > 0 {
-		summary += fmt.Sprintf(" · %d conflict%s", len(res.Conflicts), plural(len(res.Conflicts)))
-	}
+	summary += conflictNote(len(res.Conflicts))
 	if s.syncOnly && res.Image != "" {
 		summary += " · image " + res.Image
 	}
@@ -716,7 +719,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			subStart := time.Now()
 			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
 			interrupted := ctx.Err() != nil
-			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot}
+			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot, conflicts: len(res.Conflicts)}
 			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
 				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, part.label)
 				out.code, err = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(parts)), nil
@@ -762,14 +765,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 						depsDetail(os.Stderr, prefix, err)
 					}
 				}
-				summary := fmt.Sprintf("%s · %s%s", part.label, ui.Dur(out.took), out.where())
-				if res.DepsInstalled > 0 {
-					summary += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(res.DepsInstalled))
-				}
-				if code != 0 {
-					summary += fmt.Sprintf(" · exit %d", code)
-				}
-				sr.Reporter.PartDone(summary, code == 0)
+				sr.Reporter.PartDone(out.doneLine(res.DepsInstalled), code == 0)
 			}
 			// The siblings stop before this part's (possibly long) block
 			// is printed.
@@ -808,23 +804,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	}
 	wg.Wait()
 	saveFirstLastRun(l.ws, records)
-	// Interrupted: 130. A spotexec failure (125) outranks a command's own
-	// failure, so agents can tell "tests failed" from "couldn't run tests".
-	exit := 0
-	for _, o := range outs {
-		if o.status == partStopped {
-			continue // the failure that stopped it is what counts
-		}
-		if o.code != 0 && (exit == 0 || o.code == client.ExitInfra) {
-			exit = o.code
-		}
-	}
 	interrupted := ctx.Err() != nil
-	if interrupted {
-		exit = client.ExitInterrupted
-	}
+	exit := taskExit(outs, interrupted)
 	took := time.Since(start)
-	result := map[string]any{"task": name, "exit_code": exit, "duration_ms": took.Milliseconds(), "parts": resultParts(outs)}
+	result := map[string]any{"task": name, "exit_code": exit, "duration_ms": took.Milliseconds(), "parts": resultParts(outs), "conflict_count": totalConflicts(outs)}
 	if len(t.Parallel) > 0 {
 		result["parallel"] = t.Parallel
 	} else {

@@ -195,6 +195,31 @@ func TestShutdownIsALostRunner(t *testing.T) {
 	}
 }
 
+func TestConflictExit(t *testing.T) {
+	conflicted := []string{"src/a.js"}
+	for _, c := range []struct {
+		name string
+		res  Result
+		on   bool
+		want int
+	}{
+		{"opt-in off keeps the command's 0", Result{Conflicts: conflicted}, false, 0},
+		{"opt-in, no conflict", Result{}, true, 0},
+		{"opt-in, a successful command whose changes didn't all land", Result{Conflicts: conflicted}, true, ExitWritebackConflict},
+		{"a failed command keeps its own code", Result{ExitCode: 2, Conflicts: conflicted}, true, 2},
+		{"interrupted stays 130", Result{ExitCode: ExitInterrupted, Canceled: true, Conflicts: conflicted}, true, ExitInterrupted},
+		{"timed out stays 124", Result{ExitCode: ExitTimeout, TimedOut: true, Conflicts: conflicted}, true, ExitTimeout},
+		{"a canceled 0 is never promoted", Result{Canceled: true, Conflicts: conflicted}, true, 0},
+		{"a timed-out 0 is never promoted", Result{TimedOut: true, Conflicts: conflicted}, true, 0},
+		{"a setup failure's 0 is never promoted", Result{SetupFailed: true, Conflicts: conflicted}, true, 0},
+		{"a setup failure keeps its code", Result{ExitCode: 1, SetupFailed: true, Conflicts: conflicted}, true, 1},
+	} {
+		if got := conflictExit(c.res, c.on); got != c.want {
+			t.Errorf("%s: exit %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
 func TestInterruptedRunIsNeverOnSuccess(t *testing.T) {
 	if wantWriteback("on-success", ExitInterrupted) {
 		t.Fatal("an interrupted run counted as success for on-success write-back")
