@@ -134,44 +134,53 @@ func TestUnreadFramesDontHideSilence(t *testing.T) {
 	short(t, &SilenceLimit, time.Second)
 	e.Set("rpc-flood", "200") // over half the buffer, short of filling it
 	s := e.session(t)
-	deadline := time.Now().Add(10 * time.Second)
-	for !s.Dead() && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !s.Dead() {
+	select {
+	case <-s.Lost():
+	case <-time.After(10 * time.Second):
 		t.Fatal("a silent helper behind unread frames was never given up on")
+	}
+	if n := len(s.frames); n != 200 {
+		t.Fatalf("%d frames queued when the session ended, want the 200 unread", n)
+	}
+	if err := s.LostErr(); !strings.Contains(err.Error(), "stopped responding") {
+		t.Fatalf("want a stopped-responding error, got %v", err)
 	}
 }
 
 // A full buffer is our backlog, not the helper's silence: nothing more can
 // be read until it drains (output piped into a paused pager), so the
-// session waits; once it drains, silence counts from then.
+// session waits; once a frame is taken, silence counts from then, not from
+// when the helper last sent anything.
 func TestFullBufferIsNotSilence(t *testing.T) {
 	e := newFakeEnv(t)
 	short(t, &SilenceLimit, time.Second)
-	e.Set("rpc-flood", "400")
+	e.Set("rpc-flood", "257") // the buffer's 256, and one more waiting to go in
 	s := e.session(t)
+	deadline := time.Now().Add(5 * time.Second)
+	for !s.backed.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !s.backed.Load() {
+		t.Fatalf("buffer never filled (%d frames)", len(s.frames))
+	}
 	time.Sleep(3 * time.Second) // three limits with nothing read
 	if s.Dead() {
 		t.Fatal("given up on while our own buffer was full")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	start, got := time.Now(), 0
-	var err error
-	for err == nil {
-		_, err = s.Next(ctx)
-		if err == nil {
-			got++
-		}
+	// Taking one frame lets the last one in; nothing else arrives.
+	if _, err := s.Next(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	if !IsConnError(err) || !strings.Contains(err.Error(), "stopped responding") {
-		t.Fatalf("after %d frames: want a stopped-responding error, got %v", got, err)
+	taken := time.Now()
+	select {
+	case <-s.Lost():
+	case <-time.After(10 * time.Second):
+		t.Fatal("never given up on after the buffer drained")
 	}
-	if got != 400 {
-		t.Fatalf("read %d frames before the session ended, want all 400", got)
+	if took := time.Since(taken); took < 500*time.Millisecond {
+		t.Fatalf("given up on %s after a frame was taken: the silence counted the backlog", took)
 	}
-	if took := time.Since(start); took < 500*time.Millisecond {
-		t.Fatalf("given up on %s after the buffer drained: the silence counted the backlog", took)
+	if err := s.LostErr(); !strings.Contains(err.Error(), "stopped responding") {
+		t.Fatalf("want a stopped-responding error, got %v", err)
 	}
 }

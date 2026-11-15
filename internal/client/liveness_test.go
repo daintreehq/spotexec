@@ -109,18 +109,19 @@ func TestDepsFailsOnSilentHelper(t *testing.T) {
 	for _, shared := range []bool{false, true} {
 		t.Run(fmt.Sprintf("shared=%v", shared), func(t *testing.T) {
 			r, tgt := liveRunner(t, "rpc-silent")
+			ctx := fastShare(t)
+			req := protocol.Deps{Lockfiles: []string{"package-lock.json"}, Install: "npm ci", CacheDirs: []string{"node_modules"}}
+			if shared {
+				req = sharedDeps()
+			}
 			_, s, err := Connect(context.Background(), r, tgt)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer s.Abort()
-			req := protocol.Deps{Lockfiles: []string{"package-lock.json"}, Install: "npm ci", CacheDirs: []string{"node_modules"}}
-			if shared {
-				req = sharedDeps()
-			}
 			done := make(chan error, 1)
 			go func() {
-				_, _, _, err := depsFetch(fastShare(t), t, sessionRPC{s}, &recRep{}, req)
+				_, _, _, err := depsFetch(ctx, t, sessionRPC{s}, &recRep{}, req)
 				done <- err
 			}()
 			select {
@@ -142,11 +143,8 @@ func TestDepsFailsOnSilentHelper(t *testing.T) {
 func TestDepsWaitEndsWhenItsHelperGoesSilent(t *testing.T) {
 	r, tgt := liveRunner(t, "rpc-deps-missing")
 	ctx := fastShare(t)
-	_, s, err := Connect(context.Background(), r, tgt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Abort()
+	// Everything but the session first: its silence clock starts when it
+	// opens.
 	req := sharedDeps()
 	lock := shareLockFor("deps", stripQuery(req.CacheGet))
 	held, err := lock.take(ctx, lock.verdict(), "other#1", time.Minute, nil)
@@ -155,6 +153,11 @@ func TestDepsWaitEndsWhenItsHelperGoesSilent(t *testing.T) {
 	}
 	defer held.release("")
 	rep := &recRep{}
+	_, s, err := Connect(context.Background(), r, tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Abort()
 	start := time.Now()
 	_, _, _, err = depsFetch(ctx, t, sessionRPC{s}, rep, req)
 	if !transport.IsConnError(err) || !strings.Contains(err.Error(), "stopped responding") {
