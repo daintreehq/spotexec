@@ -2,12 +2,16 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
@@ -198,11 +202,22 @@ func (r watchReporter) Event(name string, fields map[string]any) {
 
 // localCommand reports whether the shell of a local run finds word as a
 // command (a program, builtin or function), with the run's environment and
-// directory.
+// directory. The probe runs in its own process group, which is killed once
+// it returns, and gives up after a few seconds: anything it can't settle
+// counts as found, so no warning is made on a guess.
 func localCommand(l *loaded, o client.Options, word string) bool {
-	cmd := exec.Command(localShell(), "-c", `command -v -- "$1" >/dev/null 2>&1`, "sh", word)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, localShell(), "-c", `command -v -- "$1" >/dev/null 2>&1`, "sh", word)
 	cmd.Env, cmd.Dir = localEnv(l, o, 0, 1), localDir(l)
-	return cmd.Run() == nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	err := cmd.Run()
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	var ee *exec.ExitError
+	return err == nil || ctx.Err() != nil || !errors.As(err, &ee) || ee.ExitCode() != 1
 }
 
 // warnUnknownTask warns after a run of a task-like word exited 127 and the

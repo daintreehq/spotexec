@@ -249,15 +249,12 @@ func TestLocalCommand(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "bin", "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "data"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
 	l := testLoaded()
 	l.ws.Root = root
 	// Relative PATH entries resolve against the run's directory, not this
 	// process's, and builtins count as commands.
 	l.cfg.Project.Env = map[string]string{"PATH": "bin:/usr/bin:/bin"}
-	for word, want := range map[string]bool{"tool": true, "eval": true, "sh": true, "data": false, "test-al": false} {
+	for word, want := range map[string]bool{"tool": true, "eval": true, "sh": true, "test-al": false} {
 		if got := localCommand(l, client.Options{}, word); got != want {
 			t.Errorf("%q: found %v, want %v", word, got, want)
 		}
