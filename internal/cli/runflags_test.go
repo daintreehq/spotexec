@@ -140,18 +140,31 @@ func project(t *testing.T, toml string) string {
 }
 
 // runMain runs a CLI entry point and returns its exit code and stderr.
+// Whatever the test binary was given as stdin, the run sees none, so no
+// STDIN_IGNORED warning depends on how the tests were started.
 func runMain(t *testing.T, name string, args ...string) (int, string) {
+	t.Helper()
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	return runMainStdin(t, null, name, args...)
+}
+
+// runMainStdin is runMain with stdin as the CLI's stdin.
+func runMainStdin(t *testing.T, stdin *os.File, name string, args ...string) (int, string) {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := os.Stderr
-	os.Stderr = w
+	old, oldIn := os.Stderr, os.Stdin
+	os.Stderr, os.Stdin = w, stdin
 	out := make(chan string)
 	go func() { b, _ := io.ReadAll(r); out <- string(b) }()
 	code := MainAs(name, args)
-	os.Stderr = old
+	os.Stderr, os.Stdin = old, oldIn
 	w.Close()
 	return code, <-out
 }

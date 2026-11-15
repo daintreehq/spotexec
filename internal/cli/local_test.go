@@ -505,3 +505,49 @@ func TestRunLocalSetupInterrupted(t *testing.T) {
 		t.Fatalf("exit %d, command ran: %v, output %q", code, err == nil, out.String())
 	}
 }
+
+// Input piped into sx doesn't reach the command (stdin is /dev/null there
+// too), so it is flagged once; an empty pipe, as an agent harness may pass,
+// and a sync are not.
+func TestPipedStdinIsFlaggedNotForwarded(t *testing.T) {
+	dir := project(t, "[tasks.l]\nrun = \"cat > l.out\"\n[tasks.t]\nrun = \"true\"\n[tasks.v]\nparallel = [\"l\", \"t\"]\n")
+	cfg := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfg, []byte("version = 1\n[runners.a]\ntype = \"ssh\"\nhosts = [\"nobody@127.0.0.1\"]\nssh_options = [\"Port=1\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTEXEC_CONFIG", cfg)
+	t.Setenv("HOME", t.TempDir())
+	pipe := func(data string) *os.File {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		_ = w.Close()
+		t.Cleanup(func() { _ = r.Close() })
+		return r
+	}
+	for _, args := range [][]string{{"--", "cat"}, {"v"}} {
+		all := append([]string{"-C", dir, "--fallback-local", "--queue-timeout", "5s"}, args...)
+		code, stderr := runMainStdin(t, pipe("x y\n"), "sx", all...)
+		if code != 0 {
+			t.Fatalf("%v: exit %d, stderr %q", args, code, stderr)
+		}
+		if n := strings.Count(stderr, "stdin has input, but the command doesn't get it"); n != 1 {
+			t.Errorf("%v: want one STDIN_IGNORED warning, got %d: %q", args, n, stderr)
+		}
+		code, stderr = runMainStdin(t, pipe(""), "sx", all...)
+		if code != 0 || strings.Contains(stderr, "stdin") {
+			t.Errorf("%v with an empty pipe: exit %d, stderr %q", args, code, stderr)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "l.out")); err != nil || len(b) != 0 {
+		t.Errorf("the task read stdin: %q, %v", b, err)
+	}
+	code, stderr := runMainStdin(t, pipe("x y\n"), "sx", "-C", dir, "--json", "--fallback-local", "--queue-timeout", "5s", "--", "true")
+	if code != 0 || !strings.Contains(stderr, `"code":"STDIN_IGNORED"`) {
+		t.Errorf("--json: exit %d, stderr %q", code, stderr)
+	}
+}

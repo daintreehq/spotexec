@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/ui"
@@ -146,10 +147,14 @@ func socketPair(t *testing.T) (*os.File, *os.File) {
 type warnRecorder struct {
 	ui.Reporter
 	warnings []string
+	log      []string // warnings and events, in order
 }
+
+func (w *warnRecorder) Event(name string, _ map[string]any) { w.log = append(w.log, "event "+name) }
 
 func (w *warnRecorder) Warn(code, format string, args ...any) {
 	w.warnings = append(w.warnings, code+": "+fmt.Sprintf(format, args...))
+	w.log = append(w.log, "warn "+code)
 }
 
 func TestStdinNoticeWarnsOnce(t *testing.T) {
@@ -181,4 +186,30 @@ func TestStdinNoticeWithoutCommand(t *testing.T) {
 	}
 	var n *stdinNotice
 	n.check(&warnRecorder{}) // nil never warns, never panics
+}
+
+func TestStdinReporterWarnsBeforeResult(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	rec := &warnRecorder{}
+	n := &stdinNotice{in: r}
+	rep := n.reporter(rec)
+	rep.Event("start", nil)
+	if _, err := w.Write([]byte("late")); err != nil { // written while the command ran
+		t.Fatal(err)
+	}
+	rep.Event("result", nil)
+	n.check(rec) // the check after the run: already warned
+	want := "event start,warn STDIN_IGNORED,event result"
+	if got := strings.Join(rec.log, ","); got != want {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+	var none *stdinNotice
+	if none.reporter(rec) != ui.Reporter(rec) {
+		t.Fatal("without a command the reporter is passed through as is")
+	}
 }

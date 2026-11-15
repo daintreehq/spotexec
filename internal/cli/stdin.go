@@ -62,3 +62,25 @@ func (s *stdinNotice) check(rep ui.Reporter) {
 	s.warned = true
 	rep.Warn("STDIN_IGNORED", "stdin has input, but the command doesn't get it: it runs with stdin from /dev/null. Save the input to a file in the project and pass its path instead")
 }
+
+// reporter returns rep with one more look at stdin just before the run's
+// result event, so in JSON mode the warning comes before the result rather
+// than after it.
+func (s *stdinNotice) reporter(rep ui.Reporter) ui.Reporter {
+	if s == nil {
+		return rep
+	}
+	return stdinReporter{Reporter: rep, n: s}
+}
+
+type stdinReporter struct {
+	ui.Reporter
+	n *stdinNotice
+}
+
+func (r stdinReporter) Event(name string, fields map[string]any) {
+	if name == "result" {
+		r.n.check(r.Reporter)
+	}
+	r.Reporter.Event(name, fields)
+}
