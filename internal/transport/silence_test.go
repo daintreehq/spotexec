@@ -111,6 +111,9 @@ func TestHeartbeatMemoryPressure(t *testing.T) {
 	if p := s.MemoryPressure(0); p != "" {
 		t.Fatalf("pressure outside the window: %q", p)
 	}
+	if m, ok := s.LastMemory(); !ok || m.AvailMB != 120 || m.TotalMB != 16000 || m.At.IsZero() {
+		t.Fatalf("last memory %+v %v", m, ok)
+	}
 	s.Abort()
 
 	e2 := newFakeEnv(t)
@@ -120,8 +123,14 @@ func TestHeartbeatMemoryPressure(t *testing.T) {
 	if p := s2.MemoryPressure(time.Minute); p != "" {
 		t.Fatalf("pressure from bodiless heartbeats: %q", p)
 	}
+	if m, ok := s2.LastMemory(); ok {
+		t.Fatalf("memory from bodiless heartbeats: %+v", m)
+	}
 	var none *Session
 	if none.MemoryPressure(time.Minute) != "" {
 		t.Fatal("nil session reported pressure")
+	}
+	if _, ok := none.LastMemory(); ok {
+		t.Fatal("nil session reported memory")
 	}
 }

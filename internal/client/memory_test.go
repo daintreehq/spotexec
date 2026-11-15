@@ -59,24 +59,69 @@ func testFleet() (*config.Runner, *fakeFleet) {
 	}}
 }
 
-// A lost VM the cloud still runs, with no Spot notice, isn't replayed; a
-// gone or noticed one is.
+var (
+	running   = stage{phase: phaseCommand, dispatched: true}
+	depsCheck = stage{phase: phaseDepsCheck}
+)
+
+// A lost VM the cloud still runs, with no Spot notice, isn't replayed once
+// the command was dispatched; a gone or noticed one is, and so is one lost
+// before the command was dispatched.
 func TestWhyNoReplay(t *testing.T) {
 	r, f := testFleet()
 	for _, c := range []struct {
 		id      string
 		noticed bool
+		at      stage
 		code    string
 	}{
-		{"i-run", false, "RUNNER_UNRESPONSIVE"},
-		{"i-run", true, ""},
-		{"i-gone", false, ""},
-		{"i-pend", false, ""},
+		{"i-run", false, running, "RUNNER_UNRESPONSIVE"},
+		{"i-run", false, stage{phase: phaseSetup, dispatched: true}, "RUNNER_UNRESPONSIVE"},
+		{"i-run", true, running, ""},
+		{"i-gone", false, running, ""},
+		{"i-pend", false, running, ""},
+		{"i-run", false, depsCheck, ""},
+		{"i-run", false, stage{phase: phaseSync}, ""},
+		{"i-run", false, stage{phase: phaseDeps}, ""},
 	} {
-		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id}, c.noticed)
+		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id}, c.noticed, c.at, false)
 		if got.code != c.code {
-			t.Errorf("%s noticed=%v: %q (%q), want %q", c.id, c.noticed, got.code, got.why, c.code)
+			t.Errorf("%s noticed=%v at %+v: %q (%q), want %q", c.id, c.noticed, c.at, got.code, got.why, c.code)
 		}
+	}
+}
+
+// #143: a VM lost while the run was still checking the dependency cache,
+// though EC2 still runs it, is replayed, and the warning says where the run
+// had got to rather than blaming the command.
+func TestLostBeforeTheCommandIsReplayed(t *testing.T) {
+	r, f := testFleet()
+	lease := &Lease{Runner: r, Provider: f, InstanceID: "i-run"}
+	res := Result{noReplay: replayVerdict(lease, false, io.EOF, depsCheck, true), lostAt: depsCheck}
+	retry, code, why := replayable("i-run", res, Options{RetryPreempt: true, Sync: "auto", Exclusive: true}, false, 1)
+	if !retry || code != "" || why != "" {
+		t.Fatalf("not replayed: %v %q %q", retry, code, why)
+	}
+	if w := res.lostAt.where(); w != "while checking the dependency cache, before the command started" {
+		t.Fatalf("where: %q", w)
+	}
+}
+
+// Once the command was dispatched, the warning names the phase, the last
+// memory reading when there is one, and suggests --exclusive only to a run
+// that didn't already have it.
+func TestUnresponsiveMessage(t *testing.T) {
+	r, f := testFleet()
+	lease := &Lease{Runner: r, Provider: f, InstanceID: "i-run"}
+	why := whyNoReplay(lease, false, running, false).why
+	if !strings.HasPrefix(why, "while running the command, although EC2") || !strings.Contains(why, "the command may be what overloaded it") || !strings.Contains(why, "--exclusive") || strings.Contains(why, "heartbeat") {
+		t.Errorf("not exclusive: %q", why)
+	}
+	if why := whyNoReplay(lease, false, running, true).why; strings.Contains(why, "--exclusive") {
+		t.Errorf("already exclusive: %q", why)
+	}
+	if why := whyNoReplay(lease, false, stage{phase: phaseSetup, dispatched: true}, false).why; !strings.Contains(why, "[setup] run may be what overloaded it") {
+		t.Errorf("setup: %q", why)
 	}
 }
 
@@ -97,7 +142,7 @@ func TestHelperShutdownIsANotice(t *testing.T) {
 		"helper error":  {&InfraError{Err: fmt.Errorf("lost runner aws during execution: %w", shutdown)}, lostRunner(lease, shutdown)},
 		"killed result": {shutdownErr("aws#1", 143), shutdownRunner(lease)},
 	} {
-		res := Result{noReplay: replayVerdict(lease, false, c.err)}
+		res := Result{noReplay: replayVerdict(lease, false, c.err, running, false)}
 		if res.noReplay.code != "" {
 			t.Fatalf("%s: a shutdown on a running VM withheld the replay: %q (%q)", name, res.noReplay.code, res.noReplay.why)
 		}
@@ -112,7 +157,7 @@ func TestHelperShutdownIsANotice(t *testing.T) {
 			t.Errorf("%v counted as a shutdown", e)
 		}
 	}
-	if got := replayVerdict(lease, false, io.EOF); got.code != "RUNNER_UNRESPONSIVE" {
+	if got := replayVerdict(lease, false, io.EOF, running, false); got.code != "RUNNER_UNRESPONSIVE" {
 		t.Fatalf("a dropped connection on a running VM: %q, want RUNNER_UNRESPONSIVE", got.code)
 	}
 }
@@ -137,20 +182,46 @@ func TestNoticeOutranksMemoryPressure(t *testing.T) {
 	for _, c := range []struct {
 		id      string
 		noticed bool
+		at      stage
 		code    string
 	}{
-		{"i-run", true, ""},
-		{"i-gone", true, ""},
-		{"i-run", false, "MEMORY_PRESSURE"},
-		{"i-gone", false, "MEMORY_PRESSURE"},
+		{"i-run", true, running, ""},
+		{"i-gone", true, running, ""},
+		{"i-run", false, running, "MEMORY_PRESSURE"},
+		{"i-gone", false, running, "MEMORY_PRESSURE"},
+		{"i-run", true, depsCheck, ""},
+		{"i-run", false, depsCheck, "MEMORY_PRESSURE"},
 	} {
-		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id, Sess: s}, c.noticed)
+		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id, Sess: s}, c.noticed, c.at, false)
 		if got.code != c.code {
-			t.Errorf("%s noticed=%v under pressure: %q (%q), want %q", c.id, c.noticed, got.code, got.why, c.code)
+			t.Errorf("%s noticed=%v at %+v under pressure: %q (%q), want %q", c.id, c.noticed, c.at, got.code, got.why, c.code)
+		}
+		if c.code != "" && !strings.HasPrefix(got.why, c.at.where()+": it was out of memory") {
+			t.Errorf("%s at %+v: %q doesn't say where the run had got to", c.id, c.at, got.why)
 		}
 		if retry, _, _ := replayable(c.id, Result{noReplay: got}, Options{RetryPreempt: true, Sync: "auto"}, false, 1); retry != c.noticed {
 			t.Errorf("%s noticed=%v under pressure: replayed %v", c.id, c.noticed, retry)
 		}
+	}
+}
+
+// The unresponsive warning carries the VM's last memory reading.
+func TestLastMemory(t *testing.T) {
+	sr, tgt := liveRunner(t, "rpc-pressure")
+	_, s, err := Connect(context.Background(), sr, tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Abort()
+	deadline := time.Now().Add(5 * time.Second)
+	for lastMemory(s) == "" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m := lastMemory(s); !strings.Contains(m, "120.0 MB of 15.6 GB memory available") {
+		t.Fatalf("last memory: %q", m)
+	}
+	if lastMemory(nil) != "" {
+		t.Fatal("a nil session has a reading")
 	}
 }
 

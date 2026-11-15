@@ -126,10 +126,12 @@ noticed warm instance within the notice. Then:
 
 There is at most one reallocation per run by default (`--no-retry` disables
 it). A connection lost without a notice on an ephemeral runner is also retried
-once, if the VM is gone by then. A VM that EC2 still reports running, or whose
-last heartbeats showed it out of memory, is not: the run may be what
-overloaded it, and replayed it could take another VM's jobs down with it
-(`RUNNER_UNRESPONSIVE`, `MEMORY_PRESSURE`; exit 125). A VM that announced it
+once, if the VM is gone by then, or if the command hadn't been handed to the
+VM yet (it was still syncing, building the image or installing dependencies).
+A VM whose last heartbeats showed it out of memory is not, and nor is one that
+EC2 still reports running after the command was handed over: the command may
+be what overloaded it, and replayed it could take another VM's jobs down with
+it (`MEMORY_PRESSURE`, `RUNNER_UNRESPONSIVE`; exit 125). A VM that announced it
 was going away (a Spot notice, or the helper reporting its shutdown, as at
 `max_lifetime`) is replayed either way. Before giving up on a
 silent helper whose VM is still running, the CLI waits 3 more minutes, so a

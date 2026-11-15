@@ -140,6 +140,52 @@ type Result struct {
 	// noReplay, when the runner was lost, is why the run must not be
 	// replayed elsewhere (see replayable).
 	noReplay noReplay
+	// lostAt, when the runner was lost, is how far the attempt had got.
+	lostAt stage
+}
+
+// stage is how far an attempt had got: the phase it was in, and whether
+// the command had been handed to the helper (dispatched), after which it
+// may have started and its outcome is unknown.
+type stage struct {
+	phase      string
+	dispatched bool
+}
+
+// where describes s for a warning about losing the runner during it.
+func (s stage) where() string {
+	if s.dispatched {
+		return "while " + s.phase
+	}
+	return "while " + s.phase + ", before the command started"
+}
+
+// progress tracks an attempt's stage as it goes. It is read when the
+// runner is lost; helper events may update it from another goroutine.
+type progress struct {
+	mu sync.Mutex
+	at stage
+}
+
+func (p *progress) set(phase string) {
+	p.mu.Lock()
+	p.at.phase = phase
+	p.mu.Unlock()
+}
+
+// dispatch records that the command is being handed to the helper, from
+// just before the request is sent: a send that fails part way may still
+// have reached it.
+func (p *progress) dispatch(phase string) {
+	p.mu.Lock()
+	p.at = stage{phase: phase, dispatched: true}
+	p.mu.Unlock()
+}
+
+func (p *progress) get() stage {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.at
 }
 
 // noReplay is a warning code and the reason behind it.
@@ -174,8 +220,8 @@ type attempt struct {
 // Run executes opts.Command remotely for workspace ws. If the runner is lost
 // before the command's result arrives (a reclaimed Spot instance, a dead
 // VM), the run is replayed once on another slot: nothing from the lost
-// attempt was applied locally. Once a result has arrived it is never
-// replayed.
+// attempt was applied locally (whyNoReplay says when it isn't). Once a
+// result has arrived it is never replayed.
 func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Result, error) {
 	if err := validOptions(o); err != nil {
 		return Result{}, infra(err)
@@ -199,7 +245,7 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		if !retry {
 			return res, err
 		}
-		o.Rep.Warn("RUNNER_LOST", "lost %s before the command finished (%v); replaying the run on another slot", lost, err)
+		o.Rep.Warn("RUNNER_LOST", "lost %s %s (%v); replaying the run on another slot", lost, res.lostAt.where(), err)
 		o.Rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "lost": lost})
 		if lost != "static" {
 			att.exclude[lost] = true
@@ -212,9 +258,10 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 // replayable decides whether an attempt that lost its runner (lost, from
 // lostRunner) is replayed on another slot. why is set when whyNoReplay
 // withheld the replay (the runner was out of memory, or still running with
-// no notice it was going away): that run is never replayed, since a run
-// that used up its VM's memory would most likely do the same on the next
-// one, and take that VM's other jobs with it.
+// no notice it was going away after the command was dispatched): that run
+// is never replayed, since a run that used up its VM's memory would most
+// likely do the same on the next one, and take that VM's other jobs with
+// it.
 func replayable(lost string, res Result, o Options, canceled bool, n int) (retry bool, code, why string) {
 	if lost == "" {
 		return false, "", ""
@@ -230,27 +277,64 @@ func replayable(lost string, res Result, o Options, canceled bool, n int) (retry
 	return false, res.noReplay.code, why
 }
 
-// whyNoReplay decides, once a fleet lease's runner is lost, whether the
-// run must not be replayed elsewhere: its VM reported memory pressure (a
-// run that used up its VM's memory would most likely do the same on the
-// next one, and take that VM's other jobs with it), or the VM is still
-// running and gave no Spot notice, so whatever stopped it answering came
-// from inside, quite possibly from this run. A VM that announced it was
-// going away (a Spot notice, or its helper reporting the shutdown, as at
-// max_lifetime) is replayed whatever its memory looked like: it was going
-// down whatever the run did. A VM that is gone is replayed too, unless it
-// was out of memory.
-func whyNoReplay(lease *Lease, noticed bool) noReplay {
+// whyNoReplay decides, once a fleet lease's runner is lost at stage at,
+// whether the run must not be replayed elsewhere: its VM reported memory
+// pressure (a run that used up its VM's memory would most likely do the
+// same on the next one, and take that VM's other jobs with it), or the
+// command had been dispatched and the VM is still running and gave no Spot
+// notice, so whatever stopped it answering came from inside, quite
+// possibly from the command, whose outcome is unknown. A VM that announced
+// it was going away (a Spot notice, or its helper reporting the shutdown,
+// as at max_lifetime) is replayed whatever its memory looked like: it was
+// going down whatever the run did. A VM that is gone is replayed too, and
+// so is one lost before the command was dispatched (the command can't
+// have run, so it has no outcome to protect), unless it was out of memory.
+// exclusive is whether the run already had the whole VM.
+func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay {
 	if noticed {
 		return noReplay{}
 	}
 	if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
-		return noReplay{"MEMORY_PRESSURE", "while it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
+		return noReplay{"MEMORY_PRESSURE", at.where() + ": it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
 	}
-	if instanceRunning(lease) {
-		return noReplay{"RUNNER_UNRESPONSIVE", "although EC2 still reports it running, without a Spot notice: the run may be what overloaded it (memory, most often), and the attempt's outcome is unknown. Rerun it, with --exclusive if it may need the whole VM"}
+	if !at.dispatched || !instanceRunning(lease) {
+		return noReplay{}
 	}
-	return noReplay{}
+	what := "the command"
+	if at.phase == phaseSetup {
+		what = "[setup] run"
+	}
+	why := at.where() + ", although EC2 still reports it running, without a Spot notice: " + what + " may be what overloaded it (memory, most often)"
+	if m := lastMemory(lease.Sess); m != "" {
+		why += "; " + m
+	}
+	why += ". The attempt's outcome is unknown. Rerun it"
+	if !exclusive {
+		why += ", with --exclusive if it may need the whole VM"
+	}
+	return noReplay{"RUNNER_UNRESPONSIVE", why}
+}
+
+// Phases of an attempt (stage.phase), as warnings name them.
+const (
+	phaseSlot      = "setting up the slot"
+	phaseSync      = "syncing files"
+	phaseGitSeed   = "seeding .git"
+	phaseImage     = "preparing the container image"
+	phaseDepsCheck = "checking the dependency cache"
+	phaseDeps      = "installing dependencies"
+	phaseSetup     = "running [setup] run"
+	phaseCommand   = "running the command"
+)
+
+// lastMemory describes the memory reading of s's latest heartbeat, "" when
+// none carried one.
+func lastMemory(s *transport.Session) string {
+	m, ok := s.LastMemory()
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("its last heartbeat (%s ago) reported %s of %s memory available", ui.Dur(time.Since(m.At).Round(time.Second)), ui.Bytes(m.AvailMB<<20), ui.Bytes(m.TotalMB<<20))
 }
 
 // noteReclaimed tells the lease's fleet that AWS is reclaiming its VM, so
@@ -265,8 +349,8 @@ func noteReclaimed(lease *Lease) {
 // replayVerdict is whyNoReplay for an attempt that lost its runner with
 // err: a shutdown the helper reported counts as the VM's notice, since EC2
 // still reports a VM running while its OS halts.
-func replayVerdict(lease *Lease, noticed bool, err error) noReplay {
-	return whyNoReplay(lease, noticed || vmShutdown(err))
+func replayVerdict(lease *Lease, noticed bool, err error, at stage, exclusive bool) noReplay {
+	return whyNoReplay(lease, noticed || vmShutdown(err), at, exclusive)
 }
 
 // shutdownErr is what runOnce returns when the VM's shutdown killed the
@@ -417,9 +501,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	var noticed atomic.Bool // a reclamation notice arrived
 	// Before any replacement launches: steer it away from this VM's pool.
 	reclaimed := sync.OnceFunc(func() { noteReclaimed(lease) })
+	prog := &progress{at: stage{phase: phaseSlot}}
 	defer func() {
-		if lost != "" && lease.InstanceID != "" {
-			res.noReplay = replayVerdict(lease, noticed.Load(), err)
+		if lost != "" {
+			res.lostAt = prog.get()
+			if lease.InstanceID != "" {
+				res.noReplay = replayVerdict(lease, noticed.Load(), err, res.lostAt, o.Exclusive)
+			}
 		}
 	}()
 	// Before the command starts, Ctrl-C aborts the session outright (a
@@ -441,6 +529,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	sess := lease.Sess
 	sess.OnEvent = func(ev protocol.Event) {
 		o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
+		if ev.Name == "deps_install" {
+			prog.set(phaseDeps)
+		}
 		if ev.Name == "spot_interruption" {
 			noticed.Store(true)
 			reclaimed()
@@ -459,6 +550,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			o.Rep.Event("sync_in", map[string]any{"mode": "fingerprint_hit", "files": 0, "bytes": 0, "duration_ms": 0})
 		} else {
 			t := time.Now()
+			prog.set(phaseSync)
 			o.Rep.Status("%s · syncing %d files", label, len(m.Entries))
 			stray, err := strayFiles(ctx, ws, m, lease.Acq.Pending)
 			if err != nil {
@@ -475,6 +567,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			o.Rep.Status("%s · synced %d files (%s) in %s", label, syn.Written, ui.Bytes(syn.Bytes), ui.Dur(time.Since(t)))
 		}
 		// Before the image and dependencies, so install scripts see it too.
+		prog.set(phaseGitSeed)
 		if err := seedGit(ctx, sess, m, p.Sync.GitSeed, o, label); err != nil {
 			return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, err)), lostRunner(lease, err)
 		}
@@ -484,6 +577,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	var crun *protocol.ContainerRun
 	imageID := ""
 	if p.Container.Enabled() {
+		prog.set(phaseImage)
 		ref, id, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
 		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
@@ -497,6 +591,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	// 5. Dependencies.
 	if p.Deps.Install != "" && !o.NoDeps && o.Sync != "none" {
+		prog.set(phaseDepsCheck)
 		dr, err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun, imageID, m)
 		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
@@ -577,6 +672,11 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		*att.fresh = true // a replay doesn't repeat it
 		warnContainerFresh(ws, o, p.Container.Dockerfile)
 	}
+	if ex.SetupRun != "" {
+		prog.dispatch(phaseSetup)
+	} else {
+		prog.dispatch(phaseCommand)
+	}
 	if err := sess.Conn.Send(protocol.TypeExec, ex); err != nil {
 		return res, infra(err), lostRunner(lease, err)
 	}
@@ -616,7 +716,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	outW := &ui.Rewriter{W: &ui.ClearingWriter{W: o.Stdout, R: o.Rep}, Old: []byte(remoteWS), New: []byte(ws.Root)}
 	errW := &ui.Rewriter{W: &ui.ClearingWriter{W: o.Stderr, R: o.Rep}, Old: []byte(remoteWS), New: []byte(ws.Root)}
-	afterSetup := func() { o.Rep.Status("%s · running %s", label, o.Display) }
+	afterSetup := func() {
+		prog.set(phaseCommand)
+		o.Rep.Status("%s · running %s", label, o.Display)
+	}
 	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup)
 	outW.Flush()
 	errW.Flush()
