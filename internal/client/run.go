@@ -135,6 +135,7 @@ type attempt struct {
 	runID   string
 	n       int
 	exclude map[string]bool // fleet instances lost in earlier attempts
+	fresh   *bool           // an earlier attempt already showed CONTAINER_FRESH
 }
 
 // Run executes opts.Command remotely for workspace ws. If the runner is lost
@@ -152,7 +153,7 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		}
 		return Result{}, infra(fmt.Errorf("%s is not in a Git repository and has no .spotexec.toml, so spotexec won't sync it; run `spotexec init` there to mark it as a project, or pass --sync none", ws.Root))
 	}
-	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}}
+	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}, fresh: new(bool)}
 	reached := false
 	for {
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
@@ -387,9 +388,6 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	var crun *protocol.ContainerRun
 	imageID := ""
 	if p.Container.Enabled() {
-		if o.SameSlot || o.PreferLast {
-			o.Rep.Warn("CONTAINER_FRESH", "this project runs in a container, which starts fresh each run: files in the workspace and $HOME carry over, but system packages installed by an earlier run don't (add them to %s)", orDefault(p.Container.Dockerfile, "the image"))
-		}
 		ref, id, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
 		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
@@ -468,6 +466,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			NewPool(r, f).Observe(lease.InstanceID, OutDraining, time.Time{})
 		}
 		return res, infra(fmt.Errorf("%s announced a spot interruption before the command started", lease.InstanceID)), lease.InstanceID
+	}
+	if crun != nil && !*att.fresh {
+		*att.fresh = true // a replay doesn't repeat it
+		warnContainerFresh(ws, o, p.Container.Dockerfile)
 	}
 	if err := sess.Conn.Send(protocol.TypeExec, ex); err != nil {
 		return res, infra(err), lostRunner(lease, err)
