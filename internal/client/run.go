@@ -387,9 +387,6 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	var crun *protocol.ContainerRun
 	imageID := ""
 	if p.Container.Enabled() {
-		if o.SameSlot || o.PreferLast {
-			o.Rep.Warn("CONTAINER_FRESH", "this project runs in a container, which starts fresh each run: files in the workspace and $HOME carry over, but system packages installed by an earlier run don't (add them to %s)", orDefault(p.Container.Dockerfile, "the image"))
-		}
 		ref, id, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
 		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
@@ -468,6 +465,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			NewPool(r, f).Observe(lease.InstanceID, OutDraining, time.Time{})
 		}
 		return res, infra(fmt.Errorf("%s announced a spot interruption before the command started", lease.InstanceID)), lease.InstanceID
+	}
+	if crun != nil {
+		warnContainerFresh(ws, o, p.Container.Dockerfile)
 	}
 	if err := sess.Conn.Send(protocol.TypeExec, ex); err != nil {
 		return res, infra(err), lostRunner(lease, err)
