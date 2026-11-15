@@ -554,6 +554,22 @@ func TestContainerScriptDockerCleanupFails(t *testing.T) {
 	}
 }
 
+func TestIsProxyDir(t *testing.T) {
+	for dir, ok := range map[string]bool{
+		"/tmp/sx-docker-123":         true,
+		"/tmp/sx-docker-":            false,
+		"/tmp/sx-docker-1/link/data": false,
+		"/tmp/sx-docker-1/..":        false,
+		"/tmp/other":                 false,
+		"/var/tmp/sx-docker-1":       false,
+		"/tmp/sx-docker-1/../../etc": false,
+	} {
+		if isProxyDir(dir) != ok {
+			t.Errorf("isProxyDir(%q) = %v", dir, !ok)
+		}
+	}
+}
+
 // The next holder of a slot removes what an aborted container.docker run
 // left, by the slot's label, and its proxy's socket directory, only when
 // the run's marker says there may be some.

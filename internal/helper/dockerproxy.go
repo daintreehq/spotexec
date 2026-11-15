@@ -306,6 +306,13 @@ func newProxyDir() (string, error) {
 	return os.MkdirTemp(filepath.Dir(proxyDirPrefix), filepath.Base(proxyDirPrefix))
 }
 
+// isProxyDir reports whether dir is a name newProxyDir could have made: a
+// direct child of /tmp, so removing it can't follow a symlink elsewhere.
+func isProxyDir(dir string) bool {
+	return filepath.Dir(dir) == filepath.Dir(proxyDirPrefix) && len(dir) > len(proxyDirPrefix) &&
+		strings.HasPrefix(dir, proxyDirPrefix) && !strings.Contains(dir[len(proxyDirPrefix):], "/")
+}
+
 // startDockerProxy starts a docker-proxy labelling with labels, serving in
 // dir (from newProxyDir, removed by stop), through the same Docker access as
 // d (under sg when needed). It carries the workspace marker, so

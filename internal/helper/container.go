@@ -1053,7 +1053,7 @@ func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) strin
 		// The proxies are gone with the runs' processes; their socket
 		// directories may not be (a helper that died).
 		for _, dir := range strings.Fields(string(b)) {
-			if strings.HasPrefix(dir, proxyDirPrefix) && filepath.Clean(dir) == dir {
+			if isProxyDir(dir) {
 				os.RemoveAll(dir)
 			}
 		}
