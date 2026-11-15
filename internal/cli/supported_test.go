@@ -22,6 +22,7 @@ func supportedEnv(t *testing.T, runners string) {
 	t.Setenv("SPOTEXEC_STATE_DIR", filepath.Join(home, "state"))
 	t.Setenv("SPOTEXEC_POOL", "")
 	t.Setenv("SPOTEXEC_RUNNER", "")
+	t.Setenv("SPOTEXEC_SYNC", "")
 	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES"} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
@@ -104,6 +105,23 @@ func TestSupported(t *testing.T) {
 		{"git sync source outside git", sshRunner, func(t *testing.T) string {
 			d := outsideGit(t)
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[sync]\nsource = \"git\"\n")
+			return d
+		}, false},
+		{"git sync source outside git, sync.mode none", sshRunner, func(t *testing.T) string {
+			d := outsideGit(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[sync]\nsource = \"git\"\nmode = \"none\"\n")
+			return d
+		}, true},
+		{"git sync source outside git, SPOTEXEC_SYNC=none", sshRunner, func(t *testing.T) string {
+			t.Setenv("SPOTEXEC_SYNC", "none")
+			d := outsideGit(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[sync]\nsource = \"git\"\n")
+			return d
+		}, true},
+		{"SPOTEXEC_SYNC is not a sync mode", sshRunner, func(t *testing.T) string {
+			t.Setenv("SPOTEXEC_SYNC", "bogus")
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n")
 			return d
 		}, false},
 		{"symlink into a project", sshRunner, func(t *testing.T) string {
@@ -206,14 +224,22 @@ func TestSupportedCommand(t *testing.T) {
 	putFile(t, filepath.Join(yes, ".spotexec.toml"), "version = 1\n")
 	no := initRepo(t)
 	run := func(args ...string) (int, string) {
+		t.Helper()
 		r, w, _ := os.Pipe()
-		old := os.Stdout
-		os.Stdout = w
+		er, ew, _ := os.Pipe()
+		oldOut, oldErr := os.Stdout, os.Stderr
+		os.Stdout, os.Stderr = w, ew
 		code := Main(args)
-		os.Stdout = old
+		os.Stdout, os.Stderr = oldOut, oldErr
 		w.Close()
+		ew.Close()
 		b, _ := io.ReadAll(r)
+		eb, _ := io.ReadAll(er)
 		r.Close()
+		er.Close()
+		if len(eb) > 0 {
+			t.Errorf("spotexec %v wrote to stderr: %q", args, eb)
+		}
 		return code, string(b)
 	}
 	if code, out := run("supported", "-C", yes); code != 0 || out != "true\n" {
@@ -221,6 +247,9 @@ func TestSupportedCommand(t *testing.T) {
 	}
 	if code, out := run("supported", "--dir", no); code != 1 || out != "false\n" {
 		t.Errorf("supported --dir no = %d %q, want 1 \"false\\n\"", code, out)
+	}
+	if code, out := run("supported", "-C", filepath.Join(yes, "gone")); code != 1 || out != "false\n" {
+		t.Errorf("supported -C missing = %d %q, want 1 \"false\\n\"", code, out)
 	}
 	t.Chdir(yes)
 	if code, out := run("supported"); code != 0 || out != "true\n" {

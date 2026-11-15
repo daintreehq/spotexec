@@ -54,9 +54,19 @@ func supported(dir string) bool {
 	if err != nil || l.cfg.Project.Path == "" {
 		return false
 	}
-	// As client.Run: a workspace rooted at home, / or a credential directory
-	// is never synced, and sync.source = "git" needs a Git worktree.
-	if !l.ws.Marked || l.cfg.Project.Sync.Source == "git" && !l.ws.Git {
+	// The sync mode a plain sx uses: SPOTEXEC_SYNC beats the project's, and
+	// a value the run would reject fails every run.
+	mode := l.cfg.Project.Sync.Mode
+	if v := os.Getenv("SPOTEXEC_SYNC"); v != "" {
+		mode = v
+	}
+	if mode != "auto" && mode != "in" && mode != "none" {
+		return false
+	}
+	// As client.Run: when it syncs, a workspace rooted at home, / or a
+	// credential directory is refused, and sync.source = "git" needs a Git
+	// worktree.
+	if mode != "none" && (!l.ws.Marked || l.cfg.Project.Sync.Source == "git" && !l.ws.Git) {
 		return false
 	}
 	var override []string // as UsableRunners: SPOTEXEC_RUNNER beats the pool
