@@ -110,7 +110,7 @@ func (s *Session) takeSnapshot(skip []string) snapshot {
 //
 // unreported lists created paths the result leaves out but the slot still
 // tracks for cleanup: those beyond MaxCreated, and those named so that no
-// client could use them (a backslash, .git in another case).
+// client could use them (.git in another case, such as .Git).
 func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []string, created []protocol.Entry, truncated bool, unverified, unreported []string) {
 	for rel, st := range s.stored {
 		if post.unknown[rel] {

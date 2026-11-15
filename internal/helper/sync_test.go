@@ -10,9 +10,10 @@ import (
 	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
-// Names no client can use (a backslash, a ".Git" directory) never go back,
-// but a run that creates them still leaves them pending, and the next sync
-// removes them like any other file the run left behind.
+// A name no client can use (a ".Git" directory) never goes back, but a run
+// that creates it still leaves it pending, and the next sync removes it like
+// any other file the run left behind. A backslash name is an ordinary created
+// file (#92): it is reported, and goes the same way if it doesn't come back.
 func TestSyncRemovesFilesNoClientCanUse(t *testing.T) {
 	s := testSession(t, t.TempDir())
 	if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
@@ -24,22 +25,27 @@ func TestSyncRemovesFilesNoClientCanUse(t *testing.T) {
 	pre := s.takeSnapshot(nil)
 
 	// What the run creates.
-	odd := []string{`docs/.Git/config`, `docs/a\b.txt`, `x\y/z.txt`}
-	for _, p := range odd {
+	odd := []string{`docs/.Git/config`}
+	reported := []string{`docs/a\b.txt`, "new.txt", `x\y/z.txt`}
+	for _, p := range append(append([]string{}, odd...), reported...) {
 		writeFile(t, s.workspace, p, "made remotely\n")
 	}
-	writeFile(t, s.workspace, "new.txt", "made remotely\n")
 
 	_, _, created, _, _, unreported := s.diff(pre, s.takeSnapshot(nil))
-	if len(created) != 1 || created[0].Path != "new.txt" {
-		t.Fatalf("created = %v, want only new.txt", created)
+	var got []string
+	for _, c := range created {
+		got = append(got, c.Path)
+	}
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, reported) {
+		t.Fatalf("created = %v, want %v", got, reported)
 	}
 	sort.Strings(unreported)
 	if !reflect.DeepEqual(unreported, odd) {
 		t.Fatalf("unreported = %v, want %v", unreported, odd)
 	}
 	s.state.Pending = s.pendingAfter(created, nil, unreported)
-	want := append([]string{"new.txt"}, odd...)
+	want := append(append([]string{}, reported...), odd...)
 	sort.Strings(want)
 	if !reflect.DeepEqual(s.state.Pending, want) {
 		t.Fatalf("pending = %v, want %v", s.state.Pending, want)

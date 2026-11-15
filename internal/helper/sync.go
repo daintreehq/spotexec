@@ -155,7 +155,7 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		if _, err := fsid.SlotRel(p); err != nil {
 			continue // never a file a run made here (inside .git, or not a path)
 		}
-		// A name no client could use (a backslash, .Git) goes too.
+		// A name no client could use (.Git) goes too.
 		full, err := fsid.SlotJoin(s.workspace, p)
 		if err != nil {
 			if !gonePath(err) {

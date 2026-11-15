@@ -146,9 +146,9 @@ func SafeJoin(root, rel string) (string, error) {
 
 // SlotRel validates a slash-separated path that a runner's own workspace
 // produced (a file a run created there), and returns it in OS form. Unlike
-// CleanRel it accepts names no worktree may hold, such as a backslash or a
-// ".Git" directory, which a case-sensitive runner keeps as ordinary files:
-// they never travel back, but the slot still has to clean them up. It
+// CleanRel it accepts names no worktree may hold, such as a ".Git"
+// directory, which a case-sensitive runner keeps as ordinary files: they
+// never travel back, but the slot still has to clean them up. It
 // refuses what could leave the workspace (absolute paths, "..", empty
 // segments, NUL) and any path inside a directory named exactly .git, where
 // the slot's seeded repository lives and which a run's snapshot never
