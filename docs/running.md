@@ -46,7 +46,7 @@ A parallel or sharded task's parts run in several slots at once, so `--same-slot
 | `--no-boot` | Never launch VMs for this command; use only what is running. |
 | `--pull GLOB` | Also copy these gitignored paths back (repeatable). |
 | `--no-deps` | Skip dependency hydration. |
-| `--no-retry` | Don't replay the run if its VM is lost. |
+| `--no-retry` | Don't replay the run if its VM is lost. A run whose VM was out of memory when it was lost is never replayed (see [exit codes](#exit-codes)). |
 | `--fallback-local` | Run locally if no runner could be reached (never after the command started remotely). It runs as on a runner: under `bash` in its own process group, with stdin from `/dev/null`, the same `--timeout` (exit `124`) and grace period, and Ctrl-C, `SIGTERM` or `SIGHUP` stopping it (exit `130`). Each part of a parallel or sharded task falls back on its own, with its own `SPOTEXEC_SLOT` and port range. |
 | `--force-large-sync` | Allow syncing more than 100k files or 5 GiB. |
 | `--json` / `--pretty` / `-q, --quiet` | Progress format: NDJSON events, the spinner (even without a terminal), or warnings only (no progress or summary). `-q` wins over `--json`, and `--json` over `--pretty`. Without them you get the spinner at a terminal and one plain summary line otherwise, or NDJSON with `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1` (`-q`, `--json`, `--pretty` and `--json=false` override those). |
@@ -65,6 +65,7 @@ Every command gets:
 | `SPOTEXEC_SLOT` | Host-wide slot number, unique across repos. |
 | `SPOTEXEC_PORT_BASE` | `20000 + slot × 1000`. Bind test servers here and parallel jobs never collide. |
 | `SPOTEXEC_CPUS` | This job's share: vCPUs ÷ slots, rounded down (at least 1), or all of them with `--exclusive`. In a [project container](environments.md#project-containers) on a Linux runner, the job is normally also [pinned](environments.md#settings) to that many CPUs, so `nproc` and other tools that count the CPUs they may use see the same number. |
+| `SPOTEXEC_MEMORY` | This job's fair share of memory in MiB: the machine's memory, less a reserve for the runner itself (1/16 of it, between 512 MiB and 2 GiB), ÷ slots, or all of that with `--exclusive`; at least 256. Advice for sizing heaps and worker counts (`NODE_OPTIONS=--max-old-space-size=$((SPOTEXEC_MEMORY * 3 / 4))`); nothing enforces it. In a [project container](environments.md#settings), jobs sharing a VM are capped together, not one by one. |
 | `SPOTEXEC_SLOTS` | Slots per machine. |
 | `SPOTEXEC_SHARD`, `SPOTEXEC_SHARDS` | Only in a [sharded task](configuration.md#tasks): this part's number (from 1) and the number of parts, the same as `{shard}` and `{shards}`. |
 | `SPOTEXEC_RUN_ID`, `SPOTEXEC_ATTEMPT` | Stable across a replay; `SPOTEXEC_ATTEMPT` is `2` on the replay. |
@@ -95,8 +96,8 @@ The runner itself needs `git` installed, even when commands run in a project con
 | --- | --- |
 | *command's own* | The remote command's exit status, passed through. |
 | `124` | The command hit `--timeout`. |
-| `125` | spotexec itself failed: no runner, SSH, sync, bootstrap, or the runner couldn't start the command at all. In a parallel or sharded task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". |
-| `128+N` | The command died from signal N. |
+| `125` | spotexec itself failed: no runner, SSH, sync, bootstrap, or the runner couldn't start the command at all. In a parallel or sharded task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". A Spot VM lost mid-run is replayed once on another slot (unless `--no-retry`), but not when its heartbeats showed it out of memory (`MEMORY_PRESSURE`), or when EC2 still reports it running and it gave no Spot notice (`RUNNER_UNRESPONSIVE`): the run may be what overloaded it, and replayed it could take another VM's jobs down with it. |
+| `128+N` | The command died from signal N. An `OOM_KILLED` warning (with `137`, SIGKILL, when the killed process was the command itself) means the kernel killed a process in the command's container because the VM's jobs together reached their [memory pool](environments.md#settings)'s cap and it was the largest (or, outside the pool, because the container reached a memory limit set in `container.options`, or the whole VM ran out): the command ran out of memory, and the run isn't replayed. `134` (SIGABRT) with `JavaScript heap out of memory` or `Ineffective mark-compacts near heap limit` in the output is Node's own heap limit, not the machine's: raise `--max-old-space-size`. |
 | `130` | Interrupted (Ctrl-C, `SIGTERM` or `SIGHUP`), even if the command caught the signal and exited `0`. An interrupted run never counts as a success for `writeback = "on-success"`. |
 
 ## Write-back and artifacts

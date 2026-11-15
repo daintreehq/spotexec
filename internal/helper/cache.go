@@ -184,6 +184,7 @@ func startCacheUpload(root, src, lockPath, url string) error {
 // shared so prune cannot delete the source mid-archive, and gives up if
 // the VM starts draining.
 func CachePut(root, src, lockPath string) error {
+	resetOwnOOMScore() // started by a protected helper: don't keep its score
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil && line == "" {
 		return errors.New("cache-put: no URL on stdin")

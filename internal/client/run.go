@@ -101,7 +101,16 @@ type Result struct {
 	// LastRun is where this worktree's files now are, when the run
 	// synced (saved already unless Options.DeferLastRun).
 	LastRun *LastRun `json:"-"`
+	// OOMKilled: the kernel killed a process in the command's container
+	// for exceeding its memory limit.
+	OOMKilled bool `json:"oom_killed,omitempty"`
+	// noReplay, when the runner was lost, is why the run must not be
+	// replayed elsewhere (see replayable).
+	noReplay noReplay
 }
+
+// noReplay is a warning code and the reason behind it.
+type noReplay struct{ code, why string }
 
 // InfraError marks failures of spotexec itself (exit 125).
 type InfraError struct{ Err error }
@@ -149,8 +158,11 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
 		reached = reached || res.Runner != ""
 		res.Reached = reached
-		retryable := lost != "" && o.RetryPreempt && ctx.Err() == nil && o.Sync != "none" && !o.PreferLast && !o.SameSlot && att.n < 2
-		if !retryable {
+		retry, code, why := replayable(lost, res, o, ctx.Err() != nil, att.n)
+		if why != "" {
+			o.Rep.Warn(code, "%s", why)
+		}
+		if !retry {
 			return res, err
 		}
 		o.Rep.Warn("RUNNER_LOST", "lost %s before the command finished (%v); replaying the run on another slot", lost, err)
@@ -161,6 +173,43 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		}
 		att.n++
 	}
+}
+
+// replayable decides whether an attempt that lost its runner (lost, from
+// lostRunner) is replayed on another slot. why is set when the runner was
+// out of memory when it was lost: that run is never replayed, since a run
+// that used up its VM's memory would most likely do the same on the next
+// one, and take that VM's other jobs with it.
+func replayable(lost string, res Result, o Options, canceled bool, n int) (retry bool, code, why string) {
+	if lost == "" {
+		return false, "", ""
+	}
+	eligible := o.RetryPreempt && !canceled && o.Sync != "none" && !o.PreferLast && !o.SameSlot && n < 2
+	if res.noReplay.why == "" {
+		return eligible, "", ""
+	}
+	why = "lost " + lost + " " + res.noReplay.why
+	if eligible {
+		why += "; not replaying the run on another slot"
+	}
+	return false, res.noReplay.code, why
+}
+
+// whyNoReplay decides, once a fleet lease's runner is lost, whether the
+// run must not be replayed elsewhere: its VM reported memory pressure (a
+// run that used up its VM's memory would most likely do the same on the
+// next one, and take that VM's other jobs with it), or the VM is still
+// running and gave no Spot notice, so whatever stopped it answering came
+// from inside, quite possibly from this run. A VM that is gone, or noticed
+// its reclamation, is replayed as before.
+func whyNoReplay(lease *Lease, noticed bool) noReplay {
+	if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
+		return noReplay{"MEMORY_PRESSURE", "while it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
+	}
+	if !noticed && instanceRunning(lease) {
+		return noReplay{"RUNNER_UNRESPONSIVE", "although EC2 still reports it running, without a Spot notice: the run may be what overloaded it (memory, most often), and the attempt's outcome is unknown. Rerun it, with --exclusive if it may need the whole VM"}
+	}
+	return noReplay{}
 }
 
 // lostRunner reports what to exclude when the connection to a lease died.
@@ -190,9 +239,8 @@ func lostRunner(l *Lease, err error) string {
 	return "static"
 }
 
-func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, att attempt) (Result, error, string) {
+func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, att attempt) (res Result, err error, lost string) {
 	start := time.Now()
-	var res Result
 	p := cfg.Project
 	runID := att.runID
 
@@ -271,6 +319,15 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}
 	defer lease.Close()
+	if lease.InstanceID != "" {
+		lease.Sess.SetOnSilent(waitIfRunning(lease, o.Rep))
+	}
+	var noticed atomic.Bool // a reclamation notice arrived
+	defer func() {
+		if lost != "" && lease.InstanceID != "" {
+			res.noReplay = whyNoReplay(lease, noticed.Load())
+		}
+	}()
 	// Before the command starts, Ctrl-C aborts the session outright (a
 	// blocked upload cannot otherwise be interrupted). Once it runs,
 	// interrupts are forwarded as cancels and the session stays up so
@@ -288,7 +345,6 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	r := lease.Runner
 	res.Runner, res.Slot = r.Name, lease.Acq.Token
 	sess := lease.Sess
-	var noticed atomic.Bool // a reclamation notice arrived before exec
 	sess.OnEvent = func(ev protocol.Event) {
 		o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
 		if ev.Name == "spot_interruption" {
@@ -427,6 +483,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}()
 	onSpot := func() {
+		noticed.Store(true)
 		if lease.InstanceID == "" || !(o.RetryPreempt && att.n < 2 && o.Sync != "none" && !o.PreferLast && !o.SameSlot) {
 			return
 		}
@@ -493,6 +550,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if result.TimedOut {
 		o.Rep.Warn("TIMEOUT", "command exceeded %s and was terminated (raise with --timeout)", o.Timeout)
 	}
+	if result.OOMKilled {
+		res.OOMKilled = true
+		o.Rep.Warn("OOM_KILLED", "%s", oomMessage(result.MemoryLimitMB))
+	}
 
 	// 6. Write-back of mutations.
 	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, res.ExitCode) &&
@@ -536,7 +597,11 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	checkCanceled()
 	res.Duration = time.Since(start)
-	o.Rep.Event("result", map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot})
+	ev := map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot}
+	if res.OOMKilled {
+		ev["oom_killed"] = true
+	}
+	o.Rep.Event("result", ev)
 	return res, nil, ""
 }
 
@@ -988,8 +1053,8 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot 
 			}
 		}
 	}()
-	// The helper heartbeats every 20s; silence well beyond that means it is
-	// wedged or the link is a blackhole even if SSH keepalives still pass.
+	// A silent helper is the session watchdog's to give up on (after any
+	// grace for a VM that is still running): Next then fails.
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	var canceledAt time.Time
@@ -997,10 +1062,6 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot 
 	for {
 		select {
 		case <-tick.C:
-			if time.Since(s.LastSeen()) > 75*time.Second {
-				s.Abort()
-				return res, &transport.ConnError{Target: "helper", Msg: "runner stopped responding"}
-			}
 			if !canceledAt.IsZero() && time.Since(canceledAt) > cancelGrace {
 				s.Abort()
 				return res, &transport.ConnError{Target: "helper", Msg: "runner did not confirm cancellation"}
@@ -1052,6 +1113,70 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot 
 			}
 		}
 	}
+}
+
+// PressureWindow: memory pressure the runner reported this recently before
+// it was lost counts as the reason it was lost (heartbeats come every 20s,
+// and silence lasts SilenceLimit plus any SilentGrace before a loss).
+var PressureWindow = 5 * time.Minute
+
+// SilentGrace is how much longer a session waits for a silent helper whose
+// VM the cloud still reports as running: a VM short of memory can stall
+// for minutes until the kernel's OOM killer acts, and then recovers, and
+// giving up on it throws away every slot's run there.
+var SilentGrace = 3 * time.Minute
+
+// waitIfRunning returns the session's silence hook for a fleet lease: if
+// the VM is still running, wait SilentGrace longer before giving up on it.
+func waitIfRunning(lease *Lease, rep ui.Reporter) func(time.Duration) time.Duration {
+	return func(silent time.Duration) time.Duration {
+		if !instanceRunning(lease) {
+			return 0
+		}
+		why := ""
+		if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
+			why = "; it last reported memory pressure (" + p + ")"
+		}
+		rep.Warn("RUNNER_SILENT", "%s hasn't answered for %s but is still running%s; waiting up to %s more for it", lease.InstanceID, silent.Round(time.Second), why, SilentGrace)
+		return SilentGrace
+	}
+}
+
+// instanceRunning asks the cloud (the instance's own region, for a
+// multi-region fleet) whether a lease's VM is running, within 10s; false
+// when it can't tell.
+func instanceRunning(lease *Lease) bool {
+	if lease.InstanceID == "" || lease.Provider == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.Fleet)
+	if !ok {
+		if f, ok = lease.Provider.(provider.Fleet); !ok {
+			return false
+		}
+	}
+	list, err := f.List(ctx)
+	if err != nil {
+		return false
+	}
+	for _, in := range list {
+		if in.ID == lease.InstanceID {
+			return in.State == provider.StateRunning
+		}
+	}
+	return false
+}
+
+// oomMessage explains an OOM_KILLED result; limitMB is the memory pool's
+// cap, 0 when the container wasn't in the pool (container.options set a
+// limit of its own).
+func oomMessage(limitMB int64) string {
+	if limitMB <= 0 {
+		return "the command ran out of memory: the kernel killed a process in its container for exceeding the container's memory limit (set in container.options)"
+	}
+	return fmt.Sprintf("the command ran out of memory: the jobs sharing the runner reached the memory set aside for them (%.1f GiB), and the kernel killed the largest process, in this command's container. Use --exclusive to have the whole VM, fewer max_slots, or make it use less", float64(limitMB)/1024)
 }
 
 // cpuShare is the number of CPUs one job should use on a host.

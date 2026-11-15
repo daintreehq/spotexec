@@ -12,6 +12,8 @@
 //   - upload-hangs: the helper upload never finishes;
 //   - rpc-silent: after the handshake the helper goes silent, reading and
 //     writing nothing (a wedged helper or half-open channel);
+//   - rpc-pressure: after the handshake the helper sends one heartbeat
+//     reporting memory pressure, then goes silent (a VM out of memory);
 //   - rpc-heartbeat: after the handshake the helper sends only heartbeats
 //     and never answers (alive, but slow);
 //   - hold-fds: another process keeps the session's stdin, stdout and
@@ -182,6 +184,10 @@ func rpc() int {
 		if hold.Start() == nil {
 			_ = os.WriteFile(filepath.Join(st, "hold-fds.pid"), []byte(strconv.Itoa(hold.Process.Pid)), 0o600)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(st, "rpc-pressure")); err == nil {
+		_ = conn.Send(protocol.TypeHeartbeat, protocol.Heartbeat{MemTotalMB: 16000, MemAvailMB: 120})
+		time.Sleep(time.Hour) // until killed
 	}
 	if _, err := os.Stat(filepath.Join(st, "rpc-silent")); err == nil {
 		time.Sleep(time.Hour) // until killed

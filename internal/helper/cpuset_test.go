@@ -163,7 +163,7 @@ func TestCPUOption(t *testing.T) {
 			t.Errorf("%v: not seen as a CPU limit", o)
 		}
 	}
-	for _, o := range [][]string{nil, {"--shm-size=1g"}, {"--cpu-shares=512"}, {"--cpuset-mems=0"}, {"--cpusx"}} {
+	for _, o := range [][]string{nil, {"--shm-size=1g"}, {"--cpu-shares=512"}, {"--cpuset-mems=0"}, {"--cpusx"}, {"--label", "--cpus=2"}, {"-e", "--cpus"}} {
 		if f := cpuOption(o); f != "" {
 			t.Errorf("%v: seen as %s", o, f)
 		}
