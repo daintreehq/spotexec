@@ -95,6 +95,13 @@ type Result struct {
 	Mutated   []string `json:"mutated_files"`
 	Deleted   []string `json:"deleted_files"`
 	Conflicts []string `json:"conflicts"`
+	// BackedUp: files write-back deleted or replaced that git had no
+	// committed copy of, saved under BackupDir first.
+	BackedUp  []string `json:"backed_up_files,omitempty"`
+	BackupDir string   `json:"backup_dir,omitempty"`
+	// Held: deletions write-back kept back (the project's own config, or
+	// most of the synced files).
+	Held      []string `json:"held_deletions,omitempty"`
 	Pulled    int      `json:"pulled"`
 	Synced    int      `json:"synced_files"`
 	SyncBytes int64    `json:"synced_bytes"`
@@ -645,15 +652,18 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			proceed = func() bool { return ctx.Err() == nil }
 		}
 		wb, err := writeback(post, sess, ws, m, result, runID, ignoredCreated, proceed)
-		// Conflicts stashed before any failure are reported either way.
+		// Conflicts stashed and files backed up before any failure are
+		// reported either way.
 		reportConflicts(o.Rep, wb.Stashed, runID)
+		reportSafety(o.Rep, wb, runID)
+		res.BackedUp, res.BackupDir, res.Held = wb.BackedUp, wb.BackupDir, wb.Held
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
 			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)), ""
 		}
 		res.Mutated, res.Deleted, res.Conflicts = wb.Applied, wb.Deleted, wb.Conflicts
-		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "ignored_created": wb.Ignored, "duration_ms": time.Since(t).Milliseconds()})
+		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "duration_ms": time.Since(t).Milliseconds()})
 		if len(wb.Refused) > 0 {
 			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
 		}
@@ -715,6 +725,19 @@ func reportConflicts(rep ui.Reporter, stashed []Conflict, runID string) {
 			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version. The remote version: %s", c.Path, diff)
 		}
 		rep.Event("conflict", map[string]any{"path": c.Path, "local": c.Local, "remote": c.Remote, "deleted": c.Deleted, "diff": diff, "run_id": runID})
+	}
+}
+
+// reportSafety says where write-back saved the uncommitted files it deleted
+// or replaced, and which deletions it held back and why.
+func reportSafety(rep ui.Reporter, wb WritebackResult, runID string) {
+	if len(wb.BackedUp) > 0 {
+		rep.Warn("WRITEBACK_BACKUP", "the run deleted or replaced %d file(s) git has no committed copy of; your versions are saved in %s: %s", len(wb.BackedUp), wb.BackupDir, strings.Join(firstN(wb.BackedUp, 5), ", "))
+		rep.Event("backup", map[string]any{"dir": wb.BackupDir, "files": wb.BackedUp, "run_id": runID})
+	}
+	if len(wb.Held) > 0 {
+		rep.Warn("WRITEBACK_HELD", "%s; kept %d file(s) here instead of deleting them (delete them yourself if that was intended): %s", wb.HeldWhy, len(wb.Held), strings.Join(firstN(wb.Held, 5), ", "))
+		rep.Event("held_deletions", map[string]any{"reason": wb.HeldWhy, "files": wb.Held, "run_id": runID})
 	}
 }
 

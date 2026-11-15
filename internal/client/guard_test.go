@@ -11,6 +11,8 @@ func TestReservedPath(t *testing.T) {
 		".spotexec/conflicts/r1/x": true,
 		".SpotExec/Conflicts/r1/x": true,
 		".spotexec/WRITEBACK.lock": true,
+		".spotexec/backup/r1/x":    true,
+		".spotexec/Backup/r1/x":    true,
 		".spotexec/Dockerfile":     false,
 		".spotexec/setup.sh":       false,
 		"src/git/x":                false,

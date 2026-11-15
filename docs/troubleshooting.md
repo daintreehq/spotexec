@@ -20,6 +20,8 @@ spotexec cloud-init aws         # print the exact first-boot script
 | `InsufficientInstanceCapacity` | Add more `instance_types` (or use `vcpus` to consider every type of that size), or try another region. spotexec already moves on to the next-cheapest zone and type. |
 | Sync is slow or refused as too large | Run `spotexec sync-plan`. Exclude build outputs and large fixtures with `sync.exclude` or `.spotexecignore`. |
 | `SYNC_CONFLICT` | You edited a file during the run. Compare it with the saved copy under `.git/spotexec/conflicts/<run-id>/`. |
+| `WRITEBACK_BACKUP` | The run deleted or replaced files that had no committed copy (untracked files, uncommitted edits). Your versions are saved in the directory the warning names (`<git-dir>/spotexec/backup/<run-id>/`, or `.spotexec/backup/<run-id>/` outside Git): copy back what you need. |
+| `WRITEBACK_HELD` | The run deleted the project's own `.spotexec.toml` or `.gitignore`, or most of the synced files, so those deletions weren't applied here. If they were intended, delete the files yourself. |
 | `fatal: not a git repository` on the runner | The workspace has no `.git` unless you set `git_seed = true` under `[sync]`. See [Git on the runner](running.md#git-on-the-runner). |
 | `GIT_SEED_FAILED` or `GIT_SEED_UNAVAILABLE` | The command ran without a `.git`: the runner has no `git` (install it on the runner itself, for example in `bootstrap_script`: a project container doesn't count), the project isn't synced from a Git worktree, or HEAD couldn't be read. The warning says which. |
 | A test needs a local service | Prefix it with `SPOTEXEC_LOCAL=1` (agent hook), or run it with plain `pnpm …` instead of `sx`. |

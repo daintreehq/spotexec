@@ -12,7 +12,7 @@ import (
 // runner is not trusted to write there: a git hook would run on the laptop.
 //
 // .spotexec holds spotexec's own state (the write-back lock, stashed
-// conflicts) only outside git (in a git worktree it lives under the git
+// conflicts, backups of what write-back deleted) only outside git (in a git worktree it lives under the git
 // dir). The rest of .spotexec/, such as a container's Dockerfile, is an
 // ordinary directory.
 func reservedPath(p string, git bool) bool {
@@ -25,7 +25,7 @@ func reservedPath(p string, git bool) bool {
 	if git || !strings.EqualFold(segs[0], ".spotexec") {
 		return false
 	}
-	return len(segs) == 1 || strings.EqualFold(segs[1], "conflicts") || strings.EqualFold(segs[1], "writeback.lock")
+	return len(segs) == 1 || strings.EqualFold(segs[1], "conflicts") || strings.EqualFold(segs[1], "backup") || strings.EqualFold(segs[1], "writeback.lock")
 }
 
 // pullMatches reports whether p (workspace-relative) was asked for by one of

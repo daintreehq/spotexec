@@ -231,13 +231,17 @@ func TestConflictsAreReported(t *testing.T) {
 
 type recordingReporter struct {
 	warnings []string
-	events   []map[string]any
+	events   []map[string]any // conflict events
+	named    []string         // every event, by name
+	fields   []map[string]any // and its fields
 }
 
 func (r *recordingReporter) Event(name string, f map[string]any) {
 	if name == "conflict" {
 		r.events = append(r.events, f)
 	}
+	r.named = append(r.named, name)
+	r.fields = append(r.fields, f)
 }
 func (r *recordingReporter) Status(string, ...any) {}
 func (r *recordingReporter) Clear()                {}

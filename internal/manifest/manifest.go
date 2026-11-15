@@ -43,9 +43,9 @@ var BuiltinExcludes = []string{
 // NeverSync is never synced from untracked/non-Git sources, whatever the
 // project config says (not even where Options.Include lifts the built-in
 // excludes): credential directories, and spotexec's own state in a non-Git
-// project's .spotexec/ (write-back lock, stashed conflicts). It is matched
+// project's .spotexec/ (write-back lock, stashed conflicts, backups). It is matched
 // case-insensitively, as macOS and Windows filesystems resolve it.
-var NeverSync = append(append([]string{}, config.CredentialDirs...), "/.spotexec/conflicts/", "/.spotexec/writeback.lock")
+var NeverSync = append(append([]string{}, config.CredentialDirs...), "/.spotexec/conflicts/", "/.spotexec/backup/", "/.spotexec/writeback.lock")
 
 var textAttr = regexp.MustCompile(`(^|\s)-?(text|crlf)(=|\s|$)`)
 
