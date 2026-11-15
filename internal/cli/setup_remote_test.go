@@ -329,6 +329,28 @@ func TestRemoteInstallBrewReplacesOlderLocalCopy(t *testing.T) {
 	}
 }
 
+// An older modified build that an earlier setup copied into ~/.local/bin
+// (#98) goes too, so a login shell finds Homebrew's.
+func TestRemoteInstallBrewReplacesOlderModifiedLocalCopy(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	withLatest(t, "v0.4.0")
+	f.brewOffers("0.4.0")
+	f.localInstalled("v0.2.0-10-g6fb2e4a-dirty")
+	r := f.setup()
+	in, err := f.install(r)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	for _, n := range []string{"spotexec", "sx"} {
+		if _, err := os.Lstat(filepath.Join(f.home, ".local/bin", n)); !os.IsNotExist(err) {
+			t.Fatalf("~/.local/bin/%s still there (%v)\n%s", n, err, f.out.String())
+		}
+	}
+	if err := r.checkLoginShell(context.Background(), in.dir, in.want); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCheckLoginShell(t *testing.T) {
 	f := newFakeHost(t, t.TempDir())
 	f.localInstalled("0.3.0")
