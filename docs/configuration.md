@@ -62,7 +62,6 @@ priority = 20
 idle_timeout = "10m"
 max_lifetime = "12h"
 volume_gb = 64
-hourly_cost = 0.25                # used by `spotexec monitor` for burn rate
 bootstrap_script = """
 apt-get update -o DPkg::Lock::Timeout=300 && apt-get install -y build-essential
 """
@@ -82,7 +81,7 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | `work_root` | `~/.cache/spotexec` | Where slots, caches and the helper live on the runner. |
 | `remote_path_setup` | (none) | Shell run before each command, after the login profile (for example `PATH` for mise or nvm). Not used inside a [project container](environments.md#project-containers). |
 | `ssh_options` | (none) | Extra `-o` options for `ssh`, for example `["Port=2222", "ProxyJump=bastion"]`. They override spotexec's defaults (`ConnectTimeout=10`, `ServerAliveInterval=10`, `ServerAliveCountMax=3`, `LogLevel=ERROR`), and runners whose options differ never share a connection. |
-| `hourly_cost` | (none) | Price per machine-hour of a fleet instance, for `spotexec monitor`. |
+| `hourly_cost` | (none) | Price per machine-hour, for the burn estimates in `spotexec status` and `spotexec monitor`. `aws-spot` VMs are priced at the current Spot price of their own instance type in their zone, so for them this is only the fallback when that price is unknown (an on-demand VM, or prices that can't be read). |
 
 ### `ssh` runners
 
