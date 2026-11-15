@@ -480,7 +480,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		if f.fallsBack(l, o, res, err) {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
 			code := finish(runLocal(ctx, intr, l, o, rep, 0, 1))
-			warnUnknownTask(rep, l.cfg.Project, watch, code)
+			warnUnknownTask(rep, l.cfg.Project, watch, code, true)
 			return code
 		}
 		finish(client.ExitInfra)
@@ -522,7 +522,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	}
 	finish(res.ExitCode)
 	if !res.Canceled {
-		warnUnknownTask(rep, l.cfg.Project, watch, res.ExitCode)
+		warnUnknownTask(rep, l.cfg.Project, watch, res.ExitCode, false)
 	}
 	rep.Done(summary, res.ExitCode == 0)
 	return res.ExitCode

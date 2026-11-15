@@ -24,6 +24,7 @@ func TestTaskLikeWord(t *testing.T) {
 		{[]string{"FOO=1", "test"}, false, ""},
 		{[]string{"test-al --x"}, false, ""},
 		{[]string{"echo $X"}, false, ""},
+		{[]string{"-x"}, false, ""},
 		{nil, false, ""},
 	}
 	for _, c := range cases {
@@ -77,9 +78,18 @@ func TestNotFoundWatchAcrossWrites(t *testing.T) {
 	// A not-found message only counts as a whole line.
 	w = newNotFoundWatch(io.Discard, "nosuch")
 	io.WriteString(w, "nosuch: command not found and more\n")
-	io.WriteString(w, strings.Repeat("x", maxWatchedLine+10)+"nosuch: command not found\n")
+	io.WriteString(w, strings.Repeat("x", maxWatchedLine+10)+" nosuch: command not found\n")
+	io.WriteString(w, strings.Repeat("x", maxWatchedLine-5))
+	io.WriteString(w, strings.Repeat("x", 10))
+	io.WriteString(w, " nosuch: command not found\n")
 	if w.Seen() {
 		t.Error("partial or oversized line matched")
+	}
+	// The last line counts without its newline.
+	w = newNotFoundWatch(io.Discard, "nosuch")
+	io.WriteString(w, "sh: nosuch: not found")
+	if !w.Seen() {
+		t.Error("an unterminated last line wasn't seen")
 	}
 }
 
@@ -93,23 +103,28 @@ func TestClosestName(t *testing.T) {
 		"deploy":   "",
 		"go":       "",
 		"test-all": "test-all",
+		"ts":       "",
+		"lnt":      "lint",
 	}
 	for word, want := range cases {
 		if got := closestName(word, names); got != want {
 			t.Errorf("closestName(%q) = %q, want %q", word, got, want)
 		}
 	}
+	if got := closestName("testx", []string{"testa", "tests"}); got != "" {
+		t.Errorf("a tie suggested %q", got)
+	}
 }
 
 func TestUnknownTaskWarning(t *testing.T) {
 	p := &config.Project{Tasks: map[string]*config.Task{"test-all": {Run: "x"}, "lint": {Run: "y"}}}
-	if got, want := unknownTaskWarning(p, "test-al"), `"test-al" is not a task, and no command by that name was found; did you mean "test-all"? (spotexec tasks lists the tasks)`; got != want {
+	if got, want := unknownTaskWarning(p, "test-al", false), `no task is named "test-al", and the shell found no command by that name on the runner; did you mean "test-all"? (spotexec tasks lists the tasks)`; got != want {
 		t.Errorf("got %q", got)
 	}
-	if got := unknownTaskWarning(p, "deploy"); strings.Contains(got, "did you mean") || !strings.Contains(got, "spotexec tasks") {
+	if got := unknownTaskWarning(p, "deploy", true); strings.Contains(got, "did you mean") || !strings.Contains(got, " locally (spotexec tasks lists the tasks)") {
 		t.Errorf("no close task: %q", got)
 	}
-	if got := unknownTaskWarning(&config.Project{}, "deploy"); !strings.HasSuffix(got, "(this project defines no tasks)") {
+	if got := unknownTaskWarning(&config.Project{}, "deploy", false); !strings.HasSuffix(got, "(this project defines no tasks)") {
 		t.Errorf("no tasks: %q", got)
 	}
 }
@@ -133,13 +148,13 @@ func TestMistypedTaskNameWarns(t *testing.T) {
 		return runMain(t, "sx", append([]string{"-C", dir, "--fallback-local", "--queue-timeout", "5s"}, args...)...)
 	}
 	code, stderr := run("test-al")
-	if code != 127 || !strings.Contains(stderr, `sx: warning: "test-al" is not a task, and no command by that name was found; did you mean "test-all"? (spotexec tasks lists the tasks)`) {
+	if code != 127 || !strings.Contains(stderr, `sx: warning: no task is named "test-al", and the shell found no command by that name locally; did you mean "test-all"? (spotexec tasks lists the tasks)`) {
 		t.Errorf("mistyped task: exit %d, stderr %q", code, stderr)
 	}
 	// A command that exists but exits 127, or a word after --, says nothing.
 	for _, args := range [][]string{{"sh", "-c", "exit 127"}, {"--", "test-al"}, {"sh", "-c", "test-al"}} {
 		code, stderr := run(args...)
-		if code != 127 || strings.Contains(stderr, "is not a task") {
+		if code != 127 || strings.Contains(stderr, "no task is named") {
 			t.Errorf("%q: exit %d, stderr %q", args, code, stderr)
 		}
 	}

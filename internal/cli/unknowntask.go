@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -17,17 +18,17 @@ import (
 // for the shell saying it found no command by that name, and a 127 then
 // carries a warning that names the closest task.
 
+// taskLikeWordRe is a plain command word: not a path, an assignment, a flag
+// or a shell snippet.
+var taskLikeWordRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.:+@%,-]*$`)
+
 // taskLikeWord returns the first word of a shorthand run when it could be a
-// mistyped task name: a bare word, not a path, an assignment or a snippet.
+// mistyped task name.
 func taskLikeWord(rest []string, dashed bool) string {
-	if dashed || len(rest) == 0 {
+	if dashed || len(rest) == 0 || !taskLikeWordRe.MatchString(rest[0]) {
 		return ""
 	}
-	w := rest[0]
-	if w == "" || strings.ContainsAny(w, " \t\n/=$`'\"\\;&|<>()*?[]{}~!#") {
-		return ""
-	}
-	return w
+	return rest[0]
 }
 
 // notFoundWatch passes writes through to w and notes whether a complete line
@@ -38,7 +39,8 @@ type notFoundWatch struct {
 	word string
 
 	mu   sync.Mutex
-	line []byte
+	line []byte // the current line so far
+	long bool   // the current line outgrew maxWatchedLine: it can't match
 	seen bool
 }
 
@@ -55,32 +57,34 @@ func (n *notFoundWatch) Write(p []byte) (int, error) {
 	rest := p
 	for len(rest) > 0 {
 		i := bytes.IndexByte(rest, '\n')
+		end := i
 		if i < 0 {
-			if len(n.line)+len(rest) <= maxWatchedLine {
-				n.line = append(n.line, rest...)
-			} else {
-				n.line = append(n.line[:0], "\x00"...) // too long: never a match
-			}
+			end = len(rest)
+		}
+		if !n.long && len(n.line)+end <= maxWatchedLine {
+			n.line = append(n.line, rest[:end]...)
+		} else {
+			n.long, n.line = true, n.line[:0]
+		}
+		if i < 0 {
 			break
 		}
-		if len(n.line)+i <= maxWatchedLine {
-			n.line = append(n.line, rest[:i]...)
-			if !n.seen && notFoundLine(string(n.line), n.word) {
-				n.seen = true
-			}
+		if !n.long && !n.seen && notFoundLine(string(n.line), n.word) {
+			n.seen = true
 		}
-		n.line = n.line[:0]
+		n.line, n.long = n.line[:0], false
 		rest = rest[i+1:]
 	}
 	n.mu.Unlock()
 	return n.w.Write(p)
 }
 
-// Seen reports whether the shell said the word wasn't found.
+// Seen reports whether the shell said the word wasn't found, on a complete
+// line or on the last one, left without a newline.
 func (n *notFoundWatch) Seen() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.seen
+	return n.seen || !n.long && notFoundLine(string(n.line), n.word)
 }
 
 func notFoundLine(line, word string) bool {
@@ -96,10 +100,15 @@ func notFoundLine(line, word string) bool {
 }
 
 // unknownTaskWarning returns the warning for a word that is neither a task
-// nor a command, naming the closest task when one is near enough.
-func unknownTaskWarning(p *config.Project, word string) string {
+// nor, as far as the shell could tell, a command, naming the closest task
+// when one is near enough.
+func unknownTaskWarning(p *config.Project, word string, local bool) string {
 	names := p.TaskNames()
-	msg := fmt.Sprintf("%q is not a task, and no command by that name was found", word)
+	where := "on the runner"
+	if local {
+		where = "locally"
+	}
+	msg := fmt.Sprintf("no task is named %q, and the shell found no command by that name %s", word, where)
 	if len(names) == 0 {
 		return msg + " (this project defines no tasks)"
 	}
@@ -110,15 +119,28 @@ func unknownTaskWarning(p *config.Project, word string) string {
 }
 
 // closestName returns the name nearest to word by edit distance (with
-// adjacent transpositions), if it is within a third of word's length (at
-// least 1). Ties go to the first name in order.
+// adjacent transpositions): within 1 for words of 3 to 5 characters, 2 for
+// longer ones, and never for shorter ones or when two names tie.
 func closestName(word string, names []string) string {
-	limit := max(1, len([]rune(word))/3)
-	best, bestD := "", limit+1
-	for _, n := range names {
-		if d := editDistance(strings.ToLower(word), strings.ToLower(n)); d < bestD {
-			best, bestD = n, d
+	n := len([]rune(word))
+	if n < 3 {
+		return ""
+	}
+	limit := 1
+	if n > 5 {
+		limit = 2
+	}
+	best, bestD, tied := "", limit+1, false
+	for _, name := range names {
+		switch d := editDistance(strings.ToLower(word), strings.ToLower(name)); {
+		case d < bestD:
+			best, bestD, tied = name, d, false
+		case d == bestD:
+			tied = true
 		}
+	}
+	if tied {
+		return ""
 	}
 	return best
 }
@@ -152,9 +174,9 @@ func editDistance(a, b string) int {
 
 // warnUnknownTask warns, after a run that exited 127, when the watched word
 // was reported as not found.
-func warnUnknownTask(rep ui.Reporter, p *config.Project, watch *notFoundWatch, code int) {
+func warnUnknownTask(rep ui.Reporter, p *config.Project, watch *notFoundWatch, code int, local bool) {
 	if watch == nil || code != 127 || !watch.Seen() {
 		return
 	}
-	rep.Warn("UNKNOWN_TASK", "%s", unknownTaskWarning(p, watch.word))
+	rep.Warn("UNKNOWN_TASK", "%s", unknownTaskWarning(p, watch.word, local))
 }
