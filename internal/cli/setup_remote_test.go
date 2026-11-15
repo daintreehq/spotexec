@@ -336,6 +336,8 @@ func TestRemoteInstallBrewReplacesOlderModifiedLocalCopy(t *testing.T) {
 	withLatest(t, "v0.4.0")
 	f.brewOffers("0.4.0")
 	f.localInstalled("v0.2.0-10-g6fb2e4a-dirty")
+	// As on that machine: ~/.local/bin first, so the old copy shadows.
+	f.loginPath(filepath.Join(f.home, ".local", "bin"), filepath.Join(f.dir, "brew", "bin"))
 	r := f.setup()
 	in, err := f.install(r)
 	if err != nil {
@@ -348,6 +350,44 @@ func TestRemoteInstallBrewReplacesOlderModifiedLocalCopy(t *testing.T) {
 	}
 	if err := r.checkLoginShell(context.Background(), in.dir, in.want); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// An sx in ~/.local/bin that isn't the link setup made stays.
+func TestRemoteInstallBrewKeepsOtherSx(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	withLatest(t, "v0.3.0")
+	f.brewOffers("0.3.0")
+	f.localInstalled("0.2.0")
+	sx := filepath.Join(f.home, ".local/bin/sx")
+	_ = os.Remove(sx)
+	if err := os.Symlink("/usr/bin/true", sx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.install(f.setup()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out.String())
+	}
+	if _, err := os.Lstat(filepath.Join(f.home, ".local/bin/spotexec")); !os.IsNotExist(err) {
+		t.Fatalf("~/.local/bin/spotexec still there (%v)", err)
+	}
+	if target, err := os.Readlink(sx); err != nil || target != "/usr/bin/true" {
+		t.Fatalf("~/.local/bin/sx = %q, %v", target, err)
+	}
+}
+
+func TestLocalCopyNoNewer(t *testing.T) {
+	for _, c := range []struct {
+		v    string
+		want bool
+	}{
+		{"0.3.0", true}, {"0.2.0", true}, {"v0.3.0-2-gabc123", false}, {"0.4.0", false},
+		{"v0.2.0-10-g6fb2e4a-dirty", true}, {"v0.2.9-dirty", true},
+		{"v0.3.0-dirty", false}, {"v0.3.0-2-gabc123-dirty", false},
+		{"dev", false}, {"", false}, {"0.3.0-rc1", false}, {"0.2.0-rc1-dirty", false}, {"v0.2.0-dirty-dirty", false},
+	} {
+		if got := localCopyNoNewer(c.v, "0.3.0"); got != c.want {
+			t.Errorf("localCopyNoNewer(%q, 0.3.0) = %v", c.v, got)
+		}
 	}
 }
 
