@@ -106,6 +106,18 @@ type Fleet interface {
 	Terminate(ctx context.Context, instanceID string) error
 }
 
+// Matcher is implemented by fleets whose VMs can stop satisfying the
+// runner's requirements when its config changes (a raised min_memory_gib,
+// a type dropped from instance_types): such a VM should take no new runs
+// and idle out, rather than keep serving under the old requirements.
+type Matcher interface {
+	// Mismatches judges each instance against the runner's current
+	// requirements: "" when it still satisfies them, otherwise why not. An
+	// instance it can't judge (unknown type, a failed lookup) is left out,
+	// so a lookup failure never retires VMs.
+	Mismatches(ctx context.Context, insts []Instance) map[string]string
+}
+
 // ErrLaunchAmbiguous wraps a launch failure after which an instance may
 // nevertheless exist (e.g. the RunInstances response was lost).
 var ErrLaunchAmbiguous = errors.New("launch outcome unknown")
