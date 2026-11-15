@@ -311,7 +311,7 @@ func TestReportSafety(t *testing.T) {
 	if b := rec.fields[0]; b["dir"] != "/g/spotexec/backup/r" || fmt.Sprint(b["files"]) != "[a]" {
 		t.Errorf("backup event %v", b)
 	}
-	if h := rec.fields[1]; fmt.Sprint(h["files"]) != "[.gitignore]" || h["reason"] == "" {
+	if h := rec.fields[1]; fmt.Sprint(h["files"]) != "[.gitignore]" || h["reason"] != "the run deleted the project's own .gitignore" {
 		t.Errorf("held_deletions event %v", h)
 	}
 	rec = &recordingReporter{}
