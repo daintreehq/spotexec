@@ -251,10 +251,10 @@ func (s *Session) heard() { s.seen.Store(int64(time.Since(s.born))) }
 func (s *Session) readLoop() {
 	for {
 		f, err := s.Conn.ReadFrame()
-		s.heard()
 		if err != nil {
 			// Waking can bring the end of the connection before the
-			// watchdog's next tick: note the suspension first.
+			// watchdog's next tick: note the suspension first. The end is
+			// not word from the helper: it mustn't clear one (recovered).
 			s.observe(0)
 			s.setErr(err)
 			s.lostMu.Do(func() { close(s.lost) })
@@ -263,6 +263,7 @@ func (s *Session) readLoop() {
 			close(s.done)
 			return
 		}
+		s.heard()
 		if f.Kind == protocol.KindMsg {
 			if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeHeartbeat {
 				s.notePressure(env)

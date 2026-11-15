@@ -213,7 +213,13 @@ func TestClientAsleepVerdict(t *testing.T) {
 	if got := whyNoReplay(pressured, false, running, false); got.code != "CLIENT_SUSPENDED" {
 		t.Fatalf("a sleep under memory pressure: %q (%q), want CLIENT_SUSPENDED", got.code, got.why)
 	}
+	if got := whyNoReplay(pressured, false, depsCheck, false); got.code != "" {
+		t.Fatalf("a sleep under memory pressure before the command: %q (%q), want a replay", got.code, got.why)
+	}
 	sessionSuspended = func(*transport.Session) time.Duration { return 0 }
+	if got := whyNoReplay(pressured, false, depsCheck, false); got.code != "MEMORY_PRESSURE" {
+		t.Fatalf("pressure without a sleep before the command: %q, want MEMORY_PRESSURE", got.code)
+	}
 	if got := whyNoReplay(pressured, false, running, false); got.code != "MEMORY_PRESSURE" {
 		t.Fatalf("pressure without a sleep: %q, want MEMORY_PRESSURE", got.code)
 	}
