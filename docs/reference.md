@@ -53,7 +53,7 @@ spotexec version
 | `~/.config/spotexec/machines.toml` | The machines `spotexec setup` has set up from here (for `setup --all`). |
 | `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log, dependency install logs (`logs/deps/`), the full output of failed `--rtk-filter` runs (`rtk/`) (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
 | `.spotexec.toml`, `.spotexecignore` | Project config and extra sync excludes. |
-| `<git-dir>/spotexec/conflicts/` | Remote versions of files that conflicted on write-back (`.spotexec/conflicts/` outside Git). |
+| `.git/spotexec/conflicts/`, `.git/spotexec/backup/` | Remote versions of files that conflicted on write-back, and local versions write-back replaced or deleted that Git had no copy of (`.spotexec/` outside Git). Linked worktrees use the shared git directory (`git rev-parse --git-common-dir`), so removing a worktree keeps them. |
 | `.spotexec/Dockerfile` | Project image from `spotexec init` or `spotexec container init`. |
 | `~/.cache/spotexec/` | Local SSH ControlMaster sockets (`cm/`) and helper install markers. |
 | Runner: `~/.cache/spotexec/` | Helper binary, slots, dependency caches (`work_root`). |

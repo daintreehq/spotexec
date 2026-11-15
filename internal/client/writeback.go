@@ -345,7 +345,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		return err
 	}
 	defer unlock()
-	wb.ConflictDir = filepath.Join(lockDir, "conflicts", runID)
+	wb.ConflictDir = filepath.Join(keepBase(ws), "conflicts", runID)
 	synced := len(m.ByPath)
 
 	// save backs up the local version of p, about to be deleted or replaced,
@@ -355,7 +355,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		if !local.exists || committed.has(p, local) {
 			return nil
 		}
-		dir := filepath.Join(lockDir, "backup", runID)
+		dir := filepath.Join(keepBase(ws), "backup", runID)
 		if _, err := backupLocal(ws.Root, dir, p, local); err != nil {
 			return err
 		}
@@ -888,6 +888,16 @@ func conflictBase(ws *Workspace) string {
 		return filepath.Join(ws.GitDir, "spotexec")
 	}
 	return filepath.Join(ws.Root, ".spotexec")
+}
+
+// keepBase is where backups and conflict copies go: the repository's common
+// git dir, which outlives a linked worktree (git worktree remove deletes the
+// worktree's own git dir).
+func keepBase(ws *Workspace) string {
+	if ws.CommonGitDir != "" {
+		return filepath.Join(ws.CommonGitDir, "spotexec")
+	}
+	return conflictBase(ws)
 }
 
 // stashConflict saves the remote version of p under dir and returns where it
