@@ -535,7 +535,18 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		}
 	}
 	sort.SliceStable(dels, func(i, j int) bool { return strings.Count(dels[i], "/") > strings.Count(dels[j], "/") })
-	if dels, err = holdDeletions(ws.Root, m, dels, synced, wb); err != nil {
+	// A deletion loses nothing when git has the file committed or the run
+	// wrote the same content back under another path (a move).
+	cameBack := map[string]bool{}
+	for p, rf := range files {
+		if !unjudged[p] { // may yet turn out ignored, and stay remote
+			cameBack[rf.id] = true
+		}
+	}
+	recoverable := func(p string, local version) bool {
+		return cameBack[local.id] || committed.has(p, local)
+	}
+	if dels, err = holdDeletions(ws.Root, m, dels, synced, recoverable, wb); err != nil {
 		return err
 	}
 	for _, p := range dels {
@@ -560,11 +571,12 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 
 // holdDeletions keeps back the deletions a run should not make on its own:
 // the project's own root .spotexec.toml or .gitignore, or, when the run
-// deleted most of the synced files, all of them. Only deletions that would
-// apply count (the local file still matches what was uploaded). It returns
-// the deletions to go ahead with.
-func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int, wb *WritebackResult) ([]string, error) {
-	var live, protected []string
+// deleted most of the synced files, all of them that recoverable can't give
+// back (so a restructuring move, or deleting committed files, applies).
+// Only deletions that would apply count (the local file still matches what
+// was uploaded). It returns the deletions to go ahead with.
+func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int, recoverable func(string, version) bool, wb *WritebackResult) ([]string, error) {
+	var lost, protected []string
 	for _, p := range dels {
 		e, ok := m.ByPath[p]
 		if !ok {
@@ -577,16 +589,18 @@ func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int,
 		if !local.exists || !local.eq(version{true, e.ID, e.Mode}) {
 			continue
 		}
-		live = append(live, p)
 		if protectedPath(p) {
 			protected = append(protected, p)
+		}
+		if !recoverable(p, local) {
+			lost = append(lost, p)
 		}
 	}
 	hold := protected
 	switch {
-	case massDeletion(len(live), synced):
-		hold = live
-		wb.HeldWhy = fmt.Sprintf("the run deleted %d of the %d synced files", len(live), synced)
+	case massDeletion(len(lost), synced):
+		hold = append(append([]string{}, lost...), protected...)
+		wb.HeldWhy = fmt.Sprintf("the run deleted %d of the %d synced files with no committed or moved copy", len(lost), synced)
 	case len(protected) > 0:
 		wb.HeldWhy = "the run deleted the project's own " + strings.Join(protected, " and ")
 	default:
@@ -594,9 +608,11 @@ func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int,
 	}
 	held := map[string]bool{}
 	for _, p := range hold {
-		held[p] = true
+		if !held[p] { // a protected file may be lost too
+			held[p] = true
+			wb.Held = append(wb.Held, p)
+		}
 	}
-	wb.Held = append(wb.Held, hold...)
 	sort.Strings(wb.Held)
 	var keep []string
 	for _, p := range dels {
