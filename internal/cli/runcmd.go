@@ -472,7 +472,12 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		stderr, clientRep = watch, watchReporter{rep, watch}
 	}
 	o := f.options(l, s, clientRep, intr, stdout, stderr)
+	stdin := newStdinNotice(s.command)
+	stdin.check(rep)
 	res, err := client.Run(ctx, l.cfg, l.ws, o)
+	if ctx.Err() == nil {
+		stdin.check(rep)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			rep.Clear()
@@ -694,6 +699,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	}()
 	failOnce := sync.Once{}
 	var wg sync.WaitGroup
+	// Every part has a command; before and after they run, nothing else
+	// prints.
+	stdin := newStdinNotice(name)
+	stdin.check(rep)
 	start := time.Now()
 	for i, part := range parts {
 		wg.Add(1)
@@ -807,6 +816,9 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		}(i, part)
 	}
 	wg.Wait()
+	if ctx.Err() == nil {
+		stdin.check(rep)
+	}
 	saveFirstLastRun(l.ws, records)
 	// Interrupted: 130. A spotexec failure (125) outranks a command's own
 	// failure, so agents can tell "tests failed" from "couldn't run tests".
