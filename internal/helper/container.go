@@ -667,7 +667,14 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		// The run's own socket, whatever the image's ENV says; with host
 		// networking, Testcontainers would otherwise look for the ports it
 		// maps at the VPC's gateway rather than on this machine.
-		for k, v := range map[string]string{"DOCKER_HOST": "unix:///var/run/docker.sock", "TESTCONTAINERS_HOST_OVERRIDE": "localhost"} {
+		// Exec runs get COMPOSE_PROJECT_NAME from the client; the dependency
+		// install gets one here, so Compose stacks of concurrent slots differ.
+		defaults := map[string]string{
+			"DOCKER_HOST":                  "unix:///var/run/docker.sock",
+			"TESTCONTAINERS_HOST_OVERRIDE": "localhost",
+			"COMPOSE_PROJECT_NAME":         strings.Trim(s.containerPrefix(), "-"),
+		}
+		for k, v := range defaults {
 			if _, set := env[k]; !set {
 				env[k] = v
 			}
@@ -715,14 +722,19 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	)
 	var proxy *dockerProxy
 	if run.Docker {
-		// Cleared once what the run started is removed: if the run is
-		// aborted first, the slot's next holder does it.
-		if err := os.WriteFile(filepath.Join(s.slotDir, dockerRunMarker), nil, 0o644); err != nil {
-			os.Remove(scriptPath)
-			os.Remove(envPath)
-			return "", nil, nil, err
+		pdir, err := newProxyDir()
+		if err == nil {
+			// Cleared once what the run started is removed: if the run is
+			// aborted first, the slot's next holder does it, and removes the
+			// socket's directory.
+			err = appendLine(filepath.Join(s.slotDir, dockerRunMarker), pdir)
+			if err != nil {
+				os.RemoveAll(pdir)
+			}
 		}
-		proxy, err = startDockerProxy(d, s.workspace, map[string]string{labelSlot: s.containerPrefix(), labelRun: name})
+		if err == nil {
+			proxy, err = startDockerProxy(d, pdir, s.workspace, map[string]string{labelSlot: s.containerPrefix(), labelRun: name})
+		}
 		if err != nil {
 			os.Remove(scriptPath)
 			os.Remove(envPath)
@@ -765,7 +777,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	}
 	s.containers.Store(name, d)
 	if proxy != nil {
-		s.nested.Store(name, d)
+		s.nested.Store(name, nestedRun{d, proxy})
 	}
 	s.lastContainer.name, s.lastContainer.d, s.lastContainer.started = name, d, time.Now()
 	cleanup := func() error {
@@ -783,7 +795,11 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 				return fmt.Errorf("containers, networks or volumes the run started could not be removed: %s", left)
 			}
 			s.nested.Delete(name)
-			os.Remove(filepath.Join(s.slotDir, dockerRunMarker))
+			pending := false
+			s.nested.Range(func(any, any) bool { pending = true; return false })
+			if !pending {
+				os.Remove(filepath.Join(s.slotDir, dockerRunMarker))
+			}
 		}
 		os.Remove(scriptPath)
 		os.Remove(envPath)
@@ -826,8 +842,28 @@ func networkArgs(run *protocol.ContainerRun) []string {
 const rootRunMarker = "root-run"
 
 // dockerRunMarker, in a slot directory, says a container.docker run may
-// have left containers, networks or volumes labelled with the slot.
+// have left containers, networks or volumes labelled with the slot. It
+// lists the directories of those runs' proxy sockets.
 const dockerRunMarker = "docker-run"
+
+// nestedRun is a container.docker run whose own containers aren't removed
+// yet.
+type nestedRun struct {
+	d     dockerRunner
+	proxy *dockerProxy
+}
+
+func appendLine(path, line string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString(line + "\n")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 // errRepairRunning: a timed-out ownership repair's container couldn't be
 // removed, so it may still be changing files.
@@ -984,7 +1020,9 @@ func (s *Session) removeContainers(prefixOnly bool) string {
 	// What container.docker runs started (their proxies are gone with the
 	// run's processes, or with this helper).
 	s.nested.Range(func(k, v any) bool {
-		if removeLabelled(ctx, v.(dockerRunner), labelRun+"="+k.(string)) == "" {
+		n := v.(nestedRun)
+		n.proxy.stop()
+		if removeLabelled(ctx, n.d, labelRun+"="+k.(string)) == "" {
 			s.nested.Delete(k)
 		}
 		return true
@@ -1011,7 +1049,14 @@ func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) strin
 	}
 	left := strings.Fields(string(out))
 	marker := filepath.Join(s.slotDir, dockerRunMarker)
-	if _, err := os.Stat(marker); err == nil {
+	if b, err := os.ReadFile(marker); err == nil {
+		// The proxies are gone with the runs' processes; their socket
+		// directories may not be (a helper that died).
+		for _, dir := range strings.Fields(string(b)) {
+			if strings.HasPrefix(dir, proxyDirPrefix) && filepath.Clean(dir) == dir {
+				os.RemoveAll(dir)
+			}
+		}
 		if l := removeLabelled(ctx, d, labelSlot+"="+s.containerPrefix()); l != "" {
 			left = append(left, l)
 		} else {

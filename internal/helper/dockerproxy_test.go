@@ -146,6 +146,17 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 	}
 	mux.HandleFunc("POST /v1.45/containers/create", create)
 	mux.HandleFunc("POST /networks/create", create)
+	mux.HandleFunc("POST /volumes/create", func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength > 0 && r.Header.Get("Content-Type") != "application/json" {
+			http.Error(w, "unsupported Content-Type", 400)
+			return
+		}
+		create(w, r)
+	})
+	mux.HandleFunc("DELETE /containers/{id}", func(w http.ResponseWriter, r *http.Request) {
+		f.created <- "DELETE " + r.URL.Path + "?" + r.URL.RawQuery
+		w.WriteHeader(204)
+	})
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"status":"start"}`+"\n")
 		w.(http.Flusher).Flush()
@@ -224,6 +235,27 @@ func TestDockerProxyLabelsCreates(t *testing.T) {
 	if got := <-f.created; !strings.Contains(got, `"io.spotexec.slot":"sx-repo-1-"`) || !strings.Contains(got, `"Name":"net1"`) {
 		t.Fatalf("daemon got %s", got)
 	}
+	// A bodyless volume create gets a body, typed as the daemon wants it.
+	resp, err = c.Post("http://docker/volumes/create", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 201 {
+		t.Fatalf("bodyless volume create: status %d", resp.StatusCode)
+	}
+	if got := <-f.created; !strings.Contains(got, labelRun) {
+		t.Fatalf("daemon got %s", got)
+	}
+	// Removing a container takes its anonymous volumes with it.
+	req, _ = http.NewRequest("DELETE", "http://docker/containers/pg?force=1", nil)
+	if resp, err = c.Do(req); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := <-f.created; got != "DELETE /containers/pg?force=1&v=1" {
+		t.Fatalf("daemon got %s", got)
+	}
 	// A body the daemon couldn't parse either is refused, Docker-style.
 	resp, err = c.Post("http://docker/networks/create", "application/json", strings.NewReader(`{`))
 	if err != nil {
@@ -292,7 +324,11 @@ func TestDockerProxyUpgrade(t *testing.T) {
 func TestStartDockerProxy(t *testing.T) {
 	f := newFakeDaemon(t)
 	t.Setenv("DOCKER_HOST", "unix://"+f.sock)
-	p, err := startDockerProxy(dockerRunner{}, t.TempDir(), testLabels)
+	dir, err := newProxyDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := startDockerProxy(dockerRunner{}, dir, t.TempDir(), testLabels)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,27 +357,70 @@ func TestStartDockerProxy(t *testing.T) {
 }
 
 func TestStartDockerProxyNoDaemon(t *testing.T) {
-	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
-	if _, err := startDockerProxy(dockerRunner{}, t.TempDir(), testLabels); err == nil || !strings.Contains(err.Error(), "isn't answering") {
-		t.Fatalf("got %v", err)
-	}
-	t.Setenv("DOCKER_HOST", "tcp://10.0.0.1:2375")
-	if _, err := startDockerProxy(dockerRunner{}, t.TempDir(), testLabels); err == nil || !strings.Contains(err.Error(), "local socket") {
-		t.Fatalf("got %v", err)
+	for host, want := range map[string]string{"unix:///nonexistent/docker.sock": "isn't answering", "tcp://10.0.0.1:2375": "local socket"} {
+		t.Setenv("DOCKER_HOST", host)
+		dir, err := newProxyDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := startDockerProxy(dockerRunner{}, dir, t.TempDir(), testLabels); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: got %v", host, err)
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("%s: socket directory left behind", host)
+		}
 	}
 }
 
-// loggingDocker is a docker that works, has nothing to list, and logs its
-// arguments, one call per line.
-func loggingDocker(t *testing.T) (bin, log string) {
+// statefulDocker is a docker that works and holds the containers, networks
+// and volumes named in its state files (ps, network, volume): listing one
+// by label prints its file, removing it (rm -fv, network rm, volume rm)
+// empties the file, unless stuck. Every call is logged, one per line.
+func statefulDocker(t *testing.T, stuck bool, ps, network, volume string) (bin, log string) {
 	t.Helper()
 	bin = t.TempDir()
 	log = filepath.Join(bin, "calls")
-	script := "#!/bin/sh\necho \"$*\" >> " + shq(log) + "\nexit 0\n"
+	for f, v := range map[string]string{"ps": ps, "network": network, "volume": volume} {
+		if err := os.WriteFile(filepath.Join(bin, f), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rm := `: > "$d/$1"`
+	if stuck {
+		rm = "true"
+	}
+	script := `#!/bin/sh
+d=` + shq(bin) + `
+echo "$*" >> "$d/calls"
+case "$1 $2" in
+"ps "*) case "$*" in *label=*) cat "$d/ps" ;; esac ;;
+"rm -fv") set -- ps; ` + rm + ` ;;
+"network ls"|"volume ls") cat "$d/$1" ;;
+"network rm"|"volume rm") ` + rm + ` ;;
+esac
+exit 0
+`
 	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return bin, log
+}
+
+// callsWith returns the logged calls containing every one of parts.
+func callsWith(t *testing.T, log string, parts ...string) []string {
+	t.Helper()
+	b, _ := os.ReadFile(log)
+	var got []string
+	for _, l := range strings.Split(string(b), "\n") {
+		ok := l != ""
+		for _, p := range parts {
+			ok = ok && strings.Contains(l, p)
+		}
+		if ok {
+			got = append(got, l)
+		}
+	}
+	return got
 }
 
 // A container.docker run gets the proxy's socket and the environment that
@@ -351,7 +430,7 @@ func loggingDocker(t *testing.T) (bin, log string) {
 func TestContainerScriptDocker(t *testing.T) {
 	f := newFakeDaemon(t)
 	t.Setenv("DOCKER_HOST", "unix://"+f.sock)
-	bin, calls := loggingDocker(t)
+	bin, calls := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	slot := t.TempDir()
 	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
@@ -365,6 +444,10 @@ func TestContainerScriptDocker(t *testing.T) {
 	}
 	if strings.Contains(host, "docker.sock") {
 		t.Fatalf("socket without container.docker: %s", host)
+	}
+	envs, _ := filepath.Glob(filepath.Join(slot, "run", "*.env"))
+	if env, _ := os.ReadFile(envs[0]); strings.Contains(string(env), "DOCKER_HOST") {
+		t.Fatalf("docker environment without container.docker:\n%s", env)
 	}
 	if err := cleanup(); err != nil {
 		t.Fatal(err)
@@ -383,61 +466,134 @@ func TestContainerScriptDocker(t *testing.T) {
 	if !strings.Contains(host, ",target=/var/run/docker.sock'") {
 		t.Fatalf("no socket mount: %s", host)
 	}
-	envs, _ := filepath.Glob(filepath.Join(slot, "run", "*.env"))
+	envs, _ = filepath.Glob(filepath.Join(slot, "run", "*.env"))
 	if len(envs) != 1 {
 		t.Fatalf("env files %v", envs)
 	}
 	env, _ := os.ReadFile(envs[0])
-	if !strings.Contains(string(env), "DOCKER_HOST=unix:///var/run/docker.sock\n") || !strings.Contains(string(env), "TESTCONTAINERS_HOST_OVERRIDE=10.1.1.1\n") {
-		t.Fatalf("env file:\n%s", env)
+	for _, want := range []string{"DOCKER_HOST=unix:///var/run/docker.sock\n", "TESTCONTAINERS_HOST_OVERRIDE=10.1.1.1\n", "COMPOSE_PROJECT_NAME=" + strings.Trim(s.containerPrefix(), "-") + "\n"} {
+		if !strings.Contains(string(env), want) {
+			t.Fatalf("env file lacks %q:\n%s", want, env)
+		}
 	}
 	for _, m := range []string{rootRunMarker, dockerRunMarker} {
 		if _, err := os.Stat(filepath.Join(slot, m)); err != nil {
 			t.Fatalf("%s not written: %v", m, err)
 		}
 	}
+	pdir := s.nestedProxyDir(t, name)
+	if b, _ := os.ReadFile(filepath.Join(slot, dockerRunMarker)); strings.TrimSpace(string(b)) != pdir {
+		t.Fatalf("marker %q doesn't name the socket directory %s", b, pdir)
+	}
+	// What the run started is there when it ends.
+	for f, v := range map[string]string{"ps": "pg\n", "network": "net\n", "volume": "vol\n"} {
+		os.WriteFile(filepath.Join(bin, f), []byte(v), 0o644)
+	}
 	if err := cleanup(); err != nil {
 		t.Fatal(err)
 	}
-	log, _ := os.ReadFile(calls)
-	if !strings.Contains(string(log), "label="+labelRun+"="+name) {
-		t.Fatalf("run's containers not swept:\n%s", log)
+	for _, rm := range []string{"rm -fv pg", "network rm net", "volume rm -f vol"} {
+		if len(callsWith(t, calls, rm)) != 1 {
+			t.Fatalf("no %q:\n%s", rm, callsWith(t, calls))
+		}
+	}
+	for _, list := range []string{"ps -a --format", "network ls", "volume ls"} {
+		if len(callsWith(t, calls, list, "label="+labelRun+"="+name)) == 0 {
+			t.Fatalf("%s not filtered by the run's label", list)
+		}
 	}
 	for _, m := range []string{rootRunMarker, dockerRunMarker} {
 		if _, err := os.Stat(filepath.Join(slot, m)); !os.IsNotExist(err) {
 			t.Fatalf("%s kept after cleanup", m)
 		}
 	}
+	if _, err := os.Stat(pdir); !os.IsNotExist(err) {
+		t.Fatal("socket directory left behind")
+	}
 	if _, ok := s.nested.Load(name); ok {
 		t.Fatal("run still tracked")
 	}
 }
 
+// nestedProxyDir is the socket directory of the tracked run name.
+func (s *Session) nestedProxyDir(t *testing.T, name string) string {
+	t.Helper()
+	v, ok := s.nested.Load(name)
+	if !ok {
+		t.Fatal("run not tracked")
+	}
+	return v.(nestedRun).proxy.dir
+}
+
+// What the run started that can't be removed keeps the results from being
+// collected, and the run tracked and marked for the slot's next holder.
+func TestContainerScriptDockerCleanupFails(t *testing.T) {
+	f := newFakeDaemon(t)
+	t.Setenv("DOCKER_HOST", "unix://"+f.sock)
+	bin, _ := statefulDocker(t, true, "", "", "")
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	slot := t.TempDir()
+	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	os.MkdirAll(s.workspace, 0o755)
+	_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Docker: true}, "true", s.workspace, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := s.lastContainer.name
+	os.WriteFile(filepath.Join(bin, "network"), []byte("net\n"), 0o644)
+	if err := cleanup(); err == nil || !strings.Contains(err.Error(), "net") {
+		t.Fatalf("got %v", err)
+	}
+	if _, ok := s.nested.Load(name); !ok {
+		t.Fatal("run no longer tracked")
+	}
+	for _, m := range []string{rootRunMarker, dockerRunMarker} {
+		if _, err := os.Stat(filepath.Join(slot, m)); err != nil {
+			t.Fatalf("%s dropped: %v", m, err)
+		}
+	}
+}
+
 // The next holder of a slot removes what an aborted container.docker run
-// left, by the slot's label, only when the run's marker says there may be
-// some.
+// left, by the slot's label, and its proxy's socket directory, only when
+// the run's marker says there may be some.
 func TestSweepSlotContainersDockerRun(t *testing.T) {
-	bin, calls := loggingDocker(t)
+	bin, calls := statefulDocker(t, false, "", "net\n", "vol\n")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	slot := t.TempDir()
 	s := &Session{slotDir: slot, repoID: "repo"}
 	if left := s.sweepSlotContainers(context.Background(), dockerRunner{}); left != "" {
 		t.Fatal(left)
 	}
-	if log, _ := os.ReadFile(calls); strings.Contains(string(log), "label=") {
-		t.Fatalf("label sweep without the marker:\n%s", log)
+	if got := callsWith(t, calls, "label="); len(got) > 0 {
+		t.Fatalf("label sweep without the marker: %v", got)
 	}
-	if err := os.WriteFile(filepath.Join(slot, dockerRunMarker), nil, 0o644); err != nil {
+	pdir, err := newProxyDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(slot, dockerRunMarker), []byte(pdir+"\n"+outside+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if left := s.sweepSlotContainers(context.Background(), dockerRunner{}); left != "" {
 		t.Fatal(left)
 	}
-	log, _ := os.ReadFile(calls)
-	for _, kind := range []string{"ps -a", "network ls", "volume ls"} {
-		if !strings.Contains(string(log), kind+" --format") || !strings.Contains(string(log), "label="+labelSlot+"="+s.containerPrefix()) {
-			t.Fatalf("no %s sweep:\n%s", kind, log)
+	for _, list := range []string{"ps -a --format", "network ls", "volume ls"} {
+		if len(callsWith(t, calls, list, "label="+labelSlot+"="+s.containerPrefix())) == 0 {
+			t.Fatalf("%s not swept by the slot's label", list)
 		}
+	}
+	for _, rm := range []string{"network rm net", "volume rm -f vol"} {
+		if len(callsWith(t, calls, rm)) != 1 {
+			t.Fatalf("no %q", rm)
+		}
+	}
+	if _, err := os.Stat(pdir); !os.IsNotExist(err) {
+		t.Fatal("socket directory left behind")
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatal("a directory that isn't a socket directory was removed")
 	}
 	if _, err := os.Stat(filepath.Join(slot, dockerRunMarker)); !os.IsNotExist(err) {
 		t.Fatal("marker kept after a clean sweep")

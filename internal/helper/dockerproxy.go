@@ -43,6 +43,12 @@ const (
 // without an API version prefix.
 var createPathRe = regexp.MustCompile(`^(?:/v[0-9][0-9.]*)?/(containers|networks|volumes)/create$`)
 
+// deletePathRe matches removing a container: its anonymous volumes go with
+// it, as with `docker run --rm`, since nothing labelled could find them
+// afterwards (an image's VOLUME, such as postgres's data directory, makes
+// one on every run).
+var deletePathRe = regexp.MustCompile(`^(?:/v[0-9][0-9.]*)?/containers/[^/]+$`)
+
 // dockerSocketPath is the daemon socket the proxy forwards to.
 func dockerSocketPath() (string, error) {
 	h := os.Getenv("DOCKER_HOST")
@@ -91,6 +97,13 @@ func dockerProxyHandler(upstream, sock string, labels map[string]string) http.Ha
 			r.TransferEncoding = nil
 			r.Header.Del("Content-Length")
 			r.Header.Del("Transfer-Encoding")
+			// The daemon takes a bodyless create, but wants a body typed.
+			r.Header.Set("Content-Type", "application/json")
+		}
+		if r.Method == http.MethodDelete && deletePathRe.MatchString(r.URL.Path) {
+			q := r.URL.Query()
+			q.Set("v", "1")
+			r.URL.RawQuery = q.Encode()
 		}
 		rp.ServeHTTP(w, r)
 	})
@@ -283,19 +296,25 @@ type dockerProxy struct {
 	stopOnce sync.Once
 }
 
-// startDockerProxy starts a docker-proxy labelling with labels, through the
-// same Docker access as d (under sg when needed). It carries the workspace
-// marker, so reapWorkspace stops it with the run's other processes, and it
-// exits when the helper does (its stdin closes), sg or not.
-func startDockerProxy(d dockerRunner, workspace string, labels map[string]string) (*dockerProxy, error) {
+// proxyDirPrefix starts the directories that hold proxy sockets: short and
+// private, as a unix socket path is limited to ~104 bytes, which a path
+// under the slot directory can exceed.
+const proxyDirPrefix = "/tmp/sx-docker-"
+
+// newProxyDir makes a directory for a proxy's socket.
+func newProxyDir() (string, error) {
+	return os.MkdirTemp(filepath.Dir(proxyDirPrefix), filepath.Base(proxyDirPrefix))
+}
+
+// startDockerProxy starts a docker-proxy labelling with labels, serving in
+// dir (from newProxyDir, removed by stop), through the same Docker access as
+// d (under sg when needed). It carries the workspace marker, so
+// reapWorkspace stops it with the run's other processes, and it exits when
+// the helper does (its stdin closes), sg or not.
+func startDockerProxy(d dockerRunner, dir, workspace string, labels map[string]string) (*dockerProxy, error) {
 	self, err := os.Executable()
 	if err != nil {
-		return nil, err
-	}
-	// Short and private: a unix socket path is limited to ~104 bytes, which
-	// a path under the slot directory can exceed.
-	dir, err := os.MkdirTemp("/tmp", "sx-docker-")
-	if err != nil {
+		os.RemoveAll(dir)
 		return nil, err
 	}
 	p := &dockerProxy{sock: filepath.Join(dir, "docker.sock"), dir: dir, done: make(chan struct{})}

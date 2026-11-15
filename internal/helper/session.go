@@ -69,7 +69,7 @@ type Session struct {
 	child      atomic.Int64 // running command's process group, if any
 	gate       *flock
 	containers sync.Map // running container name -> dockerRunner
-	// nested: project container name -> dockerRunner, for runs with
+	// nested: project container name -> nestedRun, for runs with
 	// container.docker whose own containers aren't removed yet.
 	nested      sync.Map
 	interrupted atomic.Bool // a spot interruption notice arrived
