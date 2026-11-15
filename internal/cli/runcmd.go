@@ -25,6 +25,7 @@ import (
 // runFlags are shared by the shorthand form, run, exec, and tasks.
 type runFlags struct {
 	timeout       time.Duration
+	timeoutFrom   string // "--timeout" or "SPOTEXEC_TIMEOUT" when either set it
 	queueTimeout  time.Duration
 	sync          string
 	writeback     string
@@ -104,10 +105,10 @@ func (f *runFlags) reporter() (ui.Reporter, error) {
 // command line: an explicit flag always wins, whatever its value (so
 // --json=false, --priority 0 and --pool beat the environment).
 func (f *runFlags) applyEnv() {
-	if !f.changed("timeout") {
-		if d, err := time.ParseDuration(os.Getenv("SPOTEXEC_TIMEOUT")); err == nil {
-			f.timeout = d
-		}
+	if f.changed("timeout") {
+		f.timeoutFrom = "--timeout"
+	} else if d, err := time.ParseDuration(os.Getenv("SPOTEXEC_TIMEOUT")); err == nil {
+		f.timeout, f.timeoutFrom = d, "SPOTEXEC_TIMEOUT"
 	}
 	if !f.changed("sync") {
 		if v := os.Getenv("SPOTEXEC_SYNC"); v != "" {
@@ -159,6 +160,10 @@ func (f *runFlags) validate() error {
 	}
 	if f.writebackOver != "" && f.writebackOver != "warn" && f.writebackOver != "hold" {
 		return fmt.Errorf("--writeback-over must be warn or hold (got %q)", f.writebackOver)
+	}
+	// Zero would otherwise mean "the default", and a negative limit nothing.
+	if f.timeoutFrom != "" && f.timeout <= 0 {
+		return fmt.Errorf("%s must be positive (got %s)", f.timeoutFrom, f.timeout)
 	}
 	return nil
 }

@@ -37,7 +37,7 @@ A parallel or sharded task's parts run in several slots at once, so `--same-slot
 
 | Flag | Meaning |
 | --- | --- |
-| `--timeout D` | Wall-clock limit (default `5m`, or the project `timeout`). |
+| `--timeout D` | Wall-clock limit (default `5m`, or the project `timeout`); it must be positive: `0` or a negative value exits `125`. |
 | `--queue-timeout D` | How long to wait for a free slot (default `10m`, or the project `queue_timeout`). |
 | `--sync auto\|in\|none` | `auto` syncs and writes back; `in` syncs and discards changes; `none` runs on whatever the slot has. |
 | `--writeback always\|on-success\|never` | When changes come back. |

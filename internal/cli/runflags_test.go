@@ -138,7 +138,24 @@ func TestValidateRejectsUnknownValues(t *testing.T) {
 		t.Error("SPOTEXEC_WRITEBACK_OVER=bogus accepted")
 	}
 	t.Setenv("SPOTEXEC_WRITEBACK_OVER", "")
-	for _, args := range [][]string{{"--writeback", "on-success", "--sync", "in"}, {"--writeback", "never"}, {"--writeback-over", "warn"}, {"--writeback-over", "hold"}, {}} {
+	// A zero or negative timeout has no meaning: refused, never the default.
+	for _, args := range [][]string{{"--timeout", "0"}, {"--timeout=0s"}, {"--timeout", "-1s"}} {
+		if err := parsed(t, args...).validate(); err == nil || !strings.Contains(err.Error(), "--timeout must be positive") {
+			t.Errorf("%v: %v", args, err)
+		}
+	}
+	for _, v := range []string{"0", "0s", "-5m"} {
+		t.Setenv("SPOTEXEC_TIMEOUT", v)
+		if err := parsed(t).validate(); err == nil || !strings.Contains(err.Error(), "SPOTEXEC_TIMEOUT must be positive") {
+			t.Errorf("SPOTEXEC_TIMEOUT=%s: %v", v, err)
+		}
+	}
+	// The flag beats the variable, whatever its value.
+	if err := parsed(t, "--timeout", "1m").validate(); err != nil {
+		t.Errorf("--timeout 1m with SPOTEXEC_TIMEOUT=-5m: %v", err)
+	}
+	t.Setenv("SPOTEXEC_TIMEOUT", "")
+	for _, args := range [][]string{{"--writeback", "on-success", "--sync", "in"}, {"--writeback", "never"}, {"--writeback-over", "warn"}, {"--writeback-over", "hold"}, {"--timeout", "1ns"}, {}} {
 		if err := parsed(t, args...).validate(); err != nil {
 			t.Errorf("%v rejected: %v", args, err)
 		}
@@ -213,6 +230,9 @@ func TestBadRunValuesExit125BeforeAnyRunner(t *testing.T) {
 		{"sx", []string{"-C", dir, "--writeback=", "rm", "important.txt"}, "--writeback needs a value"},
 		{"sx", []string{"-C", dir, "--writeback=", "verify"}, "--writeback needs a value"},
 		{"sx", []string{"-C", dir, "--pool=", "true"}, "--pool needs a value"},
+		{"sx", []string{"-C", dir, "--timeout", "0", "true"}, "--timeout must be positive"},
+		{"sx", []string{"-C", dir, "--timeout", "-1s", "verify"}, "--timeout must be positive"},
+		{"spotexec", []string{"run", "-C", dir, "--timeout=0", "--", "true"}, "--timeout must be positive"},
 	}
 	for _, c := range cases {
 		code, stderr := runMain(t, c.name, c.args...)
