@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -345,7 +346,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			o.Rep.Warn("LARGE_SYNC", "syncing %d files; consider [sync].exclude", len(m.Entries))
 		}
 	}
-	if err := checkLocal(m, p, ws, o); err != nil {
+	if err := checkLocal(ctx, m, p, ws, o); err != nil {
 		return res, infra(err), ""
 	}
 
@@ -1466,10 +1467,10 @@ func markLost(cfg *config.Config, runner, id string) {
 // checks it before acquiring a runner: a working set over AbortFiles, a
 // container built from a Dockerfile whose build inputs aren't synced (exec,
 // PreferLast, reuses the image this worktree last built instead), and a
-// dependency install whose deps.lockfiles match no synced file or leave the
-// repository (runDeps).
+// dependency install whose deps.lockfiles match no synced file, leave the
+// repository, or name a file the runner can't have (runDeps).
 // m is nil when the run doesn't sync.
-func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Options) error {
+func checkLocal(ctx context.Context, m *manifest.Manifest, p *config.Project, ws *Workspace, o Options) error {
 	if m != nil && len(m.Entries) > AbortFiles && !o.ForceLargeSync {
 		return fmt.Errorf("refusing to sync %d files (limit %d); add excludes to .spotexec.toml or pass --force-large-sync", len(m.Entries), AbortFiles)
 	}
@@ -1479,28 +1480,131 @@ func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Option
 		}
 	}
 	if p.Deps.Install != "" && !o.NoDeps && m != nil {
-		lockfiles, _, err := DepsLockfiles(m, p.Deps.Lockfiles)
+		return checkDeps(ctx, m, p.Deps, ws.Root)
+	}
+	return nil
+}
+
+// CheckDeps checks deps.lockfiles against the working set a synced run from
+// ws would send, as that run does before acquiring a runner (for doctor).
+func CheckDeps(ctx context.Context, p *config.Project, ws *Workspace) error {
+	m, err := manifest.Build(ctx, ManifestOptions(ws.Root, p))
+	if err != nil {
+		return fmt.Errorf("enumerating files: %w", err)
+	}
+	return checkDeps(ctx, m, p.Deps, ws.Root)
+}
+
+// checkDeps refuses deps.lockfiles every install of a run syncing m would
+// fail on: none matching a synced file, an entry leaving the repository, or
+// a literal entry missing here (missingLockfile).
+func checkDeps(ctx context.Context, m *manifest.Manifest, d config.Deps, root string) error {
+	lockfiles, _, err := DepsLockfiles(m, d.Lockfiles)
+	if err != nil {
+		return err
+	}
+	if len(lockfiles) == 0 {
+		return errNoLockfiles
+	}
+	// The runner keys the cache on the files in its workspace
+	// (depskey.Key), so a literal entry that escapes the repository
+	// fails every install.
+	for _, lf := range lockfiles {
+		if _, err := fsid.CleanRel(lf); err != nil {
+			return fmt.Errorf("deps.lockfiles: %w", err)
+		}
+	}
+	return missingLockfile(ctx, m, d, root)
+}
+
+// missingLockfile refuses a literal deps.lockfiles entry that is missing
+// here: the runner gets the local tree, so every install would fail to read
+// it. One the slot may still have is left to the runner: under a symlinked
+// directory (it resolves there), or in a cache_dirs directory or a path this
+// worktree ignores (kept in the slot from earlier runs, never synced).
+func missingLockfile(ctx context.Context, m *manifest.Manifest, d config.Deps, root string) error {
+	var missing []string
+	for _, lf := range d.Lockfiles {
+		if depskey.IsPattern(lf) {
+			continue
+		}
+		rel, err := fsid.CleanRel(lf)
 		if err != nil {
-			return err
+			return fmt.Errorf("deps.lockfiles: %w", err)
 		}
-		if len(lockfiles) == 0 {
-			return errNoLockfiles
+		_, err = os.Lstat(filepath.Join(root, filepath.FromSlash(rel)))
+		if err == nil || !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+			continue // there, or unknown: the runner says
 		}
-		// The runner keys the cache on the files in its workspace
-		// (depskey.Key), so a literal entry that escapes the repository
-		// fails every install. Whether a literal one is there is the
-		// runner's to find: it may be reached through a synced symlinked
-		// directory, or kept in a cache directory, without a manifest entry.
-		for _, lf := range lockfiles {
-			if _, err := fsid.CleanRel(lf); err != nil {
-				return fmt.Errorf("deps.lockfiles: %w", err)
-			}
+		if underSymlink(root, rel) || inCacheDir(rel, d.CacheDirs) {
+			continue
+		}
+		if underSyncedFile(m, rel) {
+			// The next sync clears anything below a synced file.
+			return errMissingLockfile(rel)
+		}
+		missing = append(missing, rel)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	ign, err := m.CheckIgnored(ctx, missing)
+	if err != nil {
+		return nil // unknown: the runner says
+	}
+	for _, rel := range missing {
+		if !ign[rel] {
+			return errMissingLockfile(rel)
 		}
 	}
 	return nil
 }
 
+// underSymlink reports whether a directory on rel's path is a symlink.
+func underSymlink(root, rel string) bool {
+	dir := root
+	segs := strings.Split(rel, "/")
+	for _, s := range segs[:len(segs)-1] {
+		dir = filepath.Join(dir, s)
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			return false
+		}
+		if fi.Mode()&fs.ModeSymlink != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// inCacheDir reports whether rel is inside a directory matching one of the
+// cache_dirs patterns (single-level globs, as the runner expands them).
+func inCacheDir(rel string, patterns []string) bool {
+	segs := strings.Split(rel, "/")
+	for _, p := range patterns {
+		ps := strings.Split(strings.Trim(p, "/"), "/")
+		if len(segs) <= len(ps) {
+			continue
+		}
+		in := true
+		for i, pat := range ps {
+			if ok, _ := path.Match(pat, segs[i]); !ok {
+				in = false
+				break
+			}
+		}
+		if in {
+			return true
+		}
+	}
+	return false
+}
+
 var errNoLockfiles = errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
+
+func errMissingLockfile(rel string) error {
+	return fmt.Errorf("deps.lockfiles: %s doesn't exist, so every dependency install would fail; create it or fix the path", rel)
+}
 
 // Preflight checks, without a runner, what a run from ws with options o
 // (its Sync, PreferLast, NoDeps and ForceLargeSync) would refuse from the
@@ -1516,7 +1620,7 @@ func Preflight(ctx context.Context, p *config.Project, ws *Workspace, o Options)
 			return fmt.Errorf("enumerating files: %w", err)
 		}
 	}
-	return checkLocal(m, p, ws, o)
+	return checkLocal(ctx, m, p, ws, o)
 }
 
 // readFrom loads a file of the working set rooted at root.

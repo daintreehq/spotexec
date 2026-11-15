@@ -718,6 +718,7 @@ func cmdDoctor() *cobra.Command {
 				}
 				check("workspace", true, fmt.Sprintf("%s (repo id %s)", l.ws.Root, l.ws.RepoID))
 				doctorContainer(l, args, check, warn)
+				doctorDeps(cmd.Context(), l, check)
 			} else {
 				check("project config", false, err.Error())
 			}
@@ -772,6 +773,25 @@ func cmdDoctor() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// doctorDeps fails deps.lockfiles that every synced run's dependency install
+// would fail on, such as a literal entry missing here (as `spotexec
+// supported` does).
+func doctorDeps(ctx context.Context, l *loaded, check func(string, bool, string)) {
+	d := l.cfg.Project.Deps
+	mode := l.cfg.Project.Sync.Mode
+	if v := os.Getenv("SPOTEXEC_SYNC"); v != "" {
+		mode = v
+	}
+	if d.Install == "" || mode == "none" {
+		return
+	}
+	if err := client.CheckDeps(ctx, l.cfg.Project, l.ws); err != nil {
+		check("deps lockfiles", false, err.Error())
+		return
+	}
+	check("deps lockfiles", true, strings.Join(d.Lockfiles, ", "))
 }
 
 // doctorContainer reports the project's container: the image it runs in,
