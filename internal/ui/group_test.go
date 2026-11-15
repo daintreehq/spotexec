@@ -216,6 +216,22 @@ func TestGroupConcurrentParts(t *testing.T) {
 	}
 }
 
+func TestGroupPrintsTheRestOfAWritePartlyHeld(t *testing.T) {
+	defer func(n, m int) { groupMemCap, maxFrame = n, m }(groupMemCap, maxFrame)
+	groupMemCap, maxFrame = 16, 6
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+	var tp tape
+	var mu sync.Mutex
+	g := NewGroup(tapeStream{&tp, "out"}, tapeStream{&tp, "err"}, "[x] ", &mu)
+	// The first frame fits in memory; the second needs the file, which can't
+	// be made: each byte is printed once.
+	g.Stdout().Write([]byte("abcdefghij\n"))
+	g.Flush(nil)
+	if got, want := tp.text(), "out:[x] about:cdefghij\n"; got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(b []byte) (int, error) { return f(b) }

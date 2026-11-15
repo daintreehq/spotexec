@@ -63,17 +63,18 @@ func (g *Group) write(stream byte, b []byte) (int, error) {
 	defer g.mu.Unlock()
 	data := prefixLines(b, g.prefix, &g.mid[stream])
 	if !g.live {
-		err := g.hold(stream, data)
+		n, err := g.hold(stream, data)
 		if err == nil {
 			return len(b), nil
 		}
 		// Output that can't be held is printed rather than lost: what is
-		// held goes out now, then this write, and the part is live from
-		// here on, its unfinished lines left as they are.
+		// held goes out now, then the rest of this write, and the part is
+		// live from here on, its unfinished lines left as they are.
 		g.err = err
 		g.emit.Lock()
 		defer g.emit.Unlock()
 		g.drain()
+		data = data[n:]
 	} else {
 		g.emit.Lock()
 		defer g.emit.Unlock()
@@ -83,16 +84,17 @@ func (g *Group) write(stream byte, b []byte) (int, error) {
 }
 
 // hold appends data as frames, moving the held output to a temporary file
-// once it outgrows memory.
-func (g *Group) hold(stream byte, data []byte) error {
-	for len(data) > 0 {
-		n := min(len(data), maxFrame)
-		if err := g.holdFrame(stream, data[:n]); err != nil {
-			return err
+// once it outgrows memory. It returns how much of data it held.
+func (g *Group) hold(stream byte, data []byte) (int, error) {
+	held := 0
+	for held < len(data) {
+		n := min(len(data)-held, maxFrame)
+		if err := g.holdFrame(stream, data[held:held+n]); err != nil {
+			return held, err
 		}
-		data = data[n:]
+		held += n
 	}
-	return nil
+	return held, nil
 }
 
 func (g *Group) holdFrame(stream byte, data []byte) error {
