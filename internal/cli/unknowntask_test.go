@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
@@ -168,7 +169,7 @@ func TestMistypedTaskNameWarns(t *testing.T) {
 	}
 	// A command that exists but exits 127, or a word after --, says nothing.
 	// Nor does a program found on PATH whose own lookup of the same name fails.
-	for _, args := range [][]string{{"sh", "-c", "exit 127"}, {"--", "test-al"}, {"sh", "-c", "test-al"}, {"bash", "-c", "PATH=/nonexistent bash"}} {
+	for _, args := range [][]string{{"sh", "-c", "exit 127"}, {"--", "test-al"}, {"sh", "-c", "test-al"}, {"bash", "-c", "PATH=/nonexistent bash"}, {"eval", "exit", "127"}} {
 		code, stderr := run(args...)
 		if code != 127 || strings.Contains(stderr, "no task is named") {
 			t.Errorf("%q: exit %d, stderr %q", args, code, stderr)
@@ -240,21 +241,25 @@ func TestWatchResetsOnRetry(t *testing.T) {
 	}
 }
 
-func TestOnPath(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+func TestLocalCommand(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "data"), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "bin", "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir)
-	p := &config.Project{}
-	if !onPath(p, "tool") || onPath(p, "data") || onPath(p, "missing") {
-		t.Error("PATH lookup wrong")
+	if err := os.WriteFile(filepath.Join(root, "data"), nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	p.Env = map[string]string{"PATH": t.TempDir()}
-	if onPath(p, "tool") {
-		t.Error("the project's PATH wasn't used")
+	l := testLoaded()
+	l.ws.Root = root
+	// Relative PATH entries resolve against the run's directory, not this
+	// process's, and builtins count as commands.
+	l.cfg.Project.Env = map[string]string{"PATH": "bin:/usr/bin:/bin"}
+	for word, want := range map[string]bool{"tool": true, "eval": true, "sh": true, "data": false, "test-al": false} {
+		if got := localCommand(l, client.Options{}, word); got != want {
+			t.Errorf("%q: found %v, want %v", word, got, want)
+		}
 	}
 }

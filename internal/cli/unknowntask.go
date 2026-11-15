@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
+	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
 
+	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
@@ -18,7 +18,7 @@ import (
 // and the shell's exit 127 reads like a broken toolchain on the runner. When
 // the first word could have been meant as a task, the runner's stderr is
 // watched for the shell saying it found no command by that name (locally,
-// the word is looked up on PATH instead, so the command keeps its terminal),
+// the shell is asked instead, so the command keeps its terminal),
 // and a 127 then carries a warning that names the closest task.
 
 // taskLikeWordRe is a plain command word: not a path, an assignment, a flag
@@ -196,22 +196,13 @@ func (r watchReporter) Event(name string, fields map[string]any) {
 	r.Reporter.Event(name, fields)
 }
 
-// onPath reports whether bash would find word as a program on the PATH a
-// local fallback run gets: the project's [env] PATH, else this process's.
-func onPath(p *config.Project, word string) bool {
-	path := os.Getenv("PATH")
-	if v, ok := p.Env["PATH"]; ok {
-		path = v
-	}
-	for _, dir := range filepath.SplitList(path) {
-		if dir == "" {
-			dir = "."
-		}
-		if fi, err := os.Stat(filepath.Join(dir, word)); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
-			return true
-		}
-	}
-	return false
+// localCommand reports whether the shell of a local run finds word as a
+// command (a program, builtin or function), with the run's environment and
+// directory.
+func localCommand(l *loaded, o client.Options, word string) bool {
+	cmd := exec.Command(localShell(), "-c", `command -v -- "$1" >/dev/null 2>&1`, "sh", word)
+	cmd.Env, cmd.Dir = localEnv(l, o, 0, 1), localDir(l)
+	return cmd.Run() == nil
 }
 
 // warnUnknownTask warns after a run of a task-like word exited 127 and the

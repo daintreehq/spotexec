@@ -483,7 +483,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 			// Unwatched: a terminal stays one for the local command.
 			o.Stderr, o.Rep = os.Stderr, rep
 			code := finish(runLocal(ctx, intr, l, o, rep, 0, 1))
-			warnUnknownTask(rep, l.cfg.Project, s.taskLike, code, s.taskLike != "" && !onPath(l.cfg.Project, s.taskLike), true)
+			warnUnknownTask(rep, l.cfg.Project, s.taskLike, code, s.taskLike != "" && code == 127 && !localCommand(l, o, s.taskLike), true)
 			return code
 		}
 		finish(client.ExitInfra)
