@@ -371,6 +371,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// Without a sync the slot's files are not ours: don't claim ownership.
 	base.KeepOwner = o.Sync == "none"
 	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority}
+	if o.Sync != "none" {
+		// A launch for this run prefers regions that hold its caches.
+		req.Project = func(r *config.Runner) *provider.Project { return PlacementProject(p, ws, m, o.NoDeps, r) }
+	}
 	// Recently used here: go back to that VM while it has room (warm files
 	// and build caches). After a while, let work consolidate onto the
 	// oldest VMs again so younger ones can idle out.

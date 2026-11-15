@@ -308,6 +308,11 @@ type placementState struct {
 	Warm        map[string]time.Time `json:"warm,omitempty"`
 	WarmProfile string               `json:"warm_profile,omitempty"`
 	RTT         map[string]rttSample `json:"rtt,omitempty"` // region -> measured round trip
+	// Evidence: what lookups found in each region's account-wide caches
+	// (bakes, the dependency cache, images), under profile
+	// EvidenceProfile (see warmth).
+	Evidence        map[string]evidence `json:"evidence,omitempty"`
+	EvidenceProfile string              `json:"evidence_profile,omitempty"`
 	// Discovered: every managed region has been listed once. Until then
 	// (first use, an upgrade from single-region, a lost state file) listings
 	// cover them all rather than trusting Active.
@@ -685,6 +690,9 @@ type PriceTable struct {
 	Cached   bool              `json:"cached"`
 	// MemoryMiB: for vcpus runners, the memory of each eligible type priced.
 	MemoryMiB map[string]int `json:"memory_mib,omitempty"`
+	// warmth: what each region holds of a cold start's parts, for the
+	// project the table was looked up for (run_cost across regions).
+	warmth map[string]regionWarmth
 }
 
 func (g *AWSGlobal) priceKey(regions []string) string {
@@ -753,6 +761,7 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 			}
 		})
 		if t.Cached {
+			t.warmth = g.warmth(ctx, t, false)
 			return t, nil
 		}
 	}
@@ -838,6 +847,7 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 		st.Prices, st.PricedAt, st.PricedFor, st.Unpriced, st.PricedMem = all, now, key, t.Unpriced, mem
 		saveRTTs(st, regions)
 	})
+	t.warmth = g.warmth(ctx, t, refresh)
 	return t, nil
 }
 

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +14,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/manifest"
 	"github.com/daintreehq/spotexec/internal/provider"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
@@ -33,6 +36,7 @@ func cmdPrices() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			ctx := cmd.Context()
 			var r *config.Runner
 			if len(args) > 0 {
 				r, err = cfg.Runner(args[0])
@@ -49,12 +53,17 @@ func cmdPrices() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			t, err := g.Prices(cmd.Context(), refresh)
+			// In a project, regions are checked for its own caches.
+			project := ""
+			if pj, name := pricesProject(ctx, r); pj != nil {
+				ctx, project = provider.WithProject(ctx, pj), name
+			}
+			t, err := g.Prices(ctx, refresh)
 			if err != nil && len(t.Prices) == 0 {
 				return err
 			}
 			k := g.Rank(t)
-			v := pricesView{r: r, t: t, k: k, cool: g.Cooldowns(t.Prices), held: g.HeldBack(t.Prices)}
+			v := pricesView{r: r, t: t, k: k, cool: g.Cooldowns(t.Prices), held: g.HeldBack(t.Prices), project: project}
 			v.next, v.hasNext = g.NextLaunch(t)
 			if asJSON {
 				return v.writeJSON(os.Stdout)
@@ -69,8 +78,28 @@ func cmdPrices() *cobra.Command {
 	return c
 }
 
+// pricesProject is the project in the current directory that a launch of
+// r from here would check regions for, and its name (nil outside one, or
+// when r doesn't launch across regions).
+func pricesProject(ctx context.Context, r *config.Runner) (*provider.Project, string) {
+	if !r.MultiRegion() {
+		return nil, ""
+	}
+	l, err := load("")
+	if err != nil || l.cfg.Project == nil || l.cfg.Project.Path == "" {
+		return nil, ""
+	}
+	p := l.cfg.Project
+	m, err := manifest.Build(ctx, client.ManifestOptions(l.ws.Root, p))
+	if err != nil {
+		return nil, ""
+	}
+	return client.PlacementProject(p, l.ws, m, false, r), l.ws.RepoName
+}
+
 // pricesView is what `spotexec prices` shows.
 type pricesView struct {
+	project string // the project whose caches were checked ("": none)
 	r       *config.Runner
 	t       provider.PriceTable
 	k       provider.Ranking // the options in launch order
@@ -178,8 +207,11 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 		row += sp.Price + "\t"
 		if c, ok := k.CostOf(sp); runCost && ok {
 			cold := added(c.Cold)
-			if c.Warm {
+			switch {
+			case c.Warm:
 				cold = "warm"
+			case c.ColdParts != nil && c.ColdParts.Paid() != "":
+				cold += " " + c.ColdParts.Paid()
 			}
 			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t", c.Score, added(c.Speed), cold, added(c.Distance))
 		}
@@ -205,7 +237,12 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 			factors = append(factors, fmt.Sprintf("a slower type (each instance generation counts as %.0f%% faster per vCPU)", (m.GenSpeedup-1)*100))
 		}
 		if m.Regions {
-			factors = append(factors, fmt.Sprintf("a cold region (%g minutes; warm: a VM of %s was up %g minutes or more there in the last %g days)", m.ColdMinutes, r.Name, m.WarmAfterMin, m.WarmDays),
+			project := fmt.Sprintf("outside a project, deps and image count as warm where a VM of %s was up %g minutes or more in the last %g days", r.Name, m.WarmAfterMin, m.WarmDays)
+			if v.project != "" {
+				project = "deps and image checked for " + v.project
+			}
+			factors = append(factors, fmt.Sprintf("a cold region (COLD: %g minutes boot without a bake of %s there, %g deps without the project's archive in the region's cache, %g image without the project's image in its registry; %s)",
+				m.BootMinutes, r.Name, m.DepsMinutes, m.ImageMinutes, project),
 				fmt.Sprintf("a farther region (%d round trips at the measured TCP connect time)", m.RoundTrips))
 		}
 		added := "nothing else differs between these options"
