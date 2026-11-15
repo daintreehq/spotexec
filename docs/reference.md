@@ -50,7 +50,7 @@ spotexec version
 | `~/.aws/credentials` `[spotexec]`, `~/.aws/config` `[profile spotexec]` | The access key and region written by `spotexec setup`. |
 | `~/.config/spotexec/owner-id` | This machine's permanent ID: it tags the instances it launches and its IAM user. A machine's runs only use its own instances. |
 | `~/.config/spotexec/machines.toml` | The machines `spotexec setup` has set up from here (for `setup --all`). |
-| `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log, dependency install logs (`logs/deps/`) (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
+| `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log, dependency install logs (`logs/deps/`), the full output of failed `--rtk-filter` runs (`rtk/`) (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
 | `.spotexec.toml`, `.spotexecignore` | Project config and extra sync excludes. |
 | `<git-dir>/spotexec/conflicts/` | Remote versions of files that conflicted on write-back (`.spotexec/conflicts/` outside Git). |
 | `.spotexec/Dockerfile` | Project image from `spotexec init` or `spotexec container init`. |

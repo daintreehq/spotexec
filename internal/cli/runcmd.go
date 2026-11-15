@@ -46,6 +46,7 @@ type runFlags struct {
 	prioritySet   bool // --priority or SPOTEXEC_PRIORITY given (0 included)
 	sameSlot      bool
 	group         bool
+	rtkFilter     string
 	fs            *pflag.FlagSet // to tell explicit flags from defaults
 }
 
@@ -72,6 +73,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.BoolVar(&f.noRetry, "no-retry", false, "do not replay the run if its runner is lost (spot reclaim)")
 	fs.IntVar(&f.priority, "priority", 0, "queue priority when every slot is busy (higher runs first)")
 	fs.BoolVarP(&f.sameSlot, "same-slot", "s", false, "run in the slot (same VM) this worktree last used, waiting if it's busy; with --sync none, skip the sync")
+	fs.StringVar(&f.rtkFilter, "rtk-filter", "", "compact stdout with RTK once the command ends (rtk pipe -f `NAME`): cargo-test for cargo test, go-test for go test -json; the full output is kept when it fails")
 	fs.BoolVar(&f.group, "group", false, "parallel and sharded tasks: print each part's output as one block when it finishes (default with SPOTEXEC_AGENT=1 when stdout isn't a terminal)")
 }
 
@@ -450,17 +452,29 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	}
 	ctx, intr, stop := signals()
 	defer stop()
-	o := f.options(l, s, rep, intr, os.Stdout, os.Stderr)
+	var stdout io.Writer = os.Stdout
+	finish := func(code int) int { return code }
+	if f.rtkFilter != "" {
+		if ro, err := newRTKOutput(f.rtkFilter, os.Stdout, rep); err != nil {
+			rep.Warn("RTK_FILTER", "can't compact the output with RTK (%v); it is shown unfiltered", err)
+		} else {
+			stdout = ro
+			// Before the summary, so it stays the last line.
+			finish = func(code int) int { ro.finish(code != 0); return code }
+		}
+	}
+	o := f.options(l, s, rep, intr, stdout, os.Stderr)
 	res, err := client.Run(ctx, l.cfg, l.ws, o)
 	if err != nil {
 		if ctx.Err() != nil {
 			rep.Clear()
-			return client.ExitInterrupted
+			return finish(client.ExitInterrupted)
 		}
 		if f.fallsBack(l, o, res, err) {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
-			return runLocal(ctx, intr, l, o, rep, 0, 1)
+			return finish(runLocal(ctx, intr, l, o, rep, 0, 1))
 		}
+		finish(client.ExitInfra)
 		rep.Clear()
 		rep.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
 		if !rep.IsJSON() {
@@ -497,6 +511,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	case res.ExitCode != 0:
 		summary += fmt.Sprintf(" · exit %d", res.ExitCode)
 	}
+	finish(res.ExitCode)
 	rep.Done(summary, res.ExitCode == 0)
 	return res.ExitCode
 }
@@ -615,6 +630,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		} else {
 			fmt.Fprintf(os.Stderr, "spotexec: --same-slot can't apply to %s: it's a sharded task, whose %d shards run on several slots at once\n", name, t.Shards)
 		}
+		return client.ExitInfra
+	}
+	if f.rtkFilter != "" {
+		fmt.Fprintf(os.Stderr, "spotexec: --rtk-filter can't apply to %s: its parts' outputs are printed separately\n", name)
 		return client.ExitInfra
 	}
 	if len(args) > 0 && len(t.Parallel) > 0 {

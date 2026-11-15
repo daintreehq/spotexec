@@ -584,8 +584,7 @@ func cmdHook() *cobra.Command {
 				var p string
 				switch {
 				case globalScope:
-					home, _ := os.UserHomeDir()
-					p = filepath.Join(home, ".claude", "settings.json")
+					p = hooks.GlobalSettings()
 				case shared:
 					p = filepath.Join(ws.Root, ".claude", "settings.json")
 				default:
@@ -599,12 +598,14 @@ func cmdHook() *cobra.Command {
 					fmt.Printf("%s: %s\n", p, map[bool]string{true: "removed spotexec hook", false: "no spotexec hook found"}[ok])
 				} else {
 					hookCmd := transportQuote(hookBinary()) + " hook claude"
-					legacy := hooks.HasLegacyClaude(p)
+					legacy, rtk := hooks.HasLegacyClaude(p), hooks.HasRTK(p)
 					ok, err := hooks.InstallClaude(p, hookCmd)
 					if err != nil {
 						return err
 					}
-					if ok && legacy {
+					if ok && rtk {
+						fmt.Printf("chained RTK's PreToolUse hook behind spotexec's in %s: spotexec decides first and hands every other command to RTK\n", p)
+					} else if ok && legacy {
 						fmt.Printf("updated the PreToolUse hook in %s to call spotexec (sx only runs commands)\n", p)
 					} else if ok {
 						fmt.Printf("installed PreToolUse hook in %s\n", p)
@@ -614,6 +615,7 @@ func cmdHook() *cobra.Command {
 					if !exists(ws.Root, ".spotexec.toml") {
 						fmt.Println("note: the hook only offloads in projects with a .spotexec.toml (run `spotexec init`)")
 					}
+					rtkNote(p, wd)
 					fmt.Println("note: permission rules now see `spotexec run -- <cmd>`; allow `Bash(spotexec run:*)` if you pre-approve test commands")
 				}
 			}
@@ -655,12 +657,18 @@ func cmdHook() *cobra.Command {
 	install.Flags().BoolVar(&globalScope, "global", false, "install into ~/.claude/settings.json")
 	install.Flags().BoolVar(&shared, "shared", false, "install into .claude/settings.json (committed) instead of settings.local.json")
 	install.Flags().BoolVar(&uninstall, "uninstall", false, "remove the hook instead")
+	var then string
 	handler := &cobra.Command{
 		Use:    "claude",
 		Short:  "PreToolUse hook handler (reads the event JSON on stdin)",
 		Hidden: true,
-		Run:    func(*cobra.Command, []string) { claudeHook() },
+		Run: func(*cobra.Command, []string) {
+			if code := claudeHook(then); code != 0 {
+				os.Exit(code)
+			}
+		},
 	}
+	handler.Flags().StringVar(&then, "then", "", "hook command to hand every event spotexec leaves alone to (RTK's)")
 	check := &cobra.Command{
 		Use:                "check <command>",
 		Short:              "Show whether the hook would offload a command line",
@@ -679,7 +687,8 @@ func cmdHook() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			line := strings.Join(args, " ")
+			orig := strings.Join(args, " ")
+			line, explicit, raw := hooks.UnwrapRTK(orig)
 			runnersErr := hooks.RunnersFor(line, wd, l.cfg.Project)
 			// The same decision the hook makes (project opt-in, disabled,
 			// cd outside the repository).
@@ -697,7 +706,13 @@ func cmdHook() *cobra.Command {
 			case runnersErr != nil:
 				fmt.Printf("local (no usable runners: %v)\n", runnersErr)
 			default:
-				fmt.Println("offload:", hooks.Wrap("spotexec", line))
+				rtk := hooks.RTKFor(wd)
+				wrapped := hooks.WrapRTK("spotexec", line, !raw && (explicit || rtk.InUse()))
+				if file, ok := rtk.Races(orig); ok {
+					fmt.Printf("offload, by denying it with instructions to re-run as: %s\n(RTK's hook in %s would rewrite it too; chain the hooks with `spotexec hook install`)\n", wrapped, file)
+					return nil
+				}
+				fmt.Println("offload:", wrapped)
 				return nil
 			}
 			return errors.New("not offloaded")
@@ -707,9 +722,21 @@ func cmdHook() *cobra.Command {
 	return c
 }
 
-// claudeHook handles one Claude Code PreToolUse event on stdin.
-func claudeHook() {
-	hooks.HandleClaude(os.Stdin, os.Stdout, transportQuote(hookBinary()))
+// claudeHook handles one Claude Code PreToolUse event on stdin, handing it
+// to then (RTK's hook) when spotexec leaves the command alone.
+func claudeHook(then string) int {
+	return hooks.RunClaude(os.Stdin, os.Stdout, os.Stderr, hooks.ClaudeOptions{Bin: transportQuote(hookBinary()), Then: then})
+}
+
+// rtkNote points at RTK hooks in the other settings files that apply here:
+// they would race the hook just installed in p.
+func rtkNote(p, dir string) {
+	for _, f := range hooks.ClaudeSettingsFiles(dir) {
+		if f == p || !hooks.HasRTK(f) {
+			continue
+		}
+		fmt.Printf("note: RTK's hook in %s rewrites the same commands; until it is chained (spotexec hook install --claude%s), offloaded commands are denied with instructions to re-run\n", f, hooks.SettingsScope(f))
+	}
 }
 
 func transportQuote(s string) string {

@@ -145,6 +145,9 @@ func isolate(t *testing.T, runner bool) {
 	t.Setenv("SPOTEXEC_POOL", "")
 	t.Setenv("SPOTEXEC_RUNNER", "")
 	t.Setenv("BASH_MAX_TIMEOUT_MS", "")
+	// Not this machine's Claude Code settings (RTK's hook, say).
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(d, "claude"))
+	t.Setenv("CLAUDE_PROJECT_DIR", "")
 	if runner {
 		if err := os.WriteFile(filepath.Join(d, "config.toml"), []byte("version = 1\n[runners.box]\ntype = \"ssh\"\nhost = \"me@box\"\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -482,7 +485,7 @@ func TestFirstNoticeOncePerSessionConcurrently(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if firstNotice("same") {
+			if firstNotice("", "same") {
 				n.Add(1)
 			}
 		}()

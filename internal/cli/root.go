@@ -238,8 +238,7 @@ func sxMain(args []string) int {
 	// v0.2.0 could install the Claude Code hook as `sx hook claude`. That
 	// line is the hook handler, never a command to run remotely.
 	if len(args) == 2 && args[0] == "hook" && args[1] == "claude" {
-		claudeHook()
-		return 0
+		return claudeHook("")
 	}
 	// Shell completion scripts for sx ask it for candidates.
 	if len(args) > 0 && (args[0] == cobra.ShellCompRequestCmd || args[0] == cobra.ShellCompNoDescRequestCmd) {
