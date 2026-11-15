@@ -1167,6 +1167,7 @@ func cmdPull() *cobra.Command {
 			defer stop()
 			rep, _ := ui.New(mode, os.Stderr, "")
 			host, _ := os.Hostname()
+			defer client.KeepAwake()() // released after the lease
 			lease, err := client.AcquireSlot(ctx, l.cfg, l.ws, r, lr, rep, host, client.PullDisplay, false, 0, false, "")
 			if err != nil {
 				return err
