@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -189,6 +191,22 @@ parallel = ["unit", "lint"]
 			t.Errorf("stderr lacks %q: %q", want, stderr)
 		}
 	}
+	// The output ends with every part, failed first, then the verdict.
+	lines := strings.Split(strings.TrimRight(stderr, "\n"), "\n")
+	if len(lines) < 4 {
+		t.Fatalf("stderr %q", stderr)
+	}
+	tail := lines[len(lines)-4:]
+	for i, re := range []string{
+		`^sx: unit 2/3 · failed · \S+ locally · exit 3$`,
+		`^sx: unit 1/3 · passed · \S+ locally$`,
+		`^sx: unit 3/3 · passed · \S+ locally$`,
+		`^sx: unit · 1 of 3 parts failed \(unit 2/3\) · \S+ · exit 3$`,
+	} {
+		if !regexp.MustCompile(re).MatchString(tail[i]) {
+			t.Errorf("line %d of the summary: %q, want %s", i, tail[i], re)
+		}
+	}
 	// NDJSON tells the shards apart, and the result names the shard count.
 	code, stderr = runMain(t, "sx", "-C", dir, "--json", "--fallback-local", "--queue-timeout", "5s", "unit")
 	if code != 3 {
@@ -208,13 +226,38 @@ parallel = ["unit", "lint"]
 		}
 	}
 	if len(shards) != 3 || result == nil || result["task"] != "unit" || result["shards"] != float64(3) || result["exit_code"] != float64(3) {
-		t.Errorf("shards %v, result %v (stderr %q)", shards, result, stderr)
+		t.Fatalf("shards %v, result %v (stderr %q)", shards, result, stderr)
+	}
+	// It has each part's outcome, in shard order.
+	parts, _ := result["parts"].([]any)
+	if len(parts) != 3 {
+		t.Fatalf("result parts: %v", result["parts"])
+	}
+	for i, p := range parts {
+		p := p.(map[string]any)
+		status, code := "passed", float64(0)
+		if i == 1 {
+			status, code = "failed", 3
+		}
+		if p["task"] != "unit" || p["shard"] != float64(i+1) || p["shards"] != float64(3) || p["label"] != fmt.Sprintf("unit %d/3", i+1) ||
+			p["status"] != status || p["exit_code"] != code || p["local"] != true || p["runner"] != nil {
+			t.Errorf("part %d: %v", i+1, p)
+		}
+		if d, ok := p["duration_ms"].(float64); !ok || d < 0 {
+			t.Errorf("part %d duration: %v", i+1, p["duration_ms"])
+		}
+	}
+	if strings.Contains(stderr, "sx: ") {
+		t.Errorf("--json printed a text summary: %q", stderr)
 	}
 	// Named in a parallel task, a sharded task fans out in place.
 	os.Remove(filepath.Join(dir, "s1of3.out"))
 	code, stderr = runMain(t, "sx", "-C", dir, "--fallback-local", "--queue-timeout", "5s", "all")
 	if code != 3 || !strings.Contains(stderr, "sx: lint · ") || !strings.Contains(stderr, "sx: unit 3/3 · ") {
 		t.Errorf("parallel: exit %d, stderr %q", code, stderr)
+	}
+	if last := stderr[strings.LastIndex(strings.TrimRight(stderr, "\n"), "\n")+1:]; !strings.HasPrefix(last, "sx: all · 1 of 4 parts failed (unit 2/3) · ") {
+		t.Errorf("parallel verdict: %q", last)
 	}
 	if b, err := os.ReadFile(filepath.Join(dir, "s1of3.out")); err != nil || string(b) != "1/3\n" {
 		t.Errorf("parallel shard 1: %q, %v", b, err)
@@ -226,6 +269,37 @@ parallel = ["unit", "lint"]
 	code, stderr = runMain(t, "sx", "-C", dir, "--same-slot", "unit")
 	if code != client.ExitInfra || !strings.Contains(stderr, "unit: it's a sharded task, whose 3 shards") {
 		t.Errorf("--same-slot: exit %d, stderr %q", code, stderr)
+	}
+}
+
+func TestFailFastSummaryNamesStoppedParts(t *testing.T) {
+	dir := project(t, `[tasks.unit]
+run = "[ {shard} != 1 ] || exit 3; sleep 20"
+shards = 3
+fail_fast = true
+`)
+	cfg := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfg, []byte("version = 1\n[runners.a]\ntype = \"ssh\"\nhosts = [\"nobody@127.0.0.1\"]\nssh_options = [\"Port=1\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTEXEC_CONFIG", cfg)
+	t.Setenv("HOME", t.TempDir())
+	start := time.Now()
+	code, stderr := runMain(t, "sx", "-C", dir, "--fallback-local", "--queue-timeout", "5s", "unit")
+	if code != 3 || time.Since(start) > 15*time.Second {
+		t.Fatalf("exit %d after %s, stderr %q", code, time.Since(start), stderr)
+	}
+	lines := strings.Split(strings.TrimRight(stderr, "\n"), "\n")
+	tail := lines[max(len(lines)-4, 0):]
+	for i, re := range []string{
+		`^sx: unit 1/3 · failed · \S+ locally · exit 3$`,
+		`^sx: unit 2/3 · stopped \(fail_fast\) · \S+( locally)?$`,
+		`^sx: unit 3/3 · stopped \(fail_fast\) · \S+( locally)?$`,
+		`^sx: unit · 1 of 3 parts failed \(unit 1/3\) · 2 stopped · \S+ · exit 3$`,
+	} {
+		if i >= len(tail) || !regexp.MustCompile(re).MatchString(tail[i]) {
+			t.Errorf("summary line %d, want %s; stderr %q", i, re, stderr)
+		}
 	}
 }
 
