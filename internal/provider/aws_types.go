@@ -191,7 +191,10 @@ func (a *AWSSpot) EligibleTypes(ctx context.Context, refresh bool) ([]InstanceTy
 	if !refresh {
 		if b, err := os.ReadFile(a.typesCachePath()); err == nil {
 			var c typesCache
-			if json.Unmarshal(b, &c) == nil && c.Key == key && now.Sub(c.At) < typesTTL && now.After(c.At) && len(c.Types) > 0 {
+			if json.Unmarshal(b, &c) == nil && c.Key == key && now.Sub(c.At) < typesTTL && now.After(c.At) {
+				if len(c.Types) == 0 {
+					return nil, &noEligibleError{a.r}
+				}
 				return c.Types, nil
 			}
 		}
@@ -207,9 +210,7 @@ func (a *AWSSpot) EligibleTypes(ctx context.Context, refresh bool) ([]InstanceTy
 		}
 	}
 	sortTypes(out)
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no instance type in %s has %s; lower min_memory_gib or min_generation, or check exclude_instance_types and instance_types", a.r.Region, describeRequirements(a.r))
-	}
+	// An empty answer is cached too: it is as definite as a full one.
 	if err := os.MkdirAll(a.dir, 0o700); err == nil {
 		b, _ := json.MarshalIndent(typesCache{Key: key, At: now, Types: out}, "", "  ")
 		tmp := a.typesCachePath() + ".tmp" + strconv.Itoa(os.Getpid())
@@ -217,7 +218,18 @@ func (a *AWSSpot) EligibleTypes(ctx context.Context, refresh bool) ([]InstanceTy
 			_ = os.Rename(tmp, a.typesCachePath())
 		}
 	}
+	if len(out) == 0 {
+		return nil, &noEligibleError{a.r}
+	}
 	return out, nil
+}
+
+// noEligibleError is EligibleTypes' answer when the region was described
+// and none of its types qualifies (as opposed to a failed lookup).
+type noEligibleError struct{ r *config.Runner }
+
+func (e *noEligibleError) Error() string {
+	return fmt.Sprintf("no instance type in %s has %s; lower min_memory_gib or min_generation, or check exclude_instance_types and instance_types", e.r.Region, describeRequirements(e.r))
 }
 
 func sortTypes(ts []InstanceTypeInfo) {

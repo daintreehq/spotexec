@@ -76,6 +76,9 @@ type runnerStatus struct {
 	// the VM's type in its zone) or "hourly_cost" (the runner's setting).
 	CostFrom string `json:"hourly_cost_from,omitempty"`
 	Fleet    string `json:"fleet,omitempty"`
+	// Mismatch says why a fleet VM no longer satisfies the runner's
+	// current requirements: it takes no new runs and idles out.
+	Mismatch string `json:"mismatch,omitempty"`
 	r        *config.Runner
 }
 
@@ -182,6 +185,18 @@ func fallbackCost(r *config.Runner) (float64, string) {
 	return 0, ""
 }
 
+// fleetMismatches says which of a fleet's VMs no longer satisfy the
+// runner's current requirements, and why (none when that can't be told).
+func fleetMismatches(ctx context.Context, f provider.Fleet, insts []provider.Instance) map[string]string {
+	m, ok := f.(provider.Matcher)
+	if !ok || len(insts) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return m.Mismatches(ctx, insts)
+}
+
 func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []runnerStatus {
 	var rows []runnerStatus
 	var fleets []fleetInstances
@@ -202,9 +217,10 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 					Info: provider.Info{State: provider.StateAbsent, Detail: fmt.Sprintf("0 of max %d instances; scales on demand", r.MaxInstances)}})
 			}
 			fleets = append(fleets, fleetInstances{r, insts})
+			mismatch := fleetMismatches(ctx, f, insts)
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
-				rows = append(rows, runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name,
+				rows = append(rows, runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
 					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}})
 			}
 			continue
@@ -295,6 +311,9 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 				state = "draining"
 			}
 		}
+		if s.Mismatch != "" && state != "draining" {
+			state = "outdated" // explained below the table
+		}
 		typ := s.Type
 		if s.r != nil && s.Info.Region != "" && (s.r.MultiRegion() || s.Info.Region != s.r.Region) {
 			typ += " " + s.Info.Region // which region each instance landed in
@@ -311,6 +330,9 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 	for _, s := range sts {
 		if s.Error != "" {
 			fmt.Fprintf(w, "  %s: %s\n", s.Name, s.Error)
+		}
+		if s.Mismatch != "" {
+			fmt.Fprintf(w, "  %s: doesn't match the current config (%s): takes no new runs and terminates when idle\n", s.Name, s.Mismatch)
 		}
 		if s.Helper == nil {
 			continue

@@ -152,6 +152,8 @@ func cmdDaemon() *cobra.Command {
 					switch {
 					case in.Draining:
 						health = "draining"
+					case in.Mismatch != "":
+						health = "not matching config (" + in.Mismatch + ")"
 					case in.Booting:
 						health = "booting"
 					case in.Healthy:

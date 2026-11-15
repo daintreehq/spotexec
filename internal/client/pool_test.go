@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -229,5 +230,178 @@ func TestNearLifetimeInstancesDrain(t *testing.T) {
 	}
 	if !NearLifetime(r, provider.Instance{LaunchedAt: time.Now().Add(-61 * time.Second)}) || NearLifetime(r, provider.Instance{LaunchedAt: time.Now().Add(-59 * time.Second)}) {
 		t.Fatal("NearLifetime boundary")
+	}
+}
+
+// matchFleet is a fakeFleet that judges instances by type: a type in bad
+// no longer matches; a type in unknown can't be judged.
+type matchFleet struct {
+	*fakeFleet
+	bad, unknown map[string]bool
+	calls        int
+}
+
+func (m *matchFleet) Mismatches(_ context.Context, insts []provider.Instance) map[string]string {
+	m.calls++
+	out := map[string]string{}
+	for _, in := range insts {
+		switch {
+		case m.unknown[in.Type]:
+		case m.bad[in.Type]:
+			out[in.ID] = in.Type + " doesn't have 8 vCPUs, at least 32 GiB"
+		default:
+			out[in.ID] = ""
+		}
+	}
+	return out
+}
+
+// Issue #99: after min_memory_gib was raised, the older 16 GiB VMs kept
+// taking every run (oldest first) while the matching 64 GiB ones idled
+// out. A VM that no longer satisfies the runner's requirements takes no new
+// runs and isn't capacity (so it idles out and replacements launch), until
+// the config matches it again.
+func TestMismatchedInstancesTakeNoNewRuns(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 4)
+	p.R.VCPUs, p.R.MinMemoryGiB = 8, 32
+	m := &matchFleet{fakeFleet: f, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{}}
+	p.Fleet = m
+	host := provider.Target{Host: "127.0.0.1", Port: 1}
+	f.insts = []provider.Instance{
+		{ID: "i-old", Type: "c6a.2xlarge", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-2 * time.Hour)},
+		{ID: "i-new", Type: "r6a.2xlarge", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Hour)},
+	}
+
+	cands, usable, err := p.Candidates(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].ID != "i-new" || usable != 1 {
+		t.Fatalf("candidates %v usable %d: the mismatched VM must not take new runs", cands, usable)
+	}
+	if ids, _ := p.EnsureMin(ctx, 2); len(ids) != 1 {
+		t.Fatalf("mismatched VM not replaced in the warm pool: reserved %d", len(ids))
+	}
+	v, err := p.Snapshot(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Mismatch["i-old"] == "" || v.Mismatch["i-new"] != "" || v.Draining["i-old"] {
+		t.Fatalf("snapshot mismatch %v draining %v", v.Mismatch, v.Draining)
+	}
+
+	// Within the listing's TTL nothing is judged again under the same
+	// requirements...
+	calls := m.calls
+	if _, _, err := p.Candidates(ctx, nil); err != nil || m.calls != calls {
+		t.Fatalf("judged again without a relist or config change: %d -> %d (%v)", calls, m.calls, err)
+	}
+	// ...but a config change is: reverting it puts the VM back in service.
+	p.R.MinMemoryGiB = 0
+	m.bad = map[string]bool{}
+	cands, usable, _ = p.Candidates(ctx, nil)
+	if len(cands) != 2 || cands[0].ID != "i-old" || usable != 2 {
+		t.Fatalf("after reverting the config: candidates %v usable %d", cands, usable)
+	}
+
+	// A failed lookup keeps the last verdict under the same requirements,
+	// and never retires a VM under new ones.
+	m.bad = map[string]bool{"c6a.2xlarge": true}
+	p.R.MinMemoryGiB = 32
+	if cands, _, _ = p.Candidates(ctx, nil); len(cands) != 1 {
+		t.Fatalf("raised again: %v", cands)
+	}
+	m.unknown = map[string]bool{"c6a.2xlarge": true}
+	_ = p.with(func(st *poolState) error { st.ListedAt = time.Time{}; return nil })
+	if cands, _, _ = p.Candidates(ctx, nil); len(cands) != 1 {
+		t.Fatalf("a failed lookup put the mismatched VM back: %v", cands)
+	}
+	p.R.MinMemoryGiB = 48
+	if cands, _, _ = p.Candidates(ctx, nil); len(cands) != 2 {
+		t.Fatalf("an unjudged VM retired under new requirements: %v", cands)
+	}
+}
+
+// Clearing a mismatch never clears draining: a VM marked draining stays
+// out of service when the config matches it again.
+func TestMismatchClearingKeepsDraining(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 4)
+	p.R.VCPUs, p.R.MinMemoryGiB = 8, 32
+	m := &matchFleet{fakeFleet: f, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{}}
+	p.Fleet = m
+	in := provider.Instance{ID: "i-old", Type: "c6a.2xlarge", State: provider.StateRunning,
+		Target: provider.Target{Host: "127.0.0.1"}, LaunchedAt: time.Now().Add(-time.Hour)}
+	f.insts = []provider.Instance{in}
+	if cands, _, _ := p.Candidates(ctx, nil); len(cands) != 0 {
+		t.Fatalf("%v", cands)
+	}
+	p.Observe(in.ID, OutDraining, in.LaunchedAt)
+	m.bad = map[string]bool{}
+	p.R.MinMemoryGiB = 16
+	if cands, usable, _ := p.Candidates(ctx, nil); len(cands) != 0 || usable != 0 {
+		t.Fatalf("draining VM back in service: %v %d", cands, usable)
+	}
+	if n := readState(t, p).Notes["i-old"]; n == nil || !n.Draining || n.Mismatch != "" {
+		t.Fatalf("note %+v: want draining, mismatch cleared", n)
+	}
+}
+
+// Under the same requirements a re-listing judges again: an instance a
+// failed lookup left unjudged is retired once a lookup succeeds.
+func TestMismatchJudgedAgainOnRelist(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 4)
+	m := &matchFleet{fakeFleet: f, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{"c6a.2xlarge": true}}
+	p.Fleet = m
+	f.insts = []provider.Instance{{ID: "i-old", Type: "c6a.2xlarge", State: provider.StateRunning,
+		Target: provider.Target{Host: "127.0.0.1"}, LaunchedAt: time.Now().Add(-time.Hour)}}
+	if cands, _, _ := p.Candidates(ctx, nil); len(cands) != 1 {
+		t.Fatalf("unjudged VM retired: %v", cands)
+	}
+	m.unknown = map[string]bool{}
+	_ = p.with(func(st *poolState) error { st.ListedAt = time.Time{}; return nil })
+	if cands, usable, _ := p.Candidates(ctx, nil); len(cands) != 0 || usable != 0 {
+		t.Fatalf("not judged again on a relist: %v %d", cands, usable)
+	}
+}
+
+// Waiting demand gets a replacement for a mismatched VM: it isn't live
+// capacity (at max_instances), nor pending capacity while it boots or
+// while its launch record lasts.
+func TestMismatchedInstancesAreReplacedForDemand(t *testing.T) {
+	p, f := testPool(t, 1)
+	m := &matchFleet{fakeFleet: f, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{}}
+	p.Fleet = m
+	host := provider.Target{Host: "127.0.0.1"}
+
+	f.insts = []provider.Instance{{ID: "i-old", Type: "c6a.2xlarge", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Hour)}}
+	if d := planOnce(t, p); !d.Launch || d.Live != 0 {
+		t.Fatalf("at max_instances with only a mismatched VM: %+v", d)
+	}
+
+	// A young, never-ready mismatched VM with a launch record.
+	p2, f2 := testPool(t, 4)
+	m2 := &matchFleet{fakeFleet: f2, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{}}
+	p2.Fleet = m2
+	f2.insts = []provider.Instance{{ID: "i-young", Type: "c6a.2xlarge", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Minute)}}
+	_ = p2.with(func(st *poolState) error {
+		st.Launches = []launchRec{{ID: "l1", InstanceID: "i-young", Started: time.Now().Add(-time.Minute), PID: os.Getpid()}}
+		return nil
+	})
+	if d := planOnce(t, p2); !d.Launch || d.Pending != 1 {
+		t.Fatalf("mismatched booting VM counted as pending capacity: %+v", d)
+	}
+	// The record survives (a config change may undo the mismatch), and
+	// counts again once the VM matches.
+	m2.bad = map[string]bool{}
+	p2.R.MinMemoryGiB = 1
+	st := readState(t, p2)
+	if len(st.Launches) != 2 {
+		t.Fatalf("launch records %+v", st.Launches)
+	}
+	if d := planOnce(t, p2); d.Launch || d.Pending != 2 {
+		t.Fatalf("after the config matches again: %+v", d)
 	}
 }
