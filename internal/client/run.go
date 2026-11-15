@@ -258,6 +258,7 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		}
 		return Result{}, infra(fmt.Errorf("%s is not in a Git repository and has no .spotexec.toml, so spotexec won't sync it; run `spotexec init` there to mark it as a project, or pass --sync none", ws.Root))
 	}
+	defer KeepAwake()()
 	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}, fresh: new(bool)}
 	reached := false
 	for {
@@ -316,9 +317,21 @@ func replayable(lost string, res Result, o Options, canceled bool, n int) (retry
 // so is one lost before the command was dispatched (the command can't
 // have run, so it has no outcome to protect), unless it was out of memory.
 // exclusive is whether the run already had the whole VM.
+//
+// A runner lost after this machine was asleep (or sx was stopped) for
+// longer than the runner may wait for a silent client (#142) was most
+// likely lost to that, not to the VM or the run: replayed if the command
+// hadn't been dispatched, and otherwise not (its outcome is unknown), with
+// a warning that says so instead of blaming the run or the VM.
 func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay {
 	if noticed {
 		return noReplay{}
+	}
+	if d := sessionSuspended(lease.Sess); d > 0 {
+		if !at.dispatched {
+			return noReplay{}
+		}
+		return noReplay{"CLIENT_SUSPENDED", fmt.Sprintf("%s, after this machine was asleep or sx was stopped for %s: a runner may end a run after %s without word from sx, and the attempt's outcome is unknown. Rerun it, and keep this machine awake while it runs", at.where(), ui.Dur(d), transport.HelperPatience.Round(time.Second))}
 	}
 	if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
 		return noReplay{"MEMORY_PRESSURE", at.where() + ": it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
@@ -374,6 +387,11 @@ func lastMemory(s *transport.Session) string {
 	}
 	return fmt.Sprintf("its last heartbeat (%s ago) reported %s of %s memory available", ui.Dur(time.Since(m.At).Round(time.Second)), ui.Bytes(m.AvailMB<<20), ui.Bytes(m.TotalMB<<20))
 }
+
+// sessionSuspended is how long this machine was suspended while the
+// session was open, past the runner's patience (transport.Session.Suspended;
+// tests replace it).
+var sessionSuspended = (*transport.Session).Suspended
 
 // noteReclaimed tells the lease's fleet that AWS is reclaiming its VM, so
 // new launches (a replacement first) prefer other zones and types for a

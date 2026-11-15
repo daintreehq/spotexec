@@ -167,6 +167,65 @@ func TestProgress(t *testing.T) {
 	}
 }
 
+// A runner lost after this machine slept past the runner's patience
+// (#142), once the command was handed over, isn't replayed, and the
+// warning says the sleep was why, not the VM or the run, whatever else the
+// VM reported before it. Lost before that, the run is replayed as usual.
+func TestClientAsleepVerdict(t *testing.T) {
+	r, f := testFleet()
+	old := sessionSuspended
+	t.Cleanup(func() { sessionSuspended = old })
+	sessionSuspended = func(*transport.Session) time.Duration { return 15*time.Minute + 41*time.Second }
+	for _, c := range []struct {
+		id      string
+		noticed bool
+		at      stage
+		code    string
+	}{
+		{"i-run", false, running, "CLIENT_SUSPENDED"},
+		{"i-gone", false, starting, "CLIENT_SUSPENDED"},
+		{"i-run", true, running, ""},    // a Spot notice: the VM was going anyway
+		{"i-run", false, depsCheck, ""}, // the command can't have run: replayed
+	} {
+		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id}, c.noticed, c.at, false)
+		if got.code != c.code {
+			t.Errorf("%s noticed=%v at %+v: %q (%q), want %q", c.id, c.noticed, c.at, got.code, got.why, c.code)
+		}
+		if c.code != "" && (!strings.HasPrefix(got.why, c.at.where()+", after this machine was asleep") || !strings.Contains(got.why, "15m41s") || strings.Contains(got.why, "overloaded")) {
+			t.Errorf("%s: %q doesn't put the loss down to the sleep", c.id, got.why)
+		}
+		if retry, _, _ := replayable(c.id, Result{noReplay: got}, Options{RetryPreempt: true, Sync: "auto"}, false, 1); retry != (c.code == "") {
+			t.Errorf("%s noticed=%v at %+v after a sleep: replayed %v", c.id, c.noticed, c.at, retry)
+		}
+	}
+	// The sleep outranks memory pressure the VM reported before it.
+	sr, tgt := liveRunner(t, "rpc-pressure")
+	_, s, err := Connect(context.Background(), sr, tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Abort()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.MemoryPressure(PressureWindow) == "" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	pressured := &Lease{Runner: r, Provider: f, InstanceID: "i-run", Sess: s}
+	if got := whyNoReplay(pressured, false, running, false); got.code != "CLIENT_SUSPENDED" {
+		t.Fatalf("a sleep under memory pressure: %q (%q), want CLIENT_SUSPENDED", got.code, got.why)
+	}
+	sessionSuspended = func(*transport.Session) time.Duration { return 0 }
+	if got := whyNoReplay(pressured, false, running, false); got.code != "MEMORY_PRESSURE" {
+		t.Fatalf("pressure without a sleep: %q, want MEMORY_PRESSURE", got.code)
+	}
+	if got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}, false, running, false); got.code != "RUNNER_UNRESPONSIVE" {
+		t.Fatalf("no sleep: %q, want RUNNER_UNRESPONSIVE", got.code)
+	}
+	// The real one: a session that never slept, or none at all.
+	if old(s) != 0 || old(nil) != 0 {
+		t.Fatal("a suspension where there was none")
+	}
+}
+
 // A run its VM's own shutdown killed (max_lifetime, or a Spot reclaim whose
 // notice never reached us) is replayed even though EC2 still reports the VM
 // running while its OS halts: the helper reporting the shutdown counts as

@@ -210,6 +210,7 @@ var _ = errors.New
 // runBake bakes runner r's image (see `image bake`), reporting progress on
 // stderr; Ctrl-C abandons it and terminates the builder.
 func runBake(r *config.Runner, a *provider.AWSSpot, pulls []string) (err error) {
+	defer client.KeepAwake()() // the builder is driven from here
 	rep, _ := ui.New(ui.ModeAuto, os.Stderr, "")
 	ctx, _, stop := signals()
 	defer stop()
