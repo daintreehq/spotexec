@@ -2,6 +2,8 @@ package client
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -127,6 +129,16 @@ func TestInstallsSystemPackages(t *testing.T) {
 		"bash -c 'apt-get install -y jq'",
 		"(apt-get install -y jq)",
 		"true;apk add jq",
+		"aptitude install curl",
+		"apt-get reinstall curl",
+		"apt-get -o Dpkg::Options::=--force-confold -y install curl",
+		"apt-get -t bookworm-backports install curl",
+		"DEBIAN_FRONTEND=noninteractive sudo -E apt-get -y --no-install-recommends install curl",
+		"tdnf install git",
+		"yum groupinstall 'Development Tools'",
+		"dnf group install 'Development Tools'",
+		"dpkg --install ./pkg.deb",
+		"rpm --upgrade pkg.rpm",
 	}
 	no := []string{
 		"cat /etc/hosts",
@@ -143,6 +155,8 @@ func TestInstallsSystemPackages(t *testing.T) {
 		"rpm -qi bash",
 		"my-apt-get install x",
 		"grep install apt.log",
+		"dnf group list",
+		"apt-get -o Debug::pkgProblemResolver=yes update",
 	}
 	for _, c := range yes {
 		if !installsSystemPackages(c) {
@@ -152,6 +166,26 @@ func TestInstallsSystemPackages(t *testing.T) {
 	for _, c := range no {
 		if installsSystemPackages(c) {
 			t.Errorf("false positive %q", c)
+		}
+	}
+}
+
+func TestContainerFreshWarnsWhenStateCantBeWritten(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "state")
+	if err := os.WriteFile(f, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTEXEC_STATE_DIR", f) // a file: the marker's directory can't be made
+	rep := &warnRec{}
+	ws := &Workspace{WorktreeKey: "a"}
+	for range 2 {
+		warnContainerFresh(ws, Options{Command: "ls", SameSlot: true, Rep: rep}, "")
+		if w := rep.take(); len(w) != 1 {
+			t.Fatalf("got %v, want one warning", w)
+		}
+		warnContainerFresh(ws, Options{Command: "apk add jq", SameSlot: true, Rep: rep}, "")
+		if w := rep.take(); len(w) != 1 || !strings.Contains(w[0], "installs system packages") {
+			t.Fatalf("install: got %v, want one install warning", w)
 		}
 	}
 }
