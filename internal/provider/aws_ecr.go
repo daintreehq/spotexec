@@ -140,3 +140,56 @@ func ecrName(repoID string) string {
 	}
 	return strings.Trim(b.String(), "-")
 }
+
+// projectImage looks up the image tagged tag in the region's repository
+// for repoID, creating nothing. It returns the image's ID as Docker on the
+// runner reports it (the config digest of a single image, the digest of
+// an index), or "" when the region doesn't hold it.
+func (a *AWSSpot) projectImage(ctx context.Context, repoID, tag string) (string, error) {
+	var out struct {
+		Images []struct {
+			ID struct {
+				Digest string `json:"imageDigest"`
+			} `json:"imageId"`
+			Manifest  string `json:"imageManifest"`
+			MediaType string `json:"imageManifestMediaType"`
+		} `json:"images"`
+		Failures []struct {
+			Code   string `json:"failureCode"`
+			Reason string `json:"failureReason"`
+		} `json:"failures"`
+	}
+	err := a.ecr(ctx, "BatchGetImage", map[string]any{
+		"repositoryName": "spotexec/" + ecrName(repoID),
+		"imageIds":       []map[string]string{{"imageTag": tag}},
+		// Without these ECR answers with a converted schema 1 manifest. An
+		// index comes back as it is.
+		"acceptedMediaTypes": []string{"application/vnd.docker.distribution.manifest.v2+json", "application/vnd.oci.image.manifest.v1+json"},
+	}, &out)
+	switch {
+	case err != nil && strings.Contains(err.Error(), "RepositoryNotFoundException"):
+		return "", nil
+	case err != nil:
+		return "", err
+	case len(out.Images) == 0:
+		for _, f := range out.Failures {
+			if f.Code != "ImageNotFound" && f.Code != "ImageTagDoesNotMatchDigest" {
+				return "", fmt.Errorf("ECR: %s %s", f.Code, f.Reason)
+			}
+		}
+		return "", nil
+	}
+	img := out.Images[0]
+	if strings.Contains(img.MediaType, "manifest.list") || strings.Contains(img.MediaType, "image.index") {
+		return img.ID.Digest, nil
+	}
+	var m struct {
+		Config struct {
+			Digest string `json:"digest"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal([]byte(img.Manifest), &m); err != nil || !strings.HasPrefix(m.Config.Digest, "sha256:") {
+		return "", fmt.Errorf("ECR: unreadable manifest for %s (%s)", tag, img.MediaType)
+	}
+	return m.Config.Digest, nil
+}

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,6 +43,11 @@ type fakeRegionsEC2 struct {
 	types      map[string][]string          // region -> DescribeInstanceTypes items (typeXML)
 	typesErr   map[string]string            // region -> error code DescribeInstanceTypes answers
 	subnetZone map[string]string            // subnet ID -> its zone (DescribeSubnets by ID)
+	bakes      map[string]bool              // regions holding a current bake of the runner
+	images     map[string]map[string]string // region -> ECR tag -> config digest (nil: no repository)
+	imageErr   map[string]string            // region -> error type BatchGetImage answers
+	cached     map[string]map[string]bool   // region -> dependency cache object keys held
+	cacheErr   map[string]int               // region -> HTTP status the cache bucket answers
 	calls      []string                     // "region Action [detail]"
 	next       int
 }
@@ -104,6 +110,54 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			fmt.Fprintf(w, `{"Quota":{"Value":%d}}`, q)
 			return
 		}
+		if service == "sts" {
+			fmt.Fprint(w, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`)
+			return
+		}
+		if rest, ok := strings.CutPrefix(service, "s3/"); ok {
+			bucket, key, _ := strings.Cut(rest, "/")
+			f.log(region, r.Method+" s3 "+rest)
+			switch {
+			case r.Method != http.MethodHead || r.Header.Get("x-amz-expected-bucket-owner") != "123456789012" || bucket != "spotexec-cache-123456789012-"+region:
+				t.Errorf("unexpected S3 request %s %s (owner %q)", r.Method, r.URL, r.Header.Get("x-amz-expected-bucket-owner"))
+				w.WriteHeader(400)
+			case f.cacheErr[region] != 0:
+				w.WriteHeader(f.cacheErr[region])
+			case f.cached[region][key]:
+			default:
+				w.WriteHeader(404)
+			}
+			return
+		}
+		if service == "ecr" {
+			var in struct {
+				Repo  string              `json:"repositoryName"`
+				IDs   []map[string]string `json:"imageIds"`
+				Types []string            `json:"acceptedMediaTypes"`
+			}
+			_ = json.Unmarshal(body, &in)
+			f.log(region, "BatchGetImage "+in.Repo+":"+in.IDs[0]["imageTag"])
+			if r.Header.Get("X-Amz-Target") != "AmazonEC2ContainerRegistry_V20150921.BatchGetImage" || len(in.Types) == 0 {
+				t.Errorf("unexpected ECR request %s %s", r.Header.Get("X-Amz-Target"), body)
+			}
+			tags, ok := f.images[region]
+			switch {
+			case f.imageErr[region] != "":
+				w.WriteHeader(400)
+				fmt.Fprintf(w, `{"__type":%q,"message":"no"}`, f.imageErr[region])
+			case !ok:
+				w.WriteHeader(400)
+				fmt.Fprint(w, `{"__type":"RepositoryNotFoundException","message":"no repository"}`)
+			case tags[in.IDs[0]["imageTag"]] == "":
+				fmt.Fprint(w, `{"images":[],"failures":[{"failureCode":"ImageNotFound","failureReason":"Requested image not found"}]}`)
+			default:
+				m, _ := json.Marshal(map[string]any{"schemaVersion": 2, "config": map[string]string{"digest": tags[in.IDs[0]["imageTag"]]}})
+				out, _ := json.Marshal(map[string]any{"images": []map[string]any{{"imageId": map[string]string{"imageDigest": "sha256:manifest"},
+					"imageManifest": string(m), "imageManifestMediaType": "application/vnd.docker.distribution.manifest.v2+json"}}})
+				w.Write(out)
+			}
+			return
+		}
 		if service == "ssm" {
 			f.log(region, "GetParameter")
 			fmt.Fprint(w, `{"Parameter":{"Value":"ami-ubuntu"}}`)
@@ -143,6 +197,16 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			}
 			fmt.Fprint(w, `</spotPriceHistorySet></DescribeSpotPriceHistoryResponse>`)
 		case "DescribeImages":
+			if p.Get("Filter.4.Name") == "tag:spotexec-bootstrap-hash" {
+				f.log(region, act+" bakes")
+				if f.bakes[region] {
+					fmt.Fprintf(w, `<DescribeImagesResponse><imagesSet><item><imageId>ami-bake-%s</imageId><imageState>available</imageState><creationDate>%s</creationDate><architecture>x86_64</architecture><tagSet><item><key>spotexec-bootstrap-hash</key><value>%s</value></item><item><key>spotexec-base-ami</key><value>ami-ubuntu</value></item></tagSet></item></imagesSet></DescribeImagesResponse>`,
+						region, time.Now().Add(-time.Hour).UTC().Format(time.RFC3339), p.Get("Filter.4.Value.1"))
+					return
+				}
+				fmt.Fprint(w, `<DescribeImagesResponse><imagesSet/></DescribeImagesResponse>`)
+				return
+			}
 			if p.Get("ImageId.1") != "" {
 				fmt.Fprint(w, `<DescribeImagesResponse><imagesSet><item><rootDeviceName>/dev/sda1</rootDeviceName></item></imagesSet></DescribeImagesResponse>`)
 			} else {
@@ -292,7 +356,8 @@ func newGlobalEnv(t *testing.T, f *fakeRegionsEC2, regions ...string) *AWSGlobal
 	g.creds = &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "secret"}}
 	g.endpoints = func(region string) map[string]string {
 		return map[string]string{"ec2": srv.URL + "/" + region + "/ec2", "ssm": srv.URL + "/" + region + "/ssm",
-			"servicequotas": srv.URL + "/" + region + "/servicequotas"}
+			"servicequotas": srv.URL + "/" + region + "/servicequotas", "sts": srv.URL + "/" + region + "/sts",
+			"ecr": srv.URL + "/" + region + "/ecr", "s3": srv.URL + "/" + region + "/s3"}
 	}
 	return g
 }
@@ -1097,5 +1162,110 @@ func TestGlobalOnDemandSkipsRegionsCoolingForSetup(t *testing.T) {
 	}
 	if markets := f.callsOf("market"); in.Region != "r-three-1" || markets[len(markets)-1] != "r-three-1 market on-demand" {
 		t.Fatalf("launched %+v via %v", in, markets)
+	}
+}
+
+// LaunchRegions are the first few regions in launch order, those doctor
+// and setup check the Spot quota of, never an excluded region.
+func TestGlobalLaunchRegions(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.09"}},
+		"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.01"}},
+		"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.06"}, {"r-three-1b", "c7a.2xlarge", "0.03"}},
+		"r-off-1":   {{"r-off-1a", "c7a.2xlarge", "0.001"}}, // cheapest, but not enabled
+	}}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	g.r.LaunchOrder = config.LaunchCheapest
+	g.r.ExcludeRegions = []string{"r-two-1"}
+	got, err := g.LaunchRegions(context.Background())
+	if err != nil || strings.Join(got, ",") != "r-three-1,r-one-1" {
+		t.Fatalf("launch regions %v, %v", got, err)
+	}
+	if w := RunnerWhere(g.r); w != "all enabled regions except r-two-1" {
+		t.Fatalf("where %q", w)
+	}
+	// A listed runner: its enabled regions, cheapest first.
+	g.r.Regions, g.r.ExcludeRegions = []string{"r-one-1", "r-off-1", "r-two-1", "r-three-1"}, nil
+	got, err = g.LaunchRegions(context.Background())
+	if err != nil || strings.Join(got, ",") != "r-two-1,r-three-1,r-one-1" {
+		t.Fatalf("launch regions %v, %v", got, err)
+	}
+	if w := RunnerWhere(g.r); w != "r-one-1, r-off-1, r-two-1, r-three-1" {
+		t.Fatalf("where %q", w)
+	}
+	if w := RunnerWhere(&config.Runner{Type: config.TypeAWSSpot, Region: "r-one-1"}); w != "r-one-1" {
+		t.Fatalf("where %q", w)
+	}
+}
+
+// Setup run from another machine ranks with only the session it passed,
+// never this machine's own AWS login.
+func TestLaunchRegionsWithEnvOnly(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	r := &config.Runner{Name: "g", Type: config.TypeAWSSpot, Regions: []string{config.AllRegions}, Region: "us-east-1",
+		InstanceTypes: []string{"c7a.2xlarge"}, Arch: "amd64", User: "ubuntu", VolumeGB: 64, SSHCIDR: "0.0.0.0/0", MaxInstances: 1,
+		MaxLifetime: config.Duration{Duration: time.Hour}, BootTimeout: config.Duration{Duration: time.Minute}, IdleTimeout: config.Duration{Duration: time.Minute}}
+	if _, err := LaunchRegionsWith(context.Background(), r, "", true); !errors.Is(err, errNoPassedSession) {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// firstRegions keeps the first three distinct regions in launch order (not
+// price order).
+func TestFirstRegions(t *testing.T) {
+	k := Ranking{Prices: []SpotPrice{
+		{Region: "r-b", Price: "0.09"}, {Region: "r-a", Price: "0.01"}, {Region: "r-b", Price: "0.02"},
+		{Region: "r-d", Price: "0.05"}, {Region: "r-c", Price: "0.03"},
+	}}
+	if got := strings.Join(firstRegions(k), ","); got != "r-b,r-a,r-d" {
+		t.Fatalf("first regions %s", got)
+	}
+	if got := firstRegions(Ranking{}); len(got) != 0 {
+		t.Fatalf("first regions %v", got)
+	}
+}
+
+// Setup ranks with the admin session as the runner would launch: its own
+// profile's warm regions count, and nothing the other session reads is
+// cached in the runner's placement state.
+func TestLaunchRegionsAsKeepsRunnerState(t *testing.T) {
+	g, f := twoRegionEnv(t, "0.100", "0.096", func(r *config.Runner) { r.Profile = "spotexec" })
+	warmUp(t, g, f, "r-one-1")
+	snapshot := func() map[string]string {
+		out := map[string]string{}
+		ents, err := os.ReadDir(g.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range ents {
+			b, _ := os.ReadFile(filepath.Join(g.dir, e.Name()))
+			out[e.Name()] = string(b)
+		}
+		return out
+	}
+	before := snapshot()
+	admin := &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKADMIN", SecretAccessKey: "secret"}}
+	got, err := g.launchRegionsAs(context.Background(), admin)
+	if err != nil || strings.Join(got, ",") != "r-one-1,r-two-1" {
+		t.Fatalf("launch regions %v, %v (want the warm r-one-1 first)", got, err)
+	}
+	if after := snapshot(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("ranking with the admin session changed the runner's state: %v", after)
+	}
+	// A vcpus runner discovers instance types per region: those caches
+	// stay out of the runner's state too.
+	g.r.InstanceTypes, g.r.VCPUs = nil, 8
+	f.types = map[string][]string{"r-one-1": {typeXML("c7a.2xlarge", 8, 16, "x86_64", "")}, "r-two-1": {typeXML("c7a.2xlarge", 8, 16, "x86_64", "")}}
+	before = snapshot()
+	if _, err := g.launchRegionsAs(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	if after := snapshot(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("ranking a vcpus runner with the admin session changed the runner's state: %v", after)
+	}
+	if g.r.Profile != "spotexec" {
+		t.Fatalf("profile %q", g.r.Profile)
 	}
 }

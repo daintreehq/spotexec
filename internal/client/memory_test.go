@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/transport/sshtest"
 )
 
 func TestReplayable(t *testing.T) {
@@ -59,24 +61,174 @@ func testFleet() (*config.Runner, *fakeFleet) {
 	}}
 }
 
-// A lost VM the cloud still runs, with no Spot notice, isn't replayed; a
-// gone or noticed one is.
+var (
+	running   = stage{phase: phaseCommand, dispatched: true, started: true}
+	starting  = stage{phase: phaseStartCommand, dispatched: true}
+	depsCheck = stage{phase: phaseDepsCheck}
+)
+
+// A lost VM the cloud still runs, with no Spot notice, isn't replayed once
+// the command was dispatched; a gone or noticed one is, and so is one lost
+// before the command was dispatched.
 func TestWhyNoReplay(t *testing.T) {
 	r, f := testFleet()
 	for _, c := range []struct {
 		id      string
 		noticed bool
+		at      stage
 		code    string
 	}{
-		{"i-run", false, "RUNNER_UNRESPONSIVE"},
-		{"i-run", true, ""},
-		{"i-gone", false, ""},
-		{"i-pend", false, ""},
+		{"i-run", false, running, "RUNNER_UNRESPONSIVE"},
+		{"i-run", false, stage{phase: phaseSetup, dispatched: true, started: true}, "RUNNER_UNRESPONSIVE"},
+		{"i-run", false, starting, "RUNNER_UNRESPONSIVE"},
+		{"i-run", true, running, ""},
+		{"i-gone", false, running, ""},
+		{"i-pend", false, running, ""},
+		{"i-run", false, depsCheck, ""},
+		{"i-run", false, stage{phase: phaseSync}, ""},
+		{"i-run", false, stage{phase: phaseDeps}, ""},
 	} {
-		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id}, c.noticed)
+		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id}, c.noticed, c.at, false)
 		if got.code != c.code {
-			t.Errorf("%s noticed=%v: %q (%q), want %q", c.id, c.noticed, got.code, got.why, c.code)
+			t.Errorf("%s noticed=%v at %+v: %q (%q), want %q", c.id, c.noticed, c.at, got.code, got.why, c.code)
 		}
+	}
+}
+
+// #143: a VM lost while the run was still checking the dependency cache,
+// though EC2 still runs it, is replayed, and the warning says where the run
+// had got to rather than blaming the command.
+func TestLostBeforeTheCommandIsReplayed(t *testing.T) {
+	r, f := testFleet()
+	lease := &Lease{Runner: r, Provider: f, InstanceID: "i-run"}
+	res := Result{noReplay: replayVerdict(lease, false, io.EOF, depsCheck, true), lostAt: depsCheck}
+	retry, code, why := replayable("i-run", res, Options{RetryPreempt: true, Sync: "auto", Exclusive: true}, false, 1)
+	if !retry || code != "" || why != "" {
+		t.Fatalf("not replayed: %v %q %q", retry, code, why)
+	}
+	if w := res.lostAt.where(); w != "while checking the dependency cache, before the command started" {
+		t.Fatalf("where: %q", w)
+	}
+}
+
+// Once the command was dispatched, the warning names the phase, the last
+// memory reading when there is one, and suggests --exclusive only to a run
+// that didn't already have it.
+func TestUnresponsiveMessage(t *testing.T) {
+	r, f := testFleet()
+	lease := &Lease{Runner: r, Provider: f, InstanceID: "i-run"}
+	why := whyNoReplay(lease, false, running, false).why
+	if !strings.HasPrefix(why, "while running the command, although EC2") || !strings.Contains(why, "the command may be what overloaded it") || !strings.Contains(why, "--exclusive") || strings.Contains(why, "heartbeat") {
+		t.Errorf("not exclusive: %q", why)
+	}
+	if why := whyNoReplay(lease, false, running, true).why; strings.Contains(why, "--exclusive") {
+		t.Errorf("already exclusive: %q", why)
+	}
+	if why := whyNoReplay(lease, false, stage{phase: phaseSetup, dispatched: true, started: true}, false).why; !strings.Contains(why, "[setup] run may be what overloaded it") {
+		t.Errorf("setup: %q", why)
+	}
+	// Handed over but never confirmed started: no blame, no sizing advice.
+	if why := whyNoReplay(lease, false, starting, false).why; !strings.HasPrefix(why, "while starting the command, although EC2") || !strings.Contains(why, "may have started") || strings.Contains(why, "overloaded") || strings.Contains(why, "--exclusive") {
+		t.Errorf("not started: %q", why)
+	}
+}
+
+// The progress an attempt records as the helper reports it: dispatch, the
+// setup's start, setup_done, the command's start.
+func TestProgress(t *testing.T) {
+	p := &progress{at: stage{phase: phaseSlot}}
+	p.set(phaseDepsCheck)
+	if got := p.get(); got != depsCheck {
+		t.Fatalf("deps: %+v", got)
+	}
+	p.dispatch(true)
+	if got := p.get(); got != (stage{phase: phaseStartSetup, dispatched: true}) {
+		t.Fatalf("dispatched with setup: %+v", got)
+	}
+	p.started()
+	if got := p.get(); got != (stage{phase: phaseSetup, dispatched: true, started: true}) {
+		t.Fatalf("setup started: %+v", got)
+	}
+	p.setupDone()
+	if got := p.get(); got != starting {
+		t.Fatalf("setup done: %+v", got)
+	}
+	p.started()
+	if got := p.get(); got != running {
+		t.Fatalf("command started: %+v", got)
+	}
+	p.started() // a stray start changes nothing
+	if got := p.get(); got != running {
+		t.Fatalf("after a stray start: %+v", got)
+	}
+	p.dispatch(false)
+	if got := p.get(); got != starting {
+		t.Fatalf("dispatched without setup: %+v", got)
+	}
+}
+
+// A runner lost after this machine slept past the runner's patience
+// (#142), once the command was handed over, isn't replayed, and the
+// warning says the sleep was why, not the VM or the run, whatever else the
+// VM reported before it. Lost before that, the run is replayed as usual.
+func TestClientAsleepVerdict(t *testing.T) {
+	r, f := testFleet()
+	old := sessionSuspended
+	t.Cleanup(func() { sessionSuspended = old })
+	sessionSuspended = func(*transport.Session) time.Duration { return 15*time.Minute + 41*time.Second }
+	for _, c := range []struct {
+		id      string
+		noticed bool
+		at      stage
+		code    string
+	}{
+		{"i-run", false, running, "CLIENT_SUSPENDED"},
+		{"i-gone", false, starting, "CLIENT_SUSPENDED"},
+		{"i-run", true, running, ""},    // a Spot notice: the VM was going anyway
+		{"i-run", false, depsCheck, ""}, // the command can't have run: replayed
+	} {
+		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id}, c.noticed, c.at, false)
+		if got.code != c.code {
+			t.Errorf("%s noticed=%v at %+v: %q (%q), want %q", c.id, c.noticed, c.at, got.code, got.why, c.code)
+		}
+		if c.code != "" && (!strings.HasPrefix(got.why, c.at.where()+", after this machine was asleep") || !strings.Contains(got.why, "15m41s") || strings.Contains(got.why, "overloaded")) {
+			t.Errorf("%s: %q doesn't put the loss down to the sleep", c.id, got.why)
+		}
+		if retry, _, _ := replayable(c.id, Result{noReplay: got}, Options{RetryPreempt: true, Sync: "auto"}, false, 1); retry != (c.code == "") {
+			t.Errorf("%s noticed=%v at %+v after a sleep: replayed %v", c.id, c.noticed, c.at, retry)
+		}
+	}
+	// The sleep outranks memory pressure the VM reported before it.
+	sr, tgt := liveRunner(t, "rpc-pressure")
+	_, s, err := Connect(context.Background(), sr, tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Abort()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.MemoryPressure(PressureWindow) == "" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	pressured := &Lease{Runner: r, Provider: f, InstanceID: "i-run", Sess: s}
+	if got := whyNoReplay(pressured, false, running, false); got.code != "CLIENT_SUSPENDED" {
+		t.Fatalf("a sleep under memory pressure: %q (%q), want CLIENT_SUSPENDED", got.code, got.why)
+	}
+	if got := whyNoReplay(pressured, false, depsCheck, false); got.code != "" {
+		t.Fatalf("a sleep under memory pressure before the command: %q (%q), want a replay", got.code, got.why)
+	}
+	sessionSuspended = func(*transport.Session) time.Duration { return 0 }
+	if got := whyNoReplay(pressured, false, depsCheck, false); got.code != "MEMORY_PRESSURE" {
+		t.Fatalf("pressure without a sleep before the command: %q, want MEMORY_PRESSURE", got.code)
+	}
+	if got := whyNoReplay(pressured, false, running, false); got.code != "MEMORY_PRESSURE" {
+		t.Fatalf("pressure without a sleep: %q, want MEMORY_PRESSURE", got.code)
+	}
+	if got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}, false, running, false); got.code != "RUNNER_UNRESPONSIVE" {
+		t.Fatalf("no sleep: %q, want RUNNER_UNRESPONSIVE", got.code)
+	}
+	// The real one: a session that never slept, or none at all.
+	if old(s) != 0 || old(nil) != 0 {
+		t.Fatal("a suspension where there was none")
 	}
 }
 
@@ -97,7 +249,7 @@ func TestHelperShutdownIsANotice(t *testing.T) {
 		"helper error":  {&InfraError{Err: fmt.Errorf("lost runner aws during execution: %w", shutdown)}, lostRunner(lease, shutdown)},
 		"killed result": {shutdownErr("aws#1", 143), shutdownRunner(lease)},
 	} {
-		res := Result{noReplay: replayVerdict(lease, false, c.err)}
+		res := Result{noReplay: replayVerdict(lease, false, c.err, running, false)}
 		if res.noReplay.code != "" {
 			t.Fatalf("%s: a shutdown on a running VM withheld the replay: %q (%q)", name, res.noReplay.code, res.noReplay.why)
 		}
@@ -112,7 +264,7 @@ func TestHelperShutdownIsANotice(t *testing.T) {
 			t.Errorf("%v counted as a shutdown", e)
 		}
 	}
-	if got := replayVerdict(lease, false, io.EOF); got.code != "RUNNER_UNRESPONSIVE" {
+	if got := replayVerdict(lease, false, io.EOF, running, false); got.code != "RUNNER_UNRESPONSIVE" {
 		t.Fatalf("a dropped connection on a running VM: %q, want RUNNER_UNRESPONSIVE", got.code)
 	}
 }
@@ -137,20 +289,50 @@ func TestNoticeOutranksMemoryPressure(t *testing.T) {
 	for _, c := range []struct {
 		id      string
 		noticed bool
+		at      stage
 		code    string
 	}{
-		{"i-run", true, ""},
-		{"i-gone", true, ""},
-		{"i-run", false, "MEMORY_PRESSURE"},
-		{"i-gone", false, "MEMORY_PRESSURE"},
+		{"i-run", true, running, ""},
+		{"i-gone", true, running, ""},
+		{"i-run", false, running, "MEMORY_PRESSURE"},
+		{"i-gone", false, running, "MEMORY_PRESSURE"},
+		{"i-run", true, depsCheck, ""},
+		{"i-run", false, depsCheck, "MEMORY_PRESSURE"},
 	} {
-		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id, Sess: s}, c.noticed)
+		got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: c.id, Sess: s}, c.noticed, c.at, false)
 		if got.code != c.code {
-			t.Errorf("%s noticed=%v under pressure: %q (%q), want %q", c.id, c.noticed, got.code, got.why, c.code)
+			t.Errorf("%s noticed=%v at %+v under pressure: %q (%q), want %q", c.id, c.noticed, c.at, got.code, got.why, c.code)
+		}
+		if c.code != "" && !strings.HasPrefix(got.why, c.at.where()+": it was out of memory") {
+			t.Errorf("%s at %+v: %q doesn't say where the run had got to", c.id, c.at, got.why)
 		}
 		if retry, _, _ := replayable(c.id, Result{noReplay: got}, Options{RetryPreempt: true, Sync: "auto"}, false, 1); retry != c.noticed {
 			t.Errorf("%s noticed=%v under pressure: replayed %v", c.id, c.noticed, retry)
 		}
+	}
+}
+
+// The unresponsive warning carries the VM's last memory reading, healthy
+// or not.
+func TestUnresponsiveCarriesLastMemory(t *testing.T) {
+	sr, tgt := liveRunner(t, "rpc-memory")
+	(&sshtest.Fake{State: os.Getenv("FAKE_SSH_STATE")}).Set("rpc-memory", "12000")
+	_, s, err := Connect(context.Background(), sr, tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Abort()
+	deadline := time.Now().Add(5 * time.Second)
+	for lastMemory(s) == "" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	r, f := testFleet()
+	got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run", Sess: s}, false, running, false)
+	if got.code != "RUNNER_UNRESPONSIVE" || !strings.Contains(got.why, "reported 11.7 GB of 15.6 GB memory available") {
+		t.Fatalf("%q (%q)", got.code, got.why)
+	}
+	if lastMemory(nil) != "" {
+		t.Fatal("a nil session has a reading")
 	}
 }
 

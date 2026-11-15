@@ -178,10 +178,11 @@ other machines made for a different bootstrap are kept (--all removes them
 too). A bake a VM is booting from right now is never removed.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, as, err := pickAll(cmd.Context(), args, true)
+			r, as, err := pickAll(cmd.Context(), args, true)
 			if err != nil && len(as) == 0 {
 				return err
 			}
+			defer provider.ForgetBakeWarmth(r) // launches look for bakes again
 			removed := 0
 			for _, a := range as {
 				res, cerr := a.ClearBakes(cmd.Context(), clearAll)
@@ -209,6 +210,7 @@ var _ = errors.New
 // runBake bakes runner r's image (see `image bake`), reporting progress on
 // stderr; Ctrl-C abandons it and terminates the builder.
 func runBake(r *config.Runner, a *provider.AWSSpot, pulls []string) (err error) {
+	defer client.KeepAwake()() // the builder is driven from here
 	rep, _ := ui.New(ui.ModeAuto, os.Stderr, "")
 	ctx, _, stop := signals()
 	defer stop()
@@ -264,6 +266,7 @@ func runBake(r *config.Runner, a *provider.AWSSpot, pulls []string) (err error) 
 	if err != nil {
 		return err
 	}
+	provider.ForgetBakeWarmth(r) // launches prefer the region now
 	rep.Event("baked", map[string]any{"runner": r.Name, "ami": ami, "bootstrap_hash": a.BakeHash(), "duration_ms": time.Since(start).Milliseconds()})
 	rep.Done(fmt.Sprintf("%s: baked %s in %s; new VMs boot from it automatically (bootstrap %s)", r.Name, ami, ui.Dur(time.Since(start)), a.BakeHash()), true)
 	return nil

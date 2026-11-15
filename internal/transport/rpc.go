@@ -31,13 +31,32 @@ type Session struct {
 	closing chan struct{} // closed by Close/Abort: stop delivering frames
 	stopped sync.Once
 	once    sync.Once
-	seen    atomic.Int64
-	silent  atomic.Bool  // the watchdog gave up on the helper
-	limit   atomic.Int64 // SilenceLimit when the session opened, plus any current grace (ns)
+	lost    chan struct{} // closed when the session ends: silence or a closed channel
+	lostMu  sync.Once
+	born    time.Time    // seen and woke count from here, on the monotonic clock (which stops while this machine sleeps)
+	seen    atomic.Int64 // when the helper last sent anything, as time since born (ns)
+	woke    atomic.Int64 // when this process last came back from a suspension, as time since born (ns)
+	backed  atomic.Bool  // readLoop is blocked handing a frame to a full buffer
+	// away is the longest suspension of this process (the machine asleep,
+	// or the process stopped) the session hasn't recovered from: the helper
+	// hasn't been heard well after it ended (ns).
+	away atomic.Int64
+	// clk is the last reading of the clocks the watchdog compares.
+	clk struct {
+		sync.Mutex
+		boot, mono int64 // sinceBoot, and time since born
+		bootOK     bool  // boot was read
+	}
+	hooking  atomic.Bool   // the watchdog is in the silence hook
+	period   time.Duration // the watchdog's tick
+	patience time.Duration // HelperPatience when the session opened
+	silent   atomic.Bool   // the watchdog gave up on the helper
+	limit    atomic.Int64  // SilenceLimit when the session opened, plus any current grace (ns)
 	// onSilent, if set, is asked whether to keep waiting when the helper
 	// goes silent past the limit, once per silence (see SetOnSilent).
 	onSilent atomic.Pointer[func(time.Duration) time.Duration]
-	pressure atomic.Pointer[pressureSeen] // the latest heartbeat showing memory pressure
+	pressure atomic.Pointer[pressureSeen]  // the latest heartbeat showing memory pressure
+	memory   atomic.Pointer[MemoryReading] // the latest heartbeat's memory reading
 	// OnEvent receives helper events that arrive while waiting for replies.
 	OnEvent func(protocol.Event)
 }
@@ -135,7 +154,7 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{})}
+	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now()}
 	cmd.Stderr = s.stderr
 	// A master holding a stuck channel keeps the stderr pipe open after the
 	// client is gone: don't let that hold up Wait (and so Dead) for long.
@@ -143,8 +162,11 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	s.Conn = protocol.NewConn(protocol.ProgressReader{R: stdout, OnRead: func() { s.seen.Store(time.Now().UnixNano()) }}, stdin)
-	s.seen.Store(time.Now().UnixNano())
+	s.patience = HelperPatience
+	s.period = min(5*time.Second, SilenceLimit/4)
+	s.clk.boot, s.clk.bootOK = sinceBoot()
+	s.Conn = protocol.NewConn(protocol.ProgressReader{R: stdout, OnRead: s.heard}, stdin)
+	s.heard()
 	go s.readLoop()
 	go s.heartbeat()
 	s.limit.Store(int64(SilenceLimit))
@@ -221,17 +243,27 @@ func (s *Session) exitCode() int {
 	return -1
 }
 
+// heard notes that the helper just sent something. Silence is measured on
+// the monotonic clock: a wall clock that jumps (NTP, a laptop waking) must
+// not make a helper look silent, or alive.
+func (s *Session) heard() { s.seen.Store(int64(time.Since(s.born))) }
+
 func (s *Session) readLoop() {
 	for {
 		f, err := s.Conn.ReadFrame()
-		s.seen.Store(time.Now().UnixNano())
 		if err != nil {
+			// Waking can bring the end of the connection before the
+			// watchdog's next tick: note the suspension first. The end is
+			// not word from the helper: it mustn't clear one (recovered).
+			s.observe(0)
 			s.setErr(err)
+			s.lostMu.Do(func() { close(s.lost) })
 			close(s.frames)
 			_ = s.cmd.Wait()
 			close(s.done)
 			return
 		}
+		s.heard()
 		if f.Kind == protocol.KindMsg {
 			if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeHeartbeat {
 				s.notePressure(env)
@@ -242,8 +274,21 @@ func (s *Session) readLoop() {
 		// keep reading to EOF so the ssh process is reaped and done closes.
 		select {
 		case s.frames <- f:
+			continue
+		case <-s.closing:
+			continue
+		default:
+		}
+		// The buffer is full: until we take this frame we read nothing, so
+		// the helper can't be heard (it blocks writing to us). That is not
+		// its silence: count it from when we listen again.
+		s.backed.Store(true)
+		select {
+		case s.frames <- f:
 		case <-s.closing:
 		}
+		s.heard()
+		s.backed.Store(false)
 	}
 }
 
@@ -263,15 +308,31 @@ func (e *helperStartError) Error() string {
 // or the link is wedged, even if SSH keepalives still pass.
 var SilenceLimit = 75 * time.Second
 
+// HelperPatience is how long the helper waits for a silent client before it
+// may give up on the session (helper.ClientTimeout): a session lost after
+// this process was suspended for longer (the machine asleep, #142) was most
+// likely lost to that, however healthy the runner.
+var HelperPatience = helper.ClientTimeout
+
+// bootSkew moves the clock that counts sleep forward (tests: a machine that
+// slept).
+var bootSkew atomic.Int64
+
 // errSilent is the session error once the watchdog has given up on it.
 var errSilent = errors.New("runner stopped responding")
 
 // watchdog ends a session whose helper has gone silent, in any phase: the
 // pending read (or write) then fails as a lost connection instead of
 // waiting forever.
+//
+// Time this process spends suspended (observe) is not the helper's
+// silence: the helper gets the plain limit again to speak after it, and
+// after one longer than its patience no grace for a VM still running, since
+// the helper has most likely given up on this client meanwhile. (Not ended
+// at once: a helper stalled itself meanwhile excuses its client longer.)
 func (s *Session) watchdog() {
 	base := s.Limit()
-	t := time.NewTicker(min(5*time.Second, base/4))
+	t := time.NewTicker(s.period)
 	defer t.Stop()
 	asked := false    // onSilent was asked about the current silence
 	var askedAt int64 // s.seen when it was
@@ -282,6 +343,11 @@ func (s *Session) watchdog() {
 		case <-s.closing:
 			return
 		case <-t.C:
+			if s.observe(0) > 0 {
+				// Any grace was for a silence this suspension interrupted.
+				s.limit.Store(int64(base))
+				asked = false
+			}
 			// The helper sent something since onSilent was asked: that
 			// silence is over. Drop its grace, so a later one is noticed
 			// as quickly as the first, and ask afresh then.
@@ -290,26 +356,110 @@ func (s *Session) watchdog() {
 				s.limit.Store(int64(base))
 				asked = false
 			}
-			silent := time.Since(s.LastSeen())
+			s.recovered(seen, base/2)
+			silent := s.silence()
 			if silent <= s.Limit() {
 				continue
 			}
-			if f := s.onSilent.Load(); f != nil && !asked {
+			if f := s.onSilent.Load(); f != nil && !asked && s.Suspended() == 0 {
 				asked, askedAt = true, seen
-				if grace := (*f)(silent); grace > 0 {
-					s.limit.Store(int64(base + grace))
+				hookStart := time.Now()
+				s.hooking.Store(true)
+				grace := (*f)(silent)
+				s.hooking.Store(false)
+				// A sleep while it ran counts; its own running time doesn't.
+				if s.observe(time.Since(hookStart)) > 0 {
+					s.limit.Store(int64(base))
+					asked = false
 					continue
 				}
-				if time.Since(s.LastSeen()) <= s.Limit() {
+				if grace > 0 {
+					// From now: the hook ran after the limit was passed.
+					s.limit.Store(int64(s.silence() + grace))
+					continue
+				}
+				if s.silence() <= s.Limit() {
 					continue // it spoke up while we asked
 				}
 			}
-			s.setErr(fmt.Errorf("%w (nothing for %s)", errSilent, s.Limit()))
+			s.setErr(fmt.Errorf("%w (nothing for %s%s)", errSilent, s.Limit().Round(time.Second), s.suspendedNote()))
 			s.silent.Store(true)
+			s.lostMu.Do(func() { close(s.lost) })
 			s.Abort()
 			return
 		}
 	}
+}
+
+// suspendedNote is what a lost session's error adds about a suspension of
+// this process that most likely lost it ("" for none).
+func (s *Session) suspendedNote() string {
+	if d := s.Suspended(); d > 0 {
+		return fmt.Sprintf(" after this machine was asleep or sx was stopped for %s", d.Round(time.Second))
+	}
+	return ""
+}
+
+// now is the session's monotonic clock: time since it opened.
+func (s *Session) now() int64 { return int64(time.Since(s.born)) }
+
+// minSuspension is the least that counts as a suspension, so that a
+// loaded machine's late ticks don't.
+const minSuspension = 5 * time.Second
+
+// observe reports how long this process was just suspended (0 if it
+// wasn't), from the clocks' advance since their last reading, and records
+// it for the session. The machine asleep advances the clock that counts
+// sleep (sinceBoot) beyond the monotonic one. The process stopped shows as
+// the watchdog's tick being late: the monotonic clock's advance beyond the
+// tick period, less busy, the time the watchdog spent in the silence hook
+// (and not judged at all while it is in there: it may simply be slow).
+func (s *Session) observe(busy time.Duration) time.Duration {
+	s.clk.Lock()
+	defer s.clk.Unlock()
+	boot, bootOK := sinceBoot()
+	mono := s.now()
+	monoGap := time.Duration(mono - s.clk.mono)
+	var gap time.Duration
+	if bootOK && s.clk.bootOK {
+		gap = time.Duration(boot-s.clk.boot) - monoGap
+	}
+	if !s.hooking.Load() {
+		gap = max(gap, monoGap-s.period-busy)
+	}
+	s.clk.boot, s.clk.bootOK, s.clk.mono = boot, bootOK, mono
+	if gap <= max(s.period, minSuspension) {
+		return 0
+	}
+	s.woke.Store(mono)
+	s.away.Store(max(s.away.Load(), int64(gap)))
+	return gap
+}
+
+// recovered clears the suspension once the helper has been heard (at seen)
+// more than after its end: the session outlived it. Serialised with
+// observe, so a suspension recorded meanwhile is kept.
+func (s *Session) recovered(seen int64, after time.Duration) {
+	s.clk.Lock()
+	defer s.clk.Unlock()
+	if s.away.Load() > 0 && seen > s.woke.Load()+int64(after) {
+		s.away.Store(0)
+	}
+}
+
+// Suspended is how long this process was suspended (the machine asleep, or
+// the process stopped) while the session was open, when that was longer
+// than the helper may wait for a silent client (HelperPatience) and the
+// helper hasn't been heard well after it since: a session lost then was
+// most likely lost to the suspension, not to the runner. Otherwise 0.
+func (s *Session) Suspended() time.Duration {
+	if s == nil {
+		return 0
+	}
+	if d := time.Duration(s.away.Load()); d > s.patience {
+		return d
+	}
+	return 0
 }
 
 func (s *Session) heartbeat() {
@@ -350,22 +500,26 @@ func (s *Session) Next(ctx context.Context) (protocol.Frame, error) {
 	select {
 	case f, ok := <-s.frames:
 		if !ok {
-			s.errMu.Lock()
-			err := s.err
-			s.errMu.Unlock()
-			if errors.Is(err, io.EOF) || err == nil {
-				err = io.ErrUnexpectedEOF
-			}
-			msg := "connection to runner lost"
-			if errors.Is(err, errSilent) {
-				msg = err.Error()
-			}
-			return protocol.Frame{}, &ConnError{Target: "helper", Msg: msg, Err: s.wrap(err)}
+			return protocol.Frame{}, s.lostErr()
 		}
 		return f, nil
 	case <-ctx.Done():
 		return protocol.Frame{}, ctx.Err()
 	}
+}
+
+func (s *Session) lostErr() error {
+	s.errMu.Lock()
+	err := s.err
+	s.errMu.Unlock()
+	if errors.Is(err, io.EOF) || err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	msg := "connection to runner lost" + s.suspendedNote()
+	if errors.Is(err, errSilent) {
+		msg = err.Error()
+	}
+	return &ConnError{Target: "helper", Msg: msg, Err: s.wrap(err)}
 }
 
 // RemoteError is a structured error reported by the helper.
@@ -452,9 +606,6 @@ func (s *Session) Dead() bool {
 	}
 }
 
-// LastSeen is when the helper last sent anything (heartbeats included).
-// While our own frame buffer is backed up (we're not reading fast enough,
-// e.g. output piped into a paused pager), the helper is evidently alive.
 // Limit is how long the session may currently hear nothing from the
 // helper before it is given up on.
 func (s *Session) Limit() time.Duration { return time.Duration(s.limit.Load()) }
@@ -484,22 +635,70 @@ func (s *Session) MemoryPressure(within time.Duration) string {
 	return ""
 }
 
+// MemoryReading is the VM's memory as a heartbeat last reported it, and
+// when that heartbeat arrived.
+type MemoryReading struct {
+	At               time.Time
+	AvailMB, TotalMB int64
+}
+
+// LastMemory is the memory reading of the latest heartbeat that carried
+// one; ok is false when none has (an older helper, or a nil session).
+func (s *Session) LastMemory() (m MemoryReading, ok bool) {
+	if s == nil {
+		return m, false
+	}
+	if p := s.memory.Load(); p != nil {
+		return *p, true
+	}
+	return m, false
+}
+
 func (s *Session) notePressure(env protocol.Envelope) {
 	var hb protocol.Heartbeat
 	if len(env.Body) == 0 || env.Unmarshal(&hb) != nil {
 		return
 	}
+	now := time.Now()
+	if hb.MemTotalMB > 0 {
+		s.memory.Store(&MemoryReading{At: now, AvailMB: hb.MemAvailMB, TotalMB: hb.MemTotalMB})
+	}
 	if what := hb.Pressure(); what != "" {
-		s.pressure.Store(&pressureSeen{at: time.Now(), what: what})
+		s.pressure.Store(&pressureSeen{at: now, what: what})
 	}
 }
 
+// LastSeen is when the helper last sent anything (heartbeats included).
+// While the frame buffer is full (we're not reading fast enough, e.g.
+// output piped into a paused pager), nothing more can be read from the
+// helper, so it isn't held to its silence; once frames are taken again it
+// is, from then. Frames merely queued, with room for more, excuse nothing:
+// readLoop still hears the helper's heartbeats, or their absence.
 func (s *Session) LastSeen() time.Time {
-	if len(s.frames) >= cap(s.frames)/2 {
+	if s.backed.Load() {
 		return time.Now()
 	}
-	return time.Unix(0, s.seen.Load())
+	return s.born.Add(time.Duration(s.seen.Load()))
 }
+
+// silence is how long the helper has sent nothing, as LastSeen judges it,
+// not counting time this process was suspended: the helper gets the full
+// limit again to speak after a suspension.
+func (s *Session) silence() time.Duration {
+	if s.backed.Load() {
+		return 0
+	}
+	return time.Duration(s.now() - max(s.seen.Load(), s.woke.Load()))
+}
+
+// Lost is closed once the session has ended, because the helper went
+// silent past its limit or the channel closed: a caller waiting on
+// something other than the session (a local lock) stops then, with
+// LostErr.
+func (s *Session) Lost() <-chan struct{} { return s.lost }
+
+// LostErr is the error the session's reads end with once it is lost.
+func (s *Session) LostErr() error { return s.lostErr() }
 
 // Close ends the session (releasing the remote slot). The deadline is armed
 // before any protocol write so a wedged channel cannot hang the caller.

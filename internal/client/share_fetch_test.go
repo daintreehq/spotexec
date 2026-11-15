@@ -63,7 +63,9 @@ func (s *scriptRPC) next(context.Context) (protocol.Frame, error) {
 	return f, err
 }
 
-func (s *scriptRPC) event(protocol.Event) {}
+func (s *scriptRPC) event(protocol.Event)  {}
+func (s *scriptRPC) lost() <-chan struct{} { return nil }
+func (s *scriptRPC) lostErr() error        { return nil }
 
 type recRep struct {
 	nopRep

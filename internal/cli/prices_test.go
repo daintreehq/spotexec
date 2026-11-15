@@ -19,10 +19,16 @@ var (
 	seen    = time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
 	costs   = map[string]provider.RunCost{
 		optionKey(warmOpt): {Score: 0.1, Compute: 0.1, RelSpeed: 1, Warm: true, WarmSeen: seen, RTTMS: 150},
-		optionKey(coldOpt): {Score: 0.1691, Compute: 0.096, Cold: 0.0731, RelSpeed: 1, RTTMS: 150},
-		optionKey(slowOpt): {Score: 0.2862, Compute: 0.03, Speed: 0.103, Cold: 0.0687, Distance: 0.0845, RelSpeed: 0.9091, RTTMS: 440},
+		optionKey(coldOpt): {Score: 0.1691, Compute: 0.096, Cold: 0.0731, RelSpeed: 1, RTTMS: 150, ColdParts: &provider.ColdParts{
+			Boot:  provider.ColdPart{Cost: 0.0183, Why: "no bake of the runner"},
+			Deps:  provider.ColdPart{Cost: 0.0365, Why: "no dependency archive for the project"},
+			Image: provider.ColdPart{Cost: 0.0183, Why: "no image of the project"}}},
+		optionKey(slowOpt): {Score: 0.2518, Compute: 0.03, Speed: 0.103, Cold: 0.0343, Distance: 0.0845, RelSpeed: 0.9091, RTTMS: 440, ColdParts: &provider.ColdParts{
+			Boot:  provider.ColdPart{Warm: true, Why: "a bake of the runner"},
+			Deps:  provider.ColdPart{Cost: 0.0343, Why: "no dependency archive for the project"},
+			Image: provider.ColdPart{Warm: true, Why: "the project's image"}}},
 	}
-	model = &provider.RunCostModel{WaitCost: 1, HorizonMinutes: 60, ColdMinutes: 4, WarmDays: 7, WarmAfterMin: 10, GenSpeedup: 1.1, RoundTrips: 300, SpeedByGen: true, Regions: true}
+	model = &provider.RunCostModel{WaitCost: 1, HorizonMinutes: 60, ColdMinutes: 4, BootMinutes: 1, DepsMinutes: 2, ImageMinutes: 1, WarmDays: 7, WarmAfterMin: 10, GenSpeedup: 1.1, RoundTrips: 300, SpeedByGen: true, Regions: true}
 )
 
 func runCostView() pricesView {
@@ -55,18 +61,26 @@ func TestPricesShowRunCostBreakdown(t *testing.T) {
 	}
 	for i, want := range []string{
 		"→ us-east-1 us-east-1a m7a.2xlarge 0.100 0.100 - warm - next launch",
-		"eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.169 - +0.073 -",
-		"ap-south-2 ap-south-2a m6a.2xlarge 0.030 0.286 +0.103 +0.069 +0.085",
+		"eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.169 - +0.073 boot,deps,image -",
+		"ap-south-2 ap-south-2a m6a.2xlarge 0.030 0.252 +0.103 +0.034 deps +0.085",
 	} {
 		if got := strings.Join(strings.Fields(lines[2+i]), " "); got != want {
 			t.Errorf("row %d: %q, want %q", i+1, got, want)
 		}
 	}
 	for _, want := range []string{`launch_order = "run_cost"`, "with waiting valued at $1/h (wait_cost)", "a slower type (each instance generation counts as 10% faster per vCPU)",
-		"a cold region (4 minutes; warm: a VM of aws was up 10 minutes or more there in the last 7 days)", `"cheapest" ranks by price alone`} {
+		"a cold region (COLD, in minutes: boot 1 without a bake of aws there, deps 2 without the project's archive in the region's cache, image 1 without the project's image in its registry; outside a project, deps and image count as warm where a VM of aws was up 10 minutes or more in the last 7 days)", `"cheapest" ranks by price alone`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}
+	}
+	// In a project, its caches were checked.
+	b.Reset()
+	v := runCostView()
+	v.project = "app"
+	v.writeText(&b, 20)
+	if !strings.Contains(b.String(), "; deps and image checked for app)") {
+		t.Errorf("project:\n%s", b.String())
 	}
 	// --limit cuts the list after that many rows.
 	b.Reset()
@@ -94,6 +108,10 @@ func TestPricesJSONRunCost(t *testing.T) {
 	}
 	if err := json.Unmarshal(b.Bytes(), &got); err != nil {
 		t.Fatal(err)
+	}
+	// The parts' keys, as scripts read them.
+	if out := b.String(); !strings.Contains(out, `"cold_parts": {`) || !strings.Contains(out, `"dependencies": {`) || !strings.Contains(out, `"cold_deps_minutes": 2`) {
+		t.Fatalf("json keys: %s", out)
 	}
 	if got.Order != "run_cost" || !reflect.DeepEqual(got.Model, model) || len(got.Prices) != 3 {
 		t.Fatalf("json: %s", b.String())

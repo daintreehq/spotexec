@@ -38,6 +38,7 @@ Unknown `--sync`, `--writeback` and `--writeback-over` values and a zero or nega
 | `SPOTEXEC_FAIL_ON_CONFLICT=1` | `--fail-on-conflict`: a run whose write-back conflicted exits `122` instead of `0`. |
 | `SPOTEXEC_JSON=1` | `--json`. |
 | `SPOTEXEC_AGENT=1` | NDJSON events by default, for agent harnesses. |
+| `SPOTEXEC_KEEP_AWAKE=0` | On macOS, lets the Mac idle-sleep during a run (`0`, `false` or `no`, in any case; any other value leaves it on). By default spotexec holds an idle-sleep assertion (`caffeinate -i`) while a run, pull or bake is under way, since a runner ends a run whose client goes silent for 45 seconds. A closed lid still sleeps. |
 | `SPOTEXEC_CONFIG`, `SPOTEXEC_CONFIG_DIR` | The global config file, or its directory (default `~/.config/spotexec`, or under `XDG_CONFIG_HOME`). |
 | `SPOTEXEC_STATE_DIR` | Local state (default `~/.local/state/spotexec`, or under `XDG_STATE_HOME`). |
 

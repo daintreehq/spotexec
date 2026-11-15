@@ -53,6 +53,9 @@ type AcquireRequest struct {
 	NoBoot         bool            // never launch fleet instances
 	Priority       int             // queue priority (higher first)
 	Exclude        map[string]bool // fleet instance IDs to avoid (e.g. one being reclaimed)
+	// Project: what a launch of a runner for this request looks for in
+	// each region (nil, or a nil result: nothing in particular).
+	Project func(r *config.Runner) *provider.Project
 }
 
 // Connect opens a helper session on a known target.
@@ -362,7 +365,11 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				// Registered before the goroutine starts, so a process exiting
 				// right now still waits for it (WaitLaunches).
 				HoldLaunch()
-				go m.provision(ctx, d.ID, req.Rep)
+				pctx := ctx
+				if req.Project != nil {
+					pctx = provider.WithProject(ctx, req.Project(m.r))
+				}
+				go m.provision(pctx, d.ID, req.Rep)
 			}
 			covered += d.Capacity
 			if d.Pending > 0 || d.Launch {

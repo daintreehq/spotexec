@@ -192,6 +192,10 @@ type sharer struct {
 	// is, and leaves the build to the next waiting run.
 	publish func(context.Context) error
 	waiting func(holder string) // called once if this run has to wait
+	// sess is the helper session the artifact comes through (nil: none
+	// to watch). A run waiting for another's build stops as soon as its own
+	// session is lost, rather than when the wait runs out (#144).
+	sess rpc
 }
 
 type shareOutcome struct {
@@ -208,7 +212,7 @@ func (s sharer) run(ctx context.Context) (shareOutcome, error) {
 	if ok, err := s.probe(ctx); err != nil || ok {
 		return out, err
 	}
-	turn, err := s.lock.take(ctx, before, s.who, s.limit, s.waiting)
+	turn, err := s.take(ctx, before)
 	if err != nil {
 		return out, err
 	}
@@ -236,12 +240,43 @@ func (s sharer) run(ctx context.Context) (shareOutcome, error) {
 	return out, err
 }
 
+// take waits for the lock, giving up with the session's error if the
+// session is lost meanwhile: the lock is local, so nothing else in the wait
+// notices that the runner stopped answering.
+func (s sharer) take(ctx context.Context, before string) (*shareTurn, error) {
+	if s.sess == nil {
+		return s.lock.take(ctx, before, s.who, s.limit, s.waiting)
+	}
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	lost := false
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-s.sess.lost():
+			lost = true
+			cancel()
+		case <-wctx.Done():
+		}
+	}()
+	turn, err := s.lock.take(wctx, before, s.who, s.limit, s.waiting)
+	cancel()
+	<-stopped
+	if err != nil && lost && ctx.Err() == nil {
+		return nil, s.sess.lostErr()
+	}
+	return turn, err
+}
+
 // rpc is what preparing an artifact needs of a helper session (a
 // *transport.Session; scripted in tests).
 type rpc interface {
 	send(typ string, v any) error
 	next(ctx context.Context) (protocol.Frame, error)
-	event(protocol.Event) // a helper event that arrived meanwhile
+	event(protocol.Event)  // a helper event that arrived meanwhile
+	lost() <-chan struct{} // closed once the session has ended (nil: never)
+	lostErr() error        // why, once lost() is closed
 }
 
 type sessionRPC struct{ s *transport.Session }
@@ -250,6 +285,8 @@ func (r sessionRPC) send(typ string, v any) error { return r.s.Conn.Send(typ, v)
 func (r sessionRPC) next(ctx context.Context) (protocol.Frame, error) {
 	return r.s.Next(ctx)
 }
+func (r sessionRPC) lost() <-chan struct{} { return r.s.Lost() }
+func (r sessionRPC) lostErr() error        { return r.s.LostErr() }
 func (r sessionRPC) event(ev protocol.Event) {
 	if r.s.OnEvent != nil {
 		r.s.OnEvent(ev)

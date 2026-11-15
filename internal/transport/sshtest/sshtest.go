@@ -16,6 +16,9 @@
 //     reporting memory pressure, then goes silent (a VM out of memory);
 //   - rpc-heartbeat: after the handshake the helper sends only heartbeats
 //     and never answers (alive, but slow);
+//   - rpc-memory: after the handshake the helper sends one heartbeat per
+//     comma-separated value in the file, each that many MiB available of
+//     16000, then goes silent;
 //   - hold-fds: another process keeps the session's stdin, stdout and
 //     stderr open after the fake is killed, as a ControlMaster does for a
 //     stuck channel (its pid goes in hold-fds.pid; it exits within 30s).
@@ -189,8 +192,39 @@ func rpc() int {
 		_ = conn.Send(protocol.TypeHeartbeat, protocol.Heartbeat{MemTotalMB: 16000, MemAvailMB: 120})
 		time.Sleep(time.Hour) // until killed
 	}
+	if b, err := os.ReadFile(filepath.Join(st, "rpc-memory")); err == nil {
+		for _, v := range strings.Split(strings.TrimSpace(string(b)), ",") {
+			avail, _ := strconv.ParseInt(v, 10, 64)
+			_ = conn.Send(protocol.TypeHeartbeat, protocol.Heartbeat{MemTotalMB: 16000, MemAvailMB: avail})
+		}
+		time.Sleep(time.Hour) // until killed
+	}
 	if _, err := os.Stat(filepath.Join(st, "rpc-silent")); err == nil {
 		time.Sleep(time.Hour) // until killed
+	}
+	// rpc-flood: the number of events in the file, sent at once, then
+	// silent until killed (output the client hasn't read yet, then a stall).
+	if b, err := os.ReadFile(filepath.Join(st, "rpc-flood")); err == nil {
+		n, _ := strconv.Atoi(string(b))
+		for i := range n {
+			_ = conn.Send(protocol.TypeEvent, protocol.Event{Name: "flood", Message: strconv.Itoa(i)})
+		}
+		time.Sleep(time.Hour)
+	}
+	// rpc-deps-missing: answers a dependency request with "not in the cache",
+	// then silent until killed (a helper lost while its run waits for
+	// another run to install the dependencies).
+	if _, err := os.Stat(filepath.Join(st, "rpc-deps-missing")); err == nil {
+		for {
+			f, err := conn.ReadFrame()
+			if err != nil {
+				return 0
+			}
+			if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeDeps {
+				_ = conn.Send(protocol.TypeDepsResult, protocol.DepsResult{Missing: true})
+				time.Sleep(time.Hour)
+			}
+		}
 	}
 	// rpc-pulse: silent until the test creates rpc-pulse-go, then one
 	// heartbeat, then silent until killed (a helper that recovers once, then
