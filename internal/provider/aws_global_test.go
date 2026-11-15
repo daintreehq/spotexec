@@ -130,7 +130,14 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 				return
 			}
 			fmt.Fprint(w, `<DescribeSpotPriceHistoryResponse><spotPriceHistorySet>`)
+			asked := map[string]bool{} // like AWS: only the requested instance types
+			for i := 1; p.Get(fmt.Sprintf("InstanceType.%d", i)) != ""; i++ {
+				asked[p.Get(fmt.Sprintf("InstanceType.%d", i))] = true
+			}
 			for _, row := range f.prices[region] {
+				if len(asked) > 0 && !asked[row[1]] {
+					continue
+				}
 				fmt.Fprintf(w, `<item><instanceType>%s</instanceType><productDescription>Linux/UNIX</productDescription><spotPrice>%s</spotPrice><timestamp>2026-11-14T00:00:00.000Z</timestamp><availabilityZone>%s</availabilityZone></item>`, row[1], row[2], row[0])
 			}
 			fmt.Fprint(w, `</spotPriceHistorySet></DescribeSpotPriceHistoryResponse>`)

@@ -101,8 +101,6 @@ var starterSmall = [][2]string{
 		`instance_types = ["c7a.xlarge", "m7a.xlarge", "c6a.xlarge"]  # 4 vCPUs, to fit this account's Spot quota; once it's raised, the 2xlarge sizes (8 vCPUs) run more per VM`},
 	{`max_slots = 4                  # concurrent jobs per VM (SPOTEXEC_CPUS = 2 each)`,
 		`max_slots = 2                  # concurrent jobs per VM (SPOTEXEC_CPUS = 2 each)`},
-	{`hourly_cost = 0.12             # for 'spotexec monitor' burn estimates`,
-		`hourly_cost = 0.06             # for 'spotexec monitor' burn estimates`},
 }
 
 // sizeStarterFleet rewrites the starter template at path to 4-vCPU VMs. It

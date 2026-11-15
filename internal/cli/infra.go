@@ -72,12 +72,119 @@ type runnerStatus struct {
 	Helper *helper.Status `json:"helper,omitempty"`
 	Error  string         `json:"error,omitempty"`
 	Cost   float64        `json:"hourly_cost,omitempty"`
-	Fleet  string         `json:"fleet,omitempty"`
-	r      *config.Runner
+	// CostFrom says where Cost came from: "spot" (the current Spot price of
+	// the VM's type in its zone) or "hourly_cost" (the runner's setting).
+	CostFrom string `json:"hourly_cost_from,omitempty"`
+	Fleet    string `json:"fleet,omitempty"`
+	r        *config.Runner
 }
 
-func gatherStatus(ctx context.Context, rs []*config.Runner) []runnerStatus {
+const (
+	costSpot    = "spot"
+	costSetting = "hourly_cost"
+)
+
+// instancePricer is provider.InstancePricer, as fleetPricer uses it.
+type instancePricer interface {
+	Prices(ctx context.Context, insts []provider.Instance) map[string]float64
+}
+
+// fleetPricer prices aws-spot fleet VMs for status and monitor, keeping
+// one pricer per runner so monitor's refreshes reuse its quotes.
+type fleetPricer struct {
+	newPricer func(*config.Runner) (instancePricer, error)
+	byRunner  map[string]instancePricer
+}
+
+func newFleetPricer() *fleetPricer {
+	return &fleetPricer{byRunner: map[string]instancePricer{}, newPricer: func(r *config.Runner) (instancePricer, error) {
+		p, err := provider.NewInstancePricer(r)
+		if err != nil {
+			return nil, err
+		}
+		return p, nil
+	}}
+}
+
+// pricesTimeout bounds one refresh's price lookups, for every runner
+// together, so a slow or unreachable pricing API delays status by at most
+// this much.
+var pricesTimeout = 10 * time.Second
+
+// fleetInstances is one fleet's listed instances, to be priced.
+type fleetInstances struct {
+	r     *config.Runner
+	insts []provider.Instance
+}
+
+// priceFleets sets the cost of each fleet row whose VM has a known Spot
+// price, pricing every runner at once under one deadline. Rows it can't
+// price keep their hourly_cost fallback; pricing never fails the status.
+func (fp *fleetPricer) priceFleets(ctx context.Context, rows []runnerStatus, fleets []fleetInstances) {
+	if fp == nil {
+		return
+	}
+	type job struct {
+		p     instancePricer
+		f     fleetInstances
+		found map[string]float64
+	}
+	var jobs []*job
+	for _, f := range fleets {
+		if f.r.Type != config.TypeAWSSpot || len(f.insts) == 0 {
+			continue
+		}
+		p := fp.byRunner[f.r.Name]
+		if p == nil {
+			var err error
+			if p, err = fp.newPricer(f.r); err != nil {
+				continue
+			}
+			fp.byRunner[f.r.Name] = p
+		}
+		jobs = append(jobs, &job{p: p, f: f})
+	}
+	if len(jobs) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, pricesTimeout)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, j := range jobs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			j.found = j.p.Prices(ctx, j.f.insts)
+		}()
+	}
+	wg.Wait()
+	spot := map[string]map[string]float64{} // runner -> instance ID -> USD/hour
+	for _, j := range jobs {
+		spot[j.f.r.Name] = j.found
+	}
+	for i := range rows {
+		st := &rows[i]
+		if st.Fleet == "" || st.Info.InstanceID == "" {
+			continue
+		}
+		if usd, ok := spot[st.Fleet][st.Info.InstanceID]; ok {
+			st.Cost, st.CostFrom = usd, costSpot
+		}
+	}
+}
+
+// fallbackCost is what a VM or machine costs per hour when its Spot price
+// isn't known: the runner's hourly_cost, if set.
+func fallbackCost(r *config.Runner) (float64, string) {
+	if r.HourlyCost > 0 {
+		return r.HourlyCost, costSetting
+	}
+	return 0, ""
+}
+
+func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []runnerStatus {
 	var rows []runnerStatus
+	var fleets []fleetInstances
 	for _, r := range rs {
 		p, err := provider.New(r)
 		if err != nil {
@@ -94,20 +201,30 @@ func gatherStatus(ctx context.Context, rs []*config.Runner) []runnerStatus {
 				rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, r: r, Fleet: r.Name,
 					Info: provider.Info{State: provider.StateAbsent, Detail: fmt.Sprintf("0 of max %d instances; scales on demand", r.MaxInstances)}})
 			}
+			fleets = append(fleets, fleetInstances{r, insts})
 			for _, in := range insts {
-				rows = append(rows, runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: r.HourlyCost, r: r, Fleet: r.Name,
+				cost, from := fallbackCost(r)
+				rows = append(rows, runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name,
 					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}})
 			}
 			continue
 		}
 		info, err := p.Status(ctx)
-		st := runnerStatus{Name: r.Name, Type: r.Type, Cost: r.HourlyCost, Info: info, r: r}
+		cost, from := fallbackCost(r)
+		st := runnerStatus{Name: r.Name, Type: r.Type, Cost: cost, CostFrom: from, Info: info, r: r}
 		if err != nil {
 			st.Error = err.Error()
 		}
 		rows = append(rows, st)
 	}
 	var wg sync.WaitGroup
+	// Prices are looked up while the helpers are asked for their status;
+	// each writes only its own fields of a row.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fp.priceFleets(ctx, rows, fleets)
+	}()
 	for i := range rows {
 		st := &rows[i]
 		if st.Error != "" || st.Info.State != provider.StateRunning {
@@ -142,7 +259,7 @@ func gatherStatus(ctx context.Context, rs []*config.Runner) []runnerStatus {
 
 func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "RUNNER\tTYPE\tSTATE\tHOST\tSLOTS\tLOAD\tMEM FREE\tIDLE")
+	fmt.Fprintln(tw, "RUNNER\tTYPE\tSTATE\tHOST\tSLOTS\tLOAD\tMEM FREE\tIDLE\tUSD/HOUR")
 	for _, s := range sts {
 		state := string(s.Info.State)
 		if s.Error != "" && state == "" {
@@ -182,7 +299,13 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		if s.r != nil && s.Info.Region != "" && (s.r.MultiRegion() || s.Info.Region != s.r.Region) {
 			typ += " " + s.Info.Region // which region each instance landed in
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.Name, typ, state, host, slots, load, mem, idle)
+		cost := "-"
+		if s.CostFrom == costSpot {
+			cost = fmt.Sprintf("%.4f", s.Cost)
+		} else if s.CostFrom == costSetting {
+			cost = fmt.Sprintf("%.4f (hourly_cost)", s.Cost)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.Name, typ, state, host, slots, load, mem, idle, cost)
 	}
 	tw.Flush()
 	for _, s := range sts {
@@ -234,7 +357,7 @@ func cmdStatus() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			sts := gatherStatus(cmd.Context(), rs)
+			sts := gatherStatus(cmd.Context(), rs, newFleetPricer())
 			if asJSON {
 				return json.NewEncoder(os.Stdout).Encode(sts)
 			}
@@ -266,19 +389,14 @@ func cmdMonitor() *cobra.Command {
 			}
 			ctx, _, stop := signals()
 			defer stop()
+			fp := newFleetPricer()
 			for {
-				sts := gatherStatus(ctx, rs)
+				sts := gatherStatus(ctx, rs, fp)
 				fmt.Print("\x1b[H\x1b[2J")
 				fmt.Printf("spotexec monitor · %s · every %s · Ctrl-C to quit\n\n", time.Now().Format("15:04:05"), interval)
 				printStatus(os.Stdout, sts, cfg)
-				burn := 0.0
-				for _, s := range sts {
-					if s.Info.State == provider.StateRunning && s.r.Ephemeral() {
-						burn += s.Cost
-					}
-				}
-				if burn > 0 {
-					fmt.Printf("\nestimated burn: $%.3f/hour (from hourly_cost)\n", burn)
+				if line := burnLine(sts); line != "" {
+					fmt.Printf("\n%s\n", line)
 				}
 				select {
 				case <-ctx.Done():
@@ -290,6 +408,39 @@ func cmdMonitor() *cobra.Command {
 	}
 	c.Flags().DurationVar(&interval, "interval", 2*time.Second, "refresh interval")
 	return c
+}
+
+// burnLine sums what the running ephemeral VMs cost per hour, saying
+// where the figures came from and how many VMs had none.
+func burnLine(sts []runnerStatus) string {
+	burn, unpriced := 0.0, 0
+	from := map[string]bool{}
+	for _, s := range sts {
+		if s.Info.State != provider.StateRunning || s.r == nil || !s.r.Ephemeral() {
+			continue
+		}
+		if s.CostFrom == "" {
+			unpriced++
+			continue
+		}
+		burn += s.Cost
+		from[s.CostFrom] = true
+	}
+	if len(from) == 0 {
+		return ""
+	}
+	src := "Spot prices"
+	switch {
+	case from[costSpot] && from[costSetting]:
+		src = "Spot prices and hourly_cost"
+	case from[costSetting]:
+		src = "hourly_cost"
+	}
+	line := fmt.Sprintf("estimated burn: $%.3f/hour (from %s)", burn, src)
+	if unpriced > 0 {
+		line += fmt.Sprintf(", not counting %d running VM(s) with no known price", unpriced)
+	}
+	return line
 }
 
 func firstEphemeral(cfg *config.Config) (*config.Runner, error) {
