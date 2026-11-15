@@ -100,28 +100,34 @@ const (
 
 func TestRemoteNamesCollidingLocallyAreReportedAsCollisions(t *testing.T) {
 	c := newCollisionRun(t)
-	if !foldsNames(t, c.ws.Root, "x.txt", "X.txt") {
-		t.Skip("case-sensitive filesystem: the names don't collide")
-	}
+	// Case-sensitive APFS still ignores normalisation: test what folds.
+	cs := foldsNames(t, c.ws.Root, "x.txt", "X.txt")
 	norm := foldsNames(t, c.ws.Root, "\u00e9.txt", "e\u0301.txt")
-	c.wrote("src/Dup.txt", "A")
-	c.wrote("src/DUP.txt", "B")
+	if !cs && !norm {
+		t.Skip("this filesystem tells every name apart: nothing collides")
+	}
+	if cs {
+		c.wrote("src/Dup.txt", "A")
+		c.wrote("src/DUP.txt", "B")
+	}
 	if norm {
 		c.wrote(nfc, "1")
 		c.wrote(nfd, "2")
 	}
 	wb := c.apply()
 
-	// Byte order applies src/DUP.txt first; src/Dup.txt then names that file.
-	d := stashed(t, wb, "src/Dup.txt")
-	if d.With != "src/DUP.txt" || d.Local != filepath.Join(c.ws.Root, "src", "DUP.txt") {
-		t.Fatalf("collision %+v", d)
-	}
-	if b, err := os.ReadFile(d.Remote); err != nil || string(b) != "A" {
-		t.Fatalf("stashed remote src/Dup.txt: %q, %v", b, err)
-	}
-	if got := c.content("src/DUP.txt"); got != "B" {
-		t.Fatalf("src/DUP.txt holds %q", got)
+	if cs {
+		// Byte order applies src/DUP.txt first; src/Dup.txt then names that file.
+		d := stashed(t, wb, "src/Dup.txt")
+		if d.With != "src/DUP.txt" || d.Local != filepath.Join(c.ws.Root, "src", "DUP.txt") {
+			t.Fatalf("collision %+v", d)
+		}
+		if b, err := os.ReadFile(d.Remote); err != nil || string(b) != "A" {
+			t.Fatalf("stashed remote src/Dup.txt: %q, %v", b, err)
+		}
+		if got := c.content("src/DUP.txt"); got != "B" {
+			t.Fatalf("src/DUP.txt holds %q", got)
+		}
 	}
 	if norm {
 		n := stashed(t, wb, nfc)
@@ -225,6 +231,84 @@ func TestOnDiskName(t *testing.T) {
 		return
 	}
 	if got, ok := onDiskName(root, "src/file.txt"); !ok || got != "Src/File.txt" {
+		t.Fatalf("folded name: %q, %v", got, ok)
+	}
+}
+
+func TestEveryCollidingRemoteVersionIsStashed(t *testing.T) {
+	c := newCollisionRun(t)
+	if !foldsNames(t, c.ws.Root, "x.txt", "X.txt") {
+		t.Skip("case-sensitive filesystem: the names don't collide")
+	}
+	// You edited README.md during the run (a conflict) while the run also
+	// wrote readme.md and Readme.md: three stashed versions, one stash name.
+	c.local("README.md", "base", "yours")
+	c.wrote("README.md", "remote README")
+	c.wrote("Readme.md", "remote Readme")
+	c.wrote("readme.md", "remote readme")
+	wb := c.apply()
+	if len(wb.Stashed) != 3 || len(wb.Conflicts) != 3 {
+		t.Fatalf("stashed %+v", wb.Stashed)
+	}
+	if s := stashed(t, wb, "README.md"); s.With != "" {
+		t.Fatalf("your edit reported as a collision: %+v", s)
+	}
+	for _, p := range []string{"Readme.md", "readme.md"} {
+		if s := stashed(t, wb, p); s.With != "README.md" {
+			t.Fatalf("collision %+v", s)
+		}
+	}
+	seen := map[string]bool{}
+	for _, s := range wb.Stashed {
+		b, err := os.ReadFile(s.Remote)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "remote "+strings.TrimSuffix(s.Path, ".md") {
+			t.Fatalf("%s's stash at %s holds %q", s.Path, s.Remote, b)
+		}
+		seen[string(b)] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("stashed versions overwrote each other: %v", seen)
+	}
+	if got := c.content("README.md"); got != "yours" {
+		t.Fatalf("README.md holds %q", got)
+	}
+}
+
+func TestIdenticalCollidingVersionsAreStillReported(t *testing.T) {
+	c := newCollisionRun(t)
+	if !foldsNames(t, c.ws.Root, "x.txt", "X.txt") {
+		t.Skip("case-sensitive filesystem: the names don't collide")
+	}
+	c.wrote("Same.txt", "same")
+	c.wrote("SAME.txt", "same")
+	wb := c.apply()
+	if s := stashed(t, wb, "Same.txt"); s.With != "SAME.txt" {
+		t.Fatalf("collision %+v", s)
+	}
+	if len(wb.Applied) != 1 || wb.Applied[0] != "SAME.txt" {
+		t.Fatalf("applied %v", wb.Applied)
+	}
+}
+
+func TestOnDiskNameWithHardLinks(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(root, "a.txt"), filepath.Join(root, "b.txt")); err != nil {
+		t.Skip("no hard links here")
+	}
+	if got, ok := onDiskName(root, "b.txt"); !ok || got != "b.txt" {
+		t.Fatalf("exact name: %q, %v", got, ok)
+	}
+	if !foldsNames(t, root, "x.txt", "X.txt") {
+		return
+	}
+	// A.txt folds to a.txt, not to its hard link b.txt.
+	if got, ok := onDiskName(root, "A.txt"); !ok || got != "a.txt" {
 		t.Fatalf("folded name: %q, %v", got, ok)
 	}
 }

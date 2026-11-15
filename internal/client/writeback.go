@@ -397,6 +397,13 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		}
 		switch {
 		case local.eq(want):
+			// A new name already holding these bytes may be another
+			// remote path's file: still two names that can't both exist.
+			if !base.exists && local.exists {
+				if with := collidesWith(ws.Root, p, remote, m); with != "" {
+					return wb.conflict(ws.Root, p, want, rf, with)
+				}
+			}
 			return nil
 		case local.eq(base):
 			// Whatever is lost here and isn't committed is saved first.
@@ -594,19 +601,29 @@ func onDiskName(root, rel string) (string, bool) {
 			return "", false
 		}
 		name := ""
+		var same []string
 		for _, e := range ents {
 			if e.Name() == part {
 				name = part
 				break
 			}
-		}
-		for _, e := range ents {
-			if name != "" {
-				break
-			}
 			if ei, err := os.Lstat(filepath.Join(dir, e.Name())); err == nil && os.SameFile(ei, fi) {
-				name = e.Name()
+				same = append(same, e.Name())
 			}
+		}
+		if name == "" && len(same) > 1 {
+			// Hard links: only the entry differing from part in case is
+			// the one this name folds to; otherwise it can't be told.
+			var folded []string
+			for _, n := range same {
+				if strings.EqualFold(n, part) {
+					folded = append(folded, n)
+				}
+			}
+			same = folded
+		}
+		if name == "" && len(same) == 1 {
+			name = same[0]
 		}
 		if name == "" {
 			return "", false
@@ -632,7 +649,7 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 		full, err := fsid.SafeJoin(dir, p+".deleted")
 		if err == nil {
 			if err = os.MkdirAll(filepath.Dir(full), 0o700); err == nil {
-				err = os.WriteFile(full, mark, 0o600)
+				err = writeNew(full, mark) // never over an earlier marker whose name this one folds to
 			}
 		}
 		if err != nil && stashCollision(err) {
@@ -655,11 +672,22 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	err := writeLocal(dir, p, rf, nil)
+	// An earlier stashed path this one folds to (src/Dup.txt, src/dup.txt
+	// on a case-insensitive filesystem) must not be overwritten.
+	var err error
+	if full, jerr := fsid.SafeJoin(dir, p); jerr == nil {
+		if _, lerr := os.Lstat(full); lerr == nil {
+			err = fmt.Errorf("%s is already stashed: %w", p, syscall.EEXIST)
+		}
+	}
+	if err == nil {
+		err = writeLocal(dir, p, rf, nil)
+	}
 	if err != nil && stashCollision(err) {
-		// A directory/file collision inside the stash itself (a path that
-		// was a directory and is now a file): keep it at the top of the
-		// stash under a flattened name nothing else uses.
+		// A collision inside the stash itself (a path that was a directory
+		// and is now a file, or a name an earlier stashed path folds to):
+		// keep it at the top of the stash under a flattened name nothing
+		// else uses.
 		base := strings.ReplaceAll(p, "/", "__") + ".remote"
 		name := base
 		for i := 2; ; i++ {
@@ -671,6 +699,19 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 		return filepath.Join(dir, name), writeLocal(dir, name, rf, nil)
 	}
 	return filepath.Join(dir, filepath.FromSlash(p)), err
+}
+
+// writeNew creates p holding b, failing with EEXIST if anything is there.
+func writeNew(p string, b []byte) error {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func stashCollision(err error) bool {
