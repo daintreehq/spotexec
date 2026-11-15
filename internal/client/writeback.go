@@ -216,14 +216,22 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		return wb, nil
 	}
 
+	err := applyWriteback(ctx, ws, m, remote, files, runID, &wb)
+	return wb, err
+}
+
+// applyWriteback applies the fetched remote versions (remote: what the
+// command left at each path; files: the bytes fetched for those that exist)
+// to the local worktree, under the write-back lock.
+func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, remote map[string]version, files map[string]remoteFile, runID string, wb *WritebackResult) error {
 	// Serialize cooperating spotexec write-backs into this worktree.
 	lockDir := conflictBase(ws)
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {
-		return wb, err
+		return err
 	}
 	unlock, err := lockFile(ctx, filepath.Join(lockDir, "writeback.lock"))
 	if err != nil {
-		return wb, err
+		return err
 	}
 	defer unlock()
 	wb.ConflictDir = filepath.Join(lockDir, "conflicts", runID)
@@ -268,28 +276,28 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 			}
 			local, err := localVersion(ws.Root, del)
 			if err != nil {
-				return wb, err
+				return err
 			}
 			want := version{true, rf.id, rf.mode}
 			if !local.eq(base) && !local.eq(want) {
 				if err := wb.conflict(ws.Root, q, want, rf); err != nil {
-					return wb, err
+					return err
 				}
 				break
 			}
 			if err := os.Rename(fd, fq); err != nil {
-				return wb, fmt.Errorf("renaming %s to %s: %w", del, q, err)
+				return fmt.Errorf("renaming %s to %s: %w", del, q, err)
 			}
 			if !local.eq(want) {
 				err := writeLocal(ws.Root, q, rf, &local)
 				if errors.Is(err, errChangedUnderUs) {
 					if err := wb.conflict(ws.Root, q, want, rf); err != nil {
-						return wb, err
+						return err
 					}
 					break
 				}
 				if err != nil {
-					return wb, fmt.Errorf("%s: %w", q, err)
+					return fmt.Errorf("%s: %w", q, err)
 				}
 			}
 			wb.Applied = append(wb.Applied, q)
@@ -374,18 +382,18 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	sort.SliceStable(dels, func(i, j int) bool { return strings.Count(dels[i], "/") > strings.Count(dels[j], "/") })
 	for _, p := range dels {
 		if err := apply(p); err != nil {
-			return wb, err
+			return err
 		}
 	}
 	pruneEmptyDirs(ws.Root, removedDirs)
 	removedDirs = nil
 	for _, p := range writes {
 		if err := apply(p); err != nil {
-			return wb, err
+			return err
 		}
 	}
 	pruneEmptyDirs(ws.Root, removedDirs)
-	return wb, nil
+	return nil
 }
 
 func conflictBase(ws *Workspace) string {
