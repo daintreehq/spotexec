@@ -154,7 +154,32 @@ func TestValidateRejectsUnknownValues(t *testing.T) {
 	if err := parsed(t, "--timeout", "1m").validate(); err != nil {
 		t.Errorf("--timeout 1m with SPOTEXEC_TIMEOUT=-5m: %v", err)
 	}
+	// A value that doesn't parse is refused, naming the variable, rather
+	// than dropped for the default (#125).
+	for _, v := range []string{"abc", "5x", "15", " "} {
+		t.Setenv("SPOTEXEC_TIMEOUT", v)
+		if err := parsed(t).validate(); err == nil || !strings.Contains(err.Error(), "SPOTEXEC_TIMEOUT") {
+			t.Errorf("SPOTEXEC_TIMEOUT=%q: %v", v, err)
+		}
+		if err := parsed(t, "--timeout", "1m").validate(); err != nil {
+			t.Errorf("--timeout 1m with SPOTEXEC_TIMEOUT=%q: %v", v, err)
+		}
+	}
 	t.Setenv("SPOTEXEC_TIMEOUT", "")
+	for _, v := range []string{"abc", "1.5", "high", " "} {
+		t.Setenv("SPOTEXEC_PRIORITY", v)
+		if err := parsed(t).validate(); err == nil || !strings.Contains(err.Error(), "SPOTEXEC_PRIORITY") {
+			t.Errorf("SPOTEXEC_PRIORITY=%q: %v", v, err)
+		}
+		if err := parsed(t, "--priority", "3").validate(); err != nil {
+			t.Errorf("--priority 3 with SPOTEXEC_PRIORITY=%q: %v", v, err)
+		}
+	}
+	t.Setenv("SPOTEXEC_PRIORITY", "-2")
+	if f := parsed(t); f.validate() != nil || f.priority != -2 || !f.prioritySet {
+		t.Errorf("SPOTEXEC_PRIORITY=-2: %+v", f)
+	}
+	t.Setenv("SPOTEXEC_PRIORITY", "")
 	for _, args := range [][]string{{"--writeback", "on-success", "--sync", "in"}, {"--writeback", "never"}, {"--writeback-over", "warn"}, {"--writeback-over", "hold"}, {"--timeout", "1ns"}, {}} {
 		if err := parsed(t, args...).validate(); err != nil {
 			t.Errorf("%v rejected: %v", args, err)
@@ -239,6 +264,15 @@ func TestBadRunValuesExit125BeforeAnyRunner(t *testing.T) {
 		if code != client.ExitInfra || !strings.Contains(stderr, c.want) {
 			t.Errorf("%s %v: exit %d, stderr %q", c.name, c.args, code, stderr)
 		}
+	}
+	for _, v := range []string{"SPOTEXEC_TIMEOUT", "SPOTEXEC_PRIORITY"} {
+		t.Setenv(v, "abc")
+		for _, args := range [][]string{{"-C", dir, "true"}, {"-C", dir, "verify"}} {
+			if code, stderr := runMain(t, "sx", args...); code != client.ExitInfra || !strings.Contains(stderr, v) {
+				t.Errorf("%s=abc sx %v: exit %d, stderr %q", v, args, code, stderr)
+			}
+		}
+		t.Setenv(v, "")
 	}
 }
 

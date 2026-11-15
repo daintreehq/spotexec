@@ -50,6 +50,7 @@ type runFlags struct {
 	group         bool
 	rtkFilter     string
 	failConflict  bool
+	envErr        error          // a SPOTEXEC_* value applyEnv couldn't parse
 	fs            *pflag.FlagSet // to tell explicit flags from defaults
 }
 
@@ -104,11 +105,18 @@ func (f *runFlags) reporter() (ui.Reporter, error) {
 // applyEnv fills in SPOTEXEC_* defaults for every flag not given on the
 // command line: an explicit flag always wins, whatever its value (so
 // --json=false, --priority 0 and --pool beat the environment).
+// A value that doesn't parse is kept for validate to report, never dropped
+// for the default.
 func (f *runFlags) applyEnv() {
+	f.envErr = nil
 	if f.changed("timeout") {
 		f.timeoutFrom = "--timeout"
-	} else if d, err := time.ParseDuration(os.Getenv("SPOTEXEC_TIMEOUT")); err == nil {
-		f.timeout, f.timeoutFrom = d, "SPOTEXEC_TIMEOUT"
+	} else if v := os.Getenv("SPOTEXEC_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			f.timeout, f.timeoutFrom = d, "SPOTEXEC_TIMEOUT"
+		} else {
+			f.envErr = fmt.Errorf("SPOTEXEC_TIMEOUT must be a duration such as 15m (got %q)", v)
+		}
 	}
 	if !f.changed("sync") {
 		if v := os.Getenv("SPOTEXEC_SYNC"); v != "" {
@@ -138,14 +146,21 @@ func (f *runFlags) applyEnv() {
 	}
 	if f.changed("priority") {
 		f.prioritySet = true
-	} else if n, err := strconv.Atoi(os.Getenv("SPOTEXEC_PRIORITY")); err == nil {
-		f.priority, f.prioritySet = n, true
+	} else if v := os.Getenv("SPOTEXEC_PRIORITY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			f.priority, f.prioritySet = n, true
+		} else if f.envErr == nil {
+			f.envErr = fmt.Errorf("SPOTEXEC_PRIORITY must be a whole number (got %q)", v)
+		}
 	}
 }
 
 // validate rejects run settings no run could honour, before any runner is
 // acquired: an unknown --writeback must never fall through to writing back.
 func (f *runFlags) validate() error {
+	if f.envErr != nil {
+		return f.envErr
+	}
 	// An explicitly empty value would silently mean "the default".
 	for name, empty := range map[string]bool{"sync": f.sync == "", "writeback": f.writeback == "", "writeback-over": f.writebackOver == "", "runner": f.runner == "", "pool": len(f.pool) == 0} {
 		if empty && f.changed(name) {
