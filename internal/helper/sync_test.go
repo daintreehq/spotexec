@@ -19,6 +19,7 @@ func TestSyncRemovesFilesNoClientCanUse(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, s.workspace, "keep.txt", "synced\n")
+	writeFile(t, s.workspace, `old\name`, "there before the run\n")
 	s.loadStored()
 	pre := s.takeSnapshot(nil)
 
@@ -53,6 +54,9 @@ func TestSyncRemovesFilesNoClientCanUse(t *testing.T) {
 			t.Errorf("%s still in the slot (err %v)", p, err)
 		}
 	}
+	if _, err := os.Lstat(filepath.Join(s.workspace, `old\name`)); err != nil {
+		t.Errorf("a file the run didn't touch was removed: %v", err)
+	}
 	for _, d := range []string{"docs", `x\y`} {
 		if _, err := os.Lstat(filepath.Join(s.workspace, d)); !os.IsNotExist(err) {
 			t.Errorf("empty directory %s left behind (err %v)", d, err)
@@ -63,7 +67,8 @@ func TestSyncRemovesFilesNoClientCanUse(t *testing.T) {
 	}
 }
 
-// A pending path the run itself removed is dropped, whatever its name.
+// A pending path the run itself removed is dropped, whatever its name, and
+// so is one that can never be a run's file.
 func TestPendingAfterDropsGoneOddNames(t *testing.T) {
 	s := testSession(t, t.TempDir())
 	if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
@@ -71,7 +76,9 @@ func TestPendingAfterDropsGoneOddNames(t *testing.T) {
 	}
 	s.loadStored()
 	writeFile(t, s.workspace, `still\here`, "x")
-	s.state.Pending = []string{`gone\now`, `still\here`, "docs/.GIT/gone"}
+	writeFile(t, s.workspace, ".git/HEAD", "x")
+	// .git/HEAD and ../x exist too, but are never a run's file: dropped.
+	s.state.Pending = []string{`gone\now`, `still\here`, "docs/.GIT/gone", ".git/HEAD", "../x"}
 	if got := s.pendingAfter(nil, nil, nil); !reflect.DeepEqual(got, []string{`still\here`}) {
 		t.Fatalf("pending = %v, want [still\\here]", got)
 	}
