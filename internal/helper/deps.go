@@ -285,7 +285,7 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		}
 		script, env, cleanup = host, hostEnv, c
 	}
-	pr := s.runProc(script, s.workspace, env, time.Duration(d.TimeoutMS)*time.Millisecond, 5*time.Second, false)
+	pr := s.runProc(script, s.workspace, env, time.Duration(d.TimeoutMS)*time.Millisecond, 5*time.Second, false, nil)
 	if err := cleanup(); err != nil {
 		return perr(protocol.CodeDepsFailed, "%v", err)
 	}

@@ -60,6 +60,7 @@ type Options struct {
 	Exclusive      bool
 	Pull           []string
 	NoDeps         bool
+	NoSetup        bool // skip [setup]
 	ForceLargeSync bool
 	PreferLast     bool     // exec: reuse last runner+slot without syncing
 	SameSlot       bool     // --same-slot: sync and run in this worktree's last slot
@@ -104,6 +105,9 @@ type Result struct {
 	// OOMKilled: the kernel killed a process in the command's container
 	// for exceeding its memory limit.
 	OOMKilled bool `json:"oom_killed,omitempty"`
+	// SetupFailed: [setup] failed, timed out or couldn't start, so the
+	// command never ran (ExitCode is 1, or 124 for a timeout).
+	SetupFailed bool `json:"setup_failed,omitempty"`
 	// noReplay, when the runner was lost, is why the run must not be
 	// replayed elsewhere (see replayable).
 	noReplay noReplay
@@ -457,7 +461,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		Snapshot: true, Skip: skip, SpotWatch: r.Type == config.TypeAWSSpot,
 		Container: crun,
 	}
-	o.Rep.Status("%s · running %s", label, o.Display)
+	if run, timeout := SetupFor(p, o); run != "" {
+		ex.SetupRun, ex.SetupTimeoutMS = run, timeout.Milliseconds()
+		o.Rep.Status("%s · running setup ([setup] run)", label)
+		o.Rep.Event("setup", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": run})
+	} else {
+		o.Rep.Status("%s · running %s", label, o.Display)
+	}
 	o.Rep.Event("exec", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": o.Display, "cwd": ws.Cwd})
 	stopWatch.Do(func() { close(execStarted) })
 	if ctx.Err() != nil {
@@ -513,7 +523,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	outW := &ui.Rewriter{W: &ui.ClearingWriter{W: o.Stdout, R: o.Rep}, Old: []byte(remoteWS), New: []byte(ws.Root)}
 	errW := &ui.Rewriter{W: &ui.ClearingWriter{W: o.Stderr, R: o.Rep}, Old: []byte(remoteWS), New: []byte(ws.Root)}
-	result, err := pumpExec(sess, outW, errW, o, onSpot)
+	afterSetup := func() { o.Rep.Status("%s · running %s", label, o.Display) }
+	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup)
 	outW.Flush()
 	errW.Flush()
 	if err != nil {
@@ -529,7 +540,11 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	switch classifyExec(result) {
 	case execNotStarted:
-		return res, infra(fmt.Errorf("the command could not be started on %s: %s", r.Name, result.StartError)), ""
+		what := "the command"
+		if result.SetupFailed {
+			what = "[setup] run"
+		}
+		return res, infra(fmt.Errorf("%s could not be started on %s: %s", what, r.Name, result.StartError)), ""
 	case execCanceled:
 		res.Canceled, res.ExitCode = true, ExitInterrupted
 	case execShutdown:
@@ -553,7 +568,18 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if m != nil && len(result.Unverified) > 0 {
 		o.Rep.Warn("UNVERIFIED", "%d file(s) could not be read on the runner after the run and were not written back: %s", len(result.Unverified), strings.Join(firstN(result.Unverified, 5), ", "))
 	}
-	if result.TimedOut {
+	if result.SetupFailed && !res.Canceled {
+		// The setup's own exit code is not passed on: a setup that exits
+		// 125 or 130 must not look like a spotexec failure or an interrupt.
+		res.SetupFailed, res.ExitCode = true, 1
+		if result.TimedOut {
+			res.ExitCode = ExitTimeout
+			_, t := SetupFor(p, o)
+			o.Rep.Warn("SETUP_FAILED", "[setup] run exceeded %s and was terminated (raise setup.timeout); the command did not run", t)
+		} else {
+			o.Rep.Warn("SETUP_FAILED", "[setup] run failed (exit %d); the command did not run. Its output is above; skip the setup with --no-setup or setup = false on a task", result.ExitCode)
+		}
+	} else if result.TimedOut {
 		o.Rep.Warn("TIMEOUT", "command exceeded %s and was terminated (raise with --timeout)", o.Timeout)
 	}
 	if result.OOMKilled {
@@ -606,6 +632,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	ev := map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot}
 	if res.OOMKilled {
 		ev["oom_killed"] = true
+	}
+	if result.SetupMS > 0 || result.SetupFailed {
+		ev["setup_ms"] = result.SetupMS
+	}
+	if res.SetupFailed {
+		ev["setup_failed"] = true
+		ev["setup_exit_code"] = result.ExitCode
 	}
 	o.Rep.Event("result", ev)
 	return res, nil, ""
@@ -1037,8 +1070,20 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	}
 }
 
+// SetupFor is the [setup] command a run starts with ("" when none applies)
+// and its time limit: setup.timeout, or the command's own timeout.
+func SetupFor(p *config.Project, o Options) (string, time.Duration) {
+	if o.NoSetup || strings.TrimSpace(p.Setup.Run) == "" {
+		return "", 0
+	}
+	if p.Setup.Timeout.Duration > 0 {
+		return p.Setup.Run, p.Setup.Timeout.Duration
+	}
+	return p.Setup.Run, o.Timeout
+}
+
 // pumpExec streams output until the result arrives, forwarding interrupts.
-func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot func()) (protocol.Result, error) {
+func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot, afterSetup func()) (protocol.Result, error) {
 	var res protocol.Result
 	type fr struct {
 		f   protocol.Frame
@@ -1102,6 +1147,9 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot 
 				var ev protocol.Event
 				_ = env.Unmarshal(&ev)
 				o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
+				if ev.Name == "setup_done" && afterSetup != nil {
+					afterSetup()
+				}
 				if ev.Name == "spot_interruption" {
 					o.Rep.Warn("SPOT_INTERRUPTION", "%s; warming a replacement", ev.Message)
 					if onSpot != nil {
