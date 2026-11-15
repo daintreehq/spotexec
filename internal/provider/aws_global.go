@@ -234,6 +234,9 @@ func (g *AWSGlobal) Where() string {
 		return g.r.Region
 	}
 	if g.r.AnyRegion() {
+		if len(g.r.ExcludeRegions) > 0 {
+			return "all enabled regions except " + strings.Join(g.r.ExcludeRegions, ", ")
+		}
 		return "all enabled regions"
 	}
 	return strings.Join(g.r.Regions, ", ")
@@ -426,7 +429,13 @@ func (g *AWSGlobal) PlacementRegions(ctx context.Context) ([]string, error) {
 		}
 		return FilterEnabled(g.r.Regions, enabled), nil
 	}
-	return enabled, err
+	var out []string
+	for _, rg := range enabled {
+		if !contains(g.r.ExcludeRegions, rg) {
+			out = append(out, rg)
+		}
+	}
+	return out, err
 }
 
 // enabledRegionsTimeout bounds one DescribeRegions attempt: some regions
@@ -510,6 +519,16 @@ func (g *AWSGlobal) notEnabled(placement []string) []string {
 	return out
 }
 
+// excluded lists the regions exclude_regions leaves out of regions = ["all"].
+func (g *AWSGlobal) excluded() []string {
+	if g.oneRegion() || !g.r.AnyRegion() {
+		return nil
+	}
+	return g.r.ExcludeRegions
+}
+
+const excludedWhy = "left out by exclude_regions"
+
 const noneOfferedWhy = "none of instance_types is offered as Spot here"
 
 // noneOffered says a region offers none of the runner's types as Spot.
@@ -523,7 +542,7 @@ func noneOffered(r *config.Runner) string {
 // lastingUnpriced reports reasons a region has no price that won't clear
 // by themselves: not enabled, or none of the runner's types offered there.
 func lastingUnpriced(why string) bool {
-	return why == notEnabledWhy || strings.Contains(why, "offered as Spot here") || strings.HasPrefix(why, "no instance type in ")
+	return why == notEnabledWhy || why == excludedWhy || strings.Contains(why, "offered as Spot here") || strings.HasPrefix(why, "no instance type in ")
 }
 
 // widenHint says how to give a runner more options to launch.
@@ -553,6 +572,12 @@ var errHeld = errors.New("region still holds instances")
 // hold an instance (e.g. one since removed from the config).
 func (g *AWSGlobal) managedRegions(ctx context.Context) ([]string, error) {
 	pr, err := g.PlacementRegions(ctx)
+	if ex := g.excluded(); len(ex) > 0 && err == nil {
+		// A VM launched before its region was excluded is still ours.
+		if enabled, eerr := g.enabledRegions(ctx); eerr == nil {
+			pr = union(pr, FilterEnabled(ex, enabled))
+		}
+	}
 	ar, aerr := g.activeRegions()
 	return union(pr, ar), errors.Join(err, aerr)
 }
@@ -709,7 +734,8 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 		return PriceTable{}, err
 	}
 	off := g.notEnabled(regions)
-	key := g.priceKey(regions) + "|off:" + strings.Join(off, ",")
+	key := g.priceKey(regions) + "|off:" + strings.Join(off, ",") + "|excluded:" + strings.Join(g.excluded(), ",")
+	off = union(off, g.excluded())
 	var t PriceTable
 	if !refresh {
 		_ = g.withState(func(st *placementState) {
@@ -787,6 +813,9 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 	}
 	for _, rg := range off {
 		t.Unpriced[rg] = notEnabledWhy
+		if contains(g.excluded(), rg) {
+			t.Unpriced[rg] = excludedWhy
+		}
 	}
 	if len(all) == 0 {
 		what := strings.Join(g.r.InstanceTypes, ", ")
@@ -1627,6 +1656,9 @@ func (g *AWSGlobal) Doctor(ctx context.Context) []Check {
 	msg := fmt.Sprintf("%d: %s", len(regions), strings.Join(regions, ", "))
 	if off := g.notEnabled(regions); len(off) > 0 {
 		msg += fmt.Sprintf(" (left out, not enabled in this account: %s)", strings.Join(off, ", "))
+	}
+	if ex := g.excluded(); len(ex) > 0 {
+		msg += fmt.Sprintf(" (left out by exclude_regions: %s)", strings.Join(ex, ", "))
 	}
 	out = append(out, Check{Name: "regions", OK: len(regions) > 0, Msg: msg})
 	if len(regions) == 0 {

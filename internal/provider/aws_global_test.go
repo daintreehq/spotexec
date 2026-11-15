@@ -430,6 +430,100 @@ func TestGlobalAllRegionsSkipsNotOptedIn(t *testing.T) {
 	}
 }
 
+// exclude_regions leaves enabled regions out of regions = ["all"]: they are
+// never priced or launched in, and show as not used with the reason.
+func TestGlobalAllRegionsExcluded(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.07"}},
+		"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.01"}},
+		"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.06"}},
+	}}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	g.r.ExcludeRegions = []string{"r-two-1"}
+	placed, err := g.PlacementRegions(context.Background())
+	if err != nil || strings.Join(placed, ",") != "r-one-1,r-three-1" {
+		t.Fatalf("placement regions %v, %v", placed, err)
+	}
+	if w := g.Where(); !strings.Contains(w, "except r-two-1") {
+		t.Fatalf("where %q", w)
+	}
+	for i, refresh := range []bool{false, false, true} { // fresh, cached, refreshed
+		tbl, err := g.Prices(context.Background(), refresh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tbl.Cached != (i == 1) {
+			t.Fatalf("call %d: cached = %v", i, tbl.Cached)
+		}
+		if got := strings.Join(tbl.Regions, ","); got != "r-one-1,r-three-1,r-two-1" {
+			t.Fatalf("regions %s", got)
+		}
+		if why := tbl.Unpriced["r-two-1"]; !strings.Contains(why, "exclude_regions") || !lastingUnpriced(why) {
+			t.Fatalf("unpriced %v", tbl.Unpriced)
+		}
+		if len(tbl.Prices) != 2 || tbl.Prices[0].Region != "r-three-1" {
+			t.Fatalf("prices %+v", tbl.Prices)
+		}
+	}
+	for _, c := range f.callsOf("DescribeSpotPriceHistory") {
+		if strings.HasPrefix(c, "r-two-1") {
+			t.Fatal("priced an excluded region")
+		}
+	}
+	// Excluding a region that isn't enabled leaves placement as it was, but
+	// the cached table must not hide the new exclusion.
+	g.r.ExcludeRegions = []string{"r-off-1", "r-two-1"}
+	tbl, err := g.Prices(context.Background(), false)
+	if err != nil || tbl.Cached || tbl.Unpriced["r-off-1"] != excludedWhy {
+		t.Fatalf("after excluding r-off-1: cached %v, unpriced %v, %v", tbl.Cached, tbl.Unpriced, err)
+	}
+	in, err := g.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Region != "r-three-1" {
+		t.Fatalf("launched in %s", in.Region)
+	}
+}
+
+// A VM launched in a region before it was excluded is still listed (and so
+// counted and torn down), even with no local record of it.
+func TestGlobalExcludedRegionStillListed(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices:    map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.07"}}},
+		instances: map[string]map[string]string{"r-two-1": {"i-old": "c7a.2xlarge"}},
+	}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	g.r.ExcludeRegions = []string{"r-two-1"}
+	ins, err := g.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ins) != 1 || ins[0].ID != "i-old" || ins[0].Region != "r-two-1" {
+		t.Fatalf("listed %+v", ins)
+	}
+}
+
+// Quota refusals in every region left after the exclusions are still a
+// quota verdict: an excluded region isn't an option that might have worked.
+func TestGlobalExcludedRegionKeepsQuotaVerdict(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{
+			"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.04"}},
+			"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.01"}},
+			"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.05"}},
+		},
+		runErr: map[string]string{"r-one-1/c7a.2xlarge": "VcpuLimitExceeded", "r-three-1/c7a.2xlarge": "VcpuLimitExceeded"},
+	}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	g.r.ExcludeRegions = []string{"r-two-1"}
+	_, err := g.Launch(context.Background(), t.Logf)
+	var qe *QuotaError
+	if !errors.As(err, &qe) {
+		t.Fatalf("want a QuotaError, got %v", err)
+	}
+}
+
 func TestGlobalUnofferedRegionUnpriced(t *testing.T) {
 	f := &fakeRegionsEC2{prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.07"}}}}
 	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")

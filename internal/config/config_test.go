@@ -193,7 +193,18 @@ func TestRegions(t *testing.T) {
 			t.Errorf("%s with regions: %v", ok, err)
 		}
 	}
+	g, err = loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregions = [\"all\"]\nexclude_regions = [\"ap-south-2\", \"me-central-1\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := g.Runners["aws"]; !r.AnyRegion() || strings.Join(r.ExcludeRegions, ",") != "ap-south-2,me-central-1" {
+		t.Fatalf("all but some: %+v", r)
+	}
 	for name, body := range map[string]string{
+		"exclude, list":      "regions = [\"us-east-1\", \"us-east-2\"]\nexclude_regions = [\"us-east-2\"]\n",
+		"exclude, region":    "region = \"us-east-1\"\nexclude_regions = [\"us-east-2\"]\n",
+		"exclude invalid":    "regions = [\"all\"]\nexclude_regions = [\"mars\"]\n",
+		"exclude all":        "regions = [\"all\"]\nexclude_regions = [\"all\"]\n",
 		"region and regions": "region = \"us-east-1\"\nregions = [\"us-east-1\", \"us-east-2\"]\n",
 		"all plus a region":  "regions = [\"all\", \"us-east-1\"]\n",
 		"invalid region":     "regions = [\"us-east-1\", \"mars\"]\n",
@@ -226,6 +237,13 @@ func TestProjectCannotSetRegions(t *testing.T) {
 	if err := (&Config{Global: g, Project: p}).MergeProjectRunners(); err == nil || !strings.Contains(err.Error(), `"regions" can only be set in the global config`) {
 		t.Fatalf("a repository must not widen where code runs: %v", err)
 	}
+	os.WriteFile(pp, []byte("version = 1\n[runners.aws2]\nextends = \"aws\"\nexclude_regions = []\n"), 0o644)
+	if p, err = LoadProject(pp); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Config{Global: g, Project: p}).MergeProjectRunners(); err == nil || !strings.Contains(err.Error(), `"exclude_regions" can only be set in the global config`) {
+		t.Fatalf("a repository must not widen where code runs: %v", err)
+	}
 	// Extending a multi-region runner keeps its regions.
 	os.WriteFile(pp, []byte("version = 1\n[runners.big]\nextends = \"aws\"\nmax_slots = 1\n"), 0o644)
 	p, _ = LoadProject(pp)
@@ -240,6 +258,31 @@ func TestProjectCannotSetRegions(t *testing.T) {
 	r.Regions[0] = "changed"
 	if g.Runners["aws"].Regions[0] != "eu-north-1" {
 		t.Fatal("extending must copy the region list")
+	}
+}
+
+func TestExtendKeepsExcludedRegions(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregions = [\"all\"]\nexclude_regions = [\"ap-south-2\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte("version = 1\n[runners.big]\nextends = \"aws\"\nmax_slots = 1\n"), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Global: g, Project: p}
+	if err := c.MergeProjectRunners(); err != nil {
+		t.Fatal(err)
+	}
+	r := c.Global.Runners["big"]
+	if !r.AnyRegion() || strings.Join(r.ExcludeRegions, ",") != "ap-south-2" {
+		t.Fatalf("extended: %+v", r)
+	}
+	r.ExcludeRegions[0] = "changed"
+	if g.Runners["aws"].ExcludeRegions[0] != "ap-south-2" {
+		t.Fatal("extending must copy exclude_regions")
 	}
 }
 

@@ -218,11 +218,20 @@ instance_types = ["c7a.2xlarge", "c6a.2xlarge", "m7a.2xlarge"]
 max_instances = 4          # across all regions together
 ```
 
+To keep `"all"` but leave some regions out (one whose Spot VMs are reclaimed often, one too far away, or one ruled out for data residency), name them in `exclude_regions`:
+
+```toml
+regions = ["all"]
+exclude_regions = ["ap-south-2", "me-central-1"]
+```
+
+A region enabled later is still picked up, and `spotexec prices` and `doctor` list the excluded ones under "Not used". VMs already running in a region you exclude keep their runs and are still listed and torn down; new VMs go elsewhere. (With a list of regions, just leave the region out.)
+
 Each time the fleet needs a new VM, spotexec compares the current Linux Spot price of every instance type the runner may use (listed, or [described by size](#describe-the-vm-instead-of-naming-types)) in every availability zone of those regions and launches the cheapest. If AWS refuses it, spotexec moves on to the next-cheapest option:
 - **No capacity** for that type in that zone: skipped for a minute, then longer if it keeps failing.
 - **Quota exhausted**: that instance size and larger are skipped in that region; smaller types, and types under another quota, can still launch there. When quota is all that stopped every option, spotexec says so and holds new launches for a few minutes, or until one of the fleet's VMs ends, instead of retrying.
 - **Region not usable** (no default VPC, launches blocked by permissions): the whole region is skipped for 10 minutes.
-- **Region not enabled** in the account (or misspelled): left out entirely, and `spotexec prices` lists it under "Not used" with the reason. spotexec rechecks which regions are enabled once a day, or now with `spotexec prices --refresh`.
+- **Region not enabled** in the account (or misspelled), or in `exclude_regions`: left out entirely, and `spotexec prices` lists it under "Not used" with the reason. spotexec rechecks which regions are enabled once a day, or now with `spotexec prices --refresh`.
 - **Anything that would fail everywhere** (a bad bootstrap script, invalid parameters): the launch stops.
 
 `spotexec prices` shows the ranking and marks where the next VM will go. Prices are cached for 15 minutes. VMs that are already running stay where they are; a price change only affects new launches.

@@ -120,7 +120,7 @@ func cmdPrices() *cobra.Command {
 					keys = append(keys, k)
 				}
 				sort.Strings(keys)
-				fmt.Printf("\nNot used (no price):\n")
+				fmt.Printf("\nNot used:\n")
 				for _, k := range keys {
 					fmt.Printf("  %s: %s\n", k, t.Unpriced[k])
 				}

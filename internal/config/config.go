@@ -136,10 +136,12 @@ type Runner struct {
 	BootTimeout     Duration `toml:"boot_timeout"`
 
 	// aws-spot
-	Region        string   `toml:"region"`
-	Regions       []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
-	Profile       string   `toml:"profile"`
-	InstanceTypes []string `toml:"instance_types"`
+	Region  string   `toml:"region"`
+	Regions []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
+	// ExcludeRegions: with regions = ["all"], enabled regions never to launch in.
+	ExcludeRegions []string `toml:"exclude_regions"`
+	Profile        string   `toml:"profile"`
+	InstanceTypes  []string `toml:"instance_types"`
 	// Requirements instead of (or narrowing) a type list: every current
 	// instance type with exactly VCPUs vCPUs and at least MinMemoryGiB is a
 	// candidate, and launches go to the cheapest.
@@ -684,6 +686,14 @@ func (r *Runner) validateTypes() error {
 // several regions, region becomes the home region: the first listed, or
 // for "all" the environment default, used for account-wide lookups.
 func (r *Runner) normalizeRegions() error {
+	if len(r.ExcludeRegions) > 0 && !(len(r.Regions) == 1 && r.Regions[0] == AllRegions) {
+		return errors.New(`exclude_regions needs regions = ["all"]; with a list, just leave the region out of regions`)
+	}
+	for _, rg := range r.ExcludeRegions {
+		if !regionRe.MatchString(rg) {
+			return fmt.Errorf("exclude_regions: invalid region %q", rg)
+		}
+	}
 	if len(r.Regions) == 0 {
 		return nil
 	}
@@ -991,7 +1001,7 @@ func (p *Project) validate() error {
 var globalOnlyKeys = []string{
 	"type", "host", "hosts", "ssh_options", "identity_file", "work_root",
 	"profile", "region", "subnet_id", "security_group_ids", "ssh_cidr",
-	"user", "cache_bucket", "regions",
+	"user", "cache_bucket", "regions", "exclude_regions",
 }
 
 var (
@@ -1068,6 +1078,7 @@ func (c *Config) MergeProjectRunners() error {
 		base.SSHOptions = append([]string(nil), g.SSHOptions...)
 		base.SecurityGroupIDs = append([]string(nil), g.SecurityGroupIDs...)
 		base.Regions = append([]string(nil), g.Regions...)
+		base.ExcludeRegions = append([]string(nil), g.ExcludeRegions...)
 		base.ExcludeInstanceTypes = append([]string(nil), g.ExcludeInstanceTypes...)
 		// The project's way of choosing types replaces the inherited one: new
 		// instance_types alone drop inherited requirements, and requirements
