@@ -119,7 +119,7 @@ func shorthand(f *runFlags, rest []string, dashed bool) int {
 		}
 	}
 	cmd := buildCommand(l.ws, rest)
-	return f.execute(l, runSpec{command: cmd, display: displayOf(rest)})
+	return f.execute(l, runSpec{command: cmd, display: displayOf(rest), taskLike: taskLikeWord(rest, dashed)})
 }
 
 func displayOf(args []string) string {
