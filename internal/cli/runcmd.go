@@ -660,6 +660,14 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	t := l.cfg.Project.Tasks[name]
 	defer waitLaunches()
 	parts := taskParts(l.cfg.Project, name, args)
+	// A blank run, or run = "{args}" given none, would run nothing and pass;
+	// checked for every part before any of them syncs.
+	for _, pt := range parts {
+		if strings.TrimSpace(pt.spec(l).command) == "" {
+			fmt.Fprintf(os.Stderr, "spotexec: task %s: empty command (run = %q, with no arguments)\n", pt.name, pt.t.Run)
+			return client.ExitInfra
+		}
+	}
 	if len(t.Parallel) == 0 && len(parts) == 1 {
 		// A plain task, or one with a single shard: an ordinary run.
 		return f.execute(l, parts[0].spec(l))

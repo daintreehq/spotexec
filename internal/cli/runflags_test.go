@@ -321,10 +321,57 @@ func TestUsageAndConfigFailuresExit125(t *testing.T) {
 	}
 }
 
+// An empty or blank command, or none at all, is a usage error: nothing is
+// synced or run, and the exit isn't a passing 0 (#131).
+func TestEmptyCommandIsAUsageError(t *testing.T) {
+	dir := project(t, "")
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"sx", []string{"-C", dir, ""}, "empty command"},
+		{"sx", []string{"-C", dir, "   "}, "empty command"},
+		{"sx", []string{"-C", dir, " \t\n"}, "empty command"},
+		{"sx", []string{"-C", dir, "", " "}, "empty command"},
+		{"sx", []string{"-C", dir, "--", ""}, "empty command"},
+		{"sx", nil, "Usage:"},
+		{"sx", []string{"--"}, "missing command"},
+		{"sx", []string{"-C", dir, "--"}, "missing command"},
+		{"spotexec", []string{"-C", dir, ""}, "empty command"},
+		{"spotexec", []string{""}, "empty command"},
+		{"spotexec", []string{"--", " "}, "empty command"},
+		{"spotexec", []string{"--"}, "missing command"},
+		{"spotexec", []string{"run", "-C", dir, "--", ""}, "empty command"},
+		{"spotexec", []string{"run", "-C", dir, "  "}, "empty command"},
+		{"spotexec", []string{"exec", "-C", dir, "--", ""}, "empty command"},
+		{"spotexec", []string{"run", "-C", dir, "--"}, "missing command"},
+	}
+	// A task whose command comes out empty is refused too, every part
+	// before any of them runs.
+	tasks := project(t, "[tasks.lint]\nrun = \"true\"\n[tasks.blank]\nrun = \"  \"\n[tasks.fwd]\nrun = \"{args}\"\n[tasks.all]\nparallel = [\"lint\", \"fwd\"]\n[tasks.split]\nrun = \"'{args}'\"\nshards = 2\n")
+	for _, task := range []string{"blank", "fwd", "all", "split"} {
+		cases = append(cases, struct {
+			name string
+			args []string
+			want string
+		}{"sx", []string{"-C", tasks, task}, "empty command"})
+	}
+	for _, c := range cases {
+		code, stderr := runMain(t, c.name, c.args...)
+		if code != client.ExitInfra || !strings.Contains(stderr, c.want) {
+			t.Errorf("%s %q: exit %d, stderr %q", c.name, c.args, code, stderr)
+		}
+	}
+}
+
 func TestHelpFormsStillWork(t *testing.T) {
 	for _, a := range []string{"-h", "--help", "--help=true", "--version", "--version=true"} {
 		if code, stderr := runMain(t, "spotexec", a); code != 0 {
 			t.Errorf("spotexec %s: exit %d (stderr %q)", a, code, stderr)
+		}
+		if code, stderr := runMain(t, "sx", a); code != 0 {
+			t.Errorf("sx %s: exit %d (stderr %q)", a, code, stderr)
 		}
 	}
 }
