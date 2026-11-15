@@ -358,3 +358,12 @@ func TestPnpmWorkspacePackages(t *testing.T) {
 		}
 	}
 }
+
+// A backslash in a workspace pattern is a glob escape, not a name: it is
+// skipped with the others init can't express (#92).
+func TestWorkspaceNodeModulesSkipsBackslash(t *testing.T) {
+	dirs, skipped := workspaceNodeModules([]string{`packages/\*`, "apps/*"})
+	if strings.Join(dirs, " ") != "node_modules apps/*/node_modules" || len(skipped) != 1 || !strings.Contains(skipped[0], "packages") {
+		t.Errorf("dirs %v, skipped %v", dirs, skipped)
+	}
+}

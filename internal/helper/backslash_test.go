@@ -4,11 +4,15 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
@@ -28,9 +32,32 @@ func TestSnapshotReportsBackslashNames(t *testing.T) {
 	var created []string
 	for _, c := range o.res.Created {
 		created = append(created, c.Path)
+		if c.Path == `src/back\slash.txt` && (c.ID != fsid.Bytes([]byte("w")) || c.Mode != fsid.ModeFile || c.Size != 1) {
+			t.Errorf("entry %+v", c)
+		}
 	}
-	if got := strings.Join(created, " "); !strings.Contains(got, `src/back\slash.txt`) || !strings.Contains(got, "plain.txt") {
-		t.Errorf("created %q, want src/back\\slash.txt and plain.txt", got)
+	sort.Strings(created)
+	if got, want := strings.Join(created, " "), `plain.txt src/back\slash.txt`; got != want {
+		t.Errorf("created %q, want %q", got, want)
+	}
+}
+
+// Patterns still refuse a backslash: there it escapes, it isn't a byte of a
+// name (#92).
+func TestPatternsRefuseBackslash(t *testing.T) {
+	s := testSession(t, t.TempDir())
+	if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	s.c = protocol.NewConn(strings.NewReader(""), io.Discard)
+	var pe *protoError
+	err := s.pull(protocol.Pull{Patterns: []string{`docs/\*`}})
+	if !errors.As(err, &pe) || pe.code != protocol.CodeBadRequest || !strings.Contains(pe.msg, "bad pull pattern") {
+		t.Errorf("pull: want a bad pull pattern error, got %v", err)
+	}
+	err = s.deps(protocol.Deps{CacheDirs: []string{`vendor/\*`}})
+	if !errors.As(err, &pe) || pe.code != protocol.CodeBadRequest || !strings.Contains(pe.msg, "invalid cache_dirs entry") {
+		t.Errorf("deps: want an invalid cache_dirs error, got %v", err)
 	}
 }
 

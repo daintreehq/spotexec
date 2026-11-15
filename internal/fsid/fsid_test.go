@@ -45,6 +45,12 @@ func TestCleanRelBackslash(t *testing.T) {
 			t.Errorf("CleanRel(%q) = %q, %v; want it unchanged", in, got, err)
 		}
 	}
+	// A backslash never excuses what is refused around it.
+	for _, in := range []string{`odd\dir/../x`, `odd\dir/.GIT/config`, `/odd\file`, `a\//b`, `odd\dir/./x`} {
+		if got, err := CleanRel(in); err == nil {
+			t.Errorf("CleanRel(%q) = %q, want an error", in, got)
+		}
+	}
 }
 
 func TestSafeJoinBackslash(t *testing.T) {
