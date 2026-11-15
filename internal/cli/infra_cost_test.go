@@ -3,39 +3,90 @@ package cli
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/provider"
 )
 
-// A VM's Spot price wins over hourly_cost, which only covers VMs with no
-// known price.
-func TestInstanceCost(t *testing.T) {
-	r := &config.Runner{Name: "aws", Type: config.TypeAWSSpot, HourlyCost: 0.12}
-	spot := map[string]float64{"i-1": 0.331}
-	if c, from := instanceCost(r, spot, "i-1"); c != 0.331 || from != costSpot {
-		t.Fatalf("priced VM: %v %q", c, from)
+// fakePricer prices from a fixed table, or blocks until its deadline.
+type fakePricer struct {
+	usd   map[string]float64
+	block bool
+}
+
+func (f *fakePricer) Prices(ctx context.Context, insts []provider.Instance) map[string]float64 {
+	if f.block {
+		<-ctx.Done()
+		return nil
 	}
-	if c, from := instanceCost(r, spot, "i-2"); c != 0.12 || from != costSetting {
-		t.Fatalf("unpriced VM: %v %q", c, from)
+	return f.usd
+}
+
+// A VM's Spot price replaces hourly_cost, which stays only for VMs with no
+// known price; every runner is priced at once under one deadline.
+func TestPriceFleets(t *testing.T) {
+	old := pricesTimeout
+	pricesTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { pricesTimeout = old })
+	aws := &config.Runner{Name: "aws", Type: config.TypeAWSSpot, HourlyCost: 0.12}
+	slow1 := &config.Runner{Name: "slow1", Type: config.TypeAWSSpot, HourlyCost: 0.5}
+	slow2 := &config.Runner{Name: "slow2", Type: config.TypeAWSSpot}
+	pricers := map[string]instancePricer{
+		"aws":   &fakePricer{usd: map[string]float64{"i-1": 0.331}},
+		"slow1": &fakePricer{block: true},
+		"slow2": &fakePricer{block: true},
 	}
-	r.HourlyCost = 0
-	if c, from := instanceCost(r, spot, "i-2"); c != 0 || from != "" {
-		t.Fatalf("no price at all: %v %q", c, from)
+	fp := newFleetPricer()
+	fp.newPricer = func(r *config.Runner) (instancePricer, error) { return pricers[r.Name], nil }
+	row := func(r *config.Runner, id string) runnerStatus {
+		c, from := fallbackCost(r)
+		return runnerStatus{r: r, Fleet: r.Name, Cost: c, CostFrom: from, Info: provider.Info{InstanceID: id}}
+	}
+	rows := []runnerStatus{row(aws, "i-1"), row(aws, "i-2"), row(slow1, "i-3"), row(slow2, "i-4")}
+	fleets := []fleetInstances{
+		{aws, []provider.Instance{{ID: "i-1"}, {ID: "i-2"}}},
+		{slow1, []provider.Instance{{ID: "i-3"}}},
+		{slow2, []provider.Instance{{ID: "i-4"}}},
+	}
+	start := time.Now()
+	fp.priceFleets(context.Background(), rows, fleets)
+	if d := time.Since(start); d > 3*pricesTimeout/2 {
+		t.Fatalf("pricing took %s: the runners' deadlines added up", d)
+	}
+	want := []struct {
+		cost float64
+		from string
+	}{{0.331, costSpot}, {0.12, costSetting}, {0.5, costSetting}, {0, ""}}
+	for i, w := range want {
+		if rows[i].Cost != w.cost || rows[i].CostFrom != w.from {
+			t.Errorf("row %d: %v %q, want %v %q", i, rows[i].Cost, rows[i].CostFrom, w.cost, w.from)
+		}
+	}
+	if len(fp.byRunner) != 3 {
+		t.Fatalf("%d pricers kept, want one per runner", len(fp.byRunner))
 	}
 }
 
-// Only aws-spot runners are priced from AWS; other types never ask.
-func TestFleetPricerSkipsOtherTypes(t *testing.T) {
+// Only aws-spot runners are priced from AWS; other types never make a
+// pricer.
+func TestPriceFleetsSkipsOtherTypes(t *testing.T) {
 	fp := newFleetPricer()
+	made := 0
+	fp.newPricer = func(r *config.Runner) (instancePricer, error) {
+		made++
+		return &fakePricer{usd: map[string]float64{"x": 1}}, nil
+	}
 	for _, typ := range []string{config.TypeSim, config.TypeSSH} {
 		r := &config.Runner{Name: typ, Type: typ}
-		if got := fp.prices(context.Background(), r, []provider.Instance{{ID: "x", Spot: true, Region: "r", Zone: "z", Type: "t"}}); got != nil {
-			t.Fatalf("%s runner priced: %v", typ, got)
+		rows := []runnerStatus{{r: r, Fleet: typ, Info: provider.Info{InstanceID: "x"}}}
+		fp.priceFleets(context.Background(), rows, []fleetInstances{{r, []provider.Instance{{ID: "x"}}}})
+		if rows[0].CostFrom != "" {
+			t.Fatalf("%s runner priced: %+v", typ, rows[0])
 		}
 	}
-	if len(fp.byRunner) != 0 {
-		t.Fatal("made a pricer for a runner that isn't aws-spot")
+	if made != 0 {
+		t.Fatalf("made %d pricer(s) for runners that aren't aws-spot", made)
 	}
 }
 

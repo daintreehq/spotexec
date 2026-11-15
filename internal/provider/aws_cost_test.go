@@ -37,6 +37,22 @@ func TestInstancePricesPerVM(t *testing.T) {
 	if n := len(f.callsOf("DescribeRegions")); n != 0 {
 		t.Fatal("pricing VMs looked up the enabled regions")
 	}
+
+	// A zone the lookup had no price for isn't asked about again on every
+	// refresh, only after a minute.
+	g.now = func() time.Time { return time.Now().Add(30 * time.Second) }
+	missing := insts[6:]
+	if got := p.Prices(context.Background(), missing); len(got) != 0 {
+		t.Fatalf("priced a zone with no price: %v", got)
+	}
+	if n := len(f.callsOf("DescribeSpotPriceHistory")); n != 2 {
+		t.Fatalf("%d lookups: the zone without a price was asked again within a minute", n)
+	}
+	g.now = func() time.Time { return time.Now().Add(priceRetry + time.Second) }
+	p.Prices(context.Background(), missing)
+	if n := len(f.callsOf("DescribeSpotPriceHistory")); n != 3 {
+		t.Fatalf("%d lookups: the zone without a price was never asked again", n)
+	}
 }
 
 // Quotes are reused for 15 minutes, and a failed lookup isn't repeated on
@@ -61,6 +77,12 @@ func TestInstancePricesCacheAndRetry(t *testing.T) {
 	}
 	if n := lookups(); n != 1 {
 		t.Fatalf("%d lookups over five refreshes, want 1", n)
+	}
+	// Past the retry floor but within the TTL, the quote still stands.
+	now = now.Add(priceRetry + time.Minute)
+	p.Prices(ctx, insts)
+	if n := lookups(); n != 1 {
+		t.Fatalf("%d lookups: a quote younger than 15 minutes was fetched again", n)
 	}
 
 	// Past the TTL the price is fetched again; while that fails the old
