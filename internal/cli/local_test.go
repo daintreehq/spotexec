@@ -254,3 +254,38 @@ func TestSameSlotAfterParallelTaskUsesTheFirstPart(t *testing.T) {
 		t.Fatalf("record replaced: %+v", lr)
 	}
 }
+
+// The project's [setup] runs first, from the worktree root, quietly; a
+// failed one shows its output and the command never runs.
+func TestRunLocalSetup(t *testing.T) {
+	run := func(setup, command string, o client.Options) (int, string, string) {
+		t.Helper()
+		l := testLoaded()
+		l.ws.Root = t.TempDir()
+		l.ws.Cwd = "sub"
+		os.Mkdir(filepath.Join(l.ws.Root, "sub"), 0o755)
+		l.cfg.Project.Setup.Run = setup
+		rep, _ := ui.New(ui.ModeQuiet, os.Stderr, "")
+		var out lockedBuf
+		o.Command, o.Stdout, o.Stderr, o.Grace = command, &out, &out, 300*time.Millisecond
+		code := runLocal(context.Background(), nil, l, o, rep, 0, 1)
+		return code, out.String(), l.ws.Root
+	}
+	code, out, root := run("echo noisy; mkdir -p dist && echo built > dist/x", "cat ../dist/x", client.Options{})
+	if code != 0 || out != "built\n" {
+		t.Fatalf("exit %d, output %q", code, out)
+	}
+	code, out, root = run("echo why-it-failed; exit 125", "touch ran", client.Options{})
+	if _, err := os.Stat(filepath.Join(root, "sub", "ran")); code != 1 || !strings.Contains(out, "why-it-failed") || err == nil {
+		t.Fatalf("failed setup: exit %d, output %q, command ran: %v", code, out, err == nil)
+	}
+	code, out, _ = run("touch ran-setup; exit 3", "echo command", client.Options{NoSetup: true})
+	if code != 0 || out != "command\n" {
+		t.Fatalf("--no-setup: exit %d, output %q", code, out)
+	}
+	start := time.Now()
+	code, _, root = run("sleep 30", "touch ran", client.Options{Timeout: 300 * time.Millisecond})
+	if _, err := os.Stat(filepath.Join(root, "sub", "ran")); code != client.ExitTimeout || err == nil || time.Since(start) > 5*time.Second {
+		t.Fatalf("setup timeout: exit %d after %s, command ran: %v", code, time.Since(start), err == nil)
+	}
+}

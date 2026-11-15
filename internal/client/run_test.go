@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/fsid"
@@ -336,5 +337,23 @@ func TestDepsLockfilesMatchSyncedFilesOnly(t *testing.T) {
 	}
 	if len(unmatched) != 1 || unmatched[0] != "vendor/*.lock" {
 		t.Fatalf("unmatched %v", unmatched)
+	}
+}
+
+func TestSetupFor(t *testing.T) {
+	p := &config.Project{}
+	if run, _ := SetupFor(p, Options{Timeout: time.Minute}); run != "" {
+		t.Errorf("no [setup]: %q", run)
+	}
+	p.Setup.Run = "make gen"
+	if run, d := SetupFor(p, Options{Timeout: time.Minute}); run != "make gen" || d != time.Minute {
+		t.Errorf("default timeout: %q %s", run, d)
+	}
+	p.Setup.Timeout.Duration = 2 * time.Minute
+	if _, d := SetupFor(p, Options{Timeout: time.Minute}); d != 2*time.Minute {
+		t.Errorf("setup.timeout: %s", d)
+	}
+	if run, _ := SetupFor(p, Options{NoSetup: true}); run != "" {
+		t.Errorf("--no-setup: %q", run)
 	}
 }

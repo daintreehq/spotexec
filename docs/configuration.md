@@ -152,6 +152,10 @@ cache_dirs = ["node_modules", "packages/*/node_modules"]
 hydrate = "auto"               # auto (reflink, else copy) | reflink | copy | hardlink
 # timeout = "20m"
 
+[setup]                        # optional: runs before every command, after [deps]
+run = "pnpm -r run build"      # e.g. build workspace packages the tests import
+# timeout = "5m"               # default: the command's own timeout
+
 [container]                    # optional; see "Project containers"
 dockerfile = ".spotexec/Dockerfile"   # written by `spotexec init` or `spotexec container init`
 
@@ -185,6 +189,21 @@ A `lockfiles` entry containing `*`, `?` or `[` is a pattern, matched one path se
 
 Patterns are expanded once per run, on your machine, against the files synced to the slot: ignored, excluded and `cache_dirs` files never match, nor do symlinks. The key hashes the sorted, deduplicated list of matches plus any literal entries, and that exact list is what the runner reads, so a new workspace or native addon joins the key as soon as it is synced. A pattern that matches nothing is a warning (`DEPS_LOCKFILES`), since an empty directory of addons is legitimate; a literal path that is missing is still an error, as is a list that matches no file at all. `spotexec sync-plan` prints the expanded list. Configs without patterns keep their existing cache key.
 
+### Setup
+
+`[setup]` declares a step that runs before every task and ad-hoc command, in the slot (and in the [project container](environments.md#project-containers), when there is one), after the dependency restore. Use it for work that depends on source rather than lockfiles, so `[deps]` can't cache it: building the `dist/` of workspace packages that tests import, or generating code.
+
+| Key | Meaning |
+| --- | --- |
+| `run` | Shell command, run from the repository root (whatever directory the command runs from) with the command's environment. Required when `[setup]` is present. |
+| `timeout` | Cap on the setup alone. Without it, the setup gets the command's own timeout; the command then gets its full timeout after it. |
+
+Its output is held back: a successful setup shows nothing, and a failed one shows (the last 64 KiB of) its output on stderr, then a `SETUP_FAILED` warning. The command doesn't run, and the run exits `1` (`124` when the setup timed out), whatever code the setup exited with. Files the setup changes are treated like the command's: ignored outputs such as `dist/` stay in the slot, and anything else comes back under the usual [write-back](running.md#write-back-and-artifacts) rules.
+
+The setup runs on every run: each part of a parallel or sharded task, `spotexec exec`, `--sync none` runs, and runs that [fall back](running.md#run-flags) to your machine (there, in your worktree). It runs as its own process (and, under a container, its own container), so variables it exports don't reach the command; put those in `[env]`. `spotexec sync` skips it. `--no-setup` skips it for one run, and `setup = false` on a task for every run of that task (on a parallel task, for all of its parts).
+
+Ignored outputs from earlier runs stay in a slot, so a setup that builds into `dist/` should leave it consistent with the source on its own (most build tools do), or clear it first.
+
 ### Tasks
 
 | Key | Meaning |
@@ -195,6 +214,7 @@ Patterns are expanded once per run, on your machine, against the files synced to
 | `fail_fast` | Stop the remaining parts of a parallel or sharded task when one fails. In a parallel task, its own setting covers every part, shards included. |
 | `timeout`, `sync`, `exclusive` | Per-task overrides of the run flags. |
 | `pool`, `priority` | Send this task to a different fleet, or move it ahead in the queue. |
+| `setup` | `false` skips the project's [`[setup]`](#setup) for this task (on a parallel task, for each of its parts). |
 
 A sharded task splits one command across the fleet, for test runners that take a shard option:
 
