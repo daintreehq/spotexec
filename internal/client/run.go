@@ -1027,7 +1027,7 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 		o.Rep.Warn("DEPS_LOCKFILES", "deps.lockfiles pattern %q matches no synced file, so it adds nothing to the dependency cache key", pat)
 	}
 	if len(lockfiles) == 0 {
-		return protocol.DepsResult{}, errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
+		return protocol.DepsResult{}, errNoLockfiles
 	}
 	o.Rep.Status("%s · checking dependency cache", label)
 	t := time.Now()
@@ -1318,10 +1318,11 @@ func markLost(cfg *config.Config, runner, id string) {
 }
 
 // checkLocal is what a run refuses from the local files alone, so Run
-// checks it before acquiring a runner: a working set over AbortFiles, and a
+// checks it before acquiring a runner: a working set over AbortFiles, a
 // container built from a Dockerfile whose build inputs aren't synced (exec,
-// PreferLast, reuses the image this worktree last built instead). m is nil
-// when the run doesn't sync.
+// PreferLast, reuses the image this worktree last built instead), and a
+// dependency install whose deps.lockfiles match no synced file (runDeps).
+// m is nil when the run doesn't sync.
 func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Options) error {
 	if m != nil && len(m.Entries) > AbortFiles && !o.ForceLargeSync {
 		return fmt.Errorf("refusing to sync %d files (limit %d); add excludes to .spotexec.toml or pass --force-large-sync", len(m.Entries), AbortFiles)
@@ -1331,8 +1332,19 @@ func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Option
 			return err
 		}
 	}
+	if p.Deps.Install != "" && !o.NoDeps && m != nil {
+		lockfiles, _, err := DepsLockfiles(m, p.Deps.Lockfiles)
+		if err != nil {
+			return err
+		}
+		if len(lockfiles) == 0 {
+			return errNoLockfiles
+		}
+	}
 	return nil
 }
+
+var errNoLockfiles = errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
 
 // Preflight checks, without a runner, what a plain run from ws with sync
 // mode sync would refuse before its command starts: it builds the working

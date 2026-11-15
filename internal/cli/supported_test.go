@@ -241,6 +241,17 @@ func TestSupported(t *testing.T) {
 			putFile(t, filepath.Join(d, "Dockerfile"), "FROM alpine\n")
 			return d
 		}, false},
+		{"deps lockfiles match nothing", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"*.lock\"]\n")
+			return d
+		}, false},
+		{"deps lockfiles match a synced file", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"*.lock\"]\n")
+			putFile(t, filepath.Join(d, "yarn.lock"), "{}\n")
+			return d
+		}, true},
 		{"container image needs no local files", sshRunner, func(t *testing.T) string {
 			d := initRepo(t)
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[container]\nimage = \"alpine\"\n")
