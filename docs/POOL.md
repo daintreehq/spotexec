@@ -58,6 +58,9 @@ takes part in scheduling, and every VM shuts itself down.
    starting (the launch ledger in `pool.json`), up to `max_instances`.
    - Lower-priority fleets only launch for demand the higher-priority ones
      can't cover.
+   - Draining and outdated VMs don't count toward `max_instances`, but
+     launches pause while twice `max_instances` VMs are alive, until some
+     end; the wait reason counts the draining and outdated VMs holding them.
    - Ledger entries record the launching PID, so a dead `sx` frees its
      reservation; an ambiguous launch (the request may have created an
      instance) keeps its reservation until listings can show it.

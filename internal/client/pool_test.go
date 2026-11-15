@@ -358,6 +358,31 @@ func TestNarrowedRegionsJudgedAgain(t *testing.T) {
 	}
 }
 
+// Issue #129: launches held by the cap on live VMs (twice max_instances)
+// were blamed on draining VMs when the VMs still alive were outdated ones.
+// The reason counts what holds them, by the state spotexec status shows.
+func TestLiveCapReasonNamesWhatHolds(t *testing.T) {
+	p, f := testPool(t, 1)
+	p.Fleet = &matchFleet{fakeFleet: f, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{}}
+	host := provider.Target{Host: "127.0.0.1"}
+	for _, id := range []string{"i-a", "i-b", "i-c"} {
+		f.insts = append(f.insts, provider.Instance{ID: id, Type: "c6a.2xlarge", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Hour)})
+	}
+	want := func(reason string) {
+		t.Helper()
+		if d := planOnce(t, p); d.Launch || d.Reason != reason {
+			t.Fatalf("reason %q, want %q", d.Reason, reason)
+		}
+	}
+	want("waiting for 3 outdated VMs to end: launches pause at 2 live VMs (twice max_instances)")
+	// A VM both outdated and draining counts once, as draining.
+	p.Observe("i-a", OutDraining, time.Now().Add(-time.Hour))
+	want("waiting for 2 outdated VMs and 1 draining VM to end: launches pause at 2 live VMs (twice max_instances)")
+	p.Observe("i-b", OutDraining, time.Now().Add(-time.Hour))
+	p.Observe("i-c", OutDraining, time.Now().Add(-time.Hour))
+	want("waiting for 3 draining VMs to end: launches pause at 2 live VMs (twice max_instances)")
+}
+
 // Clearing a mismatch never clears draining: a VM marked draining stays
 // out of service when the config matches it again.
 func TestMismatchClearingKeepsDraining(t *testing.T) {

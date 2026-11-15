@@ -544,7 +544,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		case usable >= p.R.MaxInstances:
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
 		case total >= 2*p.R.MaxInstances:
-			d.Reason = "too many draining instances still alive"
+			d.Reason = liveCapReason(st, p.R.MaxInstances)
 		case d.QuotaErr != "":
 			d.Reason = "at the account's vCPU quota, so no new VMs; waiting for a slot on running ones"
 		case time.Now().Before(st.BackoffUntil):
@@ -560,6 +560,40 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		return nil
 	})
 	return d, err
+}
+
+// liveCapReason explains launches held by the cap on live VMs (twice
+// max_instances): the VMs out of service that haven't ended yet, counted
+// as draining or outdated (the states `spotexec status` names).
+func liveCapReason(st *poolState, maxInstances int) string {
+	outdated, draining := 0, 0
+	for _, in := range st.Instances {
+		switch n := st.Notes[in.ID]; {
+		case n == nil:
+		case n.Draining:
+			draining++
+		case n.Mismatch != "":
+			outdated++
+		}
+	}
+	vms := func(n int, state string) string {
+		if n == 1 {
+			return "1 " + state + " VM"
+		}
+		return fmt.Sprintf("%d %s VMs", n, state)
+	}
+	var held []string
+	if outdated > 0 {
+		held = append(held, vms(outdated, "outdated"))
+	}
+	if draining > 0 {
+		held = append(held, vms(draining, "draining"))
+	}
+	if len(held) == 0 {
+		held = append(held, "VMs")
+	}
+	return fmt.Sprintf("waiting for %s to end: launches pause at %d live VMs (twice max_instances)",
+		strings.Join(held, " and "), 2*maxInstances)
 }
 
 // Reserve records up to n launches regardless of waiting demand (spotexec
