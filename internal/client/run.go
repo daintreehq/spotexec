@@ -719,12 +719,21 @@ func keepLastRun(ws *Workspace, o Options, lr LastRun, res *Result) {
 func reportConflicts(rep ui.Reporter, stashed []Conflict, runID string) {
 	for _, c := range stashed {
 		diff := conflictDiff(c)
-		if c.Deleted {
+		switch {
+		case c.Reason == ReasonSymlinkParent && c.Deleted:
+			rep.Warn("SYNC_CONFLICT", "%s was deleted by the remote command but not here: a parent directory of it is a symlink locally", c.Path)
+		case c.Reason == ReasonSymlinkParent:
+			rep.Warn("SYNC_CONFLICT", "%s was not written back: a parent directory of it is a symlink locally. The remote version: %s", c.Path, diff)
+		case c.Deleted:
 			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run, and the remote command deleted it; kept your version (delete it yourself to accept the deletion). Your changes: %s", c.Path, diff)
-		} else {
+		default:
 			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version. The remote version: %s", c.Path, diff)
 		}
-		rep.Event("conflict", map[string]any{"path": c.Path, "local": c.Local, "remote": c.Remote, "deleted": c.Deleted, "diff": diff, "run_id": runID})
+		ev := map[string]any{"path": c.Path, "local": c.Local, "remote": c.Remote, "deleted": c.Deleted, "diff": diff, "run_id": runID}
+		if c.Reason != "" {
+			ev["reason"] = c.Reason
+		}
+		rep.Event("conflict", ev)
 	}
 }
 
@@ -748,7 +757,9 @@ func conflictDiff(c Conflict) string {
 	if c.Deleted {
 		remote = os.DevNull // Remote is only a marker
 	}
-	if fi, err := os.Lstat(local); err != nil || fi.IsDir() {
+	if c.Reason == ReasonSymlinkParent {
+		local = os.DevNull // never read through the symlink, out of the worktree
+	} else if fi, err := os.Lstat(local); err != nil || fi.IsDir() {
 		local = os.DevNull // deleted (or replaced by a directory) locally
 	}
 	return "git diff --no-index -- " + transport.ShellQuote(local) + " " + transport.ShellQuote(remote)

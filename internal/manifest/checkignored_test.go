@@ -63,4 +63,8 @@ func TestCheckIgnoredPathBeyondSymlink(t *testing.T) {
 	if !ign["dist/app.js"] || ign["src/a.go"] || ign["docs/evil.txt"] || ign["docs/sub/x.log"] {
 		t.Fatalf("ignored = %v", ign)
 	}
+	// Nothing left for git to judge.
+	if ign, err := m.CheckIgnored(ctx, []string{"docs/evil.txt"}); err != nil || len(ign) != 0 {
+		t.Fatalf("only a blocked path: %v, %v", ign, err)
+	}
 }

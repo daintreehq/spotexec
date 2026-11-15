@@ -266,3 +266,63 @@ func TestWriteLocalBackslashName(t *testing.T) {
 		t.Errorf("content %q, %v", b, err)
 	}
 }
+
+// A path beyond a local symlink is stashed and reported as such: never as a
+// local edit, and never diffed through the symlink, out of the worktree.
+func TestSymlinkParentConflict(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "evil.txt"), []byte("outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "docs")); err != nil {
+		t.Fatal(err)
+	}
+	wb := &WritebackResult{ConflictDir: filepath.Join(t.TempDir(), "conflicts", "run-1")}
+	rf := remoteFile{data: []byte("remote\n"), mode: fsid.ModeFile}
+	want := version{true, fsid.Bytes(rf.data), rf.mode}
+	if err := wb.conflict(root, "docs/evil.txt", want, rf); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.conflict(root, "docs/old.txt", version{}, remoteFile{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.conflict(root, "src/a.txt", want, rf); err != nil {
+		t.Fatal(err)
+	}
+	c, del, plain := wb.Stashed[0], wb.Stashed[1], wb.Stashed[2]
+	if c.Reason != ReasonSymlinkParent || del.Reason != ReasonSymlinkParent || plain.Reason != "" {
+		t.Fatalf("reasons %q %q %q", c.Reason, del.Reason, plain.Reason)
+	}
+	if b, err := os.ReadFile(c.Remote); err != nil || string(b) != "remote\n" {
+		t.Fatalf("stashed copy at %s: %q, %v", c.Remote, b, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(outside, "evil.txt")); string(b) != "outside\n" {
+		t.Fatalf("file beyond the symlink changed: %q", b)
+	}
+	if d := conflictDiff(c); !strings.Contains(d, os.DevNull) || strings.Contains(d, c.Local) {
+		t.Fatalf("diff reads through the symlink: %s", d)
+	}
+
+	rec := &recordingReporter{}
+	reportConflicts(rec, wb.Stashed, "run-1")
+	if len(rec.warnings) != 3 || len(rec.events) != 3 {
+		t.Fatalf("warnings %v, events %v", rec.warnings, rec.events)
+	}
+	for i, w := range rec.warnings[:2] {
+		if !strings.Contains(w, wb.Stashed[i].Path) || !strings.Contains(w, "symlink") || strings.Contains(w, "changed locally") {
+			t.Fatalf("warning %d: %s", i, w)
+		}
+		if rec.events[i]["reason"] != ReasonSymlinkParent {
+			t.Fatalf("event %d: %v", i, rec.events[i])
+		}
+	}
+	if !strings.Contains(rec.warnings[0], conflictDiff(c)) {
+		t.Fatalf("warning without the stashed copy: %s", rec.warnings[0])
+	}
+	if !strings.Contains(rec.warnings[2], "changed locally") {
+		t.Fatalf("plain conflict: %s", rec.warnings[2])
+	}
+	if _, ok := rec.events[2]["reason"]; ok {
+		t.Fatalf("plain conflict event has a reason: %v", rec.events[2])
+	}
+}

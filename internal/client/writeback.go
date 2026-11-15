@@ -51,7 +51,14 @@ type Conflict struct {
 	Local   string `json:"local"`   // your file (absolute)
 	Remote  string `json:"remote"`  // the stashed remote version (absolute)
 	Deleted bool   `json:"deleted"` // the remote command deleted it (Remote is a marker file)
+	// Reason is empty for a local edit made during the run, or
+	// ReasonSymlinkParent: a local parent directory is a symlink, so the
+	// path can't be written here without leaving the worktree.
+	Reason string `json:"reason,omitempty"`
 }
+
+// ReasonSymlinkParent marks a conflict caused by a symlinked local parent.
+const ReasonSymlinkParent = "symlink_parent"
 
 // conflict stashes the remote version of p and records the conflict.
 func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile) error {
@@ -60,7 +67,11 @@ func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile)
 		return err
 	}
 	wb.Conflicts = append(wb.Conflicts, p)
-	wb.Stashed = append(wb.Stashed, Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(p)), Remote: stashed, Deleted: !want.exists})
+	c := Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(p)), Remote: stashed, Deleted: !want.exists}
+	if _, err := fsid.SafeJoin(root, p); errors.Is(err, fsid.ErrSymlinkParent) {
+		c.Reason = ReasonSymlinkParent
+	}
+	wb.Stashed = append(wb.Stashed, c)
 	return nil
 }
 
