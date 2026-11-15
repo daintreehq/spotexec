@@ -128,6 +128,8 @@ func TestInstallsSystemPackages(t *testing.T) {
 		"rpm -U pkg.rpm",
 		"bash -c 'apt-get install -y jq'",
 		"(apt-get install -y jq)",
+		"/usr/bin/apt-get install -y curl",
+		"sudo /sbin/apk add jq",
 		"true;apk add jq",
 		"aptitude install curl",
 		"apt-get reinstall curl",

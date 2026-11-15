@@ -51,8 +51,9 @@ func warnContainerFresh(w *Workspace, o Options, dockerfile string) {
 
 // pkgInstall matches a system package manager installing something: the
 // changes a fresh container drops (unlike files in the workspace or $HOME).
-// Best effort: it reads the command line, not the scripts it runs.
-var pkgInstall = regexp.MustCompile(`(?:^|[\s;&|(` + "`" + `'"])(?:` +
+// Best effort: it reads the command line, not the scripts it runs. A '/'
+// before the name allows a full path (/usr/bin/apt-get).
+var pkgInstall = regexp.MustCompile(`(?:^|[\s;&|(/` + "`" + `'"])(?:` +
 	// -o, -t and -c take a value in apt; only -c (the config file) does in the rest.
 	`(?:(?:apt-get|apt|aptitude)(?:\s+(?:-[otc]\s+\S+|--option\s+\S+|-\S+))*` +
 	`|(?:dnf|yum|microdnf|tdnf|zypper)(?:\s+(?:-c\s+\S+|-\S+))*)\s+` +
