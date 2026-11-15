@@ -133,26 +133,34 @@ func sizeStarterFleet(path string) (bool, error) {
 
 // quotaFits groups the AWS runners by region against each region's
 // standard Spot quota (regions whose quota is unknown, or whose runners all
-// use other quotas, are left out).
-func quotaFits(runners []*config.Runner, quotas map[string]float64) []provider.QuotaFit {
+// use other quotas, are left out). launches names the regions a runner's
+// quota is checked in, by runner name (a runner left out: its own region);
+// a multi-region runner's whole fleet may land in any one of them.
+func quotaFits(runners []*config.Runner, launches map[string][]string, quotas map[string]float64) []provider.QuotaFit {
 	byRegion := map[string]*provider.QuotaFit{}
 	others := map[string]bool{} // runners there can launch outside the standard families
 	var order []string
 	for _, r := range runners {
-		others[r.Region] = others[r.Region] || provider.HasOtherFamiliesFor(r)
+		rs, ok := launches[r.Name]
+		if !ok {
+			rs = []string{r.Region}
+		}
 		one := provider.MinLaunchVCPUsFor(r)
-		q, ok := quotas[r.Region]
-		if one == 0 || !ok {
-			continue
+		for _, rg := range rs {
+			others[rg] = others[rg] || provider.HasOtherFamiliesFor(r)
+			q, ok := quotas[rg]
+			if one == 0 || !ok {
+				continue
+			}
+			f := byRegion[rg]
+			if f == nil {
+				f = &provider.QuotaFit{Region: rg, Quota: int(q), OneVM: one}
+				byRegion[rg] = f
+				order = append(order, rg)
+			}
+			f.OneVM = min(f.OneVM, one)
+			f.Fleet += r.MaxInstances * provider.VMVCPUs(r)
 		}
-		f := byRegion[r.Region]
-		if f == nil {
-			f = &provider.QuotaFit{Region: r.Region, Quota: int(q), OneVM: one}
-			byRegion[r.Region] = f
-			order = append(order, r.Region)
-		}
-		f.OneVM = min(f.OneVM, one)
-		f.Fleet += r.MaxInstances * provider.VMVCPUs(r)
 	}
 	out := make([]provider.QuotaFit, 0, len(order))
 	for _, rg := range order {
@@ -190,4 +198,14 @@ func reportQuotas(w io.Writer, fits []provider.QuotaFit, ask func(provider.Quota
 			fmt.Fprintf(w, "✓ Spot vCPU quota in %s: %d (runners need up to %d)\n", f.Region, f.Quota, f.Fleet)
 		}
 	}
+}
+
+// describeAWSRunners names the AWS runners setup prepares with the regions
+// each may launch in, the way doctor describes them.
+func describeAWSRunners(runners []*config.Runner) string {
+	parts := make([]string, len(runners))
+	for i, r := range runners {
+		parts[i] = r.Name + " (" + provider.RunnerWhere(r) + ")"
+	}
+	return strings.Join(parts, ", ")
 }

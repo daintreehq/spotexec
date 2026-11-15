@@ -233,13 +233,22 @@ func (g *AWSGlobal) Where() string {
 	if g.oneRegion() {
 		return g.r.Region
 	}
-	if g.r.AnyRegion() {
-		if len(g.r.ExcludeRegions) > 0 {
-			return "all enabled regions except " + strings.Join(g.r.ExcludeRegions, ", ")
-		}
+	return RunnerWhere(g.r)
+}
+
+// RunnerWhere describes the regions an aws-spot runner's config lets it
+// launch in, for messages: its one region, its list, or all enabled
+// regions less exclude_regions.
+func RunnerWhere(r *config.Runner) string {
+	switch {
+	case r.AnyRegion() && len(r.ExcludeRegions) > 0:
+		return "all enabled regions except " + strings.Join(r.ExcludeRegions, ", ")
+	case r.AnyRegion():
 		return "all enabled regions"
+	case r.MultiRegion():
+		return strings.Join(r.Regions, ", ")
 	}
-	return strings.Join(g.r.Regions, ", ")
+	return r.Region
 }
 
 // ---- local placement state ----
@@ -1708,17 +1717,8 @@ func (g *AWSGlobal) Doctor(ctx context.Context) []Check {
 	// Quota and network matter where launches will actually go: the
 	// first few regions in launch order. A region the account has never
 	// used often has a tiny Spot quota.
-	var top []string
-	for _, p := range k.Prices {
-		if !contains(top, p.Region) {
-			top = append(top, p.Region)
-		}
-		if len(top) == 3 {
-			break
-		}
-	}
 	need := vcpusOf(best.Type)
-	for _, rg := range top {
+	for _, rg := range firstRegions(k) {
 		a := g.Regional(rg)
 		if vpc, err := a.vpcID(ctx); err != nil {
 			msg := err.Error()
@@ -1736,6 +1736,51 @@ func (g *AWSGlobal) Doctor(ctx context.Context) []Check {
 	}
 	out = append(out, Check{Name: "console", OK: true, Msg: fmt.Sprintf("instances can appear in any of these regions; filter by tag %s=%s (`spotexec status` shows each one's region)", tagRunner, g.r.Name)})
 	return out
+}
+
+// launchRegionsChecked is how many regions, first in launch order, doctor
+// and setup check the quota (and doctor the network) of: where launches
+// will actually go.
+const launchRegionsChecked = 3
+
+// firstRegions lists the first few distinct regions in k's launch order.
+func firstRegions(k Ranking) []string {
+	var top []string
+	for _, p := range k.Prices {
+		if !contains(top, p.Region) {
+			top = append(top, p.Region)
+		}
+		if len(top) == launchRegionsChecked {
+			break
+		}
+	}
+	return top
+}
+
+// LaunchRegions lists the first few regions in launch order, from fresh
+// prices: those `spotexec doctor` checks the Spot quota of.
+func (g *AWSGlobal) LaunchRegions(ctx context.Context) ([]string, error) {
+	if g.oneRegion() {
+		return []string{g.r.Region}, nil
+	}
+	t, err := g.Prices(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	return firstRegions(g.Rank(t)), nil
+}
+
+// LaunchRegionsWith is LaunchRegions for a multi-region runner, read with
+// profile's credentials (setup's admin session, before the runner has
+// its own; "" is the default chain).
+func LaunchRegionsWith(ctx context.Context, r *config.Runner, profile string) ([]string, error) {
+	c := *r
+	c.Profile = profile
+	p, err := NewAWSGlobal(&c)
+	if err != nil {
+		return nil, err
+	}
+	return p.(*AWSGlobal).LaunchRegions(ctx)
 }
 
 // priceCheck is doctor's finding on where a single-region runner's next

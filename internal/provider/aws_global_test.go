@@ -1099,3 +1099,35 @@ func TestGlobalOnDemandSkipsRegionsCoolingForSetup(t *testing.T) {
 		t.Fatalf("launched %+v via %v", in, markets)
 	}
 }
+
+// LaunchRegions are the first few regions in launch order, those doctor
+// and setup check the Spot quota of, never an excluded region.
+func TestGlobalLaunchRegions(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.09"}},
+		"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.01"}},
+		"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.06"}, {"r-three-1b", "c7a.2xlarge", "0.03"}},
+	}}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	g.r.LaunchOrder = config.LaunchCheapest
+	g.r.ExcludeRegions = []string{"r-two-1"}
+	got, err := g.LaunchRegions(context.Background())
+	if err != nil || strings.Join(got, ",") != "r-three-1,r-one-1" {
+		t.Fatalf("launch regions %v, %v", got, err)
+	}
+	if w := RunnerWhere(g.r); w != "all enabled regions except r-two-1" {
+		t.Fatalf("where %q", w)
+	}
+	// A listed runner: its enabled regions, cheapest first.
+	g.r.Regions, g.r.ExcludeRegions = []string{"r-one-1", "r-off-1", "r-two-1", "r-three-1"}, nil
+	got, err = g.LaunchRegions(context.Background())
+	if err != nil || strings.Join(got, ",") != "r-two-1,r-three-1,r-one-1" {
+		t.Fatalf("launch regions %v, %v", got, err)
+	}
+	if w := RunnerWhere(g.r); w != "r-one-1, r-off-1, r-two-1, r-three-1" {
+		t.Fatalf("where %q", w)
+	}
+	if w := RunnerWhere(&config.Runner{Type: config.TypeAWSSpot, Region: "r-one-1"}); w != "r-one-1" {
+		t.Fatalf("where %q", w)
+	}
+}
