@@ -29,12 +29,13 @@ const (
 type depsLog struct {
 	dir, name string
 
-	mu      sync.Mutex
-	f       *os.File
-	path    string
-	failed  bool // the file couldn't be created or written: stop trying
-	tail    []byte
-	written int64
+	mu        sync.Mutex
+	f         *os.File
+	path      string
+	failed    bool // the file couldn't be created or written: stop trying
+	tail      []byte
+	cutAtLine bool // output was dropped from the tail, ending on a line break
+	written   int64
 }
 
 func newDepsLog(dir, label string) *depsLog {
@@ -57,11 +58,11 @@ func logName(label string) string {
 func (l *depsLog) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.written += int64(len(p))
-	l.tail = append(l.tail, p...)
-	if over := len(l.tail) - depsTailBytes; over > 0 {
-		l.tail = append(l.tail[:0], l.tail[over:]...)
+	if len(p) == 0 {
+		return 0, nil
 	}
+	l.written += int64(len(p))
+	l.keepTail(p)
 	if l.f == nil && !l.failed {
 		l.open()
 	}
@@ -75,6 +76,30 @@ func (l *depsLog) Write(p []byte) (int, error) {
 	return len(p), nil // never fail the install over its log
 }
 
+// keepTail appends p to the tail, keeping its last depsTailBytes in a
+// buffer that never grows past that, and notes whether what was dropped
+// ended on a line break (so the tail starts on a whole line).
+func (l *depsLog) keepTail(p []byte) {
+	if l.tail == nil {
+		l.tail = make([]byte, 0, depsTailBytes)
+	}
+	if len(p) >= depsTailBytes {
+		switch {
+		case len(p) > depsTailBytes:
+			l.cutAtLine = p[len(p)-depsTailBytes-1] == '\n'
+		case len(l.tail) > 0:
+			l.cutAtLine = l.tail[len(l.tail)-1] == '\n'
+		}
+		l.tail = append(l.tail[:0], p[len(p)-depsTailBytes:]...)
+		return
+	}
+	if over := len(l.tail) + len(p) - depsTailBytes; over > 0 {
+		l.cutAtLine = l.tail[over-1] == '\n'
+		l.tail = append(l.tail[:0], l.tail[over:]...)
+	}
+	l.tail = append(l.tail, p...)
+}
+
 func (l *depsLog) open() {
 	if l.dir == "" {
 		l.failed = true
@@ -84,7 +109,7 @@ func (l *depsLog) open() {
 		l.failed = true
 		return
 	}
-	f, err := os.CreateTemp(l.dir, time.Now().UTC().Format("20060102-150405")+"-"+l.name+"-*.log")
+	f, err := os.CreateTemp(l.dir, time.Now().UTC().Format("20060102-150405.000")+"-"+l.name+"-*.log")
 	if err != nil {
 		l.failed = true
 		return
@@ -116,7 +141,7 @@ func (l *depsLog) Tail(n int) (string, bool) {
 	defer l.mu.Unlock()
 	t := bytes.TrimRight(l.tail, "\r\n")
 	cut := int64(len(l.tail)) < l.written
-	if cut {
+	if cut && !l.cutAtLine {
 		// The buffer starts mid-line: drop the partial first line.
 		if i := bytes.IndexByte(t, '\n'); i >= 0 {
 			t = t[i+1:]

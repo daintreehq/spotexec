@@ -34,6 +34,9 @@ func replies(t *testing.T, send func(c *protocol.Conn)) func(context.Context) (p
 }
 
 func TestConsumeDepsCapturesInstallOutput(t *testing.T) {
+	old := statusEvery
+	statusEvery = 0
+	t.Cleanup(func() { statusEvery = old })
 	dir := t.TempDir()
 	next := replies(t, func(c *protocol.Conn) {
 		_ = c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: "npm ci"})
@@ -175,5 +178,98 @@ func TestDepsErrorDetail(t *testing.T) {
 	want := []string{"last 2 lines of the install's output:", "  npm ERR! missing", "  100%", "full log: /state/logs/deps/a.log"}
 	if d := got.Detail(); strings.Join(d, "|") != strings.Join(want, "|") {
 		t.Fatalf("detail = %q", d)
+	}
+}
+
+func TestConsumeDepsCoalescesStatus(t *testing.T) {
+	next := replies(t, func(c *protocol.Conn) {
+		_ = c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: "npm ci"})
+		for i := 0; i < 500; i++ {
+			_ = c.WriteFrame(protocol.KindStdout, []byte(fmt.Sprintf("line %d\n", i)))
+		}
+		_ = c.Send(protocol.TypeDepsResult, protocol.DepsResult{Key: "k", Built: true})
+	})
+	rep := &statusRep{}
+	log := newDepsLog(t.TempDir(), "r")
+	if _, err := consumeDeps(context.Background(), next, func(protocol.Event) {}, rep, "r", log); err != nil {
+		t.Fatal(err)
+	}
+	log.Close()
+	if len(rep.status) > 10 {
+		t.Fatalf("%d status updates for 500 quick lines", len(rep.status))
+	}
+	if b, _ := os.ReadFile(log.Path()); !strings.HasSuffix(string(b), "line 499\n") {
+		t.Fatal("throttling the status lost output from the log")
+	}
+}
+
+func TestDepsLogTailOnALineBoundary(t *testing.T) {
+	// The bytes dropped from the tail end exactly on a line break: the
+	// first line kept is whole and must be shown.
+	keep := "important failure\n" + strings.Repeat("p", depsTailBytes-len("important failure\n")-1) + "\n"
+	for _, writes := range [][]string{{"old\n", keep}, {"old\n" + keep}} {
+		l := newDepsLog("", "r")
+		for _, w := range writes {
+			l.Write([]byte(w))
+		}
+		tail, cut := l.Tail(depsTailLines)
+		if !cut || !strings.HasPrefix(tail, "important failure\n") {
+			t.Fatalf("writes %d: tail starts %.30q (cut %v)", len(writes), tail, cut)
+		}
+		if cap(l.tail) > depsTailBytes {
+			t.Fatalf("tail buffer grew to %d bytes", cap(l.tail))
+		}
+	}
+	// Many writes, one bigger than the bound: the buffer stays bounded and
+	// holds the newest output.
+	l := newDepsLog("", "r")
+	l.Write([]byte(strings.Repeat("a\n", depsTailBytes)))
+	for i := 0; i < 50; i++ {
+		fmt.Fprintf(l, "w%d\n", i)
+	}
+	if tail, _ := l.Tail(1); tail != "w49" || cap(l.tail) > depsTailBytes {
+		t.Fatalf("tail %q, cap %d", tail, cap(l.tail))
+	}
+}
+
+func TestDepsLogEmptyWriteAndUnwritableDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+	l := newDepsLog(dir, "r")
+	l.Write(nil)
+	l.Write([]byte{})
+	if _, err := os.Stat(dir); !os.IsNotExist(err) || l.Path() != "" {
+		t.Fatal("an empty frame created a log")
+	}
+
+	// A logs directory that can't be made: no file, but the tail is kept.
+	file := filepath.Join(t.TempDir(), "f")
+	_ = os.WriteFile(file, nil, 0o600)
+	l = newDepsLog(filepath.Join(file, "deps"), "r")
+	if n, err := l.Write([]byte("npm ERR! boom\n")); n != 14 || err != nil {
+		t.Fatalf("write = %d, %v", n, err)
+	}
+	l.Write([]byte("more\n"))
+	l.Close()
+	if tail, _ := l.Tail(depsTailLines); l.Path() != "" || tail != "npm ERR! boom\nmore" {
+		t.Fatalf("path %q, tail %q", l.Path(), tail)
+	}
+
+	// The file failing part way: the path keeps what was written, and no
+	// new file is opened.
+	l = newDepsLog(t.TempDir(), "r")
+	l.Write([]byte("first\n"))
+	path := l.Path()
+	l.f.Close() // later writes fail
+	l.Write([]byte("second\n"))
+	l.Write([]byte("third\n"))
+	l.Close()
+	if b, _ := os.ReadFile(path); string(b) != "first\n" || l.Path() != path {
+		t.Fatalf("log %q at %q", b, l.Path())
+	}
+	if ents, _ := os.ReadDir(filepath.Dir(path)); len(ents) != 1 {
+		t.Fatalf("%d logs after a failed write", len(ents))
+	}
+	if tail, _ := l.Tail(depsTailLines); tail != "first\nsecond\nthird" {
+		t.Fatalf("tail %q", tail)
 	}
 }

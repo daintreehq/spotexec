@@ -375,7 +375,9 @@ var digits = regexp.MustCompile(`[0-9][0-9.:]*`)
 // change as a new phase.
 const DetailSep = " — "
 
-var ansi = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]`)
+// ansi matches escape sequences: OSC (a title, a hyperlink) up to its BEL or
+// ST terminator, CSI with any parameters, and two-byte escapes.
+var ansi = regexp.MustCompile(`\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]`)
 
 // LogLine makes a line of someone else's log safe and short enough for a
 // status line: the last \r rewrite only, no escape sequences or control
@@ -405,7 +407,7 @@ func CleanLines(s string) []string {
 func cleanLine(s string) string {
 	s = ansi.ReplaceAllString(s, "")
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		if r < 0x20 || r >= 0x7f && r <= 0x9f {
 			if r == '\t' {
 				return ' '
 			}

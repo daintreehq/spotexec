@@ -1085,22 +1085,23 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	o.Rep.Clear()
 	ms := time.Since(t).Milliseconds()
 	if err != nil {
-		var re *transport.RemoteError
-		if !errors.As(err, &re) {
-			return dr, err // the runner was lost, or this run interrupted
-		}
 		tail, truncated := log.Tail(depsTailLines)
-		ev := map[string]any{"code": re.Code, "message": re.Message, "duration_ms": ms}
-		if log.Bytes() > 0 {
-			ev["output_tail"], ev["output_truncated"] = tail, truncated
+		var re *transport.RemoteError
+		if errors.As(err, &re) {
+			// The helper reported the failure: no retry follows.
+			ev := map[string]any{"code": re.Code, "message": re.Message, "duration_ms": ms}
+			if log.Bytes() > 0 {
+				ev["output_tail"], ev["output_truncated"] = tail, truncated
+			}
+			if p := log.Path(); p != "" {
+				ev["log"] = p
+			}
+			o.Rep.Event("deps_failed", ev)
 		}
-		if p := log.Path(); p != "" {
-			ev["log"] = p
+		if log.Bytes() == 0 || ctx.Err() != nil {
+			return dr, err // nothing to show, or this run was interrupted
 		}
-		o.Rep.Event("deps_failed", ev)
-		if log.Bytes() == 0 {
-			return dr, err
-		}
+		// A runner lost mid-install keeps what it printed, too.
 		return dr, &DepsError{Err: err, Tail: tail, Truncated: truncated, Log: log.Path()}
 	}
 	ev := map[string]any{"key": dr.Key, "built": dr.Built, "restored": dr.Restored, "uploading": dr.Uploaded,

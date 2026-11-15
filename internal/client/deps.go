@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -50,11 +51,15 @@ func (e *DepsError) Detail() []string {
 	return out
 }
 
+// statusEvery is how often the install's latest line may update the status.
+var statusEvery = 100 * time.Millisecond
+
 // consumeDeps reads the helper's replies to a deps request until its result.
 // The install's output goes to log only, never to the run's stdout or
 // stderr: its latest line is shown as the status's detail instead.
 func consumeDeps(ctx context.Context, next func(context.Context) (protocol.Frame, error), onEvent func(protocol.Event), rep ui.Reporter, label string, log *depsLog) (protocol.DepsResult, error) {
-	status := ""
+	status, shown := "", ""
+	var shownAt time.Time
 	for {
 		f, err := next(ctx)
 		if err != nil {
@@ -63,7 +68,10 @@ func consumeDeps(ctx context.Context, next func(context.Context) (protocol.Frame
 		switch f.Kind {
 		case protocol.KindStdout, protocol.KindStderr:
 			log.Write(f.Data)
-			if line := ui.LogLine(lastLine(f.Data)); line != "" && status != "" {
+			// At most as often as the spinner turns: a chatty install
+			// sends many small frames.
+			if line := ui.LogLine(lastLine(f.Data)); line != "" && status != "" && line != shown && time.Since(shownAt) >= statusEvery {
+				shown, shownAt = line, time.Now()
 				rep.Status("%s%s%s", status, ui.DetailSep, line)
 			}
 			continue
