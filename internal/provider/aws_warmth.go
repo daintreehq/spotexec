@@ -135,9 +135,9 @@ func (g *AWSGlobal) warmth(ctx context.Context, t PriceTable, refresh bool) map[
 	defer cancel()
 	// Answers belong to the account, not the profile's name: the same
 	// profile (or none) can point at another account. Unknown: nothing is
-	// kept.
+	// kept. Asked in a priced region: the home region may not be enabled.
 	scope := ""
-	if acct, err := g.home().accountID(lctx); err == nil {
+	if acct, err := g.Regional(regions[0]).accountID(lctx); err == nil {
 		scope = g.r.Profile + "|" + acct
 	}
 	cached := map[string]evidence{}
