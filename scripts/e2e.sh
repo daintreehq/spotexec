@@ -318,7 +318,8 @@ shards = 3
 EOF
 "$SX" sharded 'x y' >"$WORK/sh.out" 2>&1 || true
 check "sharded task fans out with its number and the args" "grep -qx '\\[sharded 1/3\\] shard=1/3 arg=1/3 x y' $WORK/sh.out && grep -qx '\\[sharded 2/3\\] shard=2/3 arg=2/3 x y' $WORK/sh.out && grep -qx '\\[sharded 3/3\\] shard=3/3 arg=3/3 x y' $WORK/sh.out"
-check "sharded task results name each shard" "[ \$(grep -Ec '^sx: sharded [123]/3 · .* on box#[0-9]' $WORK/sh.out) = 3 ]"
+check "sharded task results name each shard" "(for n in 1 2 3; do [ \$(grep -Ec \"^sx: sharded \$n/3 · [0-9][^·]* on box#[0-9]\" $WORK/sh.out) = 1 ] || exit 1; done)"
+check "sharded task summary lists each shard" "(for n in 1 2 3; do [ \$(grep -Ec \"^sx: sharded \$n/3 · passed · \" $WORK/sh.out) = 1 ] || exit 1; done)"
 git add -A >/dev/null && git commit -qm wip
 "$SX" -q 'mv src/gen.txt src/Gen.txt' || true
 check "case-only rename keeps the file" "ls src | grep -qx Gen.txt"
