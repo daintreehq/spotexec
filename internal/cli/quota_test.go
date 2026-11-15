@@ -197,3 +197,11 @@ func TestSizeStarterFleetKeepsConfigOnFailure(t *testing.T) {
 		t.Fatal("a failed resize changed the config")
 	}
 }
+
+func TestQuotaFitsRequirements(t *testing.T) {
+	rs := []*config.Runner{{Name: "r", Type: config.TypeAWSSpot, Region: "us-east-2", MaxInstances: 3, VCPUs: 8}}
+	fits := quotaFits(rs, map[string]float64{"us-east-2": 16})
+	if len(fits) != 1 || fits[0] != (provider.QuotaFit{Region: "us-east-2", Quota: 16, OneVM: 8, Fleet: 24}) {
+		t.Fatalf("fits %+v", fits)
+	}
+}

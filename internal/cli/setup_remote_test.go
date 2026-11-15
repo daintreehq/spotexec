@@ -485,16 +485,17 @@ func TestCheckLoginShellRealShells(t *testing.T) {
 		t.Run(filepath.Base(c.shell), func(t *testing.T) {
 			f := newFakeHost(t, filepath.Join(t.TempDir(), "my home"))
 			t.Setenv("SHELL", c.shell)
-			f.localInstalled("0.3.0")
+			t.Setenv("ZDOTDIR", f.home) // zsh reads its profiles from the fake home
+			f.localInstalled("99.0.0")  // a version no real install on this machine has
 			r := f.setup()
-			err := r.checkLoginShell(context.Background(), "$HOME/.local/bin", "0.3.0")
+			err := r.checkLoginShell(context.Background(), "$HOME/.local/bin", "99.0.0")
 			if err == nil { // not found, or some other spotexec installed here
 				t.Fatal("ready without a profile")
 			}
 			if err := os.WriteFile(filepath.Join(f.home, c.file), []byte(c.line+"\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if err := r.checkLoginShell(context.Background(), "$HOME/.local/bin", "0.3.0"); err != nil {
+			if err := r.checkLoginShell(context.Background(), "$HOME/.local/bin", "99.0.0"); err != nil {
 				t.Fatal(err)
 			}
 		})

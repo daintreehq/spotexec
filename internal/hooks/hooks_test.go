@@ -145,6 +145,9 @@ func isolate(t *testing.T, runner bool) {
 	t.Setenv("SPOTEXEC_POOL", "")
 	t.Setenv("SPOTEXEC_RUNNER", "")
 	t.Setenv("BASH_MAX_TIMEOUT_MS", "")
+	// Not this machine's Claude Code settings (RTK's hook, say).
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(d, "claude"))
+	t.Setenv("CLAUDE_PROJECT_DIR", "")
 	if runner {
 		if err := os.WriteFile(filepath.Join(d, "config.toml"), []byte("version = 1\n[runners.box]\ntype = \"ssh\"\nhost = \"me@box\"\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -442,6 +445,20 @@ func TestUsableRunnersMatchesRun(t *testing.T) {
 	if res, raw := runHook(t, ev); res.H.Updated != nil || res.System == "" {
 		t.Fatalf("root config has no usable runner: %s", raw)
 	}
+	// A committed fleet built on a runner this machine lacks doesn't stop
+	// commands that don't use it; a pool that names it stays local (#66).
+	fleet := projectDir(t, "[runners.aws-big]\nextends = \"aws\"\nmax_slots = 1\n")
+	ev["cwd"], ev["session_id"] = fleet, "f1"
+	if res, raw := runHook(t, ev); res.H.Updated == nil {
+		t.Fatalf("an unused unavailable fleet should still offload: %s", raw)
+	}
+	fleet = projectDir(t, "pool = [\"aws-big\"]\n[runners.aws-big]\nextends = \"aws\"\n")
+	ev["cwd"], ev["session_id"] = fleet, "f2"
+	if res, raw := runHook(t, ev); res.H.Updated != nil || !strings.Contains(res.System+raw, "aws-big") {
+		t.Fatalf("a pool of an unavailable fleet should stay local and say why: %s", raw)
+	}
+	ev["cwd"], ev["session_id"] = root, "n1"
+
 	// A nested repository without a .spotexec.toml runs with the defaults.
 	lib := filepath.Join(root, "vendor", "lib")
 	os.MkdirAll(lib, 0o755)
@@ -468,7 +485,7 @@ func TestFirstNoticeOncePerSessionConcurrently(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if firstNotice("same") {
+			if firstNotice("", "same") {
 				n.Add(1)
 			}
 		}()

@@ -420,8 +420,8 @@ func slotsOf(r *config.Runner) int {
 	if r.MaxSlots > 0 {
 		return r.MaxSlots
 	}
-	if r.Type == config.TypeAWSSpot && len(r.InstanceTypes) > 0 {
-		return min(max(1, provider.VCPUsOf(r.InstanceTypes[0])/4), protocol.MaxSlots)
+	if n := provider.VMVCPUs(r); r.Type == config.TypeAWSSpot && n > 0 {
+		return min(max(1, n/4), protocol.MaxSlots)
 	}
 	return 4
 }

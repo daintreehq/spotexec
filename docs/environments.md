@@ -49,26 +49,67 @@ dockerfile = ".spotexec/Dockerfile"   # built on the runner; or:
 # image = "node:22-bookworm"          # pulled as-is
 # context = "."                       # default: the Dockerfile's directory
 # options = ["--shm-size=1g"]         # extra `docker run` arguments
+# network = "private"                 # "host" (default: the runner's network) or "private" (one per run)
 # user = "root"                       # "runner" (default: files keep the right owner) or "root"
+# docker = true                       # let commands start containers of their own; see below
 # timeout = "20m"                     # pull/build limit
 ```
 
-- **Paths and ports.** Write-back, path rewriting and snapshots work unchanged. Containers use host networking, so `SPOTEXEC_PORT_BASE` still applies.
+- **Paths and ports.** Write-back, path rewriting and snapshots work unchanged. By default containers use host networking, so `SPOTEXEC_PORT_BASE` still applies, services running on the runner are reachable on `localhost`, and names resolve from the runner's `/etc/hosts` (on `aws-spot` VMs, `localhost` is both `127.0.0.1` and `::1`).
+- **Fixed ports.** Every job on a machine shares host networking, so two jobs whose tests bind the same fixed port (a test server on `3000`, a suite's own Postgres on `5432`, an OAuth callback on a registered port) collide when they land on the same VM: one fails with `EADDRINUSE`, or worse, talks to the other job's server. Tests that bind `SPOTEXEC_PORT_BASE` or an ephemeral port (`0`) never do. When the tests can't be changed, set `network = "private"`: each command (and the dependency install) then runs in a network of its own on Docker's default bridge, with its own `localhost` and every port free, while outbound connections (package registries, APIs) work as before. What it gives up: services on the runner itself aren't reachable on `localhost`, and `localhost` inside the container comes from Docker's `/etc/hosts`, not the runner's. Each command is its own container, so a server started by one command isn't reachable from the next; start it in the same command as the tests that use it, as a test suite normally does. It separates ports, not traffic: containers on the bridge can still reach one another by IP, and a fixed port published with `-p` in `options` still collides. Names resolve through the runner's upstream DNS servers (Docker reads past a `systemd-resolved` stub); add `--dns` to `options` if the runner's resolver is reachable only on its own `localhost`. A `--network` or `--net` in `options` wins over `network`.
 - **Ownership.** With `user = "root"`, files the container creates are given back to the runner user when it exits. If the run is aborted first (client gone, `spotexec unlock`), the slot's next run does it before starting.
+- **CPUs.** On a Linux runner, commands and the dependency install are pinned (`--cpuset-cpus`) to the slot's share of the VM: `SPOTEXEC_CPUS` CPUs, a separate block for each concurrent job (the job with `SPOTEXEC_SLOT=2` on an 8-vCPU, 4-slot VM gets CPUs 2-3). So `nproc`, Node's `os.availableParallelism()`, Go's `GOMAXPROCS`, `make -j$(nproc)` and test runners that size their workers from these use the job's share instead of the whole VM; tools that count every CPU on the machine (Node's `os.cpus()`) still see them all. `--exclusive` runs and runners with one slot aren't pinned. When vCPUs don't divide evenly, the leftover CPUs go to no slot; with more slots than vCPUs, each job gets one CPU, and jobs may share one. A pinned job can't borrow the cores of idle slots, so give a job that needs more `--exclusive` (or use fewer `max_slots`). Setting `--cpuset-cpus`, `--cpus`, `--cpu-quota`, `--cpu-period` or `--cgroup-parent` in `options` turns the pinning off (`SPOTEXEC_CPUS` doesn't change). The pinning also stays off, and the run goes ahead unpinned, wherever spotexec can't tell that a cpuset is valid for the Docker daemon: macOS runners (Docker Desktop's VM has its own CPUs), a daemon on another machine (`DOCKER_HOST` or a Docker context), a daemon without cpuset support, or one whose CPU count differs from the runner's. A `container_cpus` event (with `--json` or `--events-file`) says why, once per run. Every config that runs on the same machine should give it the same `max_slots`, or their jobs' blocks can overlap.
+- **Memory.** On spotexec's own Linux VMs, the containers of jobs that share a VM run in one memory pool (a cgroup, through `--cgroup-parent`) capped at the VM's memory less a reserve for the runner itself: 1/16 of it, at least 512 MiB and at most 2 GiB (about 14.6 GiB of a 15.6 GiB c7a.2xlarge). Jobs can burst past their fair share; if together they reach the cap, the kernel kills the largest process among them, usually the job that spiked, which ends with an `OOM_KILLED` warning (usually exit `137`), while the other jobs, the helper and Docker carry on. Without the pool, one job's spike could exhaust the VM until it stopped answering and every slot's run on it was lost. The container itself has no memory limit, on purpose: runtimes size themselves from a container's own limit, and Node caps its default heap near 2 GiB under any limit at all (half what it takes on the same VM without one), so a limit there breaks Node tools that fit fine without it. A job alone on the VM (`--exclusive`, or a runner with one slot) runs with no limit at all, as before. `SPOTEXEC_MEMORY` is the fair share (the pool ÷ `max_slots`), for sizing heaps and worker counts; nothing enforces it. The dependency install runs in the pool too, and one that's killed fails with `DEPS_FAILED` saying so. Setting `--memory`, `-m`, `--memory-swap`, `--memory-reservation`, `--kernel-memory`, `--oom-kill-disable`, `--oom-score-adj` or `--cgroup-parent` in `options` leaves the container out of the pool (and a container `--memory` limit shrinks Node's default heap as above). The pool is only set up (once per VM, with sudo) on spotexec's own VMs with cgroup v2 and Docker's `systemd` or `cgroupfs` cgroup driver; elsewhere (SSH runners, macOS, a daemon on another machine) jobs run without it and a `container_memory` event says why. Without a container, nothing limits a job's memory.
 - **Control.** Docker always runs as the runner user, so Ctrl-C and timeouts can always stop a container. `container.options` may not set `--name`, `--rm`, `--detach`, `--entrypoint`, `--user` or `--workdir`, because spotexec relies on those to find, stop and clean up containers.
 - **Caching.** The dependency cache is keyed by the image's immutable ID, so a moving tag like `node:22` never restores modules built for an older image.
+
+### Docker inside the container
+
+Test suites that start containers of their own (Testcontainers, `docker compose up` in a test setup, integration tests against a real Postgres) need a Docker daemon. `docker = true` gives the project container one: the runner's own daemon, through a socket at `/var/run/docker.sock` that belongs to the run.
+
+```toml
+[container]
+dockerfile = ".spotexec/Dockerfile"
+docker = true
+```
+
+- **What the command sees.** `DOCKER_HOST=unix:///var/run/docker.sock`, so the image's own `ENV` can't point Docker elsewhere, and `TESTCONTAINERS_HOST_OVERRIDE=localhost`, because with host networking the ports Testcontainers maps are on this machine, not at the gateway it would otherwise guess. Either can be overridden in `[env]`. The dependency install gets the same socket, and a `COMPOSE_PROJECT_NAME` of its slot's own. Docker's SDKs (Testcontainers for Java, Go, Python and Node) need nothing more; the `docker` CLI, and for Compose its plugin, have to be in the image (the `docker:cli` image has both, to copy from).
+- **Paths.** The workspace is mounted at the same absolute path as on the runner, so `docker run -v "$PWD:/src"` and Compose's relative bind mounts work as written. Files those containers create in the workspace are given back to the runner user afterwards, as with `user = "root"`.
+- **Scoped to the slot.** Every container, network and volume created through the socket is labelled with the slot and the run (`io.spotexec.slot`, `io.spotexec.run`). When the command ends (normally, on a timeout or Ctrl-C), the run's containers are removed with their anonymous volumes, then its networks and its named volumes; if the run is aborted before that (client gone, `spotexec unlock`, a helper that died), the slot's next run does it before starting. Results aren't collected while any of them is still there. A container removed through the socket (`docker rm`, Compose's `down`) takes its anonymous volumes with it, as `docker run --rm` does, since nothing could find them afterwards. Images the run pulls or builds stay, as a cache. Containers that mount `/var/run/docker.sock` themselves (Testcontainers' Ryuk, a Compose service driving Docker) get the run's socket too, so what they create is labelled as well.
+- **Names.** `COMPOSE_PROJECT_NAME` differs per slot, so Compose's containers, networks and volumes don't collide between concurrent jobs, and Testcontainers names its containers at random. A fixed name (`docker run --name postgres`, `container_name:` in a Compose file, a fixed host port) is shared by every job on the runner, and concurrent jobs collide on it.
+- **Limits.** Containers the command starts run beside the project container, not in it: they aren't pinned to the slot's CPUs or held to the memory pool. A volume a container creates implicitly by name (`docker run -v data:/data` without `docker volume create`) isn't labelled and outlives the run; Compose creates its volumes explicitly, so they are. Anything that reaches the daemon some other way (another socket path, a mount of `/var/run` itself, a `DOCKER_HOST` set in `[env]`) isn't labelled or cleaned up.
+- **Security.** Access to the Docker daemon is root on the runner: the command can start a `--privileged` container, mount `/`, and see or stop other jobs' containers. The labels are for cleanup, not isolation. Turn this on only for repositories you'd trust with root on the runner; on a shared `ssh` runner, that includes everyone who can change `.spotexec.toml`.
 
 ## Dependency cache
 
 With `[deps]` configured, each slot's `cache_dirs` are restored from a cache keyed by:
-- the lockfile contents and the install command;
+- the contents of the `lockfiles` and the install command;
 - the cache dirs;
 - the runner's OS and architecture;
 - in a [project container](#project-containers), the image's immutable ID;
 - otherwise, the runner's configured AMI, bootstrap scripts and `remote_path_setup`.
 
+`lockfiles` may hold globs, so the key can cover everything an install depends on, not just the package manager's lockfile, much like `hashFiles()` in a GitHub Actions cache key: workspace manifests, postinstall scripts and native addon sources.
+
+```toml
+[deps]
+lockfiles = [
+  "package-lock.json",
+  "packages/*/package.json",
+  "scripts/patchNodePty*.cjs",
+  "electron/native/*/binding.gyp",
+  "electron/native/*/package.json",
+  "electron/native/*/src/**",
+]
+```
+
+Patterns are expanded on your machine against the synced files (so they never match ignored files, `cache_dirs` contents or symlinks), and the runner hashes exactly that list. `**` is recursive here, unlike in `--pull`. A pattern matching nothing only warns. See [`[deps]`](configuration.md#dependencies) for the full rules, and `spotexec sync-plan` for the list a run would key on.
+
+`spotexec init` lists the root `node_modules` and each workspace's in `cache_dirs`, from package.json `workspaces` (npm, Yarn, Bun) or pnpm-workspace.yaml `packages`: the workspace glob `packages/*` becomes `packages/*/node_modules`. `cache_dirs` globs match one directory per `*`, so a workspace pattern they can't express (`**`, `{a,b}`) is left out, and init names it for you to add by hand. Update `cache_dirs` when the workspaces change.
+
 With a container, native modules never cross toolchain versions. Without one, pin tool versions in your bootstrap: upgrading Node on an `ssh` host, or a newer Ubuntu image behind `ami = "auto"`, doesn't change the key.
 
+- **The install's output stays out of the command's.** On a cache miss, the install runs before the command, and what it prints goes to a log on your machine (`~/.local/state/spotexec/logs/deps/`, the newest 20 kept) instead of the command's stdout and stderr. Its latest line shows in the progress line, and the summary says `installed dependencies (1m4s)`. When the install fails, its last 40 lines are printed under the error, with the path to the full log.
 - **On a runner,** caches are hydrated into the slot with `reflink` where the filesystem supports it (XFS, Btrfs, APFS), else `copy`. `hardlink` is opt-in, because shared inodes let one slot corrupt another's `node_modules`.
 - **Across Spot VMs,** the first VM to install a dependency set uploads it as one compressed archive to a private S3 bucket in your account, `spotexec-cache-<account>-<region>`. The bucket is created on the first `[deps]` run, with S3's default Block Public Access and a 14-day expiry. Without the S3 permissions, set `cache_bucket = "off"`. Later VMs download it instead of installing.
 - **VMs never hold AWS credentials.** The CLI hands each one presigned URLs, and only for a bucket your account owns.

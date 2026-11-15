@@ -82,7 +82,10 @@ type Manifest struct {
 	Bytes       int64
 	Excluded    map[string]int // pattern/reason -> count, for sync-plan
 	Matcher     *ignore.Matcher
-	spot        *spotExcluder // spotexec's own excludes, with Include applied
+	// Hidden: tracked paths git status doesn't look at here
+	// (assume-unchanged, skip-worktree).
+	Hidden map[string]bool
+	spot   *spotExcluder // spotexec's own excludes, with Include applied
 }
 
 // Build enumerates and hashes the working set.
@@ -137,6 +140,7 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		// assume-unchanged / skip-worktree entries are invisible to git
 		// status even when edited: never trust their index IDs.
 		if hidden, err := hiddenFromStatus(ctx, o.Root); err == nil {
+			m.Hidden = hidden
 			for p := range hidden {
 				dirty[p] = true
 			}

@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/hooks"
 	"github.com/daintreehq/spotexec/internal/provider"
 	"github.com/daintreehq/spotexec/internal/ui"
@@ -34,13 +37,16 @@ local_fallback = false
 type = "aws-spot"
 region = "{{REGION}}"
 # profile = "default"          # AWS CLI profile (SSO and aws login work)
-instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]  # 8 vCPUs; tried in order on capacity errors
+instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]  # 8 vCPUs; each VM gets the cheapest with Spot capacity
+# Or let spotexec pick from every current type of this size (instead of instance_types):
+# vcpus = 8                    # exact, so every VM gets the same slots
+# min_memory_gib = 16
 max_slots = 4                  # concurrent jobs per VM (SPOTEXEC_CPUS = 2 each)
 max_instances = 4              # fleet ceiling
 priority = 20
 idle_timeout = "10m"           # the VM terminates itself after this much idle time (15m suits long agent pauses)
 max_lifetime = "12h"           # hard cap regardless of activity
-hourly_cost = 0.12             # for 'spotexec monitor' burn estimates
+# hourly_cost = 0.12           # burn estimate for VMs without a Spot price (status and monitor use each VM's own Spot price)
 # max_price = "0.40"           # USD/hour cap (default: the on-demand price)
 # on_demand_fallback = true
 # cache_bucket = "auto"        # shared dependency cache in S3: auto | <bucket> | off
@@ -217,29 +223,30 @@ func detectProject(root string) (string, []string) {
 	b.WriteString("[sync]\nmode = \"auto\"          # write back files the command changed (prettier --write, vitest -u, codegen)\nwriteback = \"always\"\nexclude = [\".env*\", \"*.pem\", \"*.key\"]\npull_artifacts = []     # e.g. [\"coverage/\"]\n\n")
 
 	// The same package manager the project container installs.
-	pm, pmVer := jsPackageManager(root, readPackageJSON(root))
+	pkg := readPackageJSON(root)
+	pm, pmVer := jsPackageManager(root, pkg)
+	jsDeps := func() string {
+		dirs, n := jsCacheDirs(root, pm, pkg)
+		notes = append(notes, n...)
+		return tomlStrings(dirs)
+	}
 	switch {
 	case pm == "pnpm" && exists(root, "pnpm-lock.yaml"):
-		dirs := `["node_modules"]`
-		if exists(root, "pnpm-workspace.yaml") {
-			dirs = `["node_modules", "packages/*/node_modules", "apps/*/node_modules"]`
-			notes = append(notes, "pnpm workspace detected: adjust deps.cache_dirs globs to your package folders")
-		}
-		fmt.Fprintf(&b, "[deps]\nlockfiles = [\"pnpm-lock.yaml\"]\ninstall = \"pnpm install --frozen-lockfile\"\ncache_dirs = %s\n\n", dirs)
+		fmt.Fprintf(&b, "[deps]\nlockfiles = [\"pnpm-lock.yaml\"]\ninstall = \"pnpm install --frozen-lockfile\"\ncache_dirs = %s\n\n", jsDeps())
 	case pm == "bun" && (exists(root, "bun.lock") || exists(root, "bun.lockb")):
 		lf := "bun.lock"
 		if !exists(root, lf) {
 			lf = "bun.lockb"
 		}
-		fmt.Fprintf(&b, "[deps]\nlockfiles = [%q]\ninstall = \"bun install --frozen-lockfile\"\ncache_dirs = [\"node_modules\"]\n\n", lf)
+		fmt.Fprintf(&b, "[deps]\nlockfiles = [%q]\ninstall = \"bun install --frozen-lockfile\"\ncache_dirs = %s\n\n", lf, jsDeps())
 	case pm == "yarn" && exists(root, "yarn.lock"):
 		inst := "yarn install --frozen-lockfile"
 		if exists(root, ".yarnrc.yml") || (pmVer != "" && !strings.HasPrefix(pmVer, "1.")) {
 			inst = "yarn install --immutable"
 		}
-		fmt.Fprintf(&b, "[deps]\nlockfiles = [\"yarn.lock\"]\ninstall = %q\ncache_dirs = [\"node_modules\"]\n\n", inst)
+		fmt.Fprintf(&b, "[deps]\nlockfiles = [\"yarn.lock\"]\ninstall = %q\ncache_dirs = %s\n\n", inst, jsDeps())
 	case pm == "npm" && exists(root, "package-lock.json"):
-		b.WriteString("[deps]\nlockfiles = [\"package-lock.json\"]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\n\n")
+		fmt.Fprintf(&b, "[deps]\nlockfiles = [\"package-lock.json\"]\ninstall = \"npm ci\"\ncache_dirs = %s\n\n", jsDeps())
 	case exists(root, "uv.lock"):
 		b.WriteString("[deps]\nlockfiles = [\"uv.lock\"]\ninstall = \"uv sync --frozen\"\ncache_dirs = [\".venv\"]\n\n")
 	}
@@ -317,6 +324,221 @@ func detectProject(root string) (string, []string) {
 	return b.String(), notes
 }
 
+// jsCacheDirs returns deps.cache_dirs for a JavaScript project: the root
+// node_modules, then each workspace's, from pnpm-workspace.yaml "packages"
+// (pnpm) or package.json "workspaces" (npm, Yarn, Bun). Without them a run
+// restored from the cache would be missing every workspace's node_modules.
+func jsCacheDirs(root, pm string, pkg map[string]any) ([]string, []string) {
+	var pats []string
+	var notes []string
+	src := "package.json workspaces"
+	if pm == "pnpm" {
+		src = "pnpm-workspace.yaml packages"
+		if exists(root, "pnpm-workspace.yaml") {
+			var ok bool
+			if pats, ok = pnpmWorkspacePackages(readSmall(root, "pnpm-workspace.yaml")); !ok {
+				return []string{"node_modules", "packages/*/node_modules", "apps/*/node_modules"},
+					[]string{"pnpm workspace detected, but its packages list wasn't readable: adjust deps.cache_dirs globs to your package folders"}
+			}
+		}
+	} else {
+		if pkg == nil && exists(root, "package.json") {
+			notes = append(notes, "package.json didn't parse: deps.cache_dirs lists only the root node_modules; add each workspace's node_modules if it has workspaces")
+		}
+		pats = packageJSONWorkspaces(pkg)
+	}
+	dirs, skipped := workspaceNodeModules(pats)
+	if len(dirs) > 1 {
+		notes = append(notes, fmt.Sprintf("%s workspaces: deps.cache_dirs includes each workspace's node_modules, from %s (update it when those change)", pm, src))
+	}
+	if len(skipped) > 0 {
+		notes = append(notes, fmt.Sprintf("deps.cache_dirs leaves out workspace pattern(s) %s: cache_dirs globs match one directory per * (no ** or {a,b}) inside the repository; add those workspaces' node_modules by hand", strings.Join(skipped, ", ")))
+	}
+	return dirs, notes
+}
+
+// packageJSONWorkspaces reads "workspaces" as an array (npm, Yarn, Bun) or
+// an object with a "packages" array (Yarn classic, Bun).
+func packageJSONWorkspaces(pkg map[string]any) []string {
+	w := pkg["workspaces"]
+	if o, ok := w.(map[string]any); ok {
+		w = o["packages"]
+	}
+	list, _ := w.([]any)
+	var pats []string
+	for _, v := range list {
+		if s, ok := v.(string); ok {
+			pats = append(pats, s)
+		}
+	}
+	return pats
+}
+
+// workspaceNodeModules maps each workspace glob X to X/node_modules after
+// the root node_modules, deduplicated in declaration order. Negated
+// patterns only exclude, so they add nothing. skipped holds the (quoted)
+// patterns cache_dirs can't express: cache_dirs are expanded with
+// filepath.Glob, which has no ** or brace alternatives, and must stay
+// inside the repository.
+func workspaceNodeModules(pats []string) (dirs, skipped []string) {
+	dirs = []string{"node_modules"}
+	seen := map[string]bool{"node_modules": true}
+	for _, raw := range pats {
+		p := strings.TrimSpace(raw)
+		if p == "" || strings.HasPrefix(p, "!") {
+			continue
+		}
+		for strings.HasPrefix(p, "./") {
+			p = strings.TrimLeft(p[2:], "/")
+		}
+		p = strings.TrimRight(p, "/")
+		if p == "" || p == "." {
+			continue // the root itself
+		}
+		d := p + "/node_modules"
+		_, badGlob := path.Match(d, "")
+		_, badPath := fsid.CleanRel(strings.NewReplacer("*", "x", "?", "x", "[", "x", "]", "x").Replace(d))
+		if strings.Contains(p, "**") || strings.ContainsAny(p, "{}") || badGlob != nil || badPath != nil {
+			skipped = append(skipped, strconv.Quote(raw))
+			continue
+		}
+		if !seen[d] {
+			seen[d] = true
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs, skipped
+}
+
+// pnpmWorkspacePackages reads the top-level "packages" sequence of a
+// pnpm-workspace.yaml, block or flow style, without a YAML parser. ok is
+// false for anything it can't read with confidence (anchors, multi-line
+// scalars); a file without "packages" is ok and declares no workspaces.
+func pnpmWorkspacePackages(data string) (pats []string, ok bool) {
+	lines := strings.Split(strings.ReplaceAll(data, "\r\n", "\n"), "\n")
+	for i, l := range lines {
+		rest, found := strings.CutPrefix(l, "packages:")
+		if !found {
+			if r, f := strings.CutPrefix(l, `"packages":`); f {
+				rest, found = r, true
+			} else if r, f := strings.CutPrefix(l, `'packages':`); f {
+				rest, found = r, true
+			}
+		}
+		if !found {
+			continue
+		}
+		rest = strings.TrimSpace(stripYAMLComment(rest))
+		if strings.HasPrefix(rest, "[") {
+			if !strings.HasSuffix(rest, "]") {
+				return nil, false
+			}
+			for _, item := range strings.Split(rest[1:len(rest)-1], ",") {
+				if item = strings.TrimSpace(item); item == "" {
+					continue
+				}
+				v, ok := yamlScalar(item)
+				if !ok {
+					return nil, false
+				}
+				pats = append(pats, v)
+			}
+			return pats, true
+		}
+		if rest != "" {
+			return nil, false
+		}
+		for _, l := range lines[i+1:] {
+			t := strings.TrimSpace(l)
+			if t == "" || strings.HasPrefix(t, "#") {
+				continue
+			}
+			item, isItem := strings.CutPrefix(t, "-")
+			if !isItem || (item != "" && item[0] != ' ' && item[0] != '\t') {
+				break // the next key
+			}
+			v, ok := yamlScalar(strings.TrimSpace(item))
+			if !ok {
+				return nil, false
+			}
+			pats = append(pats, v)
+		}
+		return pats, true
+	}
+	return nil, true
+}
+
+// yamlScalar reads a single-line quoted or plain YAML scalar.
+func yamlScalar(s string) (string, bool) {
+	switch {
+	case s == "":
+		return "", false
+	case s[0] == '\'':
+		var v strings.Builder
+		for i := 1; i < len(s); i++ {
+			if s[i] != '\'' {
+				v.WriteByte(s[i])
+				continue
+			}
+			if i+1 < len(s) && s[i+1] == '\'' { // '' is an escaped quote
+				v.WriteByte('\'')
+				i++
+				continue
+			}
+			if strings.TrimSpace(stripYAMLComment(s[i+1:])) != "" {
+				return "", false
+			}
+			return v.String(), true
+		}
+		return "", false
+	case s[0] == '"':
+		for i := 1; i < len(s); i++ {
+			switch s[i] {
+			case '\\':
+				i++
+			case '"':
+				v, err := strconv.Unquote(s[:i+1])
+				if err != nil || strings.TrimSpace(stripYAMLComment(s[i+1:])) != "" {
+					return "", false
+				}
+				return v, true
+			}
+		}
+		return "", false
+	case strings.ContainsRune("&*|>{[@`%", rune(s[0])):
+		return "", false
+	}
+	return strings.TrimSpace(stripYAMLComment(s)), true
+}
+
+// stripYAMLComment drops a trailing comment: # at the start or after
+// whitespace, outside quotes.
+func stripYAMLComment(s string) string {
+	var q byte
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case q != 0:
+			if c == q {
+				q = 0
+			}
+		case c == '\'' || c == '"':
+			q = c
+		case c == '#' && (i == 0 || s[i-1] == ' ' || s[i-1] == '\t'):
+			return s[:i]
+		}
+	}
+	return s
+}
+
+// tomlStrings renders a TOML array of basic strings.
+func tomlStrings(ss []string) string {
+	q := make([]string, len(ss))
+	for i, s := range ss {
+		q[i] = strconv.Quote(s)
+	}
+	return "[" + strings.Join(q, ", ") + "]"
+}
+
 func hookBinary() string {
 	exe, err := os.Executable()
 	if err == nil {
@@ -362,8 +584,7 @@ func cmdHook() *cobra.Command {
 				var p string
 				switch {
 				case globalScope:
-					home, _ := os.UserHomeDir()
-					p = filepath.Join(home, ".claude", "settings.json")
+					p = hooks.GlobalSettings()
 				case shared:
 					p = filepath.Join(ws.Root, ".claude", "settings.json")
 				default:
@@ -377,12 +598,14 @@ func cmdHook() *cobra.Command {
 					fmt.Printf("%s: %s\n", p, map[bool]string{true: "removed spotexec hook", false: "no spotexec hook found"}[ok])
 				} else {
 					hookCmd := transportQuote(hookBinary()) + " hook claude"
-					legacy := hooks.HasLegacyClaude(p)
+					legacy, rtk := hooks.HasLegacyClaude(p), hooks.HasRTK(p)
 					ok, err := hooks.InstallClaude(p, hookCmd)
 					if err != nil {
 						return err
 					}
-					if ok && legacy {
+					if ok && rtk {
+						fmt.Printf("chained RTK's PreToolUse hook behind spotexec's in %s: spotexec decides first and hands every other command to RTK\n", p)
+					} else if ok && legacy {
 						fmt.Printf("updated the PreToolUse hook in %s to call spotexec (sx only runs commands)\n", p)
 					} else if ok {
 						fmt.Printf("installed PreToolUse hook in %s\n", p)
@@ -392,6 +615,7 @@ func cmdHook() *cobra.Command {
 					if !exists(ws.Root, ".spotexec.toml") {
 						fmt.Println("note: the hook only offloads in projects with a .spotexec.toml (run `spotexec init`)")
 					}
+					rtkNote(p, wd)
 					fmt.Println("note: permission rules now see `spotexec run -- <cmd>`; allow `Bash(spotexec run:*)` if you pre-approve test commands")
 				}
 			}
@@ -433,12 +657,18 @@ func cmdHook() *cobra.Command {
 	install.Flags().BoolVar(&globalScope, "global", false, "install into ~/.claude/settings.json")
 	install.Flags().BoolVar(&shared, "shared", false, "install into .claude/settings.json (committed) instead of settings.local.json")
 	install.Flags().BoolVar(&uninstall, "uninstall", false, "remove the hook instead")
+	var then string
 	handler := &cobra.Command{
 		Use:    "claude",
 		Short:  "PreToolUse hook handler (reads the event JSON on stdin)",
 		Hidden: true,
-		Run:    func(*cobra.Command, []string) { claudeHook() },
+		Run: func(*cobra.Command, []string) {
+			if code := claudeHook(then); code != 0 {
+				os.Exit(code)
+			}
+		},
 	}
+	handler.Flags().StringVar(&then, "then", "", "hook command to hand every event spotexec leaves alone to (RTK's)")
 	check := &cobra.Command{
 		Use:                "check <command>",
 		Short:              "Show whether the hook would offload a command line",
@@ -457,7 +687,8 @@ func cmdHook() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			line := strings.Join(args, " ")
+			orig := strings.Join(args, " ")
+			line, explicit, raw := hooks.UnwrapRTK(orig)
 			runnersErr := hooks.RunnersFor(line, wd, l.cfg.Project)
 			// The same decision the hook makes (project opt-in, disabled,
 			// cd outside the repository).
@@ -475,7 +706,13 @@ func cmdHook() *cobra.Command {
 			case runnersErr != nil:
 				fmt.Printf("local (no usable runners: %v)\n", runnersErr)
 			default:
-				fmt.Println("offload:", hooks.Wrap("spotexec", line))
+				rtk := hooks.RTKFor(wd)
+				wrapped := hooks.WrapRTK("spotexec", line, !raw && (explicit || rtk.InUse()))
+				if file, ok := rtk.Races(orig); ok {
+					fmt.Printf("offload, by denying it with instructions to re-run as: %s\n(RTK's hook in %s would rewrite it too; chain the hooks with `spotexec hook install`)\n", wrapped, file)
+					return nil
+				}
+				fmt.Println("offload:", wrapped)
 				return nil
 			}
 			return errors.New("not offloaded")
@@ -485,9 +722,21 @@ func cmdHook() *cobra.Command {
 	return c
 }
 
-// claudeHook handles one Claude Code PreToolUse event on stdin.
-func claudeHook() {
-	hooks.HandleClaude(os.Stdin, os.Stdout, transportQuote(hookBinary()))
+// claudeHook handles one Claude Code PreToolUse event on stdin, handing it
+// to then (RTK's hook) when spotexec leaves the command alone.
+func claudeHook(then string) int {
+	return hooks.RunClaude(os.Stdin, os.Stdout, os.Stderr, hooks.ClaudeOptions{Bin: transportQuote(hookBinary()), Then: then})
+}
+
+// rtkNote points at RTK hooks in the other settings files that apply here:
+// they would race the hook just installed in p.
+func rtkNote(p, dir string) {
+	for _, f := range hooks.ClaudeSettingsFiles(dir) {
+		if f == p || !hooks.HasRTK(f) {
+			continue
+		}
+		fmt.Printf("note: RTK's hook in %s rewrites the same commands; until it is chained (spotexec hook install --claude%s), offloaded commands are denied with instructions to re-run\n", f, hooks.SettingsScope(f))
+	}
 }
 
 func transportQuote(s string) string {

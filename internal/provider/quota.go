@@ -260,7 +260,7 @@ func (a *AWSSpot) admitSpot(u QuotaUsage, need int) *QuotaError {
 	if ok {
 		return nil
 	}
-	fleet := a.r.MaxInstances * vcpusOf(a.r.InstanceTypes[0])
+	fleet := a.r.MaxInstances * VMVCPUs(a.r)
 	return &QuotaError{Region: a.r.Region, Spot: true, Code: QuotaCodeSpotStandard, VCPUs: need,
 		Desired: u.desired(need, fleet), Usage: &u, Fair: fair}
 }
@@ -295,10 +295,6 @@ func minStandardVCPUs(types []string) int {
 	}
 	return n
 }
-
-// MinLaunchVCPUs is the smallest Spot launch among instance types that use
-// the standard Spot quota (0 when none of them does).
-func MinLaunchVCPUs(types []string) int { return minStandardVCPUs(types) }
 
 // QuotaFit compares a region's standard Spot vCPU quota with what the
 // runners there need: one VM (the smallest launch) to work at all, and every
@@ -369,7 +365,7 @@ func (s *AWSUserSetup) RequestQuotaIncrease(ctx context.Context, region string, 
 // one VM fits, and says how to raise the quota whenever the quota is what
 // limits the fleet. ok is false when there is nothing to report.
 func (a *AWSSpot) quotaCheck(ctx context.Context) (Check, bool) {
-	one := minStandardVCPUs(a.r.InstanceTypes)
+	one := MinLaunchVCPUsFor(a.r)
 	if one == 0 {
 		return Check{}, false // these types use other quotas
 	}
@@ -377,8 +373,8 @@ func (a *AWSSpot) quotaCheck(ctx context.Context) (Check, bool) {
 	if err != nil {
 		return Check{}, false
 	}
-	return quotaFinding(QuotaFit{Region: a.r.Region, Quota: q, OneVM: one, Fleet: a.r.MaxInstances * vcpusOf(a.r.InstanceTypes[0]),
-		Others: HasOtherFamilies(a.r.InstanceTypes)}), true
+	return quotaFinding(QuotaFit{Region: a.r.Region, Quota: q, OneVM: one, Fleet: a.r.MaxInstances * VMVCPUs(a.r),
+		Others: HasOtherFamiliesFor(a.r)}), true
 }
 
 // HasOtherFamilies reports instance types outside the standard families.

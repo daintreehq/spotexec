@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/daintreehq/spotexec/internal/dockerignore"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"os/user"
@@ -27,7 +28,7 @@ import (
 // bind-mounted at the same absolute path, so path rewriting, snapshots and
 // write-back work exactly as on the host. Commands run as the runner user by
 // default (files keep the right owner), with host networking (per-slot port
-// ranges still apply).
+// ranges still apply) unless container.network is "private" (networkArgs).
 //
 // Docker is always driven as the runner user (directly, or via `sg docker`
 // when the docker group was granted after this login), never via sudo: the
@@ -36,8 +37,12 @@ import (
 
 var imageRefRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}$`)
 
-// dockerRunner composes shell commands that run docker.
-type dockerRunner struct{ viaSG bool }
+// dockerRunner composes shell commands that run docker. info is what the
+// probe's `docker info` printed (stdout and stderr), for the daemon's CPUs.
+type dockerRunner struct {
+	viaSG bool
+	info  string
+}
 
 // cmd returns a shell command running `docker <args>` (args already quoted).
 func (d dockerRunner) cmd(args string) string {
@@ -69,11 +74,19 @@ func probeDocker(ctx context.Context) (dockerRunner, error) {
 	}
 	pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	if exec.CommandContext(pctx, "docker", "info").Run() == nil {
-		return dockerRunner{}, nil
+	info := func(name string, arg ...string) (string, error) {
+		cmd := exec.CommandContext(pctx, name, arg...)
+		cmd.WaitDelay = 5 * time.Second // a docker left behind by a killed sg can't hold the output pipe open
+		out, err := cmd.CombinedOutput()
+		return string(out), err
 	}
-	if inDockerGroup() && exec.CommandContext(pctx, "sg", "docker", "-c", "docker info").Run() == nil {
-		return dockerRunner{viaSG: true}, nil
+	if out, err := info("docker", "info"); err == nil {
+		return dockerRunner{info: out}, nil
+	}
+	if inDockerGroup() {
+		if out, err := info("sg", "docker", "-c", "docker info"); err == nil {
+			return dockerRunner{viaSG: true, info: out}, nil
+		}
 	}
 	return dockerRunner{}, errors.New("docker is installed but this user cannot use it (add it to the docker group)")
 }
@@ -119,19 +132,28 @@ func (s *Session) ensureDocker(ctx context.Context) (dockerRunner, bool, error) 
 	}
 	u, _ := user.Current()
 	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "docker_install", Message: "installing docker on the runner (add `apt-get install -y docker.io docker-buildx` and `usermod -aG docker " + u.Username + "` to bootstrap_script to skip this)"})
-	script := `set -e
-export DEBIAN_FRONTEND=noninteractive
-if ! command -v docker >/dev/null 2>&1; then
-  sudo -n apt-get update -o DPkg::Lock::Timeout=300 -qq
-  sudo -n apt-get install -y -qq -o DPkg::Lock::Timeout=300 docker.io docker-buildx
-fi
-sudo -n systemctl enable --now docker >/dev/null 2>&1 || sudo -n service docker start || true
-sudo -n usermod -aG docker ` + shq(u.Username)
+	// apt's output goes to a log, shown only if the install fails: the
+	// event above already says what is happening, and an agent reading the
+	// run's output shouldn't get dpkg's progress. sudo resets the
+	// environment, so DEBIAN_FRONTEND goes through env. Chained with &&
+	// rather than set -e, which an if condition would disable.
+	script := `log=` + shq(filepath.Join(s.layout.Root, "docker-install.log")) + `
+if ! (
+  { command -v docker >/dev/null 2>&1 || {
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -o DPkg::Lock::Timeout=300 -qq &&
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeout=300 docker.io docker-buildx; }; } &&
+  { sudo -n systemctl enable --now docker || sudo -n service docker start || true; } &&
+  sudo -n usermod -aG docker ` + shq(u.Username) + `
+) >"$log" 2>&1; then
+  echo "installing docker failed; the end of $log:" >&2
+  tail -n 40 "$log" >&2
+  exit 1
+fi`
 	left := min(10*time.Minute, time.Until(deadlineOf(ctx)))
 	if left <= 0 {
 		return dockerRunner{}, false, errors.New("no time left to install docker")
 	}
-	pr := s.runProc(script, s.layout.Root, nil, left, 5*time.Second, false)
+	pr := s.runProc(script, s.layout.Root, nil, left, 5*time.Second, false, nil)
 	if pr.code != 0 {
 		return dockerRunner{}, false, fmt.Errorf("installing docker failed (exit %d)", pr.code)
 	}
@@ -180,7 +202,7 @@ func (s *Session) image(m protocol.Image) error {
 		if left <= 0 {
 			return errors.New("image preparation timed out")
 		}
-		pr := s.runProc(script, s.workspace, nil, left, 5*time.Second, false)
+		pr := s.runProc(script, s.workspace, nil, left, 5*time.Second, false, nil)
 		if pr.startErr != nil {
 			return pr.startErr
 		}
@@ -556,6 +578,7 @@ func startImagePush(root string, d dockerRunner, local, remote, cfgDir string) e
 // stdin). It holds the lifecycle lock, is bounded, and stops if the VM
 // starts draining.
 func ImagePush(root string) error {
+	resetOwnOOMScore() // started by a protected helper: don't keep its score
 	sc := bufio.NewScanner(os.Stdin)
 	var lines []string
 	for sc.Scan() {
@@ -613,6 +636,8 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 			return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
 		}
 	}
+	// Before procMu: these may send an event.
+	limits := append(s.cpusetArgs(run, d), s.memoryArgs(run, d)...)
 	s.procMu.Lock()
 	if s.stopping.Load() {
 		s.procMu.Unlock()
@@ -634,6 +659,27 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	// redirect `docker run` itself): single-line values via a 0600
 	// env-file, multi-line values as quoted -e KEY=value arguments.
 	envPath := filepath.Join(runDir, id+".env")
+	if run.Root && s.state.GitOwned {
+		env = withSafeDirectory(env, s.workspace)
+	}
+	if run.Docker {
+		env = maps.Clone(env)
+		// The run's own socket, whatever the image's ENV says; with host
+		// networking, Testcontainers would otherwise look for the ports it
+		// maps at the VPC's gateway rather than on this machine.
+		// Exec runs get COMPOSE_PROJECT_NAME from the client; the dependency
+		// install gets one here, so Compose stacks of concurrent slots differ.
+		defaults := map[string]string{
+			"DOCKER_HOST":                  "unix:///var/run/docker.sock",
+			"TESTCONTAINERS_HOST_OVERRIDE": "localhost",
+			"COMPOSE_PROJECT_NAME":         strings.Trim(s.containerPrefix(), "-"),
+		}
+		for k, v := range defaults {
+			if _, set := env[k]; !set {
+				env[k] = v
+			}
+		}
+	}
 	var envb strings.Builder
 	var multi []string
 	keys := make([]string, 0, len(env))
@@ -667,18 +713,43 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		os.Remove(envPath)
 		return "", nil, nil, err
 	}
-	args := []string{
-		"run", "--rm", "--init", "--name", name, "--network", "host",
-		"-v", s.workspace + ":" + s.workspace,
-		"-v", scriptPath + ":/tmp/spotexec-run.sh:ro",
+	args := append([]string{"run", "--rm", "--init", "--name", name}, networkArgs(run)...)
+	args = append(args,
+		"-v", s.workspace+":"+s.workspace,
+		"-v", scriptPath+":/tmp/spotexec-run.sh:ro",
 		"--env-file", envPath,
 		"-w", dir, "--entrypoint", "/bin/sh",
+	)
+	var proxy *dockerProxy
+	if run.Docker {
+		pdir, err := newProxyDir()
+		if err == nil {
+			// Cleared once what the run started is removed: if the run is
+			// aborted first, the slot's next holder does it, and removes the
+			// socket's directory.
+			err = appendLine(filepath.Join(s.slotDir, dockerRunMarker), pdir)
+			if err != nil {
+				os.RemoveAll(pdir)
+			}
+		}
+		if err == nil {
+			proxy, err = startDockerProxy(d, pdir, s.workspace, map[string]string{labelSlot: s.containerPrefix(), labelRun: name})
+		}
+		if err != nil {
+			os.Remove(scriptPath)
+			os.Remove(envPath)
+			return "", nil, nil, err
+		}
+		// --mount, not -v: a missing socket fails the run instead of
+		// becoming an empty directory.
+		args = append(args, "--mount", "type=bind,source="+proxy.sock+",target=/var/run/docker.sock")
 	}
 
 	if !run.Root {
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
 			"-v", home+":/home/spotexec", "-e", "HOME=/home/spotexec")
 	}
+	args = append(args, limits...)
 	args = append(args, run.Options...)
 	args = append(args, run.Image, "-c",
 		`if command -v bash >/dev/null 2>&1; then exec bash /tmp/spotexec-run.sh; else exec sh /tmp/spotexec-run.sh; fi`)
@@ -688,16 +759,27 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	}
 	host := "exec " + d.cmd(strings.Join(q, " "))
 	marker := filepath.Join(s.slotDir, rootRunMarker)
-	if run.Root {
+	// Containers the run starts itself usually run as root, and may write
+	// into the workspace through a bind mount, so their files are given
+	// back too.
+	giveBack := run.Root || run.Docker
+	if giveBack {
 		// Cleared once the run's files are given back: if the run is
 		// aborted first, the slot's next holder does it (reclaimFiles).
 		if err := os.WriteFile(marker, []byte(run.Image+"\n"), 0o644); err != nil {
+			if proxy != nil {
+				proxy.stop()
+			}
 			os.Remove(scriptPath)
 			os.Remove(envPath)
 			return "", nil, nil, err
 		}
 	}
 	s.containers.Store(name, d)
+	if proxy != nil {
+		s.nested.Store(name, nestedRun{d, proxy})
+	}
+	s.lastContainer.name, s.lastContainer.d, s.lastContainer.started = name, d, time.Now()
 	cleanup := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -705,9 +787,23 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 			return err // keep tracking it; the caller must not snapshot
 		}
 		s.containers.Delete(name)
+		if proxy != nil {
+			// Nothing in the run can call Docker any more, so nothing it
+			// starts can appear after this sweep.
+			proxy.stop()
+			if left := removeLabelled(ctx, d, labelRun+"="+name); left != "" {
+				return fmt.Errorf("containers, networks or volumes the run started could not be removed: %s", left)
+			}
+			s.nested.Delete(name)
+			pending := false
+			s.nested.Range(func(any, any) bool { pending = true; return false })
+			if !pending {
+				os.Remove(filepath.Join(s.slotDir, dockerRunMarker))
+			}
+		}
 		os.Remove(scriptPath)
 		os.Remove(envPath)
-		if run.Root {
+		if giveBack {
 			switch err := s.giveBackFiles(ctx, &d, run.Image); {
 			case err == nil:
 				os.Remove(marker)
@@ -720,9 +816,54 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	return host, nil, cleanup, nil
 }
 
+// networkArgs picks the container's network. By default it is the
+// runner's own (host networking: SPOTEXEC_PORT_BASE ranges apply, and
+// services on the runner are reachable). "private" gives each run a
+// network namespace of its own on Docker's default bridge, so fixed ports
+// (a test server on 3000, a suite's own Postgres on 5432) can't collide
+// with another slot's, and localhost reaches only the run's own; outbound
+// traffic goes through NAT. It separates ports, not traffic: containers on
+// the bridge can still reach one another by IP.
+// A --network or --net in container.options wins: the user decides.
+func networkArgs(run *protocol.ContainerRun) []string {
+	for _, f := range dockerFlags(run.Options) {
+		if f == "--network" || f == "--net" {
+			return nil
+		}
+	}
+	if run.Network == "private" {
+		return []string{"--network", "bridge"}
+	}
+	return []string{"--network", "host"}
+}
+
 // rootRunMarker, in a slot directory, names the image of a root container
 // run whose files haven't been given back to the runner user yet.
 const rootRunMarker = "root-run"
+
+// dockerRunMarker, in a slot directory, says a container.docker run may
+// have left containers, networks or volumes labelled with the slot. It
+// lists the directories of those runs' proxy sockets.
+const dockerRunMarker = "docker-run"
+
+// nestedRun is a container.docker run whose own containers aren't removed
+// yet.
+type nestedRun struct {
+	d     dockerRunner
+	proxy *dockerProxy
+}
+
+func appendLine(path, line string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString(line + "\n")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 // errRepairRunning: a timed-out ownership repair's container couldn't be
 // removed, so it may still be changing files.
@@ -876,6 +1017,16 @@ func (s *Session) removeContainers(prefixOnly bool) string {
 		}
 		return true
 	})
+	// What container.docker runs started (their proxies are gone with the
+	// run's processes, or with this helper).
+	s.nested.Range(func(k, v any) bool {
+		n := v.(nestedRun)
+		n.proxy.stop()
+		if removeLabelled(ctx, n.d, labelRun+"="+k.(string)) == "" {
+			s.nested.Delete(k)
+		}
+		return true
+	})
 	if !prefixOnly {
 		return ""
 	}
@@ -886,7 +1037,8 @@ func (s *Session) removeContainers(prefixOnly bool) string {
 	return s.sweepSlotContainers(ctx, d)
 }
 
-// sweepSlotContainers force-removes all of this slot's containers and
+// sweepSlotContainers force-removes all of this slot's containers, and the
+// containers, networks and volumes its container.docker runs started, and
 // returns those that still exist.
 func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) string {
 	filter := "--filter " + shq("name=^"+s.containerPrefix())
@@ -895,7 +1047,23 @@ func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) strin
 	if err != nil {
 		return "(docker ps failed: " + strings.TrimSpace(string(out)) + ")"
 	}
-	return strings.Join(strings.Fields(string(out)), " ")
+	left := strings.Fields(string(out))
+	marker := filepath.Join(s.slotDir, dockerRunMarker)
+	if b, err := os.ReadFile(marker); err == nil {
+		// The proxies are gone with the runs' processes; their socket
+		// directories may not be (a helper that died).
+		for _, dir := range strings.Fields(string(b)) {
+			if isProxyDir(dir) {
+				os.RemoveAll(dir)
+			}
+		}
+		if l := removeLabelled(ctx, d, labelSlot+"="+s.containerPrefix()); l != "" {
+			left = append(left, l)
+		} else {
+			os.Remove(marker)
+		}
+	}
+	return strings.Join(left, " ")
 }
 
 func shq(s string) string {

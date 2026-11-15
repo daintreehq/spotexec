@@ -2,11 +2,13 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/fsid"
@@ -286,5 +288,89 @@ func TestRunRefusesHome(t *testing.T) {
 	}
 	if _, err = Run(context.Background(), nil, ws, Options{Sync: "auto", Writeback: "always"}); err == nil || !strings.Contains(err.Error(), "never syncs") {
 		t.Fatalf("git home: want a refusal, got %v", err)
+	}
+}
+
+// Lockfile patterns match only what is synced to the slot: never an
+// excluded file, a dependency tree, or a symlink (whose target the runner
+// may not have, or which could point outside the worktree).
+func TestDepsLockfilesMatchSyncedFilesOnly(t *testing.T) {
+	root := t.TempDir()
+	for p, c := range map[string]string{
+		"package-lock.json":                      "lock",
+		"packages/a/package.json":                "a",
+		"packages/secret/package.json":           "excluded",
+		"node_modules/x/package.json":            "dep",
+		"packages/b/node_modules/y/package.json": "dep",
+		"outside/package.json":                   "outside",
+	} {
+		full := filepath.Join(root, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(root, "outside"), filepath.Join(root, "packages", "linkdir")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../outside/package.json", filepath.Join(root, "packages", "a", "linked.json")); err != nil {
+		t.Fatal(err)
+	}
+	p := &config.Project{}
+	p.Sync.Source = "directory"
+	p.Sync.Exclude = []string{"packages/secret/"}
+	m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.ByPath["packages/a/linked.json"]; !ok {
+		t.Fatal("fixture: the symlink should be synced (as a link)")
+	}
+	got, unmatched, err := DepsLockfiles(m, []string{"package-lock.json", "**/package.json", "packages/a/*.json", "vendor/*.lock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"outside/package.json", "package-lock.json", "packages/a/package.json"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if len(unmatched) != 1 || unmatched[0] != "vendor/*.lock" {
+		t.Fatalf("unmatched %v", unmatched)
+	}
+}
+
+func TestSetupFor(t *testing.T) {
+	p := &config.Project{}
+	if run, _ := SetupFor(p, Options{Timeout: time.Minute}); run != "" {
+		t.Errorf("no [setup]: %q", run)
+	}
+	p.Setup.Run = "make gen"
+	if run, d := SetupFor(p, Options{Timeout: time.Minute}); run != "make gen" || d != time.Minute {
+		t.Errorf("default timeout: %q %s", run, d)
+	}
+	p.Setup.Timeout.Duration = 2 * time.Minute
+	if run, d := SetupFor(p, Options{Timeout: time.Minute}); run != "make gen" || d != 2*time.Minute {
+		t.Errorf("setup.timeout: %q %s", run, d)
+	}
+	if run, _ := SetupFor(p, Options{NoSetup: true}); run != "" {
+		t.Errorf("--no-setup: %q", run)
+	}
+}
+
+// A failed setup exits 1 whatever its own code (so 125 and 130 never pass
+// for spotexec's own failure or an interrupt), or 124 when it timed out.
+func TestSetupFailureExitCode(t *testing.T) {
+	p := &config.Project{}
+	p.Setup.Run = "make gen"
+	for _, code := range []int{1, 7, 125, 130} {
+		if got, msg := setupFailure(p, Options{}, protocol.Result{ExitCode: code, SetupFailed: true}); got != 1 || !strings.Contains(msg, fmt.Sprintf("exit %d", code)) {
+			t.Errorf("setup exit %d: run exits %d (%s)", code, got, msg)
+		}
+	}
+	got, msg := setupFailure(p, Options{Timeout: 3 * time.Minute}, protocol.Result{ExitCode: 124, TimedOut: true, SetupFailed: true})
+	if got != ExitTimeout || !strings.Contains(msg, "exceeded 3m0s") {
+		t.Errorf("setup timeout: run exits %d (%s)", got, msg)
 	}
 }

@@ -105,6 +105,13 @@ func parseAWSXMLError(status int, body []byte) *awsError {
 	return &awsError{Status: status, Message: msg}
 }
 
+// queryAttemptTimeout bounds one attempt of a read-only Query call.
+var queryAttemptTimeout = 20 * time.Second
+
+func readOnlyAction(action string) bool {
+	return strings.HasPrefix(action, "Describe") || strings.HasPrefix(action, "Get")
+}
+
 // awsClient performs signed requests.
 type awsClient struct {
 	region string
@@ -168,7 +175,22 @@ func (c *awsClient) query(ctx context.Context, service, version, action string, 
 			case <-time.After(time.Duration(1<<attempt) * 300 * time.Millisecond):
 			}
 		}
-		status, b, err := c.do(ctx, service, "application/x-www-form-urlencoded; charset=utf-8", nil, body)
+		// Each attempt of a read gets its own deadline, so one stuck
+		// connection (a far region's endpoint that stops answering) is
+		// retried within the caller's deadline instead of using it all up.
+		// Writes keep the caller's: retrying one that went through (an
+		// image already created) would fail as a duplicate. Credentials
+		// resolve first under the caller's deadline, since a credential
+		// helper can be slow; do then finds them cached. If they don't
+		// resolve, do reports it as before.
+		actx, cancel := ctx, context.CancelFunc(func() {})
+		if readOnlyAction(action) {
+			if _, err := c.creds.get(ctx); err == nil {
+				actx, cancel = context.WithTimeout(ctx, queryAttemptTimeout)
+			}
+		}
+		status, b, err := c.do(actx, service, "application/x-www-form-urlencoded; charset=utf-8", nil, body)
+		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()

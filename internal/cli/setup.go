@@ -143,7 +143,7 @@ and keeps a working key. --rotate replaces the key.
 							regions = append(regions, rg)
 						}
 						// The whole fleet may land in any one of them.
-						need[rg] += r.MaxInstances * provider.VCPUsOf(r.InstanceTypes[0])
+						need[rg] += r.MaxInstances * provider.VMVCPUs(r)
 						ownNet[rg] = ownNet[rg] || r.SubnetID != ""
 					}
 				}
@@ -575,7 +575,7 @@ func setRunnerProfileText(text string, runners []string, profile string) (string
 // the user turned the hook down when asked.
 func setupClaudeHook(yes, skip bool) (declined bool) {
 	home, _ := os.UserHomeDir()
-	p := filepath.Join(home, ".claude", "settings.json")
+	p := hooks.GlobalSettings()
 	if !skip && hooks.HasLegacyClaude(p) {
 		// Installed by v0.2.0 as `sx hook claude`; sx only runs commands now.
 		if _, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
@@ -584,6 +584,15 @@ func setupClaudeHook(yes, skip bool) (declined bool) {
 			fmt.Printf("✓ updated the Claude Code hook in %s to call spotexec\n", p)
 			return true
 		}
+	}
+	if !skip && hooks.HasRTK(p) && hooks.HasClaude(p) {
+		// Both hooks would rewrite the same commands: chain RTK's.
+		if _, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
+			fmt.Printf("! couldn't chain RTK's hook behind spotexec's: %v\n", err)
+		} else {
+			fmt.Printf("✓ chained RTK's hook behind spotexec's in %s\n", p)
+		}
+		return false
 	}
 	if hooks.HasClaude(p) {
 		fmt.Printf("✓ Claude Code hook in %s\n", p)
@@ -607,11 +616,16 @@ func setupClaudeHook(yes, skip bool) (declined bool) {
 			return true
 		}
 	}
+	rtk := hooks.HasRTK(p)
 	if _, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
 		fmt.Printf("! couldn't install the Claude Code hook: %v\n", err)
 		return false
 	}
-	fmt.Printf("✓ installed the Claude Code hook in %s\n", p)
+	if rtk {
+		fmt.Printf("✓ installed the Claude Code hook in %s, with RTK's hook chained behind it\n", p)
+	} else {
+		fmt.Printf("✓ installed the Claude Code hook in %s\n", p)
+	}
 	fmt.Println("  Permission rules now see `spotexec run -- <cmd>`: allow `Bash(spotexec run:*)` if you pre-approve test commands.")
 	return false
 }

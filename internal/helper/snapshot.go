@@ -51,7 +51,9 @@ func (s *Session) takeSnapshot(skip []string) snapshot {
 		}
 		rel := filepath.ToSlash(p[len(s.workspace)+1:])
 		if d.IsDir() {
-			if skipNames[d.Name()] || strings.HasPrefix(d.Name(), ".spotexec-tmp") {
+			// .git is never a source of changes (a seeded one included),
+			// whatever the client asked to skip.
+			if skipNames[d.Name()] || d.Name() == ".git" || strings.HasPrefix(d.Name(), ".spotexec-tmp") {
 				return filepath.SkipDir
 			}
 			for _, sp := range skipPaths {

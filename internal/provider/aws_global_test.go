@@ -38,6 +38,9 @@ type fakeRegionsEC2 struct {
 	deny       map[string]bool              // regions answering AuthFailure to everything (not enabled); set before use
 	noRegions  bool                         // DescribeRegions is denied everywhere
 	priceErr   map[string]string            // region -> error code DescribeSpotPriceHistory answers
+	types      map[string][]string          // region -> DescribeInstanceTypes items (typeXML)
+	typesErr   map[string]string            // region -> error code DescribeInstanceTypes answers
+	subnetZone map[string]string            // subnet ID -> its zone (DescribeSubnets by ID)
 	calls      []string                     // "region Action [detail]"
 	next       int
 }
@@ -127,7 +130,14 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 				return
 			}
 			fmt.Fprint(w, `<DescribeSpotPriceHistoryResponse><spotPriceHistorySet>`)
+			asked := map[string]bool{} // like AWS: only the requested instance types
+			for i := 1; p.Get(fmt.Sprintf("InstanceType.%d", i)) != ""; i++ {
+				asked[p.Get(fmt.Sprintf("InstanceType.%d", i))] = true
+			}
 			for _, row := range f.prices[region] {
+				if len(asked) > 0 && !asked[row[1]] {
+					continue
+				}
 				fmt.Fprintf(w, `<item><instanceType>%s</instanceType><productDescription>Linux/UNIX</productDescription><spotPrice>%s</spotPrice><timestamp>2026-11-14T00:00:00.000Z</timestamp><availabilityZone>%s</availabilityZone></item>`, row[1], row[2], row[0])
 			}
 			fmt.Fprint(w, `</spotPriceHistorySet></DescribeSpotPriceHistoryResponse>`)
@@ -141,7 +151,19 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			fmt.Fprint(w, `<DescribeVpcsResponse><vpcSet><item><vpcId>vpc-1</vpcId></item></vpcSet></DescribeVpcsResponse>`)
 		case "DescribeSecurityGroups":
 			fmt.Fprint(w, `<DescribeSecurityGroupsResponse><securityGroupInfo><item><groupId>sg-1</groupId><ipPermissions><item><ipProtocol>tcp</ipProtocol><fromPort>22</fromPort><toPort>22</toPort><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges></item></ipPermissions></item></securityGroupInfo></DescribeSecurityGroupsResponse>`)
+		case "DescribeInstanceTypes":
+			f.log(region, fmt.Sprintf("%s vcpus=%s arch=%s current=%s", act, p.Get("Filter.1.Value.1"), p.Get("Filter.2.Value.1"), p.Get("Filter.3.Value.1")))
+			if code := f.typesErr[region]; code != "" {
+				ec2Err(w, 403, code)
+				return
+			}
+			fmt.Fprint(w, `<DescribeInstanceTypesResponse><instanceTypeSet>`+strings.Join(f.types[region], "")+`</instanceTypeSet></DescribeInstanceTypesResponse>`)
 		case "DescribeSubnets":
+			if id := p.Get("SubnetId.1"); id != "" {
+				f.log(region, act+" "+id)
+				fmt.Fprintf(w, `<DescribeSubnetsResponse><subnetSet><item><subnetId>%s</subnetId><vpcId>vpc-1</vpcId><availabilityZone>%s</availabilityZone></item></subnetSet></DescribeSubnetsResponse>`, id, f.subnetZone[id])
+				return
+			}
 			if f.noSubnet[p.Get("Filter.1.Value.1")] {
 				fmt.Fprint(w, `<DescribeSubnetsResponse><subnetSet/></DescribeSubnetsResponse>`)
 				return
@@ -202,16 +224,30 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 				return
 			}
 			want := map[string]bool{}
-			for i := 1; p.Get(fmt.Sprintf("Filter.3.Value.%d", i)) != ""; i++ {
-				want[p.Get(fmt.Sprintf("Filter.3.Value.%d", i))] = true
+			for n := 1; p.Get(fmt.Sprintf("Filter.%d.Name", n)) != ""; n++ {
+				if p.Get(fmt.Sprintf("Filter.%d.Name", n)) != "instance-state-name" {
+					continue
+				}
+				for i := 1; p.Get(fmt.Sprintf("Filter.%d.Value.%d", n, i)) != ""; i++ {
+					want[p.Get(fmt.Sprintf("Filter.%d.Value.%d", n, i))] = true
+				}
 			}
-			f.log(region, act)
+			// Listed by owner alone (leftovers): bake builders as well.
+			byOwner := p.Get("Filter.1.Name") == "tag:spotexec-owner"
+			if byOwner {
+				f.log(region, act+" owned")
+			} else {
+				f.log(region, act)
+			}
 			if code := f.listErr[region]; code != "" {
 				ec2Err(w, 403, code)
 				return
 			}
 			owner, _ := ownerID()
 			fmt.Fprint(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet>`)
+			if byOwner && f.builders[region] {
+				fmt.Fprintf(w, `<item><instanceId>i-builder</instanceId><instanceState><name>stopped</name></instanceState><tagSet><item><key>spotexec-bake-runner</key><value>g</value></item><item><key>spotexec-owner</key><value>%s</value></item></tagSet></item>`, owner)
+			}
 			for id, typ := range f.instances[region] {
 				st := f.state[id]
 				if st == "" {
@@ -797,11 +833,15 @@ func TestNewPicksRegionalOrGlobal(t *testing.T) {
 	}
 }
 
-// A single-region runner still tidying up old regions launches exactly as
-// before: its own region, instance_types in order, the configured network.
+// A single-region runner still tidying up old regions launches as a
+// single-region runner does: only in its own region, cheapest first, and
+// it still records where it launched.
 func TestLegacyLaunchKeepsSingleRegionBehaviour(t *testing.T) {
-	f := &fakeRegionsEC2{runErr: map[string]string{"r-one-1/c7a.2xlarge": "InsufficientInstanceCapacity"},
-		prices: map[string][][3]string{"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.01"}}}}
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{
+			"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.06"}, {"r-one-1b", "c6a.2xlarge", "0.05"}, {"r-one-1c", "c7a.2xlarge", "0.07"}},
+			"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.01"}},
+		}}
 	g := newGlobalEnv(t, f, "r-one-1")
 	g.legacy = true
 	in, err := g.Launch(context.Background(), t.Logf)
@@ -809,11 +849,16 @@ func TestLegacyLaunchKeepsSingleRegionBehaviour(t *testing.T) {
 		t.Fatal(err)
 	}
 	runs := f.callsOf("RunInstances")
-	if in.Region != "r-one-1" || strings.Join(runs, "|") != "r-one-1 RunInstances c7a.2xlarge |r-one-1 RunInstances c6a.2xlarge " {
+	if in.Region != "r-one-1" || strings.Join(runs, "|") != "r-one-1 RunInstances c6a.2xlarge subnet-r-one-1b" {
 		t.Fatalf("launched %+v via %v", in, runs)
 	}
-	if n := len(f.callsOf("DescribeSpotPriceHistory")); n != 0 {
-		t.Fatal("a single-region launch doesn't compare prices")
+	for _, c := range f.callsOf("DescribeSpotPriceHistory") {
+		if !strings.HasPrefix(c, "r-one-1 ") {
+			t.Fatalf("priced another region: %s", c)
+		}
+	}
+	if got := active(t, g); got != "r-one-1" {
+		t.Fatalf("active regions %s", got)
 	}
 }
 

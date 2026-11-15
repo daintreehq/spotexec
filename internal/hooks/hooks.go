@@ -5,6 +5,7 @@
 package hooks
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -293,24 +294,34 @@ func splitSegments(c string) []string {
 //   - spotexec's own warnings and summary go to stderr, outside the pipe.
 //
 // It expects a line ShouldOffload accepted.
-func Wrap(bin, command string) string {
+func Wrap(bin, command string) string { return WrapRTK(bin, command, false) }
+
+// WrapRTK is Wrap for a machine where RTK compacts agents' output (rtk true):
+// a single command whose raw output RTK's pipe filter reads (see rtkFilters)
+// runs with --rtk-filter, so it comes back compacted as `rtk <cmd>` would.
+// A line the agent already filters itself (`| tail -50`) is left as it is.
+func WrapRTK(bin, command string, rtk bool) string {
 	head, filters, ok := splitFilters(command)
 	if !ok {
 		head, filters = strings.TrimSpace(command), ""
 	}
 	segs, ops := splitList(head)
-	run := func(segs, ops []string) string { return bin + " run -- " + shellQuote(joinList(segs, ops)) }
 	var b strings.Builder
 	i := 0
 	for ; i < len(segs)-1 && isCd(segs[i]); i++ {
 		b.WriteString(segs[i] + listOp(ops[i]))
 	}
 	segs, ops = segs[i:], ops[i:]
-	if filters == "" {
-		b.WriteString(run(segs, ops))
-		return b.String()
+	flags := ""
+	if rtk && filters == "" && len(segs) == 1 {
+		if name, run, ok := rtkFilterFor(segs[0]); ok {
+			flags, segs[0] = "--rtk-filter "+name+" ", run
+		}
 	}
-	b.WriteString(run(segs, ops) + " | " + filters)
+	b.WriteString(bin + " run " + flags + "-- " + shellQuote(joinList(segs, ops)))
+	if filters != "" {
+		b.WriteString(" | " + filters)
+	}
 	return b.String()
 }
 
@@ -402,16 +413,73 @@ func bashTimeout() int {
 // HandleClaude processes one PreToolUse event. It never fails the tool call:
 // on any problem it prints nothing and exits 0, leaving the command as is.
 func HandleClaude(in io.Reader, out io.Writer, bin string) {
+	RunClaude(in, out, io.Discard, ClaudeOptions{Bin: bin})
+}
+
+// ClaudeOptions configure the PreToolUse hook.
+type ClaudeOptions struct {
+	Bin string // how the rewritten command calls spotexec
+	// Then is another PreToolUse hook command (RTK's) that gets every event
+	// spotexec leaves alone, so the two never rewrite the same command.
+	Then string
+}
+
+// RunClaude handles one PreToolUse event and returns the hook's exit code:
+// spotexec's own answer always exits 0; a chained hook's exit code is its own.
+func RunClaude(in io.Reader, out, errOut io.Writer, o ClaudeOptions) int {
+	raw, err := io.ReadAll(in)
+	if err != nil {
+		return 0
+	}
+	resp, took := decide(raw, o)
+	if took || o.Then == "" {
+		if resp != nil {
+			writeJSON(out, resp)
+		}
+		return 0
+	}
+	return chain(raw, resp, out, errOut, o.Then)
+}
+
+// chain hands the event to the next hook, adding spotexec's one-time notice
+// (if any) to its answer.
+func chain(raw []byte, notice map[string]any, out, errOut io.Writer, then string) int {
+	c := exec.Command("sh", "-c", then)
+	c.Stdin = bytes.NewReader(raw)
+	var buf bytes.Buffer
+	c.Stdout, c.Stderr = &buf, errOut
+	code := 0
+	if err := c.Run(); err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			// It never ran: leave the command as it is.
+			fmt.Fprintf(errOut, "spotexec: couldn't run the chained hook %q: %v\n", then, err)
+		} else if code = ee.ExitCode(); code < 0 {
+			code = 1
+		}
+	}
+	b := buf.Bytes()
+	if notice != nil && code == 0 {
+		b = mergeNotice(b, notice)
+	}
+	out.Write(b)
+	return code
+}
+
+// decide is spotexec's answer to one event: nil to leave the command alone.
+// took is true when spotexec rewrote or denied the command, so no chained
+// hook may touch it.
+func decide(raw []byte, o ClaudeOptions) (resp map[string]any, took bool) {
 	var ev claudeInput
-	if err := json.NewDecoder(in).Decode(&ev); err != nil || ev.ToolName != "Bash" {
-		return
+	if err := json.Unmarshal(raw, &ev); err != nil || ev.ToolName != "Bash" {
+		return nil, false
 	}
 	cmd, _ := ev.ToolInput["command"].(string)
 	if cmd == "" {
-		return
+		return nil, false
 	}
 	if bg, _ := ev.ToolInput["run_in_background"].(bool); bg {
-		return // long-lived background jobs stay local
+		return nil, false // long-lived background jobs stay local
 	}
 	dir := ev.Cwd
 	if dir == "" {
@@ -419,45 +487,65 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 	}
 	proj, ok := project(dir)
 	if !ok || proj.Hook.Disabled {
-		return
+		return nil, false
 	}
 	h := proj.Hook
 	d, err := NewDecider(h)
-	if err != nil || !d.ShouldOffload(cmd) {
-		return
+	if err != nil {
+		return nil, false
+	}
+	// `rtk cargo test` is `cargo test` with its output compacted.
+	line, explicit, raw2 := UnwrapRTK(cmd)
+	if !d.ShouldOffload(line) {
+		return nil, false
 	}
 	// `cd` must stay inside this repository: sx syncs only this worktree.
-	if !cdsInside(cmd, dir) {
-		return
+	if !cdsInside(line, dir) {
+		return nil, false
 	}
 	if h.WhenLoadAbove > 0 {
 		if l, err := LoadPerCPU(); err != nil || l < h.WhenLoadAbove {
-			return
+			return nil, false
 		}
 	}
-	if err := RunnersFor(cmd, dir, proj); err != nil {
+	if err := RunnersFor(line, dir, proj); err != nil {
 		// Offloading would only fail: run it here, and say so once a
 		// session (a hook installed before `spotexec setup` would otherwise
 		// keep a first demo silently local).
-		if firstNotice(ev.SessionID) {
-			writeJSON(out, map[string]any{
+		if firstNotice("", ev.SessionID) {
+			return map[string]any{
 				"systemMessage": "spotexec: heavy commands are running on this machine: " + err.Error(),
 				"hookSpecificOutput": map[string]any{
 					"hookEventName":     "PreToolUse",
 					"additionalContext": "spotexec kept this command on this machine instead of offloading it, because it has no usable runners (" + err.Error() + "). Heavy commands keep running locally until that is fixed.",
 				},
-			})
+			}, false
 		}
-		return
+		return nil, false
 	}
-	wrapped := Wrap(bin, cmd)
+	rtk := scanRTK(dir)
+	filtered := !raw2 && (explicit || rtk.inUse || isRTKHook(o.Then))
+	wrapped := WrapRTK(o.Bin, line, filtered)
+	if racer, ok := rtk.racer(cmd); ok && h.Mode != "block" {
+		// RTK's hook will rewrite this command too, and either rewrite
+		// could win: have the agent run the offloaded form, which RTK leaves
+		// alone, and tell the user once how to chain the hooks instead.
+		resp := map[string]any{"hookSpecificOutput": map[string]any{
+			"hookEventName":            "PreToolUse",
+			"permissionDecision":       "deny",
+			"permissionDecisionReason": fmt.Sprintf("This project offloads heavy commands to remote runners, but RTK's hook would also rewrite this command, so it can't be rewritten automatically. Re-run it as: %s with a Bash timeout of %d ms, since a cold start can take minutes (or prefix SPOTEXEC_LOCAL=1 if it must run on this machine)", wrapped, bashTimeout()),
+		}}
+		if firstNotice("rtk", ev.SessionID) {
+			resp["systemMessage"] = fmt.Sprintf("spotexec: RTK's hook in %s rewrites the same commands as spotexec's, so offloaded commands are denied with instructions to re-run. Run `%s` to chain RTK's hook behind spotexec's.", racer.file, "spotexec hook install --claude"+SettingsScope(racer.file))
+		}
+		return resp, true
+	}
 	if h.Mode == "block" {
-		writeJSON(out, map[string]any{"hookSpecificOutput": map[string]any{
+		return map[string]any{"hookSpecificOutput": map[string]any{
 			"hookEventName":            "PreToolUse",
 			"permissionDecision":       "deny",
 			"permissionDecisionReason": fmt.Sprintf("This project offloads heavy commands to remote runners. Re-run it as: %s with a Bash timeout of %d ms, since a cold start can take minutes (or prefix SPOTEXEC_LOCAL=1 if it must run on this machine, e.g. it needs local services)", wrapped, bashTimeout()),
-		}})
-		return
+		}}, true
 	}
 	newInput := map[string]any{}
 	for k, v := range ev.ToolInput {
@@ -467,10 +555,10 @@ func HandleClaude(in io.Reader, out io.Writer, bin string) {
 	if t, _ := newInput["timeout"].(float64); t <= 0 {
 		newInput["timeout"] = bashTimeout()
 	}
-	writeJSON(out, map[string]any{"hookSpecificOutput": map[string]any{
+	return map[string]any{"hookSpecificOutput": map[string]any{
 		"hookEventName": "PreToolUse",
 		"updatedInput":  newInput,
-	}})
+	}}, true
 }
 
 // RunnersFor is UsableRunners for the config the wrapped command line will
@@ -507,13 +595,14 @@ func UsableRunners(proj *config.Project) error {
 	return err
 }
 
-// firstNotice reports whether this session hasn't had the "staying local"
-// notice yet, and records that it has. Without a session id it is once a day.
-func firstNotice(session string) bool {
+// firstNotice reports whether this session hasn't had the notice of this
+// kind yet ("" is the "staying local" one), and records that it has. Without
+// a session id it is once a day.
+func firstNotice(kind, session string) bool {
 	if session == "" {
 		session = time.Now().Format("2006-01-02")
 	}
-	sum := sha256.Sum256([]byte(session))
+	sum := sha256.Sum256([]byte(kind + session))
 	dir := filepath.Join(config.StateDir(), "hook-notices")
 	p := filepath.Join(dir, hex.EncodeToString(sum[:8]))
 	if os.MkdirAll(dir, 0o700) == nil {
@@ -673,23 +762,27 @@ const (
 	hookLegacy  // calls sx, as v0.2.0 could install it
 )
 
-// hookForm classifies a PreToolUse hook command.
+// hookForm classifies a PreToolUse hook command by its executable: only
+// the single command the installer wrote counts (`spotexec hook claude`,
+// chained or not, or v0.2.0's `sx hook claude`). A compound line such as
+// `audit && sx hook claude` is the user's own and not ours to rewrite.
 func hookForm(cmd string) int {
-	cmd = strings.TrimSpace(cmd)
-	if bin, ok := strings.CutSuffix(cmd, " hook claude"); ok {
-		bin = strings.TrimSpace(bin)
-		// Only the single executable the installer wrote: a compound line
-		// (`audit && sx hook claude`) is the user's own and not ours to rewrite.
-		quoted := len(bin) >= 2 && (bin[0] == '\'' || bin[0] == '"') && bin[len(bin)-1] == bin[0]
-		if quoted {
-			bin = strings.ReplaceAll(bin[1:len(bin)-1], `'\''`, "'")
+	exe, args, ok := hookExe(cmd)
+	if !ok {
+		return hookNone
+	}
+	switch filepath.Base(exe) {
+	case "spotexec":
+		if args == "hook claude" {
+			return hookCurrent
 		}
-		if (quoted || !strings.ContainsAny(bin, " \t;&|()<>$`'\"\\")) && filepath.Base(bin) == "sx" {
+		if _, ok := thenOf(cmd); ok {
+			return hookCurrent
+		}
+	case "sx":
+		if args == "hook claude" {
 			return hookLegacy
 		}
-	}
-	if strings.Contains(cmd, "hook claude") && strings.Contains(cmd, "spotexec") {
-		return hookCurrent
 	}
 	return hookNone
 }
@@ -749,7 +842,9 @@ func HasLegacyClaude(settingsPath string) bool { return hasForm(settingsPath, ho
 // InstallClaude adds the PreToolUse hook to a Claude Code settings file,
 // preserving everything else. It is idempotent. A legacy `sx hook claude`
 // entry is rewritten in place to hookCmd (or dropped, when a spotexec entry
-// is already there). It reports whether the file changed.
+// is already there). RTK's hook (`rtk hook claude`) is chained in place
+// behind spotexec's, which then needs no entry of its own: one hook decides
+// what happens to each command. It reports whether the file changed.
 func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 	settings := map[string]any{}
 	if b, err := os.ReadFile(settingsPath); err == nil && len(strings.TrimSpace(string(b))) > 0 {
@@ -762,7 +857,45 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 		hooks = map[string]any{}
 	}
 	pre, _ := hooks["PreToolUse"].([]any)
-	current, changed := false, false
+	current, changed, chained := false, false, false
+	// A chain already here (RTK's `rtk init` can add its hook again beside
+	// it) takes in any further RTK hook rather than gaining a twin.
+	hadChain := false
+	for _, e := range pre {
+		em, _ := e.(map[string]any)
+		m, _ := em["matcher"].(string)
+		hs, _ := em["hooks"].([]any)
+		for _, h := range hs {
+			hm, _ := h.(map[string]any)
+			c, _ := hm["command"].(string)
+			if then, ok := thenOf(c); ok && isRTKHook(then) && matchesBash(m) {
+				hadChain = true
+			}
+		}
+	}
+	for _, e := range pre {
+		em, _ := e.(map[string]any)
+		m, _ := em["matcher"].(string)
+		hs, _ := em["hooks"].([]any)
+		for _, h := range hs {
+			hm, _ := h.(map[string]any)
+			c, _ := hm["command"].(string)
+			if isRTKHook(c) && matchesBash(m) && hadChain {
+				hm["command"], changed = "", true // dropped below
+				continue
+			}
+			if isRTKHook(c) && matchesBash(m) {
+				hm["command"] = chainCmd(hookCmd, c)
+				c, changed = hm["command"].(string), true
+			}
+			// Only a chain that sees Bash commands stands in for spotexec's
+			// own entry.
+			if _, ok := thenOf(c); ok && matchesBash(m) {
+				chained = true
+			}
+		}
+	}
+	var keep []any
 	for _, e := range pre {
 		em, _ := e.(map[string]any)
 		hs, _ := em["hooks"].([]any)
@@ -778,7 +911,17 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 		var keepHooks []any
 		for _, h := range hs {
 			hm, _ := h.(map[string]any)
-			if c, _ := hm["command"].(string); hookForm(c) == hookLegacy {
+			c, _ := hm["command"].(string)
+			if c == "" && hm["type"] == "command" {
+				continue // an RTK hook the chain already runs
+			}
+			if _, isChain := thenOf(c); chained && !isChain && hookForm(c) != hookNone {
+				// The chained entry runs spotexec's hook: another one would
+				// rewrite the same commands without RTK in mind.
+				changed = true
+				continue
+			}
+			if hookForm(c) == hookLegacy {
 				changed, current = true, true
 				if has {
 					continue
@@ -789,10 +932,15 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 			keepHooks = append(keepHooks, h)
 		}
 		if len(keepHooks) != len(hs) {
+			if len(keepHooks) == 0 {
+				continue
+			}
 			em["hooks"] = keepHooks
 		}
+		keep = append(keep, e)
 	}
-	if !current {
+	pre = keep
+	if !current && !chained {
 		pre = append(pre, map[string]any{
 			"matcher": "Bash",
 			"hooks":   []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}},
@@ -814,7 +962,8 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 	return true, os.WriteFile(settingsPath, append(b, '\n'), 0o644)
 }
 
-// UninstallClaude removes spotexec hook entries.
+// UninstallClaude removes spotexec hook entries. A chained hook goes back to
+// the hook it chained (RTK's), which stays installed.
 func UninstallClaude(settingsPath string) (bool, error) {
 	b, err := os.ReadFile(settingsPath)
 	if err != nil {
@@ -837,7 +986,11 @@ func UninstallClaude(settingsPath string) (bool, error) {
 		var keepHooks []any
 		for _, h := range hs {
 			hm, _ := h.(map[string]any)
-			if c, _ := hm["command"].(string); strings.Contains(c, "hook claude") {
+			c, _ := hm["command"].(string)
+			if then, ok := thenOf(c); ok {
+				hm["command"] = then
+				removed = true
+			} else if hookForm(c) != hookNone {
 				removed = true
 				continue
 			}

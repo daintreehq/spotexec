@@ -220,6 +220,44 @@ func TestSameSlotRejectsAnotherRunner(t *testing.T) {
 	}
 }
 
+// A project pool built on a runner this machine lacks doesn't stop exec or
+// --same-slot from returning to the last runner (#66).
+func TestSameSlotIgnoresUnavailableProjectPool(t *testing.T) {
+	dir := project(t, "version = 1\npool = [\"aws-big\"]\n[runners.aws-big]\nextends = \"aws\"\n")
+	ws, err := client.Resolve(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(config.StateDir(), "worktrees", ws.WorktreeKey+".json")
+	b, _ := json.Marshal(client.LastRun{Runner: "gone", Slot: 1})
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The remembered runner is looked up (and, here, missing), so the
+	// unavailable pool was not what stopped it.
+	code, stderr := runMain(t, "spotexec", "exec", "-C", dir, "--", "true")
+	if code != client.ExitInfra || !strings.Contains(stderr, `unknown runner "gone"`) {
+		t.Errorf("exec: exit %d, stderr %q", code, stderr)
+	}
+	code, stderr = runMain(t, "sx", "-C", dir, "-s", "true")
+	if code != client.ExitInfra || !strings.Contains(stderr, `unknown runner "gone"`) {
+		t.Errorf("--same-slot: exit %d, stderr %q", code, stderr)
+	}
+	// An explicit pool must still be valid, even with the last runner in it.
+	code, stderr = runMain(t, "spotexec", "exec", "-C", dir, "--pool", "typo,gone", "--", "true")
+	if code != client.ExitInfra || !strings.Contains(stderr, `unknown runner "typo"`) {
+		t.Errorf("exec --pool typo,gone: exit %d, stderr %q", code, stderr)
+	}
+	// An ordinary run selects the pool and says what's missing.
+	code, stderr = runMain(t, "sx", "-C", dir, "true")
+	if code != client.ExitInfra || !strings.Contains(stderr, `"aws-big"`) || !strings.Contains(stderr, `extends "aws"`) {
+		t.Errorf("run: exit %d, stderr %q", code, stderr)
+	}
+}
+
 func TestUsageAndConfigFailuresExit125(t *testing.T) {
 	bad := project(t, "[sync]\nmode = \"sideways\"\n")
 	cases := [][]string{
@@ -258,5 +296,26 @@ func TestSxRunsTasksNamedLikeSubcommands(t *testing.T) {
 	code, stderr := runMain(t, "sx", "-C", dir, "status", "x")
 	if code != client.ExitInfra || !strings.Contains(stderr, "status is a parallel task") {
 		t.Errorf("sx status x: exit %d, stderr %q", code, stderr)
+	}
+}
+
+func TestGroupedOutputPrecedence(t *testing.T) {
+	yes, no := true, false
+	for _, c := range []struct {
+		args  []string
+		task  *bool
+		agent bool
+		want  bool
+	}{
+		{nil, nil, false, false}, // live output by default
+		{nil, nil, true, true},   // agents get blocks
+		{nil, &no, true, false},  // the task's setting beats the agent default
+		{nil, &yes, false, true}, //
+		{[]string{"--group"}, &no, false, true},
+		{[]string{"--group=false"}, &yes, true, false}, // the flag beats both
+	} {
+		if got := parsed(t, c.args...).grouped(&config.Task{Group: c.task}, c.agent); got != c.want {
+			t.Errorf("%v task=%v agent=%v: got %v", c.args, c.task, c.agent, got)
+		}
 	}
 }

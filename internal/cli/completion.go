@@ -50,11 +50,7 @@ func taskCompletions(dir, prefix string) []cobra.Completion {
 		if !strings.HasPrefix(n, prefix) {
 			continue
 		}
-		t := l.cfg.Project.Tasks[n]
-		what := t.Run
-		if len(t.Parallel) > 0 {
-			what = "parallel: " + strings.Join(t.Parallel, ", ")
-		}
+		what := l.cfg.Project.Tasks[n].Describe()
 		out = append(out, cobra.CompletionWithDesc(n, "task: "+strings.Join(strings.Fields(what), " ")))
 	}
 	return out

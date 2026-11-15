@@ -32,7 +32,14 @@ type accountStatus struct {
 func spotQuotas(ctx context.Context, cfg *config.Config) []regionQuota {
 	seen := map[string]bool{}
 	out := []regionQuota{}
-	for _, name := range cfg.RunnerNames() {
+	// Every runner in the account, including one a project runner masks:
+	// the quota is the account's, whatever this repository selects.
+	names := make([]string, 0, len(cfg.Global.Runners))
+	for name := range cfg.Global.Runners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		r := cfg.Global.Runners[name]
 		if r == nil || r.Type != config.TypeAWSSpot || seen[r.Region+"\x00"+r.Profile] {
 			continue
@@ -90,12 +97,10 @@ func printSpotQuotas(w io.Writer, qs []regionQuota) {
 const starterVCPUs = 8
 
 var starterSmall = [][2]string{
-	{`instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]  # 8 vCPUs; tried in order on capacity errors`,
+	{`instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]  # 8 vCPUs; each VM gets the cheapest with Spot capacity`,
 		`instance_types = ["c7a.xlarge", "m7a.xlarge", "c6a.xlarge"]  # 4 vCPUs, to fit this account's Spot quota; once it's raised, the 2xlarge sizes (8 vCPUs) run more per VM`},
 	{`max_slots = 4                  # concurrent jobs per VM (SPOTEXEC_CPUS = 2 each)`,
 		`max_slots = 2                  # concurrent jobs per VM (SPOTEXEC_CPUS = 2 each)`},
-	{`hourly_cost = 0.12             # for 'spotexec monitor' burn estimates`,
-		`hourly_cost = 0.06             # for 'spotexec monitor' burn estimates`},
 }
 
 // sizeStarterFleet rewrites the starter template at path to 4-vCPU VMs. It
@@ -134,8 +139,8 @@ func quotaFits(runners []*config.Runner, quotas map[string]float64) []provider.Q
 	others := map[string]bool{} // runners there can launch outside the standard families
 	var order []string
 	for _, r := range runners {
-		others[r.Region] = others[r.Region] || provider.HasOtherFamilies(r.InstanceTypes)
-		one := provider.MinLaunchVCPUs(r.InstanceTypes)
+		others[r.Region] = others[r.Region] || provider.HasOtherFamiliesFor(r)
+		one := provider.MinLaunchVCPUsFor(r)
 		q, ok := quotas[r.Region]
 		if one == 0 || !ok {
 			continue
@@ -147,7 +152,7 @@ func quotaFits(runners []*config.Runner, quotas map[string]float64) []provider.Q
 			order = append(order, r.Region)
 		}
 		f.OneVM = min(f.OneVM, one)
-		f.Fleet += r.MaxInstances * provider.VCPUsOf(r.InstanceTypes[0])
+		f.Fleet += r.MaxInstances * provider.VMVCPUs(r)
 	}
 	out := make([]provider.QuotaFit, 0, len(order))
 	for _, rg := range order {

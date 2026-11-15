@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/daintreehq/spotexec/internal/depskey"
 	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
@@ -41,9 +43,10 @@ const (
 
 // Runner is one entry under [runners.<name>].
 type Runner struct {
-	Name    string `toml:"-"`
-	Type    string `toml:"type"`
-	Extends string `toml:"extends"` // project runners: inherit a global runner, then override
+	Name        string `toml:"-"`
+	Type        string `toml:"type"`
+	Extends     string `toml:"extends"`      // project runners: inherit a global runner, then override
+	ExtendsType string `toml:"extends_type"` // project runners: or inherit any of your runners of this type
 
 	// Common
 	MaxSlots        int      `toml:"max_slots"`
@@ -66,20 +69,28 @@ type Runner struct {
 	BootTimeout     Duration `toml:"boot_timeout"`
 
 	// aws-spot
-	Region           string   `toml:"region"`
-	Regions          []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
-	Profile          string   `toml:"profile"`
-	InstanceTypes    []string `toml:"instance_types"`
-	MaxPrice         string   `toml:"max_price"`
-	AMI              string   `toml:"ami"`
-	Arch             string   `toml:"arch"` // amd64|arm64 (derived from instance types if empty)
-	SubnetID         string   `toml:"subnet_id"`
-	SecurityGroupIDs []string `toml:"security_group_ids"`
-	SSHCIDR          string   `toml:"ssh_cidr"`
-	VolumeGB         int      `toml:"volume_gb"`
-	User             string   `toml:"user"`
-	OnDemandFallback bool     `toml:"on_demand_fallback"`
-	CacheBucket      string   `toml:"cache_bucket"` // shared dependency cache: "auto" (default), a bucket name, or "off"
+	Region        string   `toml:"region"`
+	Regions       []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
+	Profile       string   `toml:"profile"`
+	InstanceTypes []string `toml:"instance_types"`
+	// Requirements instead of (or narrowing) a type list: every current
+	// instance type with exactly VCPUs vCPUs and at least MinMemoryGiB is a
+	// candidate, and launches go to the cheapest.
+	VCPUs                int      `toml:"vcpus"`
+	MinMemoryGiB         float64  `toml:"min_memory_gib"`
+	MinGeneration        int      `toml:"min_generation"`
+	ExcludeInstanceTypes []string `toml:"exclude_instance_types"`
+	LaunchOrder          string   `toml:"launch_order"` // cheapest (default) | listed
+	MaxPrice             string   `toml:"max_price"`
+	AMI                  string   `toml:"ami"`
+	Arch                 string   `toml:"arch"` // amd64|arm64 (derived from instance types if empty)
+	SubnetID             string   `toml:"subnet_id"`
+	SecurityGroupIDs     []string `toml:"security_group_ids"`
+	SSHCIDR              string   `toml:"ssh_cidr"`
+	VolumeGB             int      `toml:"volume_gb"`
+	User                 string   `toml:"user"`
+	OnDemandFallback     bool     `toml:"on_demand_fallback"`
+	CacheBucket          string   `toml:"cache_bucket"` // shared dependency cache: "auto" (default), a bucket name, or "off"
 
 	// fleets (aws-spot, sim)
 	MaxInstances int `toml:"max_instances"`
@@ -100,6 +111,49 @@ func (r *Runner) MultiRegion() bool { return r.Type == TypeAWSSpot && len(r.Regi
 // AnyRegion reports whether the runner may launch in every enabled region.
 func (r *Runner) AnyRegion() bool {
 	return r.MultiRegion() && len(r.Regions) == 1 && r.Regions[0] == AllRegions
+}
+
+// Launch orders.
+const (
+	LaunchCheapest = "cheapest"
+	LaunchListed   = "listed"
+)
+
+// DefaultMinGeneration is the oldest instance generation a vcpus-based
+// runner considers: older ones are still "current" to AWS, but markedly
+// slower per vCPU.
+const DefaultMinGeneration = 6
+
+// ByRequirements reports whether an aws-spot runner picks its instance
+// types from vcpus (and min_memory_gib) rather than only a fixed list.
+func (r *Runner) ByRequirements() bool { return r.Type == TypeAWSSpot && r.VCPUs > 0 }
+
+// IsTypePattern reports whether an instance_types entry is a wildcard
+// pattern (only meaningful with vcpus).
+func IsTypePattern(t string) bool { return strings.Contains(t, "*") }
+
+// MatchType reports whether an instance type matches a pattern in which *
+// stands for any run of characters.
+func MatchType(pattern, t string) bool {
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == t
+	}
+	if !strings.HasPrefix(t, parts[0]) {
+		return false
+	}
+	t = t[len(parts[0]):]
+	for i, p := range parts[1:] {
+		if i == len(parts)-2 {
+			return strings.HasSuffix(t, p)
+		}
+		j := strings.Index(t, p)
+		if j < 0 {
+			return false
+		}
+		t = t[j+len(p):]
+	}
+	return true
 }
 
 // Ephemeral reports whether the runner is provisioned on demand.
@@ -133,16 +187,50 @@ type Deps struct {
 	Timeout   Duration `toml:"timeout"`
 }
 
+// Setup is [setup]: a command run in the slot (and container) before every
+// command, after the dependency restore, for steps that depend on source
+// rather than lockfiles (building workspace packages, generating code).
+type Setup struct {
+	Run     string   `toml:"run"`
+	Timeout Duration `toml:"timeout"` // default: the command's own timeout
+}
+
 // Task is [tasks.<name>].
 type Task struct {
 	Run       string   `toml:"run"`
 	Parallel  []string `toml:"parallel"`
+	Shards    int      `toml:"shards"`
 	FailFast  bool     `toml:"fail_fast"`
 	Timeout   Duration `toml:"timeout"`
 	Exclusive bool     `toml:"exclusive"`
 	Sync      string   `toml:"sync"`
 	Pool      []string `toml:"pool"`
 	Priority  int      `toml:"priority"`
+	// Setup = false skips [setup] for this task (for a parallel task, for
+	// every task it runs).
+	Setup *bool `toml:"setup"`
+	// Group prints each part of a parallel or sharded task as one block when
+	// it finishes; nil leaves it to --group and the agent default.
+	Group *bool `toml:"group"`
+}
+
+// SkipsSetup reports whether the task opts out of [setup].
+func (t *Task) SkipsSetup() bool { return t.Setup != nil && !*t.Setup }
+
+// MaxShards bounds a task's shards: past it, a typo would launch a fleet.
+const MaxShards = 64
+
+// Describe says what a task runs, for task lists and completions.
+func (t *Task) Describe() string {
+	switch {
+	case len(t.Parallel) > 0:
+		return "parallel: " + strings.Join(t.Parallel, ", ")
+	case t.Shards == 1:
+		return "1 shard: " + t.Run
+	case t.Shards > 1:
+		return fmt.Sprintf("%d shards: %s", t.Shards, t.Run)
+	}
+	return t.Run
 }
 
 // Container is [container]: run every command (and the dependency install)
@@ -152,8 +240,13 @@ type Container struct {
 	Dockerfile string   `toml:"dockerfile"` // or build this Dockerfile (repo-relative)
 	Context    string   `toml:"context"`    // build context (default: the Dockerfile's directory)
 	Options    []string `toml:"options"`    // extra `docker run` arguments
+	Network    string   `toml:"network"`    // "host" (default: the runner's network) or "private" (a network of its own per run)
 	User       string   `toml:"user"`       // "runner" (default: files stay owned by the runner user) or "root"
 	Timeout    Duration `toml:"timeout"`    // pull/build limit (default 20m)
+	// Docker lets commands in the container start containers of their own
+	// (Testcontainers, docker compose) through a Docker socket scoped to the
+	// run. It gives them root-equivalent access to the runner.
+	Docker bool `toml:"docker"`
 }
 
 // Enabled reports whether a container is configured.
@@ -179,6 +272,7 @@ type Project struct {
 	Pool         []string          `toml:"pool"`
 	Sync         Sync              `toml:"sync"`
 	Deps         Deps              `toml:"deps"`
+	Setup        Setup             `toml:"setup"`
 	Container    Container         `toml:"container"`
 	Tasks        map[string]*Task  `toml:"tasks"`
 	Hook         Hook              `toml:"hook"`
@@ -193,6 +287,10 @@ type Project struct {
 type Config struct {
 	Global  *Global
 	Project *Project
+	// Unavailable holds the project runners whose base isn't among this
+	// user's runners, with the reason. They stay out of the runner set, so
+	// only a command that selects one fails, with that reason.
+	Unavailable map[string]error
 }
 
 // Dir returns the global config directory (~/.config/spotexec, honoring
@@ -246,6 +344,9 @@ func LoadGlobal() (*Global, error) {
 	}
 	for name, r := range g.Runners {
 		r.Name = name
+		if md.IsDefined("runners", name, "extends_type") {
+			return nil, fmt.Errorf("%s: runner %q: extends_type is for runners in a project's .spotexec.toml", g.Path, name)
+		}
 		if md.IsDefined("runners", name, "region") && md.IsDefined("runners", name, "regions") {
 			return nil, fmt.Errorf("%s: runner %q: set region or regions, not both", g.Path, name)
 		}
@@ -280,11 +381,23 @@ func (r *Runner) applyDefaults() error {
 		if strings.HasPrefix(r.Region, "cn-") {
 			return fmt.Errorf("region %q: the AWS China regions aren't supported", r.Region)
 		}
-		if len(r.InstanceTypes) == 0 {
+		if len(r.InstanceTypes) == 0 && r.VCPUs == 0 {
 			r.InstanceTypes = []string{"c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"} // the starter template's 8-vCPU types
 		}
 		if r.Arch == "" {
-			r.Arch = archForInstanceType(r.InstanceTypes[0])
+			r.Arch = "amd64"
+			for _, t := range r.InstanceTypes {
+				if !IsTypePattern(t) {
+					r.Arch = archForInstanceType(t)
+					break
+				}
+			}
+		}
+		if r.VCPUs > 0 && r.MinGeneration == 0 {
+			r.MinGeneration = DefaultMinGeneration
+		}
+		if r.LaunchOrder == "" {
+			r.LaunchOrder = LaunchCheapest
 		}
 		if r.User == "" {
 			r.User = "ubuntu"
@@ -382,14 +495,61 @@ func (r *Runner) validate() error {
 		if r.Arch != "amd64" && r.Arch != "arm64" {
 			return fmt.Errorf("arch must be amd64 or arm64 (got %q)", r.Arch)
 		}
-		for _, t := range r.InstanceTypes {
-			if archForInstanceType(t) != r.Arch {
-				return fmt.Errorf("instance_types mixes architectures (%s is not %s): use one runner per architecture", t, r.Arch)
-			}
+		if err := r.validateTypes(); err != nil {
+			return err
 		}
 		if r.VolumeGB < 8 {
 			return fmt.Errorf("volume_gb must be at least 8 (got %d)", r.VolumeGB)
 		}
+	}
+	return nil
+}
+
+// validateTypes checks how an aws-spot runner chooses instance types.
+func (r *Runner) validateTypes() error {
+	for _, t := range append(append([]string(nil), r.InstanceTypes...), r.ExcludeInstanceTypes...) {
+		if !typePatternRe.MatchString(t) {
+			return fmt.Errorf("invalid instance type %q", t)
+		}
+	}
+	for _, t := range r.InstanceTypes {
+		if IsTypePattern(t) {
+			if r.VCPUs == 0 {
+				return fmt.Errorf("instance_types: %q is a pattern, which needs vcpus (patterns narrow the types vcpus and min_memory_gib select)", t)
+			}
+			continue
+		}
+		if archForInstanceType(t) != r.Arch {
+			return fmt.Errorf("instance_types mixes architectures (%s is not %s): use one runner per architecture", t, r.Arch)
+		}
+	}
+	if r.VCPUs < 0 || r.VCPUs > 448 {
+		return fmt.Errorf("vcpus must be between 1 and 448 (got %d)", r.VCPUs)
+	}
+	if r.VCPUs == 0 {
+		switch {
+		case r.MinMemoryGiB != 0:
+			return errors.New("min_memory_gib needs vcpus (the exact vCPU count of each VM)")
+		case r.MinGeneration != 0:
+			return errors.New("min_generation needs vcpus (the exact vCPU count of each VM)")
+		case len(r.ExcludeInstanceTypes) > 0:
+			return errors.New("exclude_instance_types needs vcpus; with a fixed list, just leave the type out of instance_types")
+		}
+	}
+	if r.MinMemoryGiB < 0 || math.IsNaN(r.MinMemoryGiB) || math.IsInf(r.MinMemoryGiB, 0) {
+		return fmt.Errorf("min_memory_gib must be a non-negative number (got %g)", r.MinMemoryGiB)
+	}
+	if r.MinGeneration < 0 {
+		return fmt.Errorf("min_generation must not be negative (got %d)", r.MinGeneration)
+	}
+	switch r.LaunchOrder {
+	case LaunchCheapest:
+	case LaunchListed:
+		if len(r.InstanceTypes) == 0 {
+			return errors.New(`launch_order = "listed" needs instance_types (the order to try)`)
+		}
+	default:
+		return fmt.Errorf("launch_order must be %q or %q (got %q)", LaunchCheapest, LaunchListed, r.LaunchOrder)
 	}
 	return nil
 }
@@ -623,11 +783,26 @@ func (p *Project) validate() error {
 	if p.Container.User != "" && p.Container.User != "runner" && p.Container.User != "root" {
 		return errors.New(`container.user must be "runner" or "root"`)
 	}
+	if !oneOf(p.Container.Network, "", "host", "private") {
+		return fmt.Errorf(`container.network must be "host" or "private" (got %q)`, p.Container.Network)
+	}
+	if p.Container.Docker && !p.Container.Enabled() {
+		return errors.New("container.docker requires container.image or container.dockerfile")
+	}
 	if p.Deps.Install != "" && len(p.Deps.CacheDirs) == 0 {
 		return errors.New("deps.install requires deps.cache_dirs")
 	}
 	if p.Deps.Install != "" && len(p.Deps.Lockfiles) == 0 {
 		return errors.New("deps.install requires deps.lockfiles (the cache key)")
+	}
+	if _, _, err := depskey.Expand(p.Deps.Lockfiles, nil); err != nil {
+		return err // a malformed or escaping pattern; literal paths are checked when read
+	}
+	if p.md.IsDefined("setup") && strings.TrimSpace(p.Setup.Run) == "" {
+		return errors.New("setup.run must be set when [setup] is present")
+	}
+	if p.Setup.Timeout.Duration < 0 || p.md.IsDefined("setup", "timeout") && p.Setup.Timeout.Duration == 0 {
+		return fmt.Errorf("setup.timeout must be positive (got %s)", p.Setup.Timeout.Duration)
 	}
 	if !oneOf(p.Sync.Source, "", "git", "directory") {
 		return fmt.Errorf("sync.source must be git or directory (got %q)", p.Sync.Source)
@@ -641,6 +816,16 @@ func (p *Project) validate() error {
 		}
 		if (t.Run == "") == (len(t.Parallel) == 0) {
 			return fmt.Errorf("task %q must set exactly one of run or parallel", name)
+		}
+		if t.Shards != 0 || p.md.IsDefined("tasks", name, "shards") {
+			if len(t.Parallel) > 0 {
+				return fmt.Errorf("task %q: shards applies to a run task, not a parallel one (shard the tasks it lists instead)", name)
+			}
+			if t.Shards < 1 || t.Shards > MaxShards {
+				return fmt.Errorf("task %q: shards must be between 1 and %d (got %d)", name, MaxShards, t.Shards)
+			}
+		} else if strings.Contains(t.Run, "{shard}") || strings.Contains(t.Run, "{shards}") {
+			return fmt.Errorf("task %q: {shard} and {shards} need shards = N on the task", name)
 		}
 		for _, sub := range t.Parallel {
 			st, ok := p.Tasks[sub]
@@ -666,16 +851,20 @@ var globalOnlyKeys = []string{
 }
 
 var (
-	runnerNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
-	regionRe     = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]+$`)
-	userRe       = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+	runnerNameRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+	regionRe      = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]+$`)
+	userRe        = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+	typePatternRe = regexp.MustCompile(`^[a-z0-9*][a-z0-9.*-]{0,40}$`)
 )
 
 // MergeProjectRunners decodes runners declared in .spotexec.toml and adds
 // them to the global set (a project runner with the same name as a global
 // one overrides it). `extends = "name"` starts from a copy of a global
 // runner, so a project can keep your account/region settings and change only
-// sizes, slots or bootstrap.
+// sizes, slots or bootstrap; `extends_type = "aws-spot"` starts from your
+// runner of that type, for a repository whose collaborators name their
+// runners differently. A project runner whose base this user doesn't have is
+// recorded in Unavailable instead of failing the whole config.
 func (c *Config) MergeProjectRunners() error {
 	p := c.Project
 	if p == nil {
@@ -709,31 +898,58 @@ func (c *Config) MergeProjectRunners() error {
 		if err := p.md.PrimitiveDecode(prim, &probe); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
 		}
-		base := Runner{}
-		from := probe.Extends
-		if from == "" {
-			from = name
+		if probe.ExtendsType != "" && !oneOf(probe.ExtendsType, TypeSSH, TypeAWSSpot, TypeSim) {
+			return fmt.Errorf("%s: runner %q: extends_type must be %s, %s or %s (got %q)", p.Path, name, TypeSSH, TypeAWSSpot, TypeSim, probe.ExtendsType)
 		}
-		g, ok := global[from]
-		if !ok {
-			if probe.Extends != "" {
-				return fmt.Errorf("%s: runner %q extends unknown runner %q", p.Path, name, probe.Extends)
+		// The checks that don't depend on the base (slots, durations) hold
+		// whether or not this user has one; the rest run once it's merged.
+		if err := probe.validate(); err != nil {
+			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
+		}
+		g, err := c.projectBase(global, name, probe)
+		if err != nil {
+			if c.Unavailable == nil {
+				c.Unavailable = map[string]error{}
 			}
-			return fmt.Errorf("%s: runner %q must extend one of your global runners (extends = \"...\")", p.Path, name)
+			// A global runner of the same name is not what the project meant:
+			// Runner and RunnerNames hide it, so selecting the name can't
+			// quietly run on the wrong machine. It stays in Global.Runners for
+			// what spans the account (status -A, down -A, quotas).
+			c.Unavailable[name] = err
+			continue
 		}
-		base = *g
+		base := *g
 		base.Hosts = append([]string(nil), g.Hosts...)
 		base.InstanceTypes = append([]string(nil), g.InstanceTypes...)
 		base.SSHOptions = append([]string(nil), g.SSHOptions...)
 		base.SecurityGroupIDs = append([]string(nil), g.SecurityGroupIDs...)
 		base.Regions = append([]string(nil), g.Regions...)
-		if p.md.IsDefined("runners", name, "instance_types") && !p.md.IsDefined("runners", name, "arch") {
+		base.ExcludeInstanceTypes = append([]string(nil), g.ExcludeInstanceTypes...)
+		// The project's way of choosing types replaces the inherited one: new
+		// instance_types alone drop inherited requirements, and requirements
+		// alone drop inherited instance_types (which would otherwise narrow
+		// them).
+		setsTypes := p.md.IsDefined("runners", name, "instance_types")
+		setsReqs := false
+		for _, k := range []string{"vcpus", "min_memory_gib", "min_generation", "exclude_instance_types"} {
+			setsReqs = setsReqs || p.md.IsDefined("runners", name, k)
+		}
+		if setsTypes && !setsReqs {
+			base.VCPUs, base.MinMemoryGiB, base.MinGeneration, base.ExcludeInstanceTypes = 0, 0, 0, nil
+		}
+		if setsReqs && !setsTypes {
+			base.InstanceTypes = nil
+			if !p.md.IsDefined("runners", name, "launch_order") {
+				base.LaunchOrder = ""
+			}
+		}
+		if setsTypes && !p.md.IsDefined("runners", name, "arch") {
 			base.Arch = "" // re-derive from the new instance types
 		}
 		if err := p.md.PrimitiveDecode(prim, &base); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
 		}
-		base.Name, base.Extends = name, ""
+		base.Name, base.Extends, base.ExtendsType = name, "", ""
 		if err := base.applyDefaults(); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
 		}
@@ -751,11 +967,73 @@ func (c *Config) MergeProjectRunners() error {
 		}
 	}
 	for _, n := range p.Pool {
-		if _, ok := c.Global.Runners[n]; !ok {
+		if _, ok := c.Global.Runners[n]; !ok && c.Unavailable[n] == nil {
 			return fmt.Errorf("%s: pool references unknown runner %q", p.Path, n)
 		}
 	}
 	return nil
+}
+
+// projectBase picks the global runner a project runner builds on: the one
+// extends names (or its own name, with neither key set), else, with
+// extends_type, the user's only runner of that type, or the first of that
+// type in default_pool when there are several. The error says what is
+// missing, for a collaborator whose runners don't match the repository's.
+func (c *Config) projectBase(global map[string]*Runner, name string, probe Runner) (*Runner, error) {
+	want := probe.Extends
+	if want == "" && probe.ExtendsType == "" {
+		want = name
+	}
+	if g, ok := global[want]; ok && (probe.ExtendsType == "" || g.Type == probe.ExtendsType) {
+		return g, nil
+	}
+	named := global[want]
+	var matches []string
+	if probe.ExtendsType != "" {
+		for n, g := range global {
+			if g.Type == probe.ExtendsType {
+				matches = append(matches, n)
+			}
+		}
+		sort.Strings(matches)
+		if len(matches) == 1 {
+			return global[matches[0]], nil
+		}
+		for _, n := range c.Global.DefaultPool {
+			if g, ok := global[n]; ok && g.Type == probe.ExtendsType {
+				return g, nil
+			}
+		}
+	}
+	var yours []string
+	for n, g := range global {
+		yours = append(yours, n+" ("+g.Type+")")
+	}
+	sort.Strings(yours)
+	have := "you have no runners"
+	if len(yours) > 0 {
+		have = "yours: " + strings.Join(yours, ", ")
+	}
+	what := fmt.Sprintf("runner %q from %s", name, c.Project.Path)
+	switch {
+	case len(matches) > 1:
+		return nil, fmt.Errorf("%s can use any of your %s runners, and you have several (%s): list the one to use in default_pool in %s",
+			what, probe.ExtendsType, strings.Join(matches, ", "), c.Global.Path)
+	case named != nil:
+		return nil, fmt.Errorf("%s needs a %s runner: your runner %q is %s, and you have no %s runner (%s): add one to %s",
+			what, probe.ExtendsType, want, named.Type, probe.ExtendsType, have, c.Global.Path)
+	case probe.ExtendsType != "" && probe.Extends != "":
+		return nil, fmt.Errorf("%s needs your runner %q or any %s runner, and you have neither (%s): add one to %s",
+			what, probe.Extends, probe.ExtendsType, have, c.Global.Path)
+	case probe.ExtendsType != "":
+		return nil, fmt.Errorf("%s needs one of your %s runners, and you have none (%s): add one to %s",
+			what, probe.ExtendsType, have, c.Global.Path)
+	case probe.Extends != "":
+		return nil, fmt.Errorf("%s extends %q, which isn't one of your runners (%s): add a runner named %q to %s",
+			what, probe.Extends, have, probe.Extends, c.Global.Path)
+	}
+	return nil, fmt.Errorf("%s overrides your runner %q, which you don't have (%s); a project runner builds on one of yours with extends or extends_type",
+		what, name, have)
 }
 
 // TaskNames returns sorted task names.
@@ -788,9 +1066,9 @@ func (c *Config) Pool(override []string) ([]*Runner, error) {
 	}
 	var out []*Runner
 	for _, n := range names {
-		r, ok := c.Global.Runners[n]
-		if !ok {
-			return nil, fmt.Errorf("unknown runner %q (configured: %s)", n, strings.Join(c.RunnerNames(), ", "))
+		r, err := c.Runner(n)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, r)
 	}
@@ -798,10 +1076,24 @@ func (c *Config) Pool(override []string) ([]*Runner, error) {
 	return out, nil
 }
 
-// RunnerNames lists configured runner names.
+// RunnerNames lists configured runner names, without the project runners
+// this user's runners can't back.
 func (c *Config) RunnerNames() []string {
 	var n []string
 	for k := range c.Global.Runners {
+		if c.Unavailable[k] == nil {
+			n = append(n, k)
+		}
+	}
+	sort.Strings(n)
+	return n
+}
+
+// UnavailableNames lists the project runners this user's runners can't
+// back (see Config.Unavailable), sorted.
+func (c *Config) UnavailableNames() []string {
+	var n []string
+	for k := range c.Unavailable {
 		n = append(n, k)
 	}
 	sort.Strings(n)
@@ -810,6 +1102,9 @@ func (c *Config) RunnerNames() []string {
 
 // Runner returns a runner by name.
 func (c *Config) Runner(name string) (*Runner, error) {
+	if err := c.Unavailable[name]; err != nil {
+		return nil, err
+	}
 	r, ok := c.Global.Runners[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown runner %q (configured: %s)", name, strings.Join(c.RunnerNames(), ", "))

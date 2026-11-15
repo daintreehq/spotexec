@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -93,7 +94,7 @@ func TestDownAccount(t *testing.T) {
 				{ID: "i-otheracct", Profile: "b", Region: "us-east-2", State: "stopped", Host: "studio"},
 				{ID: "i-going", Profile: "a", Region: "us-east-2", State: "shutting-down", Mine: true},
 			},
-			Searched: []provider.AccountScope{{Region: "us-east-2", Profile: "a", Account: "111111111111"}, {Region: "us-east-2", Profile: "b", Account: "222222222222"}, {Region: "us-west-2", Profile: "a", Account: "111111111111"}},
+			Searched: []provider.AccountScope{{Region: "us-east-2", Profile: "a", Account: "111111111111"}, {Region: "us-east-2", Profile: "b", Account: "222222222222"}, {Region: "us-west-2", Profile: "a", Account: "111111111111"}, {Region: "us-west-2", Profile: "c", Account: "111111111111"}},
 		}
 	}
 	t.Run("all clean", func(t *testing.T) {
@@ -106,7 +107,7 @@ func TestDownAccount(t *testing.T) {
 		if strings.Join(*term, ",") != "i-mine@a,i-builder@a,i-otheracct@b" {
 			t.Fatalf("terminated %v", *term)
 		}
-		if !strings.Contains(out, "searched us-east-2 (account 111111111111, profile a), us-east-2 (account 222222222222, profile b), us-west-2 (account 111111111111, profile a)") {
+		if !slices.Contains(strings.Split(out, "\n"), "searched us-east-2, us-west-2 (account 111111111111, profile a); us-east-2 (account 222222222222, profile b); us-west-2 (account 111111111111, profile c) (the regions your AWS runners use)") {
 			t.Fatalf("output:\n%s", out)
 		}
 	})

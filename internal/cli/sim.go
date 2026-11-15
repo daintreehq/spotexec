@@ -84,7 +84,7 @@ func cmdSim() *cobra.Command {
 	interrupt.Flags().DurationVar(&after, "after", 10*time.Second, "time between the notice and termination (AWS: 2m)")
 	rebalance := &cobra.Command{
 		Use:   "rebalance [runner] [instance]",
-		Short: "Send a rebalance recommendation (the instance drains)",
+		Short: "Send a rebalance recommendation (advisory: reported, the instance keeps working)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sim, id, err := pick(args)
 			if err != nil {

@@ -71,17 +71,23 @@ func NewPrefixWriter(w io.Writer, prefix string, mu *sync.Mutex) *PrefixWriter {
 func (p *PrefixWriter) Write(b []byte) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	_, err := p.W.Write(prefixLines(b, p.Prefix, &p.mid))
+	return len(b), err
+}
+
+// prefixLines puts prefix at the start of every line in b; mid carries
+// whether the previous write ended partway through a line.
+func prefixLines(b, prefix []byte, mid *bool) []byte {
 	var out bytes.Buffer
 	for _, c := range b {
-		if !p.mid {
-			out.Write(p.Prefix)
-			p.mid = true
+		if !*mid {
+			out.Write(prefix)
+			*mid = true
 		}
 		out.WriteByte(c)
 		if c == '\n' {
-			p.mid = false
+			*mid = false
 		}
 	}
-	_, err := p.W.Write(out.Bytes())
-	return len(b), err
+	return out.Bytes()
 }

@@ -1,6 +1,9 @@
 package protocol
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Message type names.
 const (
@@ -29,6 +32,10 @@ const (
 	TypeBye         = "bye"
 	TypeImage       = "image"
 	TypeImageResult = "image_result"
+	TypeGitSeed     = "git_seed"
+	TypeGitNeed     = "git_need"
+	TypeGitSeeded   = "git_seeded"
+	TypeGitDrop     = "git_drop" // no body, no reply: remove a .git an earlier seed left in the slot
 )
 
 // MaxSlots caps slots per machine, explicit (max_slots) or automatic
@@ -188,6 +195,12 @@ type ContainerRun struct {
 	Image   string   `json:"image"`             // local image reference to run
 	Options []string `json:"options,omitempty"` // extra `docker run` arguments
 	Root    bool     `json:"root,omitempty"`    // run as root instead of the runner user
+	// Network is "private" for a network namespace of the run's own
+	// (Docker's default bridge); anything else is the runner's (host).
+	Network string `json:"network,omitempty"`
+	// Docker gives the command a Docker socket (scoped to the run) so it
+	// can start containers of its own.
+	Docker bool `json:"docker,omitempty"`
 }
 
 // RegistryAuth is a short-lived login for the image registry (ECR).
@@ -268,6 +281,11 @@ type Exec struct {
 	Skip      []string          `json:"skip"`     // dir names/paths skipped by the post-run walk
 	SpotWatch bool              `json:"spot_watch"`
 	Container *ContainerRun     `json:"container,omitempty"`
+	// SetupRun ([setup] run) runs as its own process, from the workspace
+	// root, before Shell and inside the same snapshot. Its output is held
+	// back and sent (as stderr) only if it fails; then Shell never runs.
+	SetupRun       string `json:"setup_run,omitempty"`
+	SetupTimeoutMS int64  `json:"setup_timeout_ms,omitempty"`
 }
 
 // Started confirms the child was spawned.
@@ -293,6 +311,40 @@ type Result struct {
 	Unverified []string `json:"unverified,omitempty"` // paths that could not be read after the run
 	SnapshotMS int64    `json:"snapshot_ms"`
 	StartError string   `json:"start_error,omitempty"`
+	// OOMKilled: the kernel's OOM killer killed a process in the command's
+	// container, for a memory limit on it or on the memory pool it ran in,
+	// or for the whole machine running out (Docker's oom event).
+	OOMKilled bool `json:"oom_killed,omitempty"`
+	// MemoryLimitMB is the cap of the memory pool the container ran in
+	// (MiB), or 0 when it ran outside it.
+	MemoryLimitMB int64 `json:"memory_limit_mb,omitempty"`
+	// SetupFailed: Exec.SetupRun did not succeed (it failed, timed out, was
+	// canceled or couldn't start), so Shell never ran. ExitCode, Signal,
+	// TimedOut, Canceled, StartError and OOMKilled then describe the setup.
+	SetupFailed bool  `json:"setup_failed,omitempty"`
+	SetupMS     int64 `json:"setup_ms,omitempty"`
+}
+
+// Heartbeat is the body of a helper heartbeat (empty from older helpers):
+// the runner's memory, so a client that loses the runner can tell whether
+// it was out of memory at the time. Zero fields are unknown.
+type Heartbeat struct {
+	MemTotalMB int64   `json:"mem_total_mb,omitempty"`
+	MemAvailMB int64   `json:"mem_avail_mb,omitempty"`
+	PSIFull10  float64 `json:"psi_full10,omitempty"` // /proc/pressure/memory "full" avg10, percent
+}
+
+// Pressure says whether a heartbeat shows a runner running out of memory:
+// under 5% of it available, or every non-idle task stalled on memory for
+// over 10% of the last 10s. "" when it doesn't.
+func (h Heartbeat) Pressure() string {
+	switch {
+	case h.MemTotalMB > 0 && h.MemAvailMB*20 < h.MemTotalMB:
+		return fmt.Sprintf("%d MiB of %d MiB memory available", h.MemAvailMB, h.MemTotalMB)
+	case h.PSIFull10 >= 10:
+		return fmt.Sprintf("every task stalled on memory %.0f%% of the time", h.PSIFull10)
+	}
+	return ""
 }
 
 // Fetch asks for the content of mutated files. Accept lists created paths the
@@ -312,6 +364,47 @@ type Settle struct {
 // Pull asks for gitignored artifacts by glob (relative to the workspace).
 type Pull struct {
 	Patterns []string `json:"patterns"`
+}
+
+// GitSeed asks the helper to give the slot workspace a minimal .git
+// ([sync] git_seed) after the forward sync: the HEAD commit as a shallow
+// root, its trees, the HEAD blobs of files changed locally, HEAD and the
+// branch ref, and an index built from HEAD. The helper answers GitNeed
+// (the CLI follows with a tar blob of those objects when any are missing),
+// then GitSeeded. Nothing else of the local repository is sent.
+type GitSeed struct {
+	// Key identifies the requested state: when it matches what the slot
+	// holds and nothing in .git was touched since, nothing is redone.
+	Key  string `json:"key"`
+	Head string `json:"head,omitempty"` // HEAD commit; empty on an unborn branch
+	Ref  string `json:"ref,omitempty"`  // refs/heads/<branch>; empty when detached
+	// Objects lists every object ID the seed holds (anything else in the
+	// slot's object store is removed).
+	Objects []string `json:"objects,omitempty"`
+	// SkipWorktree: paths in HEAD that weren't synced (excluded files,
+	// submodules) or that git status hides locally, so they don't show up
+	// as deleted or changed on the runner.
+	SkipWorktree []string `json:"skip_worktree,omitempty"`
+	// IntentToAdd: synced files staged locally that HEAD doesn't have.
+	IntentToAdd []string `json:"intent_to_add,omitempty"`
+}
+
+// GitNeed lists the objects the slot is missing. When non-empty, the CLI
+// follows with a gzip'd tar blob holding one "<type>/<id>" entry each, with
+// the object's raw content.
+type GitNeed struct {
+	IDs []string `json:"ids"`
+}
+
+// GitSeeded reports the seed. Warning is set when the slot was left
+// without a .git (git missing on the runner, or seeding failed); the run
+// goes on either way.
+type GitSeeded struct {
+	Reseeded bool   `json:"reseeded"`
+	Objects  int    `json:"objects"`
+	Bytes    int64  `json:"bytes"`
+	Warning  string `json:"warning,omitempty"`
+	MS       int64  `json:"ms"`
 }
 
 // Cancel asks the helper to terminate the running command.

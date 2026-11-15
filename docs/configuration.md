@@ -62,7 +62,6 @@ priority = 20
 idle_timeout = "10m"
 max_lifetime = "12h"
 volume_gb = 64
-hourly_cost = 0.25                # used by `spotexec monitor` for burn rate
 bootstrap_script = """
 apt-get update -o DPkg::Lock::Timeout=300 && apt-get install -y build-essential
 """
@@ -82,7 +81,7 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | `work_root` | `~/.cache/spotexec` | Where slots, caches and the helper live on the runner. |
 | `remote_path_setup` | (none) | Shell run before each command, after the login profile (for example `PATH` for mise or nvm). Not used inside a [project container](environments.md#project-containers). |
 | `ssh_options` | (none) | Extra `-o` options for `ssh`, for example `["Port=2222", "ProxyJump=bastion"]`. They override spotexec's defaults (`ConnectTimeout=10`, `ServerAliveInterval=10`, `ServerAliveCountMax=3`, `LogLevel=ERROR`), and runners whose options differ never share a connection. |
-| `hourly_cost` | (none) | Price per machine-hour of a fleet instance, for `spotexec monitor`. |
+| `hourly_cost` | (none) | Price per machine-hour, for the burn estimates in `spotexec status` and `spotexec monitor`. `aws-spot` VMs are priced at the current Spot price of their own instance type in their zone, so for them this is only the fallback when that price is unknown (an on-demand VM, or prices that can't be read). |
 
 ### `ssh` runners
 
@@ -101,8 +100,13 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `region` | `AWS_REGION`, `AWS_DEFAULT_REGION`, else `us-east-1` | EC2 region. |
 | `regions` | (unset) | Launch in several regions instead: a list, or `["all"]` for every region enabled in the account. Each new VM goes wherever Spot is cheapest right now. Not with `region`, `subnet_id`, `security_group_ids`, an `ami-…` ID or a named `cache_bucket`. A list of one region is the same as `region`. See [Let spotexec pick the region](aws.md#let-spotexec-pick-the-region). |
 | `profile` | (env / default) | AWS profile to use. |
-| `instance_types` | `c7a.2xlarge`, `m7a.2xlarge`, `c6a.2xlarge` (8 vCPUs, as in the starter config) | Tried in order on capacity errors (with `regions`: cheapest first, across every region). All must share one architecture. |
-| `arch` | from the first instance type | `amd64` or `arm64` (Graviton). |
+| `instance_types` | `c7a.2xlarge`, `m7a.2xlarge`, `c6a.2xlarge` (8 vCPUs, as in the starter config), none with `vcpus` | The types VMs may use. Each VM goes to the cheapest current Spot price among them and every zone (with `regions`, every region), moving down the ranking on capacity errors; equal prices go to the type listed first. All must share one architecture. With `vcpus`, entries may be patterns (`"m*"`, `"c7a.*"`) and only narrow the matching types. See [Launch on the cheapest instance](aws.md#launch-on-the-cheapest-instance). |
+| `vcpus` | (unset) | Instead of naming types: every current instance type in the region with exactly this many vCPUs (and `min_memory_gib`, `arch`) is a candidate, and the cheapest launches. Exact, so every VM gets the same slots. See [Describe the VM instead of naming types](aws.md#describe-the-vm-instead-of-naming-types). |
+| `min_memory_gib` | `0` | With `vcpus`: the least memory a type may have. |
+| `min_generation` | `6` | With `vcpus`: the oldest instance generation used (m6a: 6). `7` keeps to the newest. |
+| `exclude_instance_types` | (none) | With `vcpus`: types or patterns never to use, such as `["m6i.*", "*n.*"]`. |
+| `launch_order` | `cheapest` | `listed` tries `instance_types` in the listed order (each in its cheapest zone first) instead of cheapest first. |
+| `arch` | from the first instance type that isn't a pattern, else `amd64` | `amd64` or `arm64` (Graviton). |
 | `max_instances` | `4` | Fleet ceiling. |
 | `min_instances` | `0` | Warm floor, kept only while the [pool manager](scaling.md#pool-manager-optional) runs. |
 | `idle_timeout` | `10m` | The VM powers off after this long with no work. |
@@ -111,7 +115,7 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `bootstrap_script` | (none) | Runs as root on first boot, after the watchdog is armed. Bounded by `boot_timeout`. |
 | `user_bootstrap_script` | (none) | Then runs as the login user, in a login shell. |
 | `max_price` | the on-demand price | Spot bid cap in USD per hour, as a string (`"0.40"`). |
-| `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available. |
+| `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available, trying the types in their Spot-price order. |
 | `volume_gb` | `64` | Root gp3 volume (at least 8). |
 | `ami` | `auto` | `auto` uses the newest matching bake, else Ubuntu 24.04. `base` ignores bakes. An `ami-…` ID pins one image. |
 | `user` | `ubuntu` | Login user of the AMI. |
@@ -138,13 +142,18 @@ writeback = "always"           # always | on-success | never (eslint --fix exits
 exclude = [".env*", "*.pem"]   # on top of .gitignore and .spotexecignore
 pull_artifacts = ["coverage/"] # gitignored outputs copied back after every run
 # source = "git"               # git | directory (default: git when in a worktree)
+# git_seed = true              # a one-commit .git on the runner: HEAD, branch, git status (see below)
 
 [deps]
-lockfiles = ["pnpm-lock.yaml"]
+lockfiles = ["pnpm-lock.yaml", "packages/*/package.json"]   # the cache key; globs allowed
 install = "pnpm install --frozen-lockfile"
 cache_dirs = ["node_modules", "packages/*/node_modules"]
 hydrate = "auto"               # auto (reflink, else copy) | reflink | copy | hardlink
 # timeout = "20m"
+
+[setup]                        # optional: runs before every command, after [deps]
+run = "pnpm -r run build"      # e.g. build workspace packages the tests import
+# timeout = "5m"               # default: the command's own timeout
 
 [container]                    # optional; see "Project containers"
 dockerfile = ".spotexec/Dockerfile"   # written by `spotexec init` or `spotexec container init`
@@ -163,15 +172,64 @@ fail_fast = false
 when_load_above = 0.6          # agents offload only when the laptop is busy
 ```
 
+`git_seed` gives the slot a minimal `.git` before the command runs (off by default), so tools that ask Git about the checkout, such as a build stamping the commit SHA or a test recording `git status`, answer as they do locally. See [Git on the runner](running.md#git-on-the-runner) for what it holds and what it can't do.
+
+### Dependencies
+
+| Key | Meaning |
+| --- | --- |
+| `lockfiles` | Repo-relative files whose contents key the [dependency cache](environments.md#dependency-cache). Required with `install`. Entries may be globs (see below). |
+| `install` | Command that installs dependencies into `cache_dirs` when the cache misses. |
+| `cache_dirs` | Directories cached and restored per slot. Globs are single-level (`packages/*/node_modules`). |
+| `hydrate` | How a cache is restored into a slot: `auto` (reflink, else copy), `reflink`, `copy` or `hardlink`. |
+| `timeout` | Cap on the install command. |
+
+A `lockfiles` entry containing `*`, `?` or `[` is a pattern, matched one path segment at a time: `*` and `?` never cross a `/`, `[a-z]` is a character class, and a segment that is exactly `**` matches any number of directories, including none (`electron/native/*/src/**`, `**/package.json`). Unlike `--pull` and `pull_artifacts`, `**` is recursive here, because lockfile patterns are matched against the list of files spotexec syncs rather than the runner's filesystem. Every pattern must stay inside the repository (no leading `/`, no `..`, nothing in `.git`).
+
+Patterns are expanded once per run, on your machine, against the files synced to the slot: ignored, excluded and `cache_dirs` files never match, nor do symlinks. The key hashes the sorted, deduplicated list of matches plus any literal entries, and that exact list is what the runner reads, so a new workspace or native addon joins the key as soon as it is synced. A pattern that matches nothing is a warning (`DEPS_LOCKFILES`), since an empty directory of addons is legitimate; a literal path that is missing is still an error, as is a list that matches no file at all. `spotexec sync-plan` prints the expanded list. Configs without patterns keep their existing cache key.
+
+### Setup
+
+`[setup]` declares a step that runs before every task and ad-hoc command, in the slot (and in the [project container](environments.md#project-containers), when there is one), after the dependency restore. Use it for work that depends on source rather than lockfiles, so `[deps]` can't cache it: building the `dist/` of workspace packages that tests import, or generating code.
+
+| Key | Meaning |
+| --- | --- |
+| `run` | Shell command, run from the repository root (whatever directory the command runs from) with the command's environment. Required when `[setup]` is present. |
+| `timeout` | Cap on the setup alone. Without it, the setup gets the command's own timeout; the command then gets its full timeout after it. |
+
+Its output is held back: a successful setup shows nothing, and a failed one shows (the last 64 KiB of) its output on stderr, then a `SETUP_FAILED` warning. The command doesn't run, and the run exits `1` (`124` when the setup timed out), whatever code the setup exited with. Files the setup changes are treated like the command's: ignored outputs such as `dist/` stay in the slot, and anything else comes back under the usual [write-back](running.md#write-back-and-artifacts) rules.
+
+The setup runs on every run: each part of a parallel or sharded task, `spotexec exec`, `--sync none` runs, and runs that [fall back](running.md#run-flags) to your machine (there, in your worktree). It runs as its own process (and, under a container, its own container), so variables it exports don't reach the command; put those in `[env]`. `spotexec sync` skips it. `--no-setup` skips it for one run, and `setup = false` on a task for every run of that task (on a parallel task, for all of its parts).
+
+Ignored outputs from earlier runs stay in a slot, so a setup that builds into `dist/` should leave it consistent with the source on its own (most build tools do), or clear it first.
+
 ### Tasks
 
 | Key | Meaning |
 | --- | --- |
 | `run` | Shell command. `{args}` (as its own word, or `"{args}"`) becomes the arguments after the task name, passed as `"$@"`; without it they are appended. |
-| `parallel` | Names of other (non-parallel) tasks to run at once, each in its own slot. Extra arguments are not forwarded. |
-| `fail_fast` | Stop the remaining parallel tasks when one fails. |
+| `parallel` | Names of other (non-parallel) tasks to run at once, each in its own slot. A sharded task named here fans out into its shards. Extra arguments are not forwarded. |
+| `shards` | Run a `run` task as this many parts at once (1 to 64), each in its own slot, like a parallel task's parts. In the command, `{shard}` becomes the part's number (from 1) and `{shards}` the count; each part also gets `SPOTEXEC_SHARD` and `SPOTEXEC_SHARDS`. Extra arguments go to every shard. |
+| `fail_fast` | Stop the remaining parts of a parallel or sharded task when one fails. In a parallel task, its own setting covers every part, shards included. |
+| `group` | `true` holds each part's output and prints it as one block, still prefixed, when the part finishes, instead of interleaving every part's lines as they come; `false` keeps the live output. Unset, it follows `--group`, which is on by default for agents (`SPOTEXEC_AGENT=1` with stdout not a terminal). In a parallel task, its own setting covers every part. |
 | `timeout`, `sync`, `exclusive` | Per-task overrides of the run flags. |
 | `pool`, `priority` | Send this task to a different fleet, or move it ahead in the queue. |
+| `setup` | `false` skips the project's [`[setup]`](#setup) for this task (on a parallel task, for each of its parts). |
+
+A sharded task splits one command across the fleet, for test runners that take a shard option:
+
+```toml
+[tasks.test-all]
+run = "npx vitest run --maxWorkers=$SPOTEXEC_CPUS --shard={shard}/{shards} {args}"
+shards = 8
+timeout = "30m"
+fail_fast = false
+
+[tasks.ci]
+parallel = ["test-all", "lint"]   # 8 shards and lint, 9 parts at once
+```
+
+`sx test-all` runs eight parts, prefixed `[test-all 1/8]` to `[test-all 8/8]`, and exits as a parallel task does; `sx test-all --bail=1` passes `--bail=1` to all eight. With `--json`, each part's events carry `"shard"` and `"shards"` beside `"task"`, and the final `result` event has `"shards"` and each part's outcome in `"parts"`. The run ends with a summary of every part, failed ones first, and a last line with the overall result (see [what an agent sees](agents.md#what-an-agent-sees)). Using `{shard}` or `{shards}` without `shards` is a config error, as is `shards` on a parallel task. With `shards = 1` the task is an ordinary run (so `--same-slot` applies), with `{shard}` and `{shards}` both `1`.
 
 `sx <task>` runs any task, even one named like a spotexec subcommand: `sx sync` runs a task called `sync`. Only `spotexec <task>` gives subcommands precedence, so `spotexec sync` still means the subcommand. A task also wins over a program of the same name; `sx -- <name>` and `spotexec run -- <name>` skip the tasks and run the program. `spotexec tasks` lists them.
 
@@ -180,15 +238,36 @@ when_load_above = 0.6          # agents offload only when the laptop is busy
 A repository can declare its own fleet, built on one of your runners:
 
 ```toml
-pool = ["ci-big"]
-
 [runners.ci-big]
 extends = "aws"                # one of YOUR runners in ~/.config/spotexec/config.toml
+extends_type = "aws-spot"      # or, if you have none by that name, your aws-spot runner
 instance_types = ["c7a.2xlarge", "m7a.2xlarge"]
 max_slots = 2                  # 4 vCPUs per job
 max_instances = 3
+
+[tasks.typecheck]
+run = "npm run typecheck"
+pool = ["ci-big"]              # only this task needs the big fleet
 ```
 
-A project runner **must** build on one of your global runners: name it with `extends`, or reuse its name to override it. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts.
+A project runner builds on one of your global runners. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts. It picks its base this way:
+
+- `extends = "name"` uses your runner of that name. With neither key, a project runner of the same name as one of yours overrides it.
+- `extends_type = "ssh" | "aws-spot" | "sim"` uses your runner of that type when `extends` names none you have (or one of another type). With several of that type, the first one in your `default_pool` wins.
+
+Runner names are personal while `.spotexec.toml` is shared, so a committed fleet should usually set `extends_type`. When the base can't be found on your machine (no such runner, or several candidates and none in `default_pool`), the fleet is unavailable to you, and that's all: commands that don't use it keep working, `spotexec doctor` lists it with the reason, and a command that selects it (through `--runner`, a task's `pool` or the project's `pool`) fails, saying what's missing. It never falls back to another runner, since a fleet sized for a job may be the only place that job fits; choose another runner with `-r` instead. An unavailable fleet that has the same name as one of your runners hides that runner in this repository (only `status -A` and `down -A` still reach it), so your `default_pool` fails here too if it names it. A project-level `pool` makes the fleet the default for every command in the repository, so for a fleet only some tasks need, set `pool` on those tasks.
+
+A project can also size its VMs by requirements. A suite that needs more memory per job than your runner's types have, for example:
+
+```toml
+[runners.ci-mem]
+extends = "aws"
+extends_type = "aws-spot"
+vcpus = 8
+min_memory_gib = 32            # whichever 8-vCPU type with 32 GiB or more is cheapest now
+max_slots = 2
+```
+
+Setting `vcpus` (or another requirement key) without `instance_types` drops the inherited `instance_types`, and setting `instance_types` alone drops inherited requirements: the project's way of choosing types replaces yours. Set both to narrow the requirements with patterns.
 
 How you connect and which account and network are used stay in your global config. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `regions`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, or open a port. See [Security model](architecture.md#security-model).

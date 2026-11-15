@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -264,6 +265,9 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		script = d.Setup + "\n" + script
 	}
 	env := map[string]string{"CI": "true"}
+	if mb := s.memoryShareMB(); mb > 0 {
+		env["SPOTEXEC_MEMORY"] = strconv.FormatInt(mb, 10)
+	}
 	for k, v := range d.Env {
 		env[k] = v
 	}
@@ -281,7 +285,7 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		}
 		script, env, cleanup = host, hostEnv, c
 	}
-	pr := s.runProc(script, s.workspace, env, time.Duration(d.TimeoutMS)*time.Millisecond, 5*time.Second, false)
+	pr := s.runProc(script, s.workspace, env, time.Duration(d.TimeoutMS)*time.Millisecond, 5*time.Second, false, nil)
 	if err := cleanup(); err != nil {
 		return perr(protocol.CodeDepsFailed, "%v", err)
 	}
@@ -292,6 +296,11 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 		}
 		if pr.timedOut {
 			msg = "install command timed out"
+		} else if d.Container != nil && pr.startErr == nil && s.containerOOMKilled() {
+			msg += ": out of memory, the kernel killed a process in its container"
+			if s.memLimit > 0 {
+				msg += fmt.Sprintf(" when the jobs sharing the runner reached the memory set aside for them (%s); use --exclusive or fewer max_slots", gib(s.memLimit))
+			}
 		}
 		return perr(protocol.CodeDepsFailed, "%s", msg)
 	}

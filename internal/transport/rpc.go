@@ -32,8 +32,12 @@ type Session struct {
 	stopped sync.Once
 	once    sync.Once
 	seen    atomic.Int64
-	silent  atomic.Bool   // the watchdog gave up on the helper
-	limit   time.Duration // SilenceLimit when the session opened
+	silent  atomic.Bool  // the watchdog gave up on the helper
+	limit   atomic.Int64 // SilenceLimit when the session opened, plus any current grace (ns)
+	// onSilent, if set, is asked whether to keep waiting when the helper
+	// goes silent past the limit, once per silence (see SetOnSilent).
+	onSilent atomic.Pointer[func(time.Duration) time.Duration]
+	pressure atomic.Pointer[pressureSeen] // the latest heartbeat showing memory pressure
 	// OnEvent receives helper events that arrive while waiting for replies.
 	OnEvent func(protocol.Event)
 }
@@ -143,7 +147,7 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	s.seen.Store(time.Now().UnixNano())
 	go s.readLoop()
 	go s.heartbeat()
-	s.limit = SilenceLimit
+	s.limit.Store(int64(SilenceLimit))
 	go s.watchdog()
 	if err := s.Conn.Send(protocol.TypeHello, protocol.Hello{Proto: protocol.Version, Version: helper.Version, WorkRoot: c.WorkRoot}); err != nil {
 		s.Close()
@@ -230,6 +234,7 @@ func (s *Session) readLoop() {
 		}
 		if f.Kind == protocol.KindMsg {
 			if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeHeartbeat {
+				s.notePressure(env)
 				continue
 			}
 		}
@@ -265,8 +270,11 @@ var errSilent = errors.New("runner stopped responding")
 // pending read (or write) then fails as a lost connection instead of
 // waiting forever.
 func (s *Session) watchdog() {
-	t := time.NewTicker(min(5*time.Second, s.limit/4))
+	base := s.Limit()
+	t := time.NewTicker(min(5*time.Second, base/4))
 	defer t.Stop()
+	asked := false    // onSilent was asked about the current silence
+	var askedAt int64 // s.seen when it was
 	for {
 		select {
 		case <-s.done:
@@ -274,12 +282,32 @@ func (s *Session) watchdog() {
 		case <-s.closing:
 			return
 		case <-t.C:
-			if time.Since(s.LastSeen()) > s.limit {
-				s.setErr(fmt.Errorf("%w (nothing for %s)", errSilent, s.limit))
-				s.silent.Store(true)
-				s.Abort()
-				return
+			// The helper sent something since onSilent was asked: that
+			// silence is over. Drop its grace, so a later one is noticed
+			// as quickly as the first, and ask afresh then.
+			seen := s.seen.Load() // before judging the silence: progress after it rearms
+			if asked && seen != askedAt {
+				s.limit.Store(int64(base))
+				asked = false
 			}
+			silent := time.Since(s.LastSeen())
+			if silent <= s.Limit() {
+				continue
+			}
+			if f := s.onSilent.Load(); f != nil && !asked {
+				asked, askedAt = true, seen
+				if grace := (*f)(silent); grace > 0 {
+					s.limit.Store(int64(base + grace))
+					continue
+				}
+				if time.Since(s.LastSeen()) <= s.Limit() {
+					continue // it spoke up while we asked
+				}
+			}
+			s.setErr(fmt.Errorf("%w (nothing for %s)", errSilent, s.Limit()))
+			s.silent.Store(true)
+			s.Abort()
+			return
 		}
 	}
 }
@@ -427,6 +455,45 @@ func (s *Session) Dead() bool {
 // LastSeen is when the helper last sent anything (heartbeats included).
 // While our own frame buffer is backed up (we're not reading fast enough,
 // e.g. output piped into a paused pager), the helper is evidently alive.
+// Limit is how long the session may currently hear nothing from the
+// helper before it is given up on.
+func (s *Session) Limit() time.Duration { return time.Duration(s.limit.Load()) }
+
+// SetOnSilent sets f to be asked, once per silence, when the helper has
+// been silent past SilenceLimit: it returns how much longer to wait (0 to
+// give up now). A helper that speaks again goes back to SilenceLimit, and
+// f is asked afresh if it falls silent later. f runs on the watchdog, so
+// it should return within seconds.
+func (s *Session) SetOnSilent(f func(silent time.Duration) time.Duration) { s.onSilent.Store(&f) }
+
+type pressureSeen struct {
+	at   time.Time
+	what string
+}
+
+// MemoryPressure describes the memory pressure the helper last reported in
+// a heartbeat (protocol.Heartbeat.Pressure) if that was within the last
+// within, else "". A nil session has seen none.
+func (s *Session) MemoryPressure(within time.Duration) string {
+	if s == nil {
+		return ""
+	}
+	if p := s.pressure.Load(); p != nil && time.Since(p.at) <= within {
+		return p.what
+	}
+	return ""
+}
+
+func (s *Session) notePressure(env protocol.Envelope) {
+	var hb protocol.Heartbeat
+	if len(env.Body) == 0 || env.Unmarshal(&hb) != nil {
+		return
+	}
+	if what := hb.Pressure(); what != "" {
+		s.pressure.Store(&pressureSeen{at: time.Now(), what: what})
+	}
+}
+
 func (s *Session) LastSeen() time.Time {
 	if len(s.frames) >= cap(s.frames)/2 {
 		return time.Now()

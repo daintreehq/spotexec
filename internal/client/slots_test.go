@@ -16,3 +16,16 @@ func TestSlotsOfRespectsCeiling(t *testing.T) {
 		}
 	}
 }
+
+// A vcpus runner's VMs all have exactly vcpus vCPUs, whichever type each
+// one gets.
+func TestSlotsOfRequirements(t *testing.T) {
+	for vcpus, want := range map[int]int{8: 2, 32: 8} {
+		if got := slotsOf(&config.Runner{Type: config.TypeAWSSpot, VCPUs: vcpus}); got != want {
+			t.Errorf("slotsOf(vcpus = %d) = %d, want %d", vcpus, got, want)
+		}
+	}
+	if got := slotsOf(&config.Runner{Type: config.TypeAWSSpot, VCPUs: 8, MaxSlots: 3}); got != 3 {
+		t.Errorf("max_slots ignored: %d", got)
+	}
+}

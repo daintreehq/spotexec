@@ -3,14 +3,14 @@
 
 ```
 sx [flags] <command...>                      sync, run remotely, write back
-sx [flags] <task> [args...]                  named task; parallel tasks fan out across slots
+sx [flags] <task> [args...]                  named task; parallel and sharded tasks fan out across slots
 sx [flags] -- <command...>                   the command, even if a task has its name
 spotexec run [flags] -- <cmd>                the same as sx --: <cmd> is never a task
 sx --same-slot [flags] <cmd>                 run in this worktree's last slot (same VM)
 spotexec exec [flags] -- <cmd>               same as sx --same-slot --sync none -- <cmd>
 spotexec tasks                               list tasks from .spotexec.toml
 spotexec sync [flags]                        pre-sync a slot (and build the container image, install deps)
-spotexec sync-plan [--json]                  dry-run the sync: files, bytes, largest files, exclusions
+spotexec sync-plan [--json]                  dry-run the sync: files, bytes, largest files, exclusions, deps key files
 spotexec pull <glob>... [--dest DIR]         copy gitignored files from the last slot
 spotexec status [runner...] [--json] [-A]    runners, instances, slot holders, idle timers (-A: every machine's VMs and builders, Spot quota use; with --json, {"instances", "searched", "failed", "spot_quotas"})
 spotexec monitor [runner...] [--interval 2s] live load and burn-rate dashboard
@@ -24,10 +24,11 @@ spotexec container build [run flags]         build the project image on a runner
 spotexec image bake [runner] [--pull IMG]    bake an AMI from the runner's bootstrap (--region R for multi-region runners)
 spotexec image list [runner]                 baked AMIs from every machine: base image, age, maker, which is in use (every region a runner uses, or --region R)
 spotexec image clear [runner] [--all]        delete this machine's and this bootstrap's bakes (--all: every machine's; every region a runner uses, or --region R)
-spotexec prices [runner] [--refresh] [--json] current Spot prices across the runner's regions (with `regions`, the next VM takes the cheapest)
+spotexec prices [runner] [--refresh] [--json] current Spot prices of the runner's instance types in every zone of its region(s), cheapest first; marks where the next VM launches
 spotexec setup [host...] [--all] [--bake]    set up this machine (config, AWS user and key, hooks), then others over SSH; offer a bake
 spotexec setup --list | --revoke HOST        every machine's IAM user and VMs; revoke one
 spotexec teardown [--dry-run] [--region R]   remove everything spotexec created in the AWS account (admin)
+spotexec supported [-C DIR]                  print true (exit 0) if sx can run from here, else false (exit 1)
 spotexec doctor [runner...]                  verify config, SSH, helper, credentials, network, quota
 spotexec unlock [runner[/id]] (--slot N | --all)
 spotexec prune [runner[/id]...] [--older-than 7d] [--dry-run]
@@ -49,7 +50,7 @@ spotexec version
 | `~/.aws/credentials` `[spotexec]`, `~/.aws/config` `[profile spotexec]` | The access key and region written by `spotexec setup`. |
 | `~/.config/spotexec/owner-id` | This machine's permanent ID: it tags the instances it launches and its IAM user. A machine's runs only use its own instances. |
 | `~/.config/spotexec/machines.toml` | The machines `spotexec setup` has set up from here (for `setup --all`). |
-| `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
+| `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log, dependency install logs (`logs/deps/`), the full output of failed `--rtk-filter` runs (`rtk/`) (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
 | `.spotexec.toml`, `.spotexecignore` | Project config and extra sync excludes. |
 | `<git-dir>/spotexec/conflicts/` | Remote versions of files that conflicted on write-back (`.spotexec/conflicts/` outside Git). |
 | `.spotexec/Dockerfile` | Project image from `spotexec init` or `spotexec container init`. |

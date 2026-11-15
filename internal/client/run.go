@@ -60,6 +60,7 @@ type Options struct {
 	Exclusive      bool
 	Pull           []string
 	NoDeps         bool
+	NoSetup        bool // skip [setup]
 	ForceLargeSync bool
 	PreferLast     bool     // exec: reuse last runner+slot without syncing
 	SameSlot       bool     // --same-slot: sync and run in this worktree's last slot
@@ -75,6 +76,9 @@ type Options struct {
 	SyncOnly       bool // stop after sync + deps (spotexec sync)
 	WaitPush       bool // push a freshly built image before returning (container build)
 	Priority       int  // queue priority when every slot is busy (higher first)
+	// Env is set for the command over the project's env (a shard's
+	// SPOTEXEC_SHARD and SPOTEXEC_SHARDS).
+	Env map[string]string
 }
 
 // Result of a run.
@@ -95,10 +99,26 @@ type Result struct {
 	Synced    int      `json:"synced_files"`
 	SyncBytes int64    `json:"synced_bytes"`
 	Image     string   `json:"image,omitempty"` // the project container image used
+	// DepsInstalled is how long the dependency phase took when it ran the
+	// install (a cache miss); zero otherwise.
+	DepsInstalled time.Duration `json:"-"`
 	// LastRun is where this worktree's files now are, when the run
 	// synced (saved already unless Options.DeferLastRun).
 	LastRun *LastRun `json:"-"`
+	// OOMKilled: the kernel killed a process in the command's container
+	// for running out of memory: the shared memory pool's cap, the
+	// container's own limit, or the whole VM's memory.
+	OOMKilled bool `json:"oom_killed,omitempty"`
+	// SetupFailed: [setup] failed, timed out or couldn't start, so the
+	// command never ran (ExitCode is 1, or 124 for a timeout).
+	SetupFailed bool `json:"setup_failed,omitempty"`
+	// noReplay, when the runner was lost, is why the run must not be
+	// replayed elsewhere (see replayable).
+	noReplay noReplay
 }
+
+// noReplay is a warning code and the reason behind it.
+type noReplay struct{ code, why string }
 
 // InfraError marks failures of spotexec itself (exit 125).
 type InfraError struct{ Err error }
@@ -123,6 +143,7 @@ type attempt struct {
 	runID   string
 	n       int
 	exclude map[string]bool // fleet instances lost in earlier attempts
+	fresh   *bool           // an earlier attempt already showed CONTAINER_FRESH
 }
 
 // Run executes opts.Command remotely for workspace ws. If the runner is lost
@@ -140,14 +161,17 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		}
 		return Result{}, infra(fmt.Errorf("%s is not in a Git repository and has no .spotexec.toml, so spotexec won't sync it; run `spotexec init` there to mark it as a project, or pass --sync none", ws.Root))
 	}
-	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}}
+	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}, fresh: new(bool)}
 	reached := false
 	for {
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
 		reached = reached || res.Runner != ""
 		res.Reached = reached
-		retryable := lost != "" && o.RetryPreempt && ctx.Err() == nil && o.Sync != "none" && !o.PreferLast && !o.SameSlot && att.n < 2
-		if !retryable {
+		retry, code, why := replayable(lost, res, o, ctx.Err() != nil, att.n)
+		if why != "" {
+			o.Rep.Warn(code, "%s", why)
+		}
+		if !retry {
 			return res, err
 		}
 		o.Rep.Warn("RUNNER_LOST", "lost %s before the command finished (%v); replaying the run on another slot", lost, err)
@@ -160,6 +184,88 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 	}
 }
 
+// replayable decides whether an attempt that lost its runner (lost, from
+// lostRunner) is replayed on another slot. why is set when whyNoReplay
+// withheld the replay (the runner was out of memory, or still running with
+// no notice it was going away): that run is never replayed, since a run
+// that used up its VM's memory would most likely do the same on the next
+// one, and take that VM's other jobs with it.
+func replayable(lost string, res Result, o Options, canceled bool, n int) (retry bool, code, why string) {
+	if lost == "" {
+		return false, "", ""
+	}
+	eligible := o.RetryPreempt && !canceled && o.Sync != "none" && !o.PreferLast && !o.SameSlot && n < 2
+	if res.noReplay.why == "" {
+		return eligible, "", ""
+	}
+	why = "lost " + lost + " " + res.noReplay.why
+	if eligible {
+		why += "; not replaying the run on another slot"
+	}
+	return false, res.noReplay.code, why
+}
+
+// whyNoReplay decides, once a fleet lease's runner is lost, whether the
+// run must not be replayed elsewhere: its VM reported memory pressure (a
+// run that used up its VM's memory would most likely do the same on the
+// next one, and take that VM's other jobs with it), or the VM is still
+// running and gave no Spot notice, so whatever stopped it answering came
+// from inside, quite possibly from this run. A VM that announced it was
+// going away (a Spot notice, or its helper reporting the shutdown, as at
+// max_lifetime) is replayed whatever its memory looked like: it was going
+// down whatever the run did. A VM that is gone is replayed too, unless it
+// was out of memory.
+func whyNoReplay(lease *Lease, noticed bool) noReplay {
+	if noticed {
+		return noReplay{}
+	}
+	if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
+		return noReplay{"MEMORY_PRESSURE", "while it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
+	}
+	if instanceRunning(lease) {
+		return noReplay{"RUNNER_UNRESPONSIVE", "although EC2 still reports it running, without a Spot notice: the run may be what overloaded it (memory, most often), and the attempt's outcome is unknown. Rerun it, with --exclusive if it may need the whole VM"}
+	}
+	return noReplay{}
+}
+
+// replayVerdict is whyNoReplay for an attempt that lost its runner with
+// err: a shutdown the helper reported counts as the VM's notice, since EC2
+// still reports a VM running while its OS halts.
+func replayVerdict(lease *Lease, noticed bool, err error) noReplay {
+	return whyNoReplay(lease, noticed || vmShutdown(err))
+}
+
+// shutdownErr is what runOnce returns when the VM's shutdown killed the
+// command.
+func shutdownErr(label string, code int) error {
+	return infra(&shutdownError{label, code})
+}
+
+// shutdownError is an attempt whose command the VM's shutdown killed.
+type shutdownError struct {
+	label string
+	code  int
+}
+
+func (e *shutdownError) Error() string {
+	return fmt.Sprintf("%s shut down while the command ran (it was stopped with exit %d); nothing was written back", e.label, e.code)
+}
+
+// vmShutdown reports whether err says the VM began shutting down under the
+// attempt: the helper's RUNNER_SHUTTING_DOWN error, or a result the
+// shutdown killed (shutdownError).
+func vmShutdown(err error) bool {
+	var se *shutdownError
+	return errors.As(err, &se) || helperShutdown(err)
+}
+
+// helperShutdown reports whether err is the helper saying the VM began
+// shutting down under the request (protocol.CodeShutdown).
+func helperShutdown(err error) bool {
+	var re *transport.RemoteError
+	return errors.As(err, &re) && re.Code == protocol.CodeShutdown
+}
+
 // lostRunner reports what to exclude when the connection to a lease died.
 func lostRunner(l *Lease, err error) string {
 	if l == nil || err == nil || !l.Runner.Ephemeral() {
@@ -169,11 +275,11 @@ func lostRunner(l *Lease, err error) string {
 	// (the command may well have run): never treat that as a lost runner,
 	// unless it says the VM is shutting down (a container killed as dockerd
 	// stops with the VM).
+	if helperShutdown(err) {
+		return shutdownRunner(l)
+	}
 	var re *transport.RemoteError
 	if errors.As(err, &re) {
-		if re.Code == protocol.CodeShutdown {
-			return shutdownRunner(l)
-		}
 		return ""
 	}
 	// Writes to a dead SSH channel fail with plain pipe errors; the session
@@ -187,14 +293,17 @@ func lostRunner(l *Lease, err error) string {
 	return "static"
 }
 
-func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, att attempt) (Result, error, string) {
+func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, att attempt) (res Result, err error, lost string) {
 	start := time.Now()
-	var res Result
 	p := cfg.Project
 	runID := att.runID
 
+	// Returning to the last slot needs only that runner: a default pool this
+	// machine can't use, such as a project fleet built on a runner it lacks,
+	// mustn't block it. A pool given with --runner/--pool (LastWithin) still
+	// has to be valid.
 	pool, err := cfg.Pool(o.Pool)
-	if err != nil {
+	if err != nil && (!o.PreferLast && !o.SameSlot || len(o.LastWithin) > 0) {
 		return res, infra(err), ""
 	}
 
@@ -268,6 +377,15 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}
 	defer lease.Close()
+	if lease.InstanceID != "" {
+		lease.Sess.SetOnSilent(waitIfRunning(lease, o.Rep))
+	}
+	var noticed atomic.Bool // a reclamation notice arrived
+	defer func() {
+		if lost != "" && lease.InstanceID != "" {
+			res.noReplay = replayVerdict(lease, noticed.Load(), err)
+		}
+	}()
 	// Before the command starts, Ctrl-C aborts the session outright (a
 	// blocked upload cannot otherwise be interrupted). Once it runs,
 	// interrupts are forwarded as cancels and the session stays up so
@@ -285,7 +403,6 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	r := lease.Runner
 	res.Runner, res.Slot = r.Name, lease.Acq.Token
 	sess := lease.Sess
-	var noticed atomic.Bool // a reclamation notice arrived before exec
 	sess.OnEvent = func(ev protocol.Event) {
 		o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
 		if ev.Name == "spot_interruption" {
@@ -318,20 +435,21 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			o.Rep.Event("sync_in", map[string]any{"mode": "delta", "files": syn.Written, "deleted": syn.Deleted, "bytes": syn.Bytes, "duration_ms": time.Since(t).Milliseconds()})
 			o.Rep.Status("%s · synced %d files (%s) in %s", label, syn.Written, ui.Bytes(syn.Bytes), ui.Dur(time.Since(t)))
 		}
+		// Before the image and dependencies, so install scripts see it too.
+		if err := seedGit(ctx, sess, m, p.Sync.GitSeed, o, label); err != nil {
+			return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, err)), lostRunner(lease, err)
+		}
 	}
 
 	// 4. Project container image.
 	var crun *protocol.ContainerRun
 	imageID := ""
 	if p.Container.Enabled() {
-		if o.SameSlot || o.PreferLast {
-			o.Rep.Warn("CONTAINER_FRESH", "this project runs in a container, which starts fresh each run: files in the workspace and $HOME carry over, but system packages installed by an earlier run don't (add them to %s)", orDefault(p.Container.Dockerfile, "the image"))
-		}
 		ref, id, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
 		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
 		}
-		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root"}
+		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root", Network: p.Container.Network, Docker: p.Container.Docker}
 		imageID = id
 		lastRun.Image = ref
 		res.Image = ref
@@ -340,8 +458,12 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	// 5. Dependencies.
 	if p.Deps.Install != "" && !o.NoDeps && o.Sync != "none" {
-		if err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun, imageID); err != nil {
+		dr, err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun, imageID, m)
+		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
+		}
+		if dr.Built {
+			res.DepsInstalled = time.Duration(dr.MS) * time.Millisecond
 		}
 	}
 
@@ -379,6 +501,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	for k, v := range p.Env {
 		env[k] = v
 	}
+	for k, v := range o.Env {
+		env[k] = v
+	}
 	skip := append([]string{}, manifest.HeavyDirs...)
 	skip = append(skip, p.Deps.CacheDirs...)
 	ex := protocol.Exec{
@@ -389,7 +514,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		Snapshot: true, Skip: skip, SpotWatch: r.Type == config.TypeAWSSpot,
 		Container: crun,
 	}
-	o.Rep.Status("%s · running %s", label, o.Display)
+	if run, timeout := SetupFor(p, o); run != "" {
+		ex.SetupRun, ex.SetupTimeoutMS = run, timeout.Milliseconds()
+		o.Rep.Status("%s · running setup ([setup] run)", label)
+		o.Rep.Event("setup", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": run})
+	} else {
+		o.Rep.Status("%s · running %s", label, o.Display)
+	}
 	o.Rep.Event("exec", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": o.Display, "cwd": ws.Cwd})
 	stopWatch.Do(func() { close(execStarted) })
 	if ctx.Err() != nil {
@@ -402,6 +533,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			NewPool(r, f).Observe(lease.InstanceID, OutDraining, time.Time{})
 		}
 		return res, infra(fmt.Errorf("%s announced a spot interruption before the command started", lease.InstanceID)), lease.InstanceID
+	}
+	if crun != nil && !*att.fresh {
+		*att.fresh = true // a replay doesn't repeat it
+		warnContainerFresh(ws, o, p.Container.Dockerfile)
 	}
 	if err := sess.Conn.Send(protocol.TypeExec, ex); err != nil {
 		return res, infra(err), lostRunner(lease, err)
@@ -417,6 +552,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}()
 	onSpot := func() {
+		noticed.Store(true)
 		if lease.InstanceID == "" || !(o.RetryPreempt && att.n < 2 && o.Sync != "none" && !o.PreferLast && !o.SameSlot) {
 			return
 		}
@@ -440,7 +576,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	outW := &ui.Rewriter{W: &ui.ClearingWriter{W: o.Stdout, R: o.Rep}, Old: []byte(remoteWS), New: []byte(ws.Root)}
 	errW := &ui.Rewriter{W: &ui.ClearingWriter{W: o.Stderr, R: o.Rep}, Old: []byte(remoteWS), New: []byte(ws.Root)}
-	result, err := pumpExec(sess, outW, errW, o, onSpot)
+	afterSetup := func() { o.Rep.Status("%s · running %s", label, o.Display) }
+	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup)
 	outW.Flush()
 	errW.Flush()
 	if err != nil {
@@ -456,7 +593,11 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	switch classifyExec(result) {
 	case execNotStarted:
-		return res, infra(fmt.Errorf("the command could not be started on %s: %s", r.Name, result.StartError)), ""
+		what := "the command"
+		if result.SetupFailed {
+			what = "[setup] run"
+		}
+		return res, infra(fmt.Errorf("%s could not be started on %s: %s", what, r.Name, result.StartError)), ""
 	case execCanceled:
 		res.Canceled, res.ExitCode = true, ExitInterrupted
 	case execShutdown:
@@ -464,7 +605,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		// runner, nothing from this attempt is written back, and on a Spot
 		// runner the run is replayed (unless the user interrupted it: then
 		// the CLI exits 130).
-		return res, infra(fmt.Errorf("%s shut down while the command ran (it was stopped with exit %d); nothing was written back", label, result.ExitCode)), shutdownRunner(lease)
+		return res, shutdownErr(label, result.ExitCode), shutdownRunner(lease)
 	}
 	checkCanceled()
 	// Post-exec work uses its own bounded context: an interrupt that already
@@ -480,8 +621,17 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if m != nil && len(result.Unverified) > 0 {
 		o.Rep.Warn("UNVERIFIED", "%d file(s) could not be read on the runner after the run and were not written back: %s", len(result.Unverified), strings.Join(firstN(result.Unverified, 5), ", "))
 	}
-	if result.TimedOut {
+	if result.SetupFailed && !res.Canceled {
+		var msg string
+		res.ExitCode, msg = setupFailure(p, o, result)
+		res.SetupFailed = true
+		o.Rep.Warn("SETUP_FAILED", "%s", msg)
+	} else if result.TimedOut {
 		o.Rep.Warn("TIMEOUT", "command exceeded %s and was terminated (raise with --timeout)", o.Timeout)
+	}
+	if result.OOMKilled {
+		res.OOMKilled = true
+		o.Rep.Warn("OOM_KILLED", "%s", oomMessage(result.MemoryLimitMB))
 	}
 
 	// 6. Write-back of mutations.
@@ -526,7 +676,18 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	checkCanceled()
 	res.Duration = time.Since(start)
-	o.Rep.Event("result", map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot})
+	ev := map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot}
+	if res.OOMKilled {
+		ev["oom_killed"] = true
+	}
+	if result.SetupMS > 0 || result.SetupFailed {
+		ev["setup_ms"] = result.SetupMS
+	}
+	if res.SetupFailed {
+		ev["setup_failed"] = true
+		ev["setup_exit_code"] = result.ExitCode
+	}
+	o.Rep.Event("result", ev)
 	return res, nil, ""
 }
 
@@ -804,6 +965,22 @@ func syncIn(ctx context.Context, s *transport.Session, m *manifest.Manifest, pro
 	return syn, nil
 }
 
+// DepsLockfiles expands the deps.lockfiles patterns against the synced
+// regular files in m (see depskey.Expand). It returns the concrete list to
+// hash and the patterns that matched nothing.
+func DepsLockfiles(m *manifest.Manifest, entries []string) ([]string, []string, error) {
+	var files []string
+	if m != nil {
+		files = make([]string, 0, len(m.ByPath))
+		for p, e := range m.ByPath {
+			if e.Mode != fsid.ModeSymlink {
+				files = append(files, p)
+			}
+		}
+	}
+	return depskey.Expand(entries, files)
+}
+
 // addLocalTar adds one file and returns the entry for exactly what was sent.
 func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 	fi, err := os.Lstat(full)
@@ -836,10 +1013,21 @@ func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 	return protocol.Entry{Path: name, ID: fsid.Bytes(b), Mode: emode, Size: int64(len(b))}, err
 }
 
-func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string) error {
-	lockfiles := p.Deps.Lockfiles
+func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string, m *manifest.Manifest) (protocol.DepsResult, error) {
+	if len(p.Deps.Lockfiles) == 0 {
+		return protocol.DepsResult{}, errors.New("deps.install is set but deps.lockfiles is empty")
+	}
+	// The runner hashes exactly this list: it never expands patterns itself,
+	// so both sides key the cache on the same files.
+	lockfiles, unmatched, err := DepsLockfiles(m, p.Deps.Lockfiles)
+	if err != nil {
+		return protocol.DepsResult{}, err
+	}
+	for _, pat := range unmatched {
+		o.Rep.Warn("DEPS_LOCKFILES", "deps.lockfiles pattern %q matches no synced file, so it adds nothing to the dependency cache key", pat)
+	}
 	if len(lockfiles) == 0 {
-		return errors.New("deps.install is set but deps.lockfiles is empty")
+		return protocol.DepsResult{}, errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
 	}
 	o.Rep.Status("%s · checking dependency cache", label)
 	t := time.Now()
@@ -880,57 +1068,76 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 		}
 	}
 	if err := s.Conn.Send(protocol.TypeDeps, req); err != nil {
-		return err
+		return protocol.DepsResult{}, err
 	}
-	errW := &ui.ClearingWriter{W: o.Stderr, R: o.Rep}
-	for {
-		f, err := s.Next(ctx)
-		if err != nil {
-			return err
-		}
-		switch f.Kind {
-		case protocol.KindStdout, protocol.KindStderr:
-			// Install output goes to stderr so command stdout stays clean.
-			errW.Write(f.Data)
-			continue
-		}
-		env, err := protocol.Decode(f)
-		if err != nil {
-			return err
-		}
-		switch env.Type {
-		case protocol.TypeStarted:
-			continue
-		case protocol.TypeEvent:
-			var ev protocol.Event
-			_ = env.Unmarshal(&ev)
-			if ev.Name == "deps_install" {
-				o.Rep.Status("%s · installing dependencies (%s)", label, ev.Message)
-			}
-			if s.OnEvent != nil {
-				s.OnEvent(ev) // records interruption notices for the pre-exec check
-			} else {
-				o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
-			}
-			continue
-		case protocol.TypeError:
-			var em protocol.ErrorMsg
-			_ = env.Unmarshal(&em)
-			return fmt.Errorf("dependencies: %w", &transport.RemoteError{ErrorMsg: em})
-		case protocol.TypeDepsResult:
-			var dr protocol.DepsResult
-			_ = env.Unmarshal(&dr)
-			o.Rep.Event("deps", map[string]any{"key": dr.Key, "built": dr.Built, "restored": dr.Restored, "uploading": dr.Uploaded,
-				"hydrated": dr.Hydrated, "method": dr.Method, "duration_ms": time.Since(t).Milliseconds()})
-			return nil
-		default:
-			return fmt.Errorf("protocol: unexpected %q during deps", env.Type)
+	onEvent := func(ev protocol.Event) {
+		if s.OnEvent != nil {
+			s.OnEvent(ev) // records interruption notices for the pre-exec check
+		} else {
+			o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
 		}
 	}
+	log := newDepsLog(depsLogDir(), label)
+	dr, err := consumeDeps(ctx, s.Next, onEvent, o.Rep, label, log)
+	log.Close()
+	// The install's status (and plain mode's heartbeat of it) ends here:
+	// the command's own phase starts next.
+	o.Rep.Clear()
+	ms := time.Since(t).Milliseconds()
+	if err != nil {
+		tail, truncated := log.Tail(depsTailLines)
+		var re *transport.RemoteError
+		if errors.As(err, &re) {
+			// The helper reported the failure: no retry follows.
+			ev := map[string]any{"code": re.Code, "message": re.Message, "duration_ms": ms}
+			if log.Bytes() > 0 {
+				ev["output_tail"], ev["output_truncated"] = tail, truncated
+			}
+			if p := log.Path(); p != "" {
+				ev["log"] = p
+			}
+			o.Rep.Event("deps_failed", ev)
+		}
+		if log.Bytes() == 0 || ctx.Err() != nil {
+			return dr, err // nothing to show, or this run was interrupted
+		}
+		// A runner lost mid-install keeps what it printed, too.
+		return dr, &DepsError{Err: err, Tail: tail, Truncated: truncated, Log: log.Path()}
+	}
+	ev := map[string]any{"key": dr.Key, "built": dr.Built, "restored": dr.Restored, "uploading": dr.Uploaded,
+		"hydrated": dr.Hydrated, "method": dr.Method, "duration_ms": ms}
+	if p := log.Path(); p != "" {
+		ev["log"] = p
+	}
+	o.Rep.Event("deps", ev)
+	return dr, nil
+}
+
+// SetupFor is the [setup] command a run starts with ("" when none applies)
+// and its time limit: setup.timeout, or the command's own timeout.
+func SetupFor(p *config.Project, o Options) (string, time.Duration) {
+	if o.NoSetup || strings.TrimSpace(p.Setup.Run) == "" {
+		return "", 0
+	}
+	if p.Setup.Timeout.Duration > 0 {
+		return p.Setup.Run, p.Setup.Timeout.Duration
+	}
+	return p.Setup.Run, o.Timeout
+}
+
+// setupFailure is the exit code and SETUP_FAILED message for a run whose
+// [setup] failed. The setup's own exit code is not passed on: a setup that
+// exits 125 or 130 must not look like a spotexec failure or an interrupt.
+func setupFailure(p *config.Project, o Options, r protocol.Result) (int, string) {
+	if r.TimedOut {
+		_, t := SetupFor(p, o)
+		return ExitTimeout, fmt.Sprintf("[setup] run exceeded %s and was terminated (raise setup.timeout); the command did not run", t)
+	}
+	return 1, fmt.Sprintf("[setup] run failed (exit %d); the command did not run. Its output is above; skip the setup with --no-setup or setup = false on a task", r.ExitCode)
 }
 
 // pumpExec streams output until the result arrives, forwarding interrupts.
-func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot func()) (protocol.Result, error) {
+func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot, afterSetup func()) (protocol.Result, error) {
 	var res protocol.Result
 	type fr struct {
 		f   protocol.Frame
@@ -951,8 +1158,8 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot 
 			}
 		}
 	}()
-	// The helper heartbeats every 20s; silence well beyond that means it is
-	// wedged or the link is a blackhole even if SSH keepalives still pass.
+	// A silent helper is the session watchdog's to give up on (after any
+	// grace for a VM that is still running): Next then fails.
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	var canceledAt time.Time
@@ -960,10 +1167,6 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot 
 	for {
 		select {
 		case <-tick.C:
-			if time.Since(s.LastSeen()) > 75*time.Second {
-				s.Abort()
-				return res, &transport.ConnError{Target: "helper", Msg: "runner stopped responding"}
-			}
 			if !canceledAt.IsZero() && time.Since(canceledAt) > cancelGrace {
 				s.Abort()
 				return res, &transport.ConnError{Target: "helper", Msg: "runner did not confirm cancellation"}
@@ -998,6 +1201,9 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot 
 				var ev protocol.Event
 				_ = env.Unmarshal(&ev)
 				o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
+				if ev.Name == "setup_done" && afterSetup != nil {
+					afterSetup()
+				}
 				if ev.Name == "spot_interruption" {
 					o.Rep.Warn("SPOT_INTERRUPTION", "%s; warming a replacement", ev.Message)
 					if onSpot != nil {
@@ -1015,6 +1221,73 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot 
 			}
 		}
 	}
+}
+
+// PressureWindow: memory pressure the runner reported this recently before
+// it was lost counts as the reason it was lost (heartbeats come every 20s,
+// and silence lasts SilenceLimit plus any SilentGrace before a loss).
+var PressureWindow = 5 * time.Minute
+
+// SilentGrace is how much longer a session waits for a silent helper whose
+// VM the cloud still reports as running: a VM short of memory can stall
+// for minutes until the kernel's OOM killer acts, and then recovers, and
+// giving up on it throws away every slot's run there.
+var SilentGrace = 3 * time.Minute
+
+// waitIfRunning returns the session's silence hook for a fleet lease: if
+// the VM is still running, wait SilentGrace longer before giving up on it.
+func waitIfRunning(lease *Lease, rep ui.Reporter) func(time.Duration) time.Duration {
+	return func(silent time.Duration) time.Duration {
+		if !instanceRunning(lease) {
+			return 0
+		}
+		why := ""
+		if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
+			why = "; it last reported memory pressure (" + p + ")"
+		}
+		rep.Warn("RUNNER_SILENT", "%s hasn't answered for %s but is still running%s; waiting up to %s more for it", lease.InstanceID, silent.Round(time.Second), why, SilentGrace)
+		return SilentGrace
+	}
+}
+
+// instanceRunning asks the cloud (the instance's own region, for a
+// multi-region fleet) whether a lease's VM is running, within 10s; false
+// when it can't tell.
+func instanceRunning(lease *Lease) bool {
+	if lease.InstanceID == "" || lease.Provider == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.Fleet)
+	if !ok {
+		if f, ok = lease.Provider.(provider.Fleet); !ok {
+			return false
+		}
+	}
+	list, err := f.List(ctx)
+	if err != nil {
+		return false
+	}
+	for _, in := range list {
+		if in.ID == lease.InstanceID {
+			return in.State == provider.StateRunning
+		}
+	}
+	return false
+}
+
+// oomMessage explains an OOM_KILLED result; limitMB is the memory pool's
+// cap, 0 when the container wasn't in the pool: a job alone on its VM
+// (--exclusive, a single slot), a host without the pool, or a memory
+// option in container.options. Then the kill came from a limit
+// container.options set (on the container, or on a --cgroup-parent), or
+// from the whole VM running out.
+func oomMessage(limitMB int64) string {
+	if limitMB <= 0 {
+		return "the command ran out of memory: the kernel killed a process in its container, which either reached a memory limit set in container.options (its own, or its --cgroup-parent's) or used up the memory of the whole VM. Raise that limit, use a larger instance type, or make it use less"
+	}
+	return fmt.Sprintf("the command ran out of memory: the jobs sharing the runner reached the memory set aside for them (%.1f GiB), and the kernel killed the largest process, in this command's container. Use --exclusive to have the whole VM, fewer max_slots, or make it use less", float64(limitMB)/1024)
 }
 
 // cpuShare is the number of CPUs one job should use on a host.

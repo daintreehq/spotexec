@@ -56,8 +56,8 @@ func NewAWSSpot(r *config.Runner) (Provider, error) {
 }
 
 func checkAWSRunner(r *config.Runner) error {
-	if len(r.InstanceTypes) == 0 {
-		return fmt.Errorf("runner %s: instance_types is empty", r.Name)
+	if len(r.InstanceTypes) == 0 && r.VCPUs <= 0 {
+		return fmt.Errorf("runner %s: instance_types is empty (or set vcpus)", r.Name)
 	}
 	if r.Arch != "amd64" && r.Arch != "arm64" {
 		return fmt.Errorf("runner %s: arch must be amd64 or arm64 (got %q)", r.Name, r.Arch)
@@ -320,11 +320,14 @@ func (a *AWSSpot) Launch(ctx context.Context, log Logger) (Instance, error) {
 		return Instance{}, err
 	}
 	defer unlock()
-	inst, err := a.launch(ctx, log)
-	if err != nil {
-		return Instance{}, err
-	}
-	return a.instance(inst), nil
+	return a.ranker().launch(ctx, log)
+}
+
+// ranker places this region's launches: the cheapest current Spot price
+// among its instance types and availability zones first, sharing prices
+// and cooldowns with `spotexec prices`.
+func (a *AWSSpot) ranker() *AWSGlobal {
+	return &AWSGlobal{r: a.r, creds: a.api.creds, dir: a.dir, regional: map[string]*AWSSpot{a.r.Region: a}, single: true}
 }
 
 // WaitRunning waits until the instance is running with a public IP.
@@ -368,14 +371,14 @@ func (a *AWSSpot) Up(ctx context.Context, log Logger) (Info, error) {
 			log("terminated %d stopped instance(s) left over for %s", len(stopped), a.r.Name)
 		}
 	}
-	inst, err := a.launch(ctx, log)
+	in, err := a.ranker().launch(ctx, log)
 	if err != nil {
 		return Info{}, err
 	}
-	info, err := a.waitRunning(ctx, inst, log)
+	info, err := a.waitRunning(ctx, ec2Instance{InstanceID: in.ID, State: string(in.State), InstanceType: in.Type}, log)
 	info.Launched = true
 	if info.InstanceID == "" {
-		info.InstanceID = inst.InstanceID
+		info.InstanceID = in.ID
 	}
 	return info, err
 }
@@ -439,11 +442,6 @@ func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger)
 	}
 }
 
-// launch performs RunInstances across the configured instance types.
-func (a *AWSSpot) launch(ctx context.Context, log Logger) (ec2Instance, error) {
-	return a.launchOrUnbaked(ctx, log, launchSpec{})
-}
-
 // launchOrUnbaked launches a fleet instance as spec says, booting the base
 // image instead when the bake it picked was deregistered (`image clear` or
 // pruning on another machine) between picking it and launching.
@@ -469,6 +467,9 @@ type launchSpec struct {
 	itype    string
 	zone     string
 	onDemand bool // on-demand only, any configured type (multi-region fallback)
+	// types to try in order without an itype (default: the configured
+	// ones, or for vcpus every eligible type).
+	types []string
 	// beforeSend runs once preparation succeeded, just before the first
 	// RunInstances; an error stops the launch with nothing sent.
 	beforeSend func() error
@@ -619,9 +620,14 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	if spec.onDemand {
 		markets = []bool{false} // multi-region fallback: on-demand only
 	}
-	types := a.r.InstanceTypes
-	if spec.itype != "" {
+	types := spec.types
+	switch {
+	case spec.itype != "":
 		types, markets = []string{spec.itype}, []bool{true}
+	case len(types) == 0:
+		if types, err = a.launchTypes(ctx); err != nil {
+			return ec2Instance{}, asRegionError(ctx, err)
+		}
 	}
 	var usage *QuotaUsage
 	if !spec.bake && markets[0] && minStandardVCPUs(types) > 0 {
@@ -647,7 +653,7 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 		}
 		return inst, nil
 	}
-	inst, err := a.launchAcross(markets, log, try)
+	inst, err := a.launchAcross(markets, types, log, try)
 	var qe *QuotaError
 	if errors.As(err, &qe) && qe.Code != "" && qe.Usage == nil {
 		// Suggest a quota above the current one: other runners or machines
@@ -688,14 +694,14 @@ func (a *AWSSpot) quotaValue(ctx context.Context, code string) (int, error) {
 // tried (no type smaller than the smallest refused one fell short only on
 // capacity), the error is a *QuotaError, so callers stop waiting for
 // capacity that the quota won't allow.
-func (a *AWSSpot) launchAcross(markets []bool, log Logger, try func(itype string, spot bool) (ec2Instance, error)) (ec2Instance, error) {
+func (a *AWSSpot) launchAcross(markets []bool, types []string, log Logger, try func(itype string, spot bool) (ec2Instance, error)) (ec2Instance, error) {
 	var errs []string
 	var quota *QuotaError
 	quotaEveryMarket := true
 	for _, spot := range markets {
 		var mq *QuotaError        // this market's quota refusal (smallest launch)
 		short := map[string]int{} // smallest type refused for capacity or price, by quota
-		for _, itype := range a.r.InstanceTypes {
+		for _, itype := range types {
 			inst, err := try(itype, spot)
 			if err == nil {
 				kind := "spot"
@@ -760,10 +766,10 @@ func (a *AWSSpot) launchAcross(markets []bool, log Logger, try func(itype string
 		if quota.Usage == nil { // the pre-launch check already says what uses the quota
 			quota.Detail = strings.Join(errs, ", ")
 		}
-		quota.Desired = max(quota.Desired, quota.VCPUs, a.r.MaxInstances*vcpusOf(a.r.InstanceTypes[0]))
+		quota.Desired = max(quota.Desired, quota.VCPUs, a.r.MaxInstances*VMVCPUs(a.r))
 		return ec2Instance{}, quota
 	}
-	return ec2Instance{}, fmt.Errorf("no instance type could be launched in %s (%s); add more instance_types, raise max_price, or set on_demand_fallback = true", a.r.Region, strings.Join(errs, ", "))
+	return ec2Instance{}, fmt.Errorf("no instance type could be launched in %s (%s); %s, raise max_price, or set on_demand_fallback = true", a.r.Region, strings.Join(errs, ", "), widenHint(a.r))
 }
 
 // capacityCode reports refusals that pass with time (capacity, price), as
@@ -1031,6 +1037,20 @@ func (a *AWSSpot) vpcID(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("no default VPC in %s; set subnet_id (and optionally security_group_ids) on the runner", a.r.Region)
 }
 
+// subnetZone returns the availability zone of the configured subnet_id.
+func (a *AWSSpot) subnetZone(ctx context.Context) (string, error) {
+	p := url.Values{}
+	p.Set("SubnetId.1", a.r.SubnetID)
+	b, err := a.api.ec2(ctx, "DescribeSubnets", p)
+	if err != nil {
+		return "", fmt.Errorf("describe subnet %s: %w", a.r.SubnetID, err)
+	}
+	if z := xmlFirst(b, "subnetSet>item>availabilityZone"); z != "" {
+		return z, nil
+	}
+	return "", fmt.Errorf("subnet %s not found in %s", a.r.SubnetID, a.r.Region)
+}
+
 // defaultSubnet returns the default VPC's subnet in one availability zone,
 // so a launch lands in the zone whose Spot price was chosen.
 func (a *AWSSpot) defaultSubnet(ctx context.Context, zone string) (string, error) {
@@ -1155,6 +1175,7 @@ func (a *AWSSpot) Doctor(ctx context.Context) []Check {
 	if c, ok := a.quotaCheck(ctx); ok {
 		out = append(out, c)
 	}
+	out = append(out, a.priceCheck(ctx))
 	// Instances live in the runner's region, which is easy to miss when the
 	// console (or the AWS CLI default) points elsewhere.
 	where := fmt.Sprintf("instances appear in EC2 → %s; filter by tag %s=%s", a.r.Region, tagRunner, a.r.Name)

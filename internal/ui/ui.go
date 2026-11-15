@@ -339,7 +339,11 @@ func Dur(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	}
-	return strings.TrimSuffix(d.Round(time.Second).String(), "0s")
+	s := d.Round(time.Second).String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s") // 6m0s → 6m, but 6m50s stays
+	}
+	return s
 }
 
 // plainReporter is the default when stderr isn't a terminal. An agent reads
@@ -371,7 +375,9 @@ var digits = regexp.MustCompile(`[0-9][0-9.:]*`)
 // change as a new phase.
 const DetailSep = " — "
 
-var ansi = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]`)
+// ansi matches escape sequences: OSC (a title, a hyperlink) up to its BEL or
+// ST terminator, CSI with any parameters, and two-byte escapes.
+var ansi = regexp.MustCompile(`\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]`)
 
 // LogLine makes a line of someone else's log safe and short enough for a
 // status line: the last \r rewrite only, no escape sequences or control
@@ -380,9 +386,28 @@ func LogLine(s string) string {
 	if i := strings.LastIndexAny(strings.TrimRight(s, "\r\n"), "\r\n"); i >= 0 {
 		s = s[i+1:]
 	}
+	return truncate(strings.TrimSpace(cleanLine(s)), 100)
+}
+
+// CleanLines makes someone else's output safe to print as spotexec's own
+// diagnostics: each line keeps only its last \r rewrite (a progress bar's
+// final state), with no escape sequences or control characters.
+func CleanLines(s string) []string {
+	lines := strings.Split(strings.TrimRight(s, "\r\n"), "\n")
+	for i, l := range lines {
+		l = strings.TrimRight(l, "\r")
+		if j := strings.LastIndexByte(l, '\r'); j >= 0 {
+			l = l[j+1:]
+		}
+		lines[i] = strings.TrimRight(cleanLine(l), " ")
+	}
+	return lines
+}
+
+func cleanLine(s string) string {
 	s = ansi.ReplaceAllString(s, "")
-	s = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r >= 0x7f && r <= 0x9f {
 			if r == '\t' {
 				return ' '
 			}
@@ -390,7 +415,6 @@ func LogLine(s string) string {
 		}
 		return r
 	}, s)
-	return truncate(strings.TrimSpace(s), 100)
 }
 
 func (p *plainReporter) Event(name string, fields map[string]any) {

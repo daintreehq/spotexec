@@ -42,12 +42,13 @@ When several coding agents work at once, one per git worktree, each checks its w
 
 The usual ways out each cost something. **CI** is minutes away from the edit. A **cloud dev environment** moves your editor, checkout and agents off your machine. A **shared build box** needs someone to keep it running and in sync.
 
-spotexec keeps everything local except the work. Only the heavy commands move, and only while they run.
+spotexec keeps everything local except the work. Only the heavy commands move, and only while they run. On [Daintree](docs/case-study-daintree.md), an Electron app with 114,000 unit tests, the full suite runs in under 11 minutes across four Spot VMs, instead of 15 to 20 minutes with the laptop locked up. [When to use spotexec](docs/when-to-use.md) covers where it helps, where it doesn't, and what it costs.
 
 - **Your command, unchanged.** Output streams back as it runs, the exit code is the command's own, and remote paths in stack traces are rewritten to local ones.
 - **Only what changed travels.** Each run sends just the files the runner is missing. Dependencies restore from a cache keyed by your lockfiles.
 - **Your edits come first.** Changed files come back through a 3-way check. If you edited a file during the run, your version stays and the runner's is [saved separately](docs/running.md#write-back-and-artifacts).
-- **VMs that clean up after themselves.** Spot fleets grow from zero as work queues up, and every VM powers itself off when idle. A run that loses its VM to an interruption is replayed once on a replacement.
+- **VMs that clean up after themselves.** Spot fleets grow from zero as work queues up, each VM launches on the cheapest instance type and zone available at the time, and every VM powers itself off when idle. A run that loses its VM to an interruption is replayed once on a replacement.
+- **Jobs stay out of each other's way.** Each job sees only its slot's CPUs, so test runners size themselves correctly, and a job that runs out of memory is killed and reported on its own, without taking down the VM or the jobs beside it.
 - **Nothing to host.** No control plane, no service in your account, and no AWS credentials on the VMs. Coordination lives on your machine and in EC2 tags.
 - **Made for agents.** Worktrees share one fleet through isolated slots and a fair queue. Agents see one summary line, or NDJSON events with `--json`.
 
@@ -109,7 +110,7 @@ aws login              # or: aws sso login, aws configure
 spotexec setup
 ```
 
-Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. The fleet uses 8-vCPU VMs; on a new account whose quota can't fit one (often 5 vCPUs), setup switches it to 4-vCPU VMs and prints the command to raise the quota. Finally it offers to bake an image, so new VMs skip their bootstrap. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
+Setup writes `~/.config/spotexec/config.toml` with a Spot fleet, gives this machine its own IAM user and key limited to spotexec's permissions, and checks your region, network and Spot quota. The fleet uses 8-vCPU VMs, each launched on whichever of its instance types and zones has the cheapest Spot price at the time (or [any current type of that size](docs/aws.md#describe-the-vm-instead-of-naming-types), with `vcpus`); on a new account whose quota can't fit one (often 5 vCPUs), setup switches it to 4-vCPU VMs and prints the command to raise the quota. Finally it offers to bake an image, so new VMs skip their bootstrap. Your own AWS session can expire afterwards without affecting spotexec. [Setting up machines](docs/setup.md) covers more machines, key rotation and revoking access.
 
 **An SSH machine you already own**, such as a Linux box or a spare Mac. Key login must already work. Put it in `~/.config/spotexec/config.toml`:
 
@@ -139,6 +140,8 @@ The runner needs your toolchain (`node`, `pnpm`, `go` and so on), and AWS VMs bo
 
 If your runners are all SSH machines, `init` leaves the container out and commands use the machine's own toolchain: it must be on `PATH` in bash's login profile (`~/.bash_profile` or `~/.profile`, not `~/.zprofile`), or set by [`remote_path_setup`](docs/configuration.md). `spotexec init --no-container` does the same anywhere; AWS VMs then need the toolchain in the runner's `bootstrap_script`.
 
+`init` is a starting point. A larger project usually needs a few more steps before its checks pass remotely as they do in CI: system packages in the Dockerfile, a dependency cache that matches CI's, whole VMs for its heaviest jobs. [Tuning a real project](docs/tuning.md) walks through them, and the [Daintree case study](docs/case-study-daintree.md) shows them on a large Electron app.
+
 ### 3. Run
 
 ```sh
@@ -147,12 +150,23 @@ sx pnpm tsc --noEmit           # type checks
 sx pnpm prettier --write .     # formatted files land in your worktree
 sx test --reporter=dot         # a task from .spotexec.toml, extra args
 sx verify                      # a parallel task fanned out over slots
+sx test-all                    # a sharded task: one test suite split across the fleet
 spotexec status                # what's running where, and idle timers
 ```
 
 Files the command changes come back. Ignored outputs such as coverage reports need `pull_artifacts` in `.spotexec.toml`, or a flag like `--pull coverage/`; see [write-back and artifacts](docs/running.md#write-back-and-artifacts).
 
-The first AWS run boots a VM, which takes about a minute plus your bootstrap, and builds the project container there; later VMs pull the built image instead. While it boots, `sx` shows how long it has been going and the latest line of the VM's bootstrap log. Later runs reuse the VM until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
+`sx test-all` above is a [sharded task](docs/configuration.md#tasks): one test suite split across the fleet, using the test runner's own shard option. Extra arguments go to every shard.
+
+```toml
+[tasks.test-all]
+run = "npx vitest run --shard={shard}/{shards} {args}"
+shards = 8
+```
+
+The runner's copy of your project has no `.git` unless you set `git_seed = true` under `[sync]`. Turn it on if your build or tests ask Git about the checkout (commit stamps, `git ls-files`, changed-files modes); see [Git on the runner](docs/running.md#git-on-the-runner).
+
+The first AWS run boots a VM, which takes about a minute plus your bootstrap, builds the project container there and installs your dependencies once; later VMs pull the built image and restore dependencies from the cache instead. While it boots, `sx` shows how long it has been going and the latest line of the VM's bootstrap log. Later runs reuse the VM until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
 
 ## With coding agents
 
@@ -172,6 +186,8 @@ spotexec hook install --codex    # Codex and others: adds a section to AGENTS.md
 ```
 
 The Claude Code hook rewrites tests, type checks, linters, formatters and builds to `spotexec run --` before they execute, and keeps `git`, dev servers and watch modes local. When an agent needs the machine it just used, say after installing a package there, it adds `-s` (`--same-slot`): `sx -s pnpm test`. [Coding agents](docs/agents.md) covers the hook's rules and the NDJSON events.
+
+If you'd rather not have commands rewritten, skip the hook and tell your agents in `CLAUDE.md` or `AGENTS.md` which commands to run with `sx`: typically the whole test suite, the type checker and the linter, while single test files stay local, where they're quicker. [When to use spotexec](docs/when-to-use.md#with-coding-agents) suggests a split.
 
 ## How it works
 
@@ -194,6 +210,9 @@ The Claude Code hook rewrites tests, type checks, linters, formatters and builds
 
 | Guide | What's in it |
 | :--- | :--- |
+| [When to use spotexec](docs/when-to-use.md) | Where it helps and where it doesn't, a split for coding agents, costs, and known gaps. |
+| [Tuning a real project](docs/tuning.md) | Getting a larger project's checks to pass remotely as in CI, sizing jobs, and debugging a runner. |
+| [Case study: Daintree](docs/case-study-daintree.md) | A 114,000-test Electron app on spotexec: what it needed, what it changed in spotexec, and the results. |
 | [Setting up machines](docs/setup.md) | `spotexec setup`, choosing runners, more machines over SSH, keys, rotation and revoking a machine. |
 | [AWS setup](docs/aws.md) | Every AWS step by hand: sign-in, the IAM policy, regions, Spot quota, networking, cost guardrails. |
 | [Running commands](docs/running.md) | Run flags, the environment on the runner, exit codes, write-back and artifacts. |

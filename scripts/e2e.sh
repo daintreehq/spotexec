@@ -203,6 +203,8 @@ check "init detects npm lockfile" "grep -q 'npm ci' .spotexec.toml"
 run test || true
 check "deps built once" "ev '\"built\":true' | grep -q ."
 check "task runs with deps" "grep -q ok=true $WORK/last.out"
+DEPS_LOG=$(ev '"event":"deps",' | sed -n 's/.*"log":"\([^"]*\)".*/\1/p' | head -1)
+check "install output kept out of the command's streams, in a local log" "[ -n \"\$DEPS_LOG\" ] && grep -Eq 'added [0-9]+ package' \"\$DEPS_LOG\" && ! grep -Eq 'added [0-9]+ package' $WORK/last.out $WORK/last.err"
 ("$SX" -q 'sleep 3' &) ; sleep 0.7
 run test || true
 check "other slot hydrated from cache" "ev '\"hydrated\":true' | grep -q ."
@@ -241,6 +243,27 @@ wait
 docker exec "$NAME" sh -c "rm -rf /home/dev/.cache/spotexec/repos/pyrepo-*/slots/slot-0$VENV_SLOT"
 "$SX" --json --same-slot "$VENV_CHECK" >"$WORK/last.out" 2>"$WORK/last.err" || true
 check "...and keeps working once the building slot is gone" "[ -n '$VENV_SLOT' ] && grep -q venv-here $WORK/last.out && ! ev '\"built\":true' | grep -q ."
+cd "$REPO"
+
+echo "== git_seed"
+GREPO="$WORK/gitrepo"
+mkdir -p "$GREPO/src" && cd "$GREPO"
+git init -q -b feature/seeded && git config user.email t@t && git config user.name t
+printf 'a\n' > src/a.txt; printf 'b\n' > src/b.txt; printf 'gone\n' > gone.txt; printf 'TOKEN=1\n' > secret.env
+printf 'version = 1\n[sync]\ngit_seed = true\nexclude = ["*.env"]\n' > .spotexec.toml
+git add -A && git commit -qm "the seeded commit"
+printf 'b2\n' > src/b.txt; rm gone.txt; printf 'n\n' > new.txt
+GIT_PROBE='git rev-parse HEAD --abbrev-ref HEAD; git log -1 --format=%s; git status --porcelain; git diff --stat | tail -1'
+{ git rev-parse HEAD --abbrev-ref HEAD; git log -1 --format=%s; git status --porcelain; git diff --stat | tail -1; } > "$WORK/git.local"
+run "$GIT_PROBE" || true
+check "git_seed: HEAD, branch, log, status and diff match the local worktree" "diff -u $WORK/git.local $WORK/last.out"
+run 'git tag runner-tag; printf "[alias]\n x = status\n" >> .git/config; echo from-runner > src/a.txt' || true
+check "git_seed: a command's changes to .git never come back" "! git rev-parse -q --verify runner-tag >/dev/null && ! grep -q alias .git/config && grep -qx from-runner src/a.txt"
+git checkout -q src/a.txt
+run "$GIT_PROBE" || true
+check "git_seed: the next run restores the seed" "diff -u $WORK/git.local $WORK/last.out && ev '\"git_seed\".*\"reseeded\":true' | grep -q ."
+run "$GIT_PROBE" || true
+check "git_seed: an unchanged seed costs nothing" "diff -u $WORK/git.local $WORK/last.out && ev '\"git_seed\".*\"reseeded\":false' | grep -q ."
 cd "$REPO"
 
 ("$SX" -q 'sleep 3' &) ; sleep 1
@@ -287,6 +310,16 @@ EOF
 "$SX" -q echoargs '$(echo INJECTED)' 'two words' >"$WORK/inj.out" 2>&1 || true
 check "task args are not shell-evaluated" "grep -qF '<\$(echo INJECTED)><two words>' $WORK/inj.out"
 cat $WORK/inj.out
+cat >> .spotexec.toml <<'EOF'
+
+[tasks.sharded]
+run = 'echo "shard=$SPOTEXEC_SHARD/$SPOTEXEC_SHARDS arg={shard}/{shards}" {args}'
+shards = 3
+EOF
+"$SX" sharded 'x y' >"$WORK/sh.out" 2>&1 || true
+check "sharded task fans out with its number and the args" "grep -qx '\\[sharded 1/3\\] shard=1/3 arg=1/3 x y' $WORK/sh.out && grep -qx '\\[sharded 2/3\\] shard=2/3 arg=2/3 x y' $WORK/sh.out && grep -qx '\\[sharded 3/3\\] shard=3/3 arg=3/3 x y' $WORK/sh.out"
+check "sharded task results name each shard" "(for n in 1 2 3; do [ \$(grep -Ec \"^sx: sharded \$n/3 · [0-9][^·]* on box#[0-9]\" $WORK/sh.out) = 1 ] || exit 1; done)"
+check "sharded task summary lists each shard" "(for n in 1 2 3; do [ \$(grep -Ec \"^sx: sharded \$n/3 · passed · \" $WORK/sh.out) = 1 ] || exit 1; done)"
 git add -A >/dev/null && git commit -qm wip
 "$SX" -q 'mv src/gen.txt src/Gen.txt' || true
 check "case-only rename keeps the file" "ls src | grep -qx Gen.txt"

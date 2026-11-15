@@ -12,6 +12,8 @@
 //   - upload-hangs: the helper upload never finishes;
 //   - rpc-silent: after the handshake the helper goes silent, reading and
 //     writing nothing (a wedged helper or half-open channel);
+//   - rpc-pressure: after the handshake the helper sends one heartbeat
+//     reporting memory pressure, then goes silent (a VM out of memory);
 //   - rpc-heartbeat: after the handshake the helper sends only heartbeats
 //     and never answers (alive, but slow);
 //   - hold-fds: another process keeps the session's stdin, stdout and
@@ -183,8 +185,24 @@ func rpc() int {
 			_ = os.WriteFile(filepath.Join(st, "hold-fds.pid"), []byte(strconv.Itoa(hold.Process.Pid)), 0o600)
 		}
 	}
+	if _, err := os.Stat(filepath.Join(st, "rpc-pressure")); err == nil {
+		_ = conn.Send(protocol.TypeHeartbeat, protocol.Heartbeat{MemTotalMB: 16000, MemAvailMB: 120})
+		time.Sleep(time.Hour) // until killed
+	}
 	if _, err := os.Stat(filepath.Join(st, "rpc-silent")); err == nil {
 		time.Sleep(time.Hour) // until killed
+	}
+	// rpc-pulse: silent until the test creates rpc-pulse-go, then one
+	// heartbeat, then silent until killed (a helper that recovers once, then
+	// dies).
+	if _, err := os.Stat(filepath.Join(st, "rpc-pulse")); err == nil {
+		for deadline := time.Now().Add(time.Minute); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if _, err := os.Stat(filepath.Join(st, "rpc-pulse-go")); err == nil {
+				_ = conn.Send(protocol.TypeHeartbeat, nil)
+				break
+			}
+		}
+		time.Sleep(time.Hour)
 	}
 	if _, err := os.Stat(filepath.Join(st, "rpc-heartbeat")); err == nil {
 		go func() { _, _ = io.Copy(io.Discard, os.Stdin); os.Exit(0) }()

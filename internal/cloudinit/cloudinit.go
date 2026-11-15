@@ -178,7 +178,23 @@ if [ -n "$H" ]; then
   chmod 0600 "$H/.ssh/authorized_keys"
 fi
 
-# ---- 3. User bootstrap ----
+# ---- 3. localhost on IPv6 too ----
+# Ubuntu maps localhost to 127.0.0.1 only; macOS and CI runners also map it
+# to ::1, so a test server bound to ::1 and dialed as localhost would fail
+# only here. Project containers (host networking) copy this file. Only with
+# an IPv6 loopback; written in place (a bind mount in the simulator). This
+# runs on baked boots too; cloud-init rewrites the file only with
+# manage_etc_hosts, from a template that already maps ::1 to localhost.
+if grep -q '^00000000000000000000000000000001 ' /proc/net/if_inet6 2>/dev/null && ! grep -qE '^[[:space:]]*::1[[:space:]]([^#]*[[:space:]])?localhost([[:space:]]|$)' /etc/hosts; then
+  if grep -qE '^[[:space:]]*::1([[:space:]]|$)' /etc/hosts; then
+    awk '!d && $1 == "::1" { sub(/::1/, "::1 localhost"); d = 1 } { print }' /etc/hosts > /etc/hosts.sx && cat /etc/hosts.sx > /etc/hosts
+    rm -f /etc/hosts.sx
+  else
+    { [ -z "$(tail -c1 /etc/hosts)" ] || echo; echo '::1 localhost'; } >> /etc/hosts
+  fi
+fi
+
+# ---- 4. User bootstrap ----
 # Bootstrap runs under a shared lifecycle lock so the idle watchdog cannot
 # power the VM off mid-setup when setup takes longer than idle_timeout
 # (max_lifetime still applies); taken before stopping apt, which can block

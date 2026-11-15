@@ -33,7 +33,7 @@ takes part in scheduling, and every VM shuts itself down.
      to) is less than 10 minutes old, the instance it names is tried first
      instead, since its slot still holds the worktree's files and build
      caches. A run is recorded once its files are synced and its container
-     image is ready; a parallel task, once it finishes; a `--sync none` run,
+     image is ready; a parallel or sharded task, once it finishes; a `--sync none` run,
      never. After that, work goes back to the oldest instances.
    - An instance that refuses with `RUNNER_DRAINING` is marked draining and
      skipped.
@@ -102,7 +102,14 @@ noticed warm instance within the notice. Then:
 
 There is at most one reallocation per run by default (`--no-retry` disables
 it). A connection lost without a notice on an ephemeral runner is also retried
-once.
+once, if the VM is gone by then. A VM that EC2 still reports running, or whose
+last heartbeats showed it out of memory, is not: the run may be what
+overloaded it, and replayed it could take another VM's jobs down with it
+(`RUNNER_UNRESPONSIVE`, `MEMORY_PRESSURE`; exit 125). A VM that announced it
+was going away (a Spot notice, or the helper reporting its shutdown, as at
+`max_lifetime`) is replayed either way. Before giving up on a
+silent helper whose VM is still running, the CLI waits 3 more minutes, so a
+VM that recovers keeps its runs.
 
 ## Simulation (`type = "sim"`)
 

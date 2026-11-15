@@ -34,7 +34,7 @@ var subcommands = map[string]bool{
 	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
 	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
 	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
-	"completion": true, "sim": true, "image": true, "prices": true, "daemon": true, "container": true, "setup": true, "teardown": true, "__complete": true, "__completeNoDesc": true,
+	"completion": true, "sim": true, "image": true, "prices": true, "daemon": true, "container": true, "setup": true, "teardown": true, "supported": true, "__complete": true, "__completeNoDesc": true,
 }
 
 // Main is the entry point for `spotexec`; it returns the process exit code.
@@ -142,7 +142,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(
 		cmdRun(), cmdExec(), cmdSync(), cmdSyncPlan(), cmdPull(), cmdStatus(), cmdMonitor(),
 		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdInit(), cmdHook(),
-		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdPrices(), cmdDaemon(), cmdContainer(), cmdSetup(), cmdTeardown(),
+		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdPrices(), cmdDaemon(), cmdContainer(), cmdSetup(), cmdTeardown(), cmdSupported(),
 	)
 	root.SetVersionTemplate("spotexec {{.Version}}\n") // as `spotexec version` and `sx --version`
 	addSxCompletion(root)
@@ -226,12 +226,7 @@ func cmdTasks() *cobra.Command {
 				return nil
 			}
 			for _, n := range names {
-				t := l.cfg.Project.Tasks[n]
-				if len(t.Parallel) > 0 {
-					fmt.Printf("%-16s parallel: %s\n", n, strings.Join(t.Parallel, ", "))
-				} else {
-					fmt.Printf("%-16s %s\n", n, t.Run)
-				}
+				fmt.Printf("%-16s %s\n", n, l.cfg.Project.Tasks[n].Describe())
 			}
 			return nil
 		},
@@ -243,8 +238,7 @@ func sxMain(args []string) int {
 	// v0.2.0 could install the Claude Code hook as `sx hook claude`. That
 	// line is the hook handler, never a command to run remotely.
 	if len(args) == 2 && args[0] == "hook" && args[1] == "claude" {
-		claudeHook()
-		return 0
+		return claudeHook("")
 	}
 	// Shell completion scripts for sx ask it for candidates.
 	if len(args) > 0 && (args[0] == cobra.ShellCompRequestCmd || args[0] == cobra.ShellCompNoDescRequestCmd) {
@@ -302,12 +296,7 @@ doctor, down, …); see spotexec -h.
 		sort.Strings(names)
 		fmt.Println("\nTasks in this project:")
 		for _, n := range names {
-			t := l.cfg.Project.Tasks[n]
-			what := t.Run
-			if len(t.Parallel) > 0 {
-				what = "parallel: " + strings.Join(t.Parallel, ", ")
-			}
-			fmt.Printf("  %-18s %s\n", n, what)
+			fmt.Printf("  %-18s %s\n", n, l.cfg.Project.Tasks[n].Describe())
 		}
 	}
 }
