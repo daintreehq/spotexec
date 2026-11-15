@@ -21,10 +21,11 @@ func cmdSupported() *cobra.Command {
 True means the project has opted in with a valid .spotexec.toml (here or in a
 parent directory, up to the repository root), spotexec syncs its workspace
 (not your home directory, / or a credential directory), there is a runner to
-run on, and the checks a run makes before its command starts pass on the local
-files: the working set is within the sync limit, and a container built from a
-Dockerfile has its build inputs synced. Whether a runner is reachable, and
-whether the image builds, only a run finds out.
+run on, and the checks a run makes on the local files pass: the working set is
+within the file-count limit, a container built from a Dockerfile has its build
+inputs synced, and deps.lockfiles name synced files. Whether a runner is
+reachable, the transfer fits, and the image builds and dependencies install,
+only a run finds out.
 It exits 0 when true and 1 when false, so scripts and agents can use either:
 
   spotexec supported            # true
@@ -103,5 +104,8 @@ func supported(ctx context.Context, dir string) error {
 	if _, err := l.cfg.Pool(override); err != nil {
 		return err
 	}
-	return client.Preflight(ctx, l.cfg.Project, l.ws, mode)
+	// SPOTEXEC_SAME_SLOT without a sync makes a plain sx exec, which reuses
+	// the image this worktree last built (runFlags.options).
+	sameSlot := os.Getenv("SPOTEXEC_SAME_SLOT") == "1"
+	return client.Preflight(ctx, l.cfg.Project, l.ws, client.Options{Sync: mode, PreferLast: sameSlot && mode == "none"})
 }

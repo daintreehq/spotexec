@@ -274,7 +274,7 @@ func TestRunChecksDockerfileBeforeAcquiring(t *testing.T) {
 		t.Fatalf("Run: want the Dockerfile refused before acquiring, got %v", err)
 	}
 	for _, sync := range []string{"auto", "none"} {
-		if err := Preflight(context.Background(), p, ws, sync); err == nil {
+		if err := Preflight(context.Background(), p, ws, Options{Sync: sync}); err == nil {
 			t.Fatalf("Preflight(%s): a missing Dockerfile passed", sync)
 		}
 	}
@@ -283,7 +283,7 @@ func TestRunChecksDockerfileBeforeAcquiring(t *testing.T) {
 		t.Fatalf("checkLocal(exec): %v", err)
 	}
 	// An image needs no local files.
-	if err := Preflight(context.Background(), &config.Project{Container: config.Container{Image: "alpine"}}, ws, "auto"); err != nil {
+	if err := Preflight(context.Background(), &config.Project{Container: config.Container{Image: "alpine"}}, ws, Options{Sync: "auto"}); err != nil {
 		t.Fatalf("Preflight(image): %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(root, ".spotexec"), 0o755); err != nil {
@@ -292,8 +292,27 @@ func TestRunChecksDockerfileBeforeAcquiring(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".spotexec", "Missing"), []byte("FROM scratch\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := Preflight(context.Background(), p, ws, "auto"); err != nil {
+	if err := Preflight(context.Background(), p, ws, Options{Sync: "auto"}); err != nil {
 		t.Fatalf("Preflight with the Dockerfile present: %v", err)
+	}
+	// .dockerignore edited after the scan: the upload sends the new bytes,
+	// so only the post-sync check (imageTag) may hold the scan to them.
+	ignore := filepath.Join(root, ".spotexec", "Missing.dockerignore")
+	if err := os.WriteFile(ignore, []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ignore, []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkLocal(m, p, ws, Options{Sync: "auto"}); err != nil {
+		t.Fatalf("checkLocal refused a .dockerignore edited since the scan: %v", err)
+	}
+	if _, err := imageTag(m, ".spotexec/Missing", "", "linux/amd64", readFrom(root)); err == nil || !strings.Contains(err.Error(), "changed after it was synced") {
+		t.Fatalf("imageTag: want the synced copy enforced, got %v", err)
 	}
 }
 

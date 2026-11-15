@@ -1328,7 +1328,7 @@ func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Option
 		return fmt.Errorf("refusing to sync %d files (limit %d); add excludes to .spotexec.toml or pass --force-large-sync", len(m.Entries), AbortFiles)
 	}
 	if c := p.Container; c.Dockerfile != "" && c.Image == "" && !o.PreferLast {
-		if _, _, _, err := containerInputs(m, c.Dockerfile, c.Context, readFrom(ws.Root)); err != nil {
+		if _, _, _, err := containerInputs(m, c.Dockerfile, c.Context, readFrom(ws.Root), false); err != nil {
 			return err
 		}
 	}
@@ -1340,26 +1340,39 @@ func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Option
 		if len(lockfiles) == 0 {
 			return errNoLockfiles
 		}
+		// The runner keys the cache on the synced copies (depskey.Key), so a
+		// literal entry that escapes the repository or isn't synced fails
+		// every install.
+		for _, lf := range lockfiles {
+			rel, err := fsid.CleanRel(lf)
+			if err != nil {
+				return fmt.Errorf("deps.lockfiles: %w", err)
+			}
+			if _, ok := m.ByPath[rel]; !ok {
+				return fmt.Errorf("deps.lockfiles: %s is not a synced file, so the dependency cache can't key on it", lf)
+			}
+		}
 	}
 	return nil
 }
 
 var errNoLockfiles = errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
 
-// Preflight checks, without a runner, what a plain run from ws with sync
-// mode sync would refuse before its command starts: it builds the working
-// set that run would sync, as Run does, and checks it as Run does
-// (checkLocal). Runner availability, credentials and the image build are
-// not checked.
-func Preflight(ctx context.Context, p *config.Project, ws *Workspace, sync string) error {
+// Preflight checks, without a runner, what a run from ws with options o
+// (its Sync, PreferLast, NoDeps and ForceLargeSync) would refuse from the
+// local files alone: it builds the working set that run would sync, as Run
+// does, and checks it as Run does (checkLocal). Runner availability,
+// credentials, the transfer size, and the image build and dependency
+// install themselves are not checked.
+func Preflight(ctx context.Context, p *config.Project, ws *Workspace, o Options) error {
 	var m *manifest.Manifest
-	if sync != "none" {
+	if o.Sync != "none" {
 		var err error
 		if m, err = manifest.Build(ctx, ManifestOptions(ws.Root, p)); err != nil {
 			return fmt.Errorf("enumerating files: %w", err)
 		}
 	}
-	return checkLocal(m, p, ws, Options{Sync: sync})
+	return checkLocal(m, p, ws, o)
 }
 
 // readFrom loads a file of the working set rooted at root.
@@ -1375,7 +1388,7 @@ func readFrom(root string) func(rel string) ([]byte, error) {
 // built image is reused until one of them changes, and never across CPU
 // architectures. read loads a synced file's content (the ignore rules).
 func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read func(rel string) ([]byte, error)) (string, error) {
-	df, buildCtx, ign, err := containerInputs(m, dockerfile, buildCtx, read)
+	df, buildCtx, ign, err := containerInputs(m, dockerfile, buildCtx, read, true)
 	if err != nil {
 		return "", err
 	}
@@ -1405,10 +1418,13 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read 
 // containerInputs checks a Dockerfile build's inputs in the working set m,
 // as the runner will build from its synced copy: the Dockerfile is a synced
 // regular file, the context stays inside the repository, and the
-// .dockerignore that applies is a synced regular file that read loads
-// unchanged and that parses. It returns the Dockerfile's entry, the
-// normalised context ("" for the root) and the ignore rules.
-func containerInputs(m *manifest.Manifest, dockerfile, buildCtx string, read func(rel string) ([]byte, error)) (protocol.Entry, string, *dockerignore.Matcher, error) {
+// .dockerignore that applies is a synced regular file that read loads and
+// that parses. synced says m is what the upload left on the runner: then
+// the rules read must be exactly that copy. Before the sync, m is only the
+// scan, and an edit since is what the upload will send. It returns the
+// Dockerfile's entry, the normalised context ("" for the root) and the
+// ignore rules.
+func containerInputs(m *manifest.Manifest, dockerfile, buildCtx string, read func(rel string) ([]byte, error), synced bool) (protocol.Entry, string, *dockerignore.Matcher, error) {
 	if m == nil {
 		return protocol.Entry{}, "", nil, errors.New("container.dockerfile needs a synced workspace (not --sync none)")
 	}
@@ -1464,7 +1480,7 @@ func containerInputs(m *manifest.Manifest, dockerfile, buildCtx string, read fun
 		}
 		// The rules must be exactly what was synced (the helper stages with
 		// that copy), or the tag would not describe the built image.
-		if fsid.Bytes(b) != e.ID {
+		if synced && fsid.Bytes(b) != e.ID {
 			return df, "", nil, fmt.Errorf("%s changed after it was synced; run again", cand)
 		}
 		rules = b

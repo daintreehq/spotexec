@@ -29,7 +29,7 @@ sx: ci · 2 of 9 parts failed (unit 2/8, unit 6/8) · 11m52s · exit 1
 
 ## Checking for spotexec
 
-`spotexec supported` prints `true` and exits 0 when a run from the current directory would reach a runner and start its command: the project has a valid `.spotexec.toml` (here or above, up to the repository root), it isn't in a directory spotexec never syncs (your home directory, `/` or a credential directory), a runner is configured for it, and the working set passes the checks a run makes on the local files (it is within the sync limit, and a `container.dockerfile` and its build inputs are synced). Whether a runner is reachable and the image builds, only a run finds out. Otherwise it prints `false` and exits 1, so an agent or script can choose between `sx` and running locally:
+`spotexec supported` prints `true` and exits 0 when a run from the current directory would reach a runner: the project has a valid `.spotexec.toml` (here or above, up to the repository root), it isn't in a directory spotexec never syncs (your home directory, `/` or a credential directory), a runner is configured for it, and the working set passes the checks a run makes on the local files (it is within the file-count limit, a `container.dockerfile` and its build inputs are synced, and `deps.lockfiles` name synced files). Whether a runner is reachable, the transfer fits, and the image builds and dependencies install, only a run finds out. Otherwise it prints `false` and exits 1, so an agent or script can choose between `sx` and running locally:
 
 ```sh
 if spotexec supported >/dev/null; then sx pnpm test; else pnpm test; fi

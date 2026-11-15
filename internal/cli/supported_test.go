@@ -252,6 +252,29 @@ func TestSupported(t *testing.T) {
 			putFile(t, filepath.Join(d, "yarn.lock"), "{}\n")
 			return d
 		}, true},
+		{"deps lockfile literal not synced", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"package-lock.json\"]\n")
+			return d
+		}, false},
+		{"deps lockfile literal outside the repository", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"../outside.lock\"]\n")
+			return d
+		}, false},
+		{"deps lockfile literal synced", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"package-lock.json\"]\n")
+			putFile(t, filepath.Join(d, "package-lock.json"), "{}\n")
+			return d
+		}, true},
+		{"container dockerfile, exec through SPOTEXEC_SAME_SLOT", sshRunner, func(t *testing.T) string {
+			t.Setenv("SPOTEXEC_SAME_SLOT", "1")
+			t.Setenv("SPOTEXEC_SYNC", "none")
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[container]\ndockerfile = \"Dockerfile\"\n")
+			return d
+		}, true},
 		{"container image needs no local files", sshRunner, func(t *testing.T) string {
 			d := initRepo(t)
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[container]\nimage = \"alpine\"\n")
@@ -263,15 +286,31 @@ func TestSupported(t *testing.T) {
 			return filepath.Join(d, "gone")
 		}, false},
 	}
+	// Why the cases that check what a run checks on the local files are
+	// false: each must fail for its own reason, not an earlier one.
+	reasons := map[string]string{
+		"container dockerfile missing":                 `container.dockerfile ".spotexec/Missing" is not in the synced working set`,
+		"container dockerfile excluded from sync":      "excludes it",
+		"container dockerfile is a symlink":            "not a symlink",
+		"container dockerfile without a sync":          "needs a synced workspace",
+		"container context outside the repository":     "container.context",
+		"deps lockfiles match nothing":                 "deps.lockfiles matches no synced file",
+		"deps lockfile literal not synced":             "package-lock.json is not a synced file",
+		"deps lockfile literal outside the repository": "deps.lockfiles: ",
+		"broken project config":                        ".spotexec.toml: unknown keys",
+		"no project config":                            "has no .spotexec.toml",
+		"pool names an unknown runner":                 "nope",
+	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			supportedEnv(t, tc.runners)
+			t.Setenv("SPOTEXEC_SAME_SLOT", "")
 			err := supported(context.Background(), tc.setup(t))
 			if got := err == nil; got != tc.want {
 				t.Fatalf("supported = %v (%v), want %v", got, err, tc.want)
 			}
-			if err != nil && err.Error() == "" {
-				t.Fatal("false without a reason")
+			if err != nil && !strings.Contains(err.Error(), reasons[tc.name]) || err != nil && err.Error() == "" {
+				t.Fatalf("supported is false for the wrong reason: %v, want %q", err, reasons[tc.name])
 			}
 		})
 	}
