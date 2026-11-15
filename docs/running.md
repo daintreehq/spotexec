@@ -70,7 +70,7 @@ Every command gets:
 | `SPOTEXEC_SLOTS` | Slots per machine. |
 | `SPOTEXEC_SHARD`, `SPOTEXEC_SHARDS` | Only in a [sharded task](configuration.md#tasks): this part's number (from 1) and the number of parts, the same as `{shard}` and `{shards}`. |
 | `SPOTEXEC_RUN_ID`, `SPOTEXEC_ATTEMPT` | Stable across a replay; `SPOTEXEC_ATTEMPT` is `2` on the replay. |
-| `COMPOSE_PROJECT_NAME` | `sx_<repo>_sNN`, so Docker Compose stacks don't collide. |
+| `COMPOSE_PROJECT_NAME` | `sx_<repo>_sNN`, so Docker Compose stacks don't collide. In a project container, Compose needs [`container.docker`](environments.md#docker-inside-the-container). |
 | `FORCE_COLOR`, `CLICOLOR_FORCE` | Set when your stdout is a terminal. |
 
 Plus anything in `env_allow` (copied from your environment) and `env` (fixed values). Outside a project container, before each command the runner sources the login profile (`/etc/profile`, then `~/.bash_profile`, `~/.bash_login` or `~/.profile`) and then `remote_path_setup`.
