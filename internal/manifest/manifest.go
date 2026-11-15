@@ -30,22 +30,24 @@ import (
 // BuiltinExcludes are never synced from untracked/non-Git sources. Tracked
 // files are always synced unless the user excludes them explicitly.
 //
-// .git and .spotexec match files too (a linked worktree's .git is a file
-// holding a local path). target is anchored: only a top-level Rust/Maven
-// build dir is assumed to be output; a source directory named "target"
-// elsewhere is not.
+// .git matches files too (a linked worktree's .git is a file holding a
+// local path). target is anchored: only a top-level Rust/Maven build dir is
+// assumed to be output; a source directory named "target" elsewhere is not.
+// .spotexec/ is not here: project files in it (a Dockerfile, a [setup]
+// script) sync, Git or not; NeverSync keeps spotexec's own state there out.
 var BuiltinExcludes = []string{
 	".git", "node_modules/", ".venv/", "venv/", "__pycache__/", ".next/", ".turbo/",
-	"/target/", ".spotexec", ".DS_Store", ".pytest_cache/", ".mypy_cache/", ".gradle/",
+	"/target/", ".DS_Store", ".pytest_cache/", ".mypy_cache/", ".gradle/",
 	".spotexec-tmp-*",
 }
 
 // NeverSync is never synced from untracked/non-Git sources, whatever the
 // project config says (not even where Options.Include lifts the built-in
 // excludes): credential directories, and spotexec's own state in a non-Git
-// project's .spotexec/ (write-back lock, stashed conflicts, backups). It is matched
-// case-insensitively, as macOS and Windows filesystems resolve it.
-var NeverSync = append(append([]string{}, config.CredentialDirs...), "/.spotexec/conflicts/", "/.spotexec/backup/", "/.spotexec/writeback.lock")
+// project's .spotexec/ (write-back lock, stashed conflicts, backups), a
+// nested project's included. It is matched case-insensitively, as macOS and
+// Windows filesystems resolve it.
+var NeverSync = append(append([]string{}, config.CredentialDirs...), "**/.spotexec/conflicts/", "**/.spotexec/backup/", "**/.spotexec/writeback.lock")
 
 var textAttr = regexp.MustCompile(`(^|\s)-?(text|crlf)(=|\s|$)`)
 
@@ -204,7 +206,7 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 	// The container's build inputs: the Dockerfile and .dockerignore, and
 	// every file in the build context, are needed to build the image. Sync
 	// them even when Git ignores them (git status doesn't list them) or
-	// they sit in a built-in excluded directory such as .spotexec/.
+	// they sit in a built-in excluded directory.
 	listed := make(map[string]bool, len(cands))
 	for _, c := range cands {
 		listed[c.path] = true
@@ -568,8 +570,8 @@ func (m *Manifest) CheckIgnored(ctx context.Context, paths []string) (map[string
 // spotExcluder applies spotexec's own excludes to untracked and non-Git
 // paths: NeverSync everywhere, and BuiltinExcludes except where they would
 // exclude a root Options.Include lists (or a directory above one): below a
-// root only the patterns matching deeper apply, so .spotexec/Dockerfile
-// syncs while .spotexec/node_modules does not.
+// root only the patterns matching deeper apply, so a build context inside
+// a built-in excluded directory syncs while its own node_modules/ does not.
 type spotExcluder struct {
 	builtin, never *ignore.Matcher
 	include        []string // cleaned repo-relative roots

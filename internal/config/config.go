@@ -35,6 +35,45 @@ func (d *Duration) UnmarshalText(b []byte) error {
 
 func (d Duration) MarshalText() ([]byte, error) { return []byte(d.String()), nil }
 
+// Dollars is an amount in US dollars, written as a number (1.5) or a
+// numeric string ("1.50", "$1.50"). Set tells an explicit 0 from unset.
+type Dollars struct {
+	V   float64
+	Set bool
+}
+
+func (d *Dollars) UnmarshalText(b []byte) error {
+	s := strings.TrimPrefix(strings.TrimSpace(string(b)), "$")
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return fmt.Errorf("invalid amount %q (want US dollars, such as 1.50)", string(b))
+	}
+	d.V, d.Set = v, true
+	return nil
+}
+
+// UnmarshalTOML takes unquoted numbers too.
+func (d *Dollars) UnmarshalTOML(v any) error {
+	switch v := v.(type) {
+	case string:
+		return d.UnmarshalText([]byte(v))
+	case int64:
+		d.V, d.Set = float64(v), true
+		return nil
+	case float64:
+		d.V, d.Set = v, true
+		return nil
+	}
+	return fmt.Errorf("invalid amount %v (want US dollars, such as 1.50)", v)
+}
+
+func (d Dollars) MarshalText() ([]byte, error) {
+	if !d.Set {
+		return nil, nil
+	}
+	return []byte(strconv.FormatFloat(d.V, 'f', -1, 64)), nil
+}
+
 // Bytes is a size in bytes, written as a plain integer or with a binary unit:
 // "512KB", "100MB", "1.5GB" (KiB, MiB and GiB spell the same).
 type Bytes int64
@@ -46,6 +85,21 @@ func (b *Bytes) UnmarshalText(t []byte) error {
 	}
 	*b = Bytes(v)
 	return nil
+}
+
+// UnmarshalTOML takes unquoted numbers too: through UnmarshalText the
+// decoder would format a float with six decimals, so 0.0000001 would read
+// as 0, no limit.
+func (b *Bytes) UnmarshalTOML(v any) error {
+	switch v := v.(type) {
+	case string:
+		return b.UnmarshalText([]byte(v))
+	case int64:
+		return b.UnmarshalText([]byte(strconv.FormatInt(v, 10)))
+	case float64:
+		return b.UnmarshalText([]byte(strconv.FormatFloat(v, 'g', -1, 64)))
+	}
+	return fmt.Errorf("invalid size %v (want bytes, or a number with KB, MB or GB)", v)
 }
 
 // ParseBytes reads a size: a plain integer of bytes, or a number with a
@@ -66,7 +120,24 @@ func ParseBytes(s string) (int64, error) {
 	if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) || f*float64(mult) > math.MaxInt64/2 {
 		return 0, fmt.Errorf("invalid size %q (want bytes, or a number with KB, MB or GB)", s)
 	}
+	// It would truncate to 0, which means no limit: only an explicit 0 may.
+	// A tiny number (1e-400) parses as 0 too; its significand isn't zero.
+	if n := f * float64(mult); (n > 0 && n < 1) || (n == 0 && !zeroSignificand(t)) {
+		return 0, fmt.Errorf("invalid size %q: below one byte (0 means no limit)", s)
+	}
 	return int64(f * float64(mult)), nil
+}
+
+// zeroSignificand reports whether a number ParseFloat read as 0 is written
+// as zero (0, -0.0, 0e5, 0x0p1) rather than underflowing. t is upper case.
+func zeroSignificand(t string) bool {
+	s := strings.TrimLeft(t, "+-")
+	if h, ok := strings.CutPrefix(s, "0X"); ok {
+		s, _, _ = strings.Cut(h, "P")
+	} else {
+		s, _, _ = strings.Cut(s, "E")
+	}
+	return strings.Trim(s, "0._") == ""
 }
 
 // Runner types.
@@ -104,10 +175,12 @@ type Runner struct {
 	BootTimeout     Duration `toml:"boot_timeout"`
 
 	// aws-spot
-	Region        string   `toml:"region"`
-	Regions       []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
-	Profile       string   `toml:"profile"`
-	InstanceTypes []string `toml:"instance_types"`
+	Region  string   `toml:"region"`
+	Regions []string `toml:"regions"` // several regions, or ["all"]: launch where the run is expected to cost least
+	// ExcludeRegions: with regions = ["all"], enabled regions never to launch in.
+	ExcludeRegions []string `toml:"exclude_regions"`
+	Profile        string   `toml:"profile"`
+	InstanceTypes  []string `toml:"instance_types"`
 	// Requirements instead of (or narrowing) a type list: every current
 	// instance type with exactly VCPUs vCPUs and at least MinMemoryGiB is a
 	// candidate, and launches go to the cheapest.
@@ -115,7 +188,7 @@ type Runner struct {
 	MinMemoryGiB         float64  `toml:"min_memory_gib"`
 	MinGeneration        int      `toml:"min_generation"`
 	ExcludeInstanceTypes []string `toml:"exclude_instance_types"`
-	LaunchOrder          string   `toml:"launch_order"` // cheapest (default) | listed
+	LaunchOrder          string   `toml:"launch_order"` // run_cost (default) | cheapest | listed
 	MaxPrice             string   `toml:"max_price"`
 	AMI                  string   `toml:"ami"`
 	Arch                 string   `toml:"arch"` // amd64|arm64 (derived from instance types if empty)
@@ -126,6 +199,7 @@ type Runner struct {
 	User                 string   `toml:"user"`
 	OnDemandFallback     bool     `toml:"on_demand_fallback"`
 	CacheBucket          string   `toml:"cache_bucket"` // shared dependency cache: "auto" (default), a bucket name, or "off"
+	WaitCost             Dollars  `toml:"wait_cost"`    // USD an hour of waiting is worth against the Spot bill (run_cost); default DefaultWaitCost
 
 	// fleets (aws-spot, sim)
 	MaxInstances int `toml:"max_instances"`
@@ -150,9 +224,24 @@ func (r *Runner) AnyRegion() bool {
 
 // Launch orders.
 const (
-	LaunchCheapest = "cheapest"
+	// LaunchRunCost ranks by the expected cost of the work, counting the
+	// waiting a cold region, a slower type or a distant region adds.
+	LaunchRunCost  = "run_cost"
+	LaunchCheapest = "cheapest" // the Spot price alone
 	LaunchListed   = "listed"
 )
+
+// DefaultWaitCost is what an hour of waiting is worth, in USD, unless a
+// runner sets wait_cost: more than an 8-vCPU Spot VM costs for an hour.
+const DefaultWaitCost = 1.0
+
+// WaitCostPerHour is the runner's wait_cost, or DefaultWaitCost.
+func (r *Runner) WaitCostPerHour() float64 {
+	if r.WaitCost.Set {
+		return r.WaitCost.V
+	}
+	return DefaultWaitCost
+}
 
 // DefaultMinGeneration is the oldest instance generation a vcpus-based
 // runner considers: older ones are still "current" to AWS, but markedly
@@ -374,6 +463,48 @@ func GlobalPath() string {
 	return filepath.Join(Dir(), "config.toml")
 }
 
+// ConfigVersion is the config format this spotexec understands. A config
+// without a version is read as this one.
+const ConfigVersion = 1
+
+// checkVersion rejects a config written for a format this spotexec doesn't
+// know, rather than reading it under today's rules.
+func checkVersion(md toml.MetaData, v int) error {
+	if v == ConfigVersion {
+		return nil
+	}
+	defined := false
+	for _, k := range md.Keys() {
+		// The decoder matches keys case-insensitively: Version is version.
+		if len(k) == 1 && strings.EqualFold(k[0], "version") {
+			defined = true
+		}
+	}
+	if !defined {
+		return nil
+	}
+	if v > ConfigVersion {
+		return fmt.Errorf("version = %d isn't supported (supported: %d); upgrade spotexec to use this config", v, ConfigVersion)
+	}
+	return fmt.Errorf("version = %d isn't supported (supported: %d)", v, ConfigVersion)
+}
+
+// CheckVersion reads only the version of the config at path, for commands
+// that edit the file without loading it.
+func CheckVersion(path string) error {
+	var v struct {
+		Version int `toml:"version"`
+	}
+	md, err := toml.DecodeFile(path, &v)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if err := checkVersion(md, v.Version); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
+
 // LoadGlobal reads the global config; a missing file yields an empty config.
 func LoadGlobal() (*Global, error) {
 	g := &Global{Runners: map[string]*Runner{}, Path: GlobalPath()}
@@ -382,6 +513,9 @@ func LoadGlobal() (*Global, error) {
 	}
 	md, err := toml.DecodeFile(g.Path, g)
 	if err != nil {
+		return nil, fmt.Errorf("%s: %w", g.Path, err)
+	}
+	if err := checkVersion(md, g.Version); err != nil {
 		return nil, fmt.Errorf("%s: %w", g.Path, err)
 	}
 	if und := md.Undecoded(); len(und) > 0 {
@@ -445,7 +579,7 @@ func (r *Runner) applyDefaults() error {
 			r.MinGeneration = DefaultMinGeneration
 		}
 		if r.LaunchOrder == "" {
-			r.LaunchOrder = LaunchCheapest
+			r.LaunchOrder = LaunchRunCost
 		}
 		if r.User == "" {
 			r.User = "ubuntu"
@@ -591,13 +725,16 @@ func (r *Runner) validateTypes() error {
 		return fmt.Errorf("min_generation must not be negative (got %d)", r.MinGeneration)
 	}
 	switch r.LaunchOrder {
-	case LaunchCheapest:
+	case LaunchRunCost, LaunchCheapest:
 	case LaunchListed:
 		if len(r.InstanceTypes) == 0 {
 			return errors.New(`launch_order = "listed" needs instance_types (the order to try)`)
 		}
 	default:
-		return fmt.Errorf("launch_order must be %q or %q (got %q)", LaunchCheapest, LaunchListed, r.LaunchOrder)
+		return fmt.Errorf("launch_order must be %q, %q or %q (got %q)", LaunchRunCost, LaunchCheapest, LaunchListed, r.LaunchOrder)
+	}
+	if w := r.WaitCost.V; r.WaitCost.Set && (w < 0 || w > 1e4 || math.IsNaN(w) || math.IsInf(w, 0)) {
+		return fmt.Errorf("wait_cost must be between 0 and 10000 US dollars per hour of waiting (got %g)", w)
 	}
 	return nil
 }
@@ -607,6 +744,14 @@ func (r *Runner) validateTypes() error {
 // several regions, region becomes the home region: the first listed, or
 // for "all" the environment default, used for account-wide lookups.
 func (r *Runner) normalizeRegions() error {
+	if len(r.ExcludeRegions) > 0 && !(len(r.Regions) == 1 && r.Regions[0] == AllRegions) {
+		return errors.New(`exclude_regions needs regions = ["all"]; with a list, just leave the region out of regions`)
+	}
+	for _, rg := range r.ExcludeRegions {
+		if !regionRe.MatchString(rg) {
+			return fmt.Errorf("exclude_regions: invalid region %q", rg)
+		}
+	}
 	if len(r.Regions) == 0 {
 		return nil
 	}
@@ -766,6 +911,9 @@ func LoadProject(path string) (*Project, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
+		if err := checkVersion(md, p.Version); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
 		var und []toml.Key
 		for _, k := range md.Undecoded() {
 			if len(k) > 0 && k[0] == "runners" {
@@ -911,7 +1059,7 @@ func (p *Project) validate() error {
 var globalOnlyKeys = []string{
 	"type", "host", "hosts", "ssh_options", "identity_file", "work_root",
 	"profile", "region", "subnet_id", "security_group_ids", "ssh_cidr",
-	"user", "cache_bucket", "regions",
+	"user", "cache_bucket", "regions", "exclude_regions",
 }
 
 var (
@@ -988,6 +1136,7 @@ func (c *Config) MergeProjectRunners() error {
 		base.SSHOptions = append([]string(nil), g.SSHOptions...)
 		base.SecurityGroupIDs = append([]string(nil), g.SecurityGroupIDs...)
 		base.Regions = append([]string(nil), g.Regions...)
+		base.ExcludeRegions = append([]string(nil), g.ExcludeRegions...)
 		base.ExcludeInstanceTypes = append([]string(nil), g.ExcludeInstanceTypes...)
 		// The project's way of choosing types replaces the inherited one: new
 		// instance_types alone drop inherited requirements, and requirements
@@ -1003,7 +1152,9 @@ func (c *Config) MergeProjectRunners() error {
 		}
 		if setsReqs && !setsTypes {
 			base.InstanceTypes = nil
-			if !p.md.IsDefined("runners", name, "launch_order") {
+			// "listed" needs the list just dropped; run_cost and cheapest
+			// carry over.
+			if !p.md.IsDefined("runners", name, "launch_order") && base.LaunchOrder == LaunchListed {
 				base.LaunchOrder = ""
 			}
 		}

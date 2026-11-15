@@ -27,6 +27,8 @@ type Lease struct {
 	Sess       *transport.Session
 	Acq        protocol.Acquired
 	InstanceID string // fleet instance, when the runner is a fleet
+	// Instance: that VM as listed (its zone and type), when known.
+	Instance provider.Instance
 }
 
 // Close releases the slot.
@@ -486,7 +488,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provi
 	}
 	switch {
 	case lease != nil:
-		lease.InstanceID = in.ID
+		lease.InstanceID, lease.Instance = in.ID, in
 		req.Rep.Event("placed", map[string]any{"runner": m.r.Name, "instance_id": in.ID, "slot": lease.Acq.Token})
 		return lease, nil, OutAcquired
 	case err == nil:
@@ -569,12 +571,31 @@ func (m *member) provision(ctx context.Context, id string, rep ui.Reporter) {
 	}
 	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.r.BootTimeout.Duration+time.Minute)
 	defer cancel()
-	in, err := m.pool.ProvisionHeld(pctx, id, logf)
+	launched := func(in provider.Instance) {
+		// Where the launch went and why that option won, as soon as it's
+		// known (the scale_out event comes before the choice).
+		rep.Event("instance_launched", placed(map[string]any{"runner": m.r.Name, "launch_id": id, "instance_id": in.ID}, in))
+	}
+	in, err := m.pool.ProvisionHeldThen(pctx, id, logf, launched)
 	if err != nil {
 		rep.Warn("LAUNCH_FAILED", "%s: %v", m.r.Name, firstLine(err.Error()))
 		return
 	}
-	rep.Event("instance_running", map[string]any{"runner": m.r.Name, "instance_id": in.ID, "host": in.Target.String()})
+	rep.Event("instance_running", placed(map[string]any{"runner": m.r.Name, "launch_id": id, "instance_id": in.ID, "host": in.Target.String()}, in))
+}
+
+// placed adds where an instance is, and why it launched there, to an
+// event's fields.
+func placed(ev map[string]any, in provider.Instance) map[string]any {
+	for k, v := range map[string]string{"region": in.Region, "zone": in.Zone, "type": in.Type} {
+		if v != "" {
+			ev[k] = v
+		}
+	}
+	if in.Placement != nil {
+		ev["placement"] = in.Placement
+	}
+	return ev
 }
 
 func isCode(err error, code string) bool {
@@ -761,11 +782,14 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 	}
 	// A VM that has shut down would only fail after an SSH timeout: ask the
 	// cloud first.
+	var listed provider.Instance
 	if f, ok := p.(provider.Fleet); ok && lr.InstanceID != "" {
 		if live, err := f.List(ctx); err == nil {
 			found := false
 			for _, in := range live {
-				found = found || in.ID == lr.InstanceID
+				if in.ID == lr.InstanceID {
+					found, listed = true, in
+				}
 			}
 			if !found {
 				return nil, fmt.Errorf("%w: %s, which held it, has shut down (idle_timeout or Spot reclaim)", ErrSlotGone, lr.InstanceID)
@@ -785,7 +809,7 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 	if err != nil {
 		return nil, err
 	}
-	lease.InstanceID = lr.InstanceID
+	lease.InstanceID, lease.Instance = lr.InstanceID, listed
 	if lease.Acq.Slot != lr.Slot {
 		lease.Close()
 		return nil, fmt.Errorf("slot %d on %s is in use by another run; try again shortly", lr.Slot, r.Name)

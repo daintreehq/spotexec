@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/daintreehq/spotexec/internal/client"
+	"github.com/daintreehq/spotexec/internal/config"
 )
 
 // defaultDockerfile is where `container init` writes the project image.
@@ -71,6 +72,14 @@ func containerInit(ws *client.Workspace, rel string, force bool) error {
 	if rel == "." || strings.HasPrefix(rel, "../") || path.IsAbs(rel) {
 		return fmt.Errorf("--path must be inside the repository")
 	}
+	cfgPath := filepath.Join(ws.Root, ".spotexec.toml")
+	// Don't add a version-1 table to a config in another format, or write a
+	// Dockerfile for it.
+	if _, err := os.Stat(cfgPath); err == nil {
+		if err := config.CheckVersion(cfgPath); err != nil {
+			return err
+		}
+	}
 	abs := filepath.Join(ws.Root, filepath.FromSlash(rel))
 	if _, err := os.Lstat(abs); err == nil {
 		if !force {
@@ -96,7 +105,6 @@ func containerInit(ws *client.Workspace, rel string, force bool) error {
 		fmt.Printf("note: this repository also uses %s; add it to %s if your commands need it\n", strings.Join(missing, " and "), rel)
 	}
 
-	cfgPath := filepath.Join(ws.Root, ".spotexec.toml")
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
 		b, notes := detectProject(ws.Root)
 		if err := os.WriteFile(cfgPath, []byte(b), 0o644); err != nil {

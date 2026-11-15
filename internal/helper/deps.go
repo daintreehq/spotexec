@@ -166,7 +166,7 @@ func (s *Session) deps(d protocol.Deps) error {
 		// Build once per key under an exclusive lock; other slots wait.
 		lockPath := cacheRoot + ".lock"
 		var l *flock
-		for {
+		for waited := false; ; waited = true {
 			var ok bool
 			l, ok, err = tryLock(lockPath)
 			if err != nil {
@@ -174,6 +174,9 @@ func (s *Session) deps(d protocol.Deps) error {
 			}
 			if ok {
 				break
+			}
+			if !waited {
+				_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_wait", Message: "waiting for another slot on this runner to install the same dependencies"})
 			}
 			if s.clientGone() {
 				return perr(protocol.CodeDepsFailed, "client went away while waiting for dependency build")
@@ -197,6 +200,12 @@ func (s *Session) deps(d protocol.Deps) error {
 					_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_cache_error", Message: err.Error()})
 				}
 			}
+			if d.Probe {
+				// The client decides who installs (one run for every
+				// runner waiting on this key), and asks again.
+				res.Missing = true
+				return nil
+			}
 			// The install runs arbitrary package scripts in the workspace:
 			// invalidate the fingerprint and dependency key first.
 			s.state.Fingerprint, s.state.DepsKey = "", ""
@@ -208,7 +217,8 @@ func (s *Session) deps(d protocol.Deps) error {
 			}
 			res.Built = true
 			if d.CachePut != "" && d.CacheKey == key {
-				if err := startCacheUpload(s.layout.Root, cacheRoot, cacheRoot+".lock", d.CachePut); err == nil {
+				if t, err := startCacheUpload(s.layout.Root, cacheRoot, cacheRoot+".lock", d.CachePut); err == nil {
+					s.track(protocol.ShareDeps, t)
 					res.Uploaded = true
 				} else {
 					_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_cache_error", Message: err.Error()})
@@ -218,6 +228,10 @@ func (s *Session) deps(d protocol.Deps) error {
 		}()
 		if err != nil {
 			return err
+		}
+		if res.Missing {
+			res.MS = time.Since(start).Milliseconds()
+			return s.c.Send(protocol.TypeDepsResult, res)
 		}
 	}
 	if !res.Built {

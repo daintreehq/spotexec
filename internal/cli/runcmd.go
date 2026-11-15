@@ -18,6 +18,7 @@ import (
 
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/transport"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
@@ -25,6 +26,7 @@ import (
 // runFlags are shared by the shorthand form, run, exec, and tasks.
 type runFlags struct {
 	timeout       time.Duration
+	timeoutFrom   string // "--timeout" or "SPOTEXEC_TIMEOUT" when either set it
 	queueTimeout  time.Duration
 	sync          string
 	writeback     string
@@ -49,6 +51,7 @@ type runFlags struct {
 	group         bool
 	rtkFilter     string
 	failConflict  bool
+	envErr        error          // a SPOTEXEC_* value applyEnv couldn't parse
 	fs            *pflag.FlagSet // to tell explicit flags from defaults
 }
 
@@ -103,10 +106,17 @@ func (f *runFlags) reporter() (ui.Reporter, error) {
 // applyEnv fills in SPOTEXEC_* defaults for every flag not given on the
 // command line: an explicit flag always wins, whatever its value (so
 // --json=false, --priority 0 and --pool beat the environment).
+// A value that doesn't parse is kept for validate to report, never dropped
+// for the default.
 func (f *runFlags) applyEnv() {
-	if !f.changed("timeout") {
-		if d, err := time.ParseDuration(os.Getenv("SPOTEXEC_TIMEOUT")); err == nil {
-			f.timeout = d
+	f.envErr = nil
+	if f.changed("timeout") {
+		f.timeoutFrom = "--timeout"
+	} else if v := os.Getenv("SPOTEXEC_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			f.timeout, f.timeoutFrom = d, "SPOTEXEC_TIMEOUT"
+		} else {
+			f.envErr = fmt.Errorf("SPOTEXEC_TIMEOUT must be a duration such as 15m (got %q)", v)
 		}
 	}
 	if !f.changed("sync") {
@@ -126,25 +136,61 @@ func (f *runFlags) applyEnv() {
 			f.runner = v
 		}
 	}
-	if os.Getenv("SPOTEXEC_JSON") == "1" && !f.changed("json") && !f.changed("pretty") && !f.changed("quiet") {
-		f.json = true
+	if !f.changed("json") && !f.changed("pretty") && !f.changed("quiet") {
+		f.envSwitch("SPOTEXEC_JSON", &f.json)
 	}
-	if os.Getenv("SPOTEXEC_SAME_SLOT") == "1" && !f.changed("same-slot") {
-		f.sameSlot = true
+	if !f.changed("same-slot") {
+		f.envSwitch("SPOTEXEC_SAME_SLOT", &f.sameSlot)
 	}
-	if os.Getenv("SPOTEXEC_FAIL_ON_CONFLICT") == "1" && !f.changed("fail-on-conflict") {
-		f.failConflict = true
+	if !f.changed("fail-on-conflict") {
+		f.envSwitch("SPOTEXEC_FAIL_ON_CONFLICT", &f.failConflict)
 	}
 	if f.changed("priority") {
 		f.prioritySet = true
-	} else if n, err := strconv.Atoi(os.Getenv("SPOTEXEC_PRIORITY")); err == nil {
-		f.priority, f.prioritySet = n, true
+	} else if v := os.Getenv("SPOTEXEC_PRIORITY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			f.priority, f.prioritySet = n, true
+		} else if f.envErr == nil {
+			f.envErr = fmt.Errorf("SPOTEXEC_PRIORITY must be a whole number (got %q)", v)
+		}
+	}
+}
+
+// envSwitch turns on a flag not given on the command line when its boolean
+// variable says so; a value that isn't one is kept for validate to report.
+func (f *runFlags) envSwitch(name string, flag *bool) {
+	on, err := envBool(name)
+	if err != nil {
+		if f.envErr == nil {
+			f.envErr = err
+		}
+		return
+	}
+	if on {
+		*flag = true
+	}
+}
+
+// envBool reads a boolean SPOTEXEC_* variable: 1, true or yes, or 0, false
+// or no, in any case; unset or empty is false. Anything else is an error
+// naming the variable, never silently false.
+func envBool(name string) (bool, error) {
+	switch v := os.Getenv(name); strings.ToLower(v) {
+	case "", "0", "false", "no":
+		return false, nil
+	case "1", "true", "yes":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s must be 1, true or yes, or 0, false or no (got %q)", name, v)
 	}
 }
 
 // validate rejects run settings no run could honour, before any runner is
 // acquired: an unknown --writeback must never fall through to writing back.
 func (f *runFlags) validate() error {
+	if f.envErr != nil {
+		return f.envErr
+	}
 	// An explicitly empty value would silently mean "the default".
 	for name, empty := range map[string]bool{"sync": f.sync == "", "writeback": f.writeback == "", "writeback-over": f.writebackOver == "", "runner": f.runner == "", "pool": len(f.pool) == 0} {
 		if empty && f.changed(name) {
@@ -159,6 +205,10 @@ func (f *runFlags) validate() error {
 	}
 	if f.writebackOver != "" && f.writebackOver != "warn" && f.writebackOver != "hold" {
 		return fmt.Errorf("--writeback-over must be warn or hold (got %q)", f.writebackOver)
+	}
+	// Zero would otherwise mean "the default", and a negative limit nothing.
+	if f.timeoutFrom != "" && f.timeout <= 0 {
+		return fmt.Errorf("%s must be positive (got %s)", f.timeoutFrom, f.timeout)
 	}
 	return nil
 }
@@ -517,7 +567,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		}
 		finish(client.ExitInfra)
 		rep.Clear()
-		rep.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
+		rep.Event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 		if !rep.IsJSON() {
 			fmt.Fprintf(os.Stderr, "spotexec: %v\n", err)
 			depsDetail(os.Stderr, "", err)
@@ -535,9 +585,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	if res.DepsInstalled > 0 {
 		summary += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(res.DepsInstalled))
 	}
-	if n := len(res.Mutated) + len(res.Deleted); n > 0 {
-		summary += fmt.Sprintf(" · pulled %d modified file%s", n, plural(n))
-	}
+	summary += writebackNote(len(res.Mutated), len(res.Deleted))
 	summary += conflictNote(len(res.Conflicts))
 	if res.HeldFiles > 0 {
 		summary += fmt.Sprintf(" · held %d new file%s (%s) in the slot", res.HeldFiles, plural(res.HeldFiles), ui.Bytes(res.HeldBytes))
@@ -565,6 +613,20 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 func (f *runFlags) executeLast(l *loaded, s runSpec) int {
 	s.preferLast = true
 	return f.execute(l, s)
+}
+
+// writebackNote is the summary's account of the write-back, as sync_out
+// has it: the files written here (new or changed, mutated_files) and the
+// files deleted here (deleted_files).
+func writebackNote(written, deleted int) string {
+	s := ""
+	if written > 0 {
+		s += fmt.Sprintf(" · pulled %d file%s", written, plural(written))
+	}
+	if deleted > 0 {
+		s += fmt.Sprintf(" · deleted %d file%s", deleted, plural(deleted))
+	}
+	return s
 }
 
 func plural(n int) string {
@@ -660,6 +722,14 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	t := l.cfg.Project.Tasks[name]
 	defer waitLaunches()
 	parts := taskParts(l.cfg.Project, name, args)
+	// A blank run, or run = "{args}" given none, would run nothing and pass;
+	// checked for every part before any of them syncs.
+	for _, pt := range parts {
+		if strings.TrimSpace(pt.spec(l).command) == "" {
+			fmt.Fprintf(os.Stderr, "spotexec: task %s: empty command (run = %q, with no arguments)\n", pt.name, pt.t.Run)
+			return client.ExitInfra
+		}
+	}
 	if len(t.Parallel) == 0 && len(parts) == 1 {
 		// A plain task, or one with a single shard: an ordinary run.
 		return f.execute(l, parts[0].spec(l))
@@ -790,7 +860,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 					return
 				}
 				if err != nil {
-					sr.event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
+					sr.event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 					if !rep.IsJSON() {
 						fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
 						depsDetail(os.Stderr, prefix, err)
@@ -911,6 +981,29 @@ func (t *taskReporter) event(name string, fields map[string]any) {
 func (t *taskReporter) Status(string, ...any) {}
 func (t *taskReporter) Clear()                {}
 func (t *taskReporter) Done(string, bool)     {}
+
+// errorCode is the code of a --json error event: the reason the helper
+// reported (BOOTSTRAP_FAILED, DEPS_FAILED, …), or the one the message starts
+// with (QUEUE_TIMEOUT: …), else SPOTEXEC_ERROR.
+func errorCode(err error) string {
+	var re *transport.RemoteError
+	if errors.As(err, &re) && re.Code != "" {
+		return re.Code
+	}
+	// Only a known code counts: "BUILD_POOL: …" names a runner.
+	if code, _, ok := strings.Cut(err.Error(), ": "); ok && errorCodes[code] {
+		return code
+	}
+	return "SPOTEXEC_ERROR"
+}
+
+// errorCodes are the reasons a failed run's error can start with.
+var errorCodes = map[string]bool{
+	protocol.CodeDraining: true, protocol.CodeBooting: true, protocol.CodeBootFailed: true,
+	protocol.CodeQueueTimeout: true, protocol.CodeBadRequest: true, protocol.CodeInternal: true,
+	protocol.CodeSyncFailed: true, protocol.CodeDepsFailed: true, protocol.CodeImageFailed: true,
+	protocol.CodeShutdown: true,
+}
 
 // depsDetail prints, under a failed dependency install's error, the end of
 // the install's output and where its full log is. prefix starts every line

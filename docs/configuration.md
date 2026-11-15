@@ -7,6 +7,8 @@ There are two files, and the split is deliberate.
 | `~/.config/spotexec/config.toml` | Your hardware, accounts, credentials, network | Never |
 | `.spotexec.toml` at the repository root | How this project syncs, installs and runs | Yes |
 
+Both start with `version = 1`, the only config format this spotexec understands. A file without `version` is read as version 1. Any other version (say, one written for a newer spotexec) is rejected rather than read under today's rules, with an error naming the supported version: `sx` and `spotexec run` exit `125`, `spotexec supported` prints `false`, `spotexec doctor` fails, and `spotexec container init` leaves the file alone.
+
 Settings resolve in this order, highest first:
 1. CLI flags. A flag given on the command line beats its environment variable whatever its value, so `--json=false`, `--priority 0` and `--pool` all override the environment.
 2. `SPOTEXEC_*` environment variables (below).
@@ -20,7 +22,7 @@ Exceptions to that order:
 - a task's own `pool` beats `SPOTEXEC_POOL`;
 - `spotexec sync` always syncs and `spotexec exec` never does, whatever `SPOTEXEC_SYNC` says.
 
-Unknown `--sync`, `--writeback` and `--writeback-over` values (from flags or the environment) are rejected with exit `125` before any runner is used.
+Unknown `--sync`, `--writeback` and `--writeback-over` values and a zero or negative `--timeout` (from flags or the environment), and a `SPOTEXEC_TIMEOUT` or `SPOTEXEC_PRIORITY` that doesn't parse (when its flag isn't given), are rejected with exit `125` before any runner is used: a malformed variable never falls back to the default. So is a boolean variable (`SPOTEXEC_SAME_SLOT`, `SPOTEXEC_FAIL_ON_CONFLICT`, `SPOTEXEC_JSON`) set to anything but `1`, `true` or `yes` (on) or `0`, `false` or `no` (off), in any case; unset or empty is off.
 
 ### Environment variables
 
@@ -100,14 +102,16 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `region` | `AWS_REGION`, `AWS_DEFAULT_REGION`, else `us-east-1` | EC2 region. |
-| `regions` | (unset) | Launch in several regions instead: a list, or `["all"]` for every region enabled in the account. Each new VM goes wherever Spot is cheapest right now. Not with `region`, `subnet_id`, `security_group_ids`, an `ami-…` ID or a named `cache_bucket`. A list of one region is the same as `region`. See [Let spotexec pick the region](aws.md#let-spotexec-pick-the-region). |
+| `regions` | (unset) | Launch in several regions instead: a list, or `["all"]` for every region enabled in the account. Each new VM goes where the run is expected to cost least: the Spot price, and the waiting a cold or far region adds (see `launch_order`). Not with `region`, `subnet_id`, `security_group_ids`, an `ami-…` ID or a named `cache_bucket`. A list of one region is the same as `region`. See [Let spotexec pick the region](aws.md#let-spotexec-pick-the-region). |
+| `exclude_regions` | (none) | With `regions = ["all"]`: regions never to launch in, such as `["ap-south-2"]` (frequent interruptions, too far away, data residency). `spotexec prices` and `doctor` list them as not used. |
 | `profile` | (env / default) | AWS profile to use. |
-| `instance_types` | `c7a.2xlarge`, `m7a.2xlarge`, `c6a.2xlarge` (8 vCPUs, as in the starter config), none with `vcpus` | The types VMs may use. Each VM goes to the cheapest current Spot price among them and every zone (with `regions`, every region), moving down the ranking on capacity errors; equal prices go to the type listed first. All must share one architecture. With `vcpus`, entries may be patterns (`"m*"`, `"c7a.*"`) and only narrow the matching types. See [Launch on the cheapest instance](aws.md#launch-on-the-cheapest-instance). |
-| `vcpus` | (unset) | Instead of naming types: every current instance type in the region with exactly this many vCPUs (and `min_memory_gib`, `arch`) is a candidate, and the cheapest launches. Exact, so every VM gets the same slots. See [Describe the VM instead of naming types](aws.md#describe-the-vm-instead-of-naming-types). |
+| `instance_types` | `c7a.2xlarge`, `m7a.2xlarge`, `c6a.2xlarge` (8 vCPUs, as in the starter config), none with `vcpus` | The types VMs may use. Each VM goes to the first option in launch order among them and every zone (with `regions`, every region), moving down the ranking on capacity errors: in one region the cheapest current Spot price, equal prices to the type listed first; with `regions`, the lowest expected run cost (see `launch_order`). All must share one architecture. With `vcpus`, entries may be patterns (`"m*"`, `"c7a.*"`) and only narrow the matching types. See [Launch on the cheapest instance](aws.md#launch-on-the-cheapest-instance). |
+| `vcpus` | (unset) | Instead of naming types: every current instance type in the region with exactly this many vCPUs (and `min_memory_gib`, `arch`) is a candidate, and the one with the lowest expected run cost launches (the Spot price, counting newer generations as faster). Exact, so every VM gets the same slots. See [Describe the VM instead of naming types](aws.md#describe-the-vm-instead-of-naming-types). |
 | `min_memory_gib` | `0` | With `vcpus`: the least memory a type may have. |
 | `min_generation` | `6` | With `vcpus`: the oldest instance generation used (m6a: 6). `7` keeps to the newest. |
 | `exclude_instance_types` | (none) | With `vcpus`: types or patterns never to use, such as `["m6i.*", "*n.*"]`. |
-| `launch_order` | `cheapest` | `listed` tries `instance_types` in the listed order (each in its cheapest zone first) instead of cheapest first. |
+| `launch_order` | `run_cost` | How launches rank the options. `run_cost`: by the expected cost of an hour of work, the Spot price plus the waiting (at `wait_cost`) that a slower generation (`vcpus` runners), a cold region or a farther region (several regions) adds; a runner in one region with a fixed list ranks by price, as with `cheapest`. `cheapest`: the Spot price alone. `listed`: `instance_types` in the listed order, each in its cheapest zone first. See [Rank by the cost of the run](aws.md#rank-by-the-cost-of-the-run). |
+| `wait_cost` | `1` | With `launch_order = "run_cost"`: what an hour of waiting for results is worth, in USD, against the Spot bill. `0` counts only the bill; higher values favor warm regions and faster types more. A number or a string (`"1.50"`). |
 | `arch` | from the first instance type that isn't a pattern, else `amd64` | `amd64` or `arm64` (Graviton). |
 | `max_instances` | `4` | Fleet ceiling. |
 | `min_instances` | `0` | Warm floor, kept only while the [pool manager](scaling.md#pool-manager-optional) runs. |
@@ -191,7 +195,7 @@ when_load_above = 0.6          # agents offload only when the laptop is busy
 
 A `lockfiles` entry containing `*`, `?` or `[` is a pattern, matched one path segment at a time: `*` and `?` never cross a `/`, `[a-z]` is a character class, and a segment that is exactly `**` matches any number of directories, including none (`electron/native/*/src/**`, `**/package.json`). Unlike `--pull` and `pull_artifacts`, `**` is recursive here, because lockfile patterns are matched against the list of files spotexec syncs rather than the runner's filesystem. Every pattern must stay inside the repository (no leading `/`, no `..`, nothing in `.git`).
 
-Patterns are expanded once per run, on your machine, against the files synced to the slot: ignored, excluded and `cache_dirs` files never match, nor do symlinks. The key hashes the sorted, deduplicated list of matches plus any literal entries, and that exact list is what the runner reads, so a new workspace or native addon joins the key as soon as it is synced. A pattern that matches nothing is a warning (`DEPS_LOCKFILES`), since an empty directory of addons is legitimate; a literal path that is missing is still an error, as is a list that matches no file at all. `spotexec sync-plan` prints the expanded list. Configs without patterns keep their existing cache key.
+Patterns are expanded once per run, on your machine, against the files synced to the slot: ignored, excluded and `cache_dirs` files never match, nor do symlinks. The key hashes the sorted, deduplicated list of matches plus any literal entries, and that exact list is what the runner reads, so a new workspace or native addon joins the key as soon as it is synced. A pattern that matches nothing is a warning (`DEPS_LOCKFILES`), since an empty directory of addons is legitimate; a literal path that is missing is still an error, as is a list that matches no file at all. When a run syncs and installs dependencies, a literal path missing from your machine fails it before it reaches a runner, and `spotexec supported` and `doctor` report it, unless the path is under a symlinked directory, in a `cache_dirs` directory or ignored (an earlier run may have left it in the slot), where the runner may still have it. `spotexec sync-plan` prints the expanded list. Configs without patterns keep their existing cache key.
 
 ### Setup
 
@@ -275,4 +279,4 @@ max_slots = 2
 
 Setting `vcpus` (or another requirement key) without `instance_types` drops the inherited `instance_types`, and setting `instance_types` alone drops inherited requirements: the project's way of choosing types replaces yours. Set both to narrow the requirements with patterns.
 
-How you connect and which account and network are used stay in your global config. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `regions`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, or open a port. See [Security model](architecture.md#security-model).
+How you connect and which account and network are used stay in your global config. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `regions`, `exclude_regions`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, or open a port. See [Security model](architecture.md#security-model).

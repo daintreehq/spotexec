@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -252,6 +253,15 @@ func whyNoReplay(lease *Lease, noticed bool) noReplay {
 	return noReplay{}
 }
 
+// noteReclaimed tells the lease's fleet that AWS is reclaiming its VM, so
+// new launches (a replacement first) prefer other zones and types for a
+// while.
+func noteReclaimed(lease *Lease) {
+	if rc, ok := lease.Provider.(provider.Reclaimer); ok && lease.Instance.ID != "" {
+		rc.Reclaimed(lease.Instance)
+	}
+}
+
 // replayVerdict is whyNoReplay for an attempt that lost its runner with
 // err: a shutdown the helper reported counts as the VM's notice, since EC2
 // still reports a VM running while its OS halts.
@@ -345,7 +355,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			o.Rep.Warn("LARGE_SYNC", "syncing %d files; consider [sync].exclude", len(m.Entries))
 		}
 	}
-	if err := checkLocal(m, p, ws, o); err != nil {
+	if err := checkLocal(ctx, m, p, ws, o); err != nil {
 		return res, infra(err), ""
 	}
 
@@ -405,6 +415,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		lease.Sess.SetOnSilent(waitIfRunning(lease, o.Rep))
 	}
 	var noticed atomic.Bool // a reclamation notice arrived
+	// Before any replacement launches: steer it away from this VM's pool.
+	reclaimed := sync.OnceFunc(func() { noteReclaimed(lease) })
 	defer func() {
 		if lost != "" && lease.InstanceID != "" {
 			res.noReplay = replayVerdict(lease, noticed.Load(), err)
@@ -431,6 +443,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
 		if ev.Name == "spot_interruption" {
 			noticed.Store(true)
+			reclaimed()
 		}
 	}
 	remoteWS := lease.Acq.Workspace
@@ -579,6 +592,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}()
 	onSpot := func() {
 		noticed.Store(true)
+		reclaimed()
 		if lease.InstanceID == "" || !(o.RetryPreempt && att.n < 2 && o.Sync != "none" && !o.PreferLast && !o.SameSlot) {
 			return
 		}
@@ -662,7 +676,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	// 6. Write-back of mutations.
 	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, res.ExitCode) &&
-		(len(result.Changed)+len(result.Deleted)+len(result.Created) > 0) {
+		(len(result.Changed)+len(result.Deleted)+len(result.Created)+len(result.GitDirs) > 0) {
 		t := time.Now()
 		// on-success: an interrupt while the changes are being fetched means
 		// the run no longer counts as a success; apply nothing.
@@ -694,7 +708,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		res.Mutated, res.Deleted = wb.Applied, wb.Deleted
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "held_files": len(wb.HeldNew), "held_bytes": wb.HeldNewBytes, "duration_ms": time.Since(t).Milliseconds()})
 		if len(wb.Refused) > 0 {
-			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
+			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (a .git directory, inside .git or spotexec's own state in .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
 		}
 		if result.Truncated {
 			o.Rep.Warn("WRITEBACK_TRUNCATED", "more than %d new files were created; only the first batch was considered for write-back", 50000)
@@ -706,7 +720,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// 7. Explicit artifact pulls.
 	pulls := append(append([]string{}, p.Sync.PullArtifacts...), o.Pull...)
 	if len(pulls) > 0 {
-		n, err := PullArtifacts(post, sess, ws, ws.Root, pulls, nil, false)
+		n, err := PullArtifacts(post, sess, ws, ws.Root, pulls, nil, false, o.Rep, runID)
 		if err != nil {
 			o.Rep.Warn("PULL_FAILED", "pulling %v: %v", pulls, err)
 		}
@@ -754,7 +768,11 @@ func reportOutsideLinks(rep ui.Reporter, links []Link, runID string) {
 			where = "an absolute path"
 		}
 		rep.Warn("WRITEBACK_SYMLINK", "the remote command made %s a symlink to %s, %s; anything reading it here reads that instead (delete it if you didn't expect it)", printable(l.Path), printable(l.Target), where)
-		rep.Event("outside_symlink", map[string]any{"path": l.Path, "target": l.Target, "run_id": runID})
+		ev := map[string]any{"path": l.Path, "target": l.Target}
+		if runID != "" {
+			ev["run_id"] = runID
+		}
+		rep.Event("outside_symlink", ev)
 	}
 }
 
@@ -928,10 +946,16 @@ func newRunID() string {
 // wrote back, the ones the next sync must remove: everything this worktree
 // doesn't ignore (ignored build outputs stay, like dependency caches).
 func strayFiles(ctx context.Context, ws *Workspace, m *manifest.Manifest, pending []string) ([]string, error) {
-	var stray, check []string
+	var stray, check, gitDirs, probes []string
 	for _, p := range pending {
 		if _, ok := m.ByPath[p]; ok {
 			continue // synced over by this run
+		}
+		// A .git directory a run made goes unless its directory is ignored
+		// here (a build output's own clone stays, like the output).
+		if probe, ok := gitDirProbe(ws, m, p); ok {
+			gitDirs, probes = append(gitDirs, p), append(probes, probe)
+			continue
 		}
 		// Never a file of ours: an invalid or reserved path, or one under a
 		// synced file or a local symlink or file (git can't judge those).
@@ -941,10 +965,10 @@ func strayFiles(ctx context.Context, ws *Workspace, m *manifest.Manifest, pendin
 		}
 		check = append(check, p)
 	}
-	if len(check) == 0 {
+	if len(check)+len(probes) == 0 {
 		return stray, nil
 	}
-	ign, err := m.CheckIgnored(ctx, check)
+	ign, err := m.CheckIgnored(ctx, append(append([]string{}, check...), probes...))
 	if err != nil {
 		return nil, err
 	}
@@ -953,7 +977,34 @@ func strayFiles(ctx context.Context, ws *Workspace, m *manifest.Manifest, pendin
 			stray = append(stray, p)
 		}
 	}
+	for i, p := range gitDirs {
+		if !ign[probes[i]] {
+			stray = append(stray, p)
+		}
+	}
 	return stray, nil
+}
+
+// gitDirProbe returns, for p a .git directory below the root that a run
+// created, the path whose being ignored here says whether p is: p's
+// directory, with a trailing slash so it is asked about as a directory (the
+// built-in excludes match .git itself, whatever surrounds it). false when p
+// is no such directory, or its directory can't be judged here (a local
+// symlink or file, or beyond one): it is never kept.
+func gitDirProbe(ws *Workspace, m *manifest.Manifest, p string) (string, bool) {
+	dir, name := path.Split(p)
+	if name != ".git" || dir == "" {
+		return "", false
+	}
+	d := strings.TrimSuffix(dir, "/")
+	full, err := fsid.SafeJoin(ws.Root, d)
+	if err != nil || reservedPath(d, ws.Git) || underSyncedFile(m, p) {
+		return "", false
+	}
+	if fi, err := os.Lstat(full); err == nil && !fi.IsDir() || err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "", false
+	}
+	return dir, true
 }
 
 // underSyncedFile reports whether a parent of p is a synced file or symlink.
@@ -1162,21 +1213,23 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	// Shared cache: sign URLs for the key the runner will compute. Any
 	// failure just means installing without the cache.
 	// The cache lives in the instance's own region (multi-region fleets).
+	var resign func(context.Context) (string, string, error)
 	if dc, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.DepsCache); ok {
 		key, err := depskey.Key(ws.Root, depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Image: image, Toolchain: req.Toolchain, OS: s.Hello.OS, Arch: s.Hello.Arch})
 		if err == nil {
-			cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-			get, put, err := dc.CacheURLs(cctx, ws.RepoID, key)
-			cancel()
+			sign := func(ctx context.Context) (string, string, error) {
+				cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				defer cancel()
+				return dc.CacheURLs(cctx, ws.RepoID, key)
+			}
+			get, put, err := sign(ctx)
 			if err != nil {
 				o.Rep.Warn("DEPS_CACHE", "shared dependency cache unavailable: %v", err)
 			} else if get != "" {
 				req.CacheKey, req.CacheGet, req.CachePut = key, get, put
+				resign = sign
 			}
 		}
-	}
-	if err := s.Conn.Send(protocol.TypeDeps, req); err != nil {
-		return protocol.DepsResult{}, err
 	}
 	onEvent := func(ev protocol.Event) {
 		if s.OnEvent != nil {
@@ -1186,7 +1239,7 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 		}
 	}
 	log := newDepsLog(depsLogDir(), label)
-	dr, err := consumeDeps(ctx, s.Next, onEvent, o.Rep, label, log)
+	dr, shared, upload, err := fetchDeps(ctx, sessionRPC{s}, onEvent, o, label, log, req, resign, p.Deps.Timeout.Duration+shareSlack)
 	log.Close()
 	// The install's status (and plain mode's heartbeat of it) ends here:
 	// the command's own phase starts next.
@@ -1217,8 +1270,95 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	if p := log.Path(); p != "" {
 		ev["log"] = p
 	}
+	if shared.waited > 0 {
+		ev["waited_ms"] = shared.waited.Milliseconds()
+	}
+	if upload != nil {
+		ev["uploaded"], ev["upload_ms"] = upload.OK, upload.MS
+	}
 	o.Rep.Event("deps", ev)
 	return dr, nil
+}
+
+// fetchDeps sends the deps request. With a shared cache, which may lack
+// this key, of the runs on this machine needing it now (the parts of a
+// task, concurrent commands) one installs it and uploads it, and the rest
+// wait for it and restore it (#139): each run first probes (restore only),
+// and on a miss queues for the key's lock. resign signs fresh cache URLs
+// (nil: no shared cache): presigned URLs expire, and a run may have waited
+// a long time for another's install.
+func fetchDeps(ctx context.Context, c rpc, onEvent func(protocol.Event), o Options, label string, log *depsLog, req protocol.Deps, resign func(context.Context) (string, string, error), limit time.Duration) (dr protocol.DepsResult, shared shareOutcome, upload *protocol.ShareDone, err error) {
+	signed := time.Now()
+	ask := func(req protocol.Deps) (protocol.DepsResult, error) {
+		if err := c.send(protocol.TypeDeps, req); err != nil {
+			return protocol.DepsResult{}, err
+		}
+		return consumeDeps(ctx, c.next, onEvent, o.Rep, label, log)
+	}
+	if req.CacheGet == "" || req.CachePut == "" {
+		dr, err = ask(req)
+		return dr, shared, nil, err
+	}
+	holder := ""
+	probe := req
+	probe.Probe = true
+	sh := sharer{
+		lock:  shareLockFor("deps", stripQuery(req.CacheGet)),
+		who:   shareWho(o, label),
+		limit: limit,
+		probe: func(context.Context) (bool, error) {
+			r, err := ask(probe)
+			if err != nil || r.Missing {
+				return false, err
+			}
+			dr = r
+			return true, nil
+		},
+		build: func(ctx context.Context) error {
+			if resign != nil && time.Since(signed) > resignAfter {
+				if get, put, err := resign(ctx); err == nil && get != "" {
+					req.CacheGet, req.CachePut = get, put
+				}
+			}
+			dr, err = ask(req)
+			return err
+		},
+		publish: func(ctx context.Context) error {
+			if !dr.Built || !dr.Uploaded {
+				return nil
+			}
+			o.Rep.Status("%s · uploading the dependency cache, for other runs to restore", label)
+			d, err := awaitShared(ctx, c, protocol.ShareDeps, shareTransfer)
+			if err != nil {
+				return err
+			}
+			if !d.OK {
+				o.Rep.Warn("DEPS_CACHE", "uploading the dependency cache failed (%s): runs waiting for it install the dependencies themselves", d.Message)
+			}
+			upload = &d
+			return nil
+		},
+		waiting: func(h string) {
+			holder = h
+			o.Rep.Status("%s · waiting for %s to install the dependencies", label, h)
+			o.Rep.Event("deps_wait", map[string]any{"key": req.CacheKey, "holder": h,
+				"message": "waiting for " + h + " to install the same dependencies, to restore them from the shared cache"})
+		},
+	}
+	shared, err = sh.run(ctx)
+	if shared.timedOut && err == nil {
+		o.Rep.Warn("DEPS_WAIT", "waited %s for %s to install the dependencies; installed them here instead", ui.Dur(shared.waited), holder)
+	}
+	return dr, shared, upload, err
+}
+
+// shareWho names this run to the runs waiting on it: its part of the task
+// (when it has a name) and where it runs.
+func shareWho(o Options, label string) string {
+	if o.Label != "" {
+		return o.Label + " on " + label
+	}
+	return label
 }
 
 // SetupFor is the [setup] command a run starts with ("" when none applies)
@@ -1429,10 +1569,10 @@ func markLost(cfg *config.Config, runner, id string) {
 // checks it before acquiring a runner: a working set over AbortFiles, a
 // container built from a Dockerfile whose build inputs aren't synced (exec,
 // PreferLast, reuses the image this worktree last built instead), and a
-// dependency install whose deps.lockfiles match no synced file or leave the
-// repository (runDeps).
+// dependency install whose deps.lockfiles match no synced file, leave the
+// repository, or name a file the runner can't have (runDeps).
 // m is nil when the run doesn't sync.
-func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Options) error {
+func checkLocal(ctx context.Context, m *manifest.Manifest, p *config.Project, ws *Workspace, o Options) error {
 	if m != nil && len(m.Entries) > AbortFiles && !o.ForceLargeSync {
 		return fmt.Errorf("refusing to sync %d files (limit %d); add excludes to .spotexec.toml or pass --force-large-sync", len(m.Entries), AbortFiles)
 	}
@@ -1442,28 +1582,131 @@ func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Option
 		}
 	}
 	if p.Deps.Install != "" && !o.NoDeps && m != nil {
-		lockfiles, _, err := DepsLockfiles(m, p.Deps.Lockfiles)
+		return checkDeps(ctx, m, p.Deps, ws.Root)
+	}
+	return nil
+}
+
+// CheckDeps checks deps.lockfiles against the working set a synced run from
+// ws would send, as that run does before acquiring a runner (for doctor).
+func CheckDeps(ctx context.Context, p *config.Project, ws *Workspace) error {
+	m, err := manifest.Build(ctx, ManifestOptions(ws.Root, p))
+	if err != nil {
+		return fmt.Errorf("enumerating files: %w", err)
+	}
+	return checkDeps(ctx, m, p.Deps, ws.Root)
+}
+
+// checkDeps refuses deps.lockfiles every install of a run syncing m would
+// fail on: none matching a synced file, an entry leaving the repository, or
+// a literal entry missing here (missingLockfile).
+func checkDeps(ctx context.Context, m *manifest.Manifest, d config.Deps, root string) error {
+	lockfiles, _, err := DepsLockfiles(m, d.Lockfiles)
+	if err != nil {
+		return err
+	}
+	if len(lockfiles) == 0 {
+		return errNoLockfiles
+	}
+	// The runner keys the cache on the files in its workspace
+	// (depskey.Key), so a literal entry that escapes the repository
+	// fails every install.
+	for _, lf := range lockfiles {
+		if _, err := fsid.CleanRel(lf); err != nil {
+			return fmt.Errorf("deps.lockfiles: %w", err)
+		}
+	}
+	return missingLockfile(ctx, m, d, root)
+}
+
+// missingLockfile refuses a literal deps.lockfiles entry that is missing
+// here: the runner gets the local tree, so every install would fail to read
+// it. One the slot may still have is left to the runner: under a symlinked
+// directory (it resolves there), or in a cache_dirs directory or a path this
+// worktree ignores (kept in the slot from earlier runs, never synced).
+func missingLockfile(ctx context.Context, m *manifest.Manifest, d config.Deps, root string) error {
+	var missing []string
+	for _, lf := range d.Lockfiles {
+		if depskey.IsPattern(lf) {
+			continue
+		}
+		rel, err := fsid.CleanRel(lf)
 		if err != nil {
-			return err
+			return fmt.Errorf("deps.lockfiles: %w", err)
 		}
-		if len(lockfiles) == 0 {
-			return errNoLockfiles
+		_, err = os.Lstat(filepath.Join(root, filepath.FromSlash(rel)))
+		if err == nil || !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+			continue // there, or unknown: the runner says
 		}
-		// The runner keys the cache on the files in its workspace
-		// (depskey.Key), so a literal entry that escapes the repository
-		// fails every install. Whether a literal one is there is the
-		// runner's to find: it may be reached through a synced symlinked
-		// directory, or kept in a cache directory, without a manifest entry.
-		for _, lf := range lockfiles {
-			if _, err := fsid.CleanRel(lf); err != nil {
-				return fmt.Errorf("deps.lockfiles: %w", err)
-			}
+		if underSymlink(root, rel) || inCacheDir(rel, d.CacheDirs) {
+			continue
+		}
+		if underSyncedFile(m, rel) {
+			// The next sync clears anything below a synced file.
+			return errMissingLockfile(rel)
+		}
+		missing = append(missing, rel)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	ign, err := m.CheckIgnored(ctx, missing)
+	if err != nil {
+		return nil // unknown: the runner says
+	}
+	for _, rel := range missing {
+		if !ign[rel] {
+			return errMissingLockfile(rel)
 		}
 	}
 	return nil
 }
 
+// underSymlink reports whether a directory on rel's path is a symlink.
+func underSymlink(root, rel string) bool {
+	dir := root
+	segs := strings.Split(rel, "/")
+	for _, s := range segs[:len(segs)-1] {
+		dir = filepath.Join(dir, s)
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			return false
+		}
+		if fi.Mode()&fs.ModeSymlink != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// inCacheDir reports whether rel is inside a directory matching one of the
+// cache_dirs patterns (single-level globs, as the runner expands them).
+func inCacheDir(rel string, patterns []string) bool {
+	segs := strings.Split(rel, "/")
+	for _, p := range patterns {
+		ps := strings.Split(strings.Trim(p, "/"), "/")
+		if len(segs) <= len(ps) {
+			continue
+		}
+		in := true
+		for i, pat := range ps {
+			if ok, _ := path.Match(pat, segs[i]); !ok {
+				in = false
+				break
+			}
+		}
+		if in {
+			return true
+		}
+	}
+	return false
+}
+
 var errNoLockfiles = errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
+
+func errMissingLockfile(rel string) error {
+	return fmt.Errorf("deps.lockfiles: %s doesn't exist, so every dependency install would fail; create it or fix the path", rel)
+}
 
 // Preflight checks, without a runner, what a run from ws with options o
 // (its Sync, PreferLast, NoDeps and ForceLargeSync) would refuse from the
@@ -1479,7 +1722,7 @@ func Preflight(ctx context.Context, p *config.Project, ws *Workspace, o Options)
 			return fmt.Errorf("enumerating files: %w", err)
 		}
 	}
-	return checkLocal(m, p, ws, o)
+	return checkLocal(ctx, m, p, ws, o)
 }
 
 // readFrom loads a file of the working set rooted at root.
@@ -1634,47 +1877,118 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 	}
 	o.Rep.Status("%s · preparing container image", label)
 	t := time.Now()
-	if err := s.Conn.Send(protocol.TypeImage, req); err != nil {
+	errW := &ui.ClearingWriter{W: o.Stderr, R: o.Rep}
+	r, shared, push, err := fetchImage(ctx, sessionRPC{s}, o, label, errW, req, c.Timeout.Duration+shareSlack)
+	if err != nil {
 		return "", "", err
 	}
-	errW := &ui.ClearingWriter{W: o.Stderr, R: o.Rep}
-	for {
-		f, err := s.Next(ctx)
-		if err != nil {
-			return "", "", err
+	ev := map[string]any{"image": r.Image, "image_id": r.ImageID, "pulled": r.Pulled, "built": r.Built, "pushing": r.Pushing, "pushed": r.Pushed,
+		"installed_docker": r.InstalledDocker, "duration_ms": time.Since(t).Milliseconds()}
+	if shared.waited > 0 {
+		ev["waited_ms"] = shared.waited.Milliseconds()
+	}
+	if push != nil {
+		ev["pushed"], ev["push_ms"] = push.OK, push.MS
+	}
+	o.Rep.Event("image", ev)
+	return r.Image, r.ImageID, nil
+}
+
+// fetchImage sends the image request. With a registry, which may lack this
+// image, of the runs on this machine needing it now one builds and pushes
+// it, and the rest wait for it and pull it (#139), as fetchDeps does.
+func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Writer, req protocol.Image, limit time.Duration) (r protocol.ImageResult, shared shareOutcome, push *protocol.ShareDone, err error) {
+	ask := func(req protocol.Image) (protocol.ImageResult, error) {
+		if err := c.send(protocol.TypeImage, req); err != nil {
+			return protocol.ImageResult{}, err
 		}
-		switch f.Kind {
-		case protocol.KindStdout, protocol.KindStderr:
-			errW.Write(f.Data) // pull/build output goes to stderr
-			continue
-		}
-		env, err := protocol.Decode(f)
-		if err != nil {
-			return "", "", err
-		}
-		switch env.Type {
-		case protocol.TypeStarted:
-		case protocol.TypeEvent:
-			var ev protocol.Event
-			_ = env.Unmarshal(&ev)
-			o.Rep.Status("%s · %s %s", label, strings.ReplaceAll(ev.Name, "_", " "), ev.Message)
-			if s.OnEvent != nil {
-				s.OnEvent(ev)
+		for {
+			f, err := c.next(ctx)
+			if err != nil {
+				return protocol.ImageResult{}, err
 			}
-		case protocol.TypeError:
-			var em protocol.ErrorMsg
-			_ = env.Unmarshal(&em)
-			return "", "", fmt.Errorf("container image: %w", &transport.RemoteError{ErrorMsg: em})
-		case protocol.TypeImageResult:
-			var r protocol.ImageResult
-			_ = env.Unmarshal(&r)
-			o.Rep.Event("image", map[string]any{"image": r.Image, "image_id": r.ImageID, "pulled": r.Pulled, "built": r.Built, "pushing": r.Pushing, "pushed": r.Pushed,
-				"installed_docker": r.InstalledDocker, "duration_ms": time.Since(t).Milliseconds()})
-			return r.Image, r.ImageID, nil
-		default:
-			return "", "", fmt.Errorf("protocol: unexpected %q while preparing the image", env.Type)
+			switch f.Kind {
+			case protocol.KindStdout, protocol.KindStderr:
+				errW.Write(f.Data) // pull/build output goes to stderr
+				continue
+			}
+			env, err := protocol.Decode(f)
+			if err != nil {
+				return protocol.ImageResult{}, err
+			}
+			switch env.Type {
+			case protocol.TypeStarted:
+			case protocol.TypeEvent:
+				var ev protocol.Event
+				_ = env.Unmarshal(&ev)
+				o.Rep.Status("%s · %s %s", label, strings.ReplaceAll(ev.Name, "_", " "), ev.Message)
+				c.event(ev)
+			case protocol.TypeError:
+				var em protocol.ErrorMsg
+				_ = env.Unmarshal(&em)
+				return protocol.ImageResult{}, fmt.Errorf("container image: %w", &transport.RemoteError{ErrorMsg: em})
+			case protocol.TypeImageResult:
+				var r protocol.ImageResult
+				_ = env.Unmarshal(&r)
+				return r, nil
+			default:
+				return protocol.ImageResult{}, fmt.Errorf("protocol: unexpected %q while preparing the image", env.Type)
+			}
 		}
 	}
+	if req.Registry == nil || req.Tag == "" {
+		r, err = ask(req)
+		return r, shared, nil, err
+	}
+	holder := ""
+	installed := false // a probe installed Docker
+	probe := req
+	probe.Probe = true
+	sh := sharer{
+		lock:  shareLockFor("image", req.Registry.Repo+":"+req.Tag),
+		who:   shareWho(o, label),
+		limit: limit,
+		probe: func(context.Context) (bool, error) {
+			got, err := ask(probe)
+			installed = got.InstalledDocker
+			if err != nil || got.Missing {
+				return false, err
+			}
+			r = got
+			return true, nil
+		},
+		build: func(context.Context) error {
+			r, err = ask(req)
+			return err
+		},
+		publish: func(ctx context.Context) error {
+			if !r.Built || !r.Pushing {
+				return nil
+			}
+			o.Rep.Status("%s · pushing the image, for other runs to pull", label)
+			d, err := awaitShared(ctx, c, protocol.ShareImage, shareTransfer)
+			if err != nil {
+				return err
+			}
+			if !d.OK {
+				o.Rep.Warn("IMAGE_REGISTRY", "pushing the image failed (%s): runs waiting for it build it themselves", d.Message)
+			}
+			push = &d
+			return nil
+		},
+		waiting: func(h string) {
+			holder = h
+			o.Rep.Status("%s · waiting for %s to build the container image", label, h)
+			o.Rep.Event("image_wait", map[string]any{"tag": req.Tag, "holder": h,
+				"message": "waiting for " + h + " to build the same image, to pull it from the registry"})
+		},
+	}
+	shared, err = sh.run(ctx)
+	r.InstalledDocker = r.InstalledDocker || installed
+	if shared.timedOut && err == nil {
+		o.Rep.Warn("IMAGE_WAIT", "waited %s for %s to build the container image; built it here instead", ui.Dur(shared.waited), holder)
+	}
+	return r, shared, push, err
 }
 
 // toolchainFor fingerprints what the dependency install depends on besides

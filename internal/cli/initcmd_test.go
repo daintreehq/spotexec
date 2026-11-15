@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -198,6 +199,43 @@ func TestDoctorContainer(t *testing.T) {
 	for i, w := range want {
 		if i >= len(got) || !strings.HasPrefix(got[i], w) {
 			t.Fatalf("doctor container checks = %q, want prefixes %q", got, want)
+		}
+	}
+}
+
+// doctor fails a literal lockfile the runner can't have, as supported does.
+func TestDoctorDeps(t *testing.T) {
+	dir := gitRepo(t, map[string]string{"package-lock.json": "{}\n"})
+	p := &config.Project{Deps: config.Deps{Install: "npm ci", CacheDirs: []string{"node_modules"}}}
+	l := &loaded{cfg: &config.Config{Global: &config.Global{}, Project: p}, ws: &client.Workspace{Root: dir}}
+	var got []string
+	check := func(n string, ok bool, m string) { got = append(got, fmt.Sprintf("%v %s", ok, m)) }
+	ctx := context.Background()
+	t.Setenv("SPOTEXEC_SYNC", "")
+
+	p.Sync.Mode = "auto"
+	p.Deps.Lockfiles = []string{"package-lock.json", "node_modules/.package-lock.json"}
+	doctorDeps(ctx, l, check)
+	p.Deps.Lockfiles = []string{"api/package-lock.json"}
+	doctorDeps(ctx, l, check)
+	// Nothing synced: the slot's files are the runner's. SPOTEXEC_SYNC
+	// beats the project's mode, either way.
+	t.Setenv("SPOTEXEC_SYNC", "none")
+	doctorDeps(ctx, l, check)
+	p.Sync.Mode = "none"
+	t.Setenv("SPOTEXEC_SYNC", "")
+	doctorDeps(ctx, l, check)
+	t.Setenv("SPOTEXEC_SYNC", "in")
+	doctorDeps(ctx, l, check)
+
+	const missing = "false deps.lockfiles: api/package-lock.json doesn't exist"
+	want := []string{"true package-lock.json, node_modules/.package-lock.json", missing, missing}
+	if len(got) != len(want) {
+		t.Fatalf("doctor deps checks = %q, want prefixes %q", got, want)
+	}
+	for i, w := range want {
+		if !strings.HasPrefix(got[i], w) {
+			t.Fatalf("doctor deps checks = %q, want prefixes %q", got, want)
 		}
 	}
 }

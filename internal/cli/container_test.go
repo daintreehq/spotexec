@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/daintreehq/spotexec/internal/client"
 )
 
 func TestScaffoldDockerfileStacks(t *testing.T) {
@@ -90,6 +92,27 @@ func TestWireContainer(t *testing.T) {
 	msg, _ = wireContainer(p, ".spotexec/Dockerfile")
 	if b3, _ := os.ReadFile(p); string(b3) != "[container]\nimage = \"node:22\"\n" || !strings.Contains(msg, "remove image") {
 		t.Fatalf("edited an existing table: %s", msg)
+	}
+}
+
+// container init leaves a config in an unsupported format alone, and writes
+// no Dockerfile for it.
+func TestContainerInitUnsupportedVersion(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, ".spotexec.toml")
+	const body = "version = 2\n[tasks.test]\nrun = \"x\"\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := containerInit(&client.Workspace{Root: root}, defaultDockerfile, false)
+	if err == nil || !strings.Contains(err.Error(), "version = 2 isn't supported") {
+		t.Fatalf("want an unsupported-version error, got %v", err)
+	}
+	if b, _ := os.ReadFile(p); string(b) != body {
+		t.Fatalf(".spotexec.toml changed:\n%s", b)
+	}
+	if _, err := os.Lstat(filepath.Join(root, defaultDockerfile)); !os.IsNotExist(err) {
+		t.Fatalf("wrote a Dockerfile: %v", err)
 	}
 }
 

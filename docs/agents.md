@@ -10,8 +10,10 @@ An agent reads everything on stderr, so when stderr isn't a terminal `sx` keeps 
 ```console
 $ sx pnpm prettier --write src 2>&1 | cat
 src/index.ts 41ms
-sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
+sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 file
 ```
+
+`pulled N files` counts the files write-back wrote here, new or changed (`mutated_files` in the `sync_out` event), and `deleted N files` the ones the command deleted that write-back removed here (`deleted_files`); a file renamed counts in both.
 
 Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)). When you edit a file while a run that changes it is still going, write-back keeps your version: the summary line then counts it (`· 1 conflict`), as does `conflict_count` in the `result` event with `--json` or `SPOTEXEC_AGENT=1`, but the exit status stays the command's own, `0` when it succeeded. Set `SPOTEXEC_FAIL_ON_CONFLICT=1` (or pass `--fail-on-conflict`) to have an otherwise successful run exit `122` instead, so a harness that only checks the exit status sees that the command's changes didn't all land.
 
@@ -29,7 +31,7 @@ sx: ci · 2 of 9 parts failed (unit 2/8, unit 6/8) · 11m52s · exit 1
 
 ## Checking for spotexec
 
-`spotexec supported` prints `true` and exits 0 when a run from the current directory would reach a runner: the project has a valid `.spotexec.toml` (here or above, up to the repository root), it isn't in a directory spotexec never syncs (your home directory, `/` or a credential directory), a runner is configured for it, and the working set passes the checks a run makes on the local files (it is within the file-count limit, a `container.dockerfile` and its build inputs are synced, and `deps.lockfiles` name at least one lockfile, none outside the repository). Whether a runner is reachable, the transfer fits, and the image builds and dependencies install, only a run finds out. Otherwise it prints `false` and exits 1, so an agent or script can choose between `sx` and running locally:
+`spotexec supported` prints `true` and exits 0 when a run from the current directory would reach a runner: the project has a valid `.spotexec.toml` (here or above, up to the repository root), it isn't in a directory spotexec never syncs (your home directory, `/` or a credential directory), a runner is configured for it, and the working set passes the checks a run makes on the local files (it is within the file-count limit, a `container.dockerfile` and its build inputs are synced, and `deps.lockfiles` name at least one lockfile, none outside the repository and none missing locally, unless it is under a symlinked directory, in a `cache_dirs` directory or ignored, where the runner may have it). Whether a runner is reachable, the transfer fits, and the image builds and dependencies install, only a run finds out. Otherwise it prints `false` and exits 1, so an agent or script can choose between `sx` and running locally:
 
 ```sh
 if spotexec supported >/dev/null; then sx pnpm test; else pnpm test; fi
@@ -57,16 +59,17 @@ A parallel or sharded task ends with a `result` event for the whole run, which (
 
 Other events include:
 - `queued`, `queue_position`, `placed`;
-- `scale_out`, `provision`, `instance_running`, `instance_ready`;
+- `scale_out` (demand for a new VM, with its `launch_id`, before the provider picks where), `provision`, `instance_launched` (as soon as the launch request succeeds), `instance_running`, `instance_ready`. On an `aws-spot` fleet, `instance_launched` and `instance_running` carry the `launch_id`, where the VM went (`region`, `zone`, `type`) and why, as `placement`: the launch `order`, its `rank` of `of` options, `price`, a `why` line (what was passed over and why, and what the cheapest option would have added) and, with `launch_order = "run_cost"`, the `run_cost` breakdown;
 - `boot_progress` while a new VM runs its first-boot setup: `elapsed_ms` and the latest `line` of its bootstrap log, at most every 5s;
 - `manifest`, `deps`, `image`, `exec`, `pull`, `cancel`;
 - `deps_failed` when the dependency install fails: the error's `code` and `message`, the install's last 40 lines (`output_tail`, `output_truncated` when earlier lines were left out) and the full `log` on this machine. The install's output never reaches the command's stdout or stderr, in any mode; a successful `deps` event also has its `log` when the install ran;
+- `deps_wait` and `image_wait` when a run (a part of a sharded or parallel task, or another `sx` command on this machine) is already installing the same missing dependencies or building the same missing image: this run waits for it and then restores or pulls the result instead of repeating the work. They name the `holder` and say so in a `message`; the run's `deps` or `image` event then has `waited_ms`, and the installing run's `deps` event has `uploaded` and `upload_ms` (`pushed` and `push_ms` for an image), from waiting for its upload so others could fetch it. A slot waiting for another slot on the same VM to install the same dependencies gets a `deps_wait` with only a `message`. See [the dependency cache](environments.md#dependency-cache);
 - `spot_interruption`, `spot_rebalance`, `retry`;
 - `large_writeback` before a write-back over its limit transfers anything (`files`, `bytes`, `new_files`, `changed_files`, and the `largest` paths, each with its `files` and `bytes`), and `writeback_held` when the new files stay in the slot instead (`files`, `bytes`, `largest`, `run_id`); `sync_out` and the result's `held_files` and `held_bytes` count them. Set `SPOTEXEC_WRITEBACK_OVER=hold` to never have a run flood the worktree; see [write-back limits](running.md#write-back-limits);
 - `conflict`, one per write-back conflict: your kept file (`local`), the stashed remote version (`remote`, a marker when `deleted` is true), and a `diff` command to see the remote changes;
-- `outside_symlink`, one per symlink write-back created or retargeted to point outside the worktree: the link's `path` and its `target`, with a `WRITEBACK_SYMLINK` warning naming them;
+- `outside_symlink`, one per symlink write-back (or a `--pull`, or `spotexec pull --json`) created or retargeted to point outside the worktree: the link's `path` and its `target`, with a `WRITEBACK_SYMLINK` warning naming them;
 - `warning` events with stable codes (`SYNC_CONFLICT`, `SYNC_COLLISION`, `LARGE_WRITEBACK`, `WRITEBACK_HELD`, `RUNNER_LOST`, `SPOT_INTERRUPTION`, `TIMEOUT`, `LOCAL_FALLBACK`, `RTK_FILTER`, `STDIN_IGNORED`, …). `UNKNOWN_TASK` follows an exit 127 of `sx <word>` (no `--`) when the word is a plain name, no task has it, and the shell found no command by that name: its message names the closest task when exactly one is near, and `spotexec tasks` lists them all;
-- `error` with code `SPOTEXEC_ERROR` when spotexec itself fails (exit `125`). For example, a `BOOTSTRAP_FAILED` message.
+- `error` when spotexec itself fails (exit `125`), with its `message` and a `code` to branch on: the specific reason when there is one, `SPOTEXEC_ERROR` otherwise (an SSH failure, an unknown runner, a config error). The reasons are `QUEUE_TIMEOUT` (no free slot within `--queue-timeout`), `BOOTSTRAP_FAILED` (the VM's `bootstrap_script` failed), `DEPS_FAILED` (the dependency install failed; see `deps_failed`), `SYNC_FAILED`, `IMAGE_FAILED` (the project container couldn't be built, pulled or managed), `RUNNER_BOOTING`, `RUNNER_DRAINING`, `RUNNER_SHUTTING_DOWN`, `BAD_REQUEST` (the runner refused the request, such as a slot that no longer exists or an invalid image reference) and `INTERNAL` (the runner couldn't do its own part, such as clearing a slot of an earlier run's processes or containers). A single run ends with it, with no `result` event; in a parallel or sharded task each part that failed this way has its own, with its `task`, before the task's `result`.
 
 ## Claude Code hook
 

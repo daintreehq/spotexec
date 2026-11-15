@@ -304,7 +304,7 @@ func TestRunChecksDockerfileBeforeAcquiring(t *testing.T) {
 		}
 	}
 	// exec reuses the image this worktree last built: no Dockerfile needed.
-	if err := checkLocal(nil, p, ws, Options{Sync: "none", PreferLast: true}); err != nil {
+	if err := checkLocal(context.Background(), nil, p, ws, Options{Sync: "none", PreferLast: true}); err != nil {
 		t.Fatalf("checkLocal(exec): %v", err)
 	}
 	// An image needs no local files.
@@ -333,7 +333,7 @@ func TestRunChecksDockerfileBeforeAcquiring(t *testing.T) {
 	if err := os.WriteFile(ignore, []byte("b\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkLocal(m, p, ws, Options{Sync: "auto"}); err != nil {
+	if err := checkLocal(context.Background(), m, p, ws, Options{Sync: "auto"}); err != nil {
 		t.Fatalf("checkLocal refused a .dockerignore edited since the scan: %v", err)
 	}
 	if _, err := imageTag(m, ".spotexec/Missing", "", "linux/amd64", readFrom(root)); err == nil || !strings.Contains(err.Error(), "changed after it was synced") {

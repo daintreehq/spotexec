@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -429,6 +430,100 @@ func TestGlobalAllRegionsSkipsNotOptedIn(t *testing.T) {
 	}
 }
 
+// exclude_regions leaves enabled regions out of regions = ["all"]: they are
+// never priced or launched in, and show as not used with the reason.
+func TestGlobalAllRegionsExcluded(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.07"}},
+		"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.01"}},
+		"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.06"}},
+	}}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	g.r.ExcludeRegions = []string{"r-two-1"}
+	placed, err := g.PlacementRegions(context.Background())
+	if err != nil || strings.Join(placed, ",") != "r-one-1,r-three-1" {
+		t.Fatalf("placement regions %v, %v", placed, err)
+	}
+	if w := g.Where(); !strings.Contains(w, "except r-two-1") {
+		t.Fatalf("where %q", w)
+	}
+	for i, refresh := range []bool{false, false, true} { // fresh, cached, refreshed
+		tbl, err := g.Prices(context.Background(), refresh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tbl.Cached != (i == 1) {
+			t.Fatalf("call %d: cached = %v", i, tbl.Cached)
+		}
+		if got := strings.Join(tbl.Regions, ","); got != "r-one-1,r-three-1,r-two-1" {
+			t.Fatalf("regions %s", got)
+		}
+		if why := tbl.Unpriced["r-two-1"]; !strings.Contains(why, "exclude_regions") || !lastingUnpriced(why) {
+			t.Fatalf("unpriced %v", tbl.Unpriced)
+		}
+		if len(tbl.Prices) != 2 || tbl.Prices[0].Region != "r-three-1" {
+			t.Fatalf("prices %+v", tbl.Prices)
+		}
+	}
+	for _, c := range f.callsOf("DescribeSpotPriceHistory") {
+		if strings.HasPrefix(c, "r-two-1") {
+			t.Fatal("priced an excluded region")
+		}
+	}
+	// Excluding a region that isn't enabled leaves placement as it was, but
+	// the cached table must not hide the new exclusion.
+	g.r.ExcludeRegions = []string{"r-off-1", "r-two-1"}
+	tbl, err := g.Prices(context.Background(), false)
+	if err != nil || tbl.Cached || tbl.Unpriced["r-off-1"] != excludedWhy {
+		t.Fatalf("after excluding r-off-1: cached %v, unpriced %v, %v", tbl.Cached, tbl.Unpriced, err)
+	}
+	in, err := g.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Region != "r-three-1" {
+		t.Fatalf("launched in %s", in.Region)
+	}
+}
+
+// A VM launched in a region before it was excluded is still listed (and so
+// counted and torn down), even with no local record of it.
+func TestGlobalExcludedRegionStillListed(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices:    map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.07"}}},
+		instances: map[string]map[string]string{"r-two-1": {"i-old": "c7a.2xlarge"}},
+	}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	g.r.ExcludeRegions = []string{"r-two-1"}
+	ins, err := g.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ins) != 1 || ins[0].ID != "i-old" || ins[0].Region != "r-two-1" {
+		t.Fatalf("listed %+v", ins)
+	}
+}
+
+// Quota refusals in every region left after the exclusions are still a
+// quota verdict: an excluded region isn't an option that might have worked.
+func TestGlobalExcludedRegionKeepsQuotaVerdict(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{
+			"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.04"}},
+			"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.01"}},
+			"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.05"}},
+		},
+		runErr: map[string]string{"r-one-1/c7a.2xlarge": "VcpuLimitExceeded", "r-three-1/c7a.2xlarge": "VcpuLimitExceeded"},
+	}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	g.r.ExcludeRegions = []string{"r-two-1"}
+	_, err := g.Launch(context.Background(), t.Logf)
+	var qe *QuotaError
+	if !errors.As(err, &qe) {
+		t.Fatalf("want a QuotaError, got %v", err)
+	}
+}
+
 func TestGlobalUnofferedRegionUnpriced(t *testing.T) {
 	f := &fakeRegionsEC2{prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.07"}}}}
 	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
@@ -766,11 +861,37 @@ func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
 	}}
 	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
 	g.r.MaxPrice = "0.04"
-	if _, err := g.Launch(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "above max_price") {
+	_, err := g.Launch(context.Background(), t.Logf)
+	// Typed, so a run with no VM to wait for fails at once naming it.
+	var pe *PriceCapError
+	if !errors.As(err, &pe) || pe.Cheapest.Zone != "r-one-1a" || !strings.Contains(err.Error(), "above max_price 0.04 (cheapest: $0.05/h") {
 		t.Fatalf("err = %v", err)
 	}
 	if runs := f.callsOf("RunInstances"); len(runs) != 0 {
 		t.Fatalf("launched above max_price: %v", runs)
+	}
+	// A region that couldn't be priced just now may be under the cap:
+	// not a lasting verdict.
+	f.mu.Lock()
+	f.priceErr = map[string]string{"r-three-1": "RequestLimitExceeded"}
+	f.mu.Unlock()
+	gu := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
+	gu.r.MaxPrice = "0.04"
+	if _, err := gu.Launch(context.Background(), t.Logf); err == nil || errors.As(err, &pe) {
+		t.Fatalf("with a region unpriced: %v", err)
+	}
+	f.mu.Lock()
+	f.priceErr = nil
+	f.mu.Unlock()
+	// With launch_order = "listed", the first option isn't the cheapest:
+	// the error still names the cheapest.
+	fl := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.10"}, {"r-one-1b", "c6a.2xlarge", "0.02"}},
+	}}
+	gl := newGlobalEnv(t, fl, "r-one-1", "r-two-1")
+	gl.r.MaxPrice, gl.r.LaunchOrder = "0.01", config.LaunchListed
+	if _, err := gl.Launch(context.Background(), t.Logf); !errors.As(err, &pe) || pe.Cheapest.Type != "c6a.2xlarge" {
+		t.Fatalf("listed order: %v", err)
 	}
 	// At the cap is fine.
 	g2 := newGlobalEnv(t, f, "r-one-1", "r-two-1")
@@ -784,8 +905,8 @@ func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
 	f.mu.Unlock()
 	g3 := newGlobalEnv(t, f, "r-one-1", "r-two-1")
 	g3.r.MaxPrice = "0.05"
-	if _, err := g3.Launch(context.Background(), t.Logf); err == nil {
-		t.Fatal("fell back above max_price")
+	if _, err := g3.Launch(context.Background(), t.Logf); err == nil || errors.As(err, &pe) {
+		t.Fatalf("fell back above max_price, or blamed the cap for a capacity refusal: %v", err)
 	}
 	if runs := f.callsOf("RunInstances"); len(runs) != 1 || !strings.HasPrefix(runs[0], "r-one-1 ") {
 		t.Fatalf("runs %v", runs)
@@ -900,6 +1021,47 @@ func TestGlobalExpiredRegionKeptForStoppedAndBuilders(t *testing.T) {
 	}
 	if got := active(t, g); got != "r-three-1,r-two-1" {
 		t.Fatalf("regions with billable leftovers were forgotten: %q", got)
+	}
+}
+
+// Bakes of one runner in different regions run side by side; a second
+// bake in the same region is refused, and a sweep skips only the regions
+// with a bake in progress.
+func TestBakeLockPerRegion(t *testing.T) {
+	f := &fakeRegionsEC2{builders: map[string]bool{"r-one-1": true, "r-two-1": true}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	unlockOne, err := g.Regional("r-one-1").LockBake()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlockTwo, err := g.Regional("r-two-1").LockBake()
+	if err != nil {
+		t.Fatalf("a bake in another region was refused: %v", err)
+	}
+	if _, err := g.Regional("r-one-1").LockBake(); err == nil || !strings.Contains(err.Error(), "r-one-1") {
+		t.Fatalf("a second bake in the same region: %v", err)
+	}
+	// An older spotexec (one lock per runner) still running, e.g. its pool
+	// manager, can't sweep while a bake runs, nor bake alongside.
+	legacy := filepath.Join(os.Getenv("SPOTEXEC_STATE_DIR"), "bake", "g.lock")
+	if unlock, err := flockFile(legacy, syscall.LOCK_EX); err == nil {
+		unlock()
+		t.Fatal("an older version's runner-wide lock was free during a bake")
+	}
+	unlockTwo()
+
+	g.sweepBuilders(context.Background(), []string{"r-one-1", "r-two-1"}, t.Logf)
+	if got := f.callsOf("TerminateInstances"); len(got) != 1 || got[0] != "r-two-1 TerminateInstances i-builder" {
+		t.Fatalf("sweep terminated %v; want only r-two-1's builder", got)
+	}
+	unlockOne()
+	unlockOld, err := flockFile(legacy, syscall.LOCK_EX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlockOld()
+	if _, err := g.Regional("r-two-1").LockBake(); err == nil {
+		t.Fatal("bake started while an older version's bake holds the runner-wide lock")
 	}
 }
 

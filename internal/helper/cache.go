@@ -154,10 +154,10 @@ func bodyHas(r io.Reader, s string) bool {
 // startCacheUpload archives src and uploads it in a detached helper process,
 // so the job doesn't wait and the upload outlives this session. The URL is
 // passed on stdin, never in argv (visible to every process on the VM).
-func startCacheUpload(root, src, lockPath, url string) error {
+func startCacheUpload(root, src, lockPath, url string) (*transfer, error) {
 	self, err := os.Executable()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	logf, _ := os.OpenFile(filepath.Join(root, "cache-upload.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	cmd := exec.Command(self, "cache-put", "--work-root", root, "--src", src, "--lock", lockPath)
@@ -165,17 +165,17 @@ func startCacheUpload(root, src, lockPath, url string) error {
 	cmd.Stdout, cmd.Stderr = logf, logf
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return err
+		return nil, err
 	}
 	_, _ = io.WriteString(stdin, url+"\n")
 	stdin.Close()
 	if logf != nil {
 		logf.Close()
 	}
-	return cmd.Process.Release()
+	return watch(cmd), nil
 }
 
 // CachePut is the detached upload (spotexec-helper cache-put; URL on
@@ -209,7 +209,15 @@ func CachePut(root, src, lockPath string) error {
 	if lockPath != "" {
 		if f, err := openLockFile(lockPath); err == nil {
 			defer f.Close()
-			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_SH)
+			// Not a blocking flock: the transfer budget (and a drain)
+			// bound the wait too, and a run may be waiting for this upload.
+			for syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB) != nil {
+				select {
+				case <-ctx.Done():
+					return fmt.Errorf("waiting for %s: %w", lockPath, ctx.Err())
+				case <-time.After(200 * time.Millisecond):
+				}
+			}
 		}
 	}
 	tmpDir := filepath.Join(root, "tmp")

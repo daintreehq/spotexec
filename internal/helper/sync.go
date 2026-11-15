@@ -165,6 +165,14 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		}
 		fi, err := os.Lstat(full)
 		switch {
+		case err == nil && fi.IsDir() && nestedGitDir(p):
+			// A repository a run made below the root goes whole.
+			if err := os.RemoveAll(full); err != nil {
+				keep = append(keep, p)
+				continue
+			}
+			deleted++
+			dirs = append(dirs, path.Dir(p))
 		case err == nil && fi.IsDir():
 		case err == nil:
 			if err := os.Remove(full); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -412,7 +420,7 @@ func (s *Session) pendingAfter(created []protocol.Entry, unverified, more []stri
 			}
 			continue
 		}
-		if fi, err := os.Lstat(full); err == nil && fi.IsDir() || err != nil && gonePath(err) {
+		if fi, err := os.Lstat(full); err == nil && fi.IsDir() && !nestedGitDir(p) || err != nil && gonePath(err) {
 			continue // removed (or replaced by a directory) by the run itself
 		}
 		set[p] = true
@@ -460,6 +468,9 @@ func (s *Session) sweepPending() {
 		if _, ok := s.stored[rel]; !ok {
 			more = append(more, rel)
 		}
+	}
+	for rel := range snap.gitDirs {
+		more = append(more, rel)
 	}
 	s.state.Pending = s.pendingAfter(nil, nil, more)
 	s.state.Sweep, s.state.SweepSkip = false, nil

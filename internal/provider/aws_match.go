@@ -4,13 +4,37 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/daintreehq/spotexec/internal/config"
 )
 
 // MatchKey identifies the requirements Mismatches judges instances
-// against: when it changes, earlier judgements no longer hold.
-func MatchKey(r *config.Runner) string { return typesKey(r) }
+// against (instance types and regions): when it changes, earlier
+// judgements no longer hold.
+func MatchKey(r *config.Runner) string {
+	// The set of regions, not their order (nor the home region of
+	// several): a change that leaves it alone keeps earlier verdicts.
+	regions := r.Region
+	if len(r.Regions) > 0 {
+		rs := slices.Clone(r.Regions)
+		slices.Sort(rs)
+		regions = strings.Join(rs, ",")
+	}
+	if r.AnyRegion() && len(r.ExcludeRegions) > 0 {
+		ex := slices.Clone(r.ExcludeRegions)
+		slices.Sort(ex)
+		regions += "-" + strings.Join(ex, ",")
+	}
+	return typesKey(r) + "|" + regions
+}
+
+// droppedRegion is the mismatch of a VM in a region the runner no longer
+// uses (where names the ones it does).
+func droppedRegion(region, where string) string {
+	return fmt.Sprintf("%s is no longer one of the runner's regions: %s", region, where)
+}
 
 // Mismatches implements Matcher for one region's instances.
 func (a *AWSSpot) Mismatches(ctx context.Context, insts []Instance) map[string]string {
@@ -18,6 +42,11 @@ func (a *AWSSpot) Mismatches(ctx context.Context, insts []Instance) map[string]s
 	var eligible map[string]bool
 	loaded := false
 	for _, in := range insts {
+		if in.Region != "" && in.Region != a.r.Region {
+			// Listed before the runner moved to this region.
+			out[in.ID] = droppedRegion(in.Region, a.r.Region)
+			continue
+		}
 		if in.Type == "" {
 			continue
 		}
@@ -68,6 +97,8 @@ func (a *AWSSpot) typeMismatch(ctx context.Context, t string, eligible *map[stri
 }
 
 // Mismatches implements Matcher, judging each instance in its own region.
+// An instance in a region the runner no longer uses mismatches whatever its
+// type (it is still listed until it ends: see newLegacyAWSGlobal).
 func (g *AWSGlobal) Mismatches(ctx context.Context, insts []Instance) map[string]string {
 	byRegion := map[string][]Instance{}
 	for _, in := range insts {
@@ -79,9 +110,27 @@ func (g *AWSGlobal) Mismatches(ctx context.Context, insts []Instance) map[string
 	}
 	out := map[string]string{}
 	for region, ins := range byRegion {
+		if !g.usesRegion(region) {
+			for _, in := range ins {
+				out[in.ID] = droppedRegion(region, g.Where())
+			}
+			continue
+		}
 		for id, why := range g.Regional(region).Mismatches(ctx, ins) {
 			out[id] = why
 		}
 	}
 	return out
+}
+
+// usesRegion reports whether the runner's config still lists region (with
+// regions = ["all"], every region exclude_regions doesn't leave out).
+func (g *AWSGlobal) usesRegion(region string) bool {
+	if g.oneRegion() {
+		return region == g.r.Region
+	}
+	if g.r.AnyRegion() {
+		return !contains(g.excluded(), region)
+	}
+	return contains(g.r.Regions, region)
 }

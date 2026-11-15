@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,9 @@ type fakeFleet struct {
 	slowRunning bool
 	// goneOnWait: WaitRunning reports the instance gone (reclaimed).
 	goneOnWait bool
+	// placement: what Launch says about where it launched (WaitRunning,
+	// like a cloud listing, doesn't know).
+	placement *provider.Placement
 }
 
 func (f *fakeFleet) Runner() *config.Runner                        { return f.r }
@@ -50,6 +54,11 @@ func (f *fakeFleet) Launch(context.Context, provider.Logger) (provider.Instance,
 	f.n++
 	in := provider.Instance{ID: "i-" + string(rune('a'+f.n)), State: provider.StateRunning, LaunchedAt: time.Now(), Target: provider.Target{Host: "192.0.2.1"}}
 	f.insts = append(f.insts, in)
+	if f.placement != nil {
+		// As a cloud answers a launch: pending, no address yet, but where
+		// and why.
+		in.Placement, in.Zone, in.State, in.Target = f.placement, "zone-a", provider.StatePending, provider.Target{}
+	}
 	return in, nil
 }
 
@@ -234,10 +243,12 @@ func TestNearLifetimeInstancesDrain(t *testing.T) {
 }
 
 // matchFleet is a fakeFleet that judges instances by type: a type in bad
-// no longer matches; a type in unknown can't be judged.
+// no longer matches; a type in unknown can't be judged. With regions set,
+// an instance in another region doesn't match either.
 type matchFleet struct {
 	*fakeFleet
 	bad, unknown map[string]bool
+	regions      []string
 	calls        int
 }
 
@@ -246,6 +257,8 @@ func (m *matchFleet) Mismatches(_ context.Context, insts []provider.Instance) ma
 	out := map[string]string{}
 	for _, in := range insts {
 		switch {
+		case m.regions != nil && !slices.Contains(m.regions, in.Region):
+			out[in.ID] = in.Region + " is no longer one of the runner's regions"
 		case m.unknown[in.Type]:
 		case m.bad[in.Type]:
 			out[in.ID] = in.Type + " doesn't have 8 vCPUs, at least 32 GiB"
@@ -321,6 +334,61 @@ func TestMismatchedInstancesTakeNoNewRuns(t *testing.T) {
 	if cands, _, _ = p.Candidates(ctx, nil); len(cands) != 2 {
 		t.Fatalf("an unjudged VM retired under new requirements: %v", cands)
 	}
+}
+
+// Issue #127: after regions were narrowed, a VM in the dropped region kept
+// taking runs. Changing the set of regions judges the VMs again at once
+// (within the listing's TTL); only reordering it doesn't.
+func TestNarrowedRegionsJudgedAgain(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 4)
+	p.R.Region, p.R.Regions = "r-one-1", []string{"r-one-1", "r-two-1"}
+	m := &matchFleet{fakeFleet: f, unknown: map[string]bool{}, regions: p.R.Regions}
+	p.Fleet = m
+	host := provider.Target{Host: "127.0.0.1", Port: 1}
+	f.insts = []provider.Instance{
+		{ID: "i-two", Region: "r-two-1", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-2 * time.Hour)},
+		{ID: "i-one", Region: "r-one-1", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Hour)},
+	}
+	if cands, usable, _ := p.Candidates(ctx, nil); len(cands) != 2 || usable != 2 {
+		t.Fatalf("both regions configured: %v usable %d", cands, usable)
+	}
+	calls := m.calls
+	p.R.Regions = []string{"r-two-1", "r-one-1"}
+	if _, _, _ = p.Candidates(ctx, nil); m.calls != calls {
+		t.Fatal("reordering regions judged the VMs again")
+	}
+	p.R.Regions = nil // regions = ["r-one-1"]
+	m.regions = []string{"r-one-1"}
+	cands, usable, _ := p.Candidates(ctx, nil)
+	if len(cands) != 1 || cands[0].ID != "i-one" || usable != 1 {
+		t.Fatalf("after narrowing: candidates %v usable %d", cands, usable)
+	}
+}
+
+// Issue #129: launches held by the cap on live VMs (twice max_instances)
+// were blamed on draining VMs when the VMs still alive were outdated ones.
+// The reason counts what holds them, by the state spotexec status shows.
+func TestLiveCapReasonNamesWhatHolds(t *testing.T) {
+	p, f := testPool(t, 1)
+	p.Fleet = &matchFleet{fakeFleet: f, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{}}
+	host := provider.Target{Host: "127.0.0.1"}
+	for _, id := range []string{"i-a", "i-b", "i-c"} {
+		f.insts = append(f.insts, provider.Instance{ID: id, Type: "c6a.2xlarge", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Hour)})
+	}
+	want := func(reason string) {
+		t.Helper()
+		if d := planOnce(t, p); d.Launch || d.Reason != reason {
+			t.Fatalf("reason %q, want %q", d.Reason, reason)
+		}
+	}
+	want("waiting for 3 outdated VMs to end: launches pause at 2 live VMs (twice max_instances)")
+	// A VM both outdated and draining counts once, as draining.
+	p.Observe("i-a", OutDraining, time.Now().Add(-time.Hour))
+	want("waiting for 2 outdated VMs and 1 draining VM to end: launches pause at 2 live VMs (twice max_instances)")
+	p.Observe("i-b", OutDraining, time.Now().Add(-time.Hour))
+	p.Observe("i-c", OutDraining, time.Now().Add(-time.Hour))
+	want("waiting for 3 draining VMs to end: launches pause at 2 live VMs (twice max_instances)")
 }
 
 // Clearing a mismatch never clears draining: a VM marked draining stays
@@ -403,5 +471,89 @@ func TestMismatchedInstancesAreReplacedForDemand(t *testing.T) {
 	}
 	if d := planOnce(t, p2); d.Launch || d.Pending != 2 {
 		t.Fatalf("after the config matches again: %+v", d)
+	}
+}
+
+// Why a VM launched where it did survives the wait for it to run, so the
+// instance_running event can say so.
+func TestProvisionKeepsPlacement(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 2)
+	f.placement = &provider.Placement{Order: "run_cost", Rank: 1, Of: 3, Why: "lowest expected run cost"}
+	ids, _ := p.EnsureMin(ctx, 1)
+	in, err := p.Provision(ctx, ids[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Placement != f.placement || in.Zone != "zone-a" || in.Target.Host == "" || in.State != provider.StateRunning {
+		t.Fatalf("provisioned %+v", in)
+	}
+}
+
+type namedEvents struct {
+	nopRep
+	mu     sync.Mutex
+	fields map[string]map[string]any
+}
+
+func (e *namedEvents) Event(name string, f map[string]any) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.fields == nil {
+		e.fields = map[string]map[string]any{}
+	}
+	e.fields[name] = f
+}
+
+// A launch says where it went and why as soon as it's made, and again when
+// the VM runs, under the launch_id of its scale_out.
+func TestProvisionEventsSayWhereAndWhy(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 2)
+	f.placement = &provider.Placement{Order: "run_cost", Rank: 2, Of: 3, Why: "#2 by run cost; passed over: 1 above max_price"}
+	ids, _ := p.EnsureMin(ctx, 1)
+	m := &member{r: p.R, pool: p}
+	rep := &namedEvents{}
+	HoldLaunch()
+	m.provision(ctx, ids[0], rep)
+	for _, name := range []string{"instance_launched", "instance_running"} {
+		ev := rep.fields[name]
+		if ev == nil || ev["launch_id"] != ids[0] || ev["zone"] != "zone-a" || ev["placement"] != f.placement || ev["runner"] != "fake" {
+			t.Fatalf("%s: %v", name, ev)
+		}
+		if _, ok := ev["region"]; ok {
+			t.Fatalf("%s: empty region reported: %v", name, ev)
+		}
+	}
+	if rep.fields["instance_running"]["host"] != "192.0.2.1" {
+		t.Fatalf("instance_running: %v", rep.fields["instance_running"])
+	}
+}
+
+// A process exiting right after a launch (WaitLaunches) still reports it.
+func TestWaitLaunchesCoversLaunchedEvent(t *testing.T) {
+	ctx := context.Background()
+	p, _ := testPool(t, 2)
+	ids, _ := p.EnsureMin(ctx, 1)
+	release := make(chan struct{})
+	inCallback := make(chan struct{})
+	HoldLaunch()
+	go p.ProvisionHeldThen(ctx, ids[0], nil, func(provider.Instance) {
+		close(inCallback)
+		<-release
+	})
+	<-inCallback
+	waited := make(chan struct{})
+	go func() { WaitLaunches(time.Minute); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("WaitLaunches returned before the launch was reported")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("WaitLaunches never returned")
 	}
 }

@@ -89,6 +89,8 @@ type Instance struct {
 	Spot       bool      `json:"spot,omitempty"`
 	Region     string    `json:"region,omitempty"` // cloud region (aws-spot)
 	Zone       string    `json:"zone,omitempty"`   // availability zone, when known
+	// Placement says why a launch went where it did (set by Launch only).
+	Placement *Placement `json:"placement,omitempty"`
 }
 
 // Fleet is implemented by ephemeral, autoscaled runner types: a pool of 0 to
