@@ -49,6 +49,7 @@ func TestIncludeSyncsContainerInputsWithoutGit(t *testing.T) {
 		"src/a.txt", ".spotexec/Dockerfile", ".spotexec/Dockerfile.dockerignore", ".spotexec/entry.sh",
 		".spotexec/node_modules/x.js", ".spotexec/conflicts/run1/src/a.txt", ".spotexec/writeback.lock",
 		".spotexec/Conflicts/run2/b.txt", ".spotexec/WriteBack.lock",
+		".spotexec/backup/run1/src/a.txt", ".spotexec/Backup/run2/b.txt",
 		"node_modules/y.js",
 	}
 	want := ".spotexec/Dockerfile .spotexec/Dockerfile.dockerignore .spotexec/entry.sh src/a.txt"

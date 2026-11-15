@@ -34,6 +34,14 @@ type WritebackResult struct {
 	Ignored     int
 	Refused     []string // paths the runner reported that may not be written
 	ConflictDir string
+	// BackedUp: local files the write-back deleted or replaced that had no
+	// committed copy, saved under BackupDir first.
+	BackedUp  []string
+	BackupDir string
+	// Held: deletions kept back because the run would have deleted the
+	// project's own config or most of its files (HeldWhy says which).
+	Held    []string
+	HeldWhy string
 }
 
 // Conflict is a path where your local edit was kept and the remote version
@@ -235,6 +243,23 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 	}
 	defer unlock()
 	wb.ConflictDir = filepath.Join(lockDir, "conflicts", runID)
+	synced := len(m.ByPath)
+
+	// save backs up the local version of p, about to be deleted or replaced,
+	// unless git has it committed.
+	committed := &committedFiles{ctx: ctx, m: m}
+	save := func(p string, local version) error {
+		if !local.exists || committed.has(p, local) {
+			return nil
+		}
+		dir := filepath.Join(lockDir, "backup", runID)
+		if _, err := backupLocal(ws.Root, dir, p, local); err != nil {
+			return err
+		}
+		wb.BackupDir = dir
+		wb.BackedUp = append(wb.BackedUp, p)
+		return nil
+	}
 
 	paths := make([]string, 0, len(remote))
 	for p := range remote {
@@ -285,6 +310,18 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				}
 				break
 			}
+			if !local.eq(want) {
+				err := save(del, local)
+				if errors.Is(err, errChangedUnderUs) {
+					if err := wb.conflict(ws.Root, q, want, rf); err != nil {
+						return err
+					}
+					break
+				}
+				if err != nil {
+					return fmt.Errorf("backing up %s: %w", del, err)
+				}
+			}
 			if err := os.Rename(fd, fq); err != nil {
 				return fmt.Errorf("renaming %s to %s: %w", del, q, err)
 			}
@@ -334,6 +371,12 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		case local.eq(want):
 			return nil
 		case local.eq(base):
+			// Whatever is lost here and isn't committed is saved first.
+			if err := save(p, local); errors.Is(err, errChangedUnderUs) {
+				return wb.conflict(ws.Root, p, want, rf)
+			} else if err != nil {
+				return fmt.Errorf("backing up %s: %w", p, err)
+			}
 			if want.exists {
 				err := writeLocal(ws.Root, p, rf, &local)
 				// Changed under us, or the way is blocked (a file where a
@@ -354,6 +397,9 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				full, err := fsid.SafeJoin(ws.Root, p)
 				if err != nil {
 					return err
+				}
+				if now, err := localVersion(ws.Root, p); err != nil || !now.eq(local) {
+					return wb.conflict(ws.Root, p, want, rf)
 				}
 				if err := os.Remove(full); err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return err
@@ -380,6 +426,9 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		}
 	}
 	sort.SliceStable(dels, func(i, j int) bool { return strings.Count(dels[i], "/") > strings.Count(dels[j], "/") })
+	if dels, err = holdDeletions(ws.Root, m, dels, synced, wb); err != nil {
+		return err
+	}
 	for _, p := range dels {
 		if err := apply(p); err != nil {
 			return err
@@ -394,6 +443,55 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 	}
 	pruneEmptyDirs(ws.Root, removedDirs)
 	return nil
+}
+
+// holdDeletions keeps back the deletions a run should not make on its own:
+// the project's own root .spotexec.toml or .gitignore, or, when the run
+// deleted most of the synced files, all of them. Only deletions that would
+// apply count (the local file still matches what was uploaded). It returns
+// the deletions to go ahead with.
+func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int, wb *WritebackResult) ([]string, error) {
+	var live, protected []string
+	for _, p := range dels {
+		e, ok := m.ByPath[p]
+		if !ok {
+			continue
+		}
+		local, err := localVersion(root, p)
+		if err != nil {
+			return nil, err
+		}
+		if !local.exists || !local.eq(version{true, e.ID, e.Mode}) {
+			continue
+		}
+		live = append(live, p)
+		if protectedPath(p) {
+			protected = append(protected, p)
+		}
+	}
+	hold := protected
+	switch {
+	case massDeletion(len(live), synced):
+		hold = live
+		wb.HeldWhy = fmt.Sprintf("the run deleted %d of the %d synced files", len(live), synced)
+	case len(protected) > 0:
+		wb.HeldWhy = "the run deleted the project's own " + strings.Join(protected, " and ")
+	default:
+		return dels, nil
+	}
+	held := map[string]bool{}
+	for _, p := range hold {
+		held[p] = true
+	}
+	wb.Held = append(wb.Held, hold...)
+	sort.Strings(wb.Held)
+	var keep []string
+	for _, p := range dels {
+		if !held[p] {
+			keep = append(keep, p)
+		}
+	}
+	return keep, nil
 }
 
 func conflictBase(ws *Workspace) string {
