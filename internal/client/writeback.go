@@ -45,7 +45,8 @@ type WritebackResult struct {
 }
 
 // Conflict is a path where your local edit was kept and the remote version
-// was stashed instead.
+// was stashed instead, or, when With is set, a remote path whose name is
+// another remote path's file on this filesystem.
 type Conflict struct {
 	Path    string `json:"path"`    // worktree-relative
 	Local   string `json:"local"`   // your file (absolute)
@@ -55,19 +56,28 @@ type Conflict struct {
 	// ReasonSymlinkParent: a local parent directory is a symlink, so the
 	// path can't be written here without leaving the worktree.
 	Reason string `json:"reason,omitempty"`
+	// With is the path whose file Path opens here, because the filesystem
+	// ignores case or Unicode normalisation (src/Dup.txt is src/DUP.txt):
+	// a name collision, not a local edit. Local is With's file, kept.
+	With string `json:"with,omitempty"`
 }
 
 // ReasonSymlinkParent marks a conflict caused by a symlinked local parent.
 const ReasonSymlinkParent = "symlink_parent"
 
-// conflict stashes the remote version of p and records the conflict.
-func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile) error {
+// conflict stashes the remote version of p and records the conflict; with
+// names the path p collides with, if that is why ("" for a local edit).
+func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile, with string) error {
 	stashed, err := stashConflict(wb.ConflictDir, p, want, rf)
 	if err != nil {
 		return err
 	}
+	local := p
+	if with != "" {
+		local = with
+	}
 	wb.Conflicts = append(wb.Conflicts, p)
-	c := Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(p)), Remote: stashed, Deleted: !want.exists}
+	c := Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(local)), Remote: stashed, Deleted: !want.exists, With: with}
 	if _, err := fsid.SafeJoin(root, p); errors.Is(err, fsid.ErrSymlinkParent) {
 		c.Reason = ReasonSymlinkParent
 	}
@@ -323,7 +333,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			}
 			want := version{true, rf.id, rf.mode}
 			if !local.eq(base) && !local.eq(want) {
-				if err := wb.conflict(ws.Root, q, want, rf); err != nil {
+				if err := wb.conflict(ws.Root, q, want, rf, ""); err != nil {
 					return err
 				}
 				break
@@ -331,7 +341,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			if !local.eq(want) {
 				err := save(del, local)
 				if errors.Is(err, errChangedUnderUs) {
-					if err := wb.conflict(ws.Root, q, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, q, want, rf, ""); err != nil {
 						return err
 					}
 					break
@@ -346,7 +356,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			if !local.eq(want) {
 				err := writeLocal(ws.Root, q, rf, &local)
 				if errors.Is(err, errChangedUnderUs) {
-					if err := wb.conflict(ws.Root, q, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, q, want, rf, ""); err != nil {
 						return err
 					}
 					break
@@ -391,7 +401,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		case local.eq(base):
 			// Whatever is lost here and isn't committed is saved first.
 			if err := save(p, local); errors.Is(err, errChangedUnderUs) {
-				return wb.conflict(ws.Root, p, want, rf)
+				return wb.conflict(ws.Root, p, want, rf, "")
 			} else if err != nil {
 				return fmt.Errorf("backing up %s: %w", p, err)
 			}
@@ -401,7 +411,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				// directory is needed, kept because of a local edit): keep
 				// the local side, stash the remote one.
 				if errors.Is(err, errChangedUnderUs) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) || errors.Is(err, fsid.ErrSymlinkParent) {
-					if err := wb.conflict(ws.Root, p, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, p, want, rf, ""); err != nil {
 						return err
 					}
 					return nil
@@ -414,13 +424,13 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			} else {
 				full, err := fsid.SafeJoin(ws.Root, p)
 				if errors.Is(err, fsid.ErrSymlinkParent) {
-					return wb.conflict(ws.Root, p, want, rf) // a symlink appeared above it
+					return wb.conflict(ws.Root, p, want, rf, "") // a symlink appeared above it
 				}
 				if err != nil {
 					return err
 				}
 				if now, err := localVersion(ws.Root, p); err != nil || !now.eq(local) {
-					return wb.conflict(ws.Root, p, want, rf)
+					return wb.conflict(ws.Root, p, want, rf, "")
 				}
 				if err := os.Remove(full); err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return err
@@ -429,7 +439,11 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				removedDirs = append(removedDirs, path.Dir(p))
 			}
 		default:
-			if err := wb.conflict(ws.Root, p, want, rf); err != nil {
+			with := ""
+			if local.exists && local != blocked {
+				with = collidesWith(ws.Root, p, remote, m)
+			}
+			if err := wb.conflict(ws.Root, p, want, rf, with); err != nil {
 				return err
 			}
 		}
@@ -543,6 +557,64 @@ func nowIgnored(ctx context.Context, m *manifest.Manifest, root string, paths []
 		}
 	}
 	return ignored
+}
+
+// collidesWith is the other path the run knows whose file p opens here,
+// when this filesystem ignores case or Unicode normalisation in names
+// (src/Dup.txt opens src/DUP.txt, src/n\u00e9.txt opens src/ne\u0301.txt):
+// two remote names for one local file, not a local edit. "" when p's file
+// has p's own name, or a name the run doesn't know.
+func collidesWith(root, p string, remote map[string]version, m *manifest.Manifest) string {
+	q, ok := onDiskName(root, p)
+	if !ok || q == p {
+		return ""
+	}
+	if v, ok := remote[q]; ok && v.exists {
+		return q
+	}
+	if _, ok := m.ByPath[q]; ok {
+		return q
+	}
+	return ""
+}
+
+// onDiskName is the name rel's file has under root, component by component:
+// rel itself where that name is listed, otherwise the listed entry that is
+// the same file. false when a component is missing or can't be read.
+func onDiskName(root, rel string) (string, bool) {
+	dir := root
+	var out []string
+	for _, part := range strings.Split(rel, "/") {
+		fi, err := os.Lstat(filepath.Join(dir, part))
+		if err != nil {
+			return "", false
+		}
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return "", false
+		}
+		name := ""
+		for _, e := range ents {
+			if e.Name() == part {
+				name = part
+				break
+			}
+		}
+		for _, e := range ents {
+			if name != "" {
+				break
+			}
+			if ei, err := os.Lstat(filepath.Join(dir, e.Name())); err == nil && os.SameFile(ei, fi) {
+				name = e.Name()
+			}
+		}
+		if name == "" {
+			return "", false
+		}
+		out = append(out, name)
+		dir = filepath.Join(dir, name)
+	}
+	return strings.Join(out, "/"), true
 }
 
 func conflictBase(ws *Workspace) string {

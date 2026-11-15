@@ -723,12 +723,26 @@ func keepLastRun(ws *Workspace, o Options, lr LastRun, res *Result) {
 	}
 }
 
-// reportConflicts says, for each write-back conflict, exactly where to look:
-// the stash is under the git dir, out of sight of `git status` and editors.
+// reportConflicts says, for each write-back conflict or name collision,
+// exactly where to look: the stash is under the git dir, out of sight of
+// `git status` and editors.
 func reportConflicts(rep ui.Reporter, stashed []Conflict, runID string) {
 	for _, c := range stashed {
 		diff := conflictDiff(c)
+		ev := map[string]any{"path": c.Path, "local": c.Local, "remote": c.Remote, "deleted": c.Deleted, "diff": diff, "run_id": runID}
+		if c.Reason != "" {
+			ev["reason"] = c.Reason
+		}
 		switch {
+		case c.With != "":
+			// Two remote names, one local file: say which landed, and spell
+			// out names that only differ in Unicode normalisation.
+			path, with := c.Path, c.With
+			if !strings.EqualFold(path, with) {
+				path, with = fmt.Sprintf("%s (%+q)", path, path), fmt.Sprintf("%s (%+q)", with, with)
+			}
+			rep.Warn("SYNC_COLLISION", "the remote run's %s is the same file as %s here, because this filesystem ignores case and Unicode normalisation in names; kept %s, and saved the remote %s instead: %s", path, with, with, path, diff)
+			ev["with"] = c.With
 		case c.Reason == ReasonSymlinkParent && c.Deleted:
 			rep.Warn("SYNC_CONFLICT", "%s was deleted by the remote command but not here: a parent directory of it is a symlink locally", c.Path)
 		case c.Reason == ReasonSymlinkParent:
@@ -737,10 +751,6 @@ func reportConflicts(rep ui.Reporter, stashed []Conflict, runID string) {
 			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run, and the remote command deleted it; kept your version (delete it yourself to accept the deletion). Your changes: %s", c.Path, diff)
 		default:
 			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version. The remote version: %s", c.Path, diff)
-		}
-		ev := map[string]any{"path": c.Path, "local": c.Local, "remote": c.Remote, "deleted": c.Deleted, "diff": diff, "run_id": runID}
-		if c.Reason != "" {
-			ev["reason"] = c.Reason
 		}
 		rep.Event("conflict", ev)
 	}
