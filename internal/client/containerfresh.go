@@ -53,7 +53,9 @@ func warnContainerFresh(w *Workspace, o Options, dockerfile string) {
 // changes a fresh container drops (unlike files in the workspace or $HOME).
 // Best effort: it reads the command line, not the scripts it runs.
 var pkgInstall = regexp.MustCompile(`(?:^|[\s;&|(` + "`" + `'"])(?:` +
-	`(?:apt-get|apt|aptitude|dnf|yum|microdnf|tdnf|zypper)(?:\s+(?:-[otc]\s+\S+|--option\s+\S+|-\S+))*\s+` +
+	// -o, -t and -c take a value in apt; only -c (the config file) does in the rest.
+	`(?:(?:apt-get|apt|aptitude)(?:\s+(?:-[otc]\s+\S+|--option\s+\S+|-\S+))*` +
+	`|(?:dnf|yum|microdnf|tdnf|zypper)(?:\s+(?:-c\s+\S+|-\S+))*)\s+` +
 	`(?:install|reinstall|in|localinstall|groupinstall|group\s+install)\b` +
 	`|apk(?:\s+-\S+)*\s+add\b` +
 	`|pacman(?:\s+-\S+)*\s+-S[yu]*\b` +

@@ -135,6 +135,7 @@ func TestInstallsSystemPackages(t *testing.T) {
 		"apt-get -t bookworm-backports install curl",
 		"DEBIAN_FRONTEND=noninteractive sudo -E apt-get -y --no-install-recommends install curl",
 		"tdnf install git",
+		"dnf -c /etc/dnf/alt.conf install git",
 		"yum groupinstall 'Development Tools'",
 		"dnf group install 'Development Tools'",
 		"dpkg --install ./pkg.deb",
@@ -156,6 +157,7 @@ func TestInstallsSystemPackages(t *testing.T) {
 		"my-apt-get install x",
 		"grep install apt.log",
 		"dnf group list",
+		"zypper -t search install",
 		"apt-get -o Debug::pkgProblemResolver=yes update",
 	}
 	for _, c := range yes {
