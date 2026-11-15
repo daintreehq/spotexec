@@ -1803,6 +1803,7 @@ func (g *AWSGlobal) launchRegionsAs(ctx context.Context, creds *awsCredResolver)
 	c := &AWSGlobal{r: g.r, creds: creds, dir: tmp, regional: map[string]*AWSSpot{}, legacy: g.legacy, single: g.single, endpoints: g.endpoints, now: g.now}
 	return c.LaunchRegions(ctx)
 }
+
 // priceCheck is doctor's finding on where a single-region runner's next
 // VM would go.
 func (a *AWSSpot) priceCheck(ctx context.Context) Check {
