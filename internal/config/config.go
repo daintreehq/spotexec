@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -67,20 +68,28 @@ type Runner struct {
 	BootTimeout     Duration `toml:"boot_timeout"`
 
 	// aws-spot
-	Region           string   `toml:"region"`
-	Regions          []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
-	Profile          string   `toml:"profile"`
-	InstanceTypes    []string `toml:"instance_types"`
-	MaxPrice         string   `toml:"max_price"`
-	AMI              string   `toml:"ami"`
-	Arch             string   `toml:"arch"` // amd64|arm64 (derived from instance types if empty)
-	SubnetID         string   `toml:"subnet_id"`
-	SecurityGroupIDs []string `toml:"security_group_ids"`
-	SSHCIDR          string   `toml:"ssh_cidr"`
-	VolumeGB         int      `toml:"volume_gb"`
-	User             string   `toml:"user"`
-	OnDemandFallback bool     `toml:"on_demand_fallback"`
-	CacheBucket      string   `toml:"cache_bucket"` // shared dependency cache: "auto" (default), a bucket name, or "off"
+	Region        string   `toml:"region"`
+	Regions       []string `toml:"regions"` // several regions, or ["all"]: launch wherever Spot is cheapest
+	Profile       string   `toml:"profile"`
+	InstanceTypes []string `toml:"instance_types"`
+	// Requirements instead of (or narrowing) a type list: every current
+	// instance type with exactly VCPUs vCPUs and at least MinMemoryGiB is a
+	// candidate, and launches go to the cheapest.
+	VCPUs                int      `toml:"vcpus"`
+	MinMemoryGiB         float64  `toml:"min_memory_gib"`
+	MinGeneration        int      `toml:"min_generation"`
+	ExcludeInstanceTypes []string `toml:"exclude_instance_types"`
+	LaunchOrder          string   `toml:"launch_order"` // cheapest (default) | listed
+	MaxPrice             string   `toml:"max_price"`
+	AMI                  string   `toml:"ami"`
+	Arch                 string   `toml:"arch"` // amd64|arm64 (derived from instance types if empty)
+	SubnetID             string   `toml:"subnet_id"`
+	SecurityGroupIDs     []string `toml:"security_group_ids"`
+	SSHCIDR              string   `toml:"ssh_cidr"`
+	VolumeGB             int      `toml:"volume_gb"`
+	User                 string   `toml:"user"`
+	OnDemandFallback     bool     `toml:"on_demand_fallback"`
+	CacheBucket          string   `toml:"cache_bucket"` // shared dependency cache: "auto" (default), a bucket name, or "off"
 
 	// fleets (aws-spot, sim)
 	MaxInstances int `toml:"max_instances"`
@@ -101,6 +110,49 @@ func (r *Runner) MultiRegion() bool { return r.Type == TypeAWSSpot && len(r.Regi
 // AnyRegion reports whether the runner may launch in every enabled region.
 func (r *Runner) AnyRegion() bool {
 	return r.MultiRegion() && len(r.Regions) == 1 && r.Regions[0] == AllRegions
+}
+
+// Launch orders.
+const (
+	LaunchCheapest = "cheapest"
+	LaunchListed   = "listed"
+)
+
+// DefaultMinGeneration is the oldest instance generation a vcpus-based
+// runner considers: older ones are still "current" to AWS, but markedly
+// slower per vCPU.
+const DefaultMinGeneration = 6
+
+// ByRequirements reports whether an aws-spot runner picks its instance
+// types from vcpus (and min_memory_gib) rather than only a fixed list.
+func (r *Runner) ByRequirements() bool { return r.Type == TypeAWSSpot && r.VCPUs > 0 }
+
+// IsTypePattern reports whether an instance_types entry is a wildcard
+// pattern (only meaningful with vcpus).
+func IsTypePattern(t string) bool { return strings.Contains(t, "*") }
+
+// MatchType reports whether an instance type matches a pattern in which *
+// stands for any run of characters.
+func MatchType(pattern, t string) bool {
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == t
+	}
+	if !strings.HasPrefix(t, parts[0]) {
+		return false
+	}
+	t = t[len(parts[0]):]
+	for i, p := range parts[1:] {
+		if i == len(parts)-2 {
+			return strings.HasSuffix(t, p)
+		}
+		j := strings.Index(t, p)
+		if j < 0 {
+			return false
+		}
+		t = t[j+len(p):]
+	}
+	return true
 }
 
 // Ephemeral reports whether the runner is provisioned on demand.
@@ -298,11 +350,23 @@ func (r *Runner) applyDefaults() error {
 		if strings.HasPrefix(r.Region, "cn-") {
 			return fmt.Errorf("region %q: the AWS China regions aren't supported", r.Region)
 		}
-		if len(r.InstanceTypes) == 0 {
+		if len(r.InstanceTypes) == 0 && r.VCPUs == 0 {
 			r.InstanceTypes = []string{"c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"} // the starter template's 8-vCPU types
 		}
 		if r.Arch == "" {
-			r.Arch = archForInstanceType(r.InstanceTypes[0])
+			r.Arch = "amd64"
+			for _, t := range r.InstanceTypes {
+				if !IsTypePattern(t) {
+					r.Arch = archForInstanceType(t)
+					break
+				}
+			}
+		}
+		if r.VCPUs > 0 && r.MinGeneration == 0 {
+			r.MinGeneration = DefaultMinGeneration
+		}
+		if r.LaunchOrder == "" {
+			r.LaunchOrder = LaunchCheapest
 		}
 		if r.User == "" {
 			r.User = "ubuntu"
@@ -400,14 +464,61 @@ func (r *Runner) validate() error {
 		if r.Arch != "amd64" && r.Arch != "arm64" {
 			return fmt.Errorf("arch must be amd64 or arm64 (got %q)", r.Arch)
 		}
-		for _, t := range r.InstanceTypes {
-			if archForInstanceType(t) != r.Arch {
-				return fmt.Errorf("instance_types mixes architectures (%s is not %s): use one runner per architecture", t, r.Arch)
-			}
+		if err := r.validateTypes(); err != nil {
+			return err
 		}
 		if r.VolumeGB < 8 {
 			return fmt.Errorf("volume_gb must be at least 8 (got %d)", r.VolumeGB)
 		}
+	}
+	return nil
+}
+
+// validateTypes checks how an aws-spot runner chooses instance types.
+func (r *Runner) validateTypes() error {
+	for _, t := range append(append([]string(nil), r.InstanceTypes...), r.ExcludeInstanceTypes...) {
+		if !typePatternRe.MatchString(t) {
+			return fmt.Errorf("invalid instance type %q", t)
+		}
+	}
+	for _, t := range r.InstanceTypes {
+		if IsTypePattern(t) {
+			if r.VCPUs == 0 {
+				return fmt.Errorf("instance_types: %q is a pattern, which needs vcpus (patterns narrow the types vcpus and min_memory_gib select)", t)
+			}
+			continue
+		}
+		if archForInstanceType(t) != r.Arch {
+			return fmt.Errorf("instance_types mixes architectures (%s is not %s): use one runner per architecture", t, r.Arch)
+		}
+	}
+	if r.VCPUs < 0 || r.VCPUs > 448 {
+		return fmt.Errorf("vcpus must be between 1 and 448 (got %d)", r.VCPUs)
+	}
+	if r.VCPUs == 0 {
+		switch {
+		case r.MinMemoryGiB != 0:
+			return errors.New("min_memory_gib needs vcpus (the exact vCPU count of each VM)")
+		case r.MinGeneration != 0:
+			return errors.New("min_generation needs vcpus (the exact vCPU count of each VM)")
+		case len(r.ExcludeInstanceTypes) > 0:
+			return errors.New("exclude_instance_types needs vcpus; with a fixed list, just leave the type out of instance_types")
+		}
+	}
+	if r.MinMemoryGiB < 0 || math.IsNaN(r.MinMemoryGiB) || math.IsInf(r.MinMemoryGiB, 0) {
+		return fmt.Errorf("min_memory_gib must be a non-negative number (got %g)", r.MinMemoryGiB)
+	}
+	if r.MinGeneration < 0 {
+		return fmt.Errorf("min_generation must not be negative (got %d)", r.MinGeneration)
+	}
+	switch r.LaunchOrder {
+	case LaunchCheapest:
+	case LaunchListed:
+		if len(r.InstanceTypes) == 0 {
+			return errors.New(`launch_order = "listed" needs instance_types (the order to try)`)
+		}
+	default:
+		return fmt.Errorf("launch_order must be %q or %q (got %q)", LaunchCheapest, LaunchListed, r.LaunchOrder)
 	}
 	return nil
 }
@@ -697,9 +808,10 @@ var globalOnlyKeys = []string{
 }
 
 var (
-	runnerNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
-	regionRe     = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]+$`)
-	userRe       = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+	runnerNameRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+	regionRe      = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]+$`)
+	userRe        = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+	typePatternRe = regexp.MustCompile(`^[a-z0-9*][a-z0-9.*-]{0,40}$`)
 )
 
 // MergeProjectRunners decodes runners declared in .spotexec.toml and adds
@@ -758,7 +870,26 @@ func (c *Config) MergeProjectRunners() error {
 		base.SSHOptions = append([]string(nil), g.SSHOptions...)
 		base.SecurityGroupIDs = append([]string(nil), g.SecurityGroupIDs...)
 		base.Regions = append([]string(nil), g.Regions...)
-		if p.md.IsDefined("runners", name, "instance_types") && !p.md.IsDefined("runners", name, "arch") {
+		base.ExcludeInstanceTypes = append([]string(nil), g.ExcludeInstanceTypes...)
+		// The project's way of choosing types replaces the inherited one: new
+		// instance_types alone drop inherited requirements, and requirements
+		// alone drop inherited instance_types (which would otherwise narrow
+		// them).
+		setsTypes := p.md.IsDefined("runners", name, "instance_types")
+		setsReqs := false
+		for _, k := range []string{"vcpus", "min_memory_gib", "min_generation", "exclude_instance_types"} {
+			setsReqs = setsReqs || p.md.IsDefined("runners", name, k)
+		}
+		if setsTypes && !setsReqs {
+			base.VCPUs, base.MinMemoryGiB, base.MinGeneration, base.ExcludeInstanceTypes = 0, 0, 0, nil
+		}
+		if setsReqs && !setsTypes {
+			base.InstanceTypes = nil
+			if !p.md.IsDefined("runners", name, "launch_order") {
+				base.LaunchOrder = ""
+			}
+		}
+		if setsTypes && !p.md.IsDefined("runners", name, "arch") {
 			base.Arch = "" // re-derive from the new instance types
 		}
 		if err := p.md.PrimitiveDecode(prim, &base); err != nil {

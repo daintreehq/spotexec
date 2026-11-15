@@ -30,6 +30,15 @@ When a launch doesn't fit, the machine behaves as for any [quota refusal](aws.md
 
 To mix machine sizes, define two fleets: a 2-vCPU fleet for light jobs and a 4-vCPU fleet for heavy ones. Route tasks to them with `pool`, or let overflow spill from one to the other by priority. [docs/POOL.md](POOL.md) has the full scheduling design.
 
+### One fleet, several instance types
+
+A fleet's VMs can be different instance types, because each VM goes to whichever of the runner's types is cheapest when it launches. Slots and CPU shares stay predictable as long as the types have the same vCPUs:
+- **Slots** come from the VM itself: `max_slots`, or its vCPUs ÷ 4. The pool plans capacity with the runner's vCPUs (`vcpus`, or the first listed type's), so a list that mixes sizes (`c7a.xlarge` with `c7a.2xlarge`) makes plans that don't match every VM. Keep one size per runner, or set `max_slots`.
+- **`$SPOTEXEC_CPUS`** is the VM's vCPUs ÷ its slots, so it is the same on every VM of one size.
+- **Memory** is what differs. With `vcpus` and `min_memory_gib`, every VM has at least `min_memory_gib`, and some (memory-optimized types that happened to be cheapest) have more. Each job can count on `min_memory_gib ÷ slots`: to give four jobs 8 GiB each, set `min_memory_gib = 32` with `max_slots = 4`.
+
+That is why `vcpus` is an exact count rather than a range: one count means one slot layout across the fleet.
+
 ## Pool manager (optional)
 
 `spotexec daemon` is a background process on **your** machine, not in the cloud. It works on the same local state as `sx`, so the two never double-launch, and `sx` behaves the same whether or not the daemon runs. It manages the fleets in `~/.config/spotexec/config.toml`, not project-defined ones. Restart it after editing that file.

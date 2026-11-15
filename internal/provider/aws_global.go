@@ -52,6 +52,10 @@ type AWSGlobal struct {
 	// behave exactly as for a single-region runner; listings and teardown
 	// still cover the old regions until they are empty.
 	legacy bool
+	// single: the launch placement of a plain single-region runner (see
+	// AWSSpot.ranker): one region, its subnet_id and security groups as
+	// configured, and nothing recorded about where instances are.
+	single bool
 
 	// tests
 	endpoints func(region string) map[string]string
@@ -65,6 +69,25 @@ func NewAWSGlobal(r *config.Runner) (Provider, error) {
 	}
 	return &AWSGlobal{r: r, creds: &awsCredResolver{profile: r.Profile}, dir: RunnerStateDir(r.Name), regional: map[string]*AWSSpot{}}, nil
 }
+
+// NewAWSPricer returns the placement of an aws-spot runner's launches, for
+// `spotexec prices`: the runner's own regions, or its one region.
+func NewAWSPricer(r *config.Runner) (*AWSGlobal, error) {
+	if r.MultiRegion() {
+		p, err := NewAWSGlobal(r)
+		if err != nil {
+			return nil, err
+		}
+		return p.(*AWSGlobal), nil
+	}
+	if err := checkAWSRunner(r); err != nil {
+		return nil, err
+	}
+	return newAWSSpot(r, &awsCredResolver{profile: r.Profile}).ranker(), nil
+}
+
+// oneRegion reports placement within the runner's one region.
+func (g *AWSGlobal) oneRegion() bool { return g.legacy || g.single }
 
 // heldElsewhere reports whether a single-region runner's placement state
 // (left from when it used several regions) says it may still have
@@ -188,7 +211,7 @@ func (g *AWSGlobal) Regional(region string) *AWSSpot {
 	rc := *g.r
 	rc.Region, rc.Regions = region, nil
 	a := newAWSSpot(&rc, g.creds)
-	a.placed = !g.legacy
+	a.placed = !g.oneRegion()
 	if g.endpoints != nil {
 		a.api.endpoints = g.endpoints(region)
 	}
@@ -207,7 +230,7 @@ func (g *AWSGlobal) home() *AWSSpot { return g.Regional(g.r.Region) }
 
 // Where describes the regions the runner may use, for messages.
 func (g *AWSGlobal) Where() string {
-	if g.legacy {
+	if g.oneRegion() {
 		return g.r.Region
 	}
 	if g.r.AnyRegion() {
@@ -267,7 +290,8 @@ type placementState struct {
 	Prices    []SpotPrice       `json:"prices,omitempty"`
 	PricedAt  time.Time         `json:"priced_at,omitempty"`
 	PricedFor string            `json:"priced_for,omitempty"`
-	Unpriced  map[string]string `json:"unpriced,omitempty"` // region -> why it has no price
+	PricedMem map[string]int    `json:"priced_mem,omitempty"` // vcpus runners: instance type -> memory (MiB)
+	Unpriced  map[string]string `json:"unpriced,omitempty"`   // region -> why it has no price
 	// Active: region -> may hold our instances until. An expired entry is
 	// only dropped once a listing of that region finds nothing, so a VM
 	// whose watchdog failed is never forgotten.
@@ -391,7 +415,7 @@ func (g *AWSGlobal) activeRegions() ([]string, error) {
 
 // PlacementRegions are the regions new instances may go to.
 func (g *AWSGlobal) PlacementRegions(ctx context.Context) ([]string, error) {
-	if g.legacy {
+	if g.oneRegion() {
 		return []string{g.r.Region}, nil
 	}
 	enabled, err := g.enabledRegions(ctx)
@@ -474,7 +498,7 @@ func enabledRegionsVia(ctx context.Context, regional func(string) *AWSSpot, home
 // notEnabled lists configured regions the account hasn't enabled (or that
 // don't exist), which placement leaves out.
 func (g *AWSGlobal) notEnabled(placement []string) []string {
-	if g.legacy || g.r.AnyRegion() {
+	if g.oneRegion() || g.r.AnyRegion() {
 		return nil
 	}
 	var out []string
@@ -487,6 +511,28 @@ func (g *AWSGlobal) notEnabled(placement []string) []string {
 }
 
 const noneOfferedWhy = "none of instance_types is offered as Spot here"
+
+// noneOffered says a region offers none of the runner's types as Spot.
+func noneOffered(r *config.Runner) string {
+	if r.ByRequirements() {
+		return "no type with " + describeRequirements(r) + " is offered as Spot here"
+	}
+	return noneOfferedWhy
+}
+
+// lastingUnpriced reports reasons a region has no price that won't clear
+// by themselves: not enabled, or none of the runner's types offered there.
+func lastingUnpriced(why string) bool {
+	return why == notEnabledWhy || strings.Contains(why, "offered as Spot here") || strings.HasPrefix(why, "no instance type in ")
+}
+
+// widenHint says how to give a runner more options to launch.
+func widenHint(r *config.Runner) string {
+	if r.ByRequirements() {
+		return "lower min_memory_gib or min_generation"
+	}
+	return "add instance_types"
+}
 
 // shortOfCapacity reports the refusals that mean AWS has no Spot capacity
 // for that type and zone right now (not a price cap or an unsupported type).
@@ -598,15 +644,56 @@ func credentialFailure(errs map[string]error) error {
 
 // PriceTable is the ranked Spot prices of a runner's instance types.
 type PriceTable struct {
-	Prices   []SpotPrice       `json:"prices"` // cheapest first
+	Prices   []SpotPrice       `json:"prices"` // in launch order: cheapest first (launch_order = "listed": by type, then price)
 	At       time.Time         `json:"at"`     // when they were fetched
 	Regions  []string          `json:"regions"`
 	Unpriced map[string]string `json:"unpriced,omitempty"` // region -> why it has no price
 	Cached   bool              `json:"cached"`
+	// MemoryMiB: for vcpus runners, the memory of each eligible type priced.
+	MemoryMiB map[string]int `json:"memory_mib,omitempty"`
 }
 
 func (g *AWSGlobal) priceKey(regions []string) string {
-	return g.r.Profile + "|" + strings.Join(g.r.InstanceTypes, ",") + "|" + strings.Join(regions, ",")
+	k := g.r.Profile + "|" + strings.Join(g.r.InstanceTypes, ",") + "|" + strings.Join(regions, ",") + "|" + g.r.LaunchOrder
+	if g.r.ByRequirements() {
+		k += "|" + typesKey(g.r)
+	}
+	if g.r.SubnetID != "" {
+		k += "|" + g.r.SubnetID
+	}
+	return k
+}
+
+// orderPrices puts prices in launch order: cheapest first, with the
+// instance_types order breaking ties; launch_order = "listed" tries the
+// types in the listed order, each in its cheapest zone first.
+func orderPrices(r *config.Runner, ps []SpotPrice) {
+	idx := func(t string) int {
+		if i := listedIndex(r, t); i >= 0 {
+			return i
+		}
+		return len(r.InstanceTypes)
+	}
+	sort.SliceStable(ps, func(i, j int) bool {
+		a, b := ps[i], ps[j]
+		ia, ib := idx(a.Type), idx(b.Type)
+		if r.LaunchOrder == config.LaunchListed && ia != ib {
+			return ia < ib
+		}
+		if fa, fb := a.USD(), b.USD(); fa != fb {
+			return fa < fb
+		}
+		if ia != ib {
+			return ia < ib
+		}
+		if a.Region != b.Region {
+			return a.Region < b.Region
+		}
+		if a.Zone != b.Zone {
+			return a.Zone < b.Zone
+		}
+		return a.Type < b.Type
+	})
 }
 
 // Prices returns the current Spot prices across the placement regions,
@@ -627,7 +714,7 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 	if !refresh {
 		_ = g.withState(func(st *placementState) {
 			if st.PricedFor == key && g.clock().Sub(st.PricedAt) < priceTTL && len(st.Prices) > 0 {
-				t = PriceTable{Prices: st.Prices, At: st.PricedAt, Regions: union(regions, off), Unpriced: st.Unpriced, Cached: true}
+				t = PriceTable{Prices: st.Prices, At: st.PricedAt, Regions: union(regions, off), Unpriced: st.Unpriced, Cached: true, MemoryMiB: st.PricedMem}
 			}
 		})
 		if t.Cached {
@@ -635,18 +722,53 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 		}
 	}
 	now := g.clock()
+	// A pinned subnet_id fixes the zone: only its prices are options.
+	zone := ""
+	if g.r.SubnetID != "" {
+		if zone, err = g.home().subnetZone(ctx); err != nil {
+			return PriceTable{}, err
+		}
+	}
 	var mu sync.Mutex
 	var all []SpotPrice
+	var mem map[string]int
+	if g.r.ByRequirements() {
+		mem = map[string]int{}
+	}
 	errs := eachRegion(ctx, regions, func(ctx context.Context, rg string) error {
-		ps, err := g.Regional(rg).spotPrices(ctx, g.r.InstanceTypes, now)
+		a := g.Regional(rg)
+		types := g.r.InstanceTypes
+		if g.r.ByRequirements() {
+			ts, err := a.EligibleTypes(ctx, refresh)
+			if err != nil {
+				return err
+			}
+			types = nil
+			mu.Lock()
+			for _, t := range ts {
+				types = append(types, t.Type)
+				mem[t.Type] = t.MemoryMiB
+			}
+			mu.Unlock()
+		}
+		ps, err := a.spotPrices(ctx, types, now)
 		if err != nil {
 			return err
 		}
-		if len(ps) == 0 {
-			return errors.New(noneOfferedWhy)
+		var keep []SpotPrice
+		for _, p := range ps {
+			if contains(types, p.Type) && (zone == "" || p.Zone == zone) {
+				keep = append(keep, p)
+			}
+		}
+		if len(keep) == 0 {
+			if zone != "" {
+				return fmt.Errorf("%s in %s (the zone of subnet_id %s)", noneOffered(g.r), zone, g.r.SubnetID)
+			}
+			return errors.New(noneOffered(g.r))
 		}
 		mu.Lock()
-		all = append(all, ps...)
+		all = append(all, keep...)
 		mu.Unlock()
 		return nil
 	})
@@ -658,8 +780,8 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 	if ctx.Err() != nil {
 		return PriceTable{}, ctx.Err()
 	}
-	rankPrices(all)
-	t = PriceTable{Prices: all, At: now, Regions: union(regions, off), Unpriced: map[string]string{}}
+	orderPrices(g.r, all)
+	t = PriceTable{Prices: all, At: now, Regions: union(regions, off), Unpriced: map[string]string{}, MemoryMiB: mem}
 	for rg, err := range errs {
 		t.Unpriced[rg] = firstLineOf([]byte(err.Error()))
 	}
@@ -667,11 +789,15 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 		t.Unpriced[rg] = notEnabledWhy
 	}
 	if len(all) == 0 {
-		err := fmt.Errorf("no Spot price for %s in %s: %s", strings.Join(g.r.InstanceTypes, ", "), g.Where(), summarize(t.Unpriced, 3))
+		what := strings.Join(g.r.InstanceTypes, ", ")
+		if g.r.ByRequirements() {
+			what = describeRequirements(g.r)
+		}
+		err := fmt.Errorf("no Spot price for %s in %s: %s", what, g.Where(), summarize(t.Unpriced, 3))
 		return t, fmt.Errorf("%w%s", err, permHint(err))
 	}
 	_ = g.withState(func(st *placementState) {
-		st.Prices, st.PricedAt, st.PricedFor, st.Unpriced = all, now, key, t.Unpriced
+		st.Prices, st.PricedAt, st.PricedFor, st.Unpriced, st.PricedMem = all, now, key, t.Unpriced, mem
 	})
 	return t, nil
 }
@@ -702,7 +828,7 @@ func (g *AWSGlobal) coolingDown(st *placementState, p SpotPrice, now time.Time) 
 	if c, ok := st.Cooldown[p.Region]; ok && now.Before(c.Until) {
 		return c, true
 	}
-	if c, ok := st.Cooldown["zone:"+p.Zone]; ok && now.Before(c.Until) {
+	if c, ok := st.Cooldown[g.zoneKey(p.Zone)]; ok && now.Before(c.Until) {
 		return c, true
 	}
 	if c, ok := st.Cooldown[poolKey(p)]; ok && now.Before(c.Until) {
@@ -745,10 +871,20 @@ func (g *AWSGlobal) coolPool(p SpotPrice, why string) {
 	})
 }
 
+// zoneKey names a zone's cooldown. Zone cooldowns are about its subnet
+// (none by default, or full), so a pinned subnet_id gets its own: another
+// subnet in the zone starts afresh.
+func (g *AWSGlobal) zoneKey(zone string) string {
+	if g.r.SubnetID != "" {
+		return "zone:" + zone + "/" + g.r.SubnetID
+	}
+	return "zone:" + zone
+}
+
 // coolZone skips every type in one availability zone for a while.
 func (g *AWSGlobal) coolZone(zone, why string, setup bool) {
 	_ = g.withState(func(st *placementState) {
-		st.Cooldown["zone:"+zone] = cooldown{Until: g.clock().Add(regionCool), Step: regionCool, Why: why, Setup: setup}
+		st.Cooldown[g.zoneKey(zone)] = cooldown{Until: g.clock().Add(regionCool), Step: regionCool, Why: why, Setup: setup}
 	})
 }
 
@@ -933,21 +1069,62 @@ func (g *AWSGlobal) Launch(ctx context.Context, log Logger) (Instance, error) {
 	return g.launch(ctx, log)
 }
 
+// mark is the beforeSend of a launch in region: record, just before the
+// request, that the region may hold an instance, so listings find one the
+// request creates even if its response is lost. (A plain single-region
+// runner always lists its one region.)
+func (g *AWSGlobal) mark(region string) func() error {
+	if g.single {
+		return nil
+	}
+	return func() error { return g.markActive(region, g.holdUntil(g.clock())) }
+}
+
+// record remembers where a new instance is.
+func (g *AWSGlobal) record(in Instance) {
+	if !g.single {
+		_ = g.remember([]Instance{in})
+	}
+}
+
+// onDemandTypes is the order to try on-demand in region: the types by
+// their Spot rank there (a stand-in for the on-demand price, which spotexec
+// doesn't look up), then any usable type without a Spot price there.
+func (g *AWSGlobal) onDemandTypes(ctx context.Context, t PriceTable, region string) []string {
+	var out []string
+	for _, p := range t.Prices {
+		if p.Region == region && !contains(out, p.Type) {
+			out = append(out, p.Type)
+		}
+	}
+	rest, _ := g.Regional(region).launchTypes(ctx) // vcpus: the cached eligible list
+	for _, it := range rest {
+		if !contains(out, it) {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
 func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
-	if g.legacy {
+	t, err := g.Prices(ctx, false)
+	if err != nil {
+		var ce *CredentialError
+		if !g.oneRegion() || g.r.ByRequirements() || ctx.Err() != nil || errors.As(err, &ce) {
+			return Instance{}, err
+		}
+		// In one region with a fixed list, prices only order the attempts
+		// (and an older IAM policy may not allow reading them): try the
+		// types in the listed order instead.
+		log("can't compare Spot prices (%s); trying instance_types in order", firstLineOfErr(err))
 		a := g.home()
-		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{
-			beforeSend: func() error { return g.markActive(a.r.Region, g.holdUntil(g.clock())) }})
+		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{beforeSend: g.mark(a.r.Region)})
 		if err != nil {
 			return Instance{}, err
 		}
 		in := a.instance(inst)
-		_ = g.remember([]Instance{in})
+		g.record(in)
 		return in, nil
-	}
-	t, err := g.Prices(ctx, false)
-	if err != nil {
-		return Instance{}, err
 	}
 	cool := g.cooldowns(t.Prices)
 	// An explicit max_price is AWS's cap on the Spot bid: options already
@@ -1001,17 +1178,14 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		}
 		a := g.Regional(c.Region)
 		attempts++
-		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{itype: c.Type, zone: c.Zone,
-			// Just before the request: an instance it creates must be found
-			// by listings even if the response is lost.
-			beforeSend: func() error { return g.markActive(c.Region, g.holdUntil(g.clock())) }})
+		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{itype: c.Type, zone: c.Zone, beforeSend: g.mark(c.Region)})
 		if err == nil {
 			g.clearCool(c)
 			in := a.instance(inst)
 			if in.Zone == "" {
 				in.Zone = c.Zone
 			}
-			_ = g.remember([]Instance{in})
+			g.record(in)
 			log("launched spot %s instance %s in %s at $%s/h (%s)", c.Type, in.ID, c.Zone, c.Price, priceNote(t, rank))
 			return in, nil
 		}
@@ -1072,6 +1246,13 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			} else {
 				log("skipping %s: %s", c.Region, why)
 			}
+		case g.oneRegion() && (errors.As(err, &re) || regionWide(code)):
+			// No other region to try, and the next launch should ask again
+			// rather than wait out a cooldown.
+			if re != nil {
+				return Instance{}, err
+			}
+			return Instance{}, fmt.Errorf("launch %s: %w", c.Type, err)
 		case errors.As(err, &re), regionWide(code):
 			why := firstLineOf([]byte(firstLineOfErr(err)))
 			skipRegion[c.Region] = why
@@ -1095,6 +1276,9 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		default:
 			// The same request would fail everywhere (bad bootstrap, image,
 			// parameters): don't burn through every region.
+			if g.oneRegion() {
+				return Instance{}, fmt.Errorf("launch %s: %w", c.Type, err)
+			}
 			return Instance{}, fmt.Errorf("%s: %w", c.Region, err)
 		}
 		tried = append(tried, c.Type+"@"+c.Zone+": "+code)
@@ -1102,7 +1286,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	// A region that couldn't be priced just now (a timeout, throttling)
 	// might have had room.
 	for _, why := range t.Unpriced {
-		if why != notEnabledWhy && why != noneOfferedWhy {
+		if !lastingUnpriced(why) {
 			otherFailure = true
 		}
 	}
@@ -1126,11 +1310,10 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		for _, rg := range regions[:min(len(regions), 2)] {
 			log("no spot capacity; falling back to on-demand in %s", rg)
 			a := g.Regional(rg)
-			inst, err := a.launchOrUnbaked(ctx, log, launchSpec{onDemand: true,
-				beforeSend: func() error { return g.markActive(rg, g.holdUntil(g.clock())) }})
+			inst, err := a.launchOrUnbaked(ctx, log, launchSpec{onDemand: true, types: g.onDemandTypes(ctx, t, rg), beforeSend: g.mark(rg)})
 			if err == nil {
 				in := a.instance(inst)
-				_ = g.remember([]Instance{in})
+				g.record(in)
 				return in, nil
 			}
 			var ce *CredentialError
@@ -1147,11 +1330,15 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		}
 	}
 	if quota != nil && !otherFailure {
-		if quota.Code != "" && quota.Usage == nil && quota.Desired == 0 {
-			// Suggest a quota above the current one, as a single region does.
-			if q, err := g.Regional(quota.Region).quotaValue(ctx, quota.Code); err == nil {
-				quota.Desired = q + quota.VCPUs
+		if quota.Code != "" && quota.Usage == nil {
+			if quota.Desired == 0 {
+				// Suggest a quota above the current one, as a single region does.
+				if q, err := g.Regional(quota.Region).quotaValue(ctx, quota.Code); err == nil {
+					quota.Desired = q + quota.VCPUs
+				}
 			}
+			// The whole fleet may need to fit in this one region.
+			quota.Desired = max(quota.Desired, quota.VCPUs, g.r.MaxInstances*VMVCPUs(g.r))
 		}
 		if len(tried) > 1 {
 			return Instance{}, fmt.Errorf("no option in %s could launch (%s); quota stopped the cheapest: %w", g.Where(), strings.Join(tried, ", "), quota)
@@ -1164,7 +1351,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	if len(tried) == 0 {
 		return Instance{}, fmt.Errorf("every Spot option in %s is cooling down after recent capacity or quota failures; retry in a few minutes (`spotexec prices %s` shows them)", g.Where(), g.r.Name)
 	}
-	return Instance{}, fmt.Errorf("no Spot capacity in the %d cheapest options (%s); add instance_types, or set on_demand_fallback = true", len(tried), strings.Join(tried, ", "))
+	return Instance{}, fmt.Errorf("no Spot capacity in the %d cheapest options (%s); %s, or set on_demand_fallback = true", len(tried), strings.Join(tried, ", "), widenHint(g.r))
 }
 
 func priceNote(t PriceTable, rank int) string {
@@ -1450,8 +1637,7 @@ func (g *AWSGlobal) Doctor(ctx context.Context) []Check {
 		return append(out, Check{Name: "spot prices", Msg: err.Error()})
 	}
 	best := t.Prices[0]
-	out = append(out, Check{Name: "spot prices", OK: true, Msg: fmt.Sprintf("cheapest now: %s in %s at $%s/h (%d options in %d regions; `spotexec prices %s` lists them)",
-		best.Type, best.Zone, best.Price, len(t.Prices), len(t.Regions)-len(t.Unpriced), g.r.Name)})
+	out = append(out, Check{Name: "spot prices", OK: true, Msg: g.nextLaunch(t)})
 	if len(t.Unpriced) > 0 {
 		out = append(out, Check{Name: "unpriced regions", OK: true, Msg: "not used: " + summarize(t.Unpriced, 4)})
 	}
@@ -1488,9 +1674,62 @@ func (g *AWSGlobal) Doctor(ctx context.Context) []Check {
 	return out
 }
 
+// priceCheck is doctor's finding on where a single-region runner's next
+// VM would go.
+func (a *AWSSpot) priceCheck(ctx context.Context) Check {
+	g := a.ranker()
+	t, err := g.Prices(ctx, true)
+	switch {
+	case err == nil:
+		return Check{Name: "spot prices", OK: true, Msg: g.nextLaunch(t)}
+	case a.r.ByRequirements():
+		return Check{Name: "spot prices", Msg: err.Error()}
+	}
+	return Check{Name: "spot prices", OK: true, Msg: "note: can't compare Spot prices (" + firstLineOfErr(err) + "), so launches try instance_types in the listed order"}
+}
+
+// NextLaunch is the option the next launch tries first: the first in
+// launch order that isn't cooling down or above max_price.
+func (g *AWSGlobal) NextLaunch(t PriceTable) (SpotPrice, bool) {
+	cool := g.cooldowns(t.Prices)
+	maxPrice, _ := strconv.ParseFloat(g.r.MaxPrice, 64)
+	for _, p := range t.Prices {
+		if _, ok := cool[poolKey(p)]; ok || (maxPrice > 0 && p.USD() > maxPrice) {
+			continue
+		}
+		return p, true
+	}
+	return SpotPrice{}, false
+}
+
+// nextLaunch describes where the next VM goes, for doctor.
+func (g *AWSGlobal) nextLaunch(t PriceTable) string {
+	what := plural(len(t.Prices), "option")
+	if !g.oneRegion() {
+		what += " in " + plural(len(t.Regions)-len(t.Unpriced), "region")
+	}
+	if g.r.ByRequirements() {
+		what += fmt.Sprintf(", %s matching %s", plural(len(t.MemoryMiB), "instance type"), describeRequirements(g.r))
+	}
+	list := fmt.Sprintf("`spotexec prices %s` lists them", g.r.Name)
+	p, ok := g.NextLaunch(t)
+	if !ok {
+		return fmt.Sprintf("every option is cooling down or above max_price (%s; %s)", what, list)
+	}
+	mem := ""
+	if m := t.MemoryMiB[p.Type]; m > 0 {
+		mem = fmt.Sprintf(" (%g GiB)", float64(m)/1024)
+	}
+	order := "cheapest first"
+	if g.r.LaunchOrder == config.LaunchListed {
+		order = "instance_types in order, cheapest zone first"
+	}
+	return fmt.Sprintf("next launch: %s%s in %s at $%s/h (%s; %s; %s)", p.Type, mem, p.Zone, p.Price, what, order, list)
+}
+
 func permHint(err error) string {
 	if awsCode(err) == "UnauthorizedOperation" || strings.Contains(err.Error(), "UnauthorizedOperation") {
-		return " (multi-region placement needs ec2:DescribeRegions and ec2:DescribeSpotPriceHistory: re-run `spotexec setup` to update the policy)"
+		return " (comparing Spot prices needs ec2:DescribeRegions, ec2:DescribeSpotPriceHistory and, for vcpus, ec2:DescribeInstanceTypes: re-run `spotexec setup` to update the policy)"
 	}
 	return ""
 }

@@ -143,7 +143,7 @@ and keeps a working key. --rotate replaces the key.
 							regions = append(regions, rg)
 						}
 						// The whole fleet may land in any one of them.
-						need[rg] += r.MaxInstances * provider.VCPUsOf(r.InstanceTypes[0])
+						need[rg] += r.MaxInstances * provider.VMVCPUs(r)
 						ownNet[rg] = ownNet[rg] || r.SubnetID != ""
 					}
 				}

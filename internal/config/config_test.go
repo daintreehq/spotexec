@@ -310,3 +310,110 @@ func TestDepsLockfilePatternsValidated(t *testing.T) {
 		}
 	}
 }
+
+func TestInstanceRequirements(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nvcpus = 8\nmin_memory_gib = 32\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := g.Runners["aws"]
+	if !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.Arch != "amd64" || r.MinGeneration != DefaultMinGeneration || r.LaunchOrder != LaunchCheapest {
+		t.Fatalf("vcpus runner: %+v", r)
+	}
+	g, err = loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nvcpus = 8\narch = \"arm64\"\ninstance_types = [\"m*g*\", \"c7g.2xlarge\"]\nexclude_instance_types = [\"*d.*\"]\nmin_generation = 7\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := g.Runners["aws"]; r.Arch != "arm64" || r.MinGeneration != 7 {
+		t.Fatalf("patterns: %+v", r)
+	}
+	// A fixed list keeps its default order, derived arch and default types.
+	g, err = loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := g.Runners["aws"]; r.ByRequirements() || len(r.InstanceTypes) != 3 || r.MinGeneration != 0 {
+		t.Fatalf("default: %+v", r)
+	}
+	for name, body := range map[string]string{
+		"pattern without vcpus":     "instance_types = [\"c7a.*\"]\n",
+		"memory without vcpus":      "min_memory_gib = 32\n",
+		"generation without vcpus":  "min_generation = 7\n",
+		"exclusions without vcpus":  "exclude_instance_types = [\"m5*\"]\n",
+		"negative vcpus":            "vcpus = -1\n",
+		"negative memory":           "vcpus = 8\nmin_memory_gib = -1\n",
+		"nan memory":                "vcpus = 8\nmin_memory_gib = nan\n",
+		"infinite memory":           "vcpus = 8\nmin_memory_gib = inf\n",
+		"mixed arch":                "vcpus = 8\narch = \"amd64\"\ninstance_types = [\"c7g.2xlarge\"]\n",
+		"bad pattern":               "vcpus = 8\ninstance_types = [\"c7a.[2]xlarge\"]\n",
+		"bad launch order":          "launch_order = \"random\"\n",
+		"listed without types":      "vcpus = 8\nlaunch_order = \"listed\"\n",
+		"listed list with no types": "instance_types = []\nvcpus = 4\nlaunch_order = \"listed\"\n",
+	} {
+		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\n"+body); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestMatchType(t *testing.T) {
+	for _, c := range []struct {
+		p, t string
+		ok   bool
+	}{
+		{"m7a.2xlarge", "m7a.2xlarge", true}, {"m7a.2xlarge", "m7a.4xlarge", false},
+		{"m*", "m7a.2xlarge", true}, {"m*", "c7a.2xlarge", false}, {"*7*", "r7iz.2xlarge", true},
+		{"c7a.*", "c7a.large", true}, {"*.2xlarge", "c7a.4xlarge", false}, {"a*a", "a", false}, {"m*g.*", "m7g.large", true},
+		{"*n.*", "m7a.2xlarge", false}, {"*n.*", "c6in.large", true}, {"*7*a*", "m7a.large", true}, {"*a*7*", "m7a.large", false},
+		{"m**a.*", "m7a.large", true}, {"m*x*z", "m7a.2xlarge", false},
+	} {
+		if got := MatchType(c.p, c.t); got != c.ok {
+			t.Errorf("MatchType(%q, %q) = %v", c.p, c.t, got)
+		}
+	}
+}
+
+// A project switches how types are chosen: requirements replace an
+// inherited list, and a list replaces inherited requirements.
+func TestProjectRequirementsReplaceTypes(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\ninstance_types = [\"c7a.2xlarge\", \"m7a.2xlarge\"]\nlaunch_order = \"listed\"\n[runners.req]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nvcpus = 8\nmin_memory_gib = 16\nexclude_instance_types = [\"m5*\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte(`version = 1
+[runners.big]
+extends = "aws"
+vcpus = 8
+min_memory_gib = 32
+[runners.listed]
+extends = "req"
+instance_types = ["c7a.2xlarge"]
+[runners.narrow]
+extends = "req"
+min_memory_gib = 32
+`), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Global: g, Project: p}
+	if err := c.MergeProjectRunners(); err != nil {
+		t.Fatal(err)
+	}
+	if r := c.Global.Runners["big"]; !r.ByRequirements() || len(r.InstanceTypes) != 0 || r.MinMemoryGiB != 32 || r.LaunchOrder != LaunchCheapest {
+		t.Fatalf("big: %+v", r)
+	}
+	if r := c.Global.Runners["listed"]; r.ByRequirements() || r.MinGeneration != 0 || len(r.ExcludeInstanceTypes) != 0 || r.InstanceTypes[0] != "c7a.2xlarge" {
+		t.Fatalf("listed: %+v", r)
+	}
+	if r := c.Global.Runners["narrow"]; r.VCPUs != 8 || r.MinMemoryGiB != 32 || len(r.ExcludeInstanceTypes) != 1 {
+		t.Fatalf("narrow: %+v", r)
+	}
+	// The merged runners own their lists.
+	c.Global.Runners["listed"].InstanceTypes[0] = "x"
+	c.Global.Runners["narrow"].ExcludeInstanceTypes[0] = "x"
+	if g.Runners["aws"].InstanceTypes[0] != "c7a.2xlarge" || g.Runners["req"].ExcludeInstanceTypes[0] != "m5*" || len(g.Runners["req"].InstanceTypes) != 0 {
+		t.Fatal("base runner must not be modified")
+	}
+}
