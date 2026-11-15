@@ -70,6 +70,10 @@ takes part in scheduling, and every VM shuts itself down.
      minutes pass, so queued jobs wait for the running VMs. With no VM
      running and no static runner in the pool, the job fails at once with
      the quota increase command.
+   - A launch that finds every Spot price above `max_price` holds back
+     launches for the jobs already waiting the same way, and with no VM
+     running the job fails at once, naming the cap and the cheapest
+     current price. A job that starts later checks the prices again.
 4. **Wait.** Tickets near the head of the queue probe instances about every
    0.5-2.5s (the head most often) until a slot frees or `queue_timeout`
    expires.

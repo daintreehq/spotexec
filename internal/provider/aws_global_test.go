@@ -767,11 +767,37 @@ func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
 	}}
 	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
 	g.r.MaxPrice = "0.04"
-	if _, err := g.Launch(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "above max_price") {
+	_, err := g.Launch(context.Background(), t.Logf)
+	// Typed, so a run with no VM to wait for fails at once naming it.
+	var pe *PriceCapError
+	if !errors.As(err, &pe) || pe.Cheapest.Zone != "r-one-1a" || !strings.Contains(err.Error(), "above max_price 0.04 (cheapest: $0.05/h") {
 		t.Fatalf("err = %v", err)
 	}
 	if runs := f.callsOf("RunInstances"); len(runs) != 0 {
 		t.Fatalf("launched above max_price: %v", runs)
+	}
+	// A region that couldn't be priced just now may be under the cap:
+	// not a lasting verdict.
+	f.mu.Lock()
+	f.priceErr = map[string]string{"r-three-1": "RequestLimitExceeded"}
+	f.mu.Unlock()
+	gu := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
+	gu.r.MaxPrice = "0.04"
+	if _, err := gu.Launch(context.Background(), t.Logf); err == nil || errors.As(err, &pe) {
+		t.Fatalf("with a region unpriced: %v", err)
+	}
+	f.mu.Lock()
+	f.priceErr = nil
+	f.mu.Unlock()
+	// With launch_order = "listed", the first option isn't the cheapest:
+	// the error still names the cheapest.
+	fl := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.10"}, {"r-one-1b", "c6a.2xlarge", "0.02"}},
+	}}
+	gl := newGlobalEnv(t, fl, "r-one-1", "r-two-1")
+	gl.r.MaxPrice, gl.r.LaunchOrder = "0.01", config.LaunchListed
+	if _, err := gl.Launch(context.Background(), t.Logf); !errors.As(err, &pe) || pe.Cheapest.Type != "c6a.2xlarge" {
+		t.Fatalf("listed order: %v", err)
 	}
 	// At the cap is fine.
 	g2 := newGlobalEnv(t, f, "r-one-1", "r-two-1")
@@ -785,8 +811,8 @@ func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
 	f.mu.Unlock()
 	g3 := newGlobalEnv(t, f, "r-one-1", "r-two-1")
 	g3.r.MaxPrice = "0.05"
-	if _, err := g3.Launch(context.Background(), t.Logf); err == nil {
-		t.Fatal("fell back above max_price")
+	if _, err := g3.Launch(context.Background(), t.Logf); err == nil || errors.As(err, &pe) {
+		t.Fatalf("fell back above max_price, or blamed the cap for a capacity refusal: %v", err)
 	}
 	if runs := f.callsOf("RunInstances"); len(runs) != 1 || !strings.HasPrefix(runs[0], "r-one-1 ") {
 		t.Fatalf("runs %v", runs)

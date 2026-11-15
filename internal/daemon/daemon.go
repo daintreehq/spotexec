@@ -587,10 +587,11 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string) {
 		in, err := fl.pool.ProvisionHeld(pctx, id, nil)
 		if err != nil {
 			d.action("%s: launch failed: %v", fl.r.Name, err)
-			// A quota refusal says nothing about the fleet's health; the pool
-			// holds further launches back until there is room.
+			// A quota or max_price refusal says nothing about the fleet's
+			// health; the pool holds further launches back for a while.
 			var qe *provider.QuotaError
-			if !errors.As(err, &qe) {
+			var pe *provider.PriceCapError
+			if !errors.As(err, &qe) && !errors.As(err, &pe) {
 				d.countFailure(fl, "") // a launch that never became usable
 			}
 			return

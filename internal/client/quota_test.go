@@ -155,6 +155,82 @@ func TestAcquireFailsPromptlyOnQuotaWithNoVMs(t *testing.T) {
 	}
 }
 
+func priceCapErr() error {
+	return &provider.PriceCapError{Where: "all enabled regions", MaxPrice: "0.001",
+		Cheapest: provider.SpotPrice{Region: "us-east-2", Zone: "us-east-2a", Type: "c7a.2xlarge", Price: "0.016400"}}
+}
+
+// Every Spot price above max_price, and no VM to wait for: the run fails
+// at once, naming the cap and the cheapest price, not with a queue timeout.
+func TestAcquireFailsPromptlyOnPriceCapWithNoVMs(t *testing.T) {
+	_, f := testPool(t, 4)
+	f.fail = priceCapErr()
+	f.r.Type = config.TypeAWSSpot
+	old := newProvider
+	newProvider = func(*config.Runner) (provider.Provider, error) { return f, nil }
+	t.Cleanup(func() { newProvider = old })
+
+	start := time.Now()
+	_, err := Acquire(context.Background(), AcquireRequest{Pool: []*config.Runner{f.r}, QueueTimeout: time.Minute, Rep: nopRep{}})
+	WaitLaunches(5 * time.Second)
+	if err == nil || strings.Contains(err.Error(), protocol.CodeQueueTimeout) {
+		t.Fatalf("want the price cap, got %v", err)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("took %s to fail: should be prompt", took)
+	}
+	for _, want := range []string{"above max_price 0.001", "cheapest: $0.016400/h for c7a.2xlarge in us-east-2a"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %q: %v", want, err)
+		}
+	}
+}
+
+// With a VM running, a price-cap refusal holds launches like a quota
+// refusal (the run queues for the VM), and says why.
+func TestPriceCapHoldsLaunchesWhileVMsRun(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 4)
+	ids, _ := p.Reserve(ctx, 1)
+	in, err := p.Provision(ctx, ids[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Observe(in.ID, OutBusy, in.LaunchedAt)
+	f.fail = priceCapErr()
+	ids, _ = p.Reserve(ctx, 1)
+	if _, err := p.Provision(ctx, ids[0], nil); err == nil {
+		t.Fatal("expected a price-cap refusal")
+	}
+	_ = p.with(func(st *poolState) error {
+		st.BackoffUntil = time.Time{}
+		st.QuotaAt = time.Now().Add(-2 * launchBackoff)
+		st.ListedAt = time.Time{}
+		return nil
+	})
+	d := planOnce(t, p)
+	if d.Launch || d.QuotaErr == "" || !strings.Contains(d.Reason, "above max_price") {
+		t.Fatalf("launch planned despite the price cap: %+v", d)
+	}
+	// A run that starts later tries once more (max_price may have been
+	// raised), even with VMs running; a quota refusal would hold it.
+	later := NewPool(p.R, f)
+	later.since = time.Now()
+	if d := planOnce(t, later); !d.Launch || d.QuotaErr != "" {
+		t.Fatalf("a new run is still held by an old price-cap verdict: %+v", d)
+	}
+	_ = p.with(func(st *poolState) error { st.Launches = st.Launches[:len(st.Launches)-1]; return nil })
+	// A later quota refusal says quota again.
+	f.fail = quotaErr()
+	_ = p.with(func(st *poolState) error { st.QuotaErr = ""; return nil })
+	ids, _ = p.Reserve(ctx, 1)
+	_, _ = p.Provision(ctx, ids[0], nil)
+	_ = p.with(func(st *poolState) error { st.BackoffUntil = time.Time{}; return nil })
+	if d := planOnce(t, p); !strings.Contains(d.Reason, "vCPU quota") {
+		t.Fatalf("reason %q", d.Reason)
+	}
+}
+
 // downStatic is a static runner that never answers.
 type downStatic struct{ r *config.Runner }
 

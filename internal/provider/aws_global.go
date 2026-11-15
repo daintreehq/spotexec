@@ -1345,8 +1345,13 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		}
 		return Instance{}, quota
 	}
-	if len(tried) == 0 && maxPrice > 0 && t.Prices[0].USD() > maxPrice {
-		return Instance{}, fmt.Errorf("every Spot price in %s is above max_price %s (cheapest: $%s/h for %s in %s)", g.Where(), g.r.MaxPrice, t.Prices[0].Price, t.Prices[0].Type, t.Prices[0].Zone)
+	// (Prices[0] is first in launch order, not always the cheapest.)
+	if cheapest := cheapestOf(t.Prices); len(tried) == 0 && maxPrice > 0 && len(t.Prices) > 0 && cheapest.USD() > maxPrice {
+		pe := &PriceCapError{Where: g.Where(), MaxPrice: g.r.MaxPrice, Cheapest: cheapest}
+		if otherFailure { // e.g. a region unpriced just now: may be under the cap
+			return Instance{}, errors.New(pe.Error())
+		}
+		return Instance{}, pe
 	}
 	if len(tried) == 0 {
 		return Instance{}, fmt.Errorf("every Spot option in %s is cooling down after recent capacity or quota failures; retry in a few minutes (`spotexec prices %s` shows them)", g.Where(), g.r.Name)
