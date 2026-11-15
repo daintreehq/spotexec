@@ -285,7 +285,8 @@ func (s *Session) watchdog() {
 			// The helper sent something since onSilent was asked: that
 			// silence is over. Drop its grace, so a later one is noticed
 			// as quickly as the first, and ask afresh then.
-			if asked && s.seen.Load() != askedAt {
+			seen := s.seen.Load() // before judging the silence: progress after it rearms
+			if asked && seen != askedAt {
 				s.limit.Store(int64(base))
 				asked = false
 			}
@@ -294,7 +295,7 @@ func (s *Session) watchdog() {
 				continue
 			}
 			if f := s.onSilent.Load(); f != nil && !asked {
-				asked, askedAt = true, s.seen.Load()
+				asked, askedAt = true, seen
 				if grace := (*f)(silent); grace > 0 {
 					s.limit.Store(int64(base + grace))
 					continue

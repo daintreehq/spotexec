@@ -47,26 +47,24 @@ func TestSilentHelperGrace(t *testing.T) {
 func TestSilentHelperGraceResets(t *testing.T) {
 	e := newFakeEnv(t)
 	short(t, &SilenceLimit, time.Second)
-	e.Set("rpc-pulse", "1800") // silent 1.8s (past the limit, within the grace), one heartbeat, then silent
+	e.Set("rpc-pulse", "") // silent; one heartbeat once rpc-pulse-go exists; silent again
 	s := e.session(t)
 	var asked atomic.Int32
 	s.SetOnSilent(func(time.Duration) time.Duration {
 		if asked.Add(1) == 1 {
+			e.Set("rpc-pulse-go", "") // the helper recovers during its grace
 			return 3 * time.Second
 		}
 		return 0
 	})
 	_ = s.Conn.Send(protocol.TypeAcquire, protocol.Acquire{RepoID: "r", Wait: true})
-	start := time.Now()
-	_, err := s.Expect(context.Background(), protocol.TypeAcquired)
-	took := time.Since(start)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := s.Expect(ctx, protocol.TypeAcquired)
+	// A grace kept from the first silence would give up only at 1s+3s,
+	// without asking again.
 	if !IsConnError(err) || !strings.Contains(err.Error(), "nothing for 1s") {
 		t.Fatalf("want a stopped-responding error at the plain limit, got %v", err)
-	}
-	// The heartbeat at 1.8s, then the plain 1s limit: about 2.8s. A grace
-	// kept from the first silence would hold on to 1.8s+4s.
-	if took < 2500*time.Millisecond || took > 4500*time.Millisecond {
-		t.Fatalf("gave up after %s, want about 2.8s", took)
 	}
 	if n := asked.Load(); n != 2 {
 		t.Fatalf("hook asked %d times, want twice (once per silence)", n)

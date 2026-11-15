@@ -95,12 +95,9 @@ func TestHelperShutdownIsANotice(t *testing.T) {
 		lost string
 	}{
 		"helper error":  {&InfraError{Err: fmt.Errorf("lost runner aws during execution: %w", shutdown)}, lostRunner(lease, shutdown)},
-		"killed result": {infra(&shutdownError{"aws#1", 143}), shutdownRunner(lease)},
+		"killed result": {shutdownErr("aws#1", 143), shutdownRunner(lease)},
 	} {
-		if !vmShutdown(c.err) {
-			t.Fatalf("%s: %v not recognised as a shutdown", name, c.err)
-		}
-		res := Result{noReplay: whyNoReplay(lease, vmShutdown(c.err))}
+		res := Result{noReplay: replayVerdict(lease, false, c.err)}
 		if res.noReplay.code != "" {
 			t.Fatalf("%s: a shutdown on a running VM withheld the replay: %q (%q)", name, res.noReplay.code, res.noReplay.why)
 		}
@@ -115,7 +112,7 @@ func TestHelperShutdownIsANotice(t *testing.T) {
 			t.Errorf("%v counted as a shutdown", e)
 		}
 	}
-	if got := whyNoReplay(lease, vmShutdown(io.EOF)); got.code != "RUNNER_UNRESPONSIVE" {
+	if got := replayVerdict(lease, false, io.EOF); got.code != "RUNNER_UNRESPONSIVE" {
 		t.Fatalf("a dropped connection on a running VM: %q, want RUNNER_UNRESPONSIVE", got.code)
 	}
 }
@@ -151,6 +148,9 @@ func TestNoticeOutranksMemoryPressure(t *testing.T) {
 		if got.code != c.code {
 			t.Errorf("%s noticed=%v under pressure: %q (%q), want %q", c.id, c.noticed, got.code, got.why, c.code)
 		}
+		if retry, _, _ := replayable(c.id, Result{noReplay: got}, Options{RetryPreempt: true, Sync: "auto"}, false, 1); retry != c.noticed {
+			t.Errorf("%s noticed=%v under pressure: replayed %v", c.id, c.noticed, retry)
+		}
 	}
 }
 
@@ -175,7 +175,7 @@ func TestOOMMessage(t *testing.T) {
 	}
 	// Outside the pool the kill came from the container's own limit or from
 	// the whole VM running out (--exclusive, one slot, no pool).
-	if m := oomMessage(0); !strings.Contains(m, "container.options") || !strings.Contains(m, "whole VM") {
+	if m := oomMessage(0); !strings.Contains(m, "container.options") || !strings.Contains(m, "--cgroup-parent") || !strings.Contains(m, "whole VM") || !strings.Contains(m, "Raise that limit") {
 		t.Errorf("outside the pool: %q", m)
 	}
 }

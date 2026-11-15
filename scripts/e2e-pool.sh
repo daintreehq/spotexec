@@ -151,8 +151,8 @@ ID=$(grep '"placed"' "$WORK/h.err" | sed 's/.*instance_id":"\([^"]*\)".*/\1/' | 
 docker exec "$ID" sh -c 'touch /var/tmp/spotexec/sim/stopping; pkill -TERM -f halt-marker'
 wait $P; code=$?
 docker rm -f "$ID" >/dev/null 2>&1
-check "no notice reached the client" "! grep -q spot_interruption $WORK/h.err"
-check "halted run replayed and succeeded on attempt 2" "[ $code = 0 ] && grep -q 'finished attempt=2' $WORK/h.out && grep -q RUNNER_LOST $WORK/h.err && ! grep -q RUNNER_UNRESPONSIVE $WORK/h.err"
+check "no notice reached the client" "test -s \"$WORK/h.err\" && ! grep -q spot_interruption \"$WORK/h.err\""
+check "halted run replayed and succeeded on attempt 2" "[ $code = 0 ] && grep -q 'finished attempt=2' \"$WORK/h.out\" && grep -q RUNNER_LOST \"$WORK/h.err\" && ! grep -q RUNNER_UNRESPONSIVE \"$WORK/h.err\""
 
 echo "== rebalance recommendation is advisory (real EC2 sends it at boot)"
 "$SX" -q true
