@@ -35,6 +35,7 @@ type runFlags struct {
 	quiet         bool
 	eventsFile    string
 	noDeps        bool
+	noSetup       bool
 	forceLarge    bool
 	fallbackLocal bool
 	noBoot        bool
@@ -61,6 +62,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.BoolVarP(&f.quiet, "quiet", "q", false, "warnings only: no progress or summary")
 	fs.StringVar(&f.eventsFile, "events-file", "", "also append NDJSON events to this file")
 	fs.BoolVar(&f.noDeps, "no-deps", false, "skip dependency hydration")
+	fs.BoolVar(&f.noSetup, "no-setup", false, "skip the project's [setup] step")
 	fs.BoolVar(&f.forceLarge, "force-large-sync", false, "allow syncing more than 100k files / 5 GiB")
 	fs.BoolVar(&f.fallbackLocal, "fallback-local", false, "run locally if no runner is available")
 	fs.BoolVar(&f.noBoot, "no-boot", false, "never provision ephemeral runners for this command")
@@ -335,6 +337,7 @@ type runSpec struct {
 	priority   int
 	preferLast bool
 	syncOnly   bool
+	noSetup    bool              // the task opts out of [setup]
 	env        map[string]string // set for the command (a shard's number)
 	waitPush   bool              // container build: push a fresh image before returning
 }
@@ -364,6 +367,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 		Command: s.command, Display: s.display, Timeout: p.Timeout.Duration, Grace: p.Grace.Duration,
 		QueueTimeout: p.QueueTimeout.Duration, Sync: p.Sync.Mode, Writeback: p.Sync.Writeback,
 		Pool: f.pool, Exclusive: f.exclusive || s.exclusive, Pull: f.pull, NoDeps: f.noDeps,
+		NoSetup:        f.noSetup || s.noSetup,
 		ForceLargeSync: f.forceLarge, Stdout: stdout, Stderr: stderr, Rep: rep, Interrupt: intr,
 		Label: s.label, RetryPreempt: !f.noRetry, NoBoot: f.noBoot,
 		PreferLast: s.preferLast, SyncOnly: s.syncOnly, WaitPush: s.waitPush, Priority: s.priority,
@@ -525,6 +529,7 @@ type taskPart struct {
 	shard, shards int    // 1-based; 0 when not sharded
 	t             *config.Task
 	args          []string
+	noSetup       bool // the task, or the parallel task it is part of, sets setup = false
 }
 
 // taskParts expands a task into the runs it fans out to: each task of a
@@ -537,18 +542,21 @@ func taskParts(p *config.Project, name string, args []string) []taskPart {
 	}
 	var parts []taskPart
 	for _, sub := range t.Parallel {
-		parts = append(parts, shardParts(sub, p.Tasks[sub], nil)...)
+		for _, pt := range shardParts(sub, p.Tasks[sub], nil) {
+			pt.noSetup = pt.noSetup || t.SkipsSetup()
+			parts = append(parts, pt)
+		}
 	}
 	return parts
 }
 
 func shardParts(name string, t *config.Task, args []string) []taskPart {
 	if t.Shards == 0 {
-		return []taskPart{{name: name, label: name, t: t, args: args}}
+		return []taskPart{{name: name, label: name, t: t, args: args, noSetup: t.SkipsSetup()}}
 	}
 	parts := make([]taskPart, t.Shards)
 	for i := range parts {
-		parts[i] = taskPart{name: name, label: fmt.Sprintf("%s %d/%d", name, i+1, t.Shards), shard: i + 1, shards: t.Shards, t: t, args: args}
+		parts[i] = taskPart{name: name, label: fmt.Sprintf("%s %d/%d", name, i+1, t.Shards), shard: i + 1, shards: t.Shards, t: t, args: args, noSetup: t.SkipsSetup()}
 	}
 	return parts
 }
@@ -564,7 +572,7 @@ func (pt taskPart) spec(l *loaded) runSpec {
 	}
 	cmd := buildTaskLine(l, run, pt.args)
 	t := pt.t
-	return runSpec{label: pt.label, command: cmd, display: pt.label + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool, priority: t.Priority, env: env}
+	return runSpec{label: pt.label, command: cmd, display: pt.label + ": " + cmd, timeout: t.Timeout.Duration, sync: t.Sync, exclusive: t.Exclusive, pool: t.Pool, priority: t.Priority, env: env, noSetup: pt.noSetup}
 }
 
 // runTask executes a named task (possibly a parallel or sharded fan-out).

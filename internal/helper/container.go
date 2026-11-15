@@ -152,7 +152,7 @@ fi`
 	if left <= 0 {
 		return dockerRunner{}, false, errors.New("no time left to install docker")
 	}
-	pr := s.runProc(script, s.layout.Root, nil, left, 5*time.Second, false)
+	pr := s.runProc(script, s.layout.Root, nil, left, 5*time.Second, false, nil)
 	if pr.code != 0 {
 		return dockerRunner{}, false, fmt.Errorf("installing docker failed (exit %d)", pr.code)
 	}
@@ -201,7 +201,7 @@ func (s *Session) image(m protocol.Image) error {
 		if left <= 0 {
 			return errors.New("image preparation timed out")
 		}
-		pr := s.runProc(script, s.workspace, nil, left, 5*time.Second, false)
+		pr := s.runProc(script, s.workspace, nil, left, 5*time.Second, false, nil)
 		if pr.startErr != nil {
 			return pr.startErr
 		}

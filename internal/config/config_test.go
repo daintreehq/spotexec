@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProjectRunnerExtends(t *testing.T) {
@@ -652,5 +653,57 @@ func TestUnavailableProjectRunnerMasksSameName(t *testing.T) {
 func TestGlobalRejectsExtendsType(t *testing.T) {
 	if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nextends_type = \"sim\"\n"); err == nil || !strings.Contains(err.Error(), "extends_type is for runners in a project") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestSetup(t *testing.T) {
+	load := func(body string) (*Project, error) {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		if err := os.WriteFile(pp, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return LoadProject(pp)
+	}
+	p, err := load(`
+[setup]
+run = "npm run prepare --workspaces --if-present"
+timeout = "3m"
+[tasks.unit]
+run = "vitest"
+[tasks.status]
+run = "git status"
+setup = false
+[tasks.typecheck]
+run = "tsc"
+setup = true
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Setup.Run != "npm run prepare --workspaces --if-present" || p.Setup.Timeout.Duration != 3*time.Minute {
+		t.Errorf("setup %+v", p.Setup)
+	}
+	for name, skips := range map[string]bool{"unit": false, "status": true, "typecheck": false} {
+		if p.Tasks[name].SkipsSetup() != skips {
+			t.Errorf("%s: SkipsSetup = %v", name, !skips)
+		}
+	}
+	if p, err := load("[setup]\nrun = \"x\"\n"); err != nil || p.Setup.Run != "x" || p.Setup.Timeout.Duration != 0 {
+		t.Errorf("setup without a timeout: %+v, %v", p.Setup, err)
+	}
+	if p, err := load("[tasks.a]\nrun = \"x\"\n"); err != nil || p.Setup.Run != "" {
+		t.Errorf("no setup: %+v, %v", p.Setup, err)
+	}
+	for body, want := range map[string]string{
+		"[setup]\n":               "setup.run must be set",
+		"[setup]\nrun = \"  \"\n": "setup.run must be set",
+		"[setup]\nrun = \"x\"\ntimeout = \"0s\"\n":  "setup.timeout must be positive",
+		"[setup]\nrun = \"x\"\ntimeout = \"-1m\"\n": "setup.timeout must be positive",
+		"[setup]\nrun = \"x\"\nonce = true\n":       "unknown keys",
+		"[tasks.a]\nrun = \"x\"\nsetup = \"no\"\n":  "setup",
+	} {
+		if _, err := load(body); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", body, err, want)
+		}
 	}
 }

@@ -77,3 +77,46 @@ func TestShardedTaskParts(t *testing.T) {
 		t.Errorf("plain task: %+v", parts)
 	}
 }
+
+// setup = false on a task skips [setup] for it; on a parallel task, for
+// every part; --no-setup for anything.
+func TestTaskSetupOptOut(t *testing.T) {
+	l := testLoaded()
+	no := false
+	l.cfg.Project.Tasks = map[string]*config.Task{
+		"unit":   {Run: "vitest", Shards: 2},
+		"status": {Run: "git status", Setup: &no},
+		"some":   {Parallel: []string{"unit", "status"}},
+		"quiet":  {Parallel: []string{"unit"}, Setup: &no},
+		"e2e":    {Run: "playwright", Shards: 2, Setup: &no},
+		"mixed":  {Parallel: []string{"e2e", "unit"}},
+	}
+	skips := func(name string) []bool {
+		var got []bool
+		for _, pt := range taskParts(l.cfg.Project, name, nil) {
+			got = append(got, pt.spec(l).noSetup)
+		}
+		return got
+	}
+	for name, want := range map[string][]bool{
+		"unit":   {false, false},
+		"status": {true},
+		"some":   {false, false, true},
+		"quiet":  {true, true},
+		"e2e":    {true, true},
+		"mixed":  {true, true, false, false},
+	} {
+		if got := skips(name); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: noSetup %v, want %v", name, got, want)
+		}
+	}
+	if o := parsed(t).options(l, runSpec{command: "x", noSetup: true}, nil, nil, nil, nil); !o.NoSetup {
+		t.Error("a task's opt-out didn't reach the run")
+	}
+	if o := parsed(t, "--no-setup").options(l, runSpec{command: "x"}, nil, nil, nil, nil); !o.NoSetup {
+		t.Error("--no-setup didn't reach the run")
+	}
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.NoSetup {
+		t.Error("setup skipped by default")
+	}
+}

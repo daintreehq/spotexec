@@ -187,6 +187,14 @@ type Deps struct {
 	Timeout   Duration `toml:"timeout"`
 }
 
+// Setup is [setup]: a command run in the slot (and container) before every
+// command, after the dependency restore, for steps that depend on source
+// rather than lockfiles (building workspace packages, generating code).
+type Setup struct {
+	Run     string   `toml:"run"`
+	Timeout Duration `toml:"timeout"` // default: the command's own timeout
+}
+
 // Task is [tasks.<name>].
 type Task struct {
 	Run       string   `toml:"run"`
@@ -198,7 +206,13 @@ type Task struct {
 	Sync      string   `toml:"sync"`
 	Pool      []string `toml:"pool"`
 	Priority  int      `toml:"priority"`
+	// Setup = false skips [setup] for this task (for a parallel task, for
+	// every task it runs).
+	Setup *bool `toml:"setup"`
 }
+
+// SkipsSetup reports whether the task opts out of [setup].
+func (t *Task) SkipsSetup() bool { return t.Setup != nil && !*t.Setup }
 
 // MaxShards bounds a task's shards: past it, a typo would launch a fleet.
 const MaxShards = 64
@@ -251,6 +265,7 @@ type Project struct {
 	Pool         []string          `toml:"pool"`
 	Sync         Sync              `toml:"sync"`
 	Deps         Deps              `toml:"deps"`
+	Setup        Setup             `toml:"setup"`
 	Container    Container         `toml:"container"`
 	Tasks        map[string]*Task  `toml:"tasks"`
 	Hook         Hook              `toml:"hook"`
@@ -772,6 +787,12 @@ func (p *Project) validate() error {
 	}
 	if _, _, err := depskey.Expand(p.Deps.Lockfiles, nil); err != nil {
 		return err // a malformed or escaping pattern; literal paths are checked when read
+	}
+	if p.md.IsDefined("setup") && strings.TrimSpace(p.Setup.Run) == "" {
+		return errors.New("setup.run must be set when [setup] is present")
+	}
+	if p.Setup.Timeout.Duration < 0 || p.md.IsDefined("setup", "timeout") && p.Setup.Timeout.Duration == 0 {
+		return fmt.Errorf("setup.timeout must be positive (got %s)", p.Setup.Timeout.Duration)
 	}
 	if !oneOf(p.Sync.Source, "", "git", "directory") {
 		return fmt.Errorf("sync.source must be git or directory (got %q)", p.Sync.Source)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/client"
+	"github.com/daintreehq/spotexec/internal/tailbuf"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
 
@@ -34,34 +35,89 @@ func (f *runFlags) fallsBack(l *loaded, o client.Options, res client.Result, err
 // second interrupt kills it at once) and exits 130. Whatever the command
 // leaves running in its group is stopped the same way once it exits.
 // Parts of a parallel task run as slot `slot` of `slots`, so each gets its
-// own SPOTEXEC_SLOT, port range and CPU share.
+// own SPOTEXEC_SLOT, port range and CPU share. The project's [setup] runs
+// first, from the worktree root, the same way: its output is shown only if
+// it fails, and then the command doesn't run.
 func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Options, rep ui.Reporter, slot, slots int) int {
-	shell := "/bin/sh"
-	if p, err := exec.LookPath("bash"); err == nil {
-		shell = p
-	}
-	cmd := exec.Command(shell, "-c", o.Command)
-	cmd.Dir = filepath.Join(l.ws.Root, filepath.FromSlash(l.ws.Cwd))
 	// The command was written for the runner: worktree paths in it were
 	// rewritten to ${SPOTEXEC_WORKSPACE}, which here is the worktree itself
 	// (unset, "rm -rf ${SPOTEXEC_WORKSPACE}/tmp" would mean /tmp).
 	// Defaults, then the project's [env] (which may override them, as on a
 	// runner), then what must hold here.
 	slots = max(slots, 1)
-	cmd.Env = append(os.Environ(), "CI=true", "SPOTEXEC_CPUS="+strconv.Itoa(max(runtime.NumCPU()/slots, 1)), "SPOTEXEC_SLOTS="+strconv.Itoa(slots),
+	env := append(os.Environ(), "CI=true", "SPOTEXEC_CPUS="+strconv.Itoa(max(runtime.NumCPU()/slots, 1)), "SPOTEXEC_SLOTS="+strconv.Itoa(slots),
 		"SPOTEXEC_SLOT="+strconv.Itoa(slot), "SPOTEXEC_PORT_BASE="+strconv.Itoa(20000+slot*1000))
 	for k, v := range l.cfg.Project.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
+		env = append(env, k+"="+v)
 	}
 	for k, v := range o.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
+		env = append(env, k+"="+v)
 	}
-	cmd.Env = append(cmd.Env, "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	env = append(env, "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
 	grace := o.Grace
 	if grace <= 0 {
 		grace = 5 * time.Second
 	}
+	if run, timeout := client.SetupFor(l.cfg.Project, o); run != "" {
+		out := tailbuf.New(64 << 10)
+		r := runLocalProc(ctx, intr, run, l.ws.Root, env, out, out, timeout, grace)
+		switch {
+		case r.err != nil:
+			fmt.Fprintf(os.Stderr, "spotexec: running [setup] locally: %v\n", r.err)
+			return client.ExitInfra
+		case r.canceled:
+			return client.ExitInterrupted
+		case r.timedOut:
+			_, _ = stderrOf(o).Write(out.Bytes())
+			rep.Warn("SETUP_FAILED", "[setup] run exceeded %s and was terminated (raise setup.timeout); the command did not run", timeout)
+			return client.ExitTimeout
+		case r.code != 0:
+			_, _ = stderrOf(o).Write(out.Bytes())
+			rep.Warn("SETUP_FAILED", "[setup] run failed (exit %d); the command did not run. Its output is above; skip the setup with --no-setup or setup = false on a task", r.code)
+			return 1
+		}
+		if ctx.Err() != nil {
+			return client.ExitInterrupted
+		}
+	}
+	r := runLocalProc(ctx, intr, o.Command, filepath.Join(l.ws.Root, filepath.FromSlash(l.ws.Cwd)), env, o.Stdout, o.Stderr, o.Timeout, grace)
+	switch {
+	case r.err != nil:
+		fmt.Fprintf(os.Stderr, "spotexec: running locally: %v\n", r.err)
+		return client.ExitInfra
+	case r.timedOut:
+		rep.Warn("TIMEOUT", "command exceeded %s and was terminated (raise with --timeout)", o.Timeout)
+		return client.ExitTimeout
+	case r.canceled:
+		return client.ExitInterrupted
+	}
+	return r.code
+}
+
+func stderrOf(o client.Options) io.Writer {
+	if o.Stderr == nil {
+		return os.Stderr
+	}
+	return o.Stderr
+}
+
+type localResult struct {
+	code               int
+	timedOut, canceled bool
+	err                error // it could not be started, or its status not read
+}
+
+// runLocalProc runs script under bash in dir, in its own process group,
+// with the timeout and interrupt handling runLocal describes.
+func runLocalProc(ctx context.Context, intr <-chan struct{}, script, dir string, env []string, stdout, stderr io.Writer, timeout, grace time.Duration) localResult {
+	shell := "/bin/sh"
+	if p, err := exec.LookPath("bash"); err == nil {
+		shell = p
+	}
+	cmd := exec.Command(shell, "-c", script)
+	cmd.Dir = dir
+	cmd.Env = env
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Output goes through pipes of our own (unless it's a file already), so
 	// the command's exit is seen at once, not when a background process it
 	// left behind lets go of its output.
@@ -86,8 +142,8 @@ func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Opt
 		}
 	}
 	var err error
-	if cmd.Stdout, err = attach(o.Stdout); err == nil {
-		cmd.Stderr, err = attach(o.Stderr)
+	if cmd.Stdout, err = attach(stdout); err == nil {
+		cmd.Stderr, err = attach(stderr)
 	}
 	if err == nil {
 		err = cmd.Start()
@@ -96,16 +152,15 @@ func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Opt
 	if err != nil {
 		closeAll(readers)
 		copies.Wait()
-		fmt.Fprintf(os.Stderr, "spotexec: running locally: %v\n", err)
-		return client.ExitInfra
+		return localResult{err: err}
 	}
 	pgid := cmd.Process.Pid
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 
 	var timer <-chan time.Time
-	if o.Timeout > 0 {
-		t := time.NewTimer(o.Timeout)
+	if timeout > 0 {
+		t := time.NewTimer(timeout)
 		defer t.Stop()
 		timer = t.C
 	}
@@ -186,25 +241,20 @@ func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Opt
 		}
 	}
 	closeAll(readers)
-	switch {
-	case timedOut:
-		rep.Warn("TIMEOUT", "command exceeded %s and was terminated (raise with --timeout)", o.Timeout)
-		return client.ExitTimeout
-	case canceled:
-		return 130
+	if timedOut || canceled {
+		return localResult{code: 1, timedOut: timedOut, canceled: canceled}
 	}
 	var ee *exec.ExitError
 	switch {
 	case werr == nil:
-		return 0
+		return localResult{}
 	case errors.As(werr, &ee):
 		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			return 128 + int(ws.Signal())
+			return localResult{code: 128 + int(ws.Signal())}
 		}
-		return ee.ExitCode()
+		return localResult{code: ee.ExitCode()}
 	}
-	fmt.Fprintf(os.Stderr, "spotexec: running locally: %v\n", werr)
-	return client.ExitInfra
+	return localResult{err: werr}
 }
 
 func groupAlive(pgid int) bool {

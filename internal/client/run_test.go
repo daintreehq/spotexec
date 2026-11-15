@@ -2,11 +2,13 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/fsid"
@@ -336,5 +338,39 @@ func TestDepsLockfilesMatchSyncedFilesOnly(t *testing.T) {
 	}
 	if len(unmatched) != 1 || unmatched[0] != "vendor/*.lock" {
 		t.Fatalf("unmatched %v", unmatched)
+	}
+}
+
+func TestSetupFor(t *testing.T) {
+	p := &config.Project{}
+	if run, _ := SetupFor(p, Options{Timeout: time.Minute}); run != "" {
+		t.Errorf("no [setup]: %q", run)
+	}
+	p.Setup.Run = "make gen"
+	if run, d := SetupFor(p, Options{Timeout: time.Minute}); run != "make gen" || d != time.Minute {
+		t.Errorf("default timeout: %q %s", run, d)
+	}
+	p.Setup.Timeout.Duration = 2 * time.Minute
+	if run, d := SetupFor(p, Options{Timeout: time.Minute}); run != "make gen" || d != 2*time.Minute {
+		t.Errorf("setup.timeout: %q %s", run, d)
+	}
+	if run, _ := SetupFor(p, Options{NoSetup: true}); run != "" {
+		t.Errorf("--no-setup: %q", run)
+	}
+}
+
+// A failed setup exits 1 whatever its own code (so 125 and 130 never pass
+// for spotexec's own failure or an interrupt), or 124 when it timed out.
+func TestSetupFailureExitCode(t *testing.T) {
+	p := &config.Project{}
+	p.Setup.Run = "make gen"
+	for _, code := range []int{1, 7, 125, 130} {
+		if got, msg := setupFailure(p, Options{}, protocol.Result{ExitCode: code, SetupFailed: true}); got != 1 || !strings.Contains(msg, fmt.Sprintf("exit %d", code)) {
+			t.Errorf("setup exit %d: run exits %d (%s)", code, got, msg)
+		}
+	}
+	got, msg := setupFailure(p, Options{Timeout: 3 * time.Minute}, protocol.Result{ExitCode: 124, TimedOut: true, SetupFailed: true})
+	if got != ExitTimeout || !strings.Contains(msg, "exceeded 3m0s") {
+		t.Errorf("setup timeout: run exits %d (%s)", got, msg)
 	}
 }

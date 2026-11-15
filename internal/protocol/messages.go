@@ -278,6 +278,11 @@ type Exec struct {
 	Skip      []string          `json:"skip"`     // dir names/paths skipped by the post-run walk
 	SpotWatch bool              `json:"spot_watch"`
 	Container *ContainerRun     `json:"container,omitempty"`
+	// SetupRun ([setup] run) runs as its own process, from the workspace
+	// root, before Shell and inside the same snapshot. Its output is held
+	// back and sent (as stderr) only if it fails; then Shell never runs.
+	SetupRun       string `json:"setup_run,omitempty"`
+	SetupTimeoutMS int64  `json:"setup_timeout_ms,omitempty"`
 }
 
 // Started confirms the child was spawned.
@@ -310,6 +315,11 @@ type Result struct {
 	// MemoryLimitMB is the cap of the memory pool the container ran in
 	// (MiB), or 0 when it ran outside it.
 	MemoryLimitMB int64 `json:"memory_limit_mb,omitempty"`
+	// SetupFailed: Exec.SetupRun did not succeed (it failed, timed out, was
+	// canceled or couldn't start), so Shell never ran. ExitCode, Signal,
+	// TimedOut, Canceled, StartError and OOMKilled then describe the setup.
+	SetupFailed bool  `json:"setup_failed,omitempty"`
+	SetupMS     int64 `json:"setup_ms,omitempty"`
 }
 
 // Heartbeat is the body of a helper heartbeat (empty from older helpers):

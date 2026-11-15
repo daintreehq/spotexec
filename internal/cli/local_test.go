@@ -408,3 +408,63 @@ func TestSameSlotAfterParallelTaskUsesTheFirstPart(t *testing.T) {
 		t.Fatalf("record replaced: %+v", lr)
 	}
 }
+
+// The project's [setup] runs first, from the worktree root, quietly; a
+// failed one shows its output and the command never runs.
+func TestRunLocalSetup(t *testing.T) {
+	run := func(setup, command string, o client.Options) (int, string, string) {
+		t.Helper()
+		l := testLoaded()
+		l.ws.Root = t.TempDir()
+		l.ws.Cwd = "sub"
+		os.Mkdir(filepath.Join(l.ws.Root, "sub"), 0o755)
+		l.cfg.Project.Setup.Run = setup
+		rep, _ := ui.New(ui.ModeQuiet, os.Stderr, "")
+		var out lockedBuf
+		o.Command, o.Stdout, o.Stderr, o.Grace = command, &out, &out, 300*time.Millisecond
+		code := runLocal(context.Background(), nil, l, o, rep, 0, 1)
+		return code, out.String(), l.ws.Root
+	}
+	code, out, root := run("echo noisy; mkdir -p dist && echo built > dist/x", "cat ../dist/x", client.Options{})
+	if code != 0 || out != "built\n" {
+		t.Fatalf("exit %d, output %q", code, out)
+	}
+	code, out, root = run("echo why-it-failed; exit 125", "touch ran", client.Options{})
+	if _, err := os.Stat(filepath.Join(root, "sub", "ran")); code != 1 || !strings.Contains(out, "why-it-failed") || err == nil {
+		t.Fatalf("failed setup: exit %d, output %q, command ran: %v", code, out, err == nil)
+	}
+	code, out, _ = run("touch ran-setup; exit 3", "echo command", client.Options{NoSetup: true})
+	if code != 0 || out != "command\n" {
+		t.Fatalf("--no-setup: exit %d, output %q", code, out)
+	}
+	start := time.Now()
+	code, _, root = run("sleep 30", "touch ran", client.Options{Timeout: 300 * time.Millisecond})
+	if _, err := os.Stat(filepath.Join(root, "sub", "ran")); code != client.ExitTimeout || err == nil || time.Since(start) > 5*time.Second {
+		t.Fatalf("setup timeout: exit %d after %s, command ran: %v", code, time.Since(start), err == nil)
+	}
+}
+
+// Ctrl-C during the setup ends the run there (130), even when the setup
+// handles the signal and exits 0.
+func TestRunLocalSetupInterrupted(t *testing.T) {
+	l := testLoaded()
+	l.ws.Root = t.TempDir()
+	l.cfg.Project.Setup.Run = `trap 'exit 0' TERM; sleep 30 & touch ready; wait`
+	rep, _ := ui.New(ui.ModeQuiet, os.Stderr, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if _, err := os.Stat(filepath.Join(l.ws.Root, "ready")); err == nil {
+				break
+			}
+		}
+		cancel()
+	}()
+	var out lockedBuf
+	o := client.Options{Command: "touch ran", Grace: 300 * time.Millisecond, Stdout: &out, Stderr: &out}
+	code := runLocal(ctx, nil, l, o, rep, 0, 1)
+	if _, err := os.Stat(filepath.Join(l.ws.Root, "ran")); code != client.ExitInterrupted || err == nil {
+		t.Fatalf("exit %d, command ran: %v, output %q", code, err == nil, out.String())
+	}
+}

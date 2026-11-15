@@ -17,7 +17,11 @@ import (
 
 	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/tailbuf"
 )
+
+// setupOutputMax is how much of a failed [setup]'s output is shown: its end.
+const setupOutputMax = 64 << 10
 
 func shellPath() (string, []string) {
 	if p, err := exec.LookPath("bash"); err == nil {
@@ -115,8 +119,10 @@ type procResult struct {
 	startErr error
 }
 
-func (s *Session) runProc(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool) procResult {
-	pr := s.runProc1(script, dir, env, timeout, grace, spotWatch)
+// Output goes to the client as frames, or into out when it is set (and
+// nothing reaches the client).
+func (s *Session) runProc(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool, out io.Writer) procResult {
+	pr := s.runProc1(script, dir, env, timeout, grace, spotWatch, out)
 	if s.stopping.Load() {
 		// Shut down under us (SIGTERM/SIGHUP, the VM going away): what ran
 		// was killed by us. Report nothing (no result, no error, no cache
@@ -127,7 +133,7 @@ func (s *Session) runProc(script, dir string, env map[string]string, timeout, gr
 	return pr
 }
 
-func (s *Session) runProc1(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool) procResult {
+func (s *Session) runProc1(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool, out io.Writer) procResult {
 	waitProtected()
 	// Starting a process (and its env file) is atomic with respect to
 	// Shutdown: it either sees the child and kills it, or we see it
@@ -202,7 +208,9 @@ func (s *Session) runProc1(script, dir string, env map[string]string, timeout, g
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := r.Read(buf)
-			if n > 0 {
+			if n > 0 && out != nil {
+				_, _ = out.Write(buf[:n])
+			} else if n > 0 {
 				if werr := s.c.WriteFrame(kind, append([]byte(nil), buf[:n]...)); werr != nil {
 					// Client gone: keep draining so the child never blocks.
 					_, _ = io.Copy(io.Discard, r)
@@ -307,6 +315,27 @@ loop:
 	return res
 }
 
+// cancelQueued reports, without waiting, whether the client canceled the
+// run (or went away) since the last process ended.
+func (s *Session) cancelQueued() bool {
+	if s.clientGone() {
+		return true
+	}
+	for {
+		select {
+		case f, ok := <-s.frames:
+			if !ok {
+				return true
+			}
+			if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeCancel {
+				return true
+			}
+		default:
+			return false
+		}
+	}
+}
+
 // shutdownExit: the exit statuses a shutdown produces (SIGHUP, SIGKILL,
 // SIGTERM). In a container, `docker run` also exits 125 when dockerd stops
 // under it.
@@ -360,50 +389,99 @@ func (s *Session) exec(e protocol.Exec) error {
 			env["SPOTEXEC_MEMORY"] = strconv.FormatInt(mb, 10)
 		}
 	}
-	script := e.Shell
-	if strings.TrimSpace(e.Setup) != "" {
-		script = e.Setup + "\n" + script
-	}
 	start := time.Now()
 	timeout := time.Duration(e.TimeoutMS) * time.Millisecond
 	grace := time.Duration(e.GraceMS) * time.Millisecond
 	if grace <= 0 {
 		grace = 5 * time.Second
 	}
-	runEnv := env
-	cleanup := func() error { return nil }
-	if e.Container != nil {
-		// Inside the project container: runner PATH setup doesn't apply.
-		host, hostEnv, c, err := s.containerScript(e.Container, e.Shell, dir, env)
-		if err != nil {
-			return perr(protocol.CodeImageFailed, "%v", err)
+	// runPhase runs one script (the setup or the command) in dir, on the
+	// runner or in the project container, and removes its container before
+	// returning: one that can't be removed could still be writing into the
+	// workspace. The VM's shutdown can kill the process (or dockerd, under a
+	// container) before this helper is signalled itself: that is a lost
+	// runner, not the script's result. One that finished on its own is
+	// never one.
+	runPhase := func(shell, dir string, timeout time.Duration, out io.Writer) (pr procResult, shutdown, oom bool, err error) {
+		script, runEnv, cleanup := shell, env, func() error { return nil }
+		if strings.TrimSpace(e.Setup) != "" {
+			script = e.Setup + "\n" + script
 		}
-		script, runEnv, cleanup = host, hostEnv, c
+		if e.Container != nil {
+			// Inside the project container: runner PATH setup doesn't apply.
+			host, hostEnv, c, err := s.containerScript(e.Container, shell, dir, env)
+			if err != nil {
+				return pr, false, false, perr(protocol.CodeImageFailed, "%v", err)
+			}
+			script, runEnv, cleanup = host, hostEnv, c
+		}
+		pr = s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch, out)
+		shutdown = pr.startErr == nil && !pr.timedOut && shutdownExit(pr.code, e.Container != nil) && systemStopping()
+		if err := cleanup(); err != nil {
+			if shutdown {
+				// dockerd went away with the VM: the run was cut short, not failed.
+				return pr, true, false, perr(protocol.CodeShutdown, "the runner is shutting down: %v", err)
+			}
+			return pr, false, false, perr(protocol.CodeImageFailed, "%v; refusing to collect results from a workspace it may still be modifying", err)
+		}
+		if e.Container != nil && pr.startErr == nil && pr.code != 0 && !pr.timedOut && !pr.canceled && !shutdown {
+			oom = s.containerOOMKilled()
+		}
+		return pr, shutdown, oom, nil
 	}
-	pr := s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch)
-	// The container must be gone before we snapshot the workspace: a
-	// container we can't remove could still be writing into it.
-	// The VM's shutdown can kill the command (or dockerd, under a container)
-	// before this helper is signalled itself: that is a lost runner, not the
-	// command's result. A command that finished on its own is never one.
-	shutdown := pr.startErr == nil && !pr.timedOut && shutdownExit(pr.code, e.Container != nil) && systemStopping()
-	if err := cleanup(); err != nil {
-		if shutdown {
-			// dockerd went away with the VM: the run was cut short, not failed.
-			return perr(protocol.CodeShutdown, "the runner is shutting down: %v", err)
+	var (
+		pr            procResult
+		shutdown, oom bool
+		setupFailed   bool
+		setupMS       int64
+		err           error
+	)
+	// The setup runs from the workspace root, inside the same snapshot as
+	// the command, so what it changes is collected like the command's
+	// changes. Its output is kept back unless it fails.
+	if strings.TrimSpace(e.SetupRun) != "" {
+		out := tailbuf.New(setupOutputMax)
+		t := time.Now()
+		pr, shutdown, oom, err = runPhase(e.SetupRun, s.workspace, time.Duration(e.SetupTimeoutMS)*time.Millisecond, out)
+		if err != nil {
+			return err
 		}
-		return perr(protocol.CodeImageFailed, "%v; refusing to collect results from a workspace it may still be modifying", err)
+		setupMS = time.Since(t).Milliseconds()
+		setupFailed = pr.startErr != nil || pr.code != 0 || pr.timedOut || pr.canceled || shutdown
+		if setupFailed && !pr.canceled && !shutdown {
+			for b := out.Bytes(); len(b) > 0; {
+				n := min(len(b), 32<<10)
+				if err := s.c.WriteFrame(protocol.KindStderr, b[:n]); err != nil {
+					break
+				}
+				b = b[n:]
+			}
+		}
+		// A cancel (or the client going) after the setup ended, while its
+		// processes were reaped, must not let the command start at all.
+		if !setupFailed && s.cancelQueued() {
+			pr.canceled, setupFailed = true, true
+		}
+		if !setupFailed {
+			_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "setup_done", Message: fmt.Sprintf("%dms", setupMS)})
+		}
+	}
+	if !setupFailed {
+		pr, shutdown, oom, err = runPhase(e.Shell, dir, timeout, nil)
+		if err != nil {
+			return err
+		}
 	}
 	res := protocol.Result{
 		ExitCode: pr.code, Signal: pr.signal, TimedOut: pr.timedOut, Canceled: pr.canceled,
 		Interrupted: pr.spotIntr || s.interrupted.Load(), DurationMS: time.Since(start).Milliseconds(),
-		Shutdown: shutdown,
+		Shutdown: shutdown, SetupFailed: setupFailed, SetupMS: setupMS,
 	}
 	if pr.startErr != nil {
 		res.StartError = pr.startErr.Error()
 	}
-	if e.Container != nil && pr.startErr == nil && pr.code != 0 && !pr.timedOut && !pr.canceled && !shutdown {
-		res.OOMKilled, res.MemoryLimitMB = s.containerOOMKilled(), s.memLimit>>20
+	if oom {
+		res.OOMKilled, res.MemoryLimitMB = true, s.memLimit>>20
 	}
 	// Nothing of a run the shutdown killed is collected (and the slot stays
 	// marked dirty): report it before anything else can fail.
