@@ -442,6 +442,20 @@ func TestUsableRunnersMatchesRun(t *testing.T) {
 	if res, raw := runHook(t, ev); res.H.Updated != nil || res.System == "" {
 		t.Fatalf("root config has no usable runner: %s", raw)
 	}
+	// A committed fleet built on a runner this machine lacks doesn't stop
+	// commands that don't use it; a pool that names it stays local (#66).
+	fleet := projectDir(t, "[runners.aws-big]\nextends = \"aws\"\nmax_slots = 1\n")
+	ev["cwd"], ev["session_id"] = fleet, "f1"
+	if res, raw := runHook(t, ev); res.H.Updated == nil {
+		t.Fatalf("an unused unavailable fleet should still offload: %s", raw)
+	}
+	fleet = projectDir(t, "pool = [\"aws-big\"]\n[runners.aws-big]\nextends = \"aws\"\n")
+	ev["cwd"], ev["session_id"] = fleet, "f2"
+	if res, raw := runHook(t, ev); res.H.Updated != nil || !strings.Contains(res.System+raw, "aws-big") {
+		t.Fatalf("a pool of an unavailable fleet should stay local and say why: %s", raw)
+	}
+	ev["cwd"], ev["session_id"] = root, "n1"
+
 	// A nested repository without a .spotexec.toml runs with the defaults.
 	lib := filepath.Join(root, "vendor", "lib")
 	os.MkdirAll(lib, 0o755)

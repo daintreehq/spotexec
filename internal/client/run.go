@@ -245,8 +245,12 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	p := cfg.Project
 	runID := att.runID
 
+	// Returning to the last slot needs only that runner: a default pool this
+	// machine can't use, such as a project fleet built on a runner it lacks,
+	// mustn't block it. A pool given with --runner/--pool (LastWithin) still
+	// has to be valid.
 	pool, err := cfg.Pool(o.Pool)
-	if err != nil {
+	if err != nil && (!o.PreferLast && !o.SameSlot || len(o.LastWithin) > 0) {
 		return res, infra(err), ""
 	}
 

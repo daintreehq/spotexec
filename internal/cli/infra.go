@@ -540,6 +540,9 @@ func cmdDoctor() *cobra.Command {
 					src = l.cfg.Project.Path
 				}
 				check("project config", true, src)
+				for _, n := range l.cfg.UnavailableNames() {
+					warn("runner "+n, l.cfg.Unavailable[n].Error())
+				}
 				check("workspace", true, fmt.Sprintf("%s (repo id %s)", l.ws.Root, l.ws.RepoID))
 				doctorContainer(l, args, check, warn)
 			} else {
