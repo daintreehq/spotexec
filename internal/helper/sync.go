@@ -152,7 +152,11 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		if _, ok := want[p]; ok || !pending[p] || underAny(p, m.Protect) {
 			continue // only what a run created here, and never a synced file
 		}
-		full, err := fsid.SafeJoin(s.workspace, p)
+		if _, err := fsid.SlotRel(p); err != nil {
+			continue // never a file a run made here (inside .git, or not a path)
+		}
+		// A name no client could use (.Git) goes too.
+		full, err := fsid.SlotJoin(s.workspace, p)
 		if err != nil {
 			if !gonePath(err) {
 				keep = append(keep, p) // can't tell: try again next sync
@@ -368,7 +372,7 @@ func removeEmptyDirs(root string, dirs []string, protect []string) {
 			continue
 		}
 		// Never act through a symlinked ancestor, and only ever rmdir.
-		full, err := fsid.SafeJoin(root, d)
+		full, err := fsid.SlotJoin(root, d)
 		if err != nil {
 			continue
 		}
@@ -398,7 +402,10 @@ func (s *Session) pendingAfter(created []protocol.Entry, unverified, more []stri
 		if _, ok := s.stored[p]; ok {
 			continue
 		}
-		full, err := fsid.SafeJoin(s.workspace, p)
+		if _, err := fsid.SlotRel(p); err != nil {
+			continue // never a file a run made here
+		}
+		full, err := fsid.SlotJoin(s.workspace, p)
 		if err != nil {
 			if !gonePath(err) {
 				set[p] = true // can't tell (permissions): keep it

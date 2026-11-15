@@ -488,10 +488,10 @@ func (s *Session) exec(e protocol.Exec) error {
 	if e.Snapshot && !shutdown {
 		t := time.Now()
 		post := s.takeSnapshot(e.Skip)
-		var overflow []string
-		res.Changed, res.Deleted, res.Created, res.Truncated, res.Unverified, overflow = s.diff(pre, post)
+		var unreported []string
+		res.Changed, res.Deleted, res.Created, res.Truncated, res.Unverified, unreported = s.diff(pre, post)
 		res.SnapshotMS = time.Since(t).Milliseconds()
-		s.state.Pending = s.pendingAfter(res.Created, res.Unverified, overflow)
+		s.state.Pending = s.pendingAfter(res.Created, res.Unverified, unreported)
 		s.state.Sweep, s.state.SweepSkip = false, nil
 		if err := s.saveStored(); err != nil {
 			return err
