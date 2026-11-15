@@ -51,7 +51,14 @@ type Conflict struct {
 	Local   string `json:"local"`   // your file (absolute)
 	Remote  string `json:"remote"`  // the stashed remote version (absolute)
 	Deleted bool   `json:"deleted"` // the remote command deleted it (Remote is a marker file)
+	// Reason is empty for a local edit made during the run, or
+	// ReasonSymlinkParent: a local parent directory is a symlink, so the
+	// path can't be written here without leaving the worktree.
+	Reason string `json:"reason,omitempty"`
 }
+
+// ReasonSymlinkParent marks a conflict caused by a symlinked local parent.
+const ReasonSymlinkParent = "symlink_parent"
 
 // conflict stashes the remote version of p and records the conflict.
 func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile) error {
@@ -60,7 +67,11 @@ func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile)
 		return err
 	}
 	wb.Conflicts = append(wb.Conflicts, p)
-	wb.Stashed = append(wb.Stashed, Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(p)), Remote: stashed, Deleted: !want.exists})
+	c := Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(p)), Remote: stashed, Deleted: !want.exists}
+	if _, err := fsid.SafeJoin(root, p); errors.Is(err, fsid.ErrSymlinkParent) {
+		c.Reason = ReasonSymlinkParent
+	}
+	wb.Stashed = append(wb.Stashed, c)
 	return nil
 }
 
@@ -171,10 +182,16 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		remote[c.Path] = version{true, c.ID, c.Mode}
 		fetch = append(fetch, c.Path)
 	}
+	// Created paths beyond a local symlink: git couldn't judge whether they
+	// are ignored, so they are asked again if a deletion clears the way.
+	unjudged := map[string]bool{}
 	for _, c := range created {
 		if ignored[c.Path] {
 			wb.Ignored++
 			continue
+		}
+		if _, err := fsid.SafeJoin(ws.Root, c.Path); errors.Is(err, fsid.ErrSymlinkParent) {
+			unjudged[c.Path] = true
 		}
 		remote[c.Path] = version{true, c.ID, c.Mode}
 		fetch = append(fetch, c.Path)
@@ -224,14 +241,15 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		return wb, nil
 	}
 
-	err := applyWriteback(ctx, ws, m, remote, files, runID, &wb)
+	err := applyWriteback(ctx, ws, m, remote, files, unjudged, runID, &wb)
 	return wb, err
 }
 
 // applyWriteback applies the fetched remote versions (remote: what the
 // command left at each path; files: the bytes fetched for those that exist)
-// to the local worktree, under the write-back lock.
-func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, remote map[string]version, files map[string]remoteFile, runID string, wb *WritebackResult) error {
+// to the local worktree, under the write-back lock. unjudged holds created
+// paths git couldn't judge for ignores (beyond a local symlink).
+func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, remote map[string]version, files map[string]remoteFile, unjudged map[string]bool, runID string, wb *WritebackResult) error {
 	// Serialize cooperating spotexec write-backs into this worktree.
 	lockDir := conflictBase(ws)
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {
@@ -382,7 +400,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				// Changed under us, or the way is blocked (a file where a
 				// directory is needed, kept because of a local edit): keep
 				// the local side, stash the remote one.
-				if errors.Is(err, errChangedUnderUs) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) {
+				if errors.Is(err, errChangedUnderUs) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) || errors.Is(err, fsid.ErrSymlinkParent) {
 					if err := wb.conflict(ws.Root, p, want, rf); err != nil {
 						return err
 					}
@@ -395,6 +413,9 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				m.Update(protocol.Entry{Path: p, ID: rf.id, Mode: rf.mode, Size: int64(len(rf.data))})
 			} else {
 				full, err := fsid.SafeJoin(ws.Root, p)
+				if errors.Is(err, fsid.ErrSymlinkParent) {
+					return wb.conflict(ws.Root, p, want, rf) // a symlink appeared above it
+				}
 				if err != nil {
 					return err
 				}
@@ -436,6 +457,10 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 	}
 	pruneEmptyDirs(ws.Root, removedDirs)
 	removedDirs = nil
+	for _, p := range nowIgnored(ctx, m, ws.Root, writes, unjudged) {
+		handled[p] = true
+		wb.Ignored++
+	}
 	for _, p := range writes {
 		if err := apply(p); err != nil {
 			return err
@@ -492,6 +517,32 @@ func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int,
 		}
 	}
 	return keep, nil
+}
+
+// nowIgnored asks git again about the unjudged paths (created beyond a local
+// symlink) that a deletion has since cleared the way to, as when a symlinked
+// dist/ is replaced by a real one: ignored outputs then stay remote as usual.
+// If git still can't answer, they are written back.
+func nowIgnored(ctx context.Context, m *manifest.Manifest, root string, paths []string, unjudged map[string]bool) []string {
+	var recheck, ignored []string
+	for _, p := range paths {
+		if _, err := fsid.SafeJoin(root, p); unjudged[p] && err == nil {
+			recheck = append(recheck, p)
+		}
+	}
+	if len(recheck) == 0 {
+		return nil
+	}
+	ign, err := m.CheckIgnored(ctx, recheck)
+	if err != nil {
+		return nil
+	}
+	for _, p := range recheck {
+		if ign[p] {
+			ignored = append(ignored, p)
+		}
+	}
+	return ignored
 }
 
 func conflictBase(ws *Workspace) string {

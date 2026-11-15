@@ -6,12 +6,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/transport"
 )
 
 func perm(t *testing.T, p string) os.FileMode {
@@ -264,5 +267,129 @@ func TestWriteLocalBackslashName(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(dir, "src", `back\slash.txt`)); err != nil || string(b) != "w" {
 		t.Errorf("content %q, %v", b, err)
+	}
+}
+
+// A path beyond a local symlink is stashed and reported as such: never as a
+// local edit, and never diffed through the symlink, out of the worktree.
+func TestSymlinkParentConflict(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	write := func(full, s string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(outside, "evil.txt"), "outside\n")
+	write(filepath.Join(outside, "old.txt"), "outside\n")
+	write(filepath.Join(root, "src", "a.txt"), "local edit\n")
+	write(filepath.Join(root, "gen"), "a file, not a directory\n")
+	// Below a real directory: every ancestor counts, not just the first.
+	if err := os.MkdirAll(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "nested", "docs")); err != nil {
+		t.Fatal(err)
+	}
+	wb := &WritebackResult{ConflictDir: filepath.Join(t.TempDir(), "conflicts", "run-1")}
+	rf := remoteFile{data: []byte("remote\n"), mode: fsid.ModeFile}
+	want := version{true, fsid.Bytes(rf.data), rf.mode}
+	for _, p := range []string{"nested/docs/evil.txt", "nested/docs/old.txt", "src/a.txt", "gen/x.txt"} {
+		w, f := want, rf
+		if p == "nested/docs/old.txt" {
+			w, f = version{}, remoteFile{} // deleted by the remote command
+		}
+		if err := wb.conflict(root, p, w, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, del, plain, file := wb.Stashed[0], wb.Stashed[1], wb.Stashed[2], wb.Stashed[3]
+	if c.Reason != ReasonSymlinkParent || del.Reason != ReasonSymlinkParent || !del.Deleted || plain.Reason != "" || file.Reason != "" {
+		t.Fatalf("reasons %q %q %q %q", c.Reason, del.Reason, plain.Reason, file.Reason)
+	}
+	if b, err := os.ReadFile(c.Remote); err != nil || string(b) != "remote\n" {
+		t.Fatalf("stashed copy at %s: %q, %v", c.Remote, b, err)
+	}
+	for _, n := range []string{"evil.txt", "old.txt"} {
+		if b, _ := os.ReadFile(filepath.Join(outside, n)); string(b) != "outside\n" {
+			t.Fatalf("%s beyond the symlink changed: %q", n, b)
+		}
+	}
+	nul := transport.ShellQuote(os.DevNull)
+	if d := conflictDiff(c); strings.Contains(d, c.Local) || !strings.Contains(d, "-- "+nul+" ") {
+		t.Fatalf("diff reads through the symlink: %s", d)
+	}
+	if d := conflictDiff(del); d != "git diff --no-index -- "+nul+" "+nul {
+		t.Fatalf("deletion diff reads through the symlink: %s", d)
+	}
+	if d := conflictDiff(plain); !strings.Contains(d, transport.ShellQuote(plain.Local)) {
+		t.Fatalf("plain conflict diff without the local file: %s", d)
+	}
+
+	rec := &recordingReporter{}
+	reportConflicts(rec, wb.Stashed, "run-1")
+	if len(rec.warnings) != 4 || len(rec.events) != 4 {
+		t.Fatalf("warnings %v, events %v", rec.warnings, rec.events)
+	}
+	for i, w := range rec.warnings[:2] {
+		if !strings.Contains(w, wb.Stashed[i].Path) || !strings.Contains(w, "symlink") || strings.Contains(w, "changed locally") {
+			t.Fatalf("warning %d: %s", i, w)
+		}
+		if rec.events[i]["reason"] != ReasonSymlinkParent {
+			t.Fatalf("event %d: %v", i, rec.events[i])
+		}
+	}
+	if !strings.Contains(rec.warnings[0], "not written back") || !strings.Contains(rec.warnings[0], conflictDiff(c)) {
+		t.Fatalf("warning without the stashed copy: %s", rec.warnings[0])
+	}
+	if !strings.Contains(rec.warnings[1], "deleted by the remote command but not here") {
+		t.Fatalf("deletion warning: %s", rec.warnings[1])
+	}
+	for i := 2; i < 4; i++ {
+		if !strings.Contains(rec.warnings[i], "changed locally") {
+			t.Fatalf("plain conflict: %s", rec.warnings[i])
+		}
+		if _, ok := rec.events[i]["reason"]; ok {
+			t.Fatalf("plain conflict event has a reason: %v", rec.events[i])
+		}
+	}
+}
+
+// A created path git couldn't judge (beyond a local symlink) is asked about
+// again once a deletion removed the symlink: a gitignored output stays remote.
+func TestNowIgnoredAfterSymlinkRemoved(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	if out, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("*.log\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "dist")
+	if err := os.Symlink(t.TempDir(), link); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	m, err := manifest.Build(ctx, manifest.Options{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writes := []string{"dist/app.log", "dist/app.js", "src/other.log"}
+	unjudged := map[string]bool{"dist/app.log": true, "dist/app.js": true}
+	if got := nowIgnored(ctx, m, root, writes, unjudged); len(got) != 0 {
+		t.Fatalf("still beyond the symlink: %v", got)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	// Only what was unjudged: src/other.log was already answered.
+	if got := nowIgnored(ctx, m, root, writes, unjudged); !reflect.DeepEqual(got, []string{"dist/app.log"}) {
+		t.Fatalf("now ignored = %v", got)
 	}
 }
