@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/transport/sshtest"
 )
 
 func TestReplayable(t *testing.T) {
@@ -60,7 +62,8 @@ func testFleet() (*config.Runner, *fakeFleet) {
 }
 
 var (
-	running   = stage{phase: phaseCommand, dispatched: true}
+	running   = stage{phase: phaseCommand, dispatched: true, started: true}
+	starting  = stage{phase: phaseStartCommand, dispatched: true}
 	depsCheck = stage{phase: phaseDepsCheck}
 )
 
@@ -76,7 +79,8 @@ func TestWhyNoReplay(t *testing.T) {
 		code    string
 	}{
 		{"i-run", false, running, "RUNNER_UNRESPONSIVE"},
-		{"i-run", false, stage{phase: phaseSetup, dispatched: true}, "RUNNER_UNRESPONSIVE"},
+		{"i-run", false, stage{phase: phaseSetup, dispatched: true, started: true}, "RUNNER_UNRESPONSIVE"},
+		{"i-run", false, starting, "RUNNER_UNRESPONSIVE"},
 		{"i-run", true, running, ""},
 		{"i-gone", false, running, ""},
 		{"i-pend", false, running, ""},
@@ -120,8 +124,46 @@ func TestUnresponsiveMessage(t *testing.T) {
 	if why := whyNoReplay(lease, false, running, true).why; strings.Contains(why, "--exclusive") {
 		t.Errorf("already exclusive: %q", why)
 	}
-	if why := whyNoReplay(lease, false, stage{phase: phaseSetup, dispatched: true}, false).why; !strings.Contains(why, "[setup] run may be what overloaded it") {
+	if why := whyNoReplay(lease, false, stage{phase: phaseSetup, dispatched: true, started: true}, false).why; !strings.Contains(why, "[setup] run may be what overloaded it") {
 		t.Errorf("setup: %q", why)
+	}
+	// Handed over but never confirmed started: no blame, no sizing advice.
+	if why := whyNoReplay(lease, false, starting, false).why; !strings.HasPrefix(why, "while starting the command, although EC2") || !strings.Contains(why, "may have started") || strings.Contains(why, "overloaded") || strings.Contains(why, "--exclusive") {
+		t.Errorf("not started: %q", why)
+	}
+}
+
+// The progress an attempt records as the helper reports it: dispatch, the
+// setup's start, setup_done, the command's start.
+func TestProgress(t *testing.T) {
+	p := &progress{at: stage{phase: phaseSlot}}
+	p.set(phaseDepsCheck)
+	if got := p.get(); got != depsCheck {
+		t.Fatalf("deps: %+v", got)
+	}
+	p.dispatch(true)
+	if got := p.get(); got != (stage{phase: phaseStartSetup, dispatched: true}) {
+		t.Fatalf("dispatched with setup: %+v", got)
+	}
+	p.started()
+	if got := p.get(); got != (stage{phase: phaseSetup, dispatched: true, started: true}) {
+		t.Fatalf("setup started: %+v", got)
+	}
+	p.setupDone()
+	if got := p.get(); got != starting {
+		t.Fatalf("setup done: %+v", got)
+	}
+	p.started()
+	if got := p.get(); got != running {
+		t.Fatalf("command started: %+v", got)
+	}
+	p.started() // a stray start changes nothing
+	if got := p.get(); got != running {
+		t.Fatalf("after a stray start: %+v", got)
+	}
+	p.dispatch(false)
+	if got := p.get(); got != starting {
+		t.Fatalf("dispatched without setup: %+v", got)
 	}
 }
 
@@ -205,9 +247,11 @@ func TestNoticeOutranksMemoryPressure(t *testing.T) {
 	}
 }
 
-// The unresponsive warning carries the VM's last memory reading.
-func TestLastMemory(t *testing.T) {
-	sr, tgt := liveRunner(t, "rpc-pressure")
+// The unresponsive warning carries the VM's last memory reading, healthy
+// or not.
+func TestUnresponsiveCarriesLastMemory(t *testing.T) {
+	sr, tgt := liveRunner(t, "rpc-memory")
+	(&sshtest.Fake{State: os.Getenv("FAKE_SSH_STATE")}).Set("rpc-memory", "12000")
 	_, s, err := Connect(context.Background(), sr, tgt)
 	if err != nil {
 		t.Fatal(err)
@@ -217,8 +261,10 @@ func TestLastMemory(t *testing.T) {
 	for lastMemory(s) == "" && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if m := lastMemory(s); !strings.Contains(m, "120.0 MB of 15.6 GB memory available") {
-		t.Fatalf("last memory: %q", m)
+	r, f := testFleet()
+	got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run", Sess: s}, false, running, false)
+	if got.code != "RUNNER_UNRESPONSIVE" || !strings.Contains(got.why, "reported 11.7 GB of 15.6 GB memory available") {
+		t.Fatalf("%q (%q)", got.code, got.why)
 	}
 	if lastMemory(nil) != "" {
 		t.Fatal("a nil session has a reading")

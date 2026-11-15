@@ -144,12 +144,14 @@ type Result struct {
 	lostAt stage
 }
 
-// stage is how far an attempt had got: the phase it was in, and whether
-// the command had been handed to the helper (dispatched), after which it
-// may have started and its outcome is unknown.
+// stage is how far an attempt had got: the phase it was in, whether the
+// command had been handed to the helper (dispatched), after which it may
+// have started and its outcome is unknown, and whether the helper had
+// confirmed starting the phase's process ([setup] run or the command).
 type stage struct {
 	phase      string
 	dispatched bool
+	started    bool
 }
 
 // where describes s for a warning about losing the runner during it.
@@ -175,10 +177,34 @@ func (p *progress) set(phase string) {
 
 // dispatch records that the command is being handed to the helper, from
 // just before the request is sent: a send that fails part way may still
-// have reached it.
-func (p *progress) dispatch(phase string) {
+// have reached it. setup: the helper runs [setup] run first.
+func (p *progress) dispatch(setup bool) {
+	phase := phaseStartCommand
+	if setup {
+		phase = phaseStartSetup
+	}
 	p.mu.Lock()
 	p.at = stage{phase: phase, dispatched: true}
+	p.mu.Unlock()
+}
+
+// started records the helper confirming it started the process the
+// attempt was waiting on.
+func (p *progress) started() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch p.at.phase {
+	case phaseStartSetup:
+		p.at.phase, p.at.started = phaseSetup, true
+	case phaseStartCommand:
+		p.at.phase, p.at.started = phaseCommand, true
+	}
+}
+
+// setupDone records that [setup] run finished and the command is next.
+func (p *progress) setupDone() {
+	p.mu.Lock()
+	p.at.phase, p.at.started = phaseStartCommand, false
 	p.mu.Unlock()
 }
 
@@ -301,10 +327,20 @@ func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay 
 		return noReplay{}
 	}
 	what := "the command"
-	if at.phase == phaseSetup {
+	if at.phase == phaseSetup || at.phase == phaseStartSetup {
 		what = "[setup] run"
 	}
-	why := at.where() + ", although EC2 still reports it running, without a Spot notice: " + what + " may be what overloaded it (memory, most often)"
+	why := at.where() + ", although EC2 still reports it running, without a Spot notice: "
+	if !at.started {
+		// Handed over, but not confirmed started: nothing says it ran,
+		// let alone overloaded the VM, but it may have.
+		why += what + " may have started, so the attempt's outcome is unknown"
+		if m := lastMemory(lease.Sess); m != "" {
+			why += " (" + m + ")"
+		}
+		return noReplay{"RUNNER_UNRESPONSIVE", why + ". Rerun it"}
+	}
+	why += what + " may be what overloaded it (memory, most often)"
 	if m := lastMemory(lease.Sess); m != "" {
 		why += "; " + m
 	}
@@ -317,14 +353,16 @@ func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay 
 
 // Phases of an attempt (stage.phase), as warnings name them.
 const (
-	phaseSlot      = "setting up the slot"
-	phaseSync      = "syncing files"
-	phaseGitSeed   = "seeding .git"
-	phaseImage     = "preparing the container image"
-	phaseDepsCheck = "checking the dependency cache"
-	phaseDeps      = "installing dependencies"
-	phaseSetup     = "running [setup] run"
-	phaseCommand   = "running the command"
+	phaseSlot         = "setting up the slot"
+	phaseSync         = "syncing files"
+	phaseGitSeed      = "seeding .git"
+	phaseImage        = "preparing the container image"
+	phaseDepsCheck    = "checking the dependency cache"
+	phaseDeps         = "installing dependencies"
+	phaseStartSetup   = "starting [setup] run"
+	phaseSetup        = "running [setup] run"
+	phaseStartCommand = "starting the command"
+	phaseCommand      = "running the command"
 )
 
 // lastMemory describes the memory reading of s's latest heartbeat, "" when
@@ -672,11 +710,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		*att.fresh = true // a replay doesn't repeat it
 		warnContainerFresh(ws, o, p.Container.Dockerfile)
 	}
-	if ex.SetupRun != "" {
-		prog.dispatch(phaseSetup)
-	} else {
-		prog.dispatch(phaseCommand)
-	}
+	prog.dispatch(ex.SetupRun != "")
 	if err := sess.Conn.Send(protocol.TypeExec, ex); err != nil {
 		return res, infra(err), lostRunner(lease, err)
 	}
@@ -717,10 +751,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	outW := &ui.Rewriter{W: &ui.ClearingWriter{W: o.Stdout, R: o.Rep}, Old: []byte(remoteWS), New: []byte(ws.Root)}
 	errW := &ui.Rewriter{W: &ui.ClearingWriter{W: o.Stderr, R: o.Rep}, Old: []byte(remoteWS), New: []byte(ws.Root)}
 	afterSetup := func() {
-		prog.set(phaseCommand)
+		prog.setupDone()
 		o.Rep.Status("%s · running %s", label, o.Display)
 	}
-	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup)
+	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup, prog.started)
 	outW.Flush()
 	errW.Flush()
 	if err != nil {
@@ -1488,7 +1522,7 @@ func setupFailure(p *config.Project, o Options, r protocol.Result) (int, string)
 }
 
 // pumpExec streams output until the result arrives, forwarding interrupts.
-func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot, afterSetup func()) (protocol.Result, error) {
+func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot, afterSetup, onStarted func()) (protocol.Result, error) {
 	var res protocol.Result
 	type fr struct {
 		f   protocol.Frame
@@ -1548,6 +1582,9 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot,
 			}
 			switch env.Type {
 			case protocol.TypeStarted:
+				if onStarted != nil {
+					onStarted()
+				}
 			case protocol.TypeEvent:
 				var ev protocol.Event
 				_ = env.Unmarshal(&ev)

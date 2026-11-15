@@ -97,6 +97,40 @@ func TestSilentHelperNoGrace(t *testing.T) {
 
 // Memory pressure in a heartbeat is remembered for the window asked about;
 // heartbeats without memory (older helpers) report none.
+// Every heartbeat's memory reading replaces the last, healthy or not, while
+// pressure reported within the window is kept through a healthy one.
+func TestHeartbeatLastMemory(t *testing.T) {
+	e := newFakeEnv(t)
+	e.Set("rpc-memory", "12000,120,8000")
+	s := e.session(t)
+	defer s.Abort()
+	deadline := time.Now().Add(5 * time.Second)
+	for m, _ := s.LastMemory(); m.AvailMB != 8000 && time.Now().Before(deadline); m, _ = s.LastMemory() {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m, ok := s.LastMemory(); !ok || m.AvailMB != 8000 || m.TotalMB != 16000 {
+		t.Fatalf("last memory %+v %v, want the latest reading", m, ok)
+	}
+	if p := s.MemoryPressure(time.Minute); !strings.Contains(p, "120 MiB") {
+		t.Fatalf("a later healthy reading cleared the pressure: %q", p)
+	}
+
+	e2 := newFakeEnv(t)
+	e2.Set("rpc-memory", "12000")
+	s2 := e2.session(t)
+	defer s2.Abort()
+	deadline = time.Now().Add(5 * time.Second)
+	for _, ok := s2.LastMemory(); !ok && time.Now().Before(deadline); _, ok = s2.LastMemory() {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m, ok := s2.LastMemory(); !ok || m.AvailMB != 12000 {
+		t.Fatalf("healthy reading not kept: %+v %v", m, ok)
+	}
+	if p := s2.MemoryPressure(time.Minute); p != "" {
+		t.Fatalf("pressure from a healthy reading: %q", p)
+	}
+}
+
 func TestHeartbeatMemoryPressure(t *testing.T) {
 	e := newFakeEnv(t)
 	e.Set("rpc-pressure", "")
