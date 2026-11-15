@@ -7,6 +7,8 @@ There are two files, and the split is deliberate.
 | `~/.config/spotexec/config.toml` | Your hardware, accounts, credentials, network | Never |
 | `.spotexec.toml` at the repository root | How this project syncs, installs and runs | Yes |
 
+Both start with `version = 1`, the only config format this spotexec understands. A file without `version` is read as version 1. Any other version (say, one written for a newer spotexec) is rejected rather than read under today's rules, with an error naming the supported version: `sx` and `spotexec run` exit `125`, `spotexec supported` prints `false`, `spotexec doctor` fails, and `spotexec container init` leaves the file alone.
+
 Settings resolve in this order, highest first:
 1. CLI flags. A flag given on the command line beats its environment variable whatever its value, so `--json=false`, `--priority 0` and `--pool` all override the environment.
 2. `SPOTEXEC_*` environment variables (below).

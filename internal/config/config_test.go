@@ -806,3 +806,53 @@ func TestParseBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigVersion(t *testing.T) {
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	const upgrade = "; upgrade spotexec to use this config"
+	for _, tc := range []struct {
+		name, body string
+		want       string // the error after the path; empty: accepted
+	}{
+		{"current", "version = 1\n", ""},
+		{"absent", "", ""},
+		{"newer", "version = 2\n", "version = 2 isn't supported (supported: 1)" + upgrade},
+		// A newer format's keys are unknown here: the version says why.
+		{"newer with new keys", "version = 3\nnew_key = true\n", "version = 3 isn't supported (supported: 1)" + upgrade},
+		// The decoder reads Version as version, so the check must too.
+		{"mixed case", "Version = 2\n", "version = 2 isn't supported (supported: 1)" + upgrade},
+		{"zero", "version = 0\n", "version = 0 isn't supported (supported: 1)"},
+		{"negative", "version = -1\n", "version = -1 isn't supported (supported: 1)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			gp := filepath.Join(dir, "global.toml")
+			if err := os.WriteFile(gp, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("SPOTEXEC_CONFIG", gp)
+			_, gerr := LoadGlobal()
+			pp := filepath.Join(dir, ".spotexec.toml")
+			if err := os.WriteFile(pp, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, perr := LoadProject(pp)
+			cerr := CheckVersion(pp)
+			for which, c := range map[string]struct {
+				path string
+				err  error
+			}{"global": {gp, gerr}, "project": {pp, perr}, "CheckVersion": {pp, cerr}} {
+				if tc.want == "" {
+					if c.err != nil {
+						t.Errorf("%s: %v", which, c.err)
+					}
+					continue
+				}
+				if want := c.path + ": " + tc.want; c.err == nil || c.err.Error() != want {
+					t.Errorf("%s: got %v, want %s", which, c.err, want)
+				}
+			}
+		})
+	}
+}

@@ -193,6 +193,11 @@ func TestSupported(t *testing.T) {
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\nnot_a_key = true\n")
 			return d
 		}, false},
+		{"project config from a newer spotexec", sshRunner, func(t *testing.T) string {
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 2\n")
+			return d
+		}, false},
 		{"no runners", "", func(t *testing.T) string {
 			d := initRepo(t)
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n")
@@ -292,6 +297,7 @@ func TestSupported(t *testing.T) {
 		"deps lockfiles match nothing":                 "deps.lockfiles matches no synced file",
 		"deps lockfile literal outside the repository": "deps.lockfiles: ",
 		"broken project config":                        ".spotexec.toml: unknown keys",
+		"project config from a newer spotexec":         "version = 2 isn't supported (supported: 1)",
 		"no project config":                            "has no .spotexec.toml",
 		"pool names an unknown runner":                 "nope",
 	}

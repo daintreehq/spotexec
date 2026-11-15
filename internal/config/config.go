@@ -374,6 +374,48 @@ func GlobalPath() string {
 	return filepath.Join(Dir(), "config.toml")
 }
 
+// ConfigVersion is the config format this spotexec understands. A config
+// without a version is read as this one.
+const ConfigVersion = 1
+
+// checkVersion rejects a config written for a format this spotexec doesn't
+// know, rather than reading it under today's rules.
+func checkVersion(md toml.MetaData, v int) error {
+	if v == ConfigVersion {
+		return nil
+	}
+	defined := false
+	for _, k := range md.Keys() {
+		// The decoder matches keys case-insensitively: Version is version.
+		if len(k) == 1 && strings.EqualFold(k[0], "version") {
+			defined = true
+		}
+	}
+	if !defined {
+		return nil
+	}
+	if v > ConfigVersion {
+		return fmt.Errorf("version = %d isn't supported (supported: %d); upgrade spotexec to use this config", v, ConfigVersion)
+	}
+	return fmt.Errorf("version = %d isn't supported (supported: %d)", v, ConfigVersion)
+}
+
+// CheckVersion reads only the version of the config at path, for commands
+// that edit the file without loading it.
+func CheckVersion(path string) error {
+	var v struct {
+		Version int `toml:"version"`
+	}
+	md, err := toml.DecodeFile(path, &v)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if err := checkVersion(md, v.Version); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
+
 // LoadGlobal reads the global config; a missing file yields an empty config.
 func LoadGlobal() (*Global, error) {
 	g := &Global{Runners: map[string]*Runner{}, Path: GlobalPath()}
@@ -382,6 +424,9 @@ func LoadGlobal() (*Global, error) {
 	}
 	md, err := toml.DecodeFile(g.Path, g)
 	if err != nil {
+		return nil, fmt.Errorf("%s: %w", g.Path, err)
+	}
+	if err := checkVersion(md, g.Version); err != nil {
 		return nil, fmt.Errorf("%s: %w", g.Path, err)
 	}
 	if und := md.Undecoded(); len(und) > 0 {
@@ -764,6 +809,9 @@ func LoadProject(path string) (*Project, error) {
 	if path != "" {
 		md, err := toml.DecodeFile(path, p)
 		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if err := checkVersion(md, p.Version); err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 		var und []toml.Key
