@@ -91,6 +91,7 @@ Patterns are expanded on your machine against the synced files (so they never ma
 
 With a container, native modules never cross toolchain versions. Without one, pin tool versions in your bootstrap: upgrading Node on an `ssh` host, or a newer Ubuntu image behind `ami = "auto"`, doesn't change the key.
 
+- **The install's output stays out of the command's.** On a cache miss, the install runs before the command, and what it prints goes to a log on your machine (`~/.local/state/spotexec/logs/deps/`, the newest 20 kept) instead of the command's stdout and stderr. Its latest line shows in the progress line, and the summary says `installed dependencies (1m4s)`. When the install fails, its last 40 lines are printed under the error, with the path to the full log.
 - **On a runner,** caches are hydrated into the slot with `reflink` where the filesystem supports it (XFS, Btrfs, APFS), else `copy`. `hardlink` is opt-in, because shared inodes let one slot corrupt another's `node_modules`.
 - **Across Spot VMs,** the first VM to install a dependency set uploads it as one compressed archive to a private S3 bucket in your account, `spotexec-cache-<account>-<region>`. The bucket is created on the first `[deps]` run, with S3's default Block Public Access and a 14-day expiry. Without the S3 permissions, set `cache_bucket = "off"`. Later VMs download it instead of installing.
 - **VMs never hold AWS credentials.** The CLI hands each one presigned URLs, and only for a bucket your account owns.

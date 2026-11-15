@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -449,6 +450,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		rep.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
 		if !rep.IsJSON() {
 			fmt.Fprintf(os.Stderr, "spotexec: %v\n", err)
+			depsDetail(os.Stderr, "", err)
 		}
 		return client.ExitInfra
 	}
@@ -459,6 +461,9 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	summary := fmt.Sprintf("%s on %s#%d", ui.Dur(res.Duration), res.Runner, res.Slot)
 	if res.Synced > 0 {
 		summary += fmt.Sprintf(" · synced %d files (%s)", res.Synced, ui.Bytes(res.SyncBytes))
+	}
+	if res.DepsInstalled > 0 {
+		summary += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(res.DepsInstalled))
 	}
 	if n := len(res.Mutated) + len(res.Deleted); n > 0 {
 		summary += fmt.Sprintf(" · pulled %d modified file%s", n, plural(n))
@@ -690,9 +695,13 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 				sr.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
 				if !rep.IsJSON() {
 					fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
+					depsDetail(os.Stderr, prefix, err)
 				}
 			}
 			summary := fmt.Sprintf("%s · %s%s", part.label, ui.Dur(out.took), out.where())
+			if res.DepsInstalled > 0 {
+				summary += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(res.DepsInstalled))
+			}
 			if code != 0 {
 				summary += fmt.Sprintf(" · exit %d", code)
 			}
@@ -795,6 +804,19 @@ func (t *taskReporter) Event(name string, fields map[string]any) {
 func (t *taskReporter) Status(string, ...any) {}
 func (t *taskReporter) Clear()                {}
 func (t *taskReporter) Done(string, bool)     {}
+
+// depsDetail prints, under a failed dependency install's error, the end of
+// the install's output and where its full log is. prefix starts every line
+// (a parallel task's "[name] ").
+func depsDetail(w io.Writer, prefix string, err error) {
+	var de *client.DepsError
+	if !errors.As(err, &de) {
+		return
+	}
+	for _, l := range de.Detail() {
+		fmt.Fprintf(w, "%s  %s\n", prefix, l)
+	}
+}
 
 // waitLaunches lets a VM launch this process started record its instance
 // ID before exiting (or the fleet could lose track of it for a while).

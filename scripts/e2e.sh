@@ -203,6 +203,7 @@ check "init detects npm lockfile" "grep -q 'npm ci' .spotexec.toml"
 run test || true
 check "deps built once" "ev '\"built\":true' | grep -q ."
 check "task runs with deps" "grep -q ok=true $WORK/last.out"
+check "install output kept out of the command's streams, in a local log" "! grep -Eq 'added [0-9]+ package' $WORK/last.out $WORK/last.err && ev '\"event\":\"deps\",.*\"log\":\"' | grep -q ."
 ("$SX" -q 'sleep 3' &) ; sleep 0.7
 run test || true
 check "other slot hydrated from cache" "ev '\"hydrated\":true' | grep -q ."
