@@ -707,3 +707,21 @@ setup = true
 		}
 	}
 }
+
+func TestContainerDockerNeedsContainer(t *testing.T) {
+	for body, ok := range map[string]bool{
+		"[container]\nimage = \"node:22\"\ndocker = true\n": true,
+		"[container]\nimage = \"node:22\"\n":                true,
+		"[container]\ndocker = true\n":                      false,
+	} {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		os.WriteFile(pp, []byte(body), 0o644)
+		p, err := LoadProject(pp)
+		if (err == nil) != ok {
+			t.Errorf("%q: err = %v, want ok=%v", body, err, ok)
+		}
+		if err == nil && p.Container.Docker != strings.Contains(body, "docker = true") {
+			t.Errorf("%q: Docker = %v", body, p.Container.Docker)
+		}
+	}
+}

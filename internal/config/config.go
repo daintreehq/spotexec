@@ -240,6 +240,10 @@ type Container struct {
 	Network    string   `toml:"network"`    // "host" (default: the runner's network) or "private" (a network of its own per run)
 	User       string   `toml:"user"`       // "runner" (default: files stay owned by the runner user) or "root"
 	Timeout    Duration `toml:"timeout"`    // pull/build limit (default 20m)
+	// Docker lets commands in the container start containers of their own
+	// (Testcontainers, docker compose) through a Docker socket scoped to the
+	// run. It gives them root-equivalent access to the runner.
+	Docker bool `toml:"docker"`
 }
 
 // Enabled reports whether a container is configured.
@@ -778,6 +782,9 @@ func (p *Project) validate() error {
 	}
 	if !oneOf(p.Container.Network, "", "host", "private") {
 		return fmt.Errorf(`container.network must be "host" or "private" (got %q)`, p.Container.Network)
+	}
+	if p.Container.Docker && !p.Container.Enabled() {
+		return errors.New("container.docker requires container.image or container.dockerfile")
 	}
 	if p.Deps.Install != "" && len(p.Deps.CacheDirs) == 0 {
 		return errors.New("deps.install requires deps.cache_dirs")
