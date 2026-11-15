@@ -134,7 +134,7 @@ To get **ignored outputs** back (coverage reports, build output), use one of:
 - `pull_artifacts` in `.spotexec.toml`;
 - `spotexec pull <glob>` afterwards, from the last-used slot (`--dest DIR` to land them elsewhere).
 
-Pulled files never overwrite tracked or non-ignored files, and never land in another repository or a git directory. The one exception is files a write-back [held](#write-back-limits).
+Pulled files never overwrite tracked or non-ignored files, and never land in another repository or a git directory. The one exception is files a write-back [held](#write-back-limits). A pulled symlink that points outside the worktree (or, with `--dest` elsewhere, outside that directory) gets the same `WRITEBACK_SYMLINK` warning and `outside_symlink` event as write-back gives one, the link named where it landed.
 
 ### Write-back limits
 

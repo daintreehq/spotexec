@@ -706,7 +706,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// 7. Explicit artifact pulls.
 	pulls := append(append([]string{}, p.Sync.PullArtifacts...), o.Pull...)
 	if len(pulls) > 0 {
-		n, err := PullArtifacts(post, sess, ws, ws.Root, pulls, nil, false)
+		n, err := PullArtifacts(post, sess, ws, ws.Root, pulls, nil, false, o.Rep, runID)
 		if err != nil {
 			o.Rep.Warn("PULL_FAILED", "pulling %v: %v", pulls, err)
 		}
@@ -754,7 +754,11 @@ func reportOutsideLinks(rep ui.Reporter, links []Link, runID string) {
 			where = "an absolute path"
 		}
 		rep.Warn("WRITEBACK_SYMLINK", "the remote command made %s a symlink to %s, %s; anything reading it here reads that instead (delete it if you didn't expect it)", printable(l.Path), printable(l.Target), where)
-		rep.Event("outside_symlink", map[string]any{"path": l.Path, "target": l.Target, "run_id": runID})
+		ev := map[string]any{"path": l.Path, "target": l.Target}
+		if runID != "" {
+			ev["run_id"] = runID
+		}
+		rep.Event("outside_symlink", ev)
 	}
 }
 

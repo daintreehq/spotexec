@@ -1076,7 +1076,7 @@ func cmdSyncPlan() *cobra.Command {
 
 func cmdPull() *cobra.Command {
 	var dest string
-	var held bool
+	var held, asJSON bool
 	c := &cobra.Command{
 		Use:   "pull <remote-glob>... | --held [<glob>...]",
 		Short: "Pull gitignored artifacts (e.g. coverage/), or held write-back files, from the last-used slot",
@@ -1107,7 +1107,14 @@ func cmdPull() *cobra.Command {
 			}
 			ctx, _, stop := signals()
 			defer stop()
-			rep, _ := ui.New(ui.ModeAuto, os.Stderr, "")
+			mode := ui.ModeAuto
+			switch {
+			case asJSON, !cmd.Flags().Changed("json") && os.Getenv("SPOTEXEC_JSON") == "1":
+				mode = ui.ModeJSON
+			case cmd.Flags().Changed("json") && os.Getenv("SPOTEXEC_AGENT") == "1":
+				mode = ui.ModePlain // --json=false beats SPOTEXEC_AGENT=1
+			}
+			rep, _ := ui.New(mode, os.Stderr, "")
 			host, _ := os.Hostname()
 			lease, err := client.AcquireSlot(ctx, l.cfg, l.ws, r, lr, rep, host, client.PullDisplay, false, 0, false, "")
 			if err != nil {
@@ -1118,14 +1125,16 @@ func cmdPull() *cobra.Command {
 			if dest != "" {
 				root = dest // created by PullArtifacts once validated
 			}
-			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args, heldFiles, held)
+			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args, heldFiles, held, rep, "")
 			if err != nil {
 				return err
 			}
+			rep.Event("pull", map[string]any{"patterns": args, "files": n})
 			rep.Done(fmt.Sprintf("pulled %d file%s from %s", n, plural(n), r.Name), true)
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&asJSON, "json", false, "NDJSON events on stderr (warnings, links pulled out of the worktree, the pull)")
 	c.Flags().StringVar(&dest, "dest", "", "write under this directory instead of the worktree root")
 	c.Flags().BoolVar(&held, "held", false, "pull the new files the last run's write-back held in the slot (over the write-back limit); globs narrow them")
 	return c

@@ -1181,7 +1181,10 @@ func lockHolder() string {
 //
 // heldOnly (pull --held) writes nothing but held files, whatever else the
 // patterns reach.
-func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool) (int, error) {
+//
+// A symlink it writes that points outside the worktree is reported to rep
+// as write-back reports one; runID, when known, is the run that made it.
+func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool, rep ui.Reporter, runID string) (int, error) {
 	if err := s.Conn.Send(protocol.TypePull, protocol.Pull{Patterns: patterns}); err != nil {
 		return 0, err
 	}
@@ -1193,12 +1196,12 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	if err := env.Unmarshal(&listed); err != nil {
 		return 0, fmt.Errorf("pull: bad listing from runner: %w", err)
 	}
-	return applyPull(ctx, ws, root, patterns, held, heldOnly, listed.Paths, s.Blob(ctx))
+	return applyPull(ctx, ws, root, patterns, held, heldOnly, listed.Paths, s.Blob(ctx), rep, runID)
 }
 
 // applyPull writes the files of blob (a gzip'd tar) that the runner listed
 // and that patterns asked for, under the rules of PullArtifacts.
-func applyPull(ctx context.Context, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool, listed []string, blob io.Reader) (int, error) {
+func applyPull(ctx context.Context, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool, listed []string, blob io.Reader, rep ui.Reporter, runID string) (int, error) {
 	// Only paths the runner listed, that match what was asked for, and that
 	// are not reserved, may be written; the rest of the stream is ignored.
 	allowed := map[string]bool{}
@@ -1330,6 +1333,15 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 		return 0, err
 	}
 	defer unlock()
+	// Symlinks written, judged once every file is in place (a link may
+	// lead out through another pulled after it).
+	var links []Link
+	appliedLink := func(p string, rf remoteFile) {
+		if rf.mode == fsid.ModeSymlink {
+			links = append(links, Link{Path: p, Target: rf.link})
+		}
+	}
+	defer func() { reportOutsideLinks(rep, pulledOutsideLinks(ws.Root, root, links), runID) }()
 	var skipped, kept, stale []string
 	defer func() {
 		if len(skipped) > 0 {
@@ -1393,6 +1405,7 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 			}
 			if err == nil {
 				n++
+				appliedLink(h.Name, rf)
 			}
 			return err
 		}
@@ -1400,9 +1413,35 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 			return nil
 		}
 		n++
-		return writeLocal(root, h.Name, rf, nil)
+		if err := writeLocal(root, h.Name, rf, nil); err != nil {
+			return err
+		}
+		appliedLink(h.Name, rf)
+		return nil
 	})
 	return n, err
+}
+
+// pulledOutsideLinks returns the pulled links (named relative to root) that
+// point outside the worktree, judged where they landed: against the
+// worktree when root is inside it, named relative to the worktree; against
+// root when it is elsewhere (--dest), named by full path.
+func pulledOutsideLinks(wsRoot, root string, links []Link) []Link {
+	if len(links) == 0 {
+		return nil
+	}
+	if rel, err := filepath.Rel(wsRoot, root); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+		in := make([]Link, len(links))
+		for i, l := range links {
+			in[i] = Link{Path: path.Join(filepath.ToSlash(rel), l.Path), Target: l.Target}
+		}
+		return outsideLinks(wsRoot, in)
+	}
+	out := outsideLinks(root, links)
+	for i := range out {
+		out[i].Path = filepath.Join(root, filepath.FromSlash(out[i].Path))
+	}
+	return out
 }
 
 // Why a pulled path is protected (0: it isn't).

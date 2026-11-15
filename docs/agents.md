@@ -64,7 +64,7 @@ Other events include:
 - `spot_interruption`, `spot_rebalance`, `retry`;
 - `large_writeback` before a write-back over its limit transfers anything (`files`, `bytes`, `new_files`, `changed_files`, and the `largest` paths, each with its `files` and `bytes`), and `writeback_held` when the new files stay in the slot instead (`files`, `bytes`, `largest`, `run_id`); `sync_out` and the result's `held_files` and `held_bytes` count them. Set `SPOTEXEC_WRITEBACK_OVER=hold` to never have a run flood the worktree; see [write-back limits](running.md#write-back-limits);
 - `conflict`, one per write-back conflict: your kept file (`local`), the stashed remote version (`remote`, a marker when `deleted` is true), and a `diff` command to see the remote changes;
-- `outside_symlink`, one per symlink write-back created or retargeted to point outside the worktree: the link's `path` and its `target`, with a `WRITEBACK_SYMLINK` warning naming them;
+- `outside_symlink`, one per symlink write-back (or a `--pull`, or `spotexec pull --json`) created or retargeted to point outside the worktree: the link's `path` and its `target`, with a `WRITEBACK_SYMLINK` warning naming them;
 - `warning` events with stable codes (`SYNC_CONFLICT`, `SYNC_COLLISION`, `LARGE_WRITEBACK`, `WRITEBACK_HELD`, `RUNNER_LOST`, `SPOT_INTERRUPTION`, `TIMEOUT`, `LOCAL_FALLBACK`, `RTK_FILTER`, `STDIN_IGNORED`, …). `UNKNOWN_TASK` follows an exit 127 of `sx <word>` (no `--`) when the word is a plain name, no task has it, and the shell found no command by that name: its message names the closest task when exactly one is near, and `spotexec tasks` lists them all;
 - `error` with code `SPOTEXEC_ERROR` when spotexec itself fails (exit `125`). For example, a `BOOTSTRAP_FAILED` message.
 
