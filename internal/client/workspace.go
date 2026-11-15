@@ -153,7 +153,7 @@ func saveLastRun(w *Workspace, lr LastRun) {
 
 // ManifestOptions are the manifest.Build options for project p rooted at
 // root. A container's Dockerfile, its companion .dockerignore and its build
-// context sync even inside built-in excludes such as .spotexec/, Git or
+// context sync even inside built-in excludes or Git-ignored paths, Git or
 // not: the runner builds the image from the synced copy.
 func ManifestOptions(root string, p *config.Project) manifest.Options {
 	o := manifest.Options{Root: root, Exclude: p.Sync.Exclude, Source: p.Sync.Source, Protect: p.Deps.CacheDirs}

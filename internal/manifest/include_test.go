@@ -69,13 +69,53 @@ func TestIncludeSyncsContainerInputsWithoutGit(t *testing.T) {
 		if got := paths(m); got != want {
 			t.Errorf("source %q: synced %q, want %q", source, got, want)
 		}
-		// Without the container, .spotexec/ stays out.
+		// Without the container, .spotexec/ is an ordinary directory:
+		// only spotexec's own state there stays out.
 		m, err = Build(context.Background(), Options{Root: root, Source: source})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := paths(m); got != "src/a.txt" {
-			t.Errorf("source %q without include: synced %q", source, got)
+		if got := paths(m); got != want {
+			t.Errorf("source %q without include: synced %q, want %q", source, got, want)
+		}
+	}
+}
+
+// Project files under .spotexec/ (a [setup] script, helpers) sync like any
+// other, Git or not; spotexec's own state there (write-back lock, conflicts,
+// backups), at the root or in a nested project, never does.
+func TestSpotexecDirSyncsExceptState(t *testing.T) {
+	files := []string{
+		"src/a.txt", ".spotexec/prep.sh", ".spotexec/lib/helper.sh",
+		".spotexec/conflicts/run1/src/a.txt", ".spotexec/backup/run1/src/a.txt", ".spotexec/writeback.lock",
+		".SpotExec/Backup/run2/b.txt",
+		"sub/.spotexec/prep.sh", "sub/.spotexec/backup/run1/x", "sub/.spotexec/conflicts/run1/x", "sub/.spotexec/writeback.lock",
+	}
+	want := ".spotexec/lib/helper.sh .spotexec/prep.sh src/a.txt sub/.spotexec/prep.sh"
+	for _, git := range []bool{false, true} {
+		root := t.TempDir()
+		writeTree(t, root, files...)
+		if git {
+			gitIn(t, root, "init", "-q")
+		}
+		m, err := Build(context.Background(), Options{Root: root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.Git != git {
+			t.Fatalf("git = %v, want %v", m.Git, git)
+		}
+		if got := paths(m); got != want {
+			t.Errorf("git %v: synced %q, want %q", git, got, want)
+		}
+		ign, err := m.CheckIgnored(context.Background(), []string{".spotexec/new.sh", ".spotexec/backup/r/x", "sub/.spotexec/conflicts/r/x", ".SpotExec/Backup/r/y", "Sub/.SPOTEXEC/WriteBack.lock"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for p, want := range map[string]bool{".spotexec/new.sh": false, ".spotexec/backup/r/x": true, "sub/.spotexec/conflicts/r/x": true, ".SpotExec/Backup/r/y": true, "Sub/.SPOTEXEC/WriteBack.lock": true} {
+			if ign[p] != want {
+				t.Errorf("git %v: CheckIgnored(%q) = %v, want %v", git, p, ign[p], want)
+			}
 		}
 	}
 }
@@ -101,7 +141,7 @@ func TestIncludeUntrackedAndIgnoredInGit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := paths(m), ".gitignore docker/Dockerfile docker/files/x.conf src/a.txt"; got != want {
+	if got, want := paths(m), ".gitignore .spotexec/Dockerfile .spotexec/setup.sh docker/Dockerfile docker/files/x.conf src/a.txt"; got != want {
 		t.Errorf("synced %q, want %q", got, want)
 	}
 	// .spotexec/ itself gitignored: its build inputs still sync.
@@ -146,8 +186,8 @@ func TestIncludeRespectsExcludes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := paths(m); got != "" {
-		t.Errorf("synced spotexec state %q", got)
+	if got := paths(m); got != ".spotexec/Dockerfile" {
+		t.Errorf("synced %q, want only .spotexec/Dockerfile (never spotexec state)", got)
 	}
 }
 
