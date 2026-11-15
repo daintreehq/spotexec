@@ -210,6 +210,8 @@ func TestConflictExit(t *testing.T) {
 		{"interrupted stays 130", Result{ExitCode: ExitInterrupted, Canceled: true, Conflicts: conflicted}, true, ExitInterrupted},
 		{"timed out stays 124", Result{ExitCode: ExitTimeout, TimedOut: true, Conflicts: conflicted}, true, ExitTimeout},
 		{"a canceled 0 is never promoted", Result{Canceled: true, Conflicts: conflicted}, true, 0},
+		{"a timed-out 0 is never promoted", Result{TimedOut: true, Conflicts: conflicted}, true, 0},
+		{"a setup failure's 0 is never promoted", Result{SetupFailed: true, Conflicts: conflicted}, true, 0},
 		{"a setup failure keeps its code", Result{ExitCode: 1, SetupFailed: true, Conflicts: conflicted}, true, 1},
 	} {
 		if got := conflictExit(c.res, c.on); got != c.want {

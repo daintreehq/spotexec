@@ -765,15 +765,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 						depsDetail(os.Stderr, prefix, err)
 					}
 				}
-				summary := fmt.Sprintf("%s · %s%s", part.label, ui.Dur(out.took), out.where())
-				if res.DepsInstalled > 0 {
-					summary += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(res.DepsInstalled))
-				}
-				summary += out.conflictNote()
-				if code != 0 {
-					summary += fmt.Sprintf(" · exit %d", code)
-				}
-				sr.Reporter.PartDone(summary, code == 0)
+				sr.Reporter.PartDone(out.doneLine(res.DepsInstalled), code == 0)
 			}
 			// The siblings stop before this part's (possibly long) block
 			// is printed.

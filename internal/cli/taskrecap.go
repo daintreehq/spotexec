@@ -80,6 +80,20 @@ func (o partOutcome) where() string {
 	return ""
 }
 
+// doneLine is the line printed as the part finishes; deps is how long its
+// dependency install took (zero when it hydrated or skipped it).
+func (o partOutcome) doneLine(deps time.Duration) string {
+	line := fmt.Sprintf("%s · %s%s", o.part.label, ui.Dur(o.took), o.where())
+	if deps > 0 {
+		line += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(deps))
+	}
+	line += o.conflictNote()
+	if o.code != 0 {
+		line += fmt.Sprintf(" · exit %d", o.code)
+	}
+	return line
+}
+
 // recapLine is the part's row in the run's closing summary.
 func (o partOutcome) recapLine() string {
 	status := o.status

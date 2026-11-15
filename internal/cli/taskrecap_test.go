@@ -101,12 +101,24 @@ func TestTaskRecapConflicts(t *testing.T) {
 	if v := taskVerdict("all", outs, 122, false, 5*time.Second); v != "all · 1 of 3 parts failed (fmt) · 3 conflicts · 5.0s · exit 122" {
 		t.Errorf("verdict: %q", v)
 	}
+	if v := taskVerdict("all", outs[1:], 0, false, 5*time.Second); v != "all · 2 parts passed · 1 conflict · 5.0s" {
+		t.Errorf("passing verdict: %q", v)
+	}
 	if n := totalConflicts(outs); n != 3 {
 		t.Errorf("total conflicts %d, want 3", n)
 	}
-	b, _ := json.Marshal(resultParts(outs[1:2]))
-	if !strings.Contains(string(b), `"conflict_count":1`) {
-		t.Errorf("part result lacks its conflict count: %s", b)
+	var parts []struct {
+		Count int `json:"conflict_count"`
+	}
+	b, _ := json.Marshal(resultParts(outs))
+	if err := json.Unmarshal(b, &parts); err != nil || len(parts) != 3 || parts[0].Count != 2 || parts[1].Count != 1 || parts[2].Count != 0 {
+		t.Errorf("part results' conflict counts: %s", b)
+	}
+	if got := outs[0].doneLine(3 * time.Second); got != "fmt · 2.0s on aws#1 · installed dependencies (3.0s) · 2 conflicts · exit 122" {
+		t.Errorf("done line: %q", got)
+	}
+	if got := outs[1].doneLine(0); got != "lint · 2.0s on aws#1 · 1 conflict" {
+		t.Errorf("done line: %q", got)
 	}
 }
 
@@ -120,6 +132,8 @@ func TestTaskExit(t *testing.T) {
 	}{
 		{"all passed", []partOutcome{part(partPassed, 0), part(partPassed, 0)}, false, 0},
 		{"first failure in task order", []partOutcome{part(partFailed, 2), part(partFailed, 1)}, false, 2},
+		{"first failure, not the largest", []partOutcome{part(partFailed, 1), part(partFailed, 2)}, false, 1},
+		{"125 over a larger code", []partOutcome{part(partFailed, 126), part(partFailed, client.ExitInfra)}, false, client.ExitInfra},
 		{"a conflict-only failure counts", []partOutcome{part(partPassed, 0), part(partFailed, client.ExitWritebackConflict)}, false, client.ExitWritebackConflict},
 		{"125 outranks an earlier failure", []partOutcome{part(partFailed, client.ExitWritebackConflict), part(partFailed, client.ExitInfra)}, false, client.ExitInfra},
 		{"125 stays over a later failure", []partOutcome{part(partFailed, client.ExitInfra), part(partFailed, 1)}, false, client.ExitInfra},
