@@ -1,13 +1,18 @@
 package cli
 
 import (
+	"errors"
+	"fmt"
 	"os/exec"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/transport"
 )
 
 func TestTaskCommandArgsAreData(t *testing.T) {
@@ -118,6 +123,36 @@ func TestTaskSetupOptOut(t *testing.T) {
 	}
 	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.NoSetup {
 		t.Error("setup skipped by default")
+	}
+}
+
+// A --json error event names the reason when there is one, so a caller
+// can branch on it without parsing the message (#134).
+func TestErrorCode(t *testing.T) {
+	remote := func(code string) error {
+		return &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: code, Message: "details"}}
+	}
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("aws: %w (fix bootstrap_script, then `spotexec down aws`)", remote(protocol.CodeBootFailed)), "BOOTSTRAP_FAILED"},
+		{&client.InfraError{Err: &client.DepsError{Err: fmt.Errorf("dependencies: %w", remote(protocol.CodeDepsFailed))}}, "DEPS_FAILED"},
+		{remote(protocol.CodeInternal), "INTERNAL"},
+		{fmt.Errorf("%s: no free slot within 10m0s", protocol.CodeQueueTimeout), "QUEUE_TIMEOUT"},
+		{&client.InfraError{Err: errors.New("QUEUE_TIMEOUT: no free slot within 10m0s (2 busy)")}, "QUEUE_TIMEOUT"},
+		{remote(""), "SPOTEXEC_ERROR"},
+		{errors.New("ssh: connect to host 192.0.2.1 port 22: timed out"), "SPOTEXEC_ERROR"},
+		{errors.New("GPU: no such runner"), "SPOTEXEC_ERROR"}, // a runner name, not a code
+		{errors.New("BUILD_POOL: bootstrap_script failed on i-0abc"), "SPOTEXEC_ERROR"},
+		{errors.New("queue_timeout: lower case"), "SPOTEXEC_ERROR"},
+		// The helper's reason beats whatever wraps it.
+		{fmt.Errorf("QUEUE_TIMEOUT: %w", remote(protocol.CodeDraining)), "RUNNER_DRAINING"},
+		{errors.New("unknown runner \"gone\""), "SPOTEXEC_ERROR"},
+	} {
+		if got := errorCode(c.err); got != c.want {
+			t.Errorf("errorCode(%q) = %s, want %s", c.err, got, c.want)
+		}
 	}
 }
 

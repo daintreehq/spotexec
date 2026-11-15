@@ -18,6 +18,7 @@ import (
 
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/transport"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
@@ -566,7 +567,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		}
 		finish(client.ExitInfra)
 		rep.Clear()
-		rep.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
+		rep.Event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 		if !rep.IsJSON() {
 			fmt.Fprintf(os.Stderr, "spotexec: %v\n", err)
 			depsDetail(os.Stderr, "", err)
@@ -859,7 +860,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 					return
 				}
 				if err != nil {
-					sr.event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
+					sr.event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 					if !rep.IsJSON() {
 						fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
 						depsDetail(os.Stderr, prefix, err)
@@ -980,6 +981,29 @@ func (t *taskReporter) event(name string, fields map[string]any) {
 func (t *taskReporter) Status(string, ...any) {}
 func (t *taskReporter) Clear()                {}
 func (t *taskReporter) Done(string, bool)     {}
+
+// errorCode is the code of a --json error event: the reason the helper
+// reported (BOOTSTRAP_FAILED, DEPS_FAILED, …), or the one the message starts
+// with (QUEUE_TIMEOUT: …), else SPOTEXEC_ERROR.
+func errorCode(err error) string {
+	var re *transport.RemoteError
+	if errors.As(err, &re) && re.Code != "" {
+		return re.Code
+	}
+	// Only a known code counts: "BUILD_POOL: …" names a runner.
+	if code, _, ok := strings.Cut(err.Error(), ": "); ok && errorCodes[code] {
+		return code
+	}
+	return "SPOTEXEC_ERROR"
+}
+
+// errorCodes are the reasons a failed run's error can start with.
+var errorCodes = map[string]bool{
+	protocol.CodeDraining: true, protocol.CodeBooting: true, protocol.CodeBootFailed: true,
+	protocol.CodeQueueTimeout: true, protocol.CodeBadRequest: true, protocol.CodeInternal: true,
+	protocol.CodeSyncFailed: true, protocol.CodeDepsFailed: true, protocol.CodeImageFailed: true,
+	protocol.CodeShutdown: true,
+}
 
 // depsDetail prints, under a failed dependency install's error, the end of
 // the install's output and where its full log is. prefix starts every line
