@@ -125,7 +125,7 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 		if a.r.Region != "us-east-1" {
 			body = []byte(`<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>` + a.r.Region + `</LocationConstraint></CreateBucketConfiguration>`)
 		}
-		st, b, err := a.s3(ctx, http.MethodPut, bucket, "", body, nil)
+		st, b, err := a.s3Settled(ctx, http.MethodPut, bucket, "", body, nil)
 		if err != nil {
 			return "", "", err
 		}
@@ -144,7 +144,7 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 		lifecycle := []byte(`<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>spotexec-expire</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>14</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>`)
 		sum := md5.Sum(lifecycle)
 		hdr := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:]), "x-amz-expected-bucket-owner": acct}
-		st, b, err := a.s3(ctx, http.MethodPut, bucket, "?lifecycle", lifecycle, hdr)
+		st, b, err := a.s3Settled(ctx, http.MethodPut, bucket, "?lifecycle", lifecycle, hdr)
 		if err != nil {
 			return "", "", err
 		}
@@ -155,6 +155,31 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 	_ = os.MkdirAll(a.dir, 0o700)
 	_ = os.WriteFile(marker, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o600)
 	return bucket, acct, nil
+}
+
+// s3OperationAbortedDelay is the first wait before retrying a bucket
+// operation S3 aborted; each retry waits longer.
+var s3OperationAbortedDelay = 500 * time.Millisecond
+
+// s3Settled is s3 for bucket configuration calls, retried while S3 answers
+// 409 OperationAborted. S3 serializes changes to one bucket's configuration
+// and aborts the rest, so the parts of a parallel or sharded task setting up
+// the cache bucket at once (on a machine that hasn't set it up yet) would
+// otherwise lose the shared cache for every part but one.
+func (a *AWSSpot) s3Settled(ctx context.Context, method, bucket, sub string, body []byte, extra map[string]string) (int, []byte, error) {
+	delay := s3OperationAbortedDelay
+	for attempt := 1; ; attempt++ {
+		st, b, err := a.s3(ctx, method, bucket, sub, body, extra)
+		if err != nil || st != http.StatusConflict || !bytes.Contains(b, []byte("OperationAborted")) || attempt == 6 {
+			return st, b, err
+		}
+		select {
+		case <-ctx.Done():
+			return st, b, nil
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
 }
 
 func firstLineOf(b []byte) string {
