@@ -253,6 +253,15 @@ func whyNoReplay(lease *Lease, noticed bool) noReplay {
 	return noReplay{}
 }
 
+// noteReclaimed tells the lease's fleet that AWS is reclaiming its VM, so
+// new launches (a replacement first) prefer other zones and types for a
+// while.
+func noteReclaimed(lease *Lease) {
+	if rc, ok := lease.Provider.(provider.Reclaimer); ok && lease.Instance.ID != "" {
+		rc.Reclaimed(lease.Instance)
+	}
+}
+
 // replayVerdict is whyNoReplay for an attempt that lost its runner with
 // err: a shutdown the helper reported counts as the VM's notice, since EC2
 // still reports a VM running while its OS halts.
@@ -406,6 +415,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		lease.Sess.SetOnSilent(waitIfRunning(lease, o.Rep))
 	}
 	var noticed atomic.Bool // a reclamation notice arrived
+	// Before any replacement launches: steer it away from this VM's pool.
+	reclaimed := sync.OnceFunc(func() { noteReclaimed(lease) })
 	defer func() {
 		if lost != "" && lease.InstanceID != "" {
 			res.noReplay = replayVerdict(lease, noticed.Load(), err)
@@ -432,6 +443,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
 		if ev.Name == "spot_interruption" {
 			noticed.Store(true)
+			reclaimed()
 		}
 	}
 	remoteWS := lease.Acq.Workspace
@@ -580,6 +592,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}()
 	onSpot := func() {
 		noticed.Store(true)
+		reclaimed()
 		if lease.InstanceID == "" || !(o.RetryPreempt && att.n < 2 && o.Sync != "none" && !o.PreferLast && !o.SameSlot) {
 			return
 		}

@@ -80,6 +80,8 @@ type runnerStatus struct {
 	// current requirements: it takes no new runs and idles out.
 	Mismatch string `json:"mismatch,omitempty"`
 	r        *config.Runner
+	// reclaimed records a Spot interruption notice the VM reports.
+	reclaimed func()
 }
 
 const (
@@ -220,8 +222,12 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			mismatch := fleetMismatches(ctx, f, insts)
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
-				rows = append(rows, runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
-					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}})
+				st := runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
+					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}}
+				if rc, ok := f.(provider.Reclaimer); ok {
+					st.reclaimed = func() { rc.Reclaimed(in) }
+				}
+				rows = append(rows, st)
 			}
 			continue
 		}
@@ -267,6 +273,11 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				return
 			}
 			st.Helper = &hs
+			// Asking marks the VM draining, so later asks (the pool
+			// manager's) no longer see the notice: record it here too.
+			if hs.SpotNotice != "" && st.reclaimed != nil {
+				st.reclaimed()
+			}
 		}()
 	}
 	wg.Wait()

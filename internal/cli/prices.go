@@ -52,6 +52,7 @@ func cmdPrices() *cobra.Command {
 				return err
 			}
 			cool := g.Cooldowns(t.Prices)
+			held := g.HeldBack(t.Prices) // a VM there was recently reclaimed
 			maxPrice, _ := strconv.ParseFloat(r.MaxPrice, 64)
 			next, hasNext := g.NextLaunch(t)
 			if asJSON {
@@ -60,6 +61,7 @@ func cmdPrices() *cobra.Command {
 					MemoryMiB int    `json:"memory_mib,omitempty"`
 					Next      bool   `json:"next,omitempty"`
 					Skipped   string `json:"skipped,omitempty"`
+					HeldBack  string `json:"held_back,omitempty"`
 				}
 				rows := make([]row, 0, len(t.Prices))
 				for _, sp := range t.Prices {
@@ -67,7 +69,7 @@ func cmdPrices() *cobra.Command {
 					if why == "" && maxPrice > 0 && sp.USD() > maxPrice {
 						why = "above max_price"
 					}
-					rows = append(rows, row{sp, t.MemoryMiB[sp.Type], hasNext && sp == next, why})
+					rows = append(rows, row{sp, t.MemoryMiB[sp.Type], hasNext && sp == next, why, held[sp.Region+"/"+sp.Zone+"/"+sp.Type]})
 				}
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
@@ -106,6 +108,11 @@ func cmdPrices() *cobra.Command {
 					note = "above max_price " + r.MaxPrice
 				} else if hasNext && sp == next {
 					mark, note = "→", "next launch"
+					if why := held[sp.Region+"/"+sp.Zone+"/"+sp.Type]; why != "" {
+						note += " (every other option is skipped; " + why + ")"
+					}
+				} else if why := held[sp.Region+"/"+sp.Zone+"/"+sp.Type]; why != "" {
+					note = "held back: " + why
 				}
 				typ := sp.Type
 				if r.ByRequirements() {

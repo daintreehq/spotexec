@@ -106,8 +106,10 @@ The helper polls IMDSv2 every 5s for the whole session:
 - `spot/instance-action` (about 2 minutes' notice): the helper marks the VM
   draining and sends `spot_interruption` to the CLI.
 
-On `spot_interruption` the CLI immediately checks for **replacement
-capacity** in the background, excluding the dying VM: it probes for a free
+On `spot_interruption` the CLI records that the VM's zone and instance type
+were reclaimed (new launches rank them last for a while; the pool manager
+does the same for notices it finds on idle VMs) and immediately checks for
+**replacement capacity** in the background, excluding the dying VM: it probes for a free
 slot (without keeping it) and registers demand, so a launch starts if one is
 needed. The optional pool manager (`spotexec daemon`) also replaces a
 noticed warm instance within the notice. Then:

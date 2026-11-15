@@ -298,9 +298,10 @@ type placementState struct {
 	// Active: region -> may hold our instances until. An expired entry is
 	// only dropped once a listing of that region finds nothing, so a VM
 	// whose watchdog failed is never forgotten.
-	Active   map[string]time.Time `json:"active,omitempty"`
-	Where    map[string]placedAt  `json:"where,omitempty"`    // instance ID -> region (a routing cache)
-	Cooldown map[string]cooldown  `json:"cooldown,omitempty"` // "region", "zone:<zone>" or "region/zone/type"
+	Active    map[string]time.Time `json:"active,omitempty"`
+	Where     map[string]placedAt  `json:"where,omitempty"`     // instance ID -> region (a routing cache)
+	Cooldown  map[string]cooldown  `json:"cooldown,omitempty"`  // "region", "zone:<zone>", "region/zone/type" or "reclaimed:region/zone/type"
+	Reclaimed map[string]time.Time `json:"reclaimed,omitempty"` // instance ID -> when its Spot interruption was recorded
 	// Discovered: every managed region has been listed once. Until then
 	// (first use, an upgrade from single-region, a lost state file) listings
 	// cover them all rather than trusting Active.
@@ -352,7 +353,7 @@ func (g *AWSGlobal) withState(fn func(st *placementState)) error {
 		}
 	}
 	for k, v := range st.Cooldown {
-		if now.After(v.Until.Add(poolCoolMax)) {
+		if now.After(v.Until.Add(coolMemory(k))) {
 			delete(st.Cooldown, k) // forget the backoff step too, eventually
 		}
 	}
@@ -1184,7 +1185,9 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		return false
 	}
 	attempts := 0
-	for rank, c := range t.Prices {
+	// Options whose VMs were recently reclaimed go last.
+	for _, rank := range heldLast(t.Prices, g.heldBack(t.Prices)) {
+		c := t.Prices[rank]
 		if skipRegion[c.Region] != "" || skipZone[c.Zone] || quotaSkipped(c) || (maxPrice > 0 && c.USD() > maxPrice) {
 			continue
 		}
@@ -1393,7 +1396,7 @@ func priceNote(t PriceTable, rank int) string {
 	if rank == 0 {
 		return "cheapest of " + where
 	}
-	return fmt.Sprintf("#%d by price of %s; cheaper ones failed or are cooling down", rank+1, where)
+	return fmt.Sprintf("#%d by price of %s; cheaper ones failed, are cooling down or had a VM reclaimed", rank+1, where)
 }
 
 func plural(n int, s string) string {
@@ -1721,11 +1724,13 @@ func (a *AWSSpot) priceCheck(ctx context.Context) Check {
 }
 
 // NextLaunch is the option the next launch tries first: the first in
-// launch order that isn't cooling down or above max_price.
+// launch order that isn't cooling down or above max_price, those held back
+// after a Spot interruption last.
 func (g *AWSGlobal) NextLaunch(t PriceTable) (SpotPrice, bool) {
 	cool := g.cooldowns(t.Prices)
 	maxPrice, _ := strconv.ParseFloat(g.r.MaxPrice, 64)
-	for _, p := range t.Prices {
+	for _, i := range heldLast(t.Prices, g.heldBack(t.Prices)) {
+		p := t.Prices[i]
 		if _, ok := cool[poolKey(p)]; ok || (maxPrice > 0 && p.USD() > maxPrice) {
 			continue
 		}

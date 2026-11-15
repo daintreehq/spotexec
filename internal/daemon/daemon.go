@@ -655,6 +655,9 @@ func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instan
 			}
 			answered++
 			mu.Unlock()
+			if rc, ok := fl.f.(provider.Reclaimer); ok && hs.SpotNotice != "" {
+				rc.Reclaimed(in) // its replacement goes elsewhere
+			}
 			if (hs.SpotNotice != "" || hs.Draining) && hs.BootFailed == "" {
 				// Replace it now, during the two-minute notice, rather than
 				// after the instance vanishes from listings.
