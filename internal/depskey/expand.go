@@ -79,7 +79,7 @@ func Expand(entries, files []string) (out, unmatched []string, err error) {
 // into segments. Each segment is a path.Match pattern; a segment that is
 // exactly "**" matches any number of directories, including none.
 func compile(p string) ([]string, error) {
-	if _, err := fsid.CleanRel(strings.NewReplacer("*", "x", "?", "x", "[", "x", "]", "x").Replace(p)); err != nil {
+	if err := fsid.CheckPattern(p); err != nil {
 		return nil, fmt.Errorf("deps.lockfiles: invalid pattern %q", p)
 	}
 	segs := strings.Split(p, "/")

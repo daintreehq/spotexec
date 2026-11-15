@@ -578,7 +578,7 @@ func (s *Session) pull(p protocol.Pull) error {
 	var files []string
 	for _, pat := range p.Patterns {
 		pat = strings.TrimSuffix(strings.TrimPrefix(pat, "./"), "/")
-		if _, err := fsid.CleanRel(strings.ReplaceAll(strings.ReplaceAll(pat, "*", "x"), "?", "x")); err != nil {
+		if err := fsid.CheckPattern(pat); err != nil {
 			return perr(protocol.CodeBadRequest, "bad pull pattern %q", pat)
 		}
 		matches, err := filepath.Glob(filepath.Join(s.workspace, filepath.FromSlash(pat)))

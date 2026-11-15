@@ -117,6 +117,19 @@ func CleanRel(p string) (string, error) {
 	return filepath.FromSlash(p), nil
 }
 
+var globBytes = strings.NewReplacer("*", "x", "?", "x", "[", "x", "]", "x")
+
+// CheckPattern validates a slash-separated glob pattern as CleanRel validates
+// a path, reading *, ?, [ and ] as ordinary bytes. A backslash is refused on
+// every OS: in a pattern it is an escape, never a filename byte.
+func CheckPattern(p string) error {
+	if strings.Contains(p, "\\") {
+		return fmt.Errorf("invalid pattern %q", p)
+	}
+	_, err := CleanRel(globBytes.Replace(p))
+	return err
+}
+
 // SafeJoin joins root and a wire path, and verifies that no existing ancestor
 // directory between root and the target is a symlink (which could redirect a
 // write outside root).

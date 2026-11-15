@@ -57,3 +57,18 @@ func TestSafeJoinBackslash(t *testing.T) {
 		t.Errorf("SafeJoin = %q, %v", got, err)
 	}
 }
+
+func TestCheckPattern(t *testing.T) {
+	for _, p := range []string{"*.lock", "packages/*/node_modules", "docs/[ab]*.md", "a/**/x", "src/?.go"} {
+		if err := CheckPattern(p); err != nil {
+			t.Errorf("CheckPattern(%q) = %v", p, err)
+		}
+	}
+	// A backslash escapes in a pattern, so it is refused on every OS even
+	// though paths may hold one.
+	for _, p := range []string{`docs/\*`, `\.\./*`, `a\`, "../*", "*/../x", ".git/*", "/etc/*", "a//*", ""} {
+		if err := CheckPattern(p); err == nil {
+			t.Errorf("CheckPattern(%q) accepted", p)
+		}
+	}
+}
