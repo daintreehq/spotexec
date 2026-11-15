@@ -39,8 +39,8 @@ takes part in scheduling, and every VM shuts itself down.
      skipped.
    - An instance that no longer satisfies the runner's current requirements
      (its type left `instance_types`, or no longer meets `vcpus`,
-     `min_memory_gib`, `min_generation` or `exclude_instance_types` after a
-     config change) is skipped and stops counting as capacity, so waiting
+     `min_memory_gib`, `min_generation` or `exclude_instance_types`, or its
+     region left `regions`, after a config change) is skipped and stops counting as capacity, so waiting
      jobs get a matching replacement and it idles out. Unlike draining this
      is judged again whenever the config changes: reverting the change puts
      it back in service. A failed type lookup never retires an instance.

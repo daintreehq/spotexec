@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -234,10 +235,12 @@ func TestNearLifetimeInstancesDrain(t *testing.T) {
 }
 
 // matchFleet is a fakeFleet that judges instances by type: a type in bad
-// no longer matches; a type in unknown can't be judged.
+// no longer matches; a type in unknown can't be judged. With regions set,
+// an instance in another region doesn't match either.
 type matchFleet struct {
 	*fakeFleet
 	bad, unknown map[string]bool
+	regions      []string
 	calls        int
 }
 
@@ -246,6 +249,8 @@ func (m *matchFleet) Mismatches(_ context.Context, insts []provider.Instance) ma
 	out := map[string]string{}
 	for _, in := range insts {
 		switch {
+		case m.regions != nil && !slices.Contains(m.regions, in.Region):
+			out[in.ID] = in.Region + " is no longer one of the runner's regions"
 		case m.unknown[in.Type]:
 		case m.bad[in.Type]:
 			out[in.ID] = in.Type + " doesn't have 8 vCPUs, at least 32 GiB"
@@ -320,6 +325,36 @@ func TestMismatchedInstancesTakeNoNewRuns(t *testing.T) {
 	p.R.MinMemoryGiB = 48
 	if cands, _, _ = p.Candidates(ctx, nil); len(cands) != 2 {
 		t.Fatalf("an unjudged VM retired under new requirements: %v", cands)
+	}
+}
+
+// Issue #127: after regions were narrowed, a VM in the dropped region kept
+// taking runs. Changing the set of regions judges the VMs again at once
+// (within the listing's TTL); only reordering it doesn't.
+func TestNarrowedRegionsJudgedAgain(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 4)
+	p.R.Region, p.R.Regions = "r-one-1", []string{"r-one-1", "r-two-1"}
+	m := &matchFleet{fakeFleet: f, unknown: map[string]bool{}, regions: p.R.Regions}
+	p.Fleet = m
+	host := provider.Target{Host: "127.0.0.1", Port: 1}
+	f.insts = []provider.Instance{
+		{ID: "i-two", Region: "r-two-1", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-2 * time.Hour)},
+		{ID: "i-one", Region: "r-one-1", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Hour)},
+	}
+	if cands, usable, _ := p.Candidates(ctx, nil); len(cands) != 2 || usable != 2 {
+		t.Fatalf("both regions configured: %v usable %d", cands, usable)
+	}
+	calls := m.calls
+	p.R.Regions = []string{"r-two-1", "r-one-1"}
+	if _, _, _ = p.Candidates(ctx, nil); m.calls != calls {
+		t.Fatal("reordering regions judged the VMs again")
+	}
+	p.R.Regions = nil // regions = ["r-one-1"]
+	m.regions = []string{"r-one-1"}
+	cands, usable, _ := p.Candidates(ctx, nil)
+	if len(cands) != 1 || cands[0].ID != "i-one" || usable != 1 {
+		t.Fatalf("after narrowing: candidates %v usable %d", cands, usable)
 	}
 }
 
