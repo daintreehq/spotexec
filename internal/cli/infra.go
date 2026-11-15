@@ -1105,6 +1105,29 @@ func cmdSyncPlan() *cobra.Command {
 	return c
 }
 
+// pullMode picks pull's output mode: --json (either way) beats
+// SPOTEXEC_JSON, read as a run reads it, and --json=false beats
+// SPOTEXEC_AGENT=1.
+func pullMode(asJSON, jsonSet bool) (ui.Mode, error) {
+	if jsonSet {
+		if asJSON {
+			return ui.ModeJSON, nil
+		}
+		if os.Getenv("SPOTEXEC_AGENT") == "1" {
+			return ui.ModePlain, nil
+		}
+		return ui.ModeAuto, nil
+	}
+	envJSON, err := envBool("SPOTEXEC_JSON")
+	if err != nil {
+		return ui.ModeAuto, err
+	}
+	if envJSON {
+		return ui.ModeJSON, nil
+	}
+	return ui.ModeAuto, nil
+}
+
 func cmdPull() *cobra.Command {
 	var dest string
 	var held, asJSON bool
@@ -1118,6 +1141,10 @@ func cmdPull() *cobra.Command {
 			return cobra.MinimumNArgs(1)(cmd, args)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			mode, err := pullMode(asJSON, cmd.Flags().Changed("json"))
+			if err != nil {
+				return err
+			}
 			l, err := load("")
 			if err != nil {
 				return err
@@ -1138,13 +1165,6 @@ func cmdPull() *cobra.Command {
 			}
 			ctx, _, stop := signals()
 			defer stop()
-			mode := ui.ModeAuto
-			switch {
-			case asJSON, !cmd.Flags().Changed("json") && os.Getenv("SPOTEXEC_JSON") == "1":
-				mode = ui.ModeJSON
-			case cmd.Flags().Changed("json") && os.Getenv("SPOTEXEC_AGENT") == "1":
-				mode = ui.ModePlain // --json=false beats SPOTEXEC_AGENT=1
-			}
 			rep, _ := ui.New(mode, os.Stderr, "")
 			host, _ := os.Hostname()
 			lease, err := client.AcquireSlot(ctx, l.cfg, l.ws, r, lr, rep, host, client.PullDisplay, false, 0, false, "")

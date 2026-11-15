@@ -22,6 +22,11 @@ func MatchKey(r *config.Runner) string {
 		slices.Sort(rs)
 		regions = strings.Join(rs, ",")
 	}
+	if r.AnyRegion() && len(r.ExcludeRegions) > 0 {
+		ex := slices.Clone(r.ExcludeRegions)
+		slices.Sort(ex)
+		regions += "-" + strings.Join(ex, ",")
+	}
 	return typesKey(r) + "|" + regions
 }
 
@@ -118,10 +123,14 @@ func (g *AWSGlobal) Mismatches(ctx context.Context, insts []Instance) map[string
 	return out
 }
 
-// usesRegion reports whether the runner's config still lists region.
+// usesRegion reports whether the runner's config still lists region (with
+// regions = ["all"], every region exclude_regions doesn't leave out).
 func (g *AWSGlobal) usesRegion(region string) bool {
 	if g.oneRegion() {
 		return region == g.r.Region
 	}
-	return g.r.AnyRegion() || contains(g.r.Regions, region)
+	if g.r.AnyRegion() {
+		return !contains(g.excluded(), region)
+	}
+	return contains(g.r.Regions, region)
 }

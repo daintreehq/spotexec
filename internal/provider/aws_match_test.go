@@ -143,6 +143,12 @@ func TestMismatchesDroppedRegion(t *testing.T) {
 	if len(got) != 3 || got["a"] != "" || got["b"] != "" || got["c"] != "" {
 		t.Fatalf("all regions: %q", got)
 	}
+	// ... except the ones exclude_regions leaves out.
+	g.r.ExcludeRegions = []string{"r-three-1"}
+	got = g.Mismatches(context.Background(), insts[:3])
+	if got["a"] != "" || got["b"] != "" || !strings.Contains(got["c"], "r-three-1 is no longer one of the runner's regions") {
+		t.Fatalf("all regions, one excluded: %q", got)
+	}
 }
 
 // A single-region runner judging a cached listing from before its region
@@ -178,6 +184,17 @@ func TestMatchKeyCoversRegions(t *testing.T) {
 	diff("narrowing", func(r *config.Runner) { r.Regions = []string{"r-one-1", "r-two-1"} })
 	diff("replacing a region", func(r *config.Runner) { r.Regions = []string{"r-one-1", "r-two-1", "r-four-1"} })
 	diff("all regions", func(r *config.Runner) { r.Regions = []string{config.AllRegions} })
+	all := config.Runner{Type: config.TypeAWSSpot, Regions: []string{config.AllRegions}, InstanceTypes: r.InstanceTypes}
+	allKey := MatchKey(&all)
+	all.ExcludeRegions = []string{"r-two-1", "r-one-1"}
+	if MatchKey(&all) == allKey {
+		t.Fatal("excluding a region kept the match key")
+	}
+	reordered := all
+	reordered.ExcludeRegions = []string{"r-one-1", "r-two-1"}
+	if MatchKey(&reordered) != MatchKey(&all) {
+		t.Fatal("reordering exclude_regions changed the match key")
+	}
 	one := &config.Runner{Region: "r-one-1", InstanceTypes: r.InstanceTypes}
 	if moved := (config.Runner{Region: "r-two-1", InstanceTypes: r.InstanceTypes}); MatchKey(&moved) == MatchKey(one) {
 		t.Fatal("changing region kept the match key")
