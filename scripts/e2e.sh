@@ -310,6 +310,8 @@ EOF
 "$SX" -q echoargs '$(echo INJECTED)' 'two words' >"$WORK/inj.out" 2>&1 || true
 check "task args are not shell-evaluated" "grep -qF '<\$(echo INJECTED)><two words>' $WORK/inj.out"
 cat $WORK/inj.out
+"$SX" echoarg >"$WORK/unk.out" 2>&1 || true
+check "a mistyped task name names the closest task" "grep -qF 'no task is named \"echoarg\", and the shell found no command by that name on the runner; did you mean \"echoargs\"?' $WORK/unk.out && grep -q 'exit 127' $WORK/unk.out"
 cat >> .spotexec.toml <<'EOF'
 
 [tasks.sharded]

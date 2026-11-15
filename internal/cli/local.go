@@ -44,16 +44,7 @@ func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Opt
 	// (unset, "rm -rf ${SPOTEXEC_WORKSPACE}/tmp" would mean /tmp).
 	// Defaults, then the project's [env] (which may override them, as on a
 	// runner), then what must hold here.
-	slots = max(slots, 1)
-	env := append(os.Environ(), "CI=true", "SPOTEXEC_CPUS="+strconv.Itoa(max(runtime.NumCPU()/slots, 1)), "SPOTEXEC_SLOTS="+strconv.Itoa(slots),
-		"SPOTEXEC_SLOT="+strconv.Itoa(slot), "SPOTEXEC_PORT_BASE="+strconv.Itoa(20000+slot*1000))
-	for k, v := range l.cfg.Project.Env {
-		env = append(env, k+"="+v)
-	}
-	for k, v := range o.Env {
-		env = append(env, k+"="+v)
-	}
-	env = append(env, "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
+	env := localEnv(l, o, slot, slots)
 	grace := o.Grace
 	if grace <= 0 {
 		grace = 5 * time.Second
@@ -80,7 +71,7 @@ func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Opt
 			return client.ExitInterrupted
 		}
 	}
-	r := runLocalProc(ctx, intr, o.Command, filepath.Join(l.ws.Root, filepath.FromSlash(l.ws.Cwd)), env, o.Stdout, o.Stderr, o.Timeout, grace)
+	r := runLocalProc(ctx, intr, o.Command, localDir(l), env, o.Stdout, o.Stderr, o.Timeout, grace)
 	switch {
 	case r.err != nil:
 		fmt.Fprintf(stderrOf(o), "spotexec: running locally: %v\n", r.err)
@@ -92,6 +83,34 @@ func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Opt
 		return client.ExitInterrupted
 	}
 	return r.code
+}
+
+// localEnv is the environment a local run gets: defaults, then the
+// project's [env] (which may override them, as on a runner), then what must
+// hold here.
+func localEnv(l *loaded, o client.Options, slot, slots int) []string {
+	slots = max(slots, 1)
+	env := append(os.Environ(), "CI=true", "SPOTEXEC_CPUS="+strconv.Itoa(max(runtime.NumCPU()/slots, 1)), "SPOTEXEC_SLOTS="+strconv.Itoa(slots),
+		"SPOTEXEC_SLOT="+strconv.Itoa(slot), "SPOTEXEC_PORT_BASE="+strconv.Itoa(20000+slot*1000))
+	for k, v := range l.cfg.Project.Env {
+		env = append(env, k+"="+v)
+	}
+	for k, v := range o.Env {
+		env = append(env, k+"="+v)
+	}
+	return append(env, "SPOTEXEC=1", "SPOTEXEC_WORKSPACE="+l.ws.Root, "SPOTEXEC_LOCAL=1")
+}
+
+// localDir is where a local run's command runs: the worktree's current
+// directory.
+func localDir(l *loaded) string { return filepath.Join(l.ws.Root, filepath.FromSlash(l.ws.Cwd)) }
+
+// localShell is the shell a local run uses: bash, else sh.
+func localShell() string {
+	if p, err := exec.LookPath("bash"); err == nil {
+		return p
+	}
+	return "/bin/sh"
 }
 
 func stderrOf(o client.Options) io.Writer {
@@ -110,11 +129,7 @@ type localResult struct {
 // runLocalProc runs script under bash in dir, in its own process group,
 // with the timeout and interrupt handling runLocal describes.
 func runLocalProc(ctx context.Context, intr <-chan struct{}, script, dir string, env []string, stdout, stderr io.Writer, timeout, grace time.Duration) localResult {
-	shell := "/bin/sh"
-	if p, err := exec.LookPath("bash"); err == nil {
-		shell = p
-	}
-	cmd := exec.Command(shell, "-c", script)
+	cmd := exec.Command(localShell(), "-c", script)
 	cmd.Dir = dir
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

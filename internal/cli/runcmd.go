@@ -358,6 +358,7 @@ type runSpec struct {
 	noSetup    bool              // the task opts out of [setup]
 	env        map[string]string // set for the command (a shard's number)
 	waitPush   bool              // container build: push a fresh image before returning
+	taskLike   string            // the first word, when it may be a mistyped task name
 }
 
 // pinnedSync: spotexec sync and container build always sync, and exec
@@ -463,7 +464,14 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 			finish = func(code int) int { ro.finish(code != 0); return code }
 		}
 	}
-	o := f.options(l, s, rep, intr, stdout, os.Stderr)
+	var stderr io.Writer = os.Stderr
+	var watch *notFoundWatch
+	clientRep := rep
+	if s.taskLike != "" {
+		watch = newNotFoundWatch(os.Stderr, s.taskLike)
+		stderr, clientRep = watch, watchReporter{rep, watch}
+	}
+	o := f.options(l, s, clientRep, intr, stdout, stderr)
 	res, err := client.Run(ctx, l.cfg, l.ws, o)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -472,7 +480,11 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		}
 		if f.fallsBack(l, o, res, err) {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
-			return finish(runLocal(ctx, intr, l, o, rep, 0, 1))
+			// Unwatched: a terminal stays one for the local command.
+			o.Stderr, o.Rep = os.Stderr, rep
+			code := finish(runLocal(ctx, intr, l, o, rep, 0, 1))
+			warnUnknownTask(rep, l.cfg.Project, s.taskLike, code, s.taskLike != "" && code == 127 && !localCommand(l, o, s.taskLike), true)
+			return code
 		}
 		finish(client.ExitInfra)
 		rep.Clear()
@@ -512,6 +524,9 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		summary += fmt.Sprintf(" · exit %d", res.ExitCode)
 	}
 	finish(res.ExitCode)
+	if !res.Canceled {
+		warnUnknownTask(rep, l.cfg.Project, s.taskLike, res.ExitCode, watch != nil && watch.Seen(), false)
+	}
 	rep.Done(summary, res.ExitCode == 0)
 	return res.ExitCode
 }
