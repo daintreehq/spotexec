@@ -597,6 +597,15 @@ func TestUnavailableProjectRunnerMasksSameName(t *testing.T) {
 	if c.Global.Runners["spot"] == nil {
 		t.Fatal("the user's own runner must stay known for account-wide commands")
 	}
+	// A default_pool naming the masked runner fails rather than running on it.
+	g, _ = loadGlobalText(t, "default_pool = [\"spot\"]\n[runners.spot]\ntype = \"ssh\"\nhost = \"small\"\n")
+	c, err = mergeProject(t, g, "[runners.spot]\nextends = \"aws\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Pool(nil); err == nil || !strings.Contains(err.Error(), `extends "aws"`) {
+		t.Fatalf("default_pool naming the masked runner: %v", err)
+	}
 	// Without extends, the same name is the base and the override applies.
 	g, _ = loadGlobalText(t, "[runners.spot]\ntype = \"ssh\"\nhost = \"small\"\n")
 	c, err = mergeProject(t, g, "[runners.spot]\nmax_slots = 3\n")
