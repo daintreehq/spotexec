@@ -253,10 +253,7 @@ func judgeBake(b *Bake, cur string, since, now time.Time) {
 	if b.Base == "" {
 		why = "its base image wasn't recorded (made by an older spotexec)"
 	}
-	until := b.Created.Add(BakeMaxAge)
-	if b.NewerBase != "" && b.NewerSince.Add(BakeBaseGrace).Before(until) {
-		until = b.NewerSince.Add(BakeBaseGrace)
-	}
+	until := b.usableUntil()
 	switch age := b.Age(now); {
 	case age > BakeMaxAge:
 		b.Expired = true
@@ -267,6 +264,16 @@ func judgeBake(b *Bake, cur string, since, now time.Time) {
 	case b.NewerBase != "":
 		b.Stale = fmt.Sprintf("%s; used until %s", why, until.Local().Format("Jan 2"))
 	}
+}
+
+// usableUntil is when launches stop using the bake (see BakeMaxAge), as
+// judged so far.
+func (b Bake) usableUntil() time.Time {
+	until := b.Created.Add(BakeMaxAge)
+	if b.NewerBase != "" && b.NewerSince.Add(BakeBaseGrace).Before(until) {
+		until = b.NewerSince.Add(BakeBaseGrace)
+	}
+	return until
 }
 
 // supersededSince is when bake id became superseded: when the newer base

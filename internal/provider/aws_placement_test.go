@@ -57,6 +57,8 @@ func twoRegionEnv(t *testing.T, one, two string, edit func(r *config.Runner)) (*
 		"r-one-1": {{"r-one-1a", "c7a.2xlarge", one}},
 		"r-two-1": {{"r-two-1a", "c7a.2xlarge", two}},
 	}}
+	// Both regions hold a bake: what history decides is the project's part.
+	f.bakes = map[string]bool{"r-one-1": true, "r-two-1": true}
 	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
 	g.r.LaunchOrder = config.LaunchRunCost
 	if edit != nil {
@@ -114,8 +116,10 @@ func TestRunCostWarmRegionHolds(t *testing.T) {
 		t.Fatalf("next launch in %s, want the warm r-one-1", rg)
 	}
 	_, k := ranking(t, g)
-	// The cold start: 4 minutes of the VM and of waiting at $1/h.
-	if c := costIn(t, k, "r-two-1"); c.Warm || !near(c.Cold, (0.096+1)*4/60) || !near(c.Score, 0.096+(0.096+1)*4/60) {
+	// The cold start, with a bake in both: the project's 3 minutes of the
+	// VM and of waiting at $1/h.
+	if c := costIn(t, k, "r-two-1"); c.Warm || !near(c.Cold, (0.096+1)*3/60) || !near(c.Score, 0.096+(0.096+1)*3/60) ||
+		c.ColdParts == nil || c.ColdParts.Paid() != "deps,image" || c.ColdParts.Boot.Why != "a bake of the runner" {
 		t.Fatalf("cold option %+v", c)
 	}
 	if c := costIn(t, k, "r-one-1"); !c.Warm || c.Cold != 0 || c.WarmSeen.IsZero() || !near(c.Score, 0.1) {
@@ -139,7 +143,7 @@ func TestRunCostWarmRegionHolds(t *testing.T) {
 		t.Fatalf("placement %+v", p)
 	}
 	if !strings.HasPrefix(p.Why, "lowest expected run cost of 2 options in 2 regions") || !strings.Contains(p.Why, "warm region") ||
-		!strings.Contains(p.Why, "the cheapest, c7a.2xlarge in r-two-1a at $0.096/h, scores $0.169 (+$0.073 cold region)") {
+		!strings.Contains(p.Why, "the cheapest, c7a.2xlarge in r-two-1a at $0.096/h, scores $0.151 (+$0.055 cold region (deps,image))") {
 		t.Fatalf("why: %s", p.Why)
 	}
 	if last := logged[len(logged)-1]; !strings.Contains(last, "launched spot c7a.2xlarge") || !strings.Contains(last, p.Why) {
@@ -176,9 +180,9 @@ func TestRunCostLargeSavingMoves(t *testing.T) {
 	if rg := nextRegion(t, g); rg != "r-two-1" {
 		t.Fatalf("wait_cost = 0: next launch in %s", rg)
 	}
-	// Without waiting, a cold start still costs the VM its 4 minutes.
+	// Without waiting, a cold start still costs the VM its 3 minutes.
 	_, k := ranking(t, g)
-	if c := costIn(t, k, "r-two-1"); !near(c.Cold, 0.090*4/60) || k.Model.WaitCost != 0 {
+	if c := costIn(t, k, "r-two-1"); !near(c.Cold, 0.090*3/60) || k.Model.WaitCost != 0 {
 		t.Fatalf("cold option %+v, model %+v", c, k.Model)
 	}
 }
@@ -446,7 +450,12 @@ func TestRunCostForgetsOldEvidence(t *testing.T) {
 	if len(st.Warm) != 1 || st.Warm["fresh"].IsZero() || len(st.RTT) != 1 || st.RTT["fresh"].MS != 10 {
 		t.Fatalf("kept %v %v", st.Warm, st.RTT)
 	}
-	m := RunCostModel{WaitCost: 1, HorizonMinutes: 60, ColdMinutes: 4, Regions: true, RoundTrips: runRoundTrips, GenSpeedup: genSpeedup}
+	m := RunCostModel{WaitCost: 1, HorizonMinutes: 60, ColdMinutes: 4, BootMinutes: 1, DepsMinutes: 2, ImageMinutes: 1, Regions: true, RoundTrips: runRoundTrips, GenSpeedup: genSpeedup}
+	// Each holds a bake: history decides the project's parts.
+	ev.found = map[string]regionWarmth{}
+	for _, rg := range []string{"old", "future", "fresh"} {
+		ev.found[rg] = regionWarmth{boot: partSeen{state: partHas}}
+	}
 	var ps []SpotPrice
 	for _, rg := range []string{"old", "future", "fresh"} {
 		ps = append(ps, SpotPrice{Region: rg, Zone: rg + "a", Type: "c7a.2xlarge", Price: "0.1"})
@@ -486,7 +495,7 @@ func TestRunCostKeepsHoldBackAndPriceCap(t *testing.T) {
 		t.Fatalf("launched %+v (%v) via %s", in, err, runsOf(f))
 	}
 	p := in.Placement
-	if p.Rank != 2 || p.Price != "0.096" || p.Cost == nil || p.Cost.Warm || !near(p.Cost.Cold, (0.096+1)*4/60) ||
+	if p.Rank != 2 || p.Price != "0.096" || p.Cost == nil || p.Cost.Warm || !near(p.Cost.Cold, (0.096+1)*3/60) ||
 		!strings.HasPrefix(p.Why, "#2 in launch order (by run cost) of 2 options in 2 regions; passed over: 1 above max_price") {
 		t.Fatalf("placement %+v", p)
 	}
@@ -503,6 +512,7 @@ func TestRunCostFallsBackInRankOrder(t *testing.T) {
 		},
 		runErr: map[string]string{"r-one-1/c7a.2xlarge": "InsufficientInstanceCapacity"},
 	}
+	f.bakes = map[string]bool{"r-one-1": true, "r-two-1": true, "r-three-1": true}
 	g := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
 	g.r.LaunchOrder = config.LaunchRunCost
 	warmUp(t, g, f, "r-one-1")
@@ -529,6 +539,7 @@ func TestRunCostDoctorRanking(t *testing.T) {
 		"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.096"}},
 		"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.300"}},
 	}}
+	f.bakes = map[string]bool{"r-one-1": true}
 	g := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
 	g.r.LaunchOrder = config.LaunchRunCost
 	warmUp(t, g, f, "r-one-1")
@@ -540,7 +551,7 @@ func TestRunCostDoctorRanking(t *testing.T) {
 	parts := strings.Split(c.Msg, " · ")
 	if len(parts) != 3 || !strings.HasPrefix(parts[0], "1. c7a.2xlarge in r-one-1a at $0.100/h: $0.100 per hour of work") ||
 		!strings.Contains(parts[0], "warm region") || !strings.HasPrefix(parts[2], "3. c7a.2xlarge in r-two-1a at $0.096/h") ||
-		!strings.Contains(parts[2], "+$0.073 cold region") || strings.Contains(c.Msg, "r-three-1") {
+		!strings.Contains(parts[2], "+$0.073 cold region (boot,deps,image)") || strings.Contains(c.Msg, "r-three-1") {
 		t.Fatalf("doctor: %s", c.Msg)
 	}
 	k.Order = config.LaunchCheapest

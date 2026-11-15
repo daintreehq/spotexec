@@ -23,13 +23,23 @@ const (
 	// fastest option's work. A cold start is paid once per VM, so this is
 	// also how long a saving has to make up for one.
 	runHorizon = time.Hour
-	// coldStart is the time a region adds while it holds none of this
-	// runner's caches: Daintree's 17-part test run took 7.1 minutes the
-	// first time in a region and 3.5 the next.
-	coldStart = 4 * time.Minute
+	// coldStart is the time a region adds while it holds none of what a
+	// run reuses: Daintree's 17-part test run took 7.1 minutes the first
+	// time in a region and 3.5 the next. It is split by what saves each
+	// part (an estimate: the dependency install is the largest).
+	coldStart = coldBoot + coldDeps + coldImage
+	// coldBoot: booting without a bake of the runner there runs its
+	// bootstrap on the VM.
+	coldBoot = time.Minute
+	// coldDeps: without the project's archive in the region's dependency
+	// cache, the install runs.
+	coldDeps = 2 * time.Minute
+	// coldImage: without the project's image in the region's registry,
+	// it is built.
+	coldImage = time.Minute
 	// warmFor is how long a region counts as warm after a VM of this
-	// runner last ran there: well inside the 14 days the S3 dependency
-	// cache keeps an archive.
+	// runner last ran there, where the project's caches can't be checked:
+	// well inside the 14 days the S3 dependency cache keeps an archive.
 	warmFor = 7 * 24 * time.Hour
 	// warmAfter is how long a VM must have been up before it counts as
 	// evidence: past its first-boot setup and first runs, which fill the
@@ -56,22 +66,58 @@ type RunCost struct {
 	Score    float64 `json:"score"`
 	Compute  float64 `json:"compute"`  // the Spot bill for an hour at this price
 	Speed    float64 `json:"speed"`    // a slower type: the extra VM time and waiting (vcpus runners)
-	Cold     float64 `json:"cold"`     // a cold start: no VM of this runner in the region lately
+	Cold     float64 `json:"cold"`     // a cold start: the sum of ColdParts
 	Distance float64 `json:"distance"` // round trips to a farther region
+	// ColdParts says which parts of a cold start the region pays, and why
+	// (several regions only).
+	ColdParts *ColdParts `json:"cold_parts,omitempty"`
 	// RelSpeed is the type's speed per vCPU against the fastest option's
 	// (1: as fast), from its instance generation.
 	RelSpeed float64   `json:"relative_speed"`
-	Warm     bool      `json:"warm"`
-	WarmSeen time.Time `json:"warm_seen,omitempty"` // last time a VM of this runner ran in the region
+	Warm     bool      `json:"warm"`                // no part of a cold start is paid
+	WarmSeen time.Time `json:"warm_seen,omitempty"` // last time a VM of this runner ran in the region, when that decided a part
 	RTTMS    int       `json:"rtt_ms,omitempty"`    // TCP connect to the region's EC2 endpoint (0: not measured)
+}
+
+// ColdParts is what a cold start in a region is made of: booting without a
+// bake, installing dependencies without the cache's archive, and building
+// the container image instead of pulling it.
+type ColdParts struct {
+	Boot  ColdPart `json:"boot"`
+	Deps  ColdPart `json:"dependencies"`
+	Image ColdPart `json:"image"`
+}
+
+// ColdPart is one part of a cold start in one region.
+type ColdPart struct {
+	Cost float64 `json:"cost"` // USD added to the score (0: warm)
+	Warm bool    `json:"warm"` // the region has what saves it, or the run doesn't need it
+	Why  string  `json:"why"`  // what decided it
+}
+
+// Paid names the parts the region pays ("" when none).
+func (p ColdParts) Paid() string {
+	var out []string
+	for _, c := range []struct {
+		name string
+		part ColdPart
+	}{{"boot", p.Boot}, {"deps", p.Deps}, {"image", p.Image}} {
+		if !c.part.Warm {
+			out = append(out, c.name)
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 // RunCostModel is the assumptions behind every RunCost.
 type RunCostModel struct {
 	WaitCost       float64 `json:"wait_cost"`          // USD per hour of waiting (wait_cost)
 	HorizonMinutes float64 `json:"horizon_minutes"`    // the work scored: an hour of the fastest option's
-	ColdMinutes    float64 `json:"cold_minutes"`       // what a cold region adds
-	WarmDays       float64 `json:"warm_days"`          // how long a region stays warm after a VM ran there
+	ColdMinutes    float64 `json:"cold_minutes"`       // what a cold region adds: the sum of the parts below
+	BootMinutes    float64 `json:"cold_boot_minutes"`  // booting without a bake
+	DepsMinutes    float64 `json:"cold_deps_minutes"`  // installing dependencies without the cache
+	ImageMinutes   float64 `json:"cold_image_minutes"` // building the container image
+	WarmDays       float64 `json:"warm_days"`          // how long a region stays warm after a VM ran there (parts not checked)
 	WarmAfterMin   float64 `json:"warm_after_minutes"` // how long that VM must have been up
 	GenSpeedup     float64 `json:"gen_speedup"`        // speed per vCPU each generation adds (vcpus runners)
 	RoundTrips     int     `json:"round_trips"`        // client round trips in that work
@@ -120,18 +166,20 @@ func (g *AWSGlobal) rankOrder() string {
 	return config.LaunchRunCost
 }
 
-// placementEvidence is what run-cost ranking reads from local state.
+// placementEvidence is what run-cost ranking reads from local state, and
+// what the price table found in each region's account-wide caches.
 type placementEvidence struct {
-	now  time.Time
-	warm map[string]time.Time     // region -> last VM of this runner seen running there
-	rtt  map[string]time.Duration // region -> measured round trip
+	now   time.Time
+	warm  map[string]time.Time     // region -> last VM of this runner seen running there
+	rtt   map[string]time.Duration // region -> measured round trip
+	found map[string]regionWarmth  // region -> what its caches hold (see warmth)
 }
 
 // Rank orders t's options for the next launch: by run cost (or price, or
 // the listed order), then those held back after a Spot interruption last.
 // Cooldowns and max_price are left to the caller: they skip, not reorder.
 func (g *AWSGlobal) Rank(t PriceTable) Ranking {
-	ev := placementEvidence{now: g.clock(), warm: map[string]time.Time{}, rtt: map[string]time.Duration{}}
+	ev := placementEvidence{now: g.clock(), warm: map[string]time.Time{}, rtt: map[string]time.Duration{}, found: t.warmth}
 	held := map[string]cooldown{}
 	_ = g.withState(func(st *placementState) {
 		for _, p := range t.Prices {
@@ -182,6 +230,9 @@ func (g *AWSGlobal) costModel() *RunCostModel {
 		WaitCost:       g.r.WaitCostPerHour(),
 		HorizonMinutes: runHorizon.Minutes(),
 		ColdMinutes:    coldStart.Minutes(),
+		BootMinutes:    coldBoot.Minutes(),
+		DepsMinutes:    coldDeps.Minutes(),
+		ImageMinutes:   coldImage.Minutes(),
 		WarmDays:       warmFor.Hours() / 24,
 		WarmAfterMin:   warmAfter.Minutes(),
 		GenSpeedup:     genSpeedup,
@@ -223,11 +274,13 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 		if m.Regions {
 			seen, ok := ev.warm[p.Region]
 			// A time ahead of the clock is no evidence of anything.
-			c.Warm = ok && ev.now.Sub(seen) < warmFor && !seen.After(ev.now.Add(time.Hour))
-			if c.Warm {
+			ran := ok && ev.now.Sub(seen) < warmFor && !seen.After(ev.now.Add(time.Hour))
+			parts, usedHistory := coldParts(m, price+wait, ev.found[p.Region], ran)
+			c.ColdParts = &parts
+			c.Cold = parts.Boot.Cost + parts.Deps.Cost + parts.Image.Cost
+			c.Warm = parts.Boot.Warm && parts.Deps.Warm && parts.Image.Warm
+			if ran && usedHistory {
 				c.WarmSeen = seen
-			} else {
-				c.Cold = (price + wait) * m.ColdMinutes / 60
 			}
 			if d, ok := ev.rtt[p.Region]; ok {
 				c.RTTMS = int(d / time.Millisecond)
@@ -240,6 +293,57 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 	return out
 }
 
+// coldParts prices each part of a cold start in one region, at perHour (the
+// VM and the waiting): checked parts by what the region holds, the
+// project's parts that couldn't be checked by whether a VM of the runner
+// ran there lately (ran). usedHistory: ran decided a part.
+func coldParts(m RunCostModel, perHour float64, w regionWarmth, ran bool) (p ColdParts, usedHistory bool) {
+	part := func(s partSeen, minutes float64, has, lacks, unused string, history bool) ColdPart {
+		c := ColdPart{Why: s.why}
+		switch s.state {
+		case partHas:
+			c.Warm = true
+			if c.Why == "" {
+				c.Why = has
+			}
+		case partUnused:
+			c.Warm = true
+			if c.Why == "" {
+				c.Why = unused
+			}
+		case partLacks:
+			if c.Why == "" {
+				c.Why = lacks
+			}
+		default:
+			if history {
+				usedHistory = true
+				c.Warm = ran
+				if c.Why != "" {
+					c.Why += "; "
+				}
+				if ran {
+					c.Why += "not checked: a VM of the runner ran here lately"
+				} else {
+					c.Why += "not checked: no VM of the runner ran here lately"
+				}
+			} else if c.Why == "" {
+				c.Why = "not checked"
+			}
+		}
+		if !c.Warm {
+			c.Cost = perHour * minutes / 60
+		}
+		return c
+	}
+	// Without a bake every VM runs the bootstrap: where VMs ran says
+	// nothing about it.
+	p.Boot = part(w.boot, m.BootMinutes, "a bake of the runner", "no bake of the runner", "", false)
+	p.Deps = part(w.deps, m.DepsMinutes, "the project's dependency archive", "no dependency archive for the project", "no dependencies to install", true)
+	p.Image = part(w.image, m.ImageMinutes, "the project's image", "no image of the project", "no image to build", true)
+	return p, usedHistory
+}
+
 // Factors lists what the score added to the Spot bill, for messages
 // ("" when nothing was).
 func (c RunCost) Factors() string {
@@ -250,7 +354,13 @@ func (c RunCost) Factors() string {
 		}
 	}
 	add(c.Speed, fmt.Sprintf("slower type (%.0f%% speed)", c.RelSpeed*100))
-	add(c.Cold, "cold region")
+	cold := "cold region"
+	if c.ColdParts != nil {
+		if paid := c.ColdParts.Paid(); paid != "" {
+			cold += " (" + paid + ")"
+		}
+	}
+	add(c.Cold, cold)
 	add(c.Distance, fmt.Sprintf("distance (%d ms)", c.RTTMS))
 	return strings.Join(parts, ", ")
 }
@@ -467,6 +577,11 @@ func forgetOld(st *placementState, now time.Time) {
 	for rg, s := range st.RTT {
 		if now.Sub(s.At) > rttFor || s.At.After(now.Add(time.Hour)) {
 			delete(st.RTT, rg)
+		}
+	}
+	for k, e := range st.Evidence {
+		if !e.fresh(now) {
+			delete(st.Evidence, k)
 		}
 	}
 }

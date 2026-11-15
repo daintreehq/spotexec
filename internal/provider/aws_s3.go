@@ -96,18 +96,9 @@ func (a *AWSSpot) accountID(ctx context.Context) (string, error) {
 // remembered per (account, region, bucket), and every check asserts
 // ownership.
 func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
-	switch a.r.CacheBucket {
-	case "off", "none", "false":
-		return "", "", nil
-	}
-	acct, err := a.accountID(ctx)
-	if err != nil {
+	bucket, acct, auto, err := a.cacheBucket(ctx)
+	if err != nil || bucket == "" {
 		return "", "", err
-	}
-	bucket := a.r.CacheBucket
-	auto := bucket == "" || bucket == "auto"
-	if auto {
-		bucket = "spotexec-cache-" + acct + "-" + a.r.Region
 	}
 	owner := map[string]string{"x-amz-expected-bucket-owner": acct}
 	marker := filepath.Join(a.dir, "cache-bucket-"+acct+"-"+a.r.Region+"-"+bucket)
@@ -157,6 +148,48 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 	return bucket, acct, nil
 }
 
+// cacheBucket names the region's cache bucket and the account that must
+// own it, without creating it ("" when cache_bucket is off). auto: the
+// bucket is spotexec's own, named after the account and region.
+func (a *AWSSpot) cacheBucket(ctx context.Context) (bucket, acct string, auto bool, err error) {
+	switch a.r.CacheBucket {
+	case "off", "none", "false":
+		return "", "", false, nil
+	}
+	if acct, err = a.accountID(ctx); err != nil {
+		return "", "", false, err
+	}
+	bucket = a.r.CacheBucket
+	auto = bucket == "" || bucket == "auto"
+	if auto {
+		bucket = "spotexec-cache-" + acct + "-" + a.r.Region
+	}
+	return bucket, acct, auto, nil
+}
+
+// hasCacheEntry reports whether the region's cache bucket holds the
+// archive for key, creating nothing: a missing bucket holds nothing.
+// Anything but a clear answer is an error.
+func (a *AWSSpot) hasCacheEntry(ctx context.Context, repoID, key string) (bool, error) {
+	bucket, acct, _, err := a.cacheBucket(ctx)
+	if err != nil {
+		return false, err
+	}
+	if bucket == "" {
+		return false, nil
+	}
+	status, _, err := a.s3(ctx, http.MethodHead, bucket, s3EscapePath(repoID+"/"+key+".tar"), nil, map[string]string{"x-amz-expected-bucket-owner": acct})
+	switch {
+	case err != nil:
+		return false, err
+	case status == 200:
+		return true, nil
+	case status == 404:
+		return false, nil
+	}
+	return false, fmt.Errorf("checking the dependency cache in %s: HTTP %d", bucket, status)
+}
+
 // s3OperationAbortedDelay is the first wait before retrying a bucket
 // operation S3 aborted; each retry waits longer.
 var s3OperationAbortedDelay = 500 * time.Millisecond
@@ -198,6 +231,9 @@ func (a *AWSSpot) s3(ctx context.Context, method, bucket, sub string, body []byt
 		return 0, nil, err
 	}
 	u := "https://" + bucket + ".s3." + a.r.Region + ".amazonaws.com/" + strings.TrimPrefix(sub, "/")
+	if e, ok := a.api.endpoints["s3"]; ok { // tests: path style
+		u = strings.TrimSuffix(e, "/") + "/" + bucket + "/" + strings.TrimPrefix(sub, "/")
+	}
 	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, err
