@@ -21,6 +21,8 @@ The **`sim` provider** runs a Spot fleet as Docker containers on your machine, s
 - Setting `SPOTEXEC_DAEMON_FAST=1` shrinks the pool manager's timings for tests.
 - With a plain `go build` (no embedded helpers), `SPOTEXEC_HELPER_DIR` points at a directory of helper binaries.
 
+To try a build against real runners, `make build`, then run `bin/sx` by its absolute path from a project. The helper uploads itself, so running VMs pick up the new one on their next run. Changes to first-boot user-data (`internal/cloudinit`) only reach new VMs, so run `spotexec down` first.
+
 The code is organized as:
 
 | Package | Role |
