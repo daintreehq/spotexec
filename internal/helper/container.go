@@ -297,6 +297,13 @@ func (s *Session) image(m protocol.Image) error {
 				}
 			}
 		}
+		if m.Probe {
+			// The client decides who builds (one run for every runner
+			// waiting on this tag), and asks again.
+			res.Missing = true
+			res.MS = time.Since(start).Milliseconds()
+			return s.c.Send(protocol.TypeImageResult, res)
+		}
 		buildCtx, dockerfile, cleanup, err := s.stageContext(m)
 		if err != nil {
 			return perr(protocol.CodeImageFailed, "%v", err)
@@ -315,7 +322,8 @@ func (s *Session) image(m protocol.Image) error {
 					return perr(protocol.CodeImageFailed, "built %s but could not push it to %s: %v", m.Dockerfile, remote, err)
 				}
 				res.Pushed = true
-			} else if err := startImagePush(s.layout.Root, d, local, remote, cfgDir); err == nil {
+			} else if t, err := startImagePush(s.layout.Root, d, local, remote, cfgDir); err == nil {
+				s.track(protocol.ShareImage, t)
 				res.Pushing = true
 			}
 		}
@@ -538,10 +546,10 @@ func dockerLogin(ctx context.Context, d dockerRunner, r *protocol.RegistryAuth) 
 // startImagePush pushes a freshly built image in a detached process (the
 // job doesn't wait), and waits for the child to take the VM's lifecycle lock
 // before returning, so a draining watchdog can't slip in between.
-func startImagePush(root string, d dockerRunner, local, remote, cfgDir string) error {
+func startImagePush(root string, d dockerRunner, local, remote, cfgDir string) (*transfer, error) {
 	self, err := os.Executable()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	logf, _ := os.OpenFile(filepath.Join(root, "image-push.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	ready := filepath.Join(root, "tmp", fmt.Sprintf("push-ready-%d-%d", os.Getpid(), time.Now().UnixNano()))
@@ -551,10 +559,10 @@ func startImagePush(root string, d dockerRunner, local, remote, cfgDir string) e
 	cmd.Stdout, cmd.Stderr = logf, logf
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return err
+		return nil, err
 	}
 	via := "direct"
 	if d.viaSG {
@@ -571,7 +579,7 @@ func startImagePush(root string, d dockerRunner, local, remote, cfgDir string) e
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return cmd.Process.Release()
+	return watch(cmd), nil
 }
 
 // ImagePush is the detached push (spotexec-helper image-push; arguments on

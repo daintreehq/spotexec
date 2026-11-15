@@ -74,6 +74,9 @@ type Session struct {
 	nested      sync.Map
 	interrupted atomic.Bool // a spot interruption notice arrived
 	watching    bool
+	// transfers: the background upload (protocol.ShareDeps) or push
+	// (protocol.ShareImage) this session last started, for ShareWait.
+	transfers map[string]*transfer
 }
 
 // Serve runs the RPC loop on stdin/stdout until the client says bye or goes
@@ -391,6 +394,12 @@ func (s *Session) dispatch(env protocol.Envelope) error {
 	case protocol.TypeGitDrop:
 		s.dropGitSeed() // no reply is expected
 		return nil
+	case protocol.TypeShareWait:
+		var w protocol.ShareWait
+		if err := env.Unmarshal(&w); err != nil {
+			return err
+		}
+		return s.shareWait(w)
 	case protocol.TypeCancel:
 		return nil // nothing running
 	case protocol.TypeBye:
