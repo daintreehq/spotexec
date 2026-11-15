@@ -312,3 +312,112 @@ func TestOnDiskNameWithHardLinks(t *testing.T) {
 		t.Fatalf("folded name: %q, %v", got, ok)
 	}
 }
+
+func TestStashNeverOverwritesAnEarlierVersion(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "conflicts", "run-1")
+	file := func(data string) (version, remoteFile) {
+		rf := remoteFile{data: []byte(data), mode: fsid.ModeFile, id: fsid.Bytes([]byte(data))}
+		return version{true, rf.id, rf.mode}, rf
+	}
+	read := func(p string) string {
+		t.Helper()
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	// a deleted remotely, then a.deleted changed remotely: the marker's
+	// name is taken by the time a.deleted's version is stashed.
+	mark, err := stashConflict(dir, "a", version{}, remoteFile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, rf := file("remote a.deleted")
+	got, err := stashConflict(dir, "a.deleted", w, rf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == mark || read(got) != "remote a.deleted" || !strings.HasPrefix(read(mark), "deleted") {
+		t.Fatalf("marker %s (%q), version %s (%q)", mark, read(mark), got, read(got))
+	}
+	// And the reverse: a deletion marker whose name a stashed file has.
+	w, rf = file("remote b.deleted")
+	first, err := stashConflict(dir, "b.deleted", w, rf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := stashConflict(dir, "b", version{}, remoteFile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first || read(first) != "remote b.deleted" || !strings.HasPrefix(read(second), "deleted") {
+		t.Fatalf("version %s (%q), marker %s (%q)", first, read(first), second, read(second))
+	}
+	// The same path twice keeps both.
+	w, rf = file("one")
+	one, err := stashConflict(dir, "src/c", w, rf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, rf = file("two")
+	two, err := stashConflict(dir, "src/c", w, rf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one == two || read(one) != "one" || read(two) != "two" {
+		t.Fatalf("%s (%q), %s (%q)", one, read(one), two, read(two))
+	}
+}
+
+func TestStashFallbackForADeepPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "conflicts", "run-1")
+	p := strings.Repeat("d/", 120) + strings.Repeat("x", 120) + ".txt"
+	var got []string
+	for _, data := range []string{"one", "two"} {
+		rf := remoteFile{data: []byte(data), mode: fsid.ModeFile, id: fsid.Bytes([]byte(data))}
+		s, err := stashConflict(dir, p, version{true, rf.id, rf.mode}, rf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b, err := os.ReadFile(s); err != nil || string(b) != data {
+			t.Fatalf("%s: %q, %v", s, b, err)
+		}
+		got = append(got, s)
+	}
+	if got[0] == got[1] || len(filepath.Base(got[1])) > 255 {
+		t.Fatalf("stashed at %v", got)
+	}
+	if _, err := stashConflict(dir, p, version{}, remoteFile{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stashConflict(dir, p, version{}, remoteFile{}); err != nil {
+		t.Fatalf("second deletion marker: %v", err)
+	}
+}
+
+func TestCollisionUnderAnotherDirectorySpelling(t *testing.T) {
+	c := newCollisionRun(t)
+	if !foldsNames(t, c.ws.Root, "x.txt", "X.txt") {
+		t.Skip("case-sensitive filesystem: the names don't collide")
+	}
+	// d/A lands in the existing D/ as D/A, a spelling no path has; d/a is
+	// then that file.
+	c.local("D/keep", "k", "k")
+	c.wrote("d/A", "upper")
+	c.wrote("d/a", "lower")
+	// SRC/x lands in the existing src/ as src/x: src/x's own name.
+	c.local("src/keep", "k", "k")
+	c.wrote("SRC/x", "upper")
+	c.wrote("src/x", "lower")
+	wb := c.apply()
+	if s := stashed(t, wb, "d/a"); s.With != "d/A" {
+		t.Fatalf("collision %+v", s)
+	}
+	if s := stashed(t, wb, "src/x"); s.With != "SRC/x" {
+		t.Fatalf("collision %+v", s)
+	}
+	if got := c.content("D/A"); got != "upper" {
+		t.Fatalf("D/A holds %q", got)
+	}
+}

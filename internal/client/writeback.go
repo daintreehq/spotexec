@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/manifest"
@@ -400,7 +403,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			// A new name already holding these bytes may be another
 			// remote path's file: still two names that can't both exist.
 			if !base.exists && local.exists {
-				if with := collidesWith(ws.Root, p, remote, m); with != "" {
+				if with := collidesWith(ws.Root, p, remote, m, wb.Applied); with != "" {
 					return wb.conflict(ws.Root, p, want, rf, with)
 				}
 			}
@@ -448,7 +451,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		default:
 			with := ""
 			if local.exists && local != blocked {
-				with = collidesWith(ws.Root, p, remote, m)
+				with = collidesWith(ws.Root, p, remote, m, wb.Applied)
 			}
 			if err := wb.conflict(ws.Root, p, want, rf, with); err != nil {
 				return err
@@ -570,17 +573,37 @@ func nowIgnored(ctx context.Context, m *manifest.Manifest, root string, paths []
 // when this filesystem ignores case or Unicode normalisation in names
 // (src/Dup.txt opens src/DUP.txt, src/n\u00e9.txt opens src/ne\u0301.txt):
 // two remote names for one local file, not a local edit. "" when p's file
-// has p's own name, or a name the run doesn't know.
-func collidesWith(root, p string, remote map[string]version, m *manifest.Manifest) string {
+// is no other path the run knows.
+func collidesWith(root, p string, remote map[string]version, m *manifest.Manifest, applied []string) string {
 	q, ok := onDiskName(root, p)
-	if !ok || q == p {
+	if ok && q != p {
+		if v, ok := remote[q]; ok && v.exists {
+			return q
+		}
+		if _, ok := m.ByPath[q]; ok {
+			return q
+		}
+	}
+	// A path this run wrote may have landed under another spelling of a
+	// parent directory (d/A written into an existing D/ is D/A, and src/a
+	// may be SRC/a's file): match those by identity.
+	full, err := fsid.SafeJoin(root, p)
+	if err != nil {
 		return ""
 	}
-	if v, ok := remote[q]; ok && v.exists {
-		return q
+	fi, err := os.Lstat(full)
+	if err != nil {
+		return ""
 	}
-	if _, ok := m.ByPath[q]; ok {
-		return q
+	for _, r := range applied {
+		if r == p {
+			continue
+		}
+		if fr, err := fsid.SafeJoin(root, r); err == nil {
+			if ri, err := os.Lstat(fr); err == nil && os.SameFile(ri, fi) {
+				return r
+			}
+		}
 	}
 	return ""
 }
@@ -657,7 +680,7 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return "", err
 			}
-			f, err := os.CreateTemp(dir, strings.ReplaceAll(p, "/", "__")+".deleted-*")
+			f, err := os.CreateTemp(dir, flatName(p)+".deleted-*")
 			if err != nil {
 				return "", err
 			}
@@ -688,10 +711,11 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 		// and is now a file, or a name an earlier stashed path folds to):
 		// keep it at the top of the stash under a flattened name nothing
 		// else uses.
-		base := strings.ReplaceAll(p, "/", "__") + ".remote"
+		base := flatName(p) + ".remote"
 		name := base
 		for i := 2; ; i++ {
-			if _, err := os.Lstat(filepath.Join(dir, name)); errors.Is(err, fs.ErrNotExist) {
+			// Free, or unusable for another reason that writing reports.
+			if _, err := os.Lstat(filepath.Join(dir, name)); err != nil {
 				break
 			}
 			name = fmt.Sprintf("%s.%d", base, i)
@@ -699,6 +723,22 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 		return filepath.Join(dir, name), writeLocal(dir, name, rf, nil)
 	}
 	return filepath.Join(dir, filepath.FromSlash(p)), err
+}
+
+// flatName is p as one file name for the top of the stash, short enough for
+// any filesystem: a deep path keeps its last part and a hash of the rest.
+func flatName(p string) string {
+	flat := strings.ReplaceAll(p, "/", "__")
+	if len(flat) <= 160 {
+		return flat
+	}
+	tail := path.Base(p)
+	for len(tail) > 100 {
+		_, n := utf8.DecodeLastRuneInString(tail)
+		tail = tail[:len(tail)-n]
+	}
+	sum := sha256.Sum256([]byte(p))
+	return hex.EncodeToString(sum[:8]) + "__" + tail
 }
 
 // writeNew creates p holding b, failing with EEXIST if anything is there.
