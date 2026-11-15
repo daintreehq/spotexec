@@ -241,7 +241,7 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 			if v.project != "" {
 				project = "deps and image checked for " + v.project
 			}
-			factors = append(factors, fmt.Sprintf("a cold region (COLD: %g minutes boot without a bake of %s there, %g deps without the project's archive in the region's cache, %g image without the project's image in its registry; %s)",
+			factors = append(factors, fmt.Sprintf("a cold region (COLD, in minutes: boot %g without a bake of %s there, deps %g without the project's archive in the region's cache, image %g without the project's image in its registry; %s)",
 				m.BootMinutes, r.Name, m.DepsMinutes, m.ImageMinutes, project),
 				fmt.Sprintf("a farther region (%d round trips at the measured TCP connect time)", m.RoundTrips))
 		}

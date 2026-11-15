@@ -42,6 +42,11 @@ type fakeRegionsEC2 struct {
 	types      map[string][]string          // region -> DescribeInstanceTypes items (typeXML)
 	typesErr   map[string]string            // region -> error code DescribeInstanceTypes answers
 	subnetZone map[string]string            // subnet ID -> its zone (DescribeSubnets by ID)
+	bakes      map[string]bool              // regions holding a current bake of the runner
+	images     map[string]map[string]string // region -> ECR tag -> config digest (nil: no repository)
+	imageErr   map[string]string            // region -> error type BatchGetImage answers
+	cached     map[string]map[string]bool   // region -> dependency cache object keys held
+	cacheErr   map[string]int               // region -> HTTP status the cache bucket answers
 	calls      []string                     // "region Action [detail]"
 	next       int
 }
@@ -104,6 +109,54 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			fmt.Fprintf(w, `{"Quota":{"Value":%d}}`, q)
 			return
 		}
+		if service == "sts" {
+			fmt.Fprint(w, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`)
+			return
+		}
+		if rest, ok := strings.CutPrefix(service, "s3/"); ok {
+			bucket, key, _ := strings.Cut(rest, "/")
+			f.log(region, r.Method+" s3 "+rest)
+			switch {
+			case r.Method != http.MethodHead || r.Header.Get("x-amz-expected-bucket-owner") != "123456789012" || bucket != "spotexec-cache-123456789012-"+region:
+				t.Errorf("unexpected S3 request %s %s (owner %q)", r.Method, r.URL, r.Header.Get("x-amz-expected-bucket-owner"))
+				w.WriteHeader(400)
+			case f.cacheErr[region] != 0:
+				w.WriteHeader(f.cacheErr[region])
+			case f.cached[region][key]:
+			default:
+				w.WriteHeader(404)
+			}
+			return
+		}
+		if service == "ecr" {
+			var in struct {
+				Repo  string              `json:"repositoryName"`
+				IDs   []map[string]string `json:"imageIds"`
+				Types []string            `json:"acceptedMediaTypes"`
+			}
+			_ = json.Unmarshal(body, &in)
+			f.log(region, "BatchGetImage "+in.Repo+":"+in.IDs[0]["imageTag"])
+			if r.Header.Get("X-Amz-Target") != "AmazonEC2ContainerRegistry_V20150921.BatchGetImage" || len(in.Types) == 0 {
+				t.Errorf("unexpected ECR request %s %s", r.Header.Get("X-Amz-Target"), body)
+			}
+			tags, ok := f.images[region]
+			switch {
+			case f.imageErr[region] != "":
+				w.WriteHeader(400)
+				fmt.Fprintf(w, `{"__type":%q,"message":"no"}`, f.imageErr[region])
+			case !ok:
+				w.WriteHeader(400)
+				fmt.Fprint(w, `{"__type":"RepositoryNotFoundException","message":"no repository"}`)
+			case tags[in.IDs[0]["imageTag"]] == "":
+				fmt.Fprint(w, `{"images":[],"failures":[{"failureCode":"ImageNotFound","failureReason":"Requested image not found"}]}`)
+			default:
+				m, _ := json.Marshal(map[string]any{"schemaVersion": 2, "config": map[string]string{"digest": tags[in.IDs[0]["imageTag"]]}})
+				out, _ := json.Marshal(map[string]any{"images": []map[string]any{{"imageId": map[string]string{"imageDigest": "sha256:manifest"},
+					"imageManifest": string(m), "imageManifestMediaType": "application/vnd.docker.distribution.manifest.v2+json"}}})
+				w.Write(out)
+			}
+			return
+		}
 		if service == "ssm" {
 			f.log(region, "GetParameter")
 			fmt.Fprint(w, `{"Parameter":{"Value":"ami-ubuntu"}}`)
@@ -143,6 +196,16 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			}
 			fmt.Fprint(w, `</spotPriceHistorySet></DescribeSpotPriceHistoryResponse>`)
 		case "DescribeImages":
+			if p.Get("Filter.4.Name") == "tag:spotexec-bootstrap-hash" {
+				f.log(region, act+" bakes")
+				if f.bakes[region] {
+					fmt.Fprintf(w, `<DescribeImagesResponse><imagesSet><item><imageId>ami-bake-%s</imageId><imageState>available</imageState><creationDate>%s</creationDate><architecture>x86_64</architecture><tagSet><item><key>spotexec-bootstrap-hash</key><value>%s</value></item><item><key>spotexec-base-ami</key><value>ami-ubuntu</value></item></tagSet></item></imagesSet></DescribeImagesResponse>`,
+						region, time.Now().Add(-time.Hour).UTC().Format(time.RFC3339), p.Get("Filter.4.Value.1"))
+					return
+				}
+				fmt.Fprint(w, `<DescribeImagesResponse><imagesSet/></DescribeImagesResponse>`)
+				return
+			}
 			if p.Get("ImageId.1") != "" {
 				fmt.Fprint(w, `<DescribeImagesResponse><imagesSet><item><rootDeviceName>/dev/sda1</rootDeviceName></item></imagesSet></DescribeImagesResponse>`)
 			} else {
@@ -292,7 +355,8 @@ func newGlobalEnv(t *testing.T, f *fakeRegionsEC2, regions ...string) *AWSGlobal
 	g.creds = &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "secret"}}
 	g.endpoints = func(region string) map[string]string {
 		return map[string]string{"ec2": srv.URL + "/" + region + "/ec2", "ssm": srv.URL + "/" + region + "/ssm",
-			"servicequotas": srv.URL + "/" + region + "/servicequotas"}
+			"servicequotas": srv.URL + "/" + region + "/servicequotas", "sts": srv.URL + "/" + region + "/sts",
+			"ecr": srv.URL + "/" + region + "/ecr", "s3": srv.URL + "/" + region + "/s3"}
 	}
 	return g
 }
