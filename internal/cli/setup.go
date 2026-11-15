@@ -117,6 +117,8 @@ and keeps a working key. --rotate replaces the key.
 				homeOff := false // the first runner's home region isn't enabled
 				need := map[string]int{}
 				ownNet := map[string]bool{}
+				launches := map[string][]string{} // runner -> the regions its quota is checked in
+				var anyRegions []string           // regions = ["all"] runners' first launch regions
 				for _, r := range aws {
 					if r.AnyRegion() {
 						if r == aws[0] {
@@ -126,7 +128,21 @@ and keeps a working key. --rotate replaces the key.
 						}
 						// Every enabled region: launches skip regions that
 						// lack a default VPC or quota, so none is prepared.
-						fmt.Printf("  %s launches in any enabled region; regions without a default VPC or Spot quota are skipped automatically\n", r.Name)
+						fmt.Printf("  %s launches in %s; regions without a default VPC or Spot quota are skipped automatically\n", r.Name, provider.RunnerWhere(r))
+						// Its quota matters where launches will go first,
+						// as `spotexec doctor` checks it.
+						ctx, cancel := context.WithTimeout(cmd.Context(), launchRegionsTimeout)
+						top, err := provider.LaunchRegionsWith(ctx, r, adminProfile, adminFromEnv)
+						cancel()
+						if err != nil {
+							fmt.Printf("  couldn't rank %s's regions by Spot price (%s), so its Spot quota isn't checked here; `spotexec doctor` checks it\n", r.Name, firstLine(err.Error()))
+						}
+						launches[r.Name] = top
+						for _, rg := range top {
+							if !slices.Contains(anyRegions, rg) {
+								anyRegions = append(anyRegions, rg)
+							}
+						}
 						continue
 					}
 					rs := []string{r.Region}
@@ -144,6 +160,7 @@ and keeps a working key. --rotate replaces the key.
 							}
 						}
 					}
+					launches[r.Name] = rs
 					for _, rg := range rs {
 						if _, seen := need[rg]; !seen {
 							regions = append(regions, rg)
@@ -153,22 +170,28 @@ and keeps a working key. --rotate replaces the key.
 						ownNet[rg] = ownNet[rg] || r.SubnetID != ""
 					}
 				}
-				if homeOff {
-					switch {
-					case len(regions) > 0:
-						region = regions[0]
-					default:
-						region = "us-east-1" // no account can disable it
-					}
-				}
 				for _, rg := range regions {
 					if !ownNet[rg] && !noVPC {
 						vpcRegions = append(vpcRegions, rg)
 					}
 				}
+				quotaRegions := slices.Clone(regions)
+				for _, rg := range anyRegions {
+					if !slices.Contains(quotaRegions, rg) {
+						quotaRegions = append(quotaRegions, rg)
+					}
+				}
+				if homeOff {
+					switch {
+					case len(quotaRegions) > 0:
+						region = quotaRegions[0]
+					default:
+						region = "us-east-1" // no account can disable it
+					}
+				}
 				s := &provider.AWSUserSetup{
 					AdminProfile: adminProfile, AdminFromEnv: adminFromEnv, Profile: profile, UserName: user, DefaultName: defaultIAMUser(), Region: region, Rotate: rotate,
-					VPCRegions: vpcRegions, QuotaRegions: regions,
+					VPCRegions: vpcRegions, QuotaRegions: quotaRegions,
 					Log: func(f string, a ...any) { fmt.Printf("  "+f+"\n", a...) },
 					Confirm: func(plan provider.AWSSetupPlan) bool {
 						fmt.Printf("\nSigned in to AWS account %s as %s. This will:\n", plan.Account, plan.AdminARN)
@@ -191,7 +214,7 @@ and keeps a working key. --rotate replaces the key.
 						return a == "" || a == "y" || a == "yes"
 					},
 				}
-				fmt.Printf("Setting up AWS access for %s (%s)…\n", strings.Join(names, ", "), strings.Join(regions, ", "))
+				fmt.Printf("Setting up AWS access for %s…\n", describeAWSRunners(aws))
 				res, err := s.Run(cmd.Context())
 				if errors.Is(err, provider.ErrSetupDeclined) {
 					return false, exitWith(1)
@@ -246,7 +269,7 @@ and keeps a working key. --rotate replaces the key.
 						return a == "" || a == "y" || a == "yes"
 					}
 				}
-				reportQuotas(os.Stdout, quotaFits(aws, res.Quotas), ask, func(f provider.QuotaFit) (string, error) {
+				reportQuotas(os.Stdout, quotaFits(aws, launches, res.Quotas), ask, func(f provider.QuotaFit) (string, error) {
 					return s.RequestQuotaIncrease(cmd.Context(), f.Region, f.Desired())
 				})
 				return true, nil
@@ -928,3 +951,7 @@ func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) e
 	}
 	return nil
 }
+
+// launchRegionsTimeout bounds setup's ranking of an any-region runner's
+// regions by Spot price: it only picks where to check the quota.
+const launchRegionsTimeout = time.Minute

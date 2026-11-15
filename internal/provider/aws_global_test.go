@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -1161,5 +1162,110 @@ func TestGlobalOnDemandSkipsRegionsCoolingForSetup(t *testing.T) {
 	}
 	if markets := f.callsOf("market"); in.Region != "r-three-1" || markets[len(markets)-1] != "r-three-1 market on-demand" {
 		t.Fatalf("launched %+v via %v", in, markets)
+	}
+}
+
+// LaunchRegions are the first few regions in launch order, those doctor
+// and setup check the Spot quota of, never an excluded region.
+func TestGlobalLaunchRegions(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1":   {{"r-one-1a", "c7a.2xlarge", "0.09"}},
+		"r-two-1":   {{"r-two-1a", "c7a.2xlarge", "0.01"}},
+		"r-three-1": {{"r-three-1a", "c7a.2xlarge", "0.06"}, {"r-three-1b", "c7a.2xlarge", "0.03"}},
+		"r-off-1":   {{"r-off-1a", "c7a.2xlarge", "0.001"}}, // cheapest, but not enabled
+	}}
+	g := newGlobalEnv(t, f, config.AllRegions)
+	g.r.LaunchOrder = config.LaunchCheapest
+	g.r.ExcludeRegions = []string{"r-two-1"}
+	got, err := g.LaunchRegions(context.Background())
+	if err != nil || strings.Join(got, ",") != "r-three-1,r-one-1" {
+		t.Fatalf("launch regions %v, %v", got, err)
+	}
+	if w := RunnerWhere(g.r); w != "all enabled regions except r-two-1" {
+		t.Fatalf("where %q", w)
+	}
+	// A listed runner: its enabled regions, cheapest first.
+	g.r.Regions, g.r.ExcludeRegions = []string{"r-one-1", "r-off-1", "r-two-1", "r-three-1"}, nil
+	got, err = g.LaunchRegions(context.Background())
+	if err != nil || strings.Join(got, ",") != "r-two-1,r-three-1,r-one-1" {
+		t.Fatalf("launch regions %v, %v", got, err)
+	}
+	if w := RunnerWhere(g.r); w != "r-one-1, r-off-1, r-two-1, r-three-1" {
+		t.Fatalf("where %q", w)
+	}
+	if w := RunnerWhere(&config.Runner{Type: config.TypeAWSSpot, Region: "r-one-1"}); w != "r-one-1" {
+		t.Fatalf("where %q", w)
+	}
+}
+
+// Setup run from another machine ranks with only the session it passed,
+// never this machine's own AWS login.
+func TestLaunchRegionsWithEnvOnly(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	r := &config.Runner{Name: "g", Type: config.TypeAWSSpot, Regions: []string{config.AllRegions}, Region: "us-east-1",
+		InstanceTypes: []string{"c7a.2xlarge"}, Arch: "amd64", User: "ubuntu", VolumeGB: 64, SSHCIDR: "0.0.0.0/0", MaxInstances: 1,
+		MaxLifetime: config.Duration{Duration: time.Hour}, BootTimeout: config.Duration{Duration: time.Minute}, IdleTimeout: config.Duration{Duration: time.Minute}}
+	if _, err := LaunchRegionsWith(context.Background(), r, "", true); !errors.Is(err, errNoPassedSession) {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// firstRegions keeps the first three distinct regions in launch order (not
+// price order).
+func TestFirstRegions(t *testing.T) {
+	k := Ranking{Prices: []SpotPrice{
+		{Region: "r-b", Price: "0.09"}, {Region: "r-a", Price: "0.01"}, {Region: "r-b", Price: "0.02"},
+		{Region: "r-d", Price: "0.05"}, {Region: "r-c", Price: "0.03"},
+	}}
+	if got := strings.Join(firstRegions(k), ","); got != "r-b,r-a,r-d" {
+		t.Fatalf("first regions %s", got)
+	}
+	if got := firstRegions(Ranking{}); len(got) != 0 {
+		t.Fatalf("first regions %v", got)
+	}
+}
+
+// Setup ranks with the admin session as the runner would launch: its own
+// profile's warm regions count, and nothing the other session reads is
+// cached in the runner's placement state.
+func TestLaunchRegionsAsKeepsRunnerState(t *testing.T) {
+	g, f := twoRegionEnv(t, "0.100", "0.096", func(r *config.Runner) { r.Profile = "spotexec" })
+	warmUp(t, g, f, "r-one-1")
+	snapshot := func() map[string]string {
+		out := map[string]string{}
+		ents, err := os.ReadDir(g.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range ents {
+			b, _ := os.ReadFile(filepath.Join(g.dir, e.Name()))
+			out[e.Name()] = string(b)
+		}
+		return out
+	}
+	before := snapshot()
+	admin := &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKADMIN", SecretAccessKey: "secret"}}
+	got, err := g.launchRegionsAs(context.Background(), admin)
+	if err != nil || strings.Join(got, ",") != "r-one-1,r-two-1" {
+		t.Fatalf("launch regions %v, %v (want the warm r-one-1 first)", got, err)
+	}
+	if after := snapshot(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("ranking with the admin session changed the runner's state: %v", after)
+	}
+	// A vcpus runner discovers instance types per region: those caches
+	// stay out of the runner's state too.
+	g.r.InstanceTypes, g.r.VCPUs = nil, 8
+	f.types = map[string][]string{"r-one-1": {typeXML("c7a.2xlarge", 8, 16, "x86_64", "")}, "r-two-1": {typeXML("c7a.2xlarge", 8, 16, "x86_64", "")}}
+	before = snapshot()
+	if _, err := g.launchRegionsAs(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	if after := snapshot(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("ranking a vcpus runner with the admin session changed the runner's state: %v", after)
+	}
+	if g.r.Profile != "spotexec" {
+		t.Fatalf("profile %q", g.r.Profile)
 	}
 }

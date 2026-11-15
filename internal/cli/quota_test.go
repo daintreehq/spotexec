@@ -92,7 +92,7 @@ func TestStarterTemplateSizing(t *testing.T) {
 	if provider.VCPUsOf(small.InstanceTypes[0]) != 4 || small.MaxSlots != 2 || small.MaxInstances != big.MaxInstances {
 		t.Fatalf("sized runner: %v slots %d max %d", small.InstanceTypes, small.MaxSlots, small.MaxInstances)
 	}
-	if fits := quotaFits([]*config.Runner{small}, map[string]float64{"us-east-2": 5}); len(fits) != 1 || fits[0].Blocked() || !fits[0].Limited() {
+	if fits := quotaFits([]*config.Runner{small}, nil, map[string]float64{"us-east-2": 5}); len(fits) != 1 || fits[0].Blocked() || !fits[0].Limited() {
 		t.Fatalf("a 5-vCPU quota should fit one 4-vCPU VM: %+v", fits)
 	}
 	// Edited since: left alone.
@@ -125,7 +125,7 @@ func TestQuotaFits(t *testing.T) {
 		{Name: "c", Region: "eu-west-1", MaxInstances: 1, InstanceTypes: []string{"c7a.xlarge"}},
 		{Name: "d", Region: "ap-south-1", MaxInstances: 1, InstanceTypes: []string{"c7a.xlarge"}}, // quota unknown
 	}
-	fits := quotaFits(rs, map[string]float64{"us-east-2": 16, "eu-west-1": 64})
+	fits := quotaFits(rs, nil, map[string]float64{"us-east-2": 16, "eu-west-1": 64})
 	if len(fits) != 2 || fits[0] != (provider.QuotaFit{Region: "us-east-2", Quota: 16, OneVM: 2, Fleet: 36, Others: true}) ||
 		fits[1] != (provider.QuotaFit{Region: "eu-west-1", Quota: 64, OneVM: 4, Fleet: 4}) {
 		t.Fatalf("fits %+v", fits)
@@ -200,8 +200,64 @@ func TestSizeStarterFleetKeepsConfigOnFailure(t *testing.T) {
 
 func TestQuotaFitsRequirements(t *testing.T) {
 	rs := []*config.Runner{{Name: "r", Type: config.TypeAWSSpot, Region: "us-east-2", MaxInstances: 3, VCPUs: 8}}
-	fits := quotaFits(rs, map[string]float64{"us-east-2": 16})
+	fits := quotaFits(rs, nil, map[string]float64{"us-east-2": 16})
 	if len(fits) != 1 || fits[0] != (provider.QuotaFit{Region: "us-east-2", Quota: 16, OneVM: 8, Fleet: 24}) {
 		t.Fatalf("fits %+v", fits)
+	}
+}
+
+// A multi-region runner's quota is fitted in each region it launches in,
+// not its home region: the whole fleet may land in any one of them.
+func TestQuotaFitsMultiRegion(t *testing.T) {
+	rs := []*config.Runner{
+		{Name: "all", Type: config.TypeAWSSpot, Region: "us-east-1", Regions: []string{config.AllRegions}, MaxInstances: 10, InstanceTypes: []string{"c7a.2xlarge"}},
+		{Name: "two", Type: config.TypeAWSSpot, Region: "us-east-1", Regions: []string{"eu-west-1", "us-west-2"}, MaxInstances: 1, InstanceTypes: []string{"c7a.xlarge"}},
+	}
+	launches := map[string][]string{"all": {"ap-south-1", "us-west-2"}, "two": {"eu-west-1", "us-west-2"}}
+	fits := quotaFits(rs, launches, map[string]float64{"us-east-1": 640, "ap-south-1": 5, "us-west-2": 64, "eu-west-1": 32})
+	want := []provider.QuotaFit{
+		{Region: "ap-south-1", Quota: 5, OneVM: 8, Fleet: 80},
+		{Region: "us-west-2", Quota: 64, OneVM: 4, Fleet: 84},
+		{Region: "eu-west-1", Quota: 32, OneVM: 4, Fleet: 4},
+	}
+	if len(fits) != len(want) {
+		t.Fatalf("fits %+v", fits)
+	}
+	for i := range want {
+		if fits[i] != want[i] {
+			t.Fatalf("fits %+v, want %+v", fits, want)
+		}
+	}
+	// A runner the map leaves out is fitted in its own region; a listed
+	// runner only where its launches go (an enabled listed region).
+	single := &config.Runner{Name: "one", Type: config.TypeAWSSpot, Region: "us-east-1", MaxInstances: 2, InstanceTypes: []string{"c7a.xlarge"}}
+	fits = quotaFits([]*config.Runner{rs[1], single}, map[string][]string{"two": {"us-west-2"}}, map[string]float64{"us-east-1": 640, "us-west-2": 64, "eu-west-1": 32})
+	if len(fits) != 2 || fits[0] != (provider.QuotaFit{Region: "us-west-2", Quota: 64, OneVM: 4, Fleet: 4}) ||
+		fits[1] != (provider.QuotaFit{Region: "us-east-1", Quota: 640, OneVM: 4, Fleet: 8}) {
+		t.Fatalf("fits %+v", fits)
+	}
+	// Other instance families count where the runner launches, not at home.
+	gpu := &config.Runner{Name: "gpu", Type: config.TypeAWSSpot, Region: "us-east-1", Regions: []string{config.AllRegions}, MaxInstances: 1, InstanceTypes: []string{"c7a.xlarge", "g5.xlarge"}}
+	fits = quotaFits([]*config.Runner{gpu}, map[string][]string{"gpu": {"eu-west-1"}}, map[string]float64{"eu-west-1": 32})
+	if len(fits) != 1 || fits[0].Region != "eu-west-1" || !fits[0].Others {
+		t.Fatalf("fits %+v", fits)
+	}
+	// An any-region runner whose launch regions couldn't be ranked is
+	// checked nowhere, not in its home region.
+	if fits := quotaFits(rs[:1], map[string][]string{"all": nil}, map[string]float64{"us-east-1": 640}); len(fits) != 0 {
+		t.Fatalf("fits %+v", fits)
+	}
+}
+
+func TestDescribeAWSRunners(t *testing.T) {
+	rs := []*config.Runner{
+		{Name: "aws", Type: config.TypeAWSSpot, Region: "us-east-1", Regions: []string{config.AllRegions}, ExcludeRegions: []string{"me-south-1", "af-south-1"}},
+		{Name: "every", Type: config.TypeAWSSpot, Region: "us-east-1", Regions: []string{config.AllRegions}},
+		{Name: "two", Type: config.TypeAWSSpot, Region: "us-east-1", Regions: []string{"eu-west-1", "us-west-2"}},
+		{Name: "one", Type: config.TypeAWSSpot, Region: "us-east-2"},
+	}
+	want := "aws (all enabled regions except me-south-1, af-south-1), every (all enabled regions), two (eu-west-1, us-west-2), one (us-east-2)"
+	if got := describeAWSRunners(rs); got != want {
+		t.Fatalf("got  %q\nwant %q", got, want)
 	}
 }
