@@ -466,11 +466,12 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	}
 	var stderr io.Writer = os.Stderr
 	var watch *notFoundWatch
+	clientRep := rep
 	if s.taskLike != "" {
 		watch = newNotFoundWatch(os.Stderr, s.taskLike)
-		stderr = watch
+		stderr, clientRep = watch, watchReporter{rep, watch}
 	}
-	o := f.options(l, s, rep, intr, stdout, stderr)
+	o := f.options(l, s, clientRep, intr, stdout, stderr)
 	res, err := client.Run(ctx, l.cfg, l.ws, o)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -479,8 +480,10 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		}
 		if f.fallsBack(l, o, res, err) {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
+			// Unwatched: a terminal stays one for the local command.
+			o.Stderr, o.Rep = os.Stderr, rep
 			code := finish(runLocal(ctx, intr, l, o, rep, 0, 1))
-			warnUnknownTask(rep, l.cfg.Project, watch, code, true)
+			warnUnknownTask(rep, l.cfg.Project, s.taskLike, code, s.taskLike != "" && !onPath(l.cfg.Project, s.taskLike), true)
 			return code
 		}
 		finish(client.ExitInfra)
@@ -522,7 +525,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	}
 	finish(res.ExitCode)
 	if !res.Canceled {
-		warnUnknownTask(rep, l.cfg.Project, watch, res.ExitCode, false)
+		warnUnknownTask(rep, l.cfg.Project, s.taskLike, res.ExitCode, watch != nil && watch.Seen(), false)
 	}
 	rep.Done(summary, res.ExitCode == 0)
 	return res.ExitCode

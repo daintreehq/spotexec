@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -14,13 +16,14 @@ import (
 
 // A mistyped task name (`sx test-al`) isn't a task, so it runs as a command,
 // and the shell's exit 127 reads like a broken toolchain on the runner. When
-// the first word could have been meant as a task, the run's stderr is watched
-// for the shell saying it found no command by that name, and a 127 then
-// carries a warning that names the closest task.
+// the first word could have been meant as a task, the runner's stderr is
+// watched for the shell saying it found no command by that name (locally,
+// the word is looked up on PATH instead, so the command keeps its terminal),
+// and a 127 then carries a warning that names the closest task.
 
 // taskLikeWordRe is a plain command word: not a path, an assignment, a flag
 // or a shell snippet.
-var taskLikeWordRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.:+@%,-]*$`)
+var taskLikeWordRe = regexp.MustCompile(`^[\p{L}\p{N}_][\p{L}\p{N}\p{M}_.:+@%,-]*$`)
 
 // taskLikeWord returns the first word of a shorthand run when it could be a
 // mistyped task name.
@@ -77,6 +80,13 @@ func (n *notFoundWatch) Write(p []byte) (int, error) {
 	}
 	n.mu.Unlock()
 	return n.w.Write(p)
+}
+
+// reset forgets what an earlier attempt printed.
+func (n *notFoundWatch) reset() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.line, n.long, n.seen = n.line[:0], false, false
 }
 
 // Seen reports whether the shell said the word wasn't found, on a complete
@@ -172,11 +182,43 @@ func editDistance(a, b string) int {
 	return prev[len(t)]
 }
 
-// warnUnknownTask warns, after a run that exited 127, when the watched word
-// was reported as not found.
-func warnUnknownTask(rep ui.Reporter, p *config.Project, watch *notFoundWatch, code int, local bool) {
-	if watch == nil || code != 127 || !watch.Seen() {
+// watchReporter resets the watch when the client replays the command on
+// another runner, so only the attempt whose result counts is judged.
+type watchReporter struct {
+	ui.Reporter
+	watch *notFoundWatch
+}
+
+func (r watchReporter) Event(name string, fields map[string]any) {
+	if name == "retry" {
+		r.watch.reset()
+	}
+	r.Reporter.Event(name, fields)
+}
+
+// onPath reports whether bash would find word as a program on the PATH a
+// local fallback run gets: the project's [env] PATH, else this process's.
+func onPath(p *config.Project, word string) bool {
+	path := os.Getenv("PATH")
+	if v, ok := p.Env["PATH"]; ok {
+		path = v
+	}
+	for _, dir := range filepath.SplitList(path) {
+		if dir == "" {
+			dir = "."
+		}
+		if fi, err := os.Stat(filepath.Join(dir, word)); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// warnUnknownTask warns after a run of a task-like word exited 127 and the
+// word was found to be no command.
+func warnUnknownTask(rep ui.Reporter, p *config.Project, word string, code int, notFound, local bool) {
+	if word == "" || code != 127 || !notFound {
 		return
 	}
-	rep.Warn("UNKNOWN_TASK", "%s", unknownTaskWarning(p, watch.word, local))
+	rep.Warn("UNKNOWN_TASK", "%s", unknownTaskWarning(p, word, local))
 }

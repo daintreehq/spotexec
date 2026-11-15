@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 func TestTaskLikeWord(t *testing.T) {
@@ -25,6 +26,7 @@ func TestTaskLikeWord(t *testing.T) {
 		{[]string{"test-al --x"}, false, ""},
 		{[]string{"echo $X"}, false, ""},
 		{[]string{"-x"}, false, ""},
+		{[]string{"tést-al"}, false, "tést-al"},
 		{nil, false, ""},
 	}
 	for _, c := range cases {
@@ -85,6 +87,11 @@ func TestNotFoundWatchAcrossWrites(t *testing.T) {
 	if w.Seen() {
 		t.Error("partial or oversized line matched")
 	}
+	// The line after an oversized one is watched again.
+	io.WriteString(w, "bash: line 3: nosuch: command not found\n")
+	if !w.Seen() {
+		t.Error("a message after an oversized line wasn't seen")
+	}
 	// The last line counts without its newline.
 	w = newNotFoundWatch(io.Discard, "nosuch")
 	io.WriteString(w, "sh: nosuch: not found")
@@ -105,6 +112,8 @@ func TestClosestName(t *testing.T) {
 		"test-all": "test-all",
 		"ts":       "",
 		"lnt":      "lint",
+		"tst-al":   "test-all", // 2 edits, allowed past 5 characters
+		"linxx":    "",         // 2 edits, too many for 5 characters
 	}
 	for word, want := range cases {
 		if got := closestName(word, names); got != want {
@@ -113,6 +122,12 @@ func TestClosestName(t *testing.T) {
 	}
 	if got := closestName("testx", []string{"testa", "tests"}); got != "" {
 		t.Errorf("a tie suggested %q", got)
+	}
+	if got := closestName("te", []string{"tea"}); got != "" {
+		t.Errorf("a two-letter word suggested %q", got)
+	}
+	if got := closestName("tést-al", []string{"tést-all", "test-all"}); got != "tést-all" {
+		t.Errorf("unicode: %q", got)
 	}
 }
 
@@ -152,7 +167,8 @@ func TestMistypedTaskNameWarns(t *testing.T) {
 		t.Errorf("mistyped task: exit %d, stderr %q", code, stderr)
 	}
 	// A command that exists but exits 127, or a word after --, says nothing.
-	for _, args := range [][]string{{"sh", "-c", "exit 127"}, {"--", "test-al"}, {"sh", "-c", "test-al"}} {
+	// Nor does a program found on PATH whose own lookup of the same name fails.
+	for _, args := range [][]string{{"sh", "-c", "exit 127"}, {"--", "test-al"}, {"sh", "-c", "test-al"}, {"bash", "-c", "PATH=/nonexistent bash"}} {
 		code, stderr := run(args...)
 		if code != 127 || strings.Contains(stderr, "no task is named") {
 			t.Errorf("%q: exit %d, stderr %q", args, code, stderr)
@@ -169,5 +185,76 @@ func TestMistypedTaskNameWarns(t *testing.T) {
 	}
 	if code != 127 || !found {
 		t.Errorf("--json: exit %d, stderr %q", code, stderr)
+	}
+}
+
+// warnings records what a reporter is told.
+type warnings struct {
+	ui.Reporter
+	codes  []string
+	events []string
+}
+
+func (w *warnings) Warn(code, format string, args ...any) { w.codes = append(w.codes, code) }
+func (w *warnings) Event(name string, _ map[string]any)   { w.events = append(w.events, name) }
+
+func TestWarnUnknownTaskGate(t *testing.T) {
+	p := &config.Project{}
+	for _, c := range []struct {
+		word     string
+		code     int
+		notFound bool
+		want     bool
+	}{
+		{"test-al", 127, true, true},
+		{"test-al", 0, true, false},
+		{"test-al", 1, true, false},
+		{"test-al", 126, true, false},
+		{"test-al", 127, false, false},
+		{"", 127, true, false},
+	} {
+		var w warnings
+		warnUnknownTask(&w, p, c.word, c.code, c.notFound, false)
+		if got := len(w.codes) == 1 && w.codes[0] == "UNKNOWN_TASK"; got != c.want {
+			t.Errorf("%+v: warned %v", c, w.codes)
+		}
+	}
+}
+
+func TestWatchResetsOnRetry(t *testing.T) {
+	watch := newNotFoundWatch(io.Discard, "nosuch")
+	var inner warnings
+	rep := watchReporter{&inner, watch}
+	io.WriteString(watch, "bash: line 1: nosuch: command not found\n")
+	rep.Event("exec", nil)
+	if !watch.Seen() {
+		t.Fatal("not seen")
+	}
+	io.WriteString(watch, "bash: line 1: nos")
+	rep.Event("retry", nil)
+	if watch.Seen() {
+		t.Error("a replayed run kept the earlier attempt's message")
+	}
+	if strings.Join(inner.events, ",") != "exec,retry" {
+		t.Errorf("events not passed on: %v", inner.events)
+	}
+}
+
+func TestOnPath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "data"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	p := &config.Project{}
+	if !onPath(p, "tool") || onPath(p, "data") || onPath(p, "missing") {
+		t.Error("PATH lookup wrong")
+	}
+	p.Env = map[string]string{"PATH": t.TempDir()}
+	if onPath(p, "tool") {
+		t.Error("the project's PATH wasn't used")
 	}
 }
