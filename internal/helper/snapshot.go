@@ -4,7 +4,9 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -22,10 +24,13 @@ const MaxCreated = 50000
 type snapshot struct {
 	sig     map[string]statSig
 	unknown map[string]bool
+	// gitDirs are the .git directories below the root: never entered, but
+	// a run that creates one must not leave it in the slot.
+	gitDirs map[string]bool
 }
 
 func (s *Session) takeSnapshot(skip []string) snapshot {
-	snap := snapshot{sig: map[string]statSig{}, unknown: map[string]bool{}}
+	snap := snapshot{sig: map[string]statSig{}, unknown: map[string]bool{}, gitDirs: map[string]bool{}}
 	skipNames := map[string]bool{}
 	var skipPaths []string
 	for _, k := range skip {
@@ -52,8 +57,15 @@ func (s *Session) takeSnapshot(skip []string) snapshot {
 		rel := filepath.ToSlash(p[len(s.workspace)+1:])
 		if d.IsDir() {
 			// .git is never a source of changes (a seeded one included),
-			// whatever the client asked to skip.
-			if skipNames[d.Name()] || d.Name() == ".git" || strings.HasPrefix(d.Name(), ".spotexec-tmp") {
+			// whatever the client asked to skip; one below the root is
+			// noted as a whole.
+			if d.Name() == ".git" {
+				if rel != ".git" {
+					snap.gitDirs[rel] = true
+				}
+				return filepath.SkipDir
+			}
+			if skipNames[d.Name()] || strings.HasPrefix(d.Name(), ".spotexec-tmp") {
 				return filepath.SkipDir
 			}
 			for _, sp := range skipPaths {
@@ -176,4 +188,25 @@ func (s *Session) diff(pre, post snapshot) (changed []protocol.Entry, deleted []
 		created = append(created, protocol.Entry{Path: rel, ID: id, Mode: mode, Size: size})
 	}
 	return
+}
+
+// newGitDirs lists the .git directories below the root that appeared
+// during the run. They never go back (nothing in one is a client's file),
+// so the client is told, and the slot keeps them pending: a later git
+// command in their directory would otherwise act on a leftover repository.
+func newGitDirs(pre, post snapshot) []string {
+	var out []string
+	for rel := range post.gitDirs {
+		if !pre.gitDirs[rel] {
+			out = append(out, rel)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// nestedGitDir reports whether p, a slot-relative path, names a .git
+// directory below the root (never the root's own, the seeded repository).
+func nestedGitDir(p string) bool {
+	return path.Base(p) == ".git" && strings.Contains(p, "/")
 }

@@ -208,6 +208,25 @@ func writeback(ctx context.Context, fetchFiles fetchFunc, ws *Workspace, m *mani
 			return wb, err
 		}
 	}
+	// .git directories the run made below the root never come back. One
+	// whose directory is ignored here stays in the slot, like any build
+	// output; the rest are refused, and the next sync removes them.
+	if len(r.GitDirs) > 0 {
+		var dirs, probes []string
+		for _, p := range r.GitDirs {
+			if probe, ok := gitDirProbe(ws, m, p); ok {
+				dirs, probes = append(dirs, p), append(probes, probe)
+			} else {
+				refuse(p)
+			}
+		}
+		ign, err := m.CheckIgnored(ctx, probes)
+		for i, p := range dirs {
+			if err != nil || !ign[probes[i]] {
+				refuse(p)
+			}
+		}
+	}
 	var fresh []protocol.Entry // created and not ignored: new files coming back
 	for _, c := range created {
 		if ignored[c.Path] {

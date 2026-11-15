@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 func TestStrayFilesKeepsIgnoredOutputs(t *testing.T) {
@@ -69,5 +71,38 @@ func TestStrayFilesKeepsIgnoredOutputs(t *testing.T) {
 	}
 	if got, _ := strayFiles(ctx, ws, m, nil); len(got) != 0 {
 		t.Fatalf("nothing pending, but stray = %v", got)
+	}
+
+	// .git directories a run made below the root: kept only where their
+	// directory is ignored here; write-back refuses the rest by name.
+	gitDirs := []string{
+		"sub/.git",        // goes
+		"deep/x/.git",     // goes
+		"dist/clone/.git", // a build output's clone (dist/ is ignored): stays
+		"linked/.git",     // under a local symlink: goes
+		"src/a.go/.git",   // under a synced file: goes
+		"sub/.git/x/.git", // inside another .git: goes
+		"dist/clone/.Git", // not a .git directory: goes
+	}
+	got, err = strayFiles(ctx, ws, m, gitDirs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"deep/x/.git", "dist/clone/.Git", "linked/.git", "src/a.go/.git", "sub/.git", "sub/.git/x/.git"}
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stray = %v, want %v", got, want)
+	}
+	fetch := func(f protocol.Fetch) (io.Reader, error) {
+		t.Fatalf("fetched %v for .git directories", f.Paths)
+		return nil, nil
+	}
+	wb, err := writeback(ctx, fetch, ws, m, protocol.Result{GitDirs: gitDirs}, "r", nil, nil, WritebackLimits{}, &recordingReporter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(wb.Refused)
+	if !reflect.DeepEqual(wb.Refused, want) {
+		t.Fatalf("refused %v, want %v", wb.Refused, want)
 	}
 }

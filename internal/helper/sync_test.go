@@ -108,3 +108,83 @@ func TestSyncNeverRemovesInsideGit(t *testing.T) {
 		t.Fatalf("a path that can't be a run's file stays pending: %v", s.state.Pending)
 	}
 }
+
+// A .git directory a run creates below the root is reported, not walked,
+// stays pending across runs that leave it alone, and the next sync that
+// lists it removes it whole. The root's own .git, and one that was there
+// before the run, are never touched.
+func TestSyncRemovesNestedGitDirsARunCreated(t *testing.T) {
+	s := testSession(t, t.TempDir())
+	if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, s.workspace, ".git/HEAD", "ref: refs/heads/main\n")
+	writeFile(t, s.workspace, "old/.git/HEAD", "there before the run\n")
+	s.loadStored()
+	pre := s.takeSnapshot([]string{".git", "node_modules"}) // as the client asks
+
+	// sx -- sh -c 'mkdir -p sub/.git deep/x; echo y > sub/.git/config; git init -q deep/x; echo n > deep/x/file'
+	writeFile(t, s.workspace, "sub/.git/config", "y\n")
+	writeFile(t, s.workspace, "deep/x/.git/HEAD", "ref: refs/heads/main\n")
+	writeFile(t, s.workspace, "deep/x/.git/objects/ab/cdef", "blob\n")
+	writeFile(t, s.workspace, "deep/x/file", "n\n")
+	writeFile(t, s.workspace, "node_modules/dep/.git/HEAD", "skipped\n")
+	post := s.takeSnapshot([]string{".git", "node_modules"})
+
+	_, _, created, _, _, unreported := s.diff(pre, post)
+	if len(created) != 1 || created[0].Path != "deep/x/file" || len(unreported) != 0 {
+		t.Fatalf("created %v, unreported %v: want only deep/x/file", created, unreported)
+	}
+	gitDirs := newGitDirs(pre, post)
+	if want := []string{"deep/x/.git", "sub/.git"}; !reflect.DeepEqual(gitDirs, want) {
+		t.Fatalf("git dirs %v, want %v", gitDirs, want)
+	}
+	s.state.Pending = s.pendingAfter(created, nil, gitDirs)
+	want := []string{"deep/x/.git", "deep/x/file", "sub/.git"}
+	if !reflect.DeepEqual(s.state.Pending, want) {
+		t.Fatalf("pending = %v, want %v", s.state.Pending, want)
+	}
+	// A later run that leaves them alone keeps them pending (deep/x/file
+	// came back: it is synced now).
+	s.stored["deep/x/file"] = storedEntry{}
+	if got := s.pendingAfter(nil, nil, nil); !reflect.DeepEqual(got, []string{"deep/x/.git", "sub/.git"}) {
+		t.Fatalf("pending after a later run = %v", got)
+	}
+	delete(s.stored, "deep/x/file")
+
+	// Even listed and pending, the root's .git is never removed.
+	s.state.Pending = append(s.state.Pending, ".git")
+	if err := s.syncManifest(protocol.Manifest{Remove: append(want, ".git", "old/.git")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"sub", "deep"} {
+		if _, err := os.Lstat(filepath.Join(s.workspace, p)); !os.IsNotExist(err) {
+			t.Errorf("%s still in the slot (err %v)", p, err)
+		}
+	}
+	for _, p := range []string{".git/HEAD", "old/.git/HEAD"} {
+		if _, err := os.Lstat(filepath.Join(s.workspace, p)); err != nil {
+			t.Errorf("%s removed: %v", p, err)
+		}
+	}
+	if len(s.state.Pending) != 0 {
+		t.Fatalf("still pending: %v", s.state.Pending)
+	}
+}
+
+// After a helper died during a run, a .git directory below the root is
+// pending like every other unsynced file (the client keeps ignored ones);
+// the root's own .git never is.
+func TestSweepPendingIncludesNestedGitDirs(t *testing.T) {
+	s := testSession(t, t.TempDir())
+	if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, s.workspace, ".git/HEAD", "ref: refs/heads/main\n")
+	writeFile(t, s.workspace, "sub/.git/config", "y\n")
+	s.state.Pending, s.state.SweepSkip = nil, []string{".git"}
+	s.sweepPending()
+	if want := []string{"sub/.git"}; !reflect.DeepEqual(s.state.Pending, want) {
+		t.Fatalf("pending = %v, want %v", s.state.Pending, want)
+	}
+}

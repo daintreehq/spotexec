@@ -662,7 +662,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	// 6. Write-back of mutations.
 	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, res.ExitCode) &&
-		(len(result.Changed)+len(result.Deleted)+len(result.Created) > 0) {
+		(len(result.Changed)+len(result.Deleted)+len(result.Created)+len(result.GitDirs) > 0) {
 		t := time.Now()
 		// on-success: an interrupt while the changes are being fetched means
 		// the run no longer counts as a success; apply nothing.
@@ -694,7 +694,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		res.Mutated, res.Deleted = wb.Applied, wb.Deleted
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "held_files": len(wb.HeldNew), "held_bytes": wb.HeldNewBytes, "duration_ms": time.Since(t).Milliseconds()})
 		if len(wb.Refused) > 0 {
-			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
+			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (a .git directory, inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
 		}
 		if result.Truncated {
 			o.Rep.Warn("WRITEBACK_TRUNCATED", "more than %d new files were created; only the first batch was considered for write-back", 50000)
@@ -932,10 +932,16 @@ func newRunID() string {
 // wrote back, the ones the next sync must remove: everything this worktree
 // doesn't ignore (ignored build outputs stay, like dependency caches).
 func strayFiles(ctx context.Context, ws *Workspace, m *manifest.Manifest, pending []string) ([]string, error) {
-	var stray, check []string
+	var stray, check, gitDirs, probes []string
 	for _, p := range pending {
 		if _, ok := m.ByPath[p]; ok {
 			continue // synced over by this run
+		}
+		// A .git directory a run made goes unless its directory is ignored
+		// here (a build output's own clone stays, like the output).
+		if probe, ok := gitDirProbe(ws, m, p); ok {
+			gitDirs, probes = append(gitDirs, p), append(probes, probe)
+			continue
 		}
 		// Never a file of ours: an invalid or reserved path, or one under a
 		// synced file or a local symlink or file (git can't judge those).
@@ -945,10 +951,10 @@ func strayFiles(ctx context.Context, ws *Workspace, m *manifest.Manifest, pendin
 		}
 		check = append(check, p)
 	}
-	if len(check) == 0 {
+	if len(check)+len(probes) == 0 {
 		return stray, nil
 	}
-	ign, err := m.CheckIgnored(ctx, check)
+	ign, err := m.CheckIgnored(ctx, append(append([]string{}, check...), probes...))
 	if err != nil {
 		return nil, err
 	}
@@ -957,7 +963,34 @@ func strayFiles(ctx context.Context, ws *Workspace, m *manifest.Manifest, pendin
 			stray = append(stray, p)
 		}
 	}
+	for i, p := range gitDirs {
+		if !ign[probes[i]] {
+			stray = append(stray, p)
+		}
+	}
 	return stray, nil
+}
+
+// gitDirProbe returns, for p a .git directory below the root that a run
+// created, the path whose being ignored here says whether p is: p's
+// directory, with a trailing slash so it is asked about as a directory (the
+// built-in excludes match .git itself, whatever surrounds it). false when p
+// is no such directory, or its directory can't be judged here (a local
+// symlink or file, or beyond one): it is never kept.
+func gitDirProbe(ws *Workspace, m *manifest.Manifest, p string) (string, bool) {
+	dir, name := path.Split(p)
+	if name != ".git" || dir == "" {
+		return "", false
+	}
+	d := strings.TrimSuffix(dir, "/")
+	full, err := fsid.SafeJoin(ws.Root, d)
+	if err != nil || reservedPath(d, ws.Git) || underSyncedFile(m, p) {
+		return "", false
+	}
+	if fi, err := os.Lstat(full); err == nil && !fi.IsDir() || err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "", false
+	}
+	return dir, true
 }
 
 // underSyncedFile reports whether a parent of p is a synced file or symlink.

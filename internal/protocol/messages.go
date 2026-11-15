@@ -307,6 +307,9 @@ type Result struct {
 	Changed    []Entry  `json:"changed,omitempty"` // manifest files with new content/mode
 	Deleted    []string `json:"deleted,omitempty"` // manifest files removed
 	Created    []Entry  `json:"created,omitempty"` // non-manifest files created/changed
+	// GitDirs are the .git directories below the root the run created:
+	// never written back, and removed by the next sync unless ignored.
+	GitDirs    []string `json:"git_dirs,omitempty"`
 	Truncated  bool     `json:"truncated,omitempty"`
 	Unverified []string `json:"unverified,omitempty"` // paths that could not be read after the run
 	SnapshotMS int64    `json:"snapshot_ms"`
