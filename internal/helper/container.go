@@ -754,7 +754,9 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 // services on the runner are reachable). "private" gives each run a
 // network namespace of its own on Docker's default bridge, so fixed ports
 // (a test server on 3000, a suite's own Postgres on 5432) can't collide
-// with, or reach, another slot's; outbound traffic still goes through NAT.
+// with another slot's, and localhost reaches only the run's own; outbound
+// traffic goes through NAT. It separates ports, not traffic: containers on
+// the bridge can still reach one another by IP.
 // A --network or --net in container.options wins: the user decides.
 func networkArgs(run *protocol.ContainerRun) []string {
 	for _, f := range dockerFlags(run.Options) {
