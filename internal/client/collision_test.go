@@ -421,3 +421,21 @@ func TestCollisionUnderAnotherDirectorySpelling(t *testing.T) {
 		t.Fatalf("D/A holds %q", got)
 	}
 }
+
+func TestHardLinkToAWrittenPathIsNotACollision(t *testing.T) {
+	c := newCollisionRun(t)
+	c.wrote("Foo", "foo")
+	c.wrote("b", "remote b")
+	// Foo is applied first; b is then a hard link to it, made locally
+	// (here, as if during the run): its own name, a local edit.
+	c.apply()
+	if err := os.Remove(filepath.Join(c.ws.Root, "b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(c.ws.Root, "Foo"), filepath.Join(c.ws.Root, "b")); err != nil {
+		t.Skip("no hard links here")
+	}
+	if with := collidesWith(c.ws.Root, "b", c.remote, c.m, []string{"Foo"}); with != "" {
+		t.Fatalf("hard link b reported as a collision with %q", with)
+	}
+}

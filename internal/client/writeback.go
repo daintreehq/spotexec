@@ -586,7 +586,11 @@ func collidesWith(root, p string, remote map[string]version, m *manifest.Manifes
 	}
 	// A path this run wrote may have landed under another spelling of a
 	// parent directory (d/A written into an existing D/ is D/A, and src/a
-	// may be SRC/a's file): match those by identity.
+	// may be SRC/a's file): match those by identity, and then by directory
+	// entry, since a hard link is the same file under a name of its own.
+	if !ok {
+		return ""
+	}
 	full, err := fsid.SafeJoin(root, p)
 	if err != nil {
 		return ""
@@ -599,10 +603,15 @@ func collidesWith(root, p string, remote map[string]version, m *manifest.Manifes
 		if r == p {
 			continue
 		}
-		if fr, err := fsid.SafeJoin(root, r); err == nil {
-			if ri, err := os.Lstat(fr); err == nil && os.SameFile(ri, fi) {
-				return r
-			}
+		fr, err := fsid.SafeJoin(root, r)
+		if err != nil {
+			continue
+		}
+		if ri, err := os.Lstat(fr); err != nil || !os.SameFile(ri, fi) {
+			continue
+		}
+		if rq, ok := onDiskName(root, r); ok && rq == q {
+			return r
 		}
 	}
 	return ""
