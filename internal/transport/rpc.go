@@ -33,9 +33,9 @@ type Session struct {
 	once    sync.Once
 	seen    atomic.Int64
 	silent  atomic.Bool  // the watchdog gave up on the helper
-	limit   atomic.Int64 // SilenceLimit when the session opened, plus any grace (ns)
-	// onSilent, if set, is asked once whether to keep waiting when the
-	// helper first goes silent past the limit (see SetOnSilent).
+	limit   atomic.Int64 // SilenceLimit when the session opened, plus any current grace (ns)
+	// onSilent, if set, is asked whether to keep waiting when the helper
+	// goes silent past the limit, once per silence (see SetOnSilent).
 	onSilent atomic.Pointer[func(time.Duration) time.Duration]
 	pressure atomic.Pointer[pressureSeen] // the latest heartbeat showing memory pressure
 	// OnEvent receives helper events that arrive while waiting for replies.
@@ -270,9 +270,11 @@ var errSilent = errors.New("runner stopped responding")
 // pending read (or write) then fails as a lost connection instead of
 // waiting forever.
 func (s *Session) watchdog() {
-	t := time.NewTicker(min(5*time.Second, s.Limit()/4))
+	base := s.Limit()
+	t := time.NewTicker(min(5*time.Second, base/4))
 	defer t.Stop()
-	asked := false
+	asked := false    // onSilent was asked about the current silence
+	var askedAt int64 // s.seen when it was
 	for {
 		select {
 		case <-s.done:
@@ -280,14 +282,22 @@ func (s *Session) watchdog() {
 		case <-s.closing:
 			return
 		case <-t.C:
+			// The helper sent something since onSilent was asked: that
+			// silence is over. Drop its grace, so a later one is noticed
+			// as quickly as the first, and ask afresh then.
+			seen := s.seen.Load() // before judging the silence: progress after it rearms
+			if asked && seen != askedAt {
+				s.limit.Store(int64(base))
+				asked = false
+			}
 			silent := time.Since(s.LastSeen())
 			if silent <= s.Limit() {
 				continue
 			}
 			if f := s.onSilent.Load(); f != nil && !asked {
-				asked = true
+				asked, askedAt = true, seen
 				if grace := (*f)(silent); grace > 0 {
-					s.limit.Add(int64(grace))
+					s.limit.Store(int64(base + grace))
 					continue
 				}
 				if time.Since(s.LastSeen()) <= s.Limit() {
@@ -449,9 +459,11 @@ func (s *Session) Dead() bool {
 // helper before it is given up on.
 func (s *Session) Limit() time.Duration { return time.Duration(s.limit.Load()) }
 
-// SetOnSilent sets f to be asked, once per session, when the helper has
+// SetOnSilent sets f to be asked, once per silence, when the helper has
 // been silent past SilenceLimit: it returns how much longer to wait (0 to
-// give up now). f runs on the watchdog, so it should return within seconds.
+// give up now). A helper that speaks again goes back to SilenceLimit, and
+// f is asked afresh if it falls silent later. f runs on the watchdog, so
+// it should return within seconds.
 func (s *Session) SetOnSilent(f func(silent time.Duration) time.Duration) { s.onSilent.Store(&f) }
 
 type pressureSeen struct {

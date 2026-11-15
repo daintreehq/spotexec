@@ -289,8 +289,9 @@ func (s *Session) memoryShareMB() int64 {
 }
 
 // containerOOMKilled reports whether Docker recorded an oom event (the
-// kernel killed a process in the container's cgroup for exceeding its
-// memory limit) for the session's last container. Docker keeps recent
+// kernel killed a process in the container's cgroup, for its memory limit,
+// the memory pool's, or the whole machine running out) for the session's
+// last container. Docker keeps recent
 // events after a --rm container is gone, so this works after the run.
 func (s *Session) containerOOMKilled() bool {
 	c := s.lastContainer

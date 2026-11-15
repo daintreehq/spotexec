@@ -192,6 +192,18 @@ func rpc() int {
 	if _, err := os.Stat(filepath.Join(st, "rpc-silent")); err == nil {
 		time.Sleep(time.Hour) // until killed
 	}
+	// rpc-pulse: silent until the test creates rpc-pulse-go, then one
+	// heartbeat, then silent until killed (a helper that recovers once, then
+	// dies).
+	if _, err := os.Stat(filepath.Join(st, "rpc-pulse")); err == nil {
+		for deadline := time.Now().Add(time.Minute); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if _, err := os.Stat(filepath.Join(st, "rpc-pulse-go")); err == nil {
+				_ = conn.Send(protocol.TypeHeartbeat, nil)
+				break
+			}
+		}
+		time.Sleep(time.Hour)
+	}
 	if _, err := os.Stat(filepath.Join(st, "rpc-heartbeat")); err == nil {
 		go func() { _, _ = io.Copy(io.Discard, os.Stdin); os.Exit(0) }()
 		for {

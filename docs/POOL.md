@@ -105,7 +105,9 @@ it). A connection lost without a notice on an ephemeral runner is also retried
 once, if the VM is gone by then. A VM that EC2 still reports running, or whose
 last heartbeats showed it out of memory, is not: the run may be what
 overloaded it, and replayed it could take another VM's jobs down with it
-(`RUNNER_UNRESPONSIVE`, `MEMORY_PRESSURE`; exit 125). Before giving up on a
+(`RUNNER_UNRESPONSIVE`, `MEMORY_PRESSURE`; exit 125). A VM that announced it
+was going away (a Spot notice, or the helper reporting its shutdown, as at
+`max_lifetime`) is replayed either way. Before giving up on a
 silent helper whose VM is still running, the CLI waits 3 more minutes, so a
 VM that recovers keeps its runs.
 
