@@ -166,10 +166,10 @@ func TestConflictStashIsDiffable(t *testing.T) {
 	}
 	wb := &WritebackResult{ConflictDir: stash}
 	rf := remoteFile{data: []byte("remote\n"), mode: fsid.ModeFile}
-	if err := wb.conflict(root, "src/a b.txt", version{true, fsid.Bytes(rf.data), rf.mode}, rf); err != nil {
+	if err := wb.conflict(root, "src/a b.txt", version{true, fsid.Bytes(rf.data), rf.mode}, rf, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := wb.conflict(root, "src/gone.txt", version{}, remoteFile{}); err != nil {
+	if err := wb.conflict(root, "src/gone.txt", version{}, remoteFile{}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(wb.Stashed) != 2 || len(wb.Conflicts) != 2 {
@@ -302,7 +302,7 @@ func TestSymlinkParentConflict(t *testing.T) {
 		if p == "nested/docs/old.txt" {
 			w, f = version{}, remoteFile{} // deleted by the remote command
 		}
-		if err := wb.conflict(root, p, w, f); err != nil {
+		if err := wb.conflict(root, p, w, f, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

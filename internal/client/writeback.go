@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/manifest"
@@ -45,7 +48,8 @@ type WritebackResult struct {
 }
 
 // Conflict is a path where your local edit was kept and the remote version
-// was stashed instead.
+// was stashed instead, or, when With is set, a remote path whose name is
+// another remote path's file on this filesystem.
 type Conflict struct {
 	Path    string `json:"path"`    // worktree-relative
 	Local   string `json:"local"`   // your file (absolute)
@@ -55,19 +59,28 @@ type Conflict struct {
 	// ReasonSymlinkParent: a local parent directory is a symlink, so the
 	// path can't be written here without leaving the worktree.
 	Reason string `json:"reason,omitempty"`
+	// With is the path whose file Path opens here, because the filesystem
+	// ignores case or Unicode normalisation (src/Dup.txt is src/DUP.txt):
+	// a name collision, not a local edit. Local is With's file, kept.
+	With string `json:"with,omitempty"`
 }
 
 // ReasonSymlinkParent marks a conflict caused by a symlinked local parent.
 const ReasonSymlinkParent = "symlink_parent"
 
-// conflict stashes the remote version of p and records the conflict.
-func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile) error {
+// conflict stashes the remote version of p and records the conflict; with
+// names the path p collides with, if that is why ("" for a local edit).
+func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile, with string) error {
 	stashed, err := stashConflict(wb.ConflictDir, p, want, rf)
 	if err != nil {
 		return err
 	}
+	local := p
+	if with != "" {
+		local = with
+	}
 	wb.Conflicts = append(wb.Conflicts, p)
-	c := Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(p)), Remote: stashed, Deleted: !want.exists}
+	c := Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(local)), Remote: stashed, Deleted: !want.exists, With: with}
 	if _, err := fsid.SafeJoin(root, p); errors.Is(err, fsid.ErrSymlinkParent) {
 		c.Reason = ReasonSymlinkParent
 	}
@@ -323,7 +336,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			}
 			want := version{true, rf.id, rf.mode}
 			if !local.eq(base) && !local.eq(want) {
-				if err := wb.conflict(ws.Root, q, want, rf); err != nil {
+				if err := wb.conflict(ws.Root, q, want, rf, ""); err != nil {
 					return err
 				}
 				break
@@ -331,7 +344,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			if !local.eq(want) {
 				err := save(del, local)
 				if errors.Is(err, errChangedUnderUs) {
-					if err := wb.conflict(ws.Root, q, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, q, want, rf, ""); err != nil {
 						return err
 					}
 					break
@@ -346,7 +359,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			if !local.eq(want) {
 				err := writeLocal(ws.Root, q, rf, &local)
 				if errors.Is(err, errChangedUnderUs) {
-					if err := wb.conflict(ws.Root, q, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, q, want, rf, ""); err != nil {
 						return err
 					}
 					break
@@ -387,11 +400,18 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 		}
 		switch {
 		case local.eq(want):
+			// A new name already holding these bytes may be another
+			// remote path's file: still two names that can't both exist.
+			if !base.exists && local.exists {
+				if with := collidesWith(ws.Root, p, remote, m, wb.Applied); with != "" {
+					return wb.conflict(ws.Root, p, want, rf, with)
+				}
+			}
 			return nil
 		case local.eq(base):
 			// Whatever is lost here and isn't committed is saved first.
 			if err := save(p, local); errors.Is(err, errChangedUnderUs) {
-				return wb.conflict(ws.Root, p, want, rf)
+				return wb.conflict(ws.Root, p, want, rf, "")
 			} else if err != nil {
 				return fmt.Errorf("backing up %s: %w", p, err)
 			}
@@ -401,7 +421,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				// directory is needed, kept because of a local edit): keep
 				// the local side, stash the remote one.
 				if errors.Is(err, errChangedUnderUs) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) || errors.Is(err, fsid.ErrSymlinkParent) {
-					if err := wb.conflict(ws.Root, p, want, rf); err != nil {
+					if err := wb.conflict(ws.Root, p, want, rf, ""); err != nil {
 						return err
 					}
 					return nil
@@ -414,13 +434,13 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			} else {
 				full, err := fsid.SafeJoin(ws.Root, p)
 				if errors.Is(err, fsid.ErrSymlinkParent) {
-					return wb.conflict(ws.Root, p, want, rf) // a symlink appeared above it
+					return wb.conflict(ws.Root, p, want, rf, "") // a symlink appeared above it
 				}
 				if err != nil {
 					return err
 				}
 				if now, err := localVersion(ws.Root, p); err != nil || !now.eq(local) {
-					return wb.conflict(ws.Root, p, want, rf)
+					return wb.conflict(ws.Root, p, want, rf, "")
 				}
 				if err := os.Remove(full); err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return err
@@ -429,7 +449,11 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				removedDirs = append(removedDirs, path.Dir(p))
 			}
 		default:
-			if err := wb.conflict(ws.Root, p, want, rf); err != nil {
+			with := ""
+			if local.exists && local != blocked {
+				with = collidesWith(ws.Root, p, remote, m, wb.Applied)
+			}
+			if err := wb.conflict(ws.Root, p, want, rf, with); err != nil {
 				return err
 			}
 		}
@@ -545,6 +569,103 @@ func nowIgnored(ctx context.Context, m *manifest.Manifest, root string, paths []
 	return ignored
 }
 
+// collidesWith is the other path the run knows whose file p opens here,
+// when this filesystem ignores case or Unicode normalisation in names
+// (src/Dup.txt opens src/DUP.txt, src/n\u00e9.txt opens src/ne\u0301.txt):
+// two remote names for one local file, not a local edit. "" when p's file
+// is no other path the run knows.
+func collidesWith(root, p string, remote map[string]version, m *manifest.Manifest, applied []string) string {
+	q, ok := onDiskName(root, p)
+	if ok && q != p {
+		if v, ok := remote[q]; ok && v.exists {
+			return q
+		}
+		if _, ok := m.ByPath[q]; ok {
+			return q
+		}
+	}
+	// A path this run wrote may have landed under another spelling of a
+	// parent directory (d/A written into an existing D/ is D/A, and src/a
+	// may be SRC/a's file): match those by identity, and then by directory
+	// entry, since a hard link is the same file under a name of its own.
+	if !ok {
+		return ""
+	}
+	full, err := fsid.SafeJoin(root, p)
+	if err != nil {
+		return ""
+	}
+	fi, err := os.Lstat(full)
+	if err != nil {
+		return ""
+	}
+	for _, r := range applied {
+		if r == p {
+			continue
+		}
+		fr, err := fsid.SafeJoin(root, r)
+		if err != nil {
+			continue
+		}
+		if ri, err := os.Lstat(fr); err != nil || !os.SameFile(ri, fi) {
+			continue
+		}
+		if rq, ok := onDiskName(root, r); ok && rq == q {
+			return r
+		}
+	}
+	return ""
+}
+
+// onDiskName is the name rel's file has under root, component by component:
+// rel itself where that name is listed, otherwise the listed entry that is
+// the same file. false when a component is missing or can't be read.
+func onDiskName(root, rel string) (string, bool) {
+	dir := root
+	var out []string
+	for _, part := range strings.Split(rel, "/") {
+		fi, err := os.Lstat(filepath.Join(dir, part))
+		if err != nil {
+			return "", false
+		}
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return "", false
+		}
+		name := ""
+		var same []string
+		for _, e := range ents {
+			if e.Name() == part {
+				name = part
+				break
+			}
+			if ei, err := os.Lstat(filepath.Join(dir, e.Name())); err == nil && os.SameFile(ei, fi) {
+				same = append(same, e.Name())
+			}
+		}
+		if name == "" && len(same) > 1 {
+			// Hard links: only the entry differing from part in case is
+			// the one this name folds to; otherwise it can't be told.
+			var folded []string
+			for _, n := range same {
+				if strings.EqualFold(n, part) {
+					folded = append(folded, n)
+				}
+			}
+			same = folded
+		}
+		if name == "" && len(same) == 1 {
+			name = same[0]
+		}
+		if name == "" {
+			return "", false
+		}
+		out = append(out, name)
+		dir = filepath.Join(dir, name)
+	}
+	return strings.Join(out, "/"), true
+}
+
 func conflictBase(ws *Workspace) string {
 	if ws.GitDir != "" {
 		return filepath.Join(ws.GitDir, "spotexec")
@@ -560,7 +681,7 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 		full, err := fsid.SafeJoin(dir, p+".deleted")
 		if err == nil {
 			if err = os.MkdirAll(filepath.Dir(full), 0o700); err == nil {
-				err = os.WriteFile(full, mark, 0o600)
+				err = writeNew(full, mark) // never over an earlier marker whose name this one folds to
 			}
 		}
 		if err != nil && stashCollision(err) {
@@ -568,7 +689,7 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return "", err
 			}
-			f, err := os.CreateTemp(dir, strings.ReplaceAll(p, "/", "__")+".deleted-*")
+			f, err := os.CreateTemp(dir, flatName(p)+".deleted-*")
 			if err != nil {
 				return "", err
 			}
@@ -583,15 +704,27 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	err := writeLocal(dir, p, rf, nil)
+	// An earlier stashed path this one folds to (src/Dup.txt, src/dup.txt
+	// on a case-insensitive filesystem) must not be overwritten.
+	var err error
+	if full, jerr := fsid.SafeJoin(dir, p); jerr == nil {
+		if _, lerr := os.Lstat(full); lerr == nil {
+			err = fmt.Errorf("%s is already stashed: %w", p, syscall.EEXIST)
+		}
+	}
+	if err == nil {
+		err = writeLocal(dir, p, rf, nil)
+	}
 	if err != nil && stashCollision(err) {
-		// A directory/file collision inside the stash itself (a path that
-		// was a directory and is now a file): keep it at the top of the
-		// stash under a flattened name nothing else uses.
-		base := strings.ReplaceAll(p, "/", "__") + ".remote"
+		// A collision inside the stash itself (a path that was a directory
+		// and is now a file, or a name an earlier stashed path folds to):
+		// keep it at the top of the stash under a flattened name nothing
+		// else uses.
+		base := flatName(p) + ".remote"
 		name := base
 		for i := 2; ; i++ {
-			if _, err := os.Lstat(filepath.Join(dir, name)); errors.Is(err, fs.ErrNotExist) {
+			// Free, or unusable for another reason that writing reports.
+			if _, err := os.Lstat(filepath.Join(dir, name)); err != nil {
 				break
 			}
 			name = fmt.Sprintf("%s.%d", base, i)
@@ -599,6 +732,35 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 		return filepath.Join(dir, name), writeLocal(dir, name, rf, nil)
 	}
 	return filepath.Join(dir, filepath.FromSlash(p)), err
+}
+
+// flatName is p as one file name for the top of the stash, short enough for
+// any filesystem: a deep path keeps its last part and a hash of the rest.
+func flatName(p string) string {
+	flat := strings.ReplaceAll(p, "/", "__")
+	if len(flat) <= 160 {
+		return flat
+	}
+	tail := path.Base(p)
+	for len(tail) > 100 {
+		_, n := utf8.DecodeLastRuneInString(tail)
+		tail = tail[:len(tail)-n]
+	}
+	sum := sha256.Sum256([]byte(p))
+	return hex.EncodeToString(sum[:8]) + "__" + tail
+}
+
+// writeNew creates p holding b, failing with EEXIST if anything is there.
+func writeNew(p string, b []byte) error {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func stashCollision(err error) bool {
