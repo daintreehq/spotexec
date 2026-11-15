@@ -37,7 +37,8 @@ type Session struct {
 	// onSilent, if set, is asked whether to keep waiting when the helper
 	// goes silent past the limit, once per silence (see SetOnSilent).
 	onSilent atomic.Pointer[func(time.Duration) time.Duration]
-	pressure atomic.Pointer[pressureSeen] // the latest heartbeat showing memory pressure
+	pressure atomic.Pointer[pressureSeen]  // the latest heartbeat showing memory pressure
+	memory   atomic.Pointer[MemoryReading] // the latest heartbeat's memory reading
 	// OnEvent receives helper events that arrive while waiting for replies.
 	OnEvent func(protocol.Event)
 }
@@ -484,13 +485,36 @@ func (s *Session) MemoryPressure(within time.Duration) string {
 	return ""
 }
 
+// MemoryReading is the VM's memory as a heartbeat last reported it, and
+// when that heartbeat arrived.
+type MemoryReading struct {
+	At               time.Time
+	AvailMB, TotalMB int64
+}
+
+// LastMemory is the memory reading of the latest heartbeat that carried
+// one; ok is false when none has (an older helper, or a nil session).
+func (s *Session) LastMemory() (m MemoryReading, ok bool) {
+	if s == nil {
+		return m, false
+	}
+	if p := s.memory.Load(); p != nil {
+		return *p, true
+	}
+	return m, false
+}
+
 func (s *Session) notePressure(env protocol.Envelope) {
 	var hb protocol.Heartbeat
 	if len(env.Body) == 0 || env.Unmarshal(&hb) != nil {
 		return
 	}
+	now := time.Now()
+	if hb.MemTotalMB > 0 {
+		s.memory.Store(&MemoryReading{At: now, AvailMB: hb.MemAvailMB, TotalMB: hb.MemTotalMB})
+	}
 	if what := hb.Pressure(); what != "" {
-		s.pressure.Store(&pressureSeen{at: time.Now(), what: what})
+		s.pressure.Store(&pressureSeen{at: now, what: what})
 	}
 }
 

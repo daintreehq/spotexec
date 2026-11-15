@@ -16,6 +16,9 @@
 //     reporting memory pressure, then goes silent (a VM out of memory);
 //   - rpc-heartbeat: after the handshake the helper sends only heartbeats
 //     and never answers (alive, but slow);
+//   - rpc-memory: after the handshake the helper sends one heartbeat per
+//     comma-separated value in the file, each that many MiB available of
+//     16000, then goes silent;
 //   - hold-fds: another process keeps the session's stdin, stdout and
 //     stderr open after the fake is killed, as a ControlMaster does for a
 //     stuck channel (its pid goes in hold-fds.pid; it exits within 30s).
@@ -187,6 +190,13 @@ func rpc() int {
 	}
 	if _, err := os.Stat(filepath.Join(st, "rpc-pressure")); err == nil {
 		_ = conn.Send(protocol.TypeHeartbeat, protocol.Heartbeat{MemTotalMB: 16000, MemAvailMB: 120})
+		time.Sleep(time.Hour) // until killed
+	}
+	if b, err := os.ReadFile(filepath.Join(st, "rpc-memory")); err == nil {
+		for _, v := range strings.Split(strings.TrimSpace(string(b)), ",") {
+			avail, _ := strconv.ParseInt(v, 10, 64)
+			_ = conn.Send(protocol.TypeHeartbeat, protocol.Heartbeat{MemTotalMB: 16000, MemAvailMB: avail})
+		}
 		time.Sleep(time.Hour) // until killed
 	}
 	if _, err := os.Stat(filepath.Join(st, "rpc-silent")); err == nil {
