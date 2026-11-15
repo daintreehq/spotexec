@@ -195,6 +195,9 @@ type ContainerRun struct {
 	Image   string   `json:"image"`             // local image reference to run
 	Options []string `json:"options,omitempty"` // extra `docker run` arguments
 	Root    bool     `json:"root,omitempty"`    // run as root instead of the runner user
+	// Network is "private" for a network namespace of the run's own
+	// (Docker's default bridge); anything else is the runner's (host).
+	Network string `json:"network,omitempty"`
 }
 
 // RegistryAuth is a short-lived login for the image registry (ECR).

@@ -223,6 +223,7 @@ type Container struct {
 	Dockerfile string   `toml:"dockerfile"` // or build this Dockerfile (repo-relative)
 	Context    string   `toml:"context"`    // build context (default: the Dockerfile's directory)
 	Options    []string `toml:"options"`    // extra `docker run` arguments
+	Network    string   `toml:"network"`    // "host" (default: the runner's network) or "private" (a network of its own per run)
 	User       string   `toml:"user"`       // "runner" (default: files stay owned by the runner user) or "root"
 	Timeout    Duration `toml:"timeout"`    // pull/build limit (default 20m)
 }
@@ -759,6 +760,9 @@ func (p *Project) validate() error {
 	}
 	if p.Container.User != "" && p.Container.User != "runner" && p.Container.User != "root" {
 		return errors.New(`container.user must be "runner" or "root"`)
+	}
+	if !oneOf(p.Container.Network, "", "host", "private") {
+		return fmt.Errorf(`container.network must be "host" or "private" (got %q)`, p.Container.Network)
 	}
 	if p.Deps.Install != "" && len(p.Deps.CacheDirs) == 0 {
 		return errors.New("deps.install requires deps.cache_dirs")
