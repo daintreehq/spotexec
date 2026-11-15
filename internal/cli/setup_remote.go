@@ -283,6 +283,20 @@ func compareVersions(a, b string) (cmp int, ok bool) {
 	return 0, true
 }
 
+// localCopyNoNewer reports whether a spotexec reporting version v is known
+// to be no newer than release want. A modified build ("-dirty", as an
+// earlier `--install copy` can leave) is placed by the commit it was built
+// from: it counts only when that commit is older than the release, since
+// its changes could be newer than the release itself.
+func localCopyNoNewer(v, want string) bool {
+	if base, dirty := strings.CutSuffix(v, "-dirty"); dirty {
+		c, ok := compareVersions(base, want)
+		return ok && c < 0
+	}
+	c, ok := compareVersions(v, want)
+	return ok && c <= 0
+}
+
 // parseVersion reads X.Y.Z, with `git describe`'s "-N-gHASH" as a fourth
 // part.
 func parseVersion(v string) ([4]int, bool) {
@@ -374,11 +388,12 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 		// ~/.local/bin would shadow it, unless that one is newer still.
 		old, _ := r.run(ctx, `f="$HOME/.local/bin/spotexec"; if [ -f "$f" ]; then echo present; "$f" version 2>/dev/null | head -n 1; fi`, nil)
 		if strings.HasPrefix(old, "present") {
-			// Only one known to be no newer goes.
+			// Only one known to be no newer goes, with the sx link setup
+			// made beside it (never another sx).
 			v := versionOf(old)
-			if c, ok := compareVersions(v, got); !ok || c > 0 {
-				r.printf("  kept spotexec %s in ~/.local/bin (not older than Homebrew's)\n", orDash(v))
-			} else if _, err := r.run(ctx, `rm -f "$HOME/.local/bin/spotexec"; if [ -L "$HOME/.local/bin/sx" ]; then rm -f "$HOME/.local/bin/sx"; fi`, nil); err == nil {
+			if !localCopyNoNewer(v, got) {
+				r.printf("  kept spotexec %s in ~/.local/bin (not known to be older than Homebrew's)\n", orDash(v))
+			} else if _, err := r.run(ctx, `d="$HOME/.local/bin"; rm -f "$d/spotexec"; if [ -L "$d/sx" ] && [ "$(readlink "$d/sx")" = spotexec ]; then rm -f "$d/sx"; fi`, nil); err == nil {
 				r.printf("  removed an older spotexec from ~/.local/bin\n")
 			}
 		}
