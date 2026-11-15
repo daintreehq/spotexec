@@ -273,7 +273,8 @@ func (s *Session) watchdog() {
 	base := s.Limit()
 	t := time.NewTicker(min(5*time.Second, base/4))
 	defer t.Stop()
-	asked := false // onSilent was asked about the current silence
+	asked := false    // onSilent was asked about the current silence
+	var askedAt int64 // s.seen when it was
 	for {
 		select {
 		case <-s.done:
@@ -281,22 +282,21 @@ func (s *Session) watchdog() {
 		case <-s.closing:
 			return
 		case <-t.C:
+			// The helper sent something since onSilent was asked: that
+			// silence is over. Drop its grace, so a later one is noticed
+			// as quickly as the first, and ask afresh then.
+			if asked && s.seen.Load() != askedAt {
+				s.limit.Store(int64(base))
+				asked = false
+			}
 			silent := time.Since(s.LastSeen())
 			if silent <= s.Limit() {
-				// Silence within the plain limit, once onSilent was asked,
-				// means the helper spoke since (asked only past base): drop
-				// any grace, so a later death is noticed as quickly as the
-				// first, and ask again next time.
-				if asked && silent <= base {
-					s.limit.Store(int64(base))
-					asked = false
-				}
 				continue
 			}
 			if f := s.onSilent.Load(); f != nil && !asked {
-				asked = true
+				asked, askedAt = true, s.seen.Load()
 				if grace := (*f)(silent); grace > 0 {
-					s.limit.Add(int64(grace))
+					s.limit.Store(int64(base + grace))
 					continue
 				}
 				if time.Since(s.LastSeen()) <= s.Limit() {

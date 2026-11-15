@@ -87,24 +87,36 @@ func TestWhyNoReplay(t *testing.T) {
 func TestHelperShutdownIsANotice(t *testing.T) {
 	r, f := testFleet()
 	shutdown := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeShutdown, Message: "the runner is shutting down"}}
-	// As runOnce returns it: wrapped, from pumpExec.
-	err := &InfraError{Err: fmt.Errorf("lost runner aws during execution: %w", shutdown)}
-	if !helperShutdown(err) {
-		t.Fatalf("a wrapped shutdown error not recognised: %v", err)
-	}
-	other := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "x"}}
-	for _, e := range []error{nil, other, errors.New("connection reset"), io.EOF} {
-		if helperShutdown(e) {
-			t.Errorf("%v counted as a helper-reported shutdown", e)
+	lease := &Lease{Runner: r, Provider: f, InstanceID: "i-run"}
+	// Both shapes, as runOnce returns them: the helper's error from
+	// pumpExec, and a result the shutdown killed (execShutdown).
+	for name, c := range map[string]struct {
+		err  error
+		lost string
+	}{
+		"helper error":  {&InfraError{Err: fmt.Errorf("lost runner aws during execution: %w", shutdown)}, lostRunner(lease, shutdown)},
+		"killed result": {infra(&shutdownError{"aws#1", 143}), shutdownRunner(lease)},
+	} {
+		if !vmShutdown(c.err) {
+			t.Fatalf("%s: %v not recognised as a shutdown", name, c.err)
+		}
+		res := Result{noReplay: whyNoReplay(lease, vmShutdown(c.err))}
+		if res.noReplay.code != "" {
+			t.Fatalf("%s: a shutdown on a running VM withheld the replay: %q (%q)", name, res.noReplay.code, res.noReplay.why)
+		}
+		if retry, code, why := replayable(c.lost, res, Options{RetryPreempt: true, Sync: "auto"}, false, 1); !retry {
+			t.Fatalf("%s: not replayed: %q (%q)", name, code, why)
 		}
 	}
-	lease := &Lease{Runner: r, Provider: f, InstanceID: "i-run"}
-	if got := whyNoReplay(lease, helperShutdown(err)); got.code != "" {
-		t.Fatalf("a helper-reported shutdown on a running VM withheld the replay: %q (%q)", got.code, got.why)
+	// Anything else lost on a running VM still isn't replayed.
+	other := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "x"}}
+	for _, e := range []error{nil, other, errors.New("connection reset"), io.EOF} {
+		if vmShutdown(e) {
+			t.Errorf("%v counted as a shutdown", e)
+		}
 	}
-	res := Result{noReplay: whyNoReplay(lease, helperShutdown(err))}
-	if retry, code, why := replayable(lostRunner(lease, err), res, Options{RetryPreempt: true, Sync: "auto"}, false, 1); !retry {
-		t.Fatalf("not replayed: %q (%q)", code, why)
+	if got := whyNoReplay(lease, vmShutdown(io.EOF)); got.code != "RUNNER_UNRESPONSIVE" {
+		t.Fatalf("a dropped connection on a running VM: %q, want RUNNER_UNRESPONSIVE", got.code)
 	}
 }
 

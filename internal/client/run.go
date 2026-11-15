@@ -178,8 +178,9 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 }
 
 // replayable decides whether an attempt that lost its runner (lost, from
-// lostRunner) is replayed on another slot. why is set when the runner was
-// out of memory when it was lost: that run is never replayed, since a run
+// lostRunner) is replayed on another slot. why is set when whyNoReplay
+// withheld the replay (the runner was out of memory, or still running with
+// no notice it was going away): that run is never replayed, since a run
 // that used up its VM's memory would most likely do the same on the next
 // one, and take that VM's other jobs with it.
 func replayable(lost string, res Result, o Options, canceled bool, n int) (retry bool, code, why string) {
@@ -203,9 +204,10 @@ func replayable(lost string, res Result, o Options, canceled bool, n int) (retry
 // next one, and take that VM's other jobs with it), or the VM is still
 // running and gave no Spot notice, so whatever stopped it answering came
 // from inside, quite possibly from this run. A VM that announced it was
-// going away (a Spot notice, or its helper reporting the shutdown) is
-// replayed whatever its memory looked like: the cloud took it, not the
-// run. A VM that is gone is replayed too, unless it was out of memory.
+// going away (a Spot notice, or its helper reporting the shutdown, as at
+// max_lifetime) is replayed whatever its memory looked like: it was going
+// down whatever the run did. A VM that is gone is replayed too, unless it
+// was out of memory.
 func whyNoReplay(lease *Lease, noticed bool) noReplay {
 	if noticed {
 		return noReplay{}
@@ -217,6 +219,24 @@ func whyNoReplay(lease *Lease, noticed bool) noReplay {
 		return noReplay{"RUNNER_UNRESPONSIVE", "although EC2 still reports it running, without a Spot notice: the run may be what overloaded it (memory, most often), and the attempt's outcome is unknown. Rerun it, with --exclusive if it may need the whole VM"}
 	}
 	return noReplay{}
+}
+
+// shutdownError is an attempt whose command the VM's shutdown killed.
+type shutdownError struct {
+	label string
+	code  int
+}
+
+func (e *shutdownError) Error() string {
+	return fmt.Sprintf("%s shut down while the command ran (it was stopped with exit %d); nothing was written back", e.label, e.code)
+}
+
+// vmShutdown reports whether err says the VM began shutting down under the
+// attempt: the helper's RUNNER_SHUTTING_DOWN error, or a result the
+// shutdown killed (shutdownError).
+func vmShutdown(err error) bool {
+	var se *shutdownError
+	return errors.As(err, &se) || helperShutdown(err)
 }
 
 // helperShutdown reports whether err is the helper saying the VM began
@@ -336,12 +356,12 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if lease.InstanceID != "" {
 		lease.Sess.SetOnSilent(waitIfRunning(lease, o.Rep))
 	}
-	// A reclamation notice arrived, or the helper reported the VM shutting
-	// down under the command: either way the VM announced it was going away.
-	var noticed atomic.Bool
+	var noticed atomic.Bool // a reclamation notice arrived
 	defer func() {
 		if lost != "" && lease.InstanceID != "" {
-			res.noReplay = whyNoReplay(lease, noticed.Load() || helperShutdown(err))
+			// A shutdown the helper reported counts as the VM's notice: EC2
+			// still reports a VM running while its OS halts.
+			res.noReplay = whyNoReplay(lease, noticed.Load() || vmShutdown(err))
 		}
 	}()
 	// Before the command starts, Ctrl-C aborts the session outright (a
@@ -547,10 +567,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		// Killed by the VM shutting down (a Spot reclaim): like a lost
 		// runner, nothing from this attempt is written back, and on a Spot
 		// runner the run is replayed (unless the user interrupted it: then
-		// the CLI exits 130). EC2 still reports a VM running while its OS
-		// halts, so this counts as the VM's own notice.
-		noticed.Store(true)
-		return res, infra(fmt.Errorf("%s shut down while the command ran (it was stopped with exit %d); nothing was written back", label, result.ExitCode)), shutdownRunner(lease)
+		// the CLI exits 130).
+		return res, infra(&shutdownError{label, result.ExitCode}), shutdownRunner(lease)
 	}
 	checkCanceled()
 	// Post-exec work uses its own bounded context: an interrupt that already

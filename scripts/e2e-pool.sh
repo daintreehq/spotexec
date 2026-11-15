@@ -140,6 +140,20 @@ kill $IP 2>/dev/null; docker rm -f "$ID" >/dev/null 2>&1
 check "killed run replayed and succeeded on attempt 2" "[ $code = 0 ] && grep -q 'finished attempt=2' $WORK/k.out && grep -q RUNNER_LOST $WORK/k.err"
 check "nothing from the killed attempt was written back" "test ! -e partial.txt"
 
+echo "== the VM's shutdown kills the command with no Spot notice (max_lifetime): replayed"
+"$SX" --json 'if [ "$SPOTEXEC_ATTEMPT" = 1 ]; then sleep 60; fi # halt-marker
+echo finished attempt=$SPOTEXEC_ATTEMPT' >"$WORK/h.out" 2>"$WORK/h.err" &
+P=$!
+for _ in $(seq 1 40); do grep -q '"exec"' "$WORK/h.err" 2>/dev/null && break; sleep 0.5; done
+sleep 1
+ID=$(grep '"placed"' "$WORK/h.err" | sed 's/.*instance_id":"\([^"]*\)".*/\1/' | tail -1)
+# The OS halts while the cloud still reports the VM running.
+docker exec "$ID" sh -c 'touch /var/tmp/spotexec/sim/stopping; pkill -TERM -f halt-marker'
+wait $P; code=$?
+docker rm -f "$ID" >/dev/null 2>&1
+check "no notice reached the client" "! grep -q spot_interruption $WORK/h.err"
+check "halted run replayed and succeeded on attempt 2" "[ $code = 0 ] && grep -q 'finished attempt=2' $WORK/h.out && grep -q RUNNER_LOST $WORK/h.err && ! grep -q RUNNER_UNRESPONSIVE $WORK/h.err"
+
 echo "== rebalance recommendation is advisory (real EC2 sends it at boot)"
 "$SX" -q true
 ID=$(docker ps --filter "label=spotexec-runner=$RUNNER" --format '{{.Names}}' | head -1)

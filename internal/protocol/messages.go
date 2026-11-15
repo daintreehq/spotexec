@@ -301,8 +301,8 @@ type Result struct {
 	SnapshotMS int64    `json:"snapshot_ms"`
 	StartError string   `json:"start_error,omitempty"`
 	// OOMKilled: the kernel's OOM killer killed a process in the command's
-	// container, for a memory limit on it or on the memory pool it ran in
-	// (Docker's oom event).
+	// container, for a memory limit on it or on the memory pool it ran in,
+	// or for the whole machine running out (Docker's oom event).
 	OOMKilled bool `json:"oom_killed,omitempty"`
 	// MemoryLimitMB is the cap of the memory pool the container ran in
 	// (MiB), or 0 when it ran outside it.
