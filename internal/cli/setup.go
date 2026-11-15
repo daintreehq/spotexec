@@ -131,7 +131,9 @@ and keeps a working key. --rotate replaces the key.
 						fmt.Printf("  %s launches in %s; regions without a default VPC or Spot quota are skipped automatically\n", r.Name, provider.RunnerWhere(r))
 						// Its quota matters where launches will go first,
 						// as `spotexec doctor` checks it.
-						top, err := provider.LaunchRegionsWith(cmd.Context(), r, adminProfile)
+						ctx, cancel := context.WithTimeout(cmd.Context(), launchRegionsTimeout)
+						top, err := provider.LaunchRegionsWith(ctx, r, adminProfile, adminFromEnv)
+						cancel()
 						if err != nil {
 							fmt.Printf("  couldn't rank %s's regions by Spot price (%s), so its Spot quota isn't checked here; `spotexec doctor` checks it\n", r.Name, firstLine(err.Error()))
 						}
@@ -949,3 +951,7 @@ func revokeMachine(ctx context.Context, adminProfile, target string, yes bool) e
 	}
 	return nil
 }
+
+// launchRegionsTimeout bounds setup's ranking of an any-region runner's
+// regions by Spot price: it only picks where to check the quota.
+const launchRegionsTimeout = time.Minute

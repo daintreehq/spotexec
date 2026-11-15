@@ -1131,3 +1131,17 @@ func TestGlobalLaunchRegions(t *testing.T) {
 		t.Fatalf("where %q", w)
 	}
 }
+
+// Setup run from another machine ranks with only the session it passed,
+// never this machine's own AWS login.
+func TestLaunchRegionsWithEnvOnly(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	r := &config.Runner{Name: "g", Type: config.TypeAWSSpot, Regions: []string{config.AllRegions}, Region: "us-east-1",
+		InstanceTypes: []string{"c7a.2xlarge"}, Arch: "amd64", User: "ubuntu", VolumeGB: 64, SSHCIDR: "0.0.0.0/0", MaxInstances: 1,
+		MaxLifetime: config.Duration{Duration: time.Hour}, BootTimeout: config.Duration{Duration: time.Minute}, IdleTimeout: config.Duration{Duration: time.Minute}}
+	if _, err := LaunchRegionsWith(context.Background(), r, "", true); !errors.Is(err, errNoPassedSession) {
+		t.Fatalf("err %v", err)
+	}
+}

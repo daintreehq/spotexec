@@ -1771,16 +1771,19 @@ func (g *AWSGlobal) LaunchRegions(ctx context.Context) ([]string, error) {
 }
 
 // LaunchRegionsWith is LaunchRegions for a multi-region runner, read with
-// profile's credentials (setup's admin session, before the runner has
-// its own; "" is the default chain).
-func LaunchRegionsWith(ctx context.Context, r *config.Runner, profile string) ([]string, error) {
+// setup's admin session before the runner has a key of its own: profile
+// ("" is the default chain), or with envOnly only the AWS_* variables
+// passed from the machine running setup.
+func LaunchRegionsWith(ctx context.Context, r *config.Runner, profile string, envOnly bool) ([]string, error) {
 	c := *r
 	c.Profile = profile
 	p, err := NewAWSGlobal(&c)
 	if err != nil {
 		return nil, err
 	}
-	return p.(*AWSGlobal).LaunchRegions(ctx)
+	g := p.(*AWSGlobal)
+	g.creds = &awsCredResolver{profile: profile, envOnly: envOnly}
+	return g.LaunchRegions(ctx)
 }
 
 // priceCheck is doctor's finding on where a single-region runner's next
