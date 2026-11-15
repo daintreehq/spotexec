@@ -45,6 +45,7 @@ type runFlags struct {
 	priority      int
 	prioritySet   bool // --priority or SPOTEXEC_PRIORITY given (0 included)
 	sameSlot      bool
+	group         bool
 	fs            *pflag.FlagSet // to tell explicit flags from defaults
 }
 
@@ -71,6 +72,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.BoolVar(&f.noRetry, "no-retry", false, "do not replay the run if its runner is lost (spot reclaim)")
 	fs.IntVar(&f.priority, "priority", 0, "queue priority when every slot is busy (higher runs first)")
 	fs.BoolVarP(&f.sameSlot, "same-slot", "s", false, "run in the slot (same VM) this worktree last used, waiting if it's busy; with --sync none, skip the sync")
+	fs.BoolVar(&f.group, "group", false, "parallel and sharded tasks: print each part's output as one block when it finishes (default with SPOTEXEC_AGENT=1 when stdout isn't a terminal)")
 }
 
 func (f *runFlags) reporter() (ui.Reporter, error) {
@@ -142,6 +144,19 @@ func (f *runFlags) validate() error {
 		return fmt.Errorf("--writeback must be always, on-success or never (got %q)", f.writeback)
 	}
 	return nil
+}
+
+// grouped reports whether the parts of fan-out task t print their output as
+// one block each: --group or --group=false, else the task's group setting,
+// else agent (SPOTEXEC_AGENT=1 with stdout not a terminal).
+func (f *runFlags) grouped(t *config.Task, agent bool) bool {
+	switch {
+	case f.changed("group"):
+		return f.group
+	case t.Group != nil:
+		return *t.Group
+	}
+	return agent
 }
 
 // changed reports whether a flag was given on the command line (explicit
@@ -611,8 +626,11 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		fmt.Fprintln(os.Stderr, "spotexec:", err)
 		return client.ExitInfra
 	}
+	group := f.grouped(t, os.Getenv("SPOTEXEC_AGENT") == "1" && !ui.IsTerminal(os.Stdout))
 	ctx, intr, stop := signals()
 	defer stop()
+	// mu guards the parts' bookkeeping and everything they print, so a
+	// grouped part's block, error and summary go out with nothing between.
 	var mu sync.Mutex
 	outs := make([]partOutcome, len(parts))
 	// Each part gets its own context, so fail_fast can stop siblings that
@@ -647,9 +665,17 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		wg.Add(1)
 		go func(i int, part taskPart) {
 			defer wg.Done()
-			sr := &taskReporter{Reporter: rep, task: part.name, shard: part.shard, shards: part.shards}
+			sr := &taskReporter{Reporter: rep, task: part.name, shard: part.shard, shards: part.shards, mu: &mu}
 			prefix := fmt.Sprintf("[%s] ", part.label)
-			o := f.options(l, part.spec(l), sr, intrs[i], ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu))
+			var grp *ui.Group
+			var stdout, stderr io.Writer
+			if group {
+				grp = ui.NewGroup(os.Stdout, os.Stderr, prefix, &mu)
+				stdout, stderr = grp.Stdout(), grp.Stderr()
+			} else {
+				stdout, stderr = ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu)
+			}
+			o := f.options(l, part.spec(l), sr, intrs[i], stdout, stderr)
 			// Parts race to sync: which one saves the last-run record is
 			// decided below, once they are all done.
 			o.DeferLastRun = true
@@ -686,30 +712,45 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 				out.status = partFailed
 			}
 			outs[i], done[i], records[i] = out, true, res.LastRun
-			if stopped[i] {
-				// Cancelled by fail_fast: not a failure of its own.
-				mu.Unlock()
-				return
-			}
-			if err != nil {
-				sr.Event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
-				if !rep.IsJSON() {
-					fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
-					depsDetail(os.Stderr, prefix, err)
-				}
-			}
-			summary := fmt.Sprintf("%s · %s%s", part.label, ui.Dur(out.took), out.where())
-			if res.DepsInstalled > 0 {
-				summary += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(res.DepsInstalled))
-			}
-			if code != 0 {
-				summary += fmt.Sprintf(" · exit %d", code)
-			}
-			sr.PartDone(summary, code == 0)
+			// Cancelled by fail_fast: not a failure of its own, so its
+			// output is printed but not its error or summary.
+			wasStopped := stopped[i]
 			mu.Unlock()
+			// report runs with mu held.
+			report := func() {
+				if wasStopped {
+					return
+				}
+				if err != nil {
+					sr.event("error", map[string]any{"code": "SPOTEXEC_ERROR", "message": err.Error()})
+					if !rep.IsJSON() {
+						fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
+						depsDetail(os.Stderr, prefix, err)
+					}
+				}
+				summary := fmt.Sprintf("%s · %s%s", part.label, ui.Dur(out.took), out.where())
+				if res.DepsInstalled > 0 {
+					summary += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(res.DepsInstalled))
+				}
+				if code != 0 {
+					summary += fmt.Sprintf(" · exit %d", code)
+				}
+				sr.Reporter.PartDone(summary, code == 0)
+			}
+			// The siblings stop before this part's (possibly long) block
+			// is printed.
+			defer func() {
+				if grp == nil {
+					mu.Lock()
+					report()
+					mu.Unlock()
+				} else if ferr := grp.Flush(report); ferr != nil {
+					sr.Warn("OUTPUT_GROUP", "%s: couldn't hold its output to print as one block (%v), so some of it was printed as it came", part.label, ferr)
+				}
+			}()
 			// After an interrupt every part is already stopping, and is
 			// interrupted rather than stopped by fail_fast.
-			if code != 0 && t.FailFast && ctx.Err() == nil {
+			if code != 0 && t.FailFast && !wasStopped && ctx.Err() == nil {
 				failOnce.Do(func() {
 					for j, c := range intrs {
 						mu.Lock()
@@ -784,14 +825,29 @@ func buildTaskLine(l *loaded, run string, args []string) string {
 }
 
 // taskReporter tags events with the task name (and a shard's number) and
-// suppresses the spinner (several tasks share one terminal).
+// suppresses the spinner (several tasks share one terminal). It takes the
+// fan-out's output lock, so no event or warning lands inside a part's block.
 type taskReporter struct {
 	ui.Reporter
 	task          string
 	shard, shards int
+	mu            *sync.Mutex
 }
 
 func (t *taskReporter) Event(name string, fields map[string]any) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.event(name, fields)
+}
+
+func (t *taskReporter) Warn(code, format string, args ...any) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Reporter.Warn(code, format, args...)
+}
+
+// event is Event for a caller already holding the lock.
+func (t *taskReporter) event(name string, fields map[string]any) {
 	m := map[string]any{"task": t.task}
 	if t.shards > 0 {
 		m["shard"], m["shards"] = t.shard, t.shards

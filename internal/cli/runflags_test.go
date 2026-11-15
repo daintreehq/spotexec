@@ -298,3 +298,24 @@ func TestSxRunsTasksNamedLikeSubcommands(t *testing.T) {
 		t.Errorf("sx status x: exit %d, stderr %q", code, stderr)
 	}
 }
+
+func TestGroupedOutputPrecedence(t *testing.T) {
+	yes, no := true, false
+	for _, c := range []struct {
+		args  []string
+		task  *bool
+		agent bool
+		want  bool
+	}{
+		{nil, nil, false, false}, // live output by default
+		{nil, nil, true, true},   // agents get blocks
+		{nil, &no, true, false},  // the task's setting beats the agent default
+		{nil, &yes, false, true}, //
+		{[]string{"--group"}, &no, false, true},
+		{[]string{"--group=false"}, &yes, true, false}, // the flag beats both
+	} {
+		if got := parsed(t, c.args...).grouped(&config.Task{Group: c.task}, c.agent); got != c.want {
+			t.Errorf("%v task=%v agent=%v: got %v", c.args, c.task, c.agent, got)
+		}
+	}
+}

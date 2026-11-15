@@ -294,6 +294,34 @@ run = "eslint ."
 	}
 }
 
+func TestTaskGroup(t *testing.T) {
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	toml := "[tasks.a]\nrun = \"x\"\nshards = 2\ngroup = true\n[tasks.b]\nrun = \"y\"\ngroup = false\n[tasks.c]\nparallel = [\"a\", \"b\"]\n"
+	if err := os.WriteFile(pp, []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unset stays unset, so --group and the agent default can decide.
+	if g := p.Tasks["a"].Group; g == nil || !*g {
+		t.Errorf("a: %v", g)
+	}
+	if g := p.Tasks["b"].Group; g == nil || *g {
+		t.Errorf("b: %v", g)
+	}
+	if g := p.Tasks["c"].Group; g != nil {
+		t.Errorf("c: %v", *g)
+	}
+	if err := os.WriteFile(pp, []byte("[tasks.a]\nrun = \"x\"\ngroup = \"yes\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadProject(pp); err == nil {
+		t.Error("group = \"yes\" loaded")
+	}
+}
+
 func TestDepsLockfilePatternsValidated(t *testing.T) {
 	for lockfiles, ok := range map[string]bool{
 		`["package-lock.json"]`:                                   true,

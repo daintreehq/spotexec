@@ -15,6 +15,8 @@ sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
 
 Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)).
 
+The parts of a [parallel or sharded task](configuration.md#tasks) run at once. With `SPOTEXEC_AGENT=1` and stdout not a terminal, each part's output is held and printed as one block when the part finishes, still prefixed `[test-all 3/8]`, so one shard's failure reads in one place instead of spread across the interleaved lines of every shard. `sx --group=false <task>` keeps the live output.
+
 A parallel or sharded task prints a line as each part finishes, and ends with a summary of the whole run: every part with its outcome (`failed`, `interrupted`, `stopped (fail_fast)` or `passed`), failed parts first, then a last line with the overall result, the parts that failed, the wall time and the combined exit code:
 
 ```console

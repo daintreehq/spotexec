@@ -209,6 +209,9 @@ type Task struct {
 	// Setup = false skips [setup] for this task (for a parallel task, for
 	// every task it runs).
 	Setup *bool `toml:"setup"`
+	// Group prints each part of a parallel or sharded task as one block when
+	// it finishes; nil leaves it to --group and the agent default.
+	Group *bool `toml:"group"`
 }
 
 // SkipsSetup reports whether the task opts out of [setup].

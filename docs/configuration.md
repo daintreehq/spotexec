@@ -211,6 +211,7 @@ Ignored outputs from earlier runs stay in a slot, so a setup that builds into `d
 | `parallel` | Names of other (non-parallel) tasks to run at once, each in its own slot. A sharded task named here fans out into its shards. Extra arguments are not forwarded. |
 | `shards` | Run a `run` task as this many parts at once (1 to 64), each in its own slot, like a parallel task's parts. In the command, `{shard}` becomes the part's number (from 1) and `{shards}` the count; each part also gets `SPOTEXEC_SHARD` and `SPOTEXEC_SHARDS`. Extra arguments go to every shard. |
 | `fail_fast` | Stop the remaining parts of a parallel or sharded task when one fails. In a parallel task, its own setting covers every part, shards included. |
+| `group` | `true` holds each part's output and prints it as one block, still prefixed, when the part finishes, instead of interleaving every part's lines as they come; `false` keeps the live output. Unset, it follows `--group`, which is on by default for agents (`SPOTEXEC_AGENT=1` with stdout not a terminal). In a parallel task, its own setting covers every part. |
 | `timeout`, `sync`, `exclusive` | Per-task overrides of the run flags. |
 | `pool`, `priority` | Send this task to a different fleet, or move it ahead in the queue. |
 | `setup` | `false` skips the project's [`[setup]`](#setup) for this task (on a parallel task, for each of its parts). |

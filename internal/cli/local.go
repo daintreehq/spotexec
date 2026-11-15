@@ -63,7 +63,7 @@ func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Opt
 		r := runLocalProc(ctx, intr, run, l.ws.Root, env, out, out, timeout, grace)
 		switch {
 		case r.err != nil:
-			fmt.Fprintf(os.Stderr, "spotexec: running [setup] locally: %v\n", r.err)
+			fmt.Fprintf(stderrOf(o), "spotexec: running [setup] locally: %v\n", r.err)
 			return client.ExitInfra
 		case r.canceled:
 			return client.ExitInterrupted
@@ -83,7 +83,7 @@ func runLocal(ctx context.Context, intr <-chan struct{}, l *loaded, o client.Opt
 	r := runLocalProc(ctx, intr, o.Command, filepath.Join(l.ws.Root, filepath.FromSlash(l.ws.Cwd)), env, o.Stdout, o.Stderr, o.Timeout, grace)
 	switch {
 	case r.err != nil:
-		fmt.Fprintf(os.Stderr, "spotexec: running locally: %v\n", r.err)
+		fmt.Fprintf(stderrOf(o), "spotexec: running locally: %v\n", r.err)
 		return client.ExitInfra
 	case r.timedOut:
 		rep.Warn("TIMEOUT", "command exceeded %s and was terminated (raise with --timeout)", o.Timeout)
