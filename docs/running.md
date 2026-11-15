@@ -116,6 +116,7 @@ The manifest records the Git blob ID of every synced file: the **baseline**. Aft
 | Equals the remote result | Nothing to do. |
 | Equals the baseline | The remote version is applied atomically (temp file, then rename). Your file keeps its permissions; only an executable-bit change made remotely comes back. |
 | Anything else | You edited it during the run. **Your file is kept**, the remote version is saved to `<git-dir>/spotexec/conflicts/<run-id>/<path>`, and a `SYNC_CONFLICT` warning gives a ready-to-run `git diff --no-index` command comparing your file with the remote version. With `--json`, a `conflict` event carries both paths and that command. |
+| Another path of the run's file | Two remote names are one file here: the filesystem ignores case or Unicode normalisation (macOS does by default), so `src/Dup.txt` opens `src/DUP.txt`. The file under the local name is kept, the other remote version is saved to the same conflicts directory, and a `SYNC_COLLISION` warning names both paths, says which version was kept, and gives the same `git diff --no-index` command. Its `conflict` event carries the other path as `with`. |
 
 The summary line counts the conflicts (`· 1 conflict`), and every `result` event carries `conflict_count` (a parallel or sharded task's also has each part's in `parts`). The exit status is still the command's own, since its other changes did land; with `--fail-on-conflict` a run that would have exited `0` exits `122` instead. A conflict never rolls back what was applied.
 
