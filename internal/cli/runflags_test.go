@@ -107,6 +107,48 @@ func TestFailOnConflictOptIn(t *testing.T) {
 	}
 }
 
+// Boolean variables take the usual spellings, in any case, and refuse
+// anything else rather than ignore it (#126).
+func TestBoolEnvSpellings(t *testing.T) {
+	vars := map[string]func(*runFlags) bool{
+		"SPOTEXEC_JSON":             func(f *runFlags) bool { return f.json },
+		"SPOTEXEC_SAME_SLOT":        func(f *runFlags) bool { return f.sameSlot },
+		"SPOTEXEC_FAIL_ON_CONFLICT": func(f *runFlags) bool { return f.failConflict },
+	}
+	flags := map[string]string{"SPOTEXEC_JSON": "--json=false", "SPOTEXEC_SAME_SLOT": "--same-slot=false", "SPOTEXEC_FAIL_ON_CONFLICT": "--fail-on-conflict=false"}
+	for name, get := range vars {
+		for k := range vars {
+			t.Setenv(k, "")
+		}
+		for v, want := range map[string]bool{"1": true, "true": true, "TRUE": true, "Yes": true, "yes": true, "0": false, "false": false, "False": false, "no": false, "NO": false, "": false} {
+			t.Setenv(name, v)
+			f := parsed(t)
+			if err := f.validate(); err != nil || get(f) != want {
+				t.Errorf("%s=%q: got %v (%v), want %v", name, v, get(f), err, want)
+			}
+		}
+		for _, v := range []string{"on", "2", "y", " true", "enable"} {
+			t.Setenv(name, v)
+			f := parsed(t)
+			if err := f.validate(); err == nil || !strings.Contains(err.Error(), name) || get(f) {
+				t.Errorf("%s=%q: got %v (%v), want refused", name, v, get(f), err)
+			}
+			// An explicit flag beats the variable, whatever its value.
+			if err := parsed(t, flags[name]).validate(); err != nil {
+				t.Errorf("%s with %s=%q: %v", flags[name], name, v, err)
+			}
+		}
+		t.Setenv(name, "")
+	}
+	// Any output flag beats SPOTEXEC_JSON.
+	t.Setenv("SPOTEXEC_JSON", "on")
+	for _, flag := range []string{"--pretty", "-q", "--json"} {
+		if err := parsed(t, flag).validate(); err != nil {
+			t.Errorf("%s with SPOTEXEC_JSON=on: %v", flag, err)
+		}
+	}
+}
+
 func TestSyncAndExecPinTheirSyncMode(t *testing.T) {
 	l := testLoaded()
 	t.Setenv("SPOTEXEC_SYNC", "none")
@@ -265,7 +307,7 @@ func TestBadRunValuesExit125BeforeAnyRunner(t *testing.T) {
 			t.Errorf("%s %v: exit %d, stderr %q", c.name, c.args, code, stderr)
 		}
 	}
-	for _, v := range []string{"SPOTEXEC_TIMEOUT", "SPOTEXEC_PRIORITY"} {
+	for _, v := range []string{"SPOTEXEC_TIMEOUT", "SPOTEXEC_PRIORITY", "SPOTEXEC_JSON", "SPOTEXEC_SAME_SLOT", "SPOTEXEC_FAIL_ON_CONFLICT"} {
 		t.Setenv(v, "abc")
 		for _, args := range [][]string{{"-C", dir, "true"}, {"-C", dir, "verify"}} {
 			if code, stderr := runMain(t, "sx", args...); code != client.ExitInfra || !strings.Contains(stderr, v) {

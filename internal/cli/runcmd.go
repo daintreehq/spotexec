@@ -135,14 +135,14 @@ func (f *runFlags) applyEnv() {
 			f.runner = v
 		}
 	}
-	if os.Getenv("SPOTEXEC_JSON") == "1" && !f.changed("json") && !f.changed("pretty") && !f.changed("quiet") {
-		f.json = true
+	if !f.changed("json") && !f.changed("pretty") && !f.changed("quiet") {
+		f.envSwitch("SPOTEXEC_JSON", &f.json)
 	}
-	if os.Getenv("SPOTEXEC_SAME_SLOT") == "1" && !f.changed("same-slot") {
-		f.sameSlot = true
+	if !f.changed("same-slot") {
+		f.envSwitch("SPOTEXEC_SAME_SLOT", &f.sameSlot)
 	}
-	if os.Getenv("SPOTEXEC_FAIL_ON_CONFLICT") == "1" && !f.changed("fail-on-conflict") {
-		f.failConflict = true
+	if !f.changed("fail-on-conflict") {
+		f.envSwitch("SPOTEXEC_FAIL_ON_CONFLICT", &f.failConflict)
 	}
 	if f.changed("priority") {
 		f.prioritySet = true
@@ -152,6 +152,35 @@ func (f *runFlags) applyEnv() {
 		} else if f.envErr == nil {
 			f.envErr = fmt.Errorf("SPOTEXEC_PRIORITY must be a whole number (got %q)", v)
 		}
+	}
+}
+
+// envSwitch turns on a flag not given on the command line when its boolean
+// variable says so; a value that isn't one is kept for validate to report.
+func (f *runFlags) envSwitch(name string, flag *bool) {
+	on, err := envBool(name)
+	if err != nil {
+		if f.envErr == nil {
+			f.envErr = err
+		}
+		return
+	}
+	if on {
+		*flag = true
+	}
+}
+
+// envBool reads a boolean SPOTEXEC_* variable: 1, true or yes, or 0, false
+// or no, in any case; unset or empty is false. Anything else is an error
+// naming the variable, never silently false.
+func envBool(name string) (bool, error) {
+	switch v := os.Getenv(name); strings.ToLower(v) {
+	case "", "0", "false", "no":
+		return false, nil
+	case "1", "true", "yes":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s must be 1, true or yes, or 0, false or no (got %q)", name, v)
 	}
 }
 

@@ -22,7 +22,7 @@ Exceptions to that order:
 - a task's own `pool` beats `SPOTEXEC_POOL`;
 - `spotexec sync` always syncs and `spotexec exec` never does, whatever `SPOTEXEC_SYNC` says.
 
-Unknown `--sync`, `--writeback` and `--writeback-over` values and a zero or negative `--timeout` (from flags or the environment), and a `SPOTEXEC_TIMEOUT` or `SPOTEXEC_PRIORITY` that doesn't parse (when its flag isn't given), are rejected with exit `125` before any runner is used: a malformed variable never falls back to the default.
+Unknown `--sync`, `--writeback` and `--writeback-over` values and a zero or negative `--timeout` (from flags or the environment), and a `SPOTEXEC_TIMEOUT` or `SPOTEXEC_PRIORITY` that doesn't parse (when its flag isn't given), are rejected with exit `125` before any runner is used: a malformed variable never falls back to the default. So is a boolean variable (`SPOTEXEC_SAME_SLOT`, `SPOTEXEC_FAIL_ON_CONFLICT`, `SPOTEXEC_JSON`) set to anything but `1`, `true` or `yes` (on) or `0`, `false` or `no` (off), in any case; unset or empty is off.
 
 ### Environment variables
 

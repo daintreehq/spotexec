@@ -311,6 +311,19 @@ func TestSupported(t *testing.T) {
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[container]\ndockerfile = \"Dockerfile\"\n")
 			return d
 		}, true},
+		{"container dockerfile, exec through SPOTEXEC_SAME_SLOT=True", sshRunner, func(t *testing.T) string {
+			t.Setenv("SPOTEXEC_SAME_SLOT", "True")
+			t.Setenv("SPOTEXEC_SYNC", "none")
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[container]\ndockerfile = \"Dockerfile\"\n")
+			return d
+		}, true},
+		{"SPOTEXEC_SAME_SLOT is not a boolean", sshRunner, func(t *testing.T) string {
+			t.Setenv("SPOTEXEC_SAME_SLOT", "on")
+			d := initRepo(t)
+			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n")
+			return d
+		}, false},
 		{"container image needs no local files", sshRunner, func(t *testing.T) string {
 			d := initRepo(t)
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[container]\nimage = \"alpine\"\n")
@@ -338,6 +351,7 @@ func TestSupported(t *testing.T) {
 		"project config from a newer spotexec":              "version = 2 isn't supported (supported: 1)",
 		"no project config":                                 "has no .spotexec.toml",
 		"pool names an unknown runner":                      "nope",
+		"SPOTEXEC_SAME_SLOT is not a boolean":               "SPOTEXEC_SAME_SLOT must be",
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

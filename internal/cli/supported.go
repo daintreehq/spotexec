@@ -108,6 +108,9 @@ func supported(ctx context.Context, dir string) error {
 	}
 	// SPOTEXEC_SAME_SLOT without a sync makes a plain sx exec, which reuses
 	// the image this worktree last built (runFlags.options).
-	sameSlot := os.Getenv("SPOTEXEC_SAME_SLOT") == "1"
+	sameSlot, err := envBool("SPOTEXEC_SAME_SLOT")
+	if err != nil {
+		return err
+	}
 	return client.Preflight(ctx, l.cfg.Project, l.ws, client.Options{Sync: mode, PreferLast: sameSlot && mode == "none"})
 }
