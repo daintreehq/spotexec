@@ -1485,6 +1485,7 @@ func fetchDeps(ctx context.Context, c rpc, onEvent func(protocol.Event), o Optio
 			o.Rep.Event("deps_wait", map[string]any{"key": req.CacheKey, "holder": h,
 				"message": "waiting for " + h + " to install the same dependencies, to restore them from the shared cache"})
 		},
+		sess: c,
 	}
 	shared, err = sh.run(ctx)
 	if shared.timedOut && err == nil {
@@ -2126,6 +2127,7 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			o.Rep.Event("image_wait", map[string]any{"tag": req.Tag, "holder": h,
 				"message": "waiting for " + h + " to build the same image, to pull it from the registry"})
 		},
+		sess: c,
 	}
 	shared, err = sh.run(ctx)
 	r.InstalledDocker = r.InstalledDocker || installed

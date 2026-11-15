@@ -31,7 +31,11 @@ type Session struct {
 	closing chan struct{} // closed by Close/Abort: stop delivering frames
 	stopped sync.Once
 	once    sync.Once
-	seen    atomic.Int64
+	lost    chan struct{} // closed when the session ends: silence or a closed channel
+	lostMu  sync.Once
+	born    time.Time    // seen counts from here, on the monotonic clock
+	seen    atomic.Int64 // when the helper last sent anything, as time since born (ns)
+	backed  atomic.Bool  // readLoop is blocked handing a frame to a full buffer
 	silent  atomic.Bool  // the watchdog gave up on the helper
 	limit   atomic.Int64 // SilenceLimit when the session opened, plus any current grace (ns)
 	// onSilent, if set, is asked whether to keep waiting when the helper
@@ -136,7 +140,7 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{})}
+	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now()}
 	cmd.Stderr = s.stderr
 	// A master holding a stuck channel keeps the stderr pipe open after the
 	// client is gone: don't let that hold up Wait (and so Dead) for long.
@@ -144,8 +148,8 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	s.Conn = protocol.NewConn(protocol.ProgressReader{R: stdout, OnRead: func() { s.seen.Store(time.Now().UnixNano()) }}, stdin)
-	s.seen.Store(time.Now().UnixNano())
+	s.Conn = protocol.NewConn(protocol.ProgressReader{R: stdout, OnRead: s.heard}, stdin)
+	s.heard()
 	go s.readLoop()
 	go s.heartbeat()
 	s.limit.Store(int64(SilenceLimit))
@@ -222,12 +226,18 @@ func (s *Session) exitCode() int {
 	return -1
 }
 
+// heard notes that the helper just sent something. Silence is measured on
+// the monotonic clock: a wall clock that jumps (NTP, a laptop waking) must
+// not make a helper look silent, or alive.
+func (s *Session) heard() { s.seen.Store(int64(time.Since(s.born))) }
+
 func (s *Session) readLoop() {
 	for {
 		f, err := s.Conn.ReadFrame()
-		s.seen.Store(time.Now().UnixNano())
+		s.heard()
 		if err != nil {
 			s.setErr(err)
+			s.lostMu.Do(func() { close(s.lost) })
 			close(s.frames)
 			_ = s.cmd.Wait()
 			close(s.done)
@@ -243,8 +253,21 @@ func (s *Session) readLoop() {
 		// keep reading to EOF so the ssh process is reaped and done closes.
 		select {
 		case s.frames <- f:
+			continue
+		case <-s.closing:
+			continue
+		default:
+		}
+		// The buffer is full: until we take this frame we read nothing, so
+		// the helper can't be heard (it blocks writing to us). That is not
+		// its silence: count it from when we listen again.
+		s.backed.Store(true)
+		select {
+		case s.frames <- f:
 		case <-s.closing:
 		}
+		s.heard()
+		s.backed.Store(false)
 	}
 }
 
@@ -307,6 +330,7 @@ func (s *Session) watchdog() {
 			}
 			s.setErr(fmt.Errorf("%w (nothing for %s)", errSilent, s.Limit()))
 			s.silent.Store(true)
+			s.lostMu.Do(func() { close(s.lost) })
 			s.Abort()
 			return
 		}
@@ -351,22 +375,26 @@ func (s *Session) Next(ctx context.Context) (protocol.Frame, error) {
 	select {
 	case f, ok := <-s.frames:
 		if !ok {
-			s.errMu.Lock()
-			err := s.err
-			s.errMu.Unlock()
-			if errors.Is(err, io.EOF) || err == nil {
-				err = io.ErrUnexpectedEOF
-			}
-			msg := "connection to runner lost"
-			if errors.Is(err, errSilent) {
-				msg = err.Error()
-			}
-			return protocol.Frame{}, &ConnError{Target: "helper", Msg: msg, Err: s.wrap(err)}
+			return protocol.Frame{}, s.lostErr()
 		}
 		return f, nil
 	case <-ctx.Done():
 		return protocol.Frame{}, ctx.Err()
 	}
+}
+
+func (s *Session) lostErr() error {
+	s.errMu.Lock()
+	err := s.err
+	s.errMu.Unlock()
+	if errors.Is(err, io.EOF) || err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	msg := "connection to runner lost"
+	if errors.Is(err, errSilent) {
+		msg = err.Error()
+	}
+	return &ConnError{Target: "helper", Msg: msg, Err: s.wrap(err)}
 }
 
 // RemoteError is a structured error reported by the helper.
@@ -453,9 +481,6 @@ func (s *Session) Dead() bool {
 	}
 }
 
-// LastSeen is when the helper last sent anything (heartbeats included).
-// While our own frame buffer is backed up (we're not reading fast enough,
-// e.g. output piped into a paused pager), the helper is evidently alive.
 // Limit is how long the session may currently hear nothing from the
 // helper before it is given up on.
 func (s *Session) Limit() time.Duration { return time.Duration(s.limit.Load()) }
@@ -518,12 +543,27 @@ func (s *Session) notePressure(env protocol.Envelope) {
 	}
 }
 
+// LastSeen is when the helper last sent anything (heartbeats included).
+// While the frame buffer is full (we're not reading fast enough, e.g.
+// output piped into a paused pager), nothing more can be read from the
+// helper, so it isn't held to its silence; once frames are taken again it
+// is, from then. Frames merely queued, with room for more, excuse nothing:
+// readLoop still hears the helper's heartbeats, or their absence.
 func (s *Session) LastSeen() time.Time {
-	if len(s.frames) >= cap(s.frames)/2 {
+	if s.backed.Load() {
 		return time.Now()
 	}
-	return time.Unix(0, s.seen.Load())
+	return s.born.Add(time.Duration(s.seen.Load()))
 }
+
+// Lost is closed once the session has ended, because the helper went
+// silent past its limit or the channel closed: a caller waiting on
+// something other than the session (a local lock) stops then, with
+// LostErr.
+func (s *Session) Lost() <-chan struct{} { return s.lost }
+
+// LostErr is the error the session's reads end with once it is lost.
+func (s *Session) LostErr() error { return s.lostErr() }
 
 // Close ends the session (releasing the remote slot). The deadline is armed
 // before any protocol write so a wedged channel cannot hang the caller.

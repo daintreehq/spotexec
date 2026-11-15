@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -98,5 +99,74 @@ func TestAcquireQueueDeadlineIsEnforcedLocally(t *testing.T) {
 	var re *transport.RemoteError
 	if !errors.As(err, &re) || re.Code != protocol.CodeQueueTimeout {
 		t.Fatalf("want a queue timeout, got %v", err)
+	}
+}
+
+// The same during the dependency step (#144), with and without the shared
+// cache: a helper that falls silent while the client checks the cache or
+// installs is given up on within the silence limit.
+func TestDepsFailsOnSilentHelper(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shared=%v", shared), func(t *testing.T) {
+			r, tgt := liveRunner(t, "rpc-silent")
+			ctx := fastShare(t)
+			req := protocol.Deps{Lockfiles: []string{"package-lock.json"}, Install: "npm ci", CacheDirs: []string{"node_modules"}}
+			if shared {
+				req = sharedDeps()
+			}
+			_, s, err := Connect(context.Background(), r, tgt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Abort()
+			done := make(chan error, 1)
+			go func() {
+				_, _, _, err := depsFetch(ctx, t, sessionRPC{s}, &recRep{}, req)
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if !transport.IsConnError(err) || !strings.Contains(err.Error(), "stopped responding") {
+					t.Fatalf("want a stopped-responding connection error, got %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("dependency step still waiting on a silent helper")
+			}
+		})
+	}
+}
+
+// A run waiting for another run to install the same dependencies waits on
+// a local lock, not its session: when its own helper falls silent meanwhile
+// it stops with that lost connection as soon as the session is given up
+// on (#144), not when the wait for the other run's install runs out.
+func TestDepsWaitEndsWhenItsHelperGoesSilent(t *testing.T) {
+	r, tgt := liveRunner(t, "rpc-deps-missing")
+	ctx := fastShare(t)
+	// Everything but the session first: its silence clock starts when it
+	// opens.
+	req := sharedDeps()
+	lock := shareLockFor("deps", stripQuery(req.CacheGet))
+	held, err := lock.take(ctx, lock.verdict(), "other#1", time.Minute, nil)
+	if err != nil || !held.lead {
+		t.Fatalf("holding the lock: %v", err)
+	}
+	defer held.release("")
+	rep := &recRep{}
+	_, s, err := Connect(context.Background(), r, tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Abort()
+	start := time.Now()
+	_, _, _, err = depsFetch(ctx, t, sessionRPC{s}, rep, req)
+	if !transport.IsConnError(err) || !strings.Contains(err.Error(), "stopped responding") {
+		t.Fatalf("want a stopped-responding connection error, got %v", err)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("took %s", took)
+	}
+	if rep.event("deps_wait") == nil {
+		t.Fatal("never waited for the other run: the test didn't reach the lock")
 	}
 }
