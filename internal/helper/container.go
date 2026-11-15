@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/daintreehq/spotexec/internal/dockerignore"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"os/user"
@@ -661,6 +662,17 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	if run.Root && s.state.GitOwned {
 		env = withSafeDirectory(env, s.workspace)
 	}
+	if run.Docker {
+		env = maps.Clone(env)
+		// The run's own socket, whatever the image's ENV says; with host
+		// networking, Testcontainers would otherwise look for the ports it
+		// maps at the VPC's gateway rather than on this machine.
+		for k, v := range map[string]string{"DOCKER_HOST": "unix:///var/run/docker.sock", "TESTCONTAINERS_HOST_OVERRIDE": "localhost"} {
+			if _, set := env[k]; !set {
+				env[k] = v
+			}
+		}
+	}
 	var envb strings.Builder
 	var multi []string
 	keys := make([]string, 0, len(env))
@@ -701,6 +713,25 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		"--env-file", envPath,
 		"-w", dir, "--entrypoint", "/bin/sh",
 	)
+	var proxy *dockerProxy
+	if run.Docker {
+		// Cleared once what the run started is removed: if the run is
+		// aborted first, the slot's next holder does it.
+		if err := os.WriteFile(filepath.Join(s.slotDir, dockerRunMarker), nil, 0o644); err != nil {
+			os.Remove(scriptPath)
+			os.Remove(envPath)
+			return "", nil, nil, err
+		}
+		proxy, err = startDockerProxy(d, s.workspace, map[string]string{labelSlot: s.containerPrefix(), labelRun: name})
+		if err != nil {
+			os.Remove(scriptPath)
+			os.Remove(envPath)
+			return "", nil, nil, err
+		}
+		// --mount, not -v: a missing socket fails the run instead of
+		// becoming an empty directory.
+		args = append(args, "--mount", "type=bind,source="+proxy.sock+",target=/var/run/docker.sock")
+	}
 
 	if !run.Root {
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
@@ -716,16 +747,26 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	}
 	host := "exec " + d.cmd(strings.Join(q, " "))
 	marker := filepath.Join(s.slotDir, rootRunMarker)
-	if run.Root {
+	// Containers the run starts itself usually run as root, and may write
+	// into the workspace through a bind mount, so their files are given
+	// back too.
+	giveBack := run.Root || run.Docker
+	if giveBack {
 		// Cleared once the run's files are given back: if the run is
 		// aborted first, the slot's next holder does it (reclaimFiles).
 		if err := os.WriteFile(marker, []byte(run.Image+"\n"), 0o644); err != nil {
+			if proxy != nil {
+				proxy.stop()
+			}
 			os.Remove(scriptPath)
 			os.Remove(envPath)
 			return "", nil, nil, err
 		}
 	}
 	s.containers.Store(name, d)
+	if proxy != nil {
+		s.nested.Store(name, d)
+	}
 	s.lastContainer.name, s.lastContainer.d, s.lastContainer.started = name, d, time.Now()
 	cleanup := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -734,9 +775,19 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 			return err // keep tracking it; the caller must not snapshot
 		}
 		s.containers.Delete(name)
+		if proxy != nil {
+			// Nothing in the run can call Docker any more, so nothing it
+			// starts can appear after this sweep.
+			proxy.stop()
+			if left := removeLabelled(ctx, d, labelRun+"="+name); left != "" {
+				return fmt.Errorf("containers, networks or volumes the run started could not be removed: %s", left)
+			}
+			s.nested.Delete(name)
+			os.Remove(filepath.Join(s.slotDir, dockerRunMarker))
+		}
 		os.Remove(scriptPath)
 		os.Remove(envPath)
-		if run.Root {
+		if giveBack {
 			switch err := s.giveBackFiles(ctx, &d, run.Image); {
 			case err == nil:
 				os.Remove(marker)
@@ -773,6 +824,10 @@ func networkArgs(run *protocol.ContainerRun) []string {
 // rootRunMarker, in a slot directory, names the image of a root container
 // run whose files haven't been given back to the runner user yet.
 const rootRunMarker = "root-run"
+
+// dockerRunMarker, in a slot directory, says a container.docker run may
+// have left containers, networks or volumes labelled with the slot.
+const dockerRunMarker = "docker-run"
 
 // errRepairRunning: a timed-out ownership repair's container couldn't be
 // removed, so it may still be changing files.
@@ -926,6 +981,14 @@ func (s *Session) removeContainers(prefixOnly bool) string {
 		}
 		return true
 	})
+	// What container.docker runs started (their proxies are gone with the
+	// run's processes, or with this helper).
+	s.nested.Range(func(k, v any) bool {
+		if removeLabelled(ctx, v.(dockerRunner), labelRun+"="+k.(string)) == "" {
+			s.nested.Delete(k)
+		}
+		return true
+	})
 	if !prefixOnly {
 		return ""
 	}
@@ -936,7 +999,8 @@ func (s *Session) removeContainers(prefixOnly bool) string {
 	return s.sweepSlotContainers(ctx, d)
 }
 
-// sweepSlotContainers force-removes all of this slot's containers and
+// sweepSlotContainers force-removes all of this slot's containers, and the
+// containers, networks and volumes its container.docker runs started, and
 // returns those that still exist.
 func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) string {
 	filter := "--filter " + shq("name=^"+s.containerPrefix())
@@ -945,7 +1009,16 @@ func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) strin
 	if err != nil {
 		return "(docker ps failed: " + strings.TrimSpace(string(out)) + ")"
 	}
-	return strings.Join(strings.Fields(string(out)), " ")
+	left := strings.Fields(string(out))
+	marker := filepath.Join(s.slotDir, dockerRunMarker)
+	if _, err := os.Stat(marker); err == nil {
+		if l := removeLabelled(ctx, d, labelSlot+"="+s.containerPrefix()); l != "" {
+			left = append(left, l)
+		} else {
+			os.Remove(marker)
+		}
+	}
+	return strings.Join(left, " ")
 }
 
 func shq(s string) string {

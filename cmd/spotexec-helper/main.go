@@ -67,6 +67,8 @@ func main() {
 		}
 	case "image-push":
 		fail(helper.ImagePush(root))
+	case "docker-proxy":
+		fail(helper.DockerProxy())
 	case "cache-put":
 		fail(helper.CachePut(root, *src, *lockPath))
 	case "version":
