@@ -125,3 +125,53 @@ func TestHeartbeatMemoryPressure(t *testing.T) {
 		t.Fatal("nil session reported pressure")
 	}
 }
+
+// Frames the client hasn't read yet don't excuse a silent helper while
+// there is room for more (#144): the session still hears the helper, or
+// doesn't, and a stall behind them is given up on within the limit.
+func TestUnreadFramesDontHideSilence(t *testing.T) {
+	e := newFakeEnv(t)
+	short(t, &SilenceLimit, time.Second)
+	e.Set("rpc-flood", "200") // over half the buffer, short of filling it
+	s := e.session(t)
+	deadline := time.Now().Add(10 * time.Second)
+	for !s.Dead() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !s.Dead() {
+		t.Fatal("a silent helper behind unread frames was never given up on")
+	}
+}
+
+// A full buffer is our backlog, not the helper's silence: nothing more can
+// be read until it drains (output piped into a paused pager), so the
+// session waits; once it drains, silence counts from then.
+func TestFullBufferIsNotSilence(t *testing.T) {
+	e := newFakeEnv(t)
+	short(t, &SilenceLimit, time.Second)
+	e.Set("rpc-flood", "400")
+	s := e.session(t)
+	time.Sleep(3 * time.Second) // three limits with nothing read
+	if s.Dead() {
+		t.Fatal("given up on while our own buffer was full")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	start, got := time.Now(), 0
+	var err error
+	for err == nil {
+		_, err = s.Next(ctx)
+		if err == nil {
+			got++
+		}
+	}
+	if !IsConnError(err) || !strings.Contains(err.Error(), "stopped responding") {
+		t.Fatalf("after %d frames: want a stopped-responding error, got %v", got, err)
+	}
+	if got != 400 {
+		t.Fatalf("read %d frames before the session ended, want all 400", got)
+	}
+	if took := time.Since(start); took < 500*time.Millisecond {
+		t.Fatalf("given up on %s after the buffer drained: the silence counted the backlog", took)
+	}
+}

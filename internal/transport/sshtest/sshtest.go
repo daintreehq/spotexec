@@ -192,6 +192,30 @@ func rpc() int {
 	if _, err := os.Stat(filepath.Join(st, "rpc-silent")); err == nil {
 		time.Sleep(time.Hour) // until killed
 	}
+	// rpc-flood: the number of events in the file, sent at once, then
+	// silent until killed (output the client hasn't read yet, then a stall).
+	if b, err := os.ReadFile(filepath.Join(st, "rpc-flood")); err == nil {
+		n, _ := strconv.Atoi(string(b))
+		for i := range n {
+			_ = conn.Send(protocol.TypeEvent, protocol.Event{Name: "flood", Message: strconv.Itoa(i)})
+		}
+		time.Sleep(time.Hour)
+	}
+	// rpc-deps-missing: answers a dependency request with "not in the cache",
+	// then silent until killed (a helper lost while its run waits for
+	// another run to install the dependencies).
+	if _, err := os.Stat(filepath.Join(st, "rpc-deps-missing")); err == nil {
+		for {
+			f, err := conn.ReadFrame()
+			if err != nil {
+				return 0
+			}
+			if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeDeps {
+				_ = conn.Send(protocol.TypeDepsResult, protocol.DepsResult{Missing: true})
+				time.Sleep(time.Hour)
+			}
+		}
+	}
 	// rpc-pulse: silent until the test creates rpc-pulse-go, then one
 	// heartbeat, then silent until killed (a helper that recovers once, then
 	// dies).
