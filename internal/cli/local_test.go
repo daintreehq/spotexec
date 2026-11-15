@@ -289,3 +289,28 @@ func TestRunLocalSetup(t *testing.T) {
 		t.Fatalf("setup timeout: exit %d after %s, command ran: %v", code, time.Since(start), err == nil)
 	}
 }
+
+// Ctrl-C during the setup ends the run there (130), even when the setup
+// handles the signal and exits 0.
+func TestRunLocalSetupInterrupted(t *testing.T) {
+	l := testLoaded()
+	l.ws.Root = t.TempDir()
+	l.cfg.Project.Setup.Run = `trap 'exit 0' TERM; sleep 30 & touch ready; wait`
+	rep, _ := ui.New(ui.ModeQuiet, os.Stderr, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if _, err := os.Stat(filepath.Join(l.ws.Root, "ready")); err == nil {
+				break
+			}
+		}
+		cancel()
+	}()
+	var out lockedBuf
+	o := client.Options{Command: "touch ran", Grace: 300 * time.Millisecond, Stdout: &out, Stderr: &out}
+	code := runLocal(ctx, nil, l, o, rep, 0, 1)
+	if _, err := os.Stat(filepath.Join(l.ws.Root, "ran")); code != client.ExitInterrupted || err == nil {
+		t.Fatalf("exit %d, command ran: %v, output %q", code, err == nil, out.String())
+	}
+}

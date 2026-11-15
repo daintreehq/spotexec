@@ -88,6 +88,8 @@ func TestTaskSetupOptOut(t *testing.T) {
 		"status": {Run: "git status", Setup: &no},
 		"some":   {Parallel: []string{"unit", "status"}},
 		"quiet":  {Parallel: []string{"unit"}, Setup: &no},
+		"e2e":    {Run: "playwright", Shards: 2, Setup: &no},
+		"mixed":  {Parallel: []string{"e2e", "unit"}},
 	}
 	skips := func(name string) []bool {
 		var got []bool
@@ -101,6 +103,8 @@ func TestTaskSetupOptOut(t *testing.T) {
 		"status": {true},
 		"some":   {false, false, true},
 		"quiet":  {true, true},
+		"e2e":    {true, true},
+		"mixed":  {true, true, false, false},
 	} {
 		if got := skips(name); !reflect.DeepEqual(got, want) {
 			t.Errorf("%s: noSetup %v, want %v", name, got, want)

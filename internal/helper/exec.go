@@ -315,6 +315,27 @@ loop:
 	return res
 }
 
+// cancelQueued reports, without waiting, whether the client canceled the
+// run (or went away) since the last process ended.
+func (s *Session) cancelQueued() bool {
+	if s.clientGone() {
+		return true
+	}
+	for {
+		select {
+		case f, ok := <-s.frames:
+			if !ok {
+				return true
+			}
+			if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeCancel {
+				return true
+			}
+		default:
+			return false
+		}
+	}
+}
+
 // shutdownExit: the exit statuses a shutdown produces (SIGHUP, SIGKILL,
 // SIGTERM). In a container, `docker run` also exits 125 when dockerd stops
 // under it.
@@ -435,6 +456,11 @@ func (s *Session) exec(e protocol.Exec) error {
 				}
 				b = b[n:]
 			}
+		}
+		// A cancel (or the client going) after the setup ended, while its
+		// processes were reaped, must not let the command start at all.
+		if !setupFailed && s.cancelQueued() {
+			pr.canceled, setupFailed = true, true
 		}
 		if !setupFailed {
 			_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "setup_done", Message: fmt.Sprintf("%dms", setupMS)})

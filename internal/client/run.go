@@ -569,16 +569,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		o.Rep.Warn("UNVERIFIED", "%d file(s) could not be read on the runner after the run and were not written back: %s", len(result.Unverified), strings.Join(firstN(result.Unverified, 5), ", "))
 	}
 	if result.SetupFailed && !res.Canceled {
-		// The setup's own exit code is not passed on: a setup that exits
-		// 125 or 130 must not look like a spotexec failure or an interrupt.
-		res.SetupFailed, res.ExitCode = true, 1
-		if result.TimedOut {
-			res.ExitCode = ExitTimeout
-			_, t := SetupFor(p, o)
-			o.Rep.Warn("SETUP_FAILED", "[setup] run exceeded %s and was terminated (raise setup.timeout); the command did not run", t)
-		} else {
-			o.Rep.Warn("SETUP_FAILED", "[setup] run failed (exit %d); the command did not run. Its output is above; skip the setup with --no-setup or setup = false on a task", result.ExitCode)
-		}
+		var msg string
+		res.ExitCode, msg = setupFailure(p, o, result)
+		res.SetupFailed = true
+		o.Rep.Warn("SETUP_FAILED", "%s", msg)
 	} else if result.TimedOut {
 		o.Rep.Warn("TIMEOUT", "command exceeded %s and was terminated (raise with --timeout)", o.Timeout)
 	}
@@ -1080,6 +1074,17 @@ func SetupFor(p *config.Project, o Options) (string, time.Duration) {
 		return p.Setup.Run, p.Setup.Timeout.Duration
 	}
 	return p.Setup.Run, o.Timeout
+}
+
+// setupFailure is the exit code and SETUP_FAILED message for a run whose
+// [setup] failed. The setup's own exit code is not passed on: a setup that
+// exits 125 or 130 must not look like a spotexec failure or an interrupt.
+func setupFailure(p *config.Project, o Options, r protocol.Result) (int, string) {
+	if r.TimedOut {
+		_, t := SetupFor(p, o)
+		return ExitTimeout, fmt.Sprintf("[setup] run exceeded %s and was terminated (raise setup.timeout); the command did not run", t)
+	}
+	return 1, fmt.Sprintf("[setup] run failed (exit %d); the command did not run. Its output is above; skip the setup with --no-setup or setup = false on a task", r.ExitCode)
 }
 
 // pumpExec streams output until the result arrives, forwarding interrupts.

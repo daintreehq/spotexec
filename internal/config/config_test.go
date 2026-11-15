@@ -664,6 +664,9 @@ setup = true
 			t.Errorf("%s: SkipsSetup = %v", name, !skips)
 		}
 	}
+	if p, err := load("[setup]\nrun = \"x\"\n"); err != nil || p.Setup.Run != "x" || p.Setup.Timeout.Duration != 0 {
+		t.Errorf("setup without a timeout: %+v, %v", p.Setup, err)
+	}
 	if p, err := load("[tasks.a]\nrun = \"x\"\n"); err != nil || p.Setup.Run != "" {
 		t.Errorf("no setup: %+v, %v", p.Setup, err)
 	}
