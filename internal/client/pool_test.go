@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -322,22 +323,85 @@ func TestMismatchedInstancesTakeNoNewRuns(t *testing.T) {
 	}
 }
 
-// Clearing a mismatch never clears draining: a VM near max_lifetime stays
+// Clearing a mismatch never clears draining: a VM marked draining stays
 // out of service when the config matches it again.
 func TestMismatchClearingKeepsDraining(t *testing.T) {
 	ctx := context.Background()
 	p, f := testPool(t, 4)
-	p.R.MaxLifetime.Duration = 12 * time.Hour
+	p.R.VCPUs, p.R.MinMemoryGiB = 8, 32
 	m := &matchFleet{fakeFleet: f, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{}}
 	p.Fleet = m
-	f.insts = []provider.Instance{{ID: "i-old", Type: "c6a.2xlarge", State: provider.StateRunning,
-		Target: provider.Target{Host: "127.0.0.1"}, LaunchedAt: time.Now().Add(-12*time.Hour + 10*time.Minute)}}
+	in := provider.Instance{ID: "i-old", Type: "c6a.2xlarge", State: provider.StateRunning,
+		Target: provider.Target{Host: "127.0.0.1"}, LaunchedAt: time.Now().Add(-time.Hour)}
+	f.insts = []provider.Instance{in}
 	if cands, _, _ := p.Candidates(ctx, nil); len(cands) != 0 {
 		t.Fatalf("%v", cands)
 	}
+	p.Observe(in.ID, OutDraining, in.LaunchedAt)
 	m.bad = map[string]bool{}
-	p.R.MinMemoryGiB = 1
+	p.R.MinMemoryGiB = 16
 	if cands, usable, _ := p.Candidates(ctx, nil); len(cands) != 0 || usable != 0 {
 		t.Fatalf("draining VM back in service: %v %d", cands, usable)
+	}
+	if n := readState(t, p).Notes["i-old"]; n == nil || !n.Draining || n.Mismatch != "" {
+		t.Fatalf("note %+v: want draining, mismatch cleared", n)
+	}
+}
+
+// Under the same requirements a re-listing judges again: an instance a
+// failed lookup left unjudged is retired once a lookup succeeds.
+func TestMismatchJudgedAgainOnRelist(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 4)
+	m := &matchFleet{fakeFleet: f, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{"c6a.2xlarge": true}}
+	p.Fleet = m
+	f.insts = []provider.Instance{{ID: "i-old", Type: "c6a.2xlarge", State: provider.StateRunning,
+		Target: provider.Target{Host: "127.0.0.1"}, LaunchedAt: time.Now().Add(-time.Hour)}}
+	if cands, _, _ := p.Candidates(ctx, nil); len(cands) != 1 {
+		t.Fatalf("unjudged VM retired: %v", cands)
+	}
+	m.unknown = map[string]bool{}
+	_ = p.with(func(st *poolState) error { st.ListedAt = time.Time{}; return nil })
+	if cands, usable, _ := p.Candidates(ctx, nil); len(cands) != 0 || usable != 0 {
+		t.Fatalf("not judged again on a relist: %v %d", cands, usable)
+	}
+}
+
+// Waiting demand gets a replacement for a mismatched VM: it isn't live
+// capacity (at max_instances), nor pending capacity while it boots or
+// while its launch record lasts.
+func TestMismatchedInstancesAreReplacedForDemand(t *testing.T) {
+	p, f := testPool(t, 1)
+	m := &matchFleet{fakeFleet: f, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{}}
+	p.Fleet = m
+	host := provider.Target{Host: "127.0.0.1"}
+
+	f.insts = []provider.Instance{{ID: "i-old", Type: "c6a.2xlarge", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Hour)}}
+	if d := planOnce(t, p); !d.Launch || d.Live != 0 {
+		t.Fatalf("at max_instances with only a mismatched VM: %+v", d)
+	}
+
+	// A young, never-ready mismatched VM with a launch record.
+	p2, f2 := testPool(t, 4)
+	m2 := &matchFleet{fakeFleet: f2, bad: map[string]bool{"c6a.2xlarge": true}, unknown: map[string]bool{}}
+	p2.Fleet = m2
+	f2.insts = []provider.Instance{{ID: "i-young", Type: "c6a.2xlarge", State: provider.StateRunning, Target: host, LaunchedAt: time.Now().Add(-time.Minute)}}
+	_ = p2.with(func(st *poolState) error {
+		st.Launches = []launchRec{{ID: "l1", InstanceID: "i-young", Started: time.Now().Add(-time.Minute), PID: os.Getpid()}}
+		return nil
+	})
+	if d := planOnce(t, p2); !d.Launch || d.Pending != 1 {
+		t.Fatalf("mismatched booting VM counted as pending capacity: %+v", d)
+	}
+	// The record survives (a config change may undo the mismatch), and
+	// counts again once the VM matches.
+	m2.bad = map[string]bool{}
+	p2.R.MinMemoryGiB = 1
+	st := readState(t, p2)
+	if len(st.Launches) != 2 {
+		t.Fatalf("launch records %+v", st.Launches)
+	}
+	if d := planOnce(t, p2); d.Launch || d.Pending != 2 {
+		t.Fatalf("after the config matches again: %+v", d)
 	}
 }

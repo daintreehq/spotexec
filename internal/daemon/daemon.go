@@ -299,13 +299,14 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		d.terminate(ctx, fl, id, why, true)
 	}
 
-	// Running, non-draining instances that still match the config; the
-	// oldest are the warm ones (ties broken by ID, as sx's placement does,
-	// so both pick the same ones). A mismatched VM gets no keepalive, so it
-	// idles out while matching ones take over the warm pool.
+	// Running, non-draining instances; the oldest that still match the
+	// config are the warm ones (ties broken by ID, as sx's placement does,
+	// so both pick the same ones). A mismatched VM is still health-checked
+	// but never warm, so it gets no keepalive and idles out while matching
+	// ones take over the warm pool.
 	running := []provider.Instance{}
 	for _, in := range view.Instances {
-		if in.State == provider.StateRunning && in.Target.Host != "" && !view.Draining[in.ID] && view.Mismatch[in.ID] == "" && fl.killing[in.ID] == "" {
+		if in.State == provider.StateRunning && in.Target.Host != "" && !view.Draining[in.ID] && fl.killing[in.ID] == "" {
 			running = append(running, in)
 		}
 	}
@@ -326,15 +327,21 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		// warm VMs are replaced one after another, never all at once.
 		ready := 0
 		for _, in := range running {
-			if _, ok := fl.lastOK[in.ID]; ok && !fl.booting[in.ID] {
+			if _, ok := fl.lastOK[in.ID]; ok && !fl.booting[in.ID] && view.Mismatch[in.ID] == "" {
 				ready++
 			}
 		}
 		var keep []provider.Instance
-		for i, in := range running {
+		i := 0 // position among the matching instances
+		for _, in := range running {
+			if view.Mismatch[in.ID] != "" {
+				keep = append(keep, in)
+				continue
+			}
+			i++
 			// One at a time: warm VMs launched together would otherwise all
 			// retire in the same pass and leave no warm capacity.
-			if i < r.MinInstances && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > retireAt {
+			if i <= r.MinInstances && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > retireAt {
 				// Drained locally now (so the warm pool replaces it); the
 				// VM itself is told below, retried until it confirms.
 				d.action("%s: retiring warm instance %s ahead of max_lifetime", r.Name, in.ID)
@@ -353,8 +360,10 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		}
 	}
 	warm := map[string]bool{}
-	for i := 0; i < len(running) && i < r.MinInstances; i++ {
-		warm[running[i].ID] = true
+	for _, in := range running {
+		if len(warm) < r.MinInstances && view.Mismatch[in.ID] == "" {
+			warm[in.ID] = true
+		}
 	}
 
 	// 3. Health probes (and keepalive for warm instances). An instance with

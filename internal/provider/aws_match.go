@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -47,7 +48,10 @@ func (a *AWSSpot) typeMismatch(ctx context.Context, t string, eligible *map[stri
 	}
 	if !*loaded {
 		*loaded = true
-		if ts, err := a.EligibleTypes(ctx, false); err == nil {
+		ts, err := a.EligibleTypes(ctx, false)
+		var none *noEligibleError
+		if err == nil || errors.As(err, &none) {
+			// Nothing qualifying is a verdict too: every VM mismatches.
 			*eligible = map[string]bool{}
 			for _, x := range ts {
 				(*eligible)[x.Type] = true

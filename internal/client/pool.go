@@ -319,8 +319,11 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 			seenBefore[id] = true
 		}
 	}
-	st.Instances, st.ListedAt = insts, time.Now()
+	st.Instances = insts
 	p.matchConfig(ctx, st, true)
+	// Fresh from now: a slow type lookup in matchConfig mustn't leave the
+	// listing already stale, sending every waiting process to re-list.
+	st.ListedAt = time.Now()
 	live := map[string]bool{}
 	for _, in := range insts {
 		live[in.ID] = true
@@ -342,8 +345,10 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 		case l.InstanceID != "" && !live[l.InstanceID] && (age > listLagGrace || seenBefore[l.InstanceID]):
 			// Launched but gone: reclaimed while booting, or it already
 			// served and has since terminated (not listing lag).
-		case l.InstanceID != "" && st.Notes[l.InstanceID].closed():
-			// Draining or mismatched: no longer pending capacity.
+		case l.InstanceID != "" && st.Notes[l.InstanceID] != nil && st.Notes[l.InstanceID].Draining:
+			// Draining: no longer pending capacity. (A mismatched launch keeps
+			// its record, uncounted while it mismatches, since a config
+			// change can undo that.)
 		case l.InstanceID != "" && st.Notes[l.InstanceID] != nil && st.Notes[l.InstanceID].Ready &&
 			(st.Notes[l.InstanceID].SawFull || readyFor(st.Notes[l.InstanceID]) > readyGrace):
 			// Usable for a while; it now counts as a normal instance. (Not at

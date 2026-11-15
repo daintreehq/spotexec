@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,5 +33,27 @@ func TestStatusMarksMismatchedVM(t *testing.T) {
 	}
 	if !strings.Contains(out, "spot/i-old: doesn't match the current config (c6a.2xlarge doesn't have 8 vCPUs, at least 32 GiB)") {
 		t.Fatalf("no reason:\n%s", out)
+	}
+}
+
+type matcherFleet struct {
+	provider.Fleet
+	got map[string]string
+}
+
+func (m matcherFleet) Mismatches(context.Context, []provider.Instance) map[string]string {
+	return m.got
+}
+
+// Status asks a fleet that can judge its VMs, and not one that can't.
+func TestFleetMismatches(t *testing.T) {
+	insts := []provider.Instance{{ID: "i-old"}}
+	want := map[string]string{"i-old": "c6a.2xlarge is not in instance_types"}
+	if got := fleetMismatches(context.Background(), matcherFleet{got: want}, insts); got["i-old"] != want["i-old"] {
+		t.Fatalf("%q", got)
+	}
+	var plain provider.Fleet = matcherFleet{}.Fleet
+	if got := fleetMismatches(context.Background(), plain, insts); got != nil {
+		t.Fatalf("%q", got)
 	}
 }

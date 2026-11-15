@@ -46,6 +46,8 @@ takes part in scheduling, and every VM shuts itself down.
      it back in service. A failed type lookup never retires an instance.
      `spotexec status` shows it as `outdated`, with the reason. `exec`,
      `pull` and `--same-slot`, which name an exact slot, still reach it.
+     The pool manager keeps such a VM out of the warm pool, but it judges
+     by the config it started with: restart it after changing requirements.
    - An instance that cannot be reached stays in the cache and still counts
      as capacity, but isn't probed again for 3s, or for 30s once it is
      older than `boot_timeout` and has failed to answer twice in a row.
