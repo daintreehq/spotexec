@@ -856,7 +856,9 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 			return 0, err
 		}
 		for p, l := range landing {
-			protected[p] = prot[l]
+			// Judged where it lands too: a --dest above the worktree
+			// must not reach its spotexec state (conflicts, backups).
+			protected[p] = prot[l] || reservedPath(l, ws.Git)
 		}
 	}
 	// Outside this worktree, anything inside some git repository (a sibling

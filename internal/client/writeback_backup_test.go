@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -120,6 +121,15 @@ func (f wbFixture) apply(t *testing.T, dels []string, writes map[string]string) 
 	return wb
 }
 
+func gone(t *testing.T, root string, paths ...string) {
+	t.Helper()
+	for _, p := range paths {
+		if _, err := os.Lstat(filepath.Join(root, filepath.FromSlash(p))); err == nil {
+			t.Errorf("%s was not deleted", p)
+		}
+	}
+}
+
 func readOr(p string) string {
 	b, err := os.ReadFile(p)
 	if err != nil {
@@ -153,6 +163,7 @@ func TestWritebackBacksUpUncommittedWork(t *testing.T) {
 	if got := strings.Join(wb.BackedUp, ","); got != "notes/todo.txt,src/edited.go" {
 		t.Errorf("BackedUp = %q", got)
 	}
+	gone(t, f.ws.Root, "notes/todo.txt", "src/clean.go")
 	if !strings.HasPrefix(wb.BackupDir, f.ws.GitDir) {
 		t.Errorf("backup %s is not under the git dir %s", wb.BackupDir, f.ws.GitDir)
 	}
@@ -167,6 +178,7 @@ func TestWritebackBacksUpEverythingOutsideGit(t *testing.T) {
 	if got := readOr(filepath.Join(wb.BackupDir, "a.txt")); got != "a\n" {
 		t.Errorf("backup %q", got)
 	}
+	gone(t, f.ws.Root, "a.txt")
 	if !strings.HasPrefix(wb.BackupDir, filepath.Join(f.ws.Root, ".spotexec")+string(filepath.Separator)) {
 		t.Errorf("backup dir %s", wb.BackupDir)
 	}
@@ -177,6 +189,13 @@ func TestWritebackWithNothingToSaveMakesNoBackup(t *testing.T) {
 	wb := f.apply(t, []string{"a.txt"}, map[string]string{"b.txt": "new\n"})
 	if wb.BackupDir != "" || len(wb.BackedUp) != 0 {
 		t.Errorf("backed up %v to %q", wb.BackedUp, wb.BackupDir)
+	}
+	gone(t, f.ws.Root, "a.txt")
+	if got := readOr(filepath.Join(f.ws.Root, "b.txt")); got != "new\n" {
+		t.Errorf("b.txt = %q", got)
+	}
+	if _, err := os.Lstat(filepath.Join(f.ws.GitDir, "spotexec", "backup")); err == nil {
+		t.Error("an empty backup directory was made")
 	}
 }
 
@@ -198,6 +217,7 @@ func TestWritebackBacksUpStagedAndModeOnlyChanges(t *testing.T) {
 	if got := perm(t, filepath.Join(wb.BackupDir, "run.sh")); got != 0o755 {
 		t.Errorf("backup of an executable is %o", got)
 	}
+	gone(t, f.ws.Root, "staged.txt", "run.sh")
 	if out := gitRun(t, f.ws.Root, "diff", "--cached", "--name-only"); out != "staged.txt" {
 		t.Errorf("the index changed: %q", out)
 	}
@@ -217,6 +237,7 @@ func TestWritebackBacksUpSymlinks(t *testing.T) {
 	if got, err := os.Readlink(filepath.Join(wb.BackupDir, "link")); err != nil || got != "a.txt" {
 		t.Errorf("symlink backup: %q, %v", got, err)
 	}
+	gone(t, f.ws.Root, "link")
 }
 
 func TestWritebackHoldsBackProjectConfigDeletion(t *testing.T) {
@@ -262,13 +283,18 @@ func TestWritebackMassDeletionGuard(t *testing.T) {
 		}
 		f := newWBFixture(t, true, committed, nil)
 		wb := f.apply(t, dels, nil)
-		if held := len(wb.Held) == c.dels && len(wb.Deleted) == 0; held != c.held {
-			t.Errorf("%d of %d: held %v, deleted %v", c.dels, c.files, wb.Held, wb.Deleted)
+		held, deleted := strings.Join(wb.Held, ","), strings.Join(wb.Deleted, ",")
+		if c.held && (held != strings.Join(dels, ",") || deleted != "") || !c.held && (held != "" || deleted != strings.Join(dels, ",")) {
+			t.Errorf("%d of %d: held %q, deleted %q", c.dels, c.files, held, deleted)
 		}
 		if c.held {
-			if _, err := os.Lstat(filepath.Join(f.ws.Root, dels[0])); err != nil {
-				t.Errorf("%d of %d: %s deleted", c.dels, c.files, dels[0])
+			for _, p := range dels {
+				if _, err := os.Lstat(filepath.Join(f.ws.Root, p)); err != nil {
+					t.Errorf("%d of %d: %s deleted", c.dels, c.files, p)
+				}
 			}
+		} else {
+			gone(t, f.ws.Root, dels...)
 		}
 	}
 }
@@ -278,5 +304,66 @@ func TestReportSafety(t *testing.T) {
 	reportSafety(rec, WritebackResult{BackedUp: []string{"a"}, BackupDir: "/g/spotexec/backup/r", Held: []string{".gitignore"}, HeldWhy: "the run deleted the project's own .gitignore"}, "r")
 	if len(rec.warnings) != 2 || !strings.Contains(rec.warnings[0], "/g/spotexec/backup/r") || !strings.HasPrefix(rec.warnings[1], "WRITEBACK_HELD: the run deleted the project's own .gitignore") {
 		t.Fatalf("warnings %q", rec.warnings)
+	}
+	if strings.Join(rec.named, ",") != "backup,held_deletions" {
+		t.Fatalf("events %v", rec.named)
+	}
+	if b := rec.fields[0]; b["dir"] != "/g/spotexec/backup/r" || fmt.Sprint(b["files"]) != "[a]" {
+		t.Errorf("backup event %v", b)
+	}
+	if h := rec.fields[1]; fmt.Sprint(h["files"]) != "[.gitignore]" || h["reason"] == "" {
+		t.Errorf("held_deletions event %v", h)
+	}
+	rec = &recordingReporter{}
+	reportSafety(rec, WritebackResult{}, "r")
+	if len(rec.warnings)+len(rec.named) != 0 {
+		t.Errorf("reported %v %v for a write-back with nothing to say", rec.warnings, rec.named)
+	}
+}
+
+func TestWritebackBacksUpBeforeTheFirstCommit(t *testing.T) {
+	f := newWBFixture(t, true, nil, map[string]string{"a.txt": "a\n", "b.txt": "b\n"})
+	gitRun(t, f.ws.Root, "add", "a.txt")
+	wb := f.apply(t, []string{"a.txt"}, nil)
+	if got := readOr(filepath.Join(wb.BackupDir, "a.txt")); got != "a\n" {
+		t.Errorf("backup %q", got)
+	}
+	gone(t, f.ws.Root, "a.txt")
+}
+
+// A backup is only made of the exact version write-back saw: anything else
+// means the file changed during write-back, and nothing is saved or deleted.
+func TestBackupLocalRefusesAChangedFile(t *testing.T) {
+	root, dir := t.TempDir(), t.TempDir()
+	writeFile(t, root, "a.txt", "now\n")
+	if err := os.Symlink("a.txt", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		p    string
+		want version
+	}{
+		{"a.txt", version{true, fsid.Bytes([]byte("then\n")), fsid.ModeFile}},
+		{"a.txt", version{true, fsid.Bytes([]byte("now\n")), fsid.ModeExec}},
+		{"a.txt", version{true, fsid.Bytes([]byte("a.txt")), fsid.ModeSymlink}},
+		{"link", version{true, fsid.Bytes([]byte("b.txt")), fsid.ModeSymlink}},
+		{"link", version{true, fsid.Bytes([]byte("now\n")), fsid.ModeFile}},
+		{"missing", version{true, fsid.Bytes([]byte("now\n")), fsid.ModeFile}},
+	} {
+		if _, err := backupLocal(root, dir, c.p, c.want); !errors.Is(err, errChangedUnderUs) {
+			t.Errorf("%s as %v: %v, want errChangedUnderUs", c.p, c.want, err)
+		}
+	}
+	if left, _ := os.ReadDir(dir); len(left) != 0 {
+		t.Errorf("left %v in the backup", left)
+	}
+	got, err := backupLocal(root, dir, "a.txt", version{true, fsid.Bytes([]byte("now\n")), fsid.ModeFile})
+	if err != nil || readOr(got) != "now\n" {
+		t.Fatalf("backup %s: %v", got, err)
+	}
+	// A second backup to the same name goes beside the first.
+	again, err := backupLocal(root, dir, "a.txt", version{true, fsid.Bytes([]byte("now\n")), fsid.ModeFile})
+	if err != nil || again == got || readOr(again) != "now\n" {
+		t.Fatalf("second backup %s: %v", again, err)
 	}
 }
