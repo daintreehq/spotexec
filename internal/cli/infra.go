@@ -1076,10 +1076,16 @@ func cmdSyncPlan() *cobra.Command {
 
 func cmdPull() *cobra.Command {
 	var dest string
+	var held bool
 	c := &cobra.Command{
-		Use:   "pull <remote-glob>... ",
-		Short: "Pull gitignored artifacts (e.g. coverage/) from the last-used slot",
-		Args:  cobra.MinimumNArgs(1),
+		Use:   "pull <remote-glob>... | --held [<glob>...]",
+		Short: "Pull gitignored artifacts (e.g. coverage/), or held write-back files, from the last-used slot",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if held {
+				return nil
+			}
+			return cobra.MinimumNArgs(1)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load("")
 			if err != nil {
@@ -1088,6 +1094,12 @@ func cmdPull() *cobra.Command {
 			lr, err := client.LoadLastRun(l.ws)
 			if err != nil {
 				return errors.New("no previous run from this worktree; run something first")
+			}
+			heldFiles := client.LoadHeld(l.ws, *lr)
+			if held {
+				if args, heldFiles, err = client.HeldPatterns(heldFiles, args); err != nil {
+					return err
+				}
 			}
 			r, err := l.cfg.Runner(lr.Runner)
 			if err != nil {
@@ -1106,7 +1118,7 @@ func cmdPull() *cobra.Command {
 			if dest != "" {
 				root = dest // created by PullArtifacts once validated
 			}
-			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args)
+			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args, heldFiles, held)
 			if err != nil {
 				return err
 			}
@@ -1115,6 +1127,7 @@ func cmdPull() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&dest, "dest", "", "write under this directory instead of the worktree root")
+	c.Flags().BoolVar(&held, "held", false, "pull the new files the last run's write-back held in the slot (over the write-back limit); globs narrow them")
 	return c
 }
 

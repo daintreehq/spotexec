@@ -20,7 +20,7 @@ Exceptions to that order:
 - a task's own `pool` beats `SPOTEXEC_POOL`;
 - `spotexec sync` always syncs and `spotexec exec` never does, whatever `SPOTEXEC_SYNC` says.
 
-Unknown `--sync` and `--writeback` values (from flags or the environment) are rejected with exit `125` before any runner is used.
+Unknown `--sync`, `--writeback` and `--writeback-over` values (from flags or the environment) are rejected with exit `125` before any runner is used.
 
 ### Environment variables
 
@@ -28,6 +28,7 @@ Unknown `--sync` and `--writeback` values (from flags or the environment) are re
 | --- | --- |
 | `SPOTEXEC_TIMEOUT` | `--timeout`, for example `SPOTEXEC_TIMEOUT=15m`. |
 | `SPOTEXEC_SYNC` | `--sync`. |
+| `SPOTEXEC_WRITEBACK_OVER` | `--writeback-over`. |
 | `SPOTEXEC_RUNNER` | `-r`, `--runner`. |
 | `SPOTEXEC_POOL` | `--pool` (comma-separated runner names). |
 | `SPOTEXEC_PRIORITY` | `--priority`. |
@@ -142,6 +143,9 @@ mode = "auto"                  # auto: write back · in: discard changes · none
 writeback = "always"           # always | on-success | never (eslint --fix exits 1 but still fixes)
 exclude = [".env*", "*.pem"]   # on top of .gitignore and .spotexecignore
 pull_artifacts = ["coverage/"] # gitignored outputs copied back after every run
+writeback_max_files = 1000     # a write-back bringing back more files than this warns (0: no limit)
+writeback_max_bytes = "100MB"  # ...or more bytes than this (a number of bytes, or KB/MB/GB; 0: no limit)
+writeback_over = "warn"        # warn: bring them back anyway · hold: leave the new files in the slot
 # source = "git"               # git | directory (default: git when in a worktree)
 # git_seed = true              # a one-commit .git on the runner: HEAD, branch, git status (see below)
 

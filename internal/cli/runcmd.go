@@ -28,6 +28,7 @@ type runFlags struct {
 	queueTimeout  time.Duration
 	sync          string
 	writeback     string
+	writebackOver string
 	pool          []string
 	runner        string
 	exclusive     bool
@@ -57,6 +58,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.DurationVar(&f.queueTimeout, "queue-timeout", 0, "how long to wait for a free slot (default 10m or .spotexec.toml queue_timeout)")
 	fs.StringVar(&f.sync, "sync", "", "sync mode: auto (bidirectional), in (no write-back), none")
 	fs.StringVar(&f.writeback, "writeback", "", "write-back policy: always, on-success, never")
+	fs.StringVar(&f.writebackOver, "writeback-over", "", "over the write-back limit: warn (bring everything back) or hold (leave the new files in the slot)")
 	fs.StringSliceVar(&f.pool, "pool", nil, "runner names to use (comma-separated)")
 	fs.StringVarP(&f.runner, "runner", "r", "", "use only this runner")
 	fs.BoolVar(&f.exclusive, "exclusive", false, "take every slot on the runner")
@@ -112,6 +114,11 @@ func (f *runFlags) applyEnv() {
 			f.sync = v
 		}
 	}
+	if !f.changed("writeback-over") {
+		if v := os.Getenv("SPOTEXEC_WRITEBACK_OVER"); v != "" {
+			f.writebackOver = v
+		}
+	}
 	// A runner named in the environment narrows the default pool, never one
 	// given with --pool.
 	if !f.changed("runner") && !f.changed("pool") {
@@ -139,7 +146,7 @@ func (f *runFlags) applyEnv() {
 // acquired: an unknown --writeback must never fall through to writing back.
 func (f *runFlags) validate() error {
 	// An explicitly empty value would silently mean "the default".
-	for name, empty := range map[string]bool{"sync": f.sync == "", "writeback": f.writeback == "", "runner": f.runner == "", "pool": len(f.pool) == 0} {
+	for name, empty := range map[string]bool{"sync": f.sync == "", "writeback": f.writeback == "", "writeback-over": f.writebackOver == "", "runner": f.runner == "", "pool": len(f.pool) == 0} {
 		if empty && f.changed(name) {
 			return fmt.Errorf("--%s needs a value", name)
 		}
@@ -149,6 +156,9 @@ func (f *runFlags) validate() error {
 	}
 	if f.writeback != "" && f.writeback != "always" && f.writeback != "on-success" && f.writeback != "never" {
 		return fmt.Errorf("--writeback must be always, on-success or never (got %q)", f.writeback)
+	}
+	if f.writebackOver != "" && f.writebackOver != "warn" && f.writebackOver != "hold" {
+		return fmt.Errorf("--writeback-over must be warn or hold (got %q)", f.writebackOver)
 	}
 	return nil
 }
@@ -421,6 +431,10 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 	if f.writeback != "" {
 		o.Writeback = f.writeback
 	}
+	o.WritebackLimits = client.WritebackLimits{MaxFiles: p.Sync.WritebackMaxFiles, MaxBytes: int64(p.Sync.WritebackMaxBytes), Hold: p.Sync.WritebackOver == "hold"}
+	if f.writebackOver != "" {
+		o.WritebackLimits.Hold = f.writebackOver == "hold"
+	}
 	if f.runner != "" {
 		o.Pool = []string{f.runner}
 	}
@@ -525,6 +539,9 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		summary += fmt.Sprintf(" · pulled %d modified file%s", n, plural(n))
 	}
 	summary += conflictNote(len(res.Conflicts))
+	if res.HeldFiles > 0 {
+		summary += fmt.Sprintf(" · held %d new file%s (%s) in the slot", res.HeldFiles, plural(res.HeldFiles), ui.Bytes(res.HeldBytes))
+	}
 	if s.syncOnly && res.Image != "" {
 		summary += " · image " + res.Image
 	}

@@ -258,6 +258,16 @@ func (r *recordingReporter) byName(name string) []map[string]any {
 	}
 	return out
 }
+
+// latest returns the fields of the last event named name, or nil.
+func (r *recordingReporter) latest(name string) map[string]any {
+	evs := r.byName(name)
+	if len(evs) == 0 {
+		return nil
+	}
+	return evs[len(evs)-1]
+}
+
 func (r *recordingReporter) Status(string, ...any) {}
 func (r *recordingReporter) Clear()                {}
 func (r *recordingReporter) Warn(code, format string, args ...any) {

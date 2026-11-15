@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,40 @@ func (d *Duration) UnmarshalText(b []byte) error {
 }
 
 func (d Duration) MarshalText() ([]byte, error) { return []byte(d.String()), nil }
+
+// Bytes is a size in bytes, written as a plain integer or with a binary unit:
+// "512KB", "100MB", "1.5GB" (KiB, MiB and GiB spell the same).
+type Bytes int64
+
+func (b *Bytes) UnmarshalText(t []byte) error {
+	v, err := ParseBytes(string(t))
+	if err != nil {
+		return err
+	}
+	*b = Bytes(v)
+	return nil
+}
+
+// ParseBytes reads a size: a plain integer of bytes, or a number with a
+// unit (B, KB, MB, GB; binary multiples, so "1MB" is 1,048,576 bytes).
+func ParseBytes(s string) (int64, error) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{{"KIB", 1 << 10}, {"MIB", 1 << 20}, {"GIB", 1 << 30}, {"KB", 1 << 10}, {"MB", 1 << 20}, {"GB", 1 << 30}, {"K", 1 << 10}, {"M", 1 << 20}, {"G", 1 << 30}, {"B", 1}} {
+		if strings.HasSuffix(t, u.suffix) {
+			t, mult = strings.TrimSpace(strings.TrimSuffix(t, u.suffix)), u.mult
+			break
+		}
+	}
+	f, err := strconv.ParseFloat(t, 64)
+	if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) || f*float64(mult) > math.MaxInt64/2 {
+		return 0, fmt.Errorf("invalid size %q (want bytes, or a number with KB, MB or GB)", s)
+	}
+	return int64(f * float64(mult)), nil
+}
 
 // Runner types.
 const (
@@ -176,7 +211,20 @@ type Sync struct {
 	PullArtifacts []string `toml:"pull_artifacts"`
 	GitSeed       bool     `toml:"git_seed"`
 	Source        string   `toml:"source"` // git|directory (auto when empty)
+	// A write-back bringing back more than WritebackMaxFiles files or
+	// WritebackMaxBytes bytes is over the limit (0: no limit). Over it,
+	// WritebackOver says what happens to the new files: warn brings them
+	// back with a warning, hold leaves them in the slot for spotexec pull.
+	WritebackMaxFiles int    `toml:"writeback_max_files"`
+	WritebackMaxBytes Bytes  `toml:"writeback_max_bytes"`
+	WritebackOver     string `toml:"writeback_over"` // warn|hold
 }
+
+// Write-back limit defaults.
+const (
+	DefaultWritebackMaxFiles = 1000
+	DefaultWritebackMaxBytes = 100 << 20
+)
 
 // Deps is [deps].
 type Deps struct {
@@ -753,6 +801,16 @@ func (p *Project) applyDefaults() {
 	if p.Sync.Writeback == "" {
 		p.Sync.Writeback = "always"
 	}
+	// An explicit 0 turns a limit off, so only a missing key gets the default.
+	if !p.md.IsDefined("sync", "writeback_max_files") {
+		p.Sync.WritebackMaxFiles = DefaultWritebackMaxFiles
+	}
+	if !p.md.IsDefined("sync", "writeback_max_bytes") {
+		p.Sync.WritebackMaxBytes = DefaultWritebackMaxBytes
+	}
+	if p.Sync.WritebackOver == "" {
+		p.Sync.WritebackOver = "warn"
+	}
 	if p.Deps.Hydrate == "" {
 		p.Deps.Hydrate = "auto"
 	}
@@ -773,6 +831,12 @@ func (p *Project) validate() error {
 	}
 	if !oneOf(p.Sync.Writeback, "always", "on-success", "never") {
 		return fmt.Errorf("sync.writeback must be always, on-success or never (got %q)", p.Sync.Writeback)
+	}
+	if !oneOf(p.Sync.WritebackOver, "warn", "hold") {
+		return fmt.Errorf("sync.writeback_over must be warn or hold (got %q)", p.Sync.WritebackOver)
+	}
+	if p.Sync.WritebackMaxFiles < 0 {
+		return fmt.Errorf("sync.writeback_max_files must be 0 (no limit) or more (got %d)", p.Sync.WritebackMaxFiles)
 	}
 	if !oneOf(p.Deps.Hydrate, "auto", "reflink", "copy", "hardlink") {
 		return fmt.Errorf("deps.hydrate must be auto, reflink, copy or hardlink (got %q)", p.Deps.Hydrate)
