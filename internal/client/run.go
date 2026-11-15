@@ -1321,7 +1321,8 @@ func markLost(cfg *config.Config, runner, id string) {
 // checks it before acquiring a runner: a working set over AbortFiles, a
 // container built from a Dockerfile whose build inputs aren't synced (exec,
 // PreferLast, reuses the image this worktree last built instead), and a
-// dependency install whose deps.lockfiles match no synced file (runDeps).
+// dependency install whose deps.lockfiles match no synced file or leave the
+// repository (runDeps).
 // m is nil when the run doesn't sync.
 func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Options) error {
 	if m != nil && len(m.Entries) > AbortFiles && !o.ForceLargeSync {
@@ -1340,16 +1341,14 @@ func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Option
 		if len(lockfiles) == 0 {
 			return errNoLockfiles
 		}
-		// The runner keys the cache on the synced copies (depskey.Key), so a
-		// literal entry that escapes the repository or isn't synced fails
-		// every install.
+		// The runner keys the cache on the files in its workspace
+		// (depskey.Key), so a literal entry that escapes the repository
+		// fails every install. Whether a literal one is there is the
+		// runner's to find: it may be reached through a synced symlinked
+		// directory, or kept in a cache directory, without a manifest entry.
 		for _, lf := range lockfiles {
-			rel, err := fsid.CleanRel(lf)
-			if err != nil {
+			if _, err := fsid.CleanRel(lf); err != nil {
 				return fmt.Errorf("deps.lockfiles: %w", err)
-			}
-			if _, ok := m.ByPath[rel]; !ok {
-				return fmt.Errorf("deps.lockfiles: %s is not a synced file, so the dependency cache can't key on it", lf)
 			}
 		}
 	}

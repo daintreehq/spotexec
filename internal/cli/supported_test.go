@@ -252,11 +252,6 @@ func TestSupported(t *testing.T) {
 			putFile(t, filepath.Join(d, "yarn.lock"), "{}\n")
 			return d
 		}, true},
-		{"deps lockfile literal not synced", sshRunner, func(t *testing.T) string {
-			d := initRepo(t)
-			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"package-lock.json\"]\n")
-			return d
-		}, false},
 		{"deps lockfile literal outside the repository", sshRunner, func(t *testing.T) string {
 			d := initRepo(t)
 			putFile(t, filepath.Join(d, ".spotexec.toml"), "version = 1\n[deps]\ninstall = \"npm ci\"\ncache_dirs = [\"node_modules\"]\nlockfiles = [\"../outside.lock\"]\n")
@@ -295,7 +290,6 @@ func TestSupported(t *testing.T) {
 		"container dockerfile without a sync":          "needs a synced workspace",
 		"container context outside the repository":     "container.context",
 		"deps lockfiles match nothing":                 "deps.lockfiles matches no synced file",
-		"deps lockfile literal not synced":             "package-lock.json is not a synced file",
 		"deps lockfile literal outside the repository": "deps.lockfiles: ",
 		"broken project config":                        ".spotexec.toml: unknown keys",
 		"no project config":                            "has no .spotexec.toml",
