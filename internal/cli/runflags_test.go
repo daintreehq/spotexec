@@ -85,6 +85,28 @@ func TestFlagsBeatEnv(t *testing.T) {
 	}
 }
 
+func TestFailOnConflictOptIn(t *testing.T) {
+	l := testLoaded()
+	t.Setenv("SPOTEXEC_FAIL_ON_CONFLICT", "")
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.FailOnConflict {
+		t.Error("on by default")
+	}
+	if o := parsed(t, "--fail-on-conflict").options(l, runSpec{command: "x"}, nil, nil, nil, nil); !o.FailOnConflict {
+		t.Error("--fail-on-conflict ignored")
+	}
+	t.Setenv("SPOTEXEC_FAIL_ON_CONFLICT", "1")
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); !o.FailOnConflict {
+		t.Error("SPOTEXEC_FAIL_ON_CONFLICT=1 ignored")
+	}
+	if o := parsed(t, "--fail-on-conflict=false").options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.FailOnConflict {
+		t.Error("SPOTEXEC_FAIL_ON_CONFLICT=1 beat --fail-on-conflict=false")
+	}
+	t.Setenv("SPOTEXEC_FAIL_ON_CONFLICT", "0")
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.FailOnConflict {
+		t.Error("SPOTEXEC_FAIL_ON_CONFLICT=0 turned it on")
+	}
+}
+
 func TestSyncAndExecPinTheirSyncMode(t *testing.T) {
 	l := testLoaded()
 	t.Setenv("SPOTEXEC_SYNC", "none")
@@ -133,7 +155,7 @@ func project(t *testing.T, toml string) string {
 	}
 	t.Setenv("SPOTEXEC_CONFIG", cfg)
 	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
-	for _, k := range []string{"SPOTEXEC_SYNC", "SPOTEXEC_RUNNER", "SPOTEXEC_POOL", "SPOTEXEC_JSON", "SPOTEXEC_AGENT", "SPOTEXEC_SAME_SLOT", "SPOTEXEC_PRIORITY", "SPOTEXEC_TIMEOUT"} {
+	for _, k := range []string{"SPOTEXEC_SYNC", "SPOTEXEC_RUNNER", "SPOTEXEC_POOL", "SPOTEXEC_JSON", "SPOTEXEC_AGENT", "SPOTEXEC_SAME_SLOT", "SPOTEXEC_PRIORITY", "SPOTEXEC_TIMEOUT", "SPOTEXEC_FAIL_ON_CONFLICT"} {
 		t.Setenv(k, "")
 	}
 	return dir

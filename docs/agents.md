@@ -13,7 +13,7 @@ src/index.ts 41ms
 sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
 ```
 
-Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)).
+Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)). When you edit a file while a run that changes it is still going, write-back keeps your version: the summary line then ends `· 1 conflict`, and the run still exits `0`. Set `SPOTEXEC_FAIL_ON_CONFLICT=1` (or pass `--fail-on-conflict`) to have such a run exit `122` instead, so a harness that only checks the exit status sees that the command's changes didn't all land.
 
 The parts of a [parallel or sharded task](configuration.md#tasks) run at once. With `SPOTEXEC_AGENT=1` and stdout not a terminal, each part's output is held and printed as one block when the part finishes, still prefixed `[test-all 3/8]`, so one shard's failure reads in one place instead of spread across the interleaved lines of every shard. `sx --group=false <task>` keeps the live output.
 

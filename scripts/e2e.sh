@@ -179,13 +179,21 @@ for case in session install; do
 done
 
 echo "== conflicts"
-("$SX" --json 'sleep 2; echo remote > src/a.txt' >/dev/null 2>"$WORK/conf.err") &
+("$SX" --json 'sleep 2; echo remote > src/a.txt' >/dev/null 2>"$WORK/conf.err"; echo $? >"$WORK/conf.code") &
 sleep 1; echo "local edit" > src/a.txt; wait
+check "a conflict alone keeps the command's exit 0" "[ \$(cat $WORK/conf.code) = 0 ]"
+check "the result event counts the conflict" "grep '\"event\":\"result\"' $WORK/conf.err | grep -q '\"conflict_count\":1'"
 check "concurrent local edit is kept" "grep -qx 'local edit' src/a.txt"
 check "remote version stashed" "ls .git/spotexec/conflicts/*/src/a.txt >/dev/null 2>&1"
 check "SYNC_CONFLICT reported" "grep -q SYNC_CONFLICT $WORK/conf.err"
 D=$(grep '"event":"conflict"' "$WORK/conf.err" | sed 's/.*"diff":"\([^"]*\)".*/\1/' | head -1)
 check "the conflict event's diff command shows the remote change" "[ -n \"\$D\" ] && { eval \"\$D\" || true; } | grep -qx '+remote'"
+("$SX" -q --fail-on-conflict 'sleep 2; echo remote2 > src/a.txt' >/dev/null 2>&1; echo $? >"$WORK/conf2.code") &
+sleep 1; echo "local edit 2" > src/a.txt; wait
+check "--fail-on-conflict: a successful run whose write-back conflicted exits 122" "[ \$(cat $WORK/conf2.code) = 122 ] && grep -qx 'local edit 2' src/a.txt"
+(SPOTEXEC_FAIL_ON_CONFLICT=1 "$SX" -q --writeback always 'sleep 2; echo remote3 > src/a.txt; exit 3' >/dev/null 2>&1; echo $? >"$WORK/conf3.code") &
+sleep 1; echo "local edit 3" > src/a.txt; wait
+check "SPOTEXEC_FAIL_ON_CONFLICT=1: a failed command keeps its own exit code" "[ \$(cat $WORK/conf3.code) = 3 ]"
 
 echo "== concurrency (max_slots=3, 4 jobs)"
 for i in 1 2 3 4; do "$SX" --json "sleep 1.5; echo slot=\$SPOTEXEC_SLOT" >"$WORK/p$i.out" 2>"$WORK/p$i.err" & done; wait

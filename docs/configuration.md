@@ -32,6 +32,7 @@ Unknown `--sync` and `--writeback` values (from flags or the environment) are re
 | `SPOTEXEC_POOL` | `--pool` (comma-separated runner names). |
 | `SPOTEXEC_PRIORITY` | `--priority`. |
 | `SPOTEXEC_SAME_SLOT=1` | `--same-slot`: every `sx` in that shell returns to this worktree's last slot. |
+| `SPOTEXEC_FAIL_ON_CONFLICT=1` | `--fail-on-conflict`: a run whose write-back conflicted exits `122` instead of `0`. |
 | `SPOTEXEC_JSON=1` | `--json`. |
 | `SPOTEXEC_AGENT=1` | NDJSON events by default, for agent harnesses. |
 | `SPOTEXEC_CONFIG`, `SPOTEXEC_CONFIG_DIR` | The global config file, or its directory (default `~/.config/spotexec`, or under `XDG_CONFIG_HOME`). |
