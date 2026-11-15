@@ -13,7 +13,7 @@ src/index.ts 41ms
 sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
 ```
 
-Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)).
+Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)). When you edit a file while a run that changes it is still going, write-back keeps your version: the summary line then counts it (`· 1 conflict`), as does `conflict_count` in the `result` event with `--json` or `SPOTEXEC_AGENT=1`, but the exit status stays the command's own, `0` when it succeeded. Set `SPOTEXEC_FAIL_ON_CONFLICT=1` (or pass `--fail-on-conflict`) to have an otherwise successful run exit `122` instead, so a harness that only checks the exit status sees that the command's changes didn't all land.
 
 The parts of a [parallel or sharded task](configuration.md#tasks) run at once. With `SPOTEXEC_AGENT=1` and stdout not a terminal, each part's output is held and printed as one block when the part finishes, still prefixed `[test-all 3/8]`, so one shard's failure reads in one place instead of spread across the interleaved lines of every shard. `sx --group=false <task>` keeps the live output.
 
@@ -29,13 +29,13 @@ sx: ci · 2 of 9 parts failed (unit 2/8, unit 6/8) · 11m52s · exit 1
 
 ## Checking for spotexec
 
-`spotexec supported` prints `true` and exits 0 when a run from the current directory would reach a runner: the project has a valid `.spotexec.toml` (here or above, up to the repository root), it isn't in a directory spotexec never syncs (your home directory, `/` or a credential directory), and a runner is configured for it. Otherwise it prints `false` and exits 1, so an agent or script can choose between `sx` and running locally:
+`spotexec supported` prints `true` and exits 0 when a run from the current directory would reach a runner: the project has a valid `.spotexec.toml` (here or above, up to the repository root), it isn't in a directory spotexec never syncs (your home directory, `/` or a credential directory), a runner is configured for it, and the working set passes the checks a run makes on the local files (it is within the file-count limit, a `container.dockerfile` and its build inputs are synced, and `deps.lockfiles` name at least one lockfile, none outside the repository). Whether a runner is reachable, the transfer fits, and the image builds and dependencies install, only a run finds out. Otherwise it prints `false` and exits 1, so an agent or script can choose between `sx` and running locally:
 
 ```sh
 if spotexec supported >/dev/null; then sx pnpm test; else pnpm test; fi
 ```
 
-`-C DIR` checks another directory. To find out why it says `false`, run `spotexec doctor` from that directory.
+`-C DIR` checks another directory. When it says `false`, the reason goes to stderr as one `spotexec:` line, so a broken config doesn't silently send every command to a local run; `-q` (`--quiet`) leaves it out. `spotexec doctor`, run from that directory, checks the config and runners in full.
 
 ## Same machine, next command
 
@@ -62,8 +62,10 @@ Other events include:
 - `manifest`, `deps`, `image`, `exec`, `pull`, `cancel`;
 - `deps_failed` when the dependency install fails: the error's `code` and `message`, the install's last 40 lines (`output_tail`, `output_truncated` when earlier lines were left out) and the full `log` on this machine. The install's output never reaches the command's stdout or stderr, in any mode; a successful `deps` event also has its `log` when the install ran;
 - `spot_interruption`, `spot_rebalance`, `retry`;
+- `large_writeback` before a write-back over its limit transfers anything (`files`, `bytes`, `new_files`, `changed_files`, and the `largest` paths, each with its `files` and `bytes`), and `writeback_held` when the new files stay in the slot instead (`files`, `bytes`, `largest`, `run_id`); `sync_out` and the result's `held_files` and `held_bytes` count them. Set `SPOTEXEC_WRITEBACK_OVER=hold` to never have a run flood the worktree; see [write-back limits](running.md#write-back-limits);
 - `conflict`, one per write-back conflict: your kept file (`local`), the stashed remote version (`remote`, a marker when `deleted` is true), and a `diff` command to see the remote changes;
-- `warning` events with stable codes (`SYNC_CONFLICT`, `RUNNER_LOST`, `SPOT_INTERRUPTION`, `TIMEOUT`, `LOCAL_FALLBACK`, `RTK_FILTER`, …);
+- `outside_symlink`, one per symlink write-back created or retargeted to point outside the worktree: the link's `path` and its `target`, with a `WRITEBACK_SYMLINK` warning naming them;
+- `warning` events with stable codes (`SYNC_CONFLICT`, `SYNC_COLLISION`, `LARGE_WRITEBACK`, `WRITEBACK_HELD`, `RUNNER_LOST`, `SPOT_INTERRUPTION`, `TIMEOUT`, `LOCAL_FALLBACK`, `RTK_FILTER`, `STDIN_IGNORED`, …). `UNKNOWN_TASK` follows an exit 127 of `sx <word>` (no `--`) when the word is a plain name, no task has it, and the shell found no command by that name: its message names the closest task when exactly one is near, and `spotexec tasks` lists them all;
 - `error` with code `SPOTEXEC_ERROR` when spotexec itself fails (exit `125`). For example, a `BOOTSTRAP_FAILED` message.
 
 ## Claude Code hook
@@ -88,14 +90,14 @@ The `[hook]` table tunes it:
 - `mode = "block"` denies the command with instructions, instead of rewriting it;
 - `disabled = true` turns it off.
 
-A hook that v0.2.0 installed as `sx hook claude` still works the same way; `spotexec setup` and `spotexec hook install` rewrite it in place to call `spotexec`.
+A hook that v0.2.0 installed as `sx hook claude` still works the same way; `spotexec setup` (unless `--no-hooks`) and `spotexec hook install` rewrite it in place to call `spotexec`.
 
 ### With RTK
 
 [RTK](https://github.com/rtk-ai/rtk) compacts command output for agents with a PreToolUse hook of its own, `rtk hook claude`, which rewrites many of the same commands (`cargo test` to `rtk cargo test`). Claude Code runs every matching hook on the original command and doesn't say which rewrite wins. With both hooks installed side by side, a test run would either stay local or come back uncompacted, whichever hook won.
 
 So only one hook decides:
-- **Chained.** `spotexec hook install` and `spotexec setup` find RTK's hook in the settings file they install into and chain it behind spotexec's, in place: `spotexec hook claude --then 'rtk hook claude'`. spotexec decides first. Every command it doesn't offload goes to RTK unchanged, and so does every command outside a project with a `.spotexec.toml`. `--uninstall` puts RTK's own hook back. RTK doesn't recognise the chained form, so it may say `No hook installed — run rtk init -g` even though `rtk verify` passes. If `rtk init -g` adds RTK's hook again, run `spotexec hook install --claude --global` to fold it back into the chain.
+- **Chained.** `spotexec hook install`, and `spotexec setup` when it installs or keeps up spotexec's hook (not with `--no-hooks`), find RTK's hook in the settings file they install into and chain it behind spotexec's, in place: `spotexec hook claude --then 'rtk hook claude'`. spotexec decides first. Every command it doesn't offload goes to RTK unchanged, and so does every command outside a project with a `.spotexec.toml`. `--uninstall` puts RTK's own hook back. RTK doesn't recognise the chained form, so it may say `No hook installed — run rtk init -g` even though `rtk verify` passes. If `rtk init -g` adds RTK's hook again, run `spotexec hook install --claude --global` to fold it back into the chain.
 - **Not chained.** RTK's hook may be in a different file, say `~/.claude/settings.json` when spotexec's is in the project. Then a command RTK would also rewrite is denied, and the reason tells the agent to run the offloaded form, which RTK leaves alone. The first denial in a session tells you which `spotexec hook install` command chains them. `spotexec hook check` shows when this would happen.
 
 Where RTK is in use, offloaded output is still compacted. `rtk pipe` runs on this machine once the command finishes, through `spotexec run --rtk-filter <filter>`. The exit code stays the command's own, and spotexec's warnings and summary still reach stderr. If the command fails, the output ends with `[full output: <path>]` (the last 20 are kept). If RTK fails, the output is printed unfiltered with an `RTK_FILTER` warning. The hook adds `--rtk-filter` only for the commands whose raw output RTK's filters are known to read correctly:

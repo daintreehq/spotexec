@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/daintreehq/spotexec/internal/client"
 )
 
 func TestTaskRecap(t *testing.T) {
@@ -43,9 +45,9 @@ func TestTaskRecap(t *testing.T) {
 	local := shard(1, partPassed, 0, "", 0)
 	local.local = true
 	b, _ := json.Marshal(resultParts([]partOutcome{outs[2], outs[3], local}))
-	if want := `[{"duration_ms":90000,"exit_code":130,"label":"unit 3/4","runner":"aws","shard":3,"shards":4,"slot":0,"status":"stopped","task":"unit"},` +
-		`{"duration_ms":90000,"exit_code":125,"label":"unit 4/4","shard":4,"shards":4,"status":"failed","task":"unit"},` +
-		`{"duration_ms":90000,"exit_code":0,"label":"unit 1/4","local":true,"shard":1,"shards":4,"status":"passed","task":"unit"}]`; string(b) != want {
+	if want := `[{"conflict_count":0,"duration_ms":90000,"exit_code":130,"label":"unit 3/4","runner":"aws","shard":3,"shards":4,"slot":0,"status":"stopped","task":"unit"},` +
+		`{"conflict_count":0,"duration_ms":90000,"exit_code":125,"label":"unit 4/4","shard":4,"shards":4,"status":"failed","task":"unit"},` +
+		`{"conflict_count":0,"duration_ms":90000,"exit_code":0,"label":"unit 1/4","local":true,"shard":1,"shards":4,"status":"passed","task":"unit"}]`; string(b) != want {
 		t.Errorf("parts:\n%s\nwant:\n%s", b, want)
 	}
 }
@@ -69,6 +71,77 @@ func TestTaskVerdict(t *testing.T) {
 	} {
 		if got := taskVerdict("all", c.outs, c.exit, c.interrupted, 5*time.Second); got != c.want {
 			t.Errorf("got %q, want %q", got, c.want)
+		}
+	}
+}
+
+// A part whose write-back conflicted says so on its own row, in the verdict
+// and in the result event, whether or not the conflict failed it.
+func TestTaskRecapConflicts(t *testing.T) {
+	part := func(label, status string, code, conflicts int) partOutcome {
+		return partOutcome{part: taskPart{name: label, label: label}, status: status, code: code, took: 2 * time.Second, runner: "aws", slot: 1, conflicts: conflicts}
+	}
+	outs := []partOutcome{
+		part("fmt", partFailed, client.ExitWritebackConflict, 2),
+		part("lint", partPassed, 0, 1),
+		part("test", partPassed, 0, 0),
+	}
+	var got []string
+	for _, o := range recapOrder(outs) {
+		got = append(got, o.recapLine())
+	}
+	want := []string{
+		"fmt · failed · 2.0s on aws#1 · 2 conflicts · exit 122",
+		"lint · passed · 2.0s on aws#1 · 1 conflict",
+		"test · passed · 2.0s on aws#1",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("recap:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if v := taskVerdict("all", outs, 122, false, 5*time.Second); v != "all · 1 of 3 parts failed (fmt) · 3 conflicts · 5.0s · exit 122" {
+		t.Errorf("verdict: %q", v)
+	}
+	if v := taskVerdict("all", outs[1:], 0, false, 5*time.Second); v != "all · 2 parts passed · 1 conflict · 5.0s" {
+		t.Errorf("passing verdict: %q", v)
+	}
+	if n := totalConflicts(outs); n != 3 {
+		t.Errorf("total conflicts %d, want 3", n)
+	}
+	var parts []struct {
+		Count int `json:"conflict_count"`
+	}
+	b, _ := json.Marshal(resultParts(outs))
+	if err := json.Unmarshal(b, &parts); err != nil || len(parts) != 3 || parts[0].Count != 2 || parts[1].Count != 1 || parts[2].Count != 0 {
+		t.Errorf("part results' conflict counts: %s", b)
+	}
+	if got := outs[0].doneLine(3 * time.Second); got != "fmt · 2.0s on aws#1 · installed dependencies (3.0s) · 2 conflicts · exit 122" {
+		t.Errorf("done line: %q", got)
+	}
+	if got := outs[1].doneLine(0); got != "lint · 2.0s on aws#1 · 1 conflict" {
+		t.Errorf("done line: %q", got)
+	}
+}
+
+func TestTaskExit(t *testing.T) {
+	part := func(status string, code int) partOutcome { return partOutcome{status: status, code: code} }
+	for _, c := range []struct {
+		name        string
+		outs        []partOutcome
+		interrupted bool
+		want        int
+	}{
+		{"all passed", []partOutcome{part(partPassed, 0), part(partPassed, 0)}, false, 0},
+		{"first failure in task order", []partOutcome{part(partFailed, 2), part(partFailed, 1)}, false, 2},
+		{"first failure, not the largest", []partOutcome{part(partFailed, 1), part(partFailed, 2)}, false, 1},
+		{"125 over a larger code", []partOutcome{part(partFailed, 126), part(partFailed, client.ExitInfra)}, false, client.ExitInfra},
+		{"a conflict-only failure counts", []partOutcome{part(partPassed, 0), part(partFailed, client.ExitWritebackConflict)}, false, client.ExitWritebackConflict},
+		{"125 outranks an earlier failure", []partOutcome{part(partFailed, client.ExitWritebackConflict), part(partFailed, client.ExitInfra)}, false, client.ExitInfra},
+		{"125 stays over a later failure", []partOutcome{part(partFailed, client.ExitInfra), part(partFailed, 1)}, false, client.ExitInfra},
+		{"stopped parts don't count", []partOutcome{part(partStopped, 130), part(partPassed, 0)}, false, 0},
+		{"interrupted wins", []partOutcome{part(partFailed, client.ExitInfra)}, true, client.ExitInterrupted},
+	} {
+		if got := taskExit(c.outs, c.interrupted); got != c.want {
+			t.Errorf("%s: %d, want %d", c.name, got, c.want)
 		}
 	}
 }

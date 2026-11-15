@@ -43,9 +43,9 @@ var BuiltinExcludes = []string{
 // NeverSync is never synced from untracked/non-Git sources, whatever the
 // project config says (not even where Options.Include lifts the built-in
 // excludes): credential directories, and spotexec's own state in a non-Git
-// project's .spotexec/ (write-back lock, stashed conflicts). It is matched
+// project's .spotexec/ (write-back lock, stashed conflicts, backups). It is matched
 // case-insensitively, as macOS and Windows filesystems resolve it.
-var NeverSync = append(append([]string{}, config.CredentialDirs...), "/.spotexec/conflicts/", "/.spotexec/writeback.lock")
+var NeverSync = append(append([]string{}, config.CredentialDirs...), "/.spotexec/conflicts/", "/.spotexec/backup/", "/.spotexec/writeback.lock")
 
 var textAttr = regexp.MustCompile(`(^|\s)-?(text|crlf)(=|\s|$)`)
 
@@ -535,6 +535,12 @@ func (m *Manifest) CheckIgnored(ctx context.Context, paths []string) (map[string
 	for _, p := range rest {
 		if builtin.Match(p, false) {
 			ign[p] = true
+			continue
+		}
+		// Git refuses a path beyond a symlink (exit 128) and would fail the
+		// whole batch: such a path can't be written here, so it is answered
+		// alone as not ignored and write-back reports it.
+		if _, err := fsid.SafeJoin(m.Root, p); errors.Is(err, fsid.ErrSymlinkParent) {
 			continue
 		}
 		// "./" keeps a name like ":(literal)x" from being read as pathspec

@@ -11,6 +11,8 @@ sx --same-slot <command>              # run on the same VM and slot as this work
 
 `sx` stops reading its own flags at the first word that isn't one, so `sx pnpm vitest run --watch=false` passes everything after `pnpm` through unchanged. Several arguments are shell-quoted one by one, except leading `NAME=value` words, which stay environment assignments whatever the value holds: `sx NODE_OPTIONS="--max-old-space-size=8192 --no-warnings" pnpm test`. A single argument runs as a shell line, as in `sx 'pnpm lint && pnpm test'`. Absolute paths under your worktree are mapped to the remote workspace.
 
+The command's stdin is `/dev/null`, on a runner and in a local fallback alike: input piped or redirected into `sx` is not forwarded. `echo "x y" | sx -- cat` prints nothing, and `git diff | sx -- some-linter --stdin` checks nothing. When spotexec's own stdin holds unread input (a file, or a pipe with data in it) before or after the run, it warns `STDIN_IGNORED`, once, and the exit code stays the command's own. An empty pipe, as some agent harnesses pass, gets no warning. The check is best effort: a writer that only starts writing after the command finishes isn't seen. To give the command input, write it to a file in the project first and pass the path: `git diff > changes.diff && sx -- some-linter changes.diff`.
+
 The synced project is the enclosing Git worktree, or the nearest directory with a `.spotexec.toml`. Anywhere else, spotexec refuses to sync: it won't upload, say, your home directory with `~/.aws` and `~/.ssh` in it. Run `spotexec init` to mark a non-Git directory as a project (it asks first, or takes `--yes`), or use `--sync none`. The home directory, `/` and anything inside `.aws`, `.ssh` or `.gnupg` are never projects, Git or not: `init` refuses them, a `.spotexec.toml` there is ignored, and `sx` won't sync them. Credential directories (`.aws`, `.ssh`, `.gnupg`) never sync unless Git tracks them, whatever `.spotexec.toml` says.
 
 ## Coming back to the same machine
@@ -39,6 +41,8 @@ A parallel or sharded task's parts run in several slots at once, so `--same-slot
 | `--queue-timeout D` | How long to wait for a free slot (default `10m`, or the project `queue_timeout`). |
 | `--sync auto\|in\|none` | `auto` syncs and writes back; `in` syncs and discards changes; `none` runs on whatever the slot has. |
 | `--writeback always\|on-success\|never` | When changes come back. |
+| `--fail-on-conflict` | Exit `122` when the command succeeded but write-back kept a local edit over one of its changes (`SYNC_CONFLICT`), so a caller that only reads the exit status knows the changes didn't all land. Also `SPOTEXEC_FAIL_ON_CONFLICT=1`. See [write-back](#write-back-and-artifacts). |
+| `--writeback-over warn\|hold` | Over the [write-back limit](#write-back-limits): bring everything back with a warning, or leave the new files in the slot. |
 | `-r, --runner NAME` / `--pool A,B` | Restrict where the command may run. |
 | `--same-slot` | Run in this worktree's last slot (same VM), waiting if it's busy. See [above](#coming-back-to-the-same-machine). |
 | `--exclusive` | Take every slot on a machine (the job gets all its CPUs). |
@@ -98,6 +102,7 @@ The runner itself needs `git` installed, even when commands run in a project con
 | --- | --- |
 | *command's own* | The remote command's exit status, passed through. |
 | `1` | Also: the project's [`[setup]`](configuration.md#setup) failed (`SETUP_FAILED`), so the command never ran. |
+| `122` | With `--fail-on-conflict` (or `SPOTEXEC_FAIL_ON_CONFLICT=1`) only: the command exited `0`, but write-back kept your version of at least one file it changed (`SYNC_CONFLICT`). A command that failed, timed out or was interrupted keeps its own code. In a parallel or sharded task the part counts as failed, so `fail_fast` stops the rest. |
 | `124` | The command hit `--timeout`, or `[setup]` hit its timeout. |
 | `125` | spotexec itself failed: no runner, SSH, sync, bootstrap, or the runner couldn't start the command at all. In a parallel or sharded task, a `125` outranks a test failure, so agents can tell "tests failed" from "couldn't run tests". A Spot VM lost mid-run is replayed once on another slot (unless `--no-retry`), but not when its heartbeats showed it out of memory (`MEMORY_PRESSURE`), or when EC2 still reports it running and it gave no Spot notice (`RUNNER_UNRESPONSIVE`): the run may be what overloaded it, and replayed it could take another VM's jobs down with it. |
 | `128+N` | The command died from signal N. An `OOM_KILLED` warning (with `137`, SIGKILL, when the killed process was the command itself) means the kernel killed a process in the command's container because the VM's jobs together reached their [memory pool](environments.md#settings)'s cap and it was the largest (or, outside the pool, because the container reached a memory limit set in `container.options`, or the whole VM ran out): the command ran out of memory, and the run isn't replayed. `134` (SIGABRT) with `JavaScript heap out of memory` or `Ineffective mark-compacts near heap limit` in the output is Node's own heap limit, not the machine's: raise `--max-old-space-size`. |
@@ -112,8 +117,15 @@ The manifest records the Git blob ID of every synced file: the **baseline**. Aft
 | Equals the remote result | Nothing to do. |
 | Equals the baseline | The remote version is applied atomically (temp file, then rename). Your file keeps its permissions; only an executable-bit change made remotely comes back. |
 | Anything else | You edited it during the run. **Your file is kept**, the remote version is saved to `<git-dir>/spotexec/conflicts/<run-id>/<path>`, and a `SYNC_CONFLICT` warning gives a ready-to-run `git diff --no-index` command comparing your file with the remote version. With `--json`, a `conflict` event carries both paths and that command. |
+| Another path of the run's file | Two remote names are one file here: the filesystem ignores case or Unicode normalisation (macOS does by default), so `src/Dup.txt` opens `src/DUP.txt`. The file under the local name is kept, the other remote version is saved to the same conflicts directory, and a `SYNC_COLLISION` warning names both paths, says which version was kept, and gives the same `git diff --no-index` command. Its `conflict` event carries the other path as `with`. |
 
-Deletions apply deepest-first, then writes. New files only come back if Git wouldn't ignore them (created no more permissively than your umask allows), so `dist/`, `target/` and `node_modules` never travel back. A runner can never write into `.git`, under any spelling.
+The summary line counts the conflicts (`· 1 conflict`), and every `result` event carries `conflict_count` (a parallel or sharded task's also has each part's in `parts`). The exit status is still the command's own, since its other changes did land; with `--fail-on-conflict` a run that would have exited `0` exits `122` instead. A conflict never rolls back what was applied.
+
+Before write-back deletes or replaces a local file, it checks whether Git could give that version back: HEAD holds the same path with the same content and mode. If not (an untracked file, an uncommitted or staged edit, or any file outside Git), your version is first copied to `<git-dir>/spotexec/backup/<run-id>/<path>` (`.spotexec/backup/<run-id>/` outside Git), and a `WRITEBACK_BACKUP` warning says where. So a remote `git checkout -- .`, `git clean` or `rm -rf` never takes work that exists only on this machine. With `--json`, a `backup` event lists the files and the directory. Backups, like conflicts, stay until you remove them.
+
+Some deletions are held back: the local file is kept, and a `WRITEBACK_HELD` warning names it (with `--json`, a `held_deletions` event). That happens to the project's own root `.spotexec.toml` and `.gitignore`, and to every deletion of a run that deleted at least 5 files and at least half of the synced files. If the deletion was intended, delete the files yourself.
+
+Deletions apply deepest-first, then writes. New files only come back if Git wouldn't ignore them (created no more permissively than your umask allows), so `dist/`, `target/` and `node_modules` never travel back. A runner can never write into `.git`, under any spelling. Symlinks come back as symlinks; one the run created or retargeted to point outside the worktree (an absolute target, one that climbs above the root, or one that leads out through another link) is applied with a `WRITEBACK_SYMLINK` warning naming each link and its target, and with `--json` an `outside_symlink` event per link.
 
 A new file the run created that doesn't come back (`--writeback never`, `--sync in`, a failed `on-success` run, a `--sync none` run, a dropped connection) stays in the slot until the next run that syncs into it, which removes it. Until then `spotexec exec` and `sx -s --sync none` can still look at it. Ignored outputs and `cache_dirs` are kept, like any build cache.
 
@@ -122,4 +134,12 @@ To get **ignored outputs** back (coverage reports, build output), use one of:
 - `pull_artifacts` in `.spotexec.toml`;
 - `spotexec pull <glob>` afterwards, from the last-used slot (`--dest DIR` to land them elsewhere).
 
-Pulled files never overwrite tracked or non-ignored files, and never land in another repository or a git directory.
+Pulled files never overwrite tracked or non-ignored files, and never land in another repository or a git directory. The one exception is files a write-back [held](#write-back-limits).
+
+### Write-back limits
+
+A command that dumps a heap snapshot, a coverage tree or generated fixtures where Git doesn't ignore them would otherwise flood the worktree, and every later run would upload them again. So a write-back bringing back more than `writeback_max_files` files (default 1000) or `writeback_max_bytes` bytes (default 100 MB) warns before it transfers anything, with `LARGE_WRITEBACK` naming the largest paths: single files, and directories with how many files they hold. Set either limit to `0` to turn it off.
+
+With `writeback_over = "hold"` in `[sync]` (or `--writeback-over hold`, or `SPOTEXEC_WRITEBACK_OVER=hold`), new files over the limit stay in the slot instead: none of them comes back, and a `WRITEBACK_HELD` warning says how many, how big and where. Changes to and deletions of files you synced still come back as usual, so a formatter rewriting 5,000 files only warns. Only the new files count toward holding, so a command that moves a directory gets its deletions applied while the moved files wait in the slot.
+
+`spotexec pull --held` brings the held files back (`spotexec pull --held gen/` only some of them), and `spotexec pull <glob>` takes held files along with ignored outputs. A held file only lands where nothing is now, and only as the run left it; Git still mustn't track it. Get them before the next run that syncs into the slot, which removes them. They come from the slot `spotexec pull` reads, the last one this worktree used, so held files of the other parts of a parallel task can't be pulled.

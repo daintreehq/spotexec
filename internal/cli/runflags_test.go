@@ -85,6 +85,28 @@ func TestFlagsBeatEnv(t *testing.T) {
 	}
 }
 
+func TestFailOnConflictOptIn(t *testing.T) {
+	l := testLoaded()
+	t.Setenv("SPOTEXEC_FAIL_ON_CONFLICT", "")
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.FailOnConflict {
+		t.Error("on by default")
+	}
+	if o := parsed(t, "--fail-on-conflict").options(l, runSpec{command: "x"}, nil, nil, nil, nil); !o.FailOnConflict {
+		t.Error("--fail-on-conflict ignored")
+	}
+	t.Setenv("SPOTEXEC_FAIL_ON_CONFLICT", "1")
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); !o.FailOnConflict {
+		t.Error("SPOTEXEC_FAIL_ON_CONFLICT=1 ignored")
+	}
+	if o := parsed(t, "--fail-on-conflict=false").options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.FailOnConflict {
+		t.Error("SPOTEXEC_FAIL_ON_CONFLICT=1 beat --fail-on-conflict=false")
+	}
+	t.Setenv("SPOTEXEC_FAIL_ON_CONFLICT", "0")
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.FailOnConflict {
+		t.Error("SPOTEXEC_FAIL_ON_CONFLICT=0 turned it on")
+	}
+}
+
 func TestSyncAndExecPinTheirSyncMode(t *testing.T) {
 	l := testLoaded()
 	t.Setenv("SPOTEXEC_SYNC", "none")
@@ -101,7 +123,7 @@ func TestSyncAndExecPinTheirSyncMode(t *testing.T) {
 }
 
 func TestValidateRejectsUnknownValues(t *testing.T) {
-	for _, args := range [][]string{{"--writeback", "nevre"}, {"--sync", "bogus"}, {"--writeback="}, {"--sync="}, {"--runner="}, {"--pool="}} {
+	for _, args := range [][]string{{"--writeback", "nevre"}, {"--sync", "bogus"}, {"--writeback="}, {"--sync="}, {"--runner="}, {"--pool="}, {"--writeback-over", "drop"}, {"--writeback-over="}} {
 		if err := parsed(t, args...).validate(); err == nil {
 			t.Errorf("%v accepted", args)
 		}
@@ -111,7 +133,12 @@ func TestValidateRejectsUnknownValues(t *testing.T) {
 		t.Error("SPOTEXEC_SYNC=bogus accepted")
 	}
 	t.Setenv("SPOTEXEC_SYNC", "")
-	for _, args := range [][]string{{"--writeback", "on-success", "--sync", "in"}, {"--writeback", "never"}, {}} {
+	t.Setenv("SPOTEXEC_WRITEBACK_OVER", "bogus")
+	if err := parsed(t).validate(); err == nil {
+		t.Error("SPOTEXEC_WRITEBACK_OVER=bogus accepted")
+	}
+	t.Setenv("SPOTEXEC_WRITEBACK_OVER", "")
+	for _, args := range [][]string{{"--writeback", "on-success", "--sync", "in"}, {"--writeback", "never"}, {"--writeback-over", "warn"}, {"--writeback-over", "hold"}, {}} {
 		if err := parsed(t, args...).validate(); err != nil {
 			t.Errorf("%v rejected: %v", args, err)
 		}
@@ -133,25 +160,38 @@ func project(t *testing.T, toml string) string {
 	}
 	t.Setenv("SPOTEXEC_CONFIG", cfg)
 	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
-	for _, k := range []string{"SPOTEXEC_SYNC", "SPOTEXEC_RUNNER", "SPOTEXEC_POOL", "SPOTEXEC_JSON", "SPOTEXEC_AGENT", "SPOTEXEC_SAME_SLOT", "SPOTEXEC_PRIORITY", "SPOTEXEC_TIMEOUT"} {
+	for _, k := range []string{"SPOTEXEC_SYNC", "SPOTEXEC_RUNNER", "SPOTEXEC_POOL", "SPOTEXEC_JSON", "SPOTEXEC_AGENT", "SPOTEXEC_SAME_SLOT", "SPOTEXEC_PRIORITY", "SPOTEXEC_TIMEOUT", "SPOTEXEC_FAIL_ON_CONFLICT", "SPOTEXEC_WRITEBACK_OVER"} {
 		t.Setenv(k, "")
 	}
 	return dir
 }
 
 // runMain runs a CLI entry point and returns its exit code and stderr.
+// Whatever the test binary was given as stdin, the run sees none, so no
+// STDIN_IGNORED warning depends on how the tests were started.
 func runMain(t *testing.T, name string, args ...string) (int, string) {
+	t.Helper()
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	return runMainStdin(t, null, name, args...)
+}
+
+// runMainStdin is runMain with stdin as the CLI's stdin.
+func runMainStdin(t *testing.T, stdin *os.File, name string, args ...string) (int, string) {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := os.Stderr
-	os.Stderr = w
+	old, oldIn := os.Stderr, os.Stdin
+	os.Stderr, os.Stdin = w, stdin
 	out := make(chan string)
 	go func() { b, _ := io.ReadAll(r); out <- string(b) }()
 	code := MainAs(name, args)
-	os.Stderr = old
+	os.Stderr, os.Stdin = old, oldIn
 	w.Close()
 	return code, <-out
 }
@@ -317,5 +357,38 @@ func TestGroupedOutputPrecedence(t *testing.T) {
 		if got := parsed(t, c.args...).grouped(&config.Task{Group: c.task}, c.agent); got != c.want {
 			t.Errorf("%v task=%v agent=%v: got %v", c.args, c.task, c.agent, got)
 		}
+	}
+}
+
+// The project's write-back limits reach the run; SPOTEXEC_WRITEBACK_OVER
+// beats the project's writeback_over, and --writeback-over beats both.
+func TestWritebackLimitOptions(t *testing.T) {
+	t.Setenv("SPOTEXEC_WRITEBACK_OVER", "")
+	l := testLoaded()
+	want := client.WritebackLimits{MaxFiles: config.DefaultWritebackMaxFiles, MaxBytes: config.DefaultWritebackMaxBytes}
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.WritebackLimits != want {
+		t.Errorf("defaults: %+v, want %+v", o.WritebackLimits, want)
+	}
+	l.cfg.Project.Sync.WritebackOver = "hold"
+	l.cfg.Project.Sync.WritebackMaxFiles = 0
+	l.cfg.Project.Sync.WritebackMaxBytes = 4096
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.WritebackLimits != (client.WritebackLimits{MaxBytes: 4096, Hold: true}) {
+		t.Errorf("project settings lost: %+v", o.WritebackLimits)
+	}
+	t.Setenv("SPOTEXEC_WRITEBACK_OVER", "warn")
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.WritebackLimits.Hold {
+		t.Error("SPOTEXEC_WRITEBACK_OVER=warn lost to the project")
+	}
+	l.cfg.Project.Sync.WritebackOver = "warn"
+	t.Setenv("SPOTEXEC_WRITEBACK_OVER", "hold")
+	if o := parsed(t).options(l, runSpec{command: "x"}, nil, nil, nil, nil); !o.WritebackLimits.Hold {
+		t.Error("SPOTEXEC_WRITEBACK_OVER=hold ignored")
+	}
+	if o := parsed(t, "--writeback-over", "warn").options(l, runSpec{command: "x"}, nil, nil, nil, nil); o.WritebackLimits.Hold {
+		t.Error("SPOTEXEC_WRITEBACK_OVER beat --writeback-over")
+	}
+	t.Setenv("SPOTEXEC_WRITEBACK_OVER", "warn")
+	if o := parsed(t, "--writeback-over", "hold").options(l, runSpec{command: "x"}, nil, nil, nil, nil); !o.WritebackLimits.Hold {
+		t.Error("SPOTEXEC_WRITEBACK_OVER=warn beat --writeback-over hold")
 	}
 }

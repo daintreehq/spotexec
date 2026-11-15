@@ -195,6 +195,31 @@ func TestShutdownIsALostRunner(t *testing.T) {
 	}
 }
 
+func TestConflictExit(t *testing.T) {
+	conflicted := []string{"src/a.js"}
+	for _, c := range []struct {
+		name string
+		res  Result
+		on   bool
+		want int
+	}{
+		{"opt-in off keeps the command's 0", Result{Conflicts: conflicted}, false, 0},
+		{"opt-in, no conflict", Result{}, true, 0},
+		{"opt-in, a successful command whose changes didn't all land", Result{Conflicts: conflicted}, true, ExitWritebackConflict},
+		{"a failed command keeps its own code", Result{ExitCode: 2, Conflicts: conflicted}, true, 2},
+		{"interrupted stays 130", Result{ExitCode: ExitInterrupted, Canceled: true, Conflicts: conflicted}, true, ExitInterrupted},
+		{"timed out stays 124", Result{ExitCode: ExitTimeout, TimedOut: true, Conflicts: conflicted}, true, ExitTimeout},
+		{"a canceled 0 is never promoted", Result{Canceled: true, Conflicts: conflicted}, true, 0},
+		{"a timed-out 0 is never promoted", Result{TimedOut: true, Conflicts: conflicted}, true, 0},
+		{"a setup failure's 0 is never promoted", Result{SetupFailed: true, Conflicts: conflicted}, true, 0},
+		{"a setup failure keeps its code", Result{ExitCode: 1, SetupFailed: true, Conflicts: conflicted}, true, 1},
+	} {
+		if got := conflictExit(c.res, c.on); got != c.want {
+			t.Errorf("%s: exit %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
 func TestInterruptedRunIsNeverOnSuccess(t *testing.T) {
 	if wantWriteback("on-success", ExitInterrupted) {
 		t.Fatal("an interrupted run counted as success for on-success write-back")
@@ -250,6 +275,69 @@ func TestImageTagNonGitProject(t *testing.T) {
 	_, err = imageTag(m, ".spotexec/Dockerfile", "", "linux/amd64", read)
 	if err == nil || strings.Contains(err.Error(), "git add") || !strings.Contains(err.Error(), "exclude") {
 		t.Fatalf("want an exclude error without a git hint, got %v", err)
+	}
+}
+
+// A Dockerfile a run can't build from fails the run before it acquires a
+// runner (an acquire would have booted a VM only to exit 125), and
+// Preflight, which spotexec supported uses, finds the same.
+func TestRunChecksDockerfileBeforeAcquiring(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".spotexec.toml"), []byte("version = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := Resolve(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &config.Project{Container: config.Container{Dockerfile: ".spotexec/Missing"}}
+	// A runner Acquire can't use: reaching it would fail differently.
+	cfg := &config.Config{Global: &config.Global{Runners: map[string]*config.Runner{"box": {Name: "box", Type: "ssh", Host: "nobody@127.0.0.1:1"}}}, Project: p}
+	t.Setenv("SPOTEXEC_POOL", "")
+	_, err = Run(context.Background(), cfg, ws, Options{Sync: "auto", Writeback: "always", Rep: quietRep(t)})
+	if err == nil || !strings.Contains(err.Error(), "not in the synced working set") {
+		t.Fatalf("Run: want the Dockerfile refused before acquiring, got %v", err)
+	}
+	for _, sync := range []string{"auto", "none"} {
+		if err := Preflight(context.Background(), p, ws, Options{Sync: sync}); err == nil {
+			t.Fatalf("Preflight(%s): a missing Dockerfile passed", sync)
+		}
+	}
+	// exec reuses the image this worktree last built: no Dockerfile needed.
+	if err := checkLocal(nil, p, ws, Options{Sync: "none", PreferLast: true}); err != nil {
+		t.Fatalf("checkLocal(exec): %v", err)
+	}
+	// An image needs no local files.
+	if err := Preflight(context.Background(), &config.Project{Container: config.Container{Image: "alpine"}}, ws, Options{Sync: "auto"}); err != nil {
+		t.Fatalf("Preflight(image): %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".spotexec"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".spotexec", "Missing"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Preflight(context.Background(), p, ws, Options{Sync: "auto"}); err != nil {
+		t.Fatalf("Preflight with the Dockerfile present: %v", err)
+	}
+	// .dockerignore edited after the scan: the upload sends the new bytes,
+	// so only the post-sync check (imageTag) may hold the scan to them.
+	ignore := filepath.Join(root, ".spotexec", "Missing.dockerignore")
+	if err := os.WriteFile(ignore, []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ignore, []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkLocal(m, p, ws, Options{Sync: "auto"}); err != nil {
+		t.Fatalf("checkLocal refused a .dockerignore edited since the scan: %v", err)
+	}
+	if _, err := imageTag(m, ".spotexec/Missing", "", "linux/amd64", readFrom(root)); err == nil || !strings.Contains(err.Error(), "changed after it was synced") {
+		t.Fatalf("imageTag: want the synced copy enforced, got %v", err)
 	}
 }
 

@@ -37,6 +37,17 @@ takes part in scheduling, and every VM shuts itself down.
      never. After that, work goes back to the oldest instances.
    - An instance that refuses with `RUNNER_DRAINING` is marked draining and
      skipped.
+   - An instance that no longer satisfies the runner's current requirements
+     (its type left `instance_types`, or no longer meets `vcpus`,
+     `min_memory_gib`, `min_generation` or `exclude_instance_types` after a
+     config change) is skipped and stops counting as capacity, so waiting
+     jobs get a matching replacement and it idles out. Unlike draining this
+     is judged again whenever the config changes: reverting the change puts
+     it back in service. A failed type lookup never retires an instance.
+     `spotexec status` shows it as `outdated`, with the reason. `exec`,
+     `pull` and `--same-slot`, which name an exact slot, still reach it.
+     The pool manager keeps such a VM out of the warm pool, but it judges
+     by the config it started with: restart it after changing requirements.
    - An instance that cannot be reached stays in the cache and still counts
      as capacity, but isn't probed again for 3s, or for 30s once it is
      older than `boot_timeout` and has failed to answer twice in a row.

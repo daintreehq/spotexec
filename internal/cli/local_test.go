@@ -505,3 +505,98 @@ func TestRunLocalSetupInterrupted(t *testing.T) {
 		t.Fatalf("exit %d, command ran: %v, output %q", code, err == nil, out.String())
 	}
 }
+
+// Input piped into sx doesn't reach the command (stdin is /dev/null there
+// too), so it is flagged once, whether it was there before the run or only
+// written while the command ran; an empty pipe, as an agent harness may
+// pass, is not.
+func TestPipedStdinIsFlaggedNotForwarded(t *testing.T) {
+	// The command signals it is running, then waits (up to 30s) for the
+	// input to have been written.
+	const handshake = "touch started && for i in $(seq 600); do [ -e release ] && break; sleep 0.05; done"
+	dir := project(t, "[tasks.l]\nrun = \"cat > l.out\"\n[tasks.t]\nrun = \"true\"\n[tasks.v]\nparallel = [\"l\", \"t\"]\n"+
+		"[tasks.w]\nrun = '"+handshake+"'\n[tasks.vw]\nparallel = [\"w\", \"t\"]\n")
+	cfg := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfg, []byte("version = 1\n[runners.a]\ntype = \"ssh\"\nhosts = [\"nobody@127.0.0.1\"]\nssh_options = [\"Port=1\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTEXEC_CONFIG", cfg)
+	t.Setenv("HOME", t.TempDir())
+	pipe := func(data string) *os.File {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		_ = w.Close()
+		t.Cleanup(func() { _ = r.Close() })
+		return r
+	}
+	const warning = "stdin has input, but the command doesn't get it"
+	flags := []string{"-C", dir, "--fallback-local", "--queue-timeout", "5s"}
+	for _, c := range []struct {
+		args []string
+		out  string
+	}{{[]string{"--", "cat > s.out"}, "s.out"}, {[]string{"v"}, "l.out"}} {
+		all := append(append([]string{}, flags...), c.args...)
+		code, stderr := runMainStdin(t, pipe("x y\n"), "sx", all...)
+		if code != 0 {
+			t.Fatalf("%v: exit %d, stderr %q", c.args, code, stderr)
+		}
+		if n := strings.Count(stderr, warning); n != 1 {
+			t.Errorf("%v: want one STDIN_IGNORED warning, got %d: %q", c.args, n, stderr)
+		}
+		if b, err := os.ReadFile(filepath.Join(dir, c.out)); err != nil || len(b) != 0 {
+			t.Errorf("%v: the command read stdin: %q, %v", c.args, b, err)
+		}
+		code, stderr = runMainStdin(t, pipe(""), "sx", all...)
+		if code != 0 || strings.Contains(stderr, "stdin") {
+			t.Errorf("%v with an empty pipe: exit %d, stderr %q", c.args, code, stderr)
+		}
+	}
+	// Input written only once the command is running, as `git diff | sx`
+	// may: seen by the look after the run.
+	for _, args := range [][]string{{"--", handshake}, {"vw"}} {
+		started, release := filepath.Join(dir, "started"), filepath.Join(dir, "release")
+		_ = os.Remove(started)
+		_ = os.Remove(release)
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		stop, wrote := make(chan struct{}), make(chan bool, 1)
+		go func() {
+			defer w.Close()
+			for {
+				select {
+				case <-stop:
+					wrote <- false
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+				if _, err := os.Stat(started); err == nil {
+					_, err := w.Write([]byte("late\n"))
+					_ = os.WriteFile(release, nil, 0o644)
+					wrote <- err == nil
+					return
+				}
+			}
+		}()
+		code, stderr := runMainStdin(t, r, "sx", append(append([]string{}, flags...), args...)...)
+		close(stop)
+		ok := <-wrote
+		_ = r.Close()
+		if code != 0 || !ok {
+			t.Fatalf("%v: exit %d, input written %v, stderr %q", args, code, ok, stderr)
+		}
+		if n := strings.Count(stderr, warning); n != 1 {
+			t.Errorf("%v, input written while it ran: want one STDIN_IGNORED warning, got %d: %q", args, n, stderr)
+		}
+	}
+	code, stderr := runMainStdin(t, pipe("x y\n"), "sx", "-C", dir, "--json", "--fallback-local", "--queue-timeout", "5s", "--", "true")
+	if code != 0 || !strings.Contains(stderr, `"code":"STDIN_IGNORED"`) {
+		t.Errorf("--json: exit %d, stderr %q", code, stderr)
+	}
+}

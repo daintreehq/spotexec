@@ -56,6 +56,7 @@ The trust boundaries, from the inside out:
 - **Secrets stay out of process listings.** Forwarded environment values go to the runner in a `0600` file, not on the command line.
 - **Slots are private.** The work root is `0700`. Lifecycle state files are writable only by the runner user's group.
 - **The runner is trusted with your worktree.** Write-back is how formatters and codegen deliver their results, so a compromised runner can still change synced files and create new non-ignored ones, such as a `Makefile` or editor task config. Review `git status` after runs on machines you don't control.
+- **Links out of the worktree are reported, not refused.** A runner can turn a synced file or directory into a symlink, or create one. Write-back never writes *through* a symlink, but the link itself lands, and local tools and agents that read it read its target: a tracked config turned into a link to `~/.ssh/id_ed25519` reads as your key. So a link written back with an absolute target, one that climbs above the worktree, or one that resolves outside it through another link gets a `WRITEBACK_SYMLINK` warning naming the link and its target (an `outside_symlink` event with `--json`).
 
 ## Known limits
 

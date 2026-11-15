@@ -28,6 +28,7 @@ type runFlags struct {
 	queueTimeout  time.Duration
 	sync          string
 	writeback     string
+	writebackOver string
 	pool          []string
 	runner        string
 	exclusive     bool
@@ -47,6 +48,7 @@ type runFlags struct {
 	sameSlot      bool
 	group         bool
 	rtkFilter     string
+	failConflict  bool
 	fs            *pflag.FlagSet // to tell explicit flags from defaults
 }
 
@@ -56,6 +58,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.DurationVar(&f.queueTimeout, "queue-timeout", 0, "how long to wait for a free slot (default 10m or .spotexec.toml queue_timeout)")
 	fs.StringVar(&f.sync, "sync", "", "sync mode: auto (bidirectional), in (no write-back), none")
 	fs.StringVar(&f.writeback, "writeback", "", "write-back policy: always, on-success, never")
+	fs.StringVar(&f.writebackOver, "writeback-over", "", "over the write-back limit: warn (bring everything back) or hold (leave the new files in the slot)")
 	fs.StringSliceVar(&f.pool, "pool", nil, "runner names to use (comma-separated)")
 	fs.StringVarP(&f.runner, "runner", "r", "", "use only this runner")
 	fs.BoolVar(&f.exclusive, "exclusive", false, "take every slot on the runner")
@@ -74,6 +77,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.IntVar(&f.priority, "priority", 0, "queue priority when every slot is busy (higher runs first)")
 	fs.BoolVarP(&f.sameSlot, "same-slot", "s", false, "run in the slot (same VM) this worktree last used, waiting if it's busy; with --sync none, skip the sync")
 	fs.StringVar(&f.rtkFilter, "rtk-filter", "", "compact stdout with RTK once the command ends (rtk pipe -f `NAME`): cargo-test for cargo test, go-test for go test -json; the full output is kept when it fails")
+	fs.BoolVar(&f.failConflict, "fail-on-conflict", false, fmt.Sprintf("exit %d when the command succeeded but write-back kept a local edit over one of its changes (SYNC_CONFLICT)", client.ExitWritebackConflict))
 	fs.BoolVar(&f.group, "group", false, "parallel and sharded tasks: print each part's output as one block when it finishes (default with SPOTEXEC_AGENT=1 when stdout isn't a terminal)")
 }
 
@@ -110,6 +114,11 @@ func (f *runFlags) applyEnv() {
 			f.sync = v
 		}
 	}
+	if !f.changed("writeback-over") {
+		if v := os.Getenv("SPOTEXEC_WRITEBACK_OVER"); v != "" {
+			f.writebackOver = v
+		}
+	}
 	// A runner named in the environment narrows the default pool, never one
 	// given with --pool.
 	if !f.changed("runner") && !f.changed("pool") {
@@ -123,6 +132,9 @@ func (f *runFlags) applyEnv() {
 	if os.Getenv("SPOTEXEC_SAME_SLOT") == "1" && !f.changed("same-slot") {
 		f.sameSlot = true
 	}
+	if os.Getenv("SPOTEXEC_FAIL_ON_CONFLICT") == "1" && !f.changed("fail-on-conflict") {
+		f.failConflict = true
+	}
 	if f.changed("priority") {
 		f.prioritySet = true
 	} else if n, err := strconv.Atoi(os.Getenv("SPOTEXEC_PRIORITY")); err == nil {
@@ -134,7 +146,7 @@ func (f *runFlags) applyEnv() {
 // acquired: an unknown --writeback must never fall through to writing back.
 func (f *runFlags) validate() error {
 	// An explicitly empty value would silently mean "the default".
-	for name, empty := range map[string]bool{"sync": f.sync == "", "writeback": f.writeback == "", "runner": f.runner == "", "pool": len(f.pool) == 0} {
+	for name, empty := range map[string]bool{"sync": f.sync == "", "writeback": f.writeback == "", "writeback-over": f.writebackOver == "", "runner": f.runner == "", "pool": len(f.pool) == 0} {
 		if empty && f.changed(name) {
 			return fmt.Errorf("--%s needs a value", name)
 		}
@@ -144,6 +156,9 @@ func (f *runFlags) validate() error {
 	}
 	if f.writeback != "" && f.writeback != "always" && f.writeback != "on-success" && f.writeback != "never" {
 		return fmt.Errorf("--writeback must be always, on-success or never (got %q)", f.writeback)
+	}
+	if f.writebackOver != "" && f.writebackOver != "warn" && f.writebackOver != "hold" {
+		return fmt.Errorf("--writeback-over must be warn or hold (got %q)", f.writebackOver)
 	}
 	return nil
 }
@@ -358,6 +373,7 @@ type runSpec struct {
 	noSetup    bool              // the task opts out of [setup]
 	env        map[string]string // set for the command (a shard's number)
 	waitPush   bool              // container build: push a fresh image before returning
+	taskLike   string            // the first word, when it may be a mistyped task name
 }
 
 // pinnedSync: spotexec sync and container build always sync, and exec
@@ -389,7 +405,7 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 		ForceLargeSync: f.forceLarge, Stdout: stdout, Stderr: stderr, Rep: rep, Interrupt: intr,
 		Label: s.label, RetryPreempt: !f.noRetry, NoBoot: f.noBoot,
 		PreferLast: s.preferLast, SyncOnly: s.syncOnly, WaitPush: s.waitPush, Priority: s.priority,
-		Env: s.env,
+		Env: s.env, FailOnConflict: f.failConflict,
 	}
 	if f.prioritySet {
 		o.Priority = f.priority
@@ -414,6 +430,10 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 	}
 	if f.writeback != "" {
 		o.Writeback = f.writeback
+	}
+	o.WritebackLimits = client.WritebackLimits{MaxFiles: p.Sync.WritebackMaxFiles, MaxBytes: int64(p.Sync.WritebackMaxBytes), Hold: p.Sync.WritebackOver == "hold"}
+	if f.writebackOver != "" {
+		o.WritebackLimits.Hold = f.writebackOver == "hold"
 	}
 	if f.runner != "" {
 		o.Pool = []string{f.runner}
@@ -463,8 +483,21 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 			finish = func(code int) int { ro.finish(code != 0); return code }
 		}
 	}
-	o := f.options(l, s, rep, intr, stdout, os.Stderr)
+	var stderr io.Writer = os.Stderr
+	var watch *notFoundWatch
+	clientRep := rep
+	if s.taskLike != "" {
+		watch = newNotFoundWatch(os.Stderr, s.taskLike)
+		stderr, clientRep = watch, watchReporter{rep, watch}
+	}
+	stdin := newStdinNotice(s.command)
+	stdin.check(rep)
+	o := f.options(l, s, stdin.reporter(clientRep), intr, stdout, stderr)
 	res, err := client.Run(ctx, l.cfg, l.ws, o)
+	if ctx.Err() == nil {
+		// A run that failed reports no result to look before.
+		stdin.check(rep)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			rep.Clear()
@@ -472,7 +505,15 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		}
 		if f.fallsBack(l, o, res, err) {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
-			return finish(runLocal(ctx, intr, l, o, rep, 0, 1))
+			// Unwatched: a terminal stays one for the local command.
+			o.Stderr, o.Rep = os.Stderr, rep
+			code := runLocal(ctx, intr, l, o, rep, 0, 1)
+			if ctx.Err() == nil {
+				stdin.check(rep)
+			}
+			code = finish(code)
+			warnUnknownTask(rep, l.cfg.Project, s.taskLike, code, s.taskLike != "" && code == 127 && !localCommand(l, o, s.taskLike), true)
+			return code
 		}
 		finish(client.ExitInfra)
 		rep.Clear()
@@ -497,8 +538,9 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	if n := len(res.Mutated) + len(res.Deleted); n > 0 {
 		summary += fmt.Sprintf(" · pulled %d modified file%s", n, plural(n))
 	}
-	if len(res.Conflicts) > 0 {
-		summary += fmt.Sprintf(" · %d conflict%s", len(res.Conflicts), plural(len(res.Conflicts)))
+	summary += conflictNote(len(res.Conflicts))
+	if res.HeldFiles > 0 {
+		summary += fmt.Sprintf(" · held %d new file%s (%s) in the slot", res.HeldFiles, plural(res.HeldFiles), ui.Bytes(res.HeldBytes))
 	}
 	if s.syncOnly && res.Image != "" {
 		summary += " · image " + res.Image
@@ -512,6 +554,9 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		summary += fmt.Sprintf(" · exit %d", res.ExitCode)
 	}
 	finish(res.ExitCode)
+	if !res.Canceled {
+		warnUnknownTask(rep, l.cfg.Project, s.taskLike, res.ExitCode, watch != nil && watch.Seen(), false)
+	}
 	rep.Done(summary, res.ExitCode == 0)
 	return res.ExitCode
 }
@@ -679,6 +724,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	}()
 	failOnce := sync.Once{}
 	var wg sync.WaitGroup
+	// Every part has a command (whatever the task is called); before and
+	// after they run, nothing else prints.
+	stdin := &stdinNotice{in: os.Stdin}
+	stdin.check(rep)
 	start := time.Now()
 	for i, part := range parts {
 		wg.Add(1)
@@ -701,7 +750,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			subStart := time.Now()
 			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
 			interrupted := ctx.Err() != nil
-			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot}
+			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot, conflicts: len(res.Conflicts)}
 			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
 				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, part.label)
 				out.code, err = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(parts)), nil
@@ -747,14 +796,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 						depsDetail(os.Stderr, prefix, err)
 					}
 				}
-				summary := fmt.Sprintf("%s · %s%s", part.label, ui.Dur(out.took), out.where())
-				if res.DepsInstalled > 0 {
-					summary += fmt.Sprintf(" · installed dependencies (%s)", ui.Dur(res.DepsInstalled))
-				}
-				if code != 0 {
-					summary += fmt.Sprintf(" · exit %d", code)
-				}
-				sr.Reporter.PartDone(summary, code == 0)
+				sr.Reporter.PartDone(out.doneLine(res.DepsInstalled), code == 0)
 			}
 			// The siblings stop before this part's (possibly long) block
 			// is printed.
@@ -792,24 +834,14 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		}(i, part)
 	}
 	wg.Wait()
+	if ctx.Err() == nil {
+		stdin.check(rep)
+	}
 	saveFirstLastRun(l.ws, records)
-	// Interrupted: 130. A spotexec failure (125) outranks a command's own
-	// failure, so agents can tell "tests failed" from "couldn't run tests".
-	exit := 0
-	for _, o := range outs {
-		if o.status == partStopped {
-			continue // the failure that stopped it is what counts
-		}
-		if o.code != 0 && (exit == 0 || o.code == client.ExitInfra) {
-			exit = o.code
-		}
-	}
 	interrupted := ctx.Err() != nil
-	if interrupted {
-		exit = client.ExitInterrupted
-	}
+	exit := taskExit(outs, interrupted)
 	took := time.Since(start)
-	result := map[string]any{"task": name, "exit_code": exit, "duration_ms": took.Milliseconds(), "parts": resultParts(outs)}
+	result := map[string]any{"task": name, "exit_code": exit, "duration_ms": took.Milliseconds(), "parts": resultParts(outs), "conflict_count": totalConflicts(outs)}
 	if len(t.Parallel) > 0 {
 		result["parallel"] = t.Parallel
 	} else {

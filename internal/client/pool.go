@@ -54,7 +54,16 @@ type note struct {
 	SawFull      bool      `json:"saw_full,omitempty"` // observed with every slot taken
 	BootFailed   bool      `json:"boot_failed,omitempty"`
 	BootFailedAt time.Time `json:"boot_failed_at,omitempty"`
+	// Why the instance no longer satisfies the runner's requirements (""
+	// when it does). Unlike Draining it is recomputed, so reverting the
+	// config puts the VM back in service.
+	Mismatch string `json:"mismatch,omitempty"`
 }
+
+// closed reports whether an instance takes no new runs and isn't capacity:
+// it is draining, or no longer matches the runner's requirements (it then
+// idles out, and replacements launch for waiting demand).
+func (n *note) closed() bool { return n != nil && (n.Draining || n.Mismatch != "") }
 
 type launchRec struct {
 	ID         string    `json:"id"`
@@ -77,6 +86,9 @@ type poolState struct {
 	QuotaErr  string    `json:"quota_error,omitempty"`
 	QuotaAt   time.Time `json:"quota_at,omitempty"`
 	QuotaLive int       `json:"quota_live,omitempty"` // instances listed when it was refused
+	// The requirements (provider.MatchKey) the notes' Mismatch reasons
+	// were judged against.
+	MatchKey string `json:"match_key,omitempty"`
 }
 
 // quotaBlocked reports the quota refusal that still holds launches back
@@ -231,6 +243,39 @@ func (p *Pool) drainAging(st *poolState) {
 	}
 }
 
+// matchConfig marks the instances that no longer satisfy the runner's
+// requirements (see note.Mismatch), when the fleet was just re-listed or
+// the requirements differ from those last judged against (the config
+// changed, or another process runs with a different one). An instance the
+// fleet can't judge keeps its last verdict under the same requirements,
+// and matches under new ones: a failed lookup never retires VMs.
+func (p *Pool) matchConfig(ctx context.Context, st *poolState, relisted bool) {
+	m, ok := p.Fleet.(provider.Matcher)
+	if !ok {
+		return
+	}
+	key := provider.MatchKey(p.R)
+	if !relisted && key == st.MatchKey {
+		return
+	}
+	mctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	judged := m.Mismatches(mctx, st.Instances)
+	same := key == st.MatchKey
+	st.MatchKey = key
+	for _, in := range st.Instances {
+		why, ok := judged[in.ID]
+		if !ok && same {
+			continue
+		}
+		if why != "" {
+			st.note(in.ID).Mismatch = why
+		} else if n := st.Notes[in.ID]; n != nil {
+			n.Mismatch = ""
+		}
+	}
+}
+
 // refresh re-lists the fleet when the cached listing is stale (or force),
 // reconciling notes and the launch ledger, and drains instances near
 // max_lifetime. Called with the lock held, so one process refreshes while
@@ -238,6 +283,7 @@ func (p *Pool) drainAging(st *poolState) {
 func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	defer p.drainAging(st)
 	if !force && time.Since(st.ListedAt) < listTTL {
+		p.matchConfig(ctx, st, false)
 		return nil
 	}
 	lctx, cancel := context.WithTimeout(ctx, 45*time.Second)
@@ -259,6 +305,7 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 			// Serve the cached view and back off, rather than letting every
 			// waiting agent retry the API (throttling) or give up.
 			st.ListedAt = time.Now().Add(-listTTL + 5*time.Second)
+			p.matchConfig(ctx, st, false)
 			return nil
 		}
 		return err
@@ -272,7 +319,11 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 			seenBefore[id] = true
 		}
 	}
-	st.Instances, st.ListedAt = insts, time.Now()
+	st.Instances = insts
+	p.matchConfig(ctx, st, true)
+	// Fresh from now: a slow type lookup in matchConfig mustn't leave the
+	// listing already stale, sending every waiting process to re-list.
+	st.ListedAt = time.Now()
 	live := map[string]bool{}
 	for _, in := range insts {
 		live[in.ID] = true
@@ -295,7 +346,9 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 			// Launched but gone: reclaimed while booting, or it already
 			// served and has since terminated (not listing lag).
 		case l.InstanceID != "" && st.Notes[l.InstanceID] != nil && st.Notes[l.InstanceID].Draining:
-			// Draining: no longer pending capacity.
+			// Draining: no longer pending capacity. (A mismatched launch keeps
+			// its record, uncounted while it mismatches, since a config
+			// change can undo that.)
 		case l.InstanceID != "" && st.Notes[l.InstanceID] != nil && st.Notes[l.InstanceID].Ready &&
 			(st.Notes[l.InstanceID].SawFull || readyFor(st.Notes[l.InstanceID]) > readyGrace):
 			// Usable for a while; it now counts as a normal instance. (Not at
@@ -335,10 +388,10 @@ func (p *Pool) Candidates(ctx context.Context, exclude map[string]bool) (out []p
 			if in.State != provider.StateRunning || in.Target.Host == "" || exclude[in.ID] {
 				continue
 			}
-			if n == nil || !n.Draining {
+			if !n.closed() {
 				usable++
 			}
-			if n != nil && (n.Draining || now.Before(n.SuspectUntil) || now.Before(n.BusyUntil)) {
+			if n != nil && (n.closed() || now.Before(n.SuspectUntil) || now.Before(n.BusyUntil)) {
 				continue
 			}
 			out = append(out, in)
@@ -433,7 +486,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		for _, in := range st.Instances {
 			listed[in.ID] = true
 			total++
-			if n := st.Notes[in.ID]; n == nil || !n.Draining {
+			if !st.Notes[in.ID].closed() {
 				usable++
 			}
 		}
@@ -445,7 +498,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			}
 			if l.InstanceID != "" {
 				inLedger[l.InstanceID] = true
-				if n := st.Notes[l.InstanceID]; n != nil && (n.Draining || (n.Ready && (n.SawFull || readyFor(n) > readyGrace))) {
+				if n := st.Notes[l.InstanceID]; n != nil && (n.closed() || (n.Ready && (n.SawFull || readyFor(n) > readyGrace))) {
 					// Dying, or already serving (full, or ready a while):
 					// not capacity a waiting agent can count on.
 					continue
@@ -464,7 +517,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			n := st.Notes[in.ID]
 			// Only never-ready instances count here: a ready one is already
 			// serving (its launch-grace capacity, if any, is in the ledger).
-			if inLedger[in.ID] || (n != nil && (n.Ready || n.Draining)) {
+			if inLedger[in.ID] || (n != nil && (n.Ready || n.closed())) {
 				continue
 			}
 			if time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
@@ -521,7 +574,7 @@ func (p *Pool) Reserve(ctx context.Context, n int) ([]string, error) {
 		usable := 0
 		for _, in := range st.Instances {
 			listed[in.ID] = true
-			if nt := st.Notes[in.ID]; nt == nil || !nt.Draining {
+			if !st.Notes[in.ID].closed() {
 				usable++
 			}
 		}
@@ -558,7 +611,7 @@ func (p *Pool) EnsureMin(ctx context.Context, min int) ([]string, error) {
 		for _, in := range st.Instances {
 			listed[in.ID] = true
 			total++
-			if nt := st.Notes[in.ID]; nt == nil || !nt.Draining {
+			if !st.Notes[in.ID].closed() {
 				usable++
 			}
 		}
@@ -845,10 +898,13 @@ func (p *Pool) Snapshot(ctx context.Context, force bool) (poolView, error) {
 			return err
 		}
 		v.Instances = st.Instances
-		v.Draining, v.BootFailed = map[string]bool{}, map[string]bool{}
+		v.Draining, v.BootFailed, v.Mismatch = map[string]bool{}, map[string]bool{}, map[string]string{}
 		for id, n := range st.Notes {
 			if n.Draining {
 				v.Draining[id] = true
+			}
+			if n.Mismatch != "" {
+				v.Mismatch[id] = n.Mismatch
 			}
 			if n.BootFailed {
 				v.BootFailed[id] = true
@@ -876,6 +932,7 @@ type poolView struct {
 	Instances     []provider.Instance
 	Draining      map[string]bool
 	BootFailed    map[string]bool
+	Mismatch      map[string]string // instance -> why it no longer matches the config
 	Launching     int
 	Demand        int
 	LastLaunchErr string

@@ -76,6 +76,9 @@ type runnerStatus struct {
 	// the VM's type in its zone) or "hourly_cost" (the runner's setting).
 	CostFrom string `json:"hourly_cost_from,omitempty"`
 	Fleet    string `json:"fleet,omitempty"`
+	// Mismatch says why a fleet VM no longer satisfies the runner's
+	// current requirements: it takes no new runs and idles out.
+	Mismatch string `json:"mismatch,omitempty"`
 	r        *config.Runner
 }
 
@@ -182,6 +185,18 @@ func fallbackCost(r *config.Runner) (float64, string) {
 	return 0, ""
 }
 
+// fleetMismatches says which of a fleet's VMs no longer satisfy the
+// runner's current requirements, and why (none when that can't be told).
+func fleetMismatches(ctx context.Context, f provider.Fleet, insts []provider.Instance) map[string]string {
+	m, ok := f.(provider.Matcher)
+	if !ok || len(insts) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return m.Mismatches(ctx, insts)
+}
+
 func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []runnerStatus {
 	var rows []runnerStatus
 	var fleets []fleetInstances
@@ -202,9 +217,10 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 					Info: provider.Info{State: provider.StateAbsent, Detail: fmt.Sprintf("0 of max %d instances; scales on demand", r.MaxInstances)}})
 			}
 			fleets = append(fleets, fleetInstances{r, insts})
+			mismatch := fleetMismatches(ctx, f, insts)
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
-				rows = append(rows, runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name,
+				rows = append(rows, runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
 					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}})
 			}
 			continue
@@ -295,6 +311,9 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 				state = "draining"
 			}
 		}
+		if s.Mismatch != "" && state != "draining" {
+			state = "outdated" // explained below the table
+		}
 		typ := s.Type
 		if s.r != nil && s.Info.Region != "" && (s.r.MultiRegion() || s.Info.Region != s.r.Region) {
 			typ += " " + s.Info.Region // which region each instance landed in
@@ -311,6 +330,9 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 	for _, s := range sts {
 		if s.Error != "" {
 			fmt.Fprintf(w, "  %s: %s\n", s.Name, s.Error)
+		}
+		if s.Mismatch != "" {
+			fmt.Fprintf(w, "  %s: doesn't match the current config (%s): takes no new runs and terminates when idle\n", s.Name, s.Mismatch)
 		}
 		if s.Helper == nil {
 			continue
@@ -1054,10 +1076,16 @@ func cmdSyncPlan() *cobra.Command {
 
 func cmdPull() *cobra.Command {
 	var dest string
+	var held bool
 	c := &cobra.Command{
-		Use:   "pull <remote-glob>... ",
-		Short: "Pull gitignored artifacts (e.g. coverage/) from the last-used slot",
-		Args:  cobra.MinimumNArgs(1),
+		Use:   "pull <remote-glob>... | --held [<glob>...]",
+		Short: "Pull gitignored artifacts (e.g. coverage/), or held write-back files, from the last-used slot",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if held {
+				return nil
+			}
+			return cobra.MinimumNArgs(1)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load("")
 			if err != nil {
@@ -1066,6 +1094,12 @@ func cmdPull() *cobra.Command {
 			lr, err := client.LoadLastRun(l.ws)
 			if err != nil {
 				return errors.New("no previous run from this worktree; run something first")
+			}
+			heldFiles := client.LoadHeld(l.ws, *lr)
+			if held {
+				if args, heldFiles, err = client.HeldPatterns(heldFiles, args); err != nil {
+					return err
+				}
 			}
 			r, err := l.cfg.Runner(lr.Runner)
 			if err != nil {
@@ -1084,7 +1118,7 @@ func cmdPull() *cobra.Command {
 			if dest != "" {
 				root = dest // created by PullArtifacts once validated
 			}
-			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args)
+			n, err := client.PullArtifacts(ctx, lease.Sess, l.ws, root, args, heldFiles, held)
 			if err != nil {
 				return err
 			}
@@ -1093,6 +1127,7 @@ func cmdPull() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&dest, "dest", "", "write under this directory instead of the worktree root")
+	c.Flags().BoolVar(&held, "held", false, "pull the new files the last run's write-back held in the slot (over the write-back limit); globs narrow them")
 	return c
 }
 

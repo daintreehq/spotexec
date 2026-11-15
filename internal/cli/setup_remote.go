@@ -37,6 +37,7 @@ type remoteSetup struct {
 	profile      string
 	rotate       bool
 	noVPC        bool
+	hooks        bool // install the Claude Code hook there (asked for here)
 	noHooks      bool
 	aws          bool
 	ctlDir       string
@@ -282,6 +283,20 @@ func compareVersions(a, b string) (cmp int, ok bool) {
 	return 0, true
 }
 
+// localCopyNoNewer reports whether a spotexec reporting version v is known
+// to be no newer than release want. A modified build ("-dirty", as an
+// earlier `--install copy` can leave) is placed by the commit it was built
+// from: it counts only when that commit is older than the release, since
+// its changes could be newer than the release itself.
+func localCopyNoNewer(v, want string) bool {
+	if base, dirty := strings.CutSuffix(v, "-dirty"); dirty {
+		c, ok := compareVersions(base, want)
+		return ok && c < 0
+	}
+	c, ok := compareVersions(v, want)
+	return ok && c <= 0
+}
+
 // parseVersion reads X.Y.Z, with `git describe`'s "-N-gHASH" as a fourth
 // part.
 func parseVersion(v string) ([4]int, bool) {
@@ -373,11 +388,12 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 		// ~/.local/bin would shadow it, unless that one is newer still.
 		old, _ := r.run(ctx, `f="$HOME/.local/bin/spotexec"; if [ -f "$f" ]; then echo present; "$f" version 2>/dev/null | head -n 1; fi`, nil)
 		if strings.HasPrefix(old, "present") {
-			// Only one known to be no newer goes.
+			// Only one known to be no newer goes, with the sx link setup
+			// made beside it (never another sx).
 			v := versionOf(old)
-			if c, ok := compareVersions(v, got); !ok || c > 0 {
-				r.printf("  kept spotexec %s in ~/.local/bin (not older than Homebrew's)\n", orDash(v))
-			} else if _, err := r.run(ctx, `rm -f "$HOME/.local/bin/spotexec"; if [ -L "$HOME/.local/bin/sx" ]; then rm -f "$HOME/.local/bin/sx"; fi`, nil); err == nil {
+			if !localCopyNoNewer(v, got) {
+				r.printf("  kept spotexec %s in ~/.local/bin (not known to be older than Homebrew's)\n", orDash(v))
+			} else if _, err := r.run(ctx, `d="$HOME/.local/bin"; rm -f "$d/spotexec"; if [ -L "$d/sx" ] && [ "$(readlink "$d/sx")" = spotexec ]; then rm -f "$d/sx"; fi`, nil); err == nil {
 				r.printf("  removed an older spotexec from ~/.local/bin\n")
 			}
 		}
@@ -528,7 +544,8 @@ func (r *remoteSetup) do(ctx context.Context) error {
 		setupProbe = " --admin-from-env"
 	}
 	ver, err := r.run(ctx, `command -v `+bin+` >/dev/null || { echo NOT-INSTALLED; exit 0; }; `+
-		bin+` version && { `+bin+` setup`+setupProbe+` --help >/dev/null 2>&1 || echo NO-SETUP; }`, nil)
+		bin+` version && { h=$(`+bin+` setup`+setupProbe+` --help 2>&1) || echo NO-SETUP; `+
+		`case "$h" in *" --hooks "*) ;; *) echo NO-HOOK-OPT-IN ;; esac; }`, nil)
 	if err != nil {
 		return fmt.Errorf("spotexec doesn't run there: %w", err)
 	}
@@ -571,7 +588,7 @@ func (r *remoteSetup) do(ctx context.Context) error {
 
 	// Run setup there: with AWS runners, using this machine's AWS sign-in
 	// (passed on stdin, so it never appears in a command line) to create
-	// that machine's own user; the Claude Code hook too, like here.
+	// that machine's own user; the Claude Code hook too, if it was asked for here.
 	env := []string{"", "", ""}
 	flags := " --yes --profile " + shq(r.profile)
 	if r.aws {
@@ -594,7 +611,13 @@ func (r *remoteSetup) do(ctx context.Context) error {
 	if r.noVPC {
 		flags += " --no-vpc"
 	}
-	if r.noHooks {
+	// A spotexec there from before the hook was opt-in doesn't know
+	// --hooks, and installs the hook with --yes unless told not to.
+	optIn := !strings.Contains(ver, "NO-HOOK-OPT-IN")
+	if r.hooks && optIn {
+		flags += " --hooks"
+	}
+	if r.noHooks || (!r.hooks && !optIn) {
 		flags += " --no-hooks"
 	}
 	script := `IFS= read -r k; IFS= read -r s; IFS= read -r t; ` +
@@ -644,7 +667,7 @@ func (r *remoteSetup) retryCommand() string {
 	for _, f := range []struct {
 		on   bool
 		flag string
-	}{{r.rotate, " --rotate"}, {r.noVPC, " --no-vpc"}, {r.noHooks, " --no-hooks"}} {
+	}{{r.rotate, " --rotate"}, {r.noVPC, " --no-vpc"}, {r.hooks, " --hooks"}, {r.noHooks, " --no-hooks"}} {
 		if f.on {
 			c += f.flag
 		}

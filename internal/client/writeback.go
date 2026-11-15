@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,11 +20,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/manifest"
 	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // WritebackResult summarizes a write-back.
@@ -34,25 +38,68 @@ type WritebackResult struct {
 	Ignored     int
 	Refused     []string // paths the runner reported that may not be written
 	ConflictDir string
+	// BackedUp: local files the write-back deleted or replaced that had no
+	// committed copy, saved under BackupDir first.
+	BackedUp  []string
+	BackupDir string
+	// Held: deletions kept back because the run would have deleted the
+	// project's own config or most of its files (HeldWhy says which).
+	Held    []string
+	HeldWhy string
+	// OutsideLinks are the symlinks write-back created or retargeted that
+	// point outside the worktree: an absolute target, or one that climbs
+	// above the root. They are applied, and reported.
+	OutsideLinks []Link
+	// HeldNew: new files left in the slot because they were over the
+	// write-back limit (hold mode). Neither fetched nor accepted.
+	HeldNew      []protocol.Entry
+	HeldNewBytes int64
+}
+
+// Link is a symlink in the worktree and its target, as written.
+type Link struct {
+	Path   string `json:"path"`   // worktree-relative
+	Target string `json:"target"` // the link's contents
 }
 
 // Conflict is a path where your local edit was kept and the remote version
-// was stashed instead.
+// was stashed instead, or, when With is set, a remote path whose name is
+// another remote path's file on this filesystem.
 type Conflict struct {
 	Path    string `json:"path"`    // worktree-relative
 	Local   string `json:"local"`   // your file (absolute)
 	Remote  string `json:"remote"`  // the stashed remote version (absolute)
 	Deleted bool   `json:"deleted"` // the remote command deleted it (Remote is a marker file)
+	// Reason is empty for a local edit made during the run, or
+	// ReasonSymlinkParent: a local parent directory is a symlink, so the
+	// path can't be written here without leaving the worktree.
+	Reason string `json:"reason,omitempty"`
+	// With is the path whose file Path opens here, because the filesystem
+	// ignores case or Unicode normalisation (src/Dup.txt is src/DUP.txt):
+	// a name collision, not a local edit. Local is With's file, kept.
+	With string `json:"with,omitempty"`
 }
 
-// conflict stashes the remote version of p and records the conflict.
-func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile) error {
+// ReasonSymlinkParent marks a conflict caused by a symlinked local parent.
+const ReasonSymlinkParent = "symlink_parent"
+
+// conflict stashes the remote version of p and records the conflict; with
+// names the path p collides with, if that is why ("" for a local edit).
+func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile, with string) error {
 	stashed, err := stashConflict(wb.ConflictDir, p, want, rf)
 	if err != nil {
 		return err
 	}
+	local := p
+	if with != "" {
+		local = with
+	}
 	wb.Conflicts = append(wb.Conflicts, p)
-	wb.Stashed = append(wb.Stashed, Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(p)), Remote: stashed, Deleted: !want.exists})
+	c := Conflict{Path: p, Local: filepath.Join(root, filepath.FromSlash(local)), Remote: stashed, Deleted: !want.exists, With: with}
+	if _, err := fsid.SafeJoin(root, p); errors.Is(err, fsid.ErrSymlinkParent) {
+		c.Reason = ReasonSymlinkParent
+	}
+	wb.Stashed = append(wb.Stashed, c)
 	return nil
 }
 
@@ -116,7 +163,11 @@ func localVersion(root, rel string) (version, error) {
 // ignored is which created files are ignored here, if already known.
 // proceed, when set, is asked once everything is fetched and before anything
 // is applied: false applies nothing.
-func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string, ignored map[string]bool, proceed func() bool) (WritebackResult, error) {
+//
+// limits are checked before anything is fetched: over them, rep gets a
+// LARGE_WRITEBACK warning, or (hold mode, when the new files alone are over)
+// a WRITEBACK_HELD one, and the new files stay in the slot.
+func writeback(ctx context.Context, fetchFiles fetchFunc, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string, ignored map[string]bool, proceed func() bool, limits WritebackLimits, rep ui.Reporter) (WritebackResult, error) {
 	var wb WritebackResult
 	// Created (non-manifest) files only come back if not ignored locally.
 	// The runner's report is not trusted: changed or deleted paths must be
@@ -157,16 +208,58 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 			return wb, err
 		}
 	}
+	var fresh []protocol.Entry // created and not ignored: new files coming back
+	for _, c := range created {
+		if ignored[c.Path] {
+			wb.Ignored++
+			continue
+		}
+		fresh = append(fresh, c)
+	}
+	// The new side of a case-only rename (foo -> Foo) is never held: on a
+	// case-insensitive filesystem it is the same file as the deleted one,
+	// renamed in place below.
+	gone := map[string]bool{}
+	for _, d := range deleted {
+		gone[strings.ToLower(d)] = true
+	}
+	var renamed, holdable []protocol.Entry
+	for _, c := range fresh {
+		if gone[strings.ToLower(c.Path)] {
+			renamed = append(renamed, c)
+		} else {
+			holdable = append(holdable, c)
+		}
+	}
+	if n, b := entryTotals(holdable); limits.Hold && limits.Over(n, b) {
+		wb.HeldNew, wb.HeldNewBytes, fresh = holdable, b, renamed
+		if rep != nil {
+			largest := largestPaths(wb.HeldNew, 3)
+			rep.Warn("WRITEBACK_HELD", "left %s (%s) in the slot: over the write-back limit of %s. Largest: %s. Bring them back with `spotexec pull --held` before the next run syncs into this slot, which removes them; add outputs to .gitignore", files(n), ui.Bytes(b), limits, describeLargest(largest))
+			rep.Event("writeback_held", map[string]any{"files": n, "bytes": b, "largest": largest, "run_id": runID})
+		}
+	}
+	if n, b := entryTotals(append(append([]protocol.Entry(nil), changed...), fresh...)); limits.Over(n, b) && rep != nil {
+		largest := largestPaths(append(append([]protocol.Entry(nil), changed...), fresh...), 3)
+		hint := ""
+		if nf, bf := entryTotals(fresh); limits.Over(nf, bf) {
+			hint = `; if they are outputs, add them to .gitignore, or set writeback_over = "hold" in [sync] (or --writeback-over hold) to leave them in the slot`
+		}
+		rep.Warn("LARGE_WRITEBACK", "bringing back %s (%s: %d new, %d changed), over the write-back limit of %s. Largest: %s%s", files(n), ui.Bytes(b), len(fresh), len(changed), limits, describeLargest(largest), hint)
+		rep.Event("large_writeback", map[string]any{"files": n, "bytes": b, "new_files": len(fresh), "changed_files": len(changed), "largest": largest})
+	}
 	remote := map[string]version{}
 	var fetch, accept []string
 	for _, c := range changed {
 		remote[c.Path] = version{true, c.ID, c.Mode}
 		fetch = append(fetch, c.Path)
 	}
-	for _, c := range created {
-		if ignored[c.Path] {
-			wb.Ignored++
-			continue
+	// Created paths beyond a local symlink: git couldn't judge whether they
+	// are ignored, so they are asked again if a deletion clears the way.
+	unjudged := map[string]bool{}
+	for _, c := range fresh {
+		if _, err := fsid.SafeJoin(ws.Root, c.Path); errors.Is(err, fsid.ErrSymlinkParent) {
+			unjudged[c.Path] = true
 		}
 		remote[c.Path] = version{true, c.ID, c.Mode}
 		fetch = append(fetch, c.Path)
@@ -181,13 +274,11 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	sort.Strings(fetch)
 
 	files := map[string]remoteFile{}
-	if err := s.Conn.Send(protocol.TypeFetch, protocol.Fetch{Paths: fetch, Accept: accept}); err != nil {
+	blob, err := fetchFiles(protocol.Fetch{Paths: fetch, Accept: accept})
+	if err != nil {
 		return wb, err
 	}
-	if _, err := s.Expect(ctx, protocol.TypeFetched); err != nil {
-		return wb, err
-	}
-	if err := readTar(s.Blob(ctx), func(h *tar.Header, rd io.Reader) error {
+	if err := readTar(blob, func(h *tar.Header, rd io.Reader) error {
 		rf := remoteFile{}
 		switch h.Typeflag {
 		case tar.TypeSymlink:
@@ -216,17 +307,43 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		return wb, nil
 	}
 
+	err = applyWriteback(ctx, ws, m, remote, files, unjudged, runID, &wb)
+	return wb, err
+}
+
+// applyWriteback applies the fetched remote versions (remote: what the
+// command left at each path; files: the bytes fetched for those that exist)
+// to the local worktree, under the write-back lock. unjudged holds created
+// paths git couldn't judge for ignores (beyond a local symlink).
+func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, remote map[string]version, files map[string]remoteFile, unjudged map[string]bool, runID string, wb *WritebackResult) error {
 	// Serialize cooperating spotexec write-backs into this worktree.
 	lockDir := conflictBase(ws)
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {
-		return wb, err
+		return err
 	}
 	unlock, err := lockFile(ctx, filepath.Join(lockDir, "writeback.lock"))
 	if err != nil {
-		return wb, err
+		return err
 	}
 	defer unlock()
 	wb.ConflictDir = filepath.Join(lockDir, "conflicts", runID)
+	synced := len(m.ByPath)
+
+	// save backs up the local version of p, about to be deleted or replaced,
+	// unless git has it committed.
+	committed := &committedFiles{ctx: ctx, m: m}
+	save := func(p string, local version) error {
+		if !local.exists || committed.has(p, local) {
+			return nil
+		}
+		dir := filepath.Join(lockDir, "backup", runID)
+		if _, err := backupLocal(ws.Root, dir, p, local); err != nil {
+			return err
+		}
+		wb.BackupDir = dir
+		wb.BackedUp = append(wb.BackedUp, p)
+		return nil
+	}
 
 	paths := make([]string, 0, len(remote))
 	for p := range remote {
@@ -235,6 +352,15 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	sort.Strings(paths)
 	var removedDirs []string
 	handled := map[string]bool{}
+	// Symlinks written into the worktree, judged once every write is done
+	// (a link may lead out through another link applied after it).
+	var links []Link
+	appliedLink := func(p string, rf remoteFile) {
+		if rf.mode == fsid.ModeSymlink {
+			links = append(links, Link{Path: p, Target: rf.link})
+		}
+	}
+	defer func() { wb.OutsideLinks = outsideLinks(ws.Root, links) }()
 
 	// Case-only renames (foo -> Foo) on a case-insensitive filesystem (the
 	// macOS default): both names resolve to one file, so applying "create Foo"
@@ -268,31 +394,44 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 			}
 			local, err := localVersion(ws.Root, del)
 			if err != nil {
-				return wb, err
+				return err
 			}
 			want := version{true, rf.id, rf.mode}
 			if !local.eq(base) && !local.eq(want) {
-				if err := wb.conflict(ws.Root, q, want, rf); err != nil {
-					return wb, err
+				if err := wb.conflict(ws.Root, q, want, rf, ""); err != nil {
+					return err
 				}
 				break
 			}
-			if err := os.Rename(fd, fq); err != nil {
-				return wb, fmt.Errorf("renaming %s to %s: %w", del, q, err)
-			}
 			if !local.eq(want) {
-				err := writeLocal(ws.Root, q, rf, &local)
+				err := save(del, local)
 				if errors.Is(err, errChangedUnderUs) {
-					if err := wb.conflict(ws.Root, q, want, rf); err != nil {
-						return wb, err
+					if err := wb.conflict(ws.Root, q, want, rf, ""); err != nil {
+						return err
 					}
 					break
 				}
 				if err != nil {
-					return wb, fmt.Errorf("%s: %w", q, err)
+					return fmt.Errorf("backing up %s: %w", del, err)
+				}
+			}
+			if err := os.Rename(fd, fq); err != nil {
+				return fmt.Errorf("renaming %s to %s: %w", del, q, err)
+			}
+			if !local.eq(want) {
+				err := writeLocal(ws.Root, q, rf, &local)
+				if errors.Is(err, errChangedUnderUs) {
+					if err := wb.conflict(ws.Root, q, want, rf, ""); err != nil {
+						return err
+					}
+					break
+				}
+				if err != nil {
+					return fmt.Errorf("%s: %w", q, err)
 				}
 			}
 			wb.Applied = append(wb.Applied, q)
+			appliedLink(q, rf)
 			wb.Deleted = append(wb.Deleted, del)
 			m.Update(protocol.Entry{Path: q, ID: rf.id, Mode: rf.mode, Size: int64(len(rf.data))})
 			break
@@ -324,15 +463,28 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		}
 		switch {
 		case local.eq(want):
+			// A new name already holding these bytes may be another
+			// remote path's file: still two names that can't both exist.
+			if !base.exists && local.exists {
+				if with := collidesWith(ws.Root, p, remote, m, wb.Applied); with != "" {
+					return wb.conflict(ws.Root, p, want, rf, with)
+				}
+			}
 			return nil
 		case local.eq(base):
+			// Whatever is lost here and isn't committed is saved first.
+			if err := save(p, local); errors.Is(err, errChangedUnderUs) {
+				return wb.conflict(ws.Root, p, want, rf, "")
+			} else if err != nil {
+				return fmt.Errorf("backing up %s: %w", p, err)
+			}
 			if want.exists {
 				err := writeLocal(ws.Root, p, rf, &local)
 				// Changed under us, or the way is blocked (a file where a
 				// directory is needed, kept because of a local edit): keep
 				// the local side, stash the remote one.
-				if errors.Is(err, errChangedUnderUs) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) {
-					if err := wb.conflict(ws.Root, p, want, rf); err != nil {
+				if errors.Is(err, errChangedUnderUs) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) || errors.Is(err, fsid.ErrSymlinkParent) {
+					if err := wb.conflict(ws.Root, p, want, rf, ""); err != nil {
 						return err
 					}
 					return nil
@@ -341,11 +493,18 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 					return fmt.Errorf("%s: %w", p, err)
 				}
 				wb.Applied = append(wb.Applied, p)
+				appliedLink(p, rf)
 				m.Update(protocol.Entry{Path: p, ID: rf.id, Mode: rf.mode, Size: int64(len(rf.data))})
 			} else {
 				full, err := fsid.SafeJoin(ws.Root, p)
+				if errors.Is(err, fsid.ErrSymlinkParent) {
+					return wb.conflict(ws.Root, p, want, rf, "") // a symlink appeared above it
+				}
 				if err != nil {
 					return err
+				}
+				if now, err := localVersion(ws.Root, p); err != nil || !now.eq(local) {
+					return wb.conflict(ws.Root, p, want, rf, "")
 				}
 				if err := os.Remove(full); err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return err
@@ -354,7 +513,11 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 				removedDirs = append(removedDirs, path.Dir(p))
 			}
 		default:
-			if err := wb.conflict(ws.Root, p, want, rf); err != nil {
+			with := ""
+			if local.exists && local != blocked {
+				with = collidesWith(ws.Root, p, remote, m, wb.Applied)
+			}
+			if err := wb.conflict(ws.Root, p, want, rf, with); err != nil {
 				return err
 			}
 		}
@@ -372,20 +535,317 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		}
 	}
 	sort.SliceStable(dels, func(i, j int) bool { return strings.Count(dels[i], "/") > strings.Count(dels[j], "/") })
+	if dels, err = holdDeletions(ws.Root, m, dels, synced, wb); err != nil {
+		return err
+	}
 	for _, p := range dels {
 		if err := apply(p); err != nil {
-			return wb, err
+			return err
 		}
 	}
 	pruneEmptyDirs(ws.Root, removedDirs)
 	removedDirs = nil
+	for _, p := range nowIgnored(ctx, m, ws.Root, writes, unjudged) {
+		handled[p] = true
+		wb.Ignored++
+	}
 	for _, p := range writes {
 		if err := apply(p); err != nil {
-			return wb, err
+			return err
 		}
 	}
 	pruneEmptyDirs(ws.Root, removedDirs)
-	return wb, nil
+	return nil
+}
+
+// holdDeletions keeps back the deletions a run should not make on its own:
+// the project's own root .spotexec.toml or .gitignore, or, when the run
+// deleted most of the synced files, all of them. Only deletions that would
+// apply count (the local file still matches what was uploaded). It returns
+// the deletions to go ahead with.
+func holdDeletions(root string, m *manifest.Manifest, dels []string, synced int, wb *WritebackResult) ([]string, error) {
+	var live, protected []string
+	for _, p := range dels {
+		e, ok := m.ByPath[p]
+		if !ok {
+			continue
+		}
+		local, err := localVersion(root, p)
+		if err != nil {
+			return nil, err
+		}
+		if !local.exists || !local.eq(version{true, e.ID, e.Mode}) {
+			continue
+		}
+		live = append(live, p)
+		if protectedPath(p) {
+			protected = append(protected, p)
+		}
+	}
+	hold := protected
+	switch {
+	case massDeletion(len(live), synced):
+		hold = live
+		wb.HeldWhy = fmt.Sprintf("the run deleted %d of the %d synced files", len(live), synced)
+	case len(protected) > 0:
+		wb.HeldWhy = "the run deleted the project's own " + strings.Join(protected, " and ")
+	default:
+		return dels, nil
+	}
+	held := map[string]bool{}
+	for _, p := range hold {
+		held[p] = true
+	}
+	wb.Held = append(wb.Held, hold...)
+	sort.Strings(wb.Held)
+	var keep []string
+	for _, p := range dels {
+		if !held[p] {
+			keep = append(keep, p)
+		}
+	}
+	return keep, nil
+}
+
+// nowIgnored asks git again about the unjudged paths (created beyond a local
+// symlink) that a deletion has since cleared the way to, as when a symlinked
+// dist/ is replaced by a real one: ignored outputs then stay remote as usual.
+// If git still can't answer, they are written back.
+func nowIgnored(ctx context.Context, m *manifest.Manifest, root string, paths []string, unjudged map[string]bool) []string {
+	var recheck, ignored []string
+	for _, p := range paths {
+		if _, err := fsid.SafeJoin(root, p); unjudged[p] && err == nil {
+			recheck = append(recheck, p)
+		}
+	}
+	if len(recheck) == 0 {
+		return nil
+	}
+	ign, err := m.CheckIgnored(ctx, recheck)
+	if err != nil {
+		return nil
+	}
+	for _, p := range recheck {
+		if ign[p] {
+			ignored = append(ignored, p)
+		}
+	}
+	return ignored
+}
+
+// collidesWith is the other path the run knows whose file p opens here,
+// when this filesystem ignores case or Unicode normalisation in names
+// (src/Dup.txt opens src/DUP.txt, src/n\u00e9.txt opens src/ne\u0301.txt):
+// two remote names for one local file, not a local edit. "" when p's file
+// is no other path the run knows.
+func collidesWith(root, p string, remote map[string]version, m *manifest.Manifest, applied []string) string {
+	q, ok := onDiskName(root, p)
+	if ok && q != p {
+		if v, ok := remote[q]; ok && v.exists {
+			return q
+		}
+		if _, ok := m.ByPath[q]; ok {
+			return q
+		}
+	}
+	// A path this run wrote may have landed under another spelling of a
+	// parent directory (d/A written into an existing D/ is D/A, and src/a
+	// may be SRC/a's file): match those by identity, and then by directory
+	// entry, since a hard link is the same file under a name of its own.
+	if !ok {
+		return ""
+	}
+	full, err := fsid.SafeJoin(root, p)
+	if err != nil {
+		return ""
+	}
+	fi, err := os.Lstat(full)
+	if err != nil {
+		return ""
+	}
+	for _, r := range applied {
+		if r == p {
+			continue
+		}
+		fr, err := fsid.SafeJoin(root, r)
+		if err != nil {
+			continue
+		}
+		if ri, err := os.Lstat(fr); err != nil || !os.SameFile(ri, fi) {
+			continue
+		}
+		if rq, ok := onDiskName(root, r); ok && rq == q {
+			return r
+		}
+	}
+	return ""
+}
+
+// onDiskName is the name rel's file has under root, component by component:
+// rel itself where that name is listed, otherwise the listed entry that is
+// the same file. false when a component is missing or can't be read.
+func onDiskName(root, rel string) (string, bool) {
+	dir := root
+	var out []string
+	for _, part := range strings.Split(rel, "/") {
+		fi, err := os.Lstat(filepath.Join(dir, part))
+		if err != nil {
+			return "", false
+		}
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return "", false
+		}
+		name := ""
+		var same []string
+		for _, e := range ents {
+			if e.Name() == part {
+				name = part
+				break
+			}
+			if ei, err := os.Lstat(filepath.Join(dir, e.Name())); err == nil && os.SameFile(ei, fi) {
+				same = append(same, e.Name())
+			}
+		}
+		if name == "" && len(same) > 1 {
+			// Hard links: only the entry differing from part in case is
+			// the one this name folds to; otherwise it can't be told.
+			var folded []string
+			for _, n := range same {
+				if strings.EqualFold(n, part) {
+					folded = append(folded, n)
+				}
+			}
+			same = folded
+		}
+		if name == "" && len(same) == 1 {
+			name = same[0]
+		}
+		if name == "" {
+			return "", false
+		}
+		out = append(out, name)
+		dir = filepath.Join(dir, name)
+	}
+	return strings.Join(out, "/"), true
+}
+
+// outsideLinks returns the links that point outside root: an absolute
+// target, a relative one that climbs above root from the link's directory,
+// or one that leads outside it on disk through another symlink (even when
+// its final target doesn't exist yet).
+func outsideLinks(root string, links []Link) []Link {
+	var out []Link
+	realRoot := resolveExisting(root)
+	rootInfo, rootErr := os.Stat(realRoot)
+	for _, l := range links {
+		if linkEscapes(l.Path, l.Target) {
+			out = append(out, l)
+			continue
+		}
+		full, err := fsid.SafeJoin(root, l.Path)
+		if err != nil {
+			continue
+		}
+		if t, err := os.Readlink(full); err != nil || t != l.Target {
+			continue // no longer the link that was written
+		}
+		dir, err := filepath.EvalSymlinks(filepath.Dir(full))
+		if err != nil {
+			continue
+		}
+		hops := 0
+		r, ok := followLink(dir, l.Target, &hops)
+		if ok && !within(r, realRoot, rootInfo, rootErr == nil) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// followLink is where target, read from a link in the resolved directory
+// dir, leads: every existing symlink on the way is followed (so ".." after
+// one means its target's parent, as for the kernel), and a missing
+// remainder is kept as written. false: a loop, or a link that can't be read.
+func followLink(dir, target string, hops *int) (string, bool) {
+	cur := dir
+	if strings.HasPrefix(target, "/") {
+		cur = "/"
+	}
+	for _, c := range strings.Split(target, "/") {
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, c)
+		fi, err := os.Lstat(next)
+		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+		if *hops++; *hops > 40 {
+			return "", false
+		}
+		t, err := os.Readlink(next)
+		if err != nil {
+			return "", false
+		}
+		r, ok := followLink(cur, t, hops)
+		if !ok {
+			return "", false
+		}
+		cur = r
+	}
+	return cur, true
+}
+
+// linkEscapes reports whether a link at the worktree-relative path p with
+// the given target points outside the worktree, judged by its text alone.
+func linkEscapes(p, target string) bool {
+	if filepath.IsAbs(target) || strings.HasPrefix(target, "/") {
+		return true
+	}
+	t := path.Clean(path.Join(path.Dir(p), target))
+	return t == ".." || strings.HasPrefix(t, "../")
+}
+
+// within reports whether p is dir or inside it: by its spelling, or by an
+// existing ancestor being dir itself (another spelling of it, as on a
+// case-insensitive filesystem).
+func within(p, dir string, dirInfo fs.FileInfo, haveInfo bool) bool {
+	if p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, string(filepath.Separator))+string(filepath.Separator)) {
+		return true
+	}
+	if !haveInfo {
+		return false
+	}
+	for d := p; ; d = filepath.Dir(d) {
+		if fi, err := os.Stat(d); err == nil && os.SameFile(fi, dirInfo) {
+			return true
+		}
+		if filepath.Dir(d) == d {
+			return false
+		}
+	}
+}
+
+// fetchFunc asks the slot for files and returns them as a gzip'd tar.
+type fetchFunc func(protocol.Fetch) (io.Reader, error)
+
+// sessionFetch fetches over the helper session.
+func sessionFetch(ctx context.Context, s *transport.Session) fetchFunc {
+	return func(f protocol.Fetch) (io.Reader, error) {
+		if err := s.Conn.Send(protocol.TypeFetch, f); err != nil {
+			return nil, err
+		}
+		if _, err := s.Expect(ctx, protocol.TypeFetched); err != nil {
+			return nil, err
+		}
+		return s.Blob(ctx), nil
+	}
 }
 
 func conflictBase(ws *Workspace) string {
@@ -403,7 +863,7 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 		full, err := fsid.SafeJoin(dir, p+".deleted")
 		if err == nil {
 			if err = os.MkdirAll(filepath.Dir(full), 0o700); err == nil {
-				err = os.WriteFile(full, mark, 0o600)
+				err = writeNew(full, mark) // never over an earlier marker whose name this one folds to
 			}
 		}
 		if err != nil && stashCollision(err) {
@@ -411,7 +871,7 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return "", err
 			}
-			f, err := os.CreateTemp(dir, strings.ReplaceAll(p, "/", "__")+".deleted-*")
+			f, err := os.CreateTemp(dir, flatName(p)+".deleted-*")
 			if err != nil {
 				return "", err
 			}
@@ -426,15 +886,27 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	err := writeLocal(dir, p, rf, nil)
+	// An earlier stashed path this one folds to (src/Dup.txt, src/dup.txt
+	// on a case-insensitive filesystem) must not be overwritten.
+	var err error
+	if full, jerr := fsid.SafeJoin(dir, p); jerr == nil {
+		if _, lerr := os.Lstat(full); lerr == nil {
+			err = fmt.Errorf("%s is already stashed: %w", p, syscall.EEXIST)
+		}
+	}
+	if err == nil {
+		err = writeLocal(dir, p, rf, nil)
+	}
 	if err != nil && stashCollision(err) {
-		// A directory/file collision inside the stash itself (a path that
-		// was a directory and is now a file): keep it at the top of the
-		// stash under a flattened name nothing else uses.
-		base := strings.ReplaceAll(p, "/", "__") + ".remote"
+		// A collision inside the stash itself (a path that was a directory
+		// and is now a file, or a name an earlier stashed path folds to):
+		// keep it at the top of the stash under a flattened name nothing
+		// else uses.
+		base := flatName(p) + ".remote"
 		name := base
 		for i := 2; ; i++ {
-			if _, err := os.Lstat(filepath.Join(dir, name)); errors.Is(err, fs.ErrNotExist) {
+			// Free, or unusable for another reason that writing reports.
+			if _, err := os.Lstat(filepath.Join(dir, name)); err != nil {
 				break
 			}
 			name = fmt.Sprintf("%s.%d", base, i)
@@ -442,6 +914,35 @@ func stashConflict(dir, p string, want version, rf remoteFile) (string, error) {
 		return filepath.Join(dir, name), writeLocal(dir, name, rf, nil)
 	}
 	return filepath.Join(dir, filepath.FromSlash(p)), err
+}
+
+// flatName is p as one file name for the top of the stash, short enough for
+// any filesystem: a deep path keeps its last part and a hash of the rest.
+func flatName(p string) string {
+	flat := strings.ReplaceAll(p, "/", "__")
+	if len(flat) <= 160 {
+		return flat
+	}
+	tail := path.Base(p)
+	for len(tail) > 100 {
+		_, n := utf8.DecodeLastRuneInString(tail)
+		tail = tail[:len(tail)-n]
+	}
+	sum := sha256.Sum256([]byte(p))
+	return hex.EncodeToString(sum[:8]) + "__" + tail
+}
+
+// writeNew creates p holding b, failing with EEXIST if anything is there.
+func writeNew(p string, b []byte) error {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func stashCollision(err error) bool {
@@ -655,7 +1156,16 @@ func lockHolder() string {
 //
 // ws is the worktree (for the write-back lock); root is where files go (the
 // worktree root, or --dest).
-func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, root string, patterns []string) (int, error) {
+//
+// held are files an over-limit write-back left in this slot. Landing at
+// their own path in the worktree, they may come back although Git doesn't
+// ignore them, as write-back would have brought them: only while Git still
+// doesn't track them, nothing is at that path locally, and the slot still
+// has the version that was held.
+//
+// heldOnly (pull --held) writes nothing but held files, whatever else the
+// patterns reach.
+func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool) (int, error) {
 	if err := s.Conn.Send(protocol.TypePull, protocol.Pull{Patterns: patterns}); err != nil {
 		return 0, err
 	}
@@ -667,12 +1177,22 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	if err := env.Unmarshal(&listed); err != nil {
 		return 0, fmt.Errorf("pull: bad listing from runner: %w", err)
 	}
+	return applyPull(ctx, ws, root, patterns, held, heldOnly, listed.Paths, s.Blob(ctx))
+}
+
+// applyPull writes the files of blob (a gzip'd tar) that the runner listed
+// and that patterns asked for, under the rules of PullArtifacts.
+func applyPull(ctx context.Context, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool, listed []string, blob io.Reader) (int, error) {
 	// Only paths the runner listed, that match what was asked for, and that
 	// are not reserved, may be written; the rest of the stream is ignored.
 	allowed := map[string]bool{}
 	var candidates []string
-	for _, p := range listed.Paths {
-		if _, err := fsid.CleanRel(p); err != nil || reservedPath(p, ws.Git) || !pullMatches(patterns, p) {
+	requested := newPullMatcher(patterns)
+	for _, p := range listed {
+		if _, isHeld := held[p]; heldOnly && !isHeld {
+			continue
+		}
+		if _, err := fsid.CleanRel(p); err != nil || reservedPath(p, ws.Git) || !requested(p) {
 			continue
 		}
 		allowed[p] = true
@@ -697,6 +1217,7 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 		}
 	}
 	protected := map[string]bool{}
+	heldOK := map[string]bool{} // protected only as not ignored, and held here
 	rel, relErr := filepath.Rel(ws.Root, root)
 	if relErr != nil {
 		return 0, fmt.Errorf("pull: can't place %s relative to the worktree: %w", root, relErr)
@@ -750,7 +1271,11 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 			return 0, err
 		}
 		for p, l := range landing {
-			protected[p] = prot[l]
+			// Judged where it lands too: a --dest above the worktree
+			// must not reach its spotexec state (conflicts, backups).
+			protected[p] = prot[l] != 0 || reservedPath(l, ws.Git)
+			_, isHeld := held[p]
+			heldOK[p] = isHeld && rel == "." && prot[l] == protNotIgnored
 		}
 	}
 	// Outside this worktree, anything inside some git repository (a sibling
@@ -774,6 +1299,7 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 		for _, g := range gitDirs {
 			if under(full, g) {
 				protected[p] = true // an in-tree git dir (a gitfile pointing inside)
+				heldOK[p] = false
 			}
 		}
 	}
@@ -788,36 +1314,71 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 		return 0, err
 	}
 	defer unlock()
-	var skipped []string
+	var skipped, kept, stale []string
 	defer func() {
 		if len(skipped) > 0 {
 			fmt.Fprintf(os.Stderr, "spotexec: pull skipped %d source file(s) (tracked or not gitignored): %s\n", len(skipped), strings.Join(firstN(skipped, 5), ", "))
 		}
+		if len(kept) > 0 {
+			fmt.Fprintf(os.Stderr, "spotexec: pull kept %d local file(s) where a held file would land: %s\n", len(kept), strings.Join(firstN(kept, 5), ", "))
+		}
+		if len(stale) > 0 {
+			fmt.Fprintf(os.Stderr, "spotexec: pull skipped %d held file(s) that changed in the slot after the run: %s\n", len(stale), strings.Join(firstN(stale, 5), ", "))
+		}
 	}()
 	n := 0
-	err = readTar(s.Blob(ctx), func(h *tar.Header, rd io.Reader) error {
+	err = readTar(blob, func(h *tar.Header, rd io.Reader) error {
 		if !allowed[h.Name] {
 			return nil
 		}
-		if protected[h.Name] {
+		if protected[h.Name] && !heldOK[h.Name] {
 			skipped = append(skipped, h.Name)
 			return nil
 		}
 		rf := remoteFile{}
 		switch h.Typeflag {
 		case tar.TypeSymlink:
-			rf.link, rf.mode = h.Linkname, fsid.ModeSymlink
+			rf.link, rf.mode, rf.id = h.Linkname, fsid.ModeSymlink, fsid.Bytes([]byte(h.Linkname))
 		case tar.TypeReg:
 			b, err := io.ReadAll(rd)
 			if err != nil {
 				return err
 			}
-			rf.data, rf.mode = b, fsid.ModeFile
+			rf.data, rf.mode, rf.id = b, fsid.ModeFile, fsid.Bytes(b)
 			if h.Mode&0o111 != 0 {
 				rf.mode = fsid.ModeExec
 			}
 		default:
 			return nil
+		}
+		// A held file, wherever it lands, comes back only as it was held and
+		// only into an empty place, ignored there or not.
+		if e, isHeld := held[h.Name]; isHeld {
+			if rf.id != e.ID || rf.mode != e.Mode {
+				stale = append(stale, h.Name)
+				return nil
+			}
+			want := version{true, rf.id, rf.mode}
+			local, err := localVersion(root, h.Name)
+			if err != nil {
+				return err
+			}
+			if local.eq(want) {
+				return nil // already here
+			}
+			if local.exists {
+				kept = append(kept, h.Name)
+				return nil
+			}
+			err = writeLocal(root, h.Name, rf, &version{})
+			if errors.Is(err, errChangedUnderUs) || errors.Is(err, fsid.ErrSymlinkParent) || stashCollision(err) {
+				kept = append(kept, h.Name)
+				return nil
+			}
+			if err == nil {
+				n++
+			}
+			return err
 		}
 		if fi, err := os.Lstat(filepath.Join(root, filepath.FromSlash(h.Name))); err == nil && fi.IsDir() {
 			return nil
@@ -828,12 +1389,19 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	return n, err
 }
 
-// protectedPaths returns the paths Git tracks or would not ignore. Outside a
-// git worktree nothing is tracked, so pulled outputs (already limited to the
-// requested patterns) may be written. If git can't answer for a git
-// worktree (for example safe.directory), it fails closed.
-func protectedPaths(ctx context.Context, root string, paths []string) (map[string]bool, error) {
-	out := map[string]bool{}
+// Why a pulled path is protected (0: it isn't).
+const (
+	protTracked    = 1 + iota // Git tracks it
+	protNotIgnored            // untracked, and Git would not ignore it
+	protUnknown               // Git couldn't say
+)
+
+// protectedPaths returns the paths Git tracks or would not ignore, and why.
+// Outside a git worktree nothing is tracked, so pulled outputs (already
+// limited to the requested patterns) may be written. If git can't answer for
+// a git worktree (for example safe.directory), it fails closed.
+func protectedPaths(ctx context.Context, root string, paths []string) (map[string]int, error) {
+	out := map[string]int{}
 	if len(paths) == 0 {
 		return out, nil
 	}
@@ -857,7 +1425,7 @@ func protectedPaths(ctx context.Context, root string, paths []string) (map[strin
 	var ee *exec.ExitError
 	if ierr != nil && !(errors.As(ierr, &ee) && ee.ExitCode() == 1) { // 1 = none ignored
 		for _, p := range paths {
-			out[p] = true
+			out[p] = protUnknown
 		}
 		return out, nil
 	}
@@ -866,11 +1434,11 @@ func protectedPaths(ctx context.Context, root string, paths []string) (map[strin
 			ign[string(p)] = true
 		}
 	}
-	tracked := map[string]bool{}
+	isTracked := map[string]bool{}
 	b, err := exec.CommandContext(ctx, "git", "-C", root, "ls-files", "-z").Output()
 	if err != nil {
 		for _, p := range paths { // cannot tell: protect everything
-			out[p] = true
+			out[p] = protUnknown
 		}
 		return out, nil
 	}
@@ -883,12 +1451,15 @@ func protectedPaths(ctx context.Context, root string, paths []string) (map[strin
 	}
 	for _, p := range bytes.Split(b, []byte{0}) {
 		if len(p) > 0 {
-			tracked[fold(string(p))] = true
+			isTracked[fold(string(p))] = true
 		}
 	}
 	for _, p := range paths {
-		if tracked[fold(p)] || !ign[p] {
-			out[p] = true
+		switch {
+		case isTracked[fold(p)]:
+			out[p] = protTracked
+		case !ign[p]:
+			out[p] = protNotIgnored
 		}
 	}
 	return out, nil

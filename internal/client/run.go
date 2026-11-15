@@ -18,10 +18,13 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/depskey"
@@ -37,6 +40,9 @@ const (
 	ExitInfra       = 125
 	ExitTimeout     = 124
 	ExitInterrupted = 130 // Ctrl-C, SIGTERM or SIGHUP
+	// ExitWritebackConflict: with Options.FailOnConflict, the command
+	// succeeded but write-back kept a local edit over one of its changes.
+	ExitWritebackConflict = 122
 )
 
 // Large-sync guardrails.
@@ -49,33 +55,40 @@ const (
 
 // Options for one run.
 type Options struct {
-	Command        string // shell command line
-	Display        string // for status/holder display
-	Timeout        time.Duration
-	Grace          time.Duration
-	QueueTimeout   time.Duration
-	Sync           string // auto|in|none
-	Writeback      string // always|on-success|never
-	Pool           []string
-	Exclusive      bool
-	Pull           []string
-	NoDeps         bool
-	NoSetup        bool // skip [setup]
-	ForceLargeSync bool
-	PreferLast     bool     // exec: reuse last runner+slot without syncing
-	SameSlot       bool     // --same-slot: sync and run in this worktree's last slot
-	LastWithin     []string // with PreferLast/SameSlot: the last runner must be one of these
-	DeferLastRun   bool     // return the last-run record in Result instead of saving it
-	Stdout         io.Writer
-	Stderr         io.Writer
-	Rep            ui.Reporter
-	Interrupt      <-chan struct{} // each receive = one Ctrl-C
-	Label          string
-	RetryPreempt   bool
-	NoBoot         bool
-	SyncOnly       bool // stop after sync + deps (spotexec sync)
-	WaitPush       bool // push a freshly built image before returning (container build)
-	Priority       int  // queue priority when every slot is busy (higher first)
+	Command      string // shell command line
+	Display      string // for status/holder display
+	Timeout      time.Duration
+	Grace        time.Duration
+	QueueTimeout time.Duration
+	Sync         string // auto|in|none
+	Writeback    string // always|on-success|never
+	// WritebackLimits: what a write-back may bring back before it warns
+	// (or holds the new files in the slot). Zero: no limits.
+	WritebackLimits WritebackLimits
+	Pool            []string
+	Exclusive       bool
+	Pull            []string
+	NoDeps          bool
+	NoSetup         bool // skip [setup]
+	ForceLargeSync  bool
+	PreferLast      bool     // exec: reuse last runner+slot without syncing
+	SameSlot        bool     // --same-slot: sync and run in this worktree's last slot
+	LastWithin      []string // with PreferLast/SameSlot: the last runner must be one of these
+	DeferLastRun    bool     // return the last-run record in Result instead of saving it
+	Stdout          io.Writer
+	Stderr          io.Writer
+	Rep             ui.Reporter
+	Interrupt       <-chan struct{} // each receive = one Ctrl-C
+	Label           string
+	RetryPreempt    bool
+	NoBoot          bool
+	SyncOnly        bool // stop after sync + deps (spotexec sync)
+	WaitPush        bool // push a freshly built image before returning (container build)
+	Priority        int  // queue priority when every slot is busy (higher first)
+	// FailOnConflict turns a successful run whose write-back conflicted
+	// into ExitWritebackConflict, so its exit status says the changes
+	// didn't all land.
+	FailOnConflict bool
 	// Env is set for the command over the project's env (a shard's
 	// SPOTEXEC_SHARD and SPOTEXEC_SHARDS).
 	Env map[string]string
@@ -95,10 +108,21 @@ type Result struct {
 	Mutated   []string `json:"mutated_files"`
 	Deleted   []string `json:"deleted_files"`
 	Conflicts []string `json:"conflicts"`
-	Pulled    int      `json:"pulled"`
-	Synced    int      `json:"synced_files"`
-	SyncBytes int64    `json:"synced_bytes"`
-	Image     string   `json:"image,omitempty"` // the project container image used
+	// BackedUp: files write-back deleted or replaced that git had no
+	// committed copy of, saved under BackupDir first.
+	BackedUp  []string `json:"backed_up_files,omitempty"`
+	BackupDir string   `json:"backup_dir,omitempty"`
+	// Held: deletions write-back kept back (the project's own config, or
+	// most of the synced files).
+	Held   []string `json:"held_deletions,omitempty"`
+	Pulled int      `json:"pulled"`
+	// HeldFiles, HeldBytes: new files left in the slot, over the
+	// write-back limit.
+	HeldFiles int    `json:"held_files"`
+	HeldBytes int64  `json:"held_bytes"`
+	Synced    int    `json:"synced_files"`
+	SyncBytes int64  `json:"synced_bytes"`
+	Image     string `json:"image,omitempty"` // the project container image used
 	// DepsInstalled is how long the dependency phase took when it ran the
 	// install (a cache miss); zero otherwise.
 	DepsInstalled time.Duration `json:"-"`
@@ -317,12 +341,12 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			return res, infra(fmt.Errorf("enumerating files: %w", err)), ""
 		}
 		o.Rep.Event("manifest", map[string]any{"files": len(m.Entries), "bytes": m.Bytes, "duration_ms": time.Since(t).Milliseconds(), "git": m.Git})
-		if len(m.Entries) > AbortFiles && !o.ForceLargeSync {
-			return res, infra(fmt.Errorf("refusing to sync %d files (limit %d); add excludes to .spotexec.toml or pass --force-large-sync", len(m.Entries), AbortFiles)), ""
-		}
-		if len(m.Entries) > WarnFiles {
+		if len(m.Entries) > WarnFiles && (len(m.Entries) <= AbortFiles || o.ForceLargeSync) {
 			o.Rep.Warn("LARGE_SYNC", "syncing %d files; consider [sync].exclude", len(m.Entries))
 		}
+	}
+	if err := checkLocal(m, p, ws, o); err != nil {
+		return res, infra(err), ""
 	}
 
 	// 2. Runner + slot.
@@ -431,6 +455,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			if err != nil {
 				return res, infra(fmt.Errorf("sync to %s: %w", r.Name, err)), lostRunner(lease, err)
 			}
+			// The sync removed whatever an earlier write-back held here.
+			clearHeld(ws, lastRun)
 			res.Synced, res.SyncBytes = syn.Written, syn.Bytes
 			o.Rep.Event("sync_in", map[string]any{"mode": "delta", "files": syn.Written, "deleted": syn.Deleted, "bytes": syn.Bytes, "duration_ms": time.Since(t).Milliseconds()})
 			o.Rep.Status("%s · synced %d files (%s) in %s", label, syn.Written, ui.Bytes(syn.Bytes), ui.Dur(time.Since(t)))
@@ -469,7 +495,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	if o.SyncOnly {
 		res.Duration = time.Since(start)
-		o.Rep.Event("result", map[string]any{"exit_code": 0, "duration_ms": res.Duration.Milliseconds(), "runner": r.Name, "slot": res.Slot, "sync_only": true})
+		o.Rep.Event("result", map[string]any{"exit_code": 0, "duration_ms": res.Duration.Milliseconds(), "runner": r.Name, "slot": res.Slot, "sync_only": true, "conflict_count": 0})
 		return res, nil, ""
 	}
 
@@ -644,16 +670,29 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if o.Writeback == "on-success" {
 			proceed = func() bool { return ctx.Err() == nil }
 		}
-		wb, err := writeback(post, sess, ws, m, result, runID, ignoredCreated, proceed)
-		// Conflicts stashed before any failure are reported either way.
+		wb, err := writeback(post, sessionFetch(post, sess), ws, m, result, runID, ignoredCreated, proceed, o.WritebackLimits, o.Rep)
+		// Conflicts stashed and files backed up before any failure are
+		// reported either way.
 		reportConflicts(o.Rep, wb.Stashed, runID)
+		reportSafety(o.Rep, wb, runID)
+		reportOutsideLinks(o.Rep, wb.OutsideLinks, runID)
+		res.BackedUp, res.BackupDir, res.Held = wb.BackedUp, wb.BackupDir, wb.Held
+		res.Conflicts = wb.Conflicts
+		// So are new files held in the slot: they are there whatever
+		// happened next.
+		if len(wb.HeldNew) > 0 {
+			res.HeldFiles, res.HeldBytes = len(wb.HeldNew), wb.HeldNewBytes
+			if err := saveHeld(ws, lastRun, runID, wb.HeldNew); err != nil {
+				o.Rep.Warn("WRITEBACK_HELD", "could not record the held files (%v); `spotexec pull <path>` can still fetch them into a directory outside this worktree with --dest", err)
+			}
+		}
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
 			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)), ""
 		}
-		res.Mutated, res.Deleted, res.Conflicts = wb.Applied, wb.Deleted, wb.Conflicts
-		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "ignored_created": wb.Ignored, "duration_ms": time.Since(t).Milliseconds()})
+		res.Mutated, res.Deleted = wb.Applied, wb.Deleted
+		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "held_files": len(wb.HeldNew), "held_bytes": wb.HeldNewBytes, "duration_ms": time.Since(t).Milliseconds()})
 		if len(wb.Refused) > 0 {
 			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
 		}
@@ -667,7 +706,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// 7. Explicit artifact pulls.
 	pulls := append(append([]string{}, p.Sync.PullArtifacts...), o.Pull...)
 	if len(pulls) > 0 {
-		n, err := PullArtifacts(post, sess, ws, ws.Root, pulls)
+		n, err := PullArtifacts(post, sess, ws, ws.Root, pulls, nil, false)
 		if err != nil {
 			o.Rep.Warn("PULL_FAILED", "pulling %v: %v", pulls, err)
 		}
@@ -675,8 +714,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		o.Rep.Event("pull", map[string]any{"patterns": pulls, "files": n})
 	}
 	checkCanceled()
+	res.ExitCode = conflictExit(res, o.FailOnConflict)
 	res.Duration = time.Since(start)
-	ev := map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot}
+	ev := map[string]any{"exit_code": res.ExitCode, "duration_ms": res.Duration.Milliseconds(), "timed_out": res.TimedOut, "canceled": res.Canceled, "runner": r.Name, "slot": res.Slot, "conflict_count": len(res.Conflicts)}
 	if res.OOMKilled {
 		ev["oom_killed"] = true
 	}
@@ -704,17 +744,72 @@ func keepLastRun(ws *Workspace, o Options, lr LastRun, res *Result) {
 	}
 }
 
-// reportConflicts says, for each write-back conflict, exactly where to look:
-// the stash is under the git dir, out of sight of `git status` and editors.
+// reportOutsideLinks warns about symlinks write-back created or retargeted
+// to point outside the worktree: local tools and agents reading one read
+// whatever it points at, such as a file under ~/.ssh.
+func reportOutsideLinks(rep ui.Reporter, links []Link, runID string) {
+	for _, l := range links {
+		where := "outside the worktree"
+		if strings.HasPrefix(l.Target, "/") {
+			where = "an absolute path"
+		}
+		rep.Warn("WRITEBACK_SYMLINK", "the remote command made %s a symlink to %s, %s; anything reading it here reads that instead (delete it if you didn't expect it)", printable(l.Path), printable(l.Target), where)
+		rep.Event("outside_symlink", map[string]any{"path": l.Path, "target": l.Target, "run_id": runID})
+	}
+}
+
+// printable quotes s when it holds anything a terminal could act on (a
+// runner chooses link names and targets).
+func printable(s string) string {
+	if !utf8.ValidString(s) || strings.IndexFunc(s, func(r rune) bool { return !unicode.IsPrint(r) }) >= 0 {
+		return strconv.Quote(s)
+	}
+	return s
+}
+
+// reportConflicts says, for each write-back conflict or name collision,
+// exactly where to look: the stash is under the git dir, out of sight of
+// `git status` and editors.
 func reportConflicts(rep ui.Reporter, stashed []Conflict, runID string) {
 	for _, c := range stashed {
 		diff := conflictDiff(c)
-		if c.Deleted {
+		ev := map[string]any{"path": c.Path, "local": c.Local, "remote": c.Remote, "deleted": c.Deleted, "diff": diff, "run_id": runID}
+		if c.Reason != "" {
+			ev["reason"] = c.Reason
+		}
+		switch {
+		case c.With != "":
+			// Two remote names, one local file: say which landed, and spell
+			// out names that only differ in Unicode normalisation.
+			path, with := c.Path, c.With
+			if !strings.EqualFold(path, with) {
+				path, with = fmt.Sprintf("%s (%+q)", path, path), fmt.Sprintf("%s (%+q)", with, with)
+			}
+			rep.Warn("SYNC_COLLISION", "the remote run's %s is the same file as %s here, because this filesystem ignores case and Unicode normalisation in names; kept %s, and saved the remote %s instead: %s", path, with, with, path, diff)
+			ev["with"] = c.With
+		case c.Reason == ReasonSymlinkParent && c.Deleted:
+			rep.Warn("SYNC_CONFLICT", "%s was deleted by the remote command but not here: a parent directory of it is a symlink locally", c.Path)
+		case c.Reason == ReasonSymlinkParent:
+			rep.Warn("SYNC_CONFLICT", "%s was not written back: a parent directory of it is a symlink locally. The remote version: %s", c.Path, diff)
+		case c.Deleted:
 			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run, and the remote command deleted it; kept your version (delete it yourself to accept the deletion). Your changes: %s", c.Path, diff)
-		} else {
+		default:
 			rep.Warn("SYNC_CONFLICT", "%s changed locally during the run; kept your version. The remote version: %s", c.Path, diff)
 		}
-		rep.Event("conflict", map[string]any{"path": c.Path, "local": c.Local, "remote": c.Remote, "deleted": c.Deleted, "diff": diff, "run_id": runID})
+		rep.Event("conflict", ev)
+	}
+}
+
+// reportSafety says where write-back saved the uncommitted files it deleted
+// or replaced, and which deletions it held back and why.
+func reportSafety(rep ui.Reporter, wb WritebackResult, runID string) {
+	if len(wb.BackedUp) > 0 {
+		rep.Warn("WRITEBACK_BACKUP", "the run deleted or replaced %d file(s) git has no committed copy of; your versions are saved in %s: %s", len(wb.BackedUp), wb.BackupDir, strings.Join(firstN(wb.BackedUp, 5), ", "))
+		rep.Event("backup", map[string]any{"dir": wb.BackupDir, "files": wb.BackedUp, "run_id": runID})
+	}
+	if len(wb.Held) > 0 {
+		rep.Warn("WRITEBACK_HELD", "%s; kept %d file(s) here instead of deleting them (delete them yourself if that was intended): %s", wb.HeldWhy, len(wb.Held), strings.Join(firstN(wb.Held, 5), ", "))
+		rep.Event("held_deletions", map[string]any{"reason": wb.HeldWhy, "files": wb.Held, "run_id": runID})
 	}
 }
 
@@ -725,7 +820,9 @@ func conflictDiff(c Conflict) string {
 	if c.Deleted {
 		remote = os.DevNull // Remote is only a marker
 	}
-	if fi, err := os.Lstat(local); err != nil || fi.IsDir() {
+	if c.Reason == ReasonSymlinkParent {
+		local = os.DevNull // never read through the symlink, out of the worktree
+	} else if fi, err := os.Lstat(local); err != nil || fi.IsDir() {
 		local = os.DevNull // deleted (or replaced by a directory) locally
 	}
 	return "git diff --no-index -- " + transport.ShellQuote(local) + " " + transport.ShellQuote(remote)
@@ -798,6 +895,17 @@ func shutdownRunner(l *Lease) string {
 		return l.InstanceID
 	}
 	return "static"
+}
+
+// conflictExit is the run's exit code once write-back is done: with
+// failOnConflict, a command that succeeded but whose changes didn't all come
+// back (a SYNC_CONFLICT kept the local file) exits ExitWritebackConflict. A
+// command that failed, timed out or was interrupted keeps its own code.
+func conflictExit(res Result, failOnConflict bool) int {
+	if failOnConflict && len(res.Conflicts) > 0 && res.ExitCode == 0 && !res.Canceled && !res.TimedOut && !res.SetupFailed {
+		return ExitWritebackConflict
+	}
+	return res.ExitCode
 }
 
 func wantWriteback(policy string, code int) bool {
@@ -1027,7 +1135,7 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 		o.Rep.Warn("DEPS_LOCKFILES", "deps.lockfiles pattern %q matches no synced file, so it adds nothing to the dependency cache key", pat)
 	}
 	if len(lockfiles) == 0 {
-		return protocol.DepsResult{}, errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
+		return protocol.DepsResult{}, errNoLockfiles
 	}
 	o.Rep.Status("%s · checking dependency cache", label)
 	t := time.Now()
@@ -1317,81 +1425,84 @@ func markLost(cfg *config.Config, runner, id string) {
 	}
 }
 
+// checkLocal is what a run refuses from the local files alone, so Run
+// checks it before acquiring a runner: a working set over AbortFiles, a
+// container built from a Dockerfile whose build inputs aren't synced (exec,
+// PreferLast, reuses the image this worktree last built instead), and a
+// dependency install whose deps.lockfiles match no synced file or leave the
+// repository (runDeps).
+// m is nil when the run doesn't sync.
+func checkLocal(m *manifest.Manifest, p *config.Project, ws *Workspace, o Options) error {
+	if m != nil && len(m.Entries) > AbortFiles && !o.ForceLargeSync {
+		return fmt.Errorf("refusing to sync %d files (limit %d); add excludes to .spotexec.toml or pass --force-large-sync", len(m.Entries), AbortFiles)
+	}
+	if c := p.Container; c.Dockerfile != "" && c.Image == "" && !o.PreferLast {
+		if _, _, _, err := containerInputs(m, c.Dockerfile, c.Context, readFrom(ws.Root), false); err != nil {
+			return err
+		}
+	}
+	if p.Deps.Install != "" && !o.NoDeps && m != nil {
+		lockfiles, _, err := DepsLockfiles(m, p.Deps.Lockfiles)
+		if err != nil {
+			return err
+		}
+		if len(lockfiles) == 0 {
+			return errNoLockfiles
+		}
+		// The runner keys the cache on the files in its workspace
+		// (depskey.Key), so a literal entry that escapes the repository
+		// fails every install. Whether a literal one is there is the
+		// runner's to find: it may be reached through a synced symlinked
+		// directory, or kept in a cache directory, without a manifest entry.
+		for _, lf := range lockfiles {
+			if _, err := fsid.CleanRel(lf); err != nil {
+				return fmt.Errorf("deps.lockfiles: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+var errNoLockfiles = errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
+
+// Preflight checks, without a runner, what a run from ws with options o
+// (its Sync, PreferLast, NoDeps and ForceLargeSync) would refuse from the
+// local files alone: it builds the working set that run would sync, as Run
+// does, and checks it as Run does (checkLocal). Runner availability,
+// credentials, the transfer size, and the image build and dependency
+// install themselves are not checked.
+func Preflight(ctx context.Context, p *config.Project, ws *Workspace, o Options) error {
+	var m *manifest.Manifest
+	if o.Sync != "none" {
+		var err error
+		if m, err = manifest.Build(ctx, ManifestOptions(ws.Root, p)); err != nil {
+			return fmt.Errorf("enumerating files: %w", err)
+		}
+	}
+	return checkLocal(m, p, ws, o)
+}
+
+// readFrom loads a file of the working set rooted at root.
+func readFrom(root string) func(rel string) ([]byte, error) {
+	return func(rel string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+	}
+}
+
 // imageTag hashes the runner platform, the Dockerfile, a companion
 // <Dockerfile>.dockerignore, and every synced file in the build context
 // that .dockerignore keeps (with any corrections from the upload), so a
 // built image is reused until one of them changes, and never across CPU
 // architectures. read loads a synced file's content (the ignore rules).
 func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read func(rel string) ([]byte, error)) (string, error) {
-	if m == nil {
-		return "", errors.New("container.dockerfile needs a synced workspace (not --sync none)")
-	}
-	df, ok := m.ByPath[dockerfile]
-	if !ok {
-		if read != nil {
-			if _, err := read(dockerfile); err == nil {
-				// The Dockerfile syncs whether or not Git tracks it, so only
-				// an exclude can keep it out.
-				if m.Matcher != nil && m.Matcher.Match(dockerfile, false) {
-					return "", fmt.Errorf("container.dockerfile %q exists but is not synced: [sync].exclude, .spotexecignore or deps.cache_dirs excludes it; remove that pattern", dockerfile)
-				}
-				return "", fmt.Errorf("container.dockerfile %q exists but is not synced: spotexec never syncs that path; move the Dockerfile and point container.dockerfile at it", dockerfile)
-			}
-		}
-		return "", fmt.Errorf("container.dockerfile %q is not in the synced working set", dockerfile)
-	}
-	if df.Mode == fsid.ModeSymlink {
-		return "", fmt.Errorf("container.dockerfile %q must be a regular file, not a symlink", dockerfile)
-	}
-	// Normalised exactly as the helper does (normContext).
-	if buildCtx == "" {
-		buildCtx = path.Dir(dockerfile)
-	}
-	buildCtx = strings.TrimSuffix(strings.TrimPrefix(buildCtx, "./"), "/")
-	if buildCtx == "." {
-		buildCtx = ""
-	}
-	if buildCtx != "" {
-		c, err := fsid.CleanRel(buildCtx)
-		if err != nil {
-			return "", fmt.Errorf("container.context %q must stay inside the repository", buildCtx)
-		}
-		buildCtx = c
+	df, buildCtx, ign, err := containerInputs(m, dockerfile, buildCtx, read, true)
+	if err != nil {
+		return "", err
 	}
 	h := sha256.New()
 	fmt.Fprintf(h, "platform\x00%s\x00dockerfile\x00%s\x00%s\x00ctx\x00%s\x00", platform, dockerfile, df.ID, buildCtx)
 	if ign, ok := m.ByPath[dockerfile+".dockerignore"]; ok {
 		fmt.Fprintf(h, "dockerignore\x00%s\x00", ign.ID)
-	}
-	// The same rules file the helper stages with (see stageContext).
-	var rules []byte
-	for _, cand := range dockerignore.Source(dockerfile, buildCtx) {
-		e, ok := m.ByPath[cand]
-		if !ok {
-			continue
-		}
-		if e.Mode == fsid.ModeSymlink {
-			// It could resolve differently on the runner than here.
-			return "", fmt.Errorf("%s is a symlink; make it a regular file", cand)
-		}
-		if read == nil {
-			return "", fmt.Errorf("cannot read %s", cand)
-		}
-		b, err := read(cand)
-		if err != nil {
-			return "", fmt.Errorf("reading %s: %w", cand, err)
-		}
-		// The rules must be exactly what was synced (the helper stages with
-		// that copy), or the tag would not describe the built image.
-		if fsid.Bytes(b) != e.ID {
-			return "", fmt.Errorf("%s changed after it was synced; run again", cand)
-		}
-		rules = b
-		break
-	}
-	ign, err := dockerignore.New(rules)
-	if err != nil {
-		return "", fmt.Errorf("parsing .dockerignore: %w", err)
 	}
 	paths := make([]string, 0, len(m.ByPath))
 	for p := range m.ByPath {
@@ -1411,6 +1522,84 @@ func imageTag(m *manifest.Manifest, dockerfile, buildCtx, platform string, read 
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
+// containerInputs checks a Dockerfile build's inputs in the working set m,
+// as the runner will build from its synced copy: the Dockerfile is a synced
+// regular file, the context stays inside the repository, and the
+// .dockerignore that applies is a synced regular file that read loads and
+// that parses. synced says m is what the upload left on the runner: then
+// the rules read must be exactly that copy. Before the sync, m is only the
+// scan, and an edit since is what the upload will send. It returns the
+// Dockerfile's entry, the normalised context ("" for the root) and the
+// ignore rules.
+func containerInputs(m *manifest.Manifest, dockerfile, buildCtx string, read func(rel string) ([]byte, error), synced bool) (protocol.Entry, string, *dockerignore.Matcher, error) {
+	if m == nil {
+		return protocol.Entry{}, "", nil, errors.New("container.dockerfile needs a synced workspace (not --sync none)")
+	}
+	df, ok := m.ByPath[dockerfile]
+	if !ok {
+		if read != nil {
+			if _, err := read(dockerfile); err == nil {
+				// The Dockerfile syncs whether or not Git tracks it, so only
+				// an exclude can keep it out.
+				if m.Matcher != nil && m.Matcher.Match(dockerfile, false) {
+					return df, "", nil, fmt.Errorf("container.dockerfile %q exists but is not synced: [sync].exclude, .spotexecignore or deps.cache_dirs excludes it; remove that pattern", dockerfile)
+				}
+				return df, "", nil, fmt.Errorf("container.dockerfile %q exists but is not synced: spotexec never syncs that path; move the Dockerfile and point container.dockerfile at it", dockerfile)
+			}
+		}
+		return df, "", nil, fmt.Errorf("container.dockerfile %q is not in the synced working set", dockerfile)
+	}
+	if df.Mode == fsid.ModeSymlink {
+		return df, "", nil, fmt.Errorf("container.dockerfile %q must be a regular file, not a symlink", dockerfile)
+	}
+	// Normalised exactly as the helper does (normContext).
+	if buildCtx == "" {
+		buildCtx = path.Dir(dockerfile)
+	}
+	buildCtx = strings.TrimSuffix(strings.TrimPrefix(buildCtx, "./"), "/")
+	if buildCtx == "." {
+		buildCtx = ""
+	}
+	if buildCtx != "" {
+		c, err := fsid.CleanRel(buildCtx)
+		if err != nil {
+			return df, "", nil, fmt.Errorf("container.context %q must stay inside the repository", buildCtx)
+		}
+		buildCtx = c
+	}
+	// The same rules file the helper stages with (see stageContext).
+	var rules []byte
+	for _, cand := range dockerignore.Source(dockerfile, buildCtx) {
+		e, ok := m.ByPath[cand]
+		if !ok {
+			continue
+		}
+		if e.Mode == fsid.ModeSymlink {
+			// It could resolve differently on the runner than here.
+			return df, "", nil, fmt.Errorf("%s is a symlink; make it a regular file", cand)
+		}
+		if read == nil {
+			return df, "", nil, fmt.Errorf("cannot read %s", cand)
+		}
+		b, err := read(cand)
+		if err != nil {
+			return df, "", nil, fmt.Errorf("reading %s: %w", cand, err)
+		}
+		// The rules must be exactly what was synced (the helper stages with
+		// that copy), or the tag would not describe the built image.
+		if synced && fsid.Bytes(b) != e.ID {
+			return df, "", nil, fmt.Errorf("%s changed after it was synced; run again", cand)
+		}
+		rules = b
+		break
+	}
+	ign, err := dockerignore.New(rules)
+	if err != nil {
+		return df, "", nil, fmt.Errorf("parsing .dockerignore: %w", err)
+	}
+	return df, buildCtx, ign, nil
+}
+
 // prepareImage makes the project's container image available on the runner
 // (pull, or build once per content hash, shared through the provider's
 // registry when it has one) and returns the local reference to run.
@@ -1427,9 +1616,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 		}
 		req.Ref = lr.Image
 	} else {
-		tag, err := imageTag(m, c.Dockerfile, c.Context, s.Hello.OS+"/"+s.Hello.Arch, func(rel string) ([]byte, error) {
-			return os.ReadFile(filepath.Join(ws.Root, filepath.FromSlash(rel)))
-		})
+		tag, err := imageTag(m, c.Dockerfile, c.Context, s.Hello.OS+"/"+s.Hello.Arch, readFrom(ws.Root))
 		if err != nil {
 			return "", "", err
 		}
