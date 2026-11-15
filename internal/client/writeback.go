@@ -26,6 +26,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/manifest"
 	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // WritebackResult summarizes a write-back.
@@ -49,6 +50,10 @@ type WritebackResult struct {
 	// point outside the worktree: an absolute target, or one that climbs
 	// above the root. They are applied, and reported.
 	OutsideLinks []Link
+	// HeldNew: new files left in the slot because they were over the
+	// write-back limit (hold mode). Neither fetched nor accepted.
+	HeldNew      []protocol.Entry
+	HeldNewBytes int64
 }
 
 // Link is a symlink in the worktree and its target, as written.
@@ -158,7 +163,11 @@ func localVersion(root, rel string) (version, error) {
 // ignored is which created files are ignored here, if already known.
 // proceed, when set, is asked once everything is fetched and before anything
 // is applied: false applies nothing.
-func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string, ignored map[string]bool, proceed func() bool) (WritebackResult, error) {
+//
+// limits are checked before anything is fetched: over them, rep gets a
+// LARGE_WRITEBACK warning, or (hold mode, when the new files alone are over)
+// a WRITEBACK_HELD one, and the new files stay in the slot.
+func writeback(ctx context.Context, fetchFiles fetchFunc, ws *Workspace, m *manifest.Manifest, r protocol.Result, runID string, ignored map[string]bool, proceed func() bool, limits WritebackLimits, rep ui.Reporter) (WritebackResult, error) {
 	var wb WritebackResult
 	// Created (non-manifest) files only come back if not ignored locally.
 	// The runner's report is not trusted: changed or deleted paths must be
@@ -199,6 +208,46 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 			return wb, err
 		}
 	}
+	var fresh []protocol.Entry // created and not ignored: new files coming back
+	for _, c := range created {
+		if ignored[c.Path] {
+			wb.Ignored++
+			continue
+		}
+		fresh = append(fresh, c)
+	}
+	// The new side of a case-only rename (foo -> Foo) is never held: on a
+	// case-insensitive filesystem it is the same file as the deleted one,
+	// renamed in place below.
+	gone := map[string]bool{}
+	for _, d := range deleted {
+		gone[strings.ToLower(d)] = true
+	}
+	var renamed, holdable []protocol.Entry
+	for _, c := range fresh {
+		if gone[strings.ToLower(c.Path)] {
+			renamed = append(renamed, c)
+		} else {
+			holdable = append(holdable, c)
+		}
+	}
+	if n, b := entryTotals(holdable); limits.Hold && limits.Over(n, b) {
+		wb.HeldNew, wb.HeldNewBytes, fresh = holdable, b, renamed
+		if rep != nil {
+			largest := largestPaths(wb.HeldNew, 3)
+			rep.Warn("WRITEBACK_HELD", "left %s (%s) in the slot: over the write-back limit of %s. Largest: %s. Bring them back with `spotexec pull --held` before the next run syncs into this slot, which removes them; add outputs to .gitignore", files(n), ui.Bytes(b), limits, describeLargest(largest))
+			rep.Event("writeback_held", map[string]any{"files": n, "bytes": b, "largest": largest, "run_id": runID})
+		}
+	}
+	if n, b := entryTotals(append(append([]protocol.Entry(nil), changed...), fresh...)); limits.Over(n, b) && rep != nil {
+		largest := largestPaths(append(append([]protocol.Entry(nil), changed...), fresh...), 3)
+		hint := ""
+		if nf, bf := entryTotals(fresh); limits.Over(nf, bf) {
+			hint = `; if they are outputs, add them to .gitignore, or set writeback_over = "hold" in [sync] (or --writeback-over hold) to leave them in the slot`
+		}
+		rep.Warn("LARGE_WRITEBACK", "bringing back %s (%s: %d new, %d changed), over the write-back limit of %s. Largest: %s%s", files(n), ui.Bytes(b), len(fresh), len(changed), limits, describeLargest(largest), hint)
+		rep.Event("large_writeback", map[string]any{"files": n, "bytes": b, "new_files": len(fresh), "changed_files": len(changed), "largest": largest})
+	}
 	remote := map[string]version{}
 	var fetch, accept []string
 	for _, c := range changed {
@@ -208,11 +257,7 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	// Created paths beyond a local symlink: git couldn't judge whether they
 	// are ignored, so they are asked again if a deletion clears the way.
 	unjudged := map[string]bool{}
-	for _, c := range created {
-		if ignored[c.Path] {
-			wb.Ignored++
-			continue
-		}
+	for _, c := range fresh {
 		if _, err := fsid.SafeJoin(ws.Root, c.Path); errors.Is(err, fsid.ErrSymlinkParent) {
 			unjudged[c.Path] = true
 		}
@@ -229,13 +274,11 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 	sort.Strings(fetch)
 
 	files := map[string]remoteFile{}
-	if err := s.Conn.Send(protocol.TypeFetch, protocol.Fetch{Paths: fetch, Accept: accept}); err != nil {
+	blob, err := fetchFiles(protocol.Fetch{Paths: fetch, Accept: accept})
+	if err != nil {
 		return wb, err
 	}
-	if _, err := s.Expect(ctx, protocol.TypeFetched); err != nil {
-		return wb, err
-	}
-	if err := readTar(s.Blob(ctx), func(h *tar.Header, rd io.Reader) error {
+	if err := readTar(blob, func(h *tar.Header, rd io.Reader) error {
 		rf := remoteFile{}
 		switch h.Typeflag {
 		case tar.TypeSymlink:
@@ -264,7 +307,7 @@ func writeback(ctx context.Context, s *transport.Session, ws *Workspace, m *mani
 		return wb, nil
 	}
 
-	err := applyWriteback(ctx, ws, m, remote, files, unjudged, runID, &wb)
+	err = applyWriteback(ctx, ws, m, remote, files, unjudged, runID, &wb)
 	return wb, err
 }
 
@@ -789,6 +832,22 @@ func within(p, dir string, dirInfo fs.FileInfo, haveInfo bool) bool {
 	}
 }
 
+// fetchFunc asks the slot for files and returns them as a gzip'd tar.
+type fetchFunc func(protocol.Fetch) (io.Reader, error)
+
+// sessionFetch fetches over the helper session.
+func sessionFetch(ctx context.Context, s *transport.Session) fetchFunc {
+	return func(f protocol.Fetch) (io.Reader, error) {
+		if err := s.Conn.Send(protocol.TypeFetch, f); err != nil {
+			return nil, err
+		}
+		if _, err := s.Expect(ctx, protocol.TypeFetched); err != nil {
+			return nil, err
+		}
+		return s.Blob(ctx), nil
+	}
+}
+
 func conflictBase(ws *Workspace) string {
 	if ws.GitDir != "" {
 		return filepath.Join(ws.GitDir, "spotexec")
@@ -1097,7 +1156,16 @@ func lockHolder() string {
 //
 // ws is the worktree (for the write-back lock); root is where files go (the
 // worktree root, or --dest).
-func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, root string, patterns []string) (int, error) {
+//
+// held are files an over-limit write-back left in this slot. Landing at
+// their own path in the worktree, they may come back although Git doesn't
+// ignore them, as write-back would have brought them: only while Git still
+// doesn't track them, nothing is at that path locally, and the slot still
+// has the version that was held.
+//
+// heldOnly (pull --held) writes nothing but held files, whatever else the
+// patterns reach.
+func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool) (int, error) {
 	if err := s.Conn.Send(protocol.TypePull, protocol.Pull{Patterns: patterns}); err != nil {
 		return 0, err
 	}
@@ -1109,12 +1177,22 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	if err := env.Unmarshal(&listed); err != nil {
 		return 0, fmt.Errorf("pull: bad listing from runner: %w", err)
 	}
+	return applyPull(ctx, ws, root, patterns, held, heldOnly, listed.Paths, s.Blob(ctx))
+}
+
+// applyPull writes the files of blob (a gzip'd tar) that the runner listed
+// and that patterns asked for, under the rules of PullArtifacts.
+func applyPull(ctx context.Context, ws *Workspace, root string, patterns []string, held HeldFiles, heldOnly bool, listed []string, blob io.Reader) (int, error) {
 	// Only paths the runner listed, that match what was asked for, and that
 	// are not reserved, may be written; the rest of the stream is ignored.
 	allowed := map[string]bool{}
 	var candidates []string
-	for _, p := range listed.Paths {
-		if _, err := fsid.CleanRel(p); err != nil || reservedPath(p, ws.Git) || !pullMatches(patterns, p) {
+	requested := newPullMatcher(patterns)
+	for _, p := range listed {
+		if _, isHeld := held[p]; heldOnly && !isHeld {
+			continue
+		}
+		if _, err := fsid.CleanRel(p); err != nil || reservedPath(p, ws.Git) || !requested(p) {
 			continue
 		}
 		allowed[p] = true
@@ -1139,6 +1217,7 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 		}
 	}
 	protected := map[string]bool{}
+	heldOK := map[string]bool{} // protected only as not ignored, and held here
 	rel, relErr := filepath.Rel(ws.Root, root)
 	if relErr != nil {
 		return 0, fmt.Errorf("pull: can't place %s relative to the worktree: %w", root, relErr)
@@ -1194,7 +1273,9 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 		for p, l := range landing {
 			// Judged where it lands too: a --dest above the worktree
 			// must not reach its spotexec state (conflicts, backups).
-			protected[p] = prot[l] || reservedPath(l, ws.Git)
+			protected[p] = prot[l] != 0 || reservedPath(l, ws.Git)
+			_, isHeld := held[p]
+			heldOK[p] = isHeld && rel == "." && prot[l] == protNotIgnored
 		}
 	}
 	// Outside this worktree, anything inside some git repository (a sibling
@@ -1218,6 +1299,7 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 		for _, g := range gitDirs {
 			if under(full, g) {
 				protected[p] = true // an in-tree git dir (a gitfile pointing inside)
+				heldOK[p] = false
 			}
 		}
 	}
@@ -1232,36 +1314,71 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 		return 0, err
 	}
 	defer unlock()
-	var skipped []string
+	var skipped, kept, stale []string
 	defer func() {
 		if len(skipped) > 0 {
 			fmt.Fprintf(os.Stderr, "spotexec: pull skipped %d source file(s) (tracked or not gitignored): %s\n", len(skipped), strings.Join(firstN(skipped, 5), ", "))
 		}
+		if len(kept) > 0 {
+			fmt.Fprintf(os.Stderr, "spotexec: pull kept %d local file(s) where a held file would land: %s\n", len(kept), strings.Join(firstN(kept, 5), ", "))
+		}
+		if len(stale) > 0 {
+			fmt.Fprintf(os.Stderr, "spotexec: pull skipped %d held file(s) that changed in the slot after the run: %s\n", len(stale), strings.Join(firstN(stale, 5), ", "))
+		}
 	}()
 	n := 0
-	err = readTar(s.Blob(ctx), func(h *tar.Header, rd io.Reader) error {
+	err = readTar(blob, func(h *tar.Header, rd io.Reader) error {
 		if !allowed[h.Name] {
 			return nil
 		}
-		if protected[h.Name] {
+		if protected[h.Name] && !heldOK[h.Name] {
 			skipped = append(skipped, h.Name)
 			return nil
 		}
 		rf := remoteFile{}
 		switch h.Typeflag {
 		case tar.TypeSymlink:
-			rf.link, rf.mode = h.Linkname, fsid.ModeSymlink
+			rf.link, rf.mode, rf.id = h.Linkname, fsid.ModeSymlink, fsid.Bytes([]byte(h.Linkname))
 		case tar.TypeReg:
 			b, err := io.ReadAll(rd)
 			if err != nil {
 				return err
 			}
-			rf.data, rf.mode = b, fsid.ModeFile
+			rf.data, rf.mode, rf.id = b, fsid.ModeFile, fsid.Bytes(b)
 			if h.Mode&0o111 != 0 {
 				rf.mode = fsid.ModeExec
 			}
 		default:
 			return nil
+		}
+		// A held file, wherever it lands, comes back only as it was held and
+		// only into an empty place, ignored there or not.
+		if e, isHeld := held[h.Name]; isHeld {
+			if rf.id != e.ID || rf.mode != e.Mode {
+				stale = append(stale, h.Name)
+				return nil
+			}
+			want := version{true, rf.id, rf.mode}
+			local, err := localVersion(root, h.Name)
+			if err != nil {
+				return err
+			}
+			if local.eq(want) {
+				return nil // already here
+			}
+			if local.exists {
+				kept = append(kept, h.Name)
+				return nil
+			}
+			err = writeLocal(root, h.Name, rf, &version{})
+			if errors.Is(err, errChangedUnderUs) || errors.Is(err, fsid.ErrSymlinkParent) || stashCollision(err) {
+				kept = append(kept, h.Name)
+				return nil
+			}
+			if err == nil {
+				n++
+			}
+			return err
 		}
 		if fi, err := os.Lstat(filepath.Join(root, filepath.FromSlash(h.Name))); err == nil && fi.IsDir() {
 			return nil
@@ -1272,12 +1389,19 @@ func PullArtifacts(ctx context.Context, s *transport.Session, ws *Workspace, roo
 	return n, err
 }
 
-// protectedPaths returns the paths Git tracks or would not ignore. Outside a
-// git worktree nothing is tracked, so pulled outputs (already limited to the
-// requested patterns) may be written. If git can't answer for a git
-// worktree (for example safe.directory), it fails closed.
-func protectedPaths(ctx context.Context, root string, paths []string) (map[string]bool, error) {
-	out := map[string]bool{}
+// Why a pulled path is protected (0: it isn't).
+const (
+	protTracked    = 1 + iota // Git tracks it
+	protNotIgnored            // untracked, and Git would not ignore it
+	protUnknown               // Git couldn't say
+)
+
+// protectedPaths returns the paths Git tracks or would not ignore, and why.
+// Outside a git worktree nothing is tracked, so pulled outputs (already
+// limited to the requested patterns) may be written. If git can't answer for
+// a git worktree (for example safe.directory), it fails closed.
+func protectedPaths(ctx context.Context, root string, paths []string) (map[string]int, error) {
+	out := map[string]int{}
 	if len(paths) == 0 {
 		return out, nil
 	}
@@ -1301,7 +1425,7 @@ func protectedPaths(ctx context.Context, root string, paths []string) (map[strin
 	var ee *exec.ExitError
 	if ierr != nil && !(errors.As(ierr, &ee) && ee.ExitCode() == 1) { // 1 = none ignored
 		for _, p := range paths {
-			out[p] = true
+			out[p] = protUnknown
 		}
 		return out, nil
 	}
@@ -1310,11 +1434,11 @@ func protectedPaths(ctx context.Context, root string, paths []string) (map[strin
 			ign[string(p)] = true
 		}
 	}
-	tracked := map[string]bool{}
+	isTracked := map[string]bool{}
 	b, err := exec.CommandContext(ctx, "git", "-C", root, "ls-files", "-z").Output()
 	if err != nil {
 		for _, p := range paths { // cannot tell: protect everything
-			out[p] = true
+			out[p] = protUnknown
 		}
 		return out, nil
 	}
@@ -1327,12 +1451,15 @@ func protectedPaths(ctx context.Context, root string, paths []string) (map[strin
 	}
 	for _, p := range bytes.Split(b, []byte{0}) {
 		if len(p) > 0 {
-			tracked[fold(string(p))] = true
+			isTracked[fold(string(p))] = true
 		}
 	}
 	for _, p := range paths {
-		if tracked[fold(p)] || !ign[p] {
-			out[p] = true
+		switch {
+		case isTracked[fold(p)]:
+			out[p] = protTracked
+		case !ign[p]:
+			out[p] = protNotIgnored
 		}
 	}
 	return out, nil

@@ -753,3 +753,56 @@ func TestContainerDockerNeedsContainer(t *testing.T) {
 		}
 	}
 }
+
+func TestWritebackLimits(t *testing.T) {
+	load := func(body string) (*Project, error) {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		if err := os.WriteFile(pp, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return LoadProject(pp)
+	}
+	p, err := LoadProject("")
+	if err != nil || p.Sync.WritebackMaxFiles != 1000 || p.Sync.WritebackMaxBytes != 100<<20 || p.Sync.WritebackOver != "warn" {
+		t.Fatalf("defaults: %+v, %v", p.Sync, err)
+	}
+	for body, want := range map[string]Sync{
+		"[sync]\nwriteback_max_files = 0\nwriteback_max_bytes = 0\n":           {WritebackMaxFiles: 0, WritebackMaxBytes: 0, WritebackOver: "warn"},
+		"[sync]\nwriteback_max_bytes = \"250MB\"\nwriteback_over = \"hold\"\n": {WritebackMaxFiles: DefaultWritebackMaxFiles, WritebackMaxBytes: 250 << 20, WritebackOver: "hold"},
+		"[sync]\nwriteback_max_files = 50\nwriteback_max_bytes = 4096\n":       {WritebackMaxFiles: 50, WritebackMaxBytes: 4096, WritebackOver: "warn"},
+		"[sync]\nwriteback_max_bytes = \"1.5 GiB\"\n":                          {WritebackMaxFiles: DefaultWritebackMaxFiles, WritebackMaxBytes: 3 << 29, WritebackOver: "warn"},
+	} {
+		p, err := load(body)
+		if err != nil {
+			t.Errorf("%q: %v", body, err)
+			continue
+		}
+		got := Sync{WritebackMaxFiles: p.Sync.WritebackMaxFiles, WritebackMaxBytes: p.Sync.WritebackMaxBytes, WritebackOver: p.Sync.WritebackOver}
+		if got.WritebackMaxFiles != want.WritebackMaxFiles || got.WritebackMaxBytes != want.WritebackMaxBytes || got.WritebackOver != want.WritebackOver {
+			t.Errorf("%q: got %+v, want %+v", body, got, want)
+		}
+	}
+	for _, body := range []string{
+		"[sync]\nwriteback_over = \"drop\"\n",
+		"[sync]\nwriteback_max_files = -1\n",
+		"[sync]\nwriteback_max_bytes = \"lots\"\n",
+		"[sync]\nwriteback_max_bytes = -5\n",
+	} {
+		if _, err := load(body); err == nil {
+			t.Errorf("%q accepted", body)
+		}
+	}
+}
+
+func TestParseBytes(t *testing.T) {
+	for in, want := range map[string]int64{"0": 0, "512": 512, "512B": 512, "4KB": 4096, "4k": 4096, "100MB": 100 << 20, "100 MiB": 100 << 20, "2GB": 2 << 30, "0.5MB": 512 << 10} {
+		if got, err := ParseBytes(in); err != nil || got != want {
+			t.Errorf("ParseBytes(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "MB", "-1", "1TB", "NaN", "1e300GB"} {
+		if _, err := ParseBytes(in); err == nil {
+			t.Errorf("ParseBytes(%q) accepted", in)
+		}
+	}
+}

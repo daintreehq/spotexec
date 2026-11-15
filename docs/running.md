@@ -42,6 +42,7 @@ A parallel or sharded task's parts run in several slots at once, so `--same-slot
 | `--sync auto\|in\|none` | `auto` syncs and writes back; `in` syncs and discards changes; `none` runs on whatever the slot has. |
 | `--writeback always\|on-success\|never` | When changes come back. |
 | `--fail-on-conflict` | Exit `122` when the command succeeded but write-back kept a local edit over one of its changes (`SYNC_CONFLICT`), so a caller that only reads the exit status knows the changes didn't all land. Also `SPOTEXEC_FAIL_ON_CONFLICT=1`. See [write-back](#write-back-and-artifacts). |
+| `--writeback-over warn\|hold` | Over the [write-back limit](#write-back-limits): bring everything back with a warning, or leave the new files in the slot. |
 | `-r, --runner NAME` / `--pool A,B` | Restrict where the command may run. |
 | `--same-slot` | Run in this worktree's last slot (same VM), waiting if it's busy. See [above](#coming-back-to-the-same-machine). |
 | `--exclusive` | Take every slot on a machine (the job gets all its CPUs). |
@@ -133,4 +134,12 @@ To get **ignored outputs** back (coverage reports, build output), use one of:
 - `pull_artifacts` in `.spotexec.toml`;
 - `spotexec pull <glob>` afterwards, from the last-used slot (`--dest DIR` to land them elsewhere).
 
-Pulled files never overwrite tracked or non-ignored files, and never land in another repository or a git directory.
+Pulled files never overwrite tracked or non-ignored files, and never land in another repository or a git directory. The one exception is files a write-back [held](#write-back-limits).
+
+### Write-back limits
+
+A command that dumps a heap snapshot, a coverage tree or generated fixtures where Git doesn't ignore them would otherwise flood the worktree, and every later run would upload them again. So a write-back bringing back more than `writeback_max_files` files (default 1000) or `writeback_max_bytes` bytes (default 100 MB) warns before it transfers anything, with `LARGE_WRITEBACK` naming the largest paths: single files, and directories with how many files they hold. Set either limit to `0` to turn it off.
+
+With `writeback_over = "hold"` in `[sync]` (or `--writeback-over hold`, or `SPOTEXEC_WRITEBACK_OVER=hold`), new files over the limit stay in the slot instead: none of them comes back, and a `WRITEBACK_HELD` warning says how many, how big and where. Changes to and deletions of files you synced still come back as usual, so a formatter rewriting 5,000 files only warns. Only the new files count toward holding, so a command that moves a directory gets its deletions applied while the moved files wait in the slot.
+
+`spotexec pull --held` brings the held files back (`spotexec pull --held gen/` only some of them), and `spotexec pull <glob>` takes held files along with ignored outputs. A held file only lands where nothing is now, and only as the run left it; Git still mustn't track it. Get them before the next run that syncs into the slot, which removes them. They come from the slot `spotexec pull` reads, the last one this worktree used, so held files of the other parts of a parallel task can't be pulled.

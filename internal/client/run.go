@@ -55,33 +55,36 @@ const (
 
 // Options for one run.
 type Options struct {
-	Command        string // shell command line
-	Display        string // for status/holder display
-	Timeout        time.Duration
-	Grace          time.Duration
-	QueueTimeout   time.Duration
-	Sync           string // auto|in|none
-	Writeback      string // always|on-success|never
-	Pool           []string
-	Exclusive      bool
-	Pull           []string
-	NoDeps         bool
-	NoSetup        bool // skip [setup]
-	ForceLargeSync bool
-	PreferLast     bool     // exec: reuse last runner+slot without syncing
-	SameSlot       bool     // --same-slot: sync and run in this worktree's last slot
-	LastWithin     []string // with PreferLast/SameSlot: the last runner must be one of these
-	DeferLastRun   bool     // return the last-run record in Result instead of saving it
-	Stdout         io.Writer
-	Stderr         io.Writer
-	Rep            ui.Reporter
-	Interrupt      <-chan struct{} // each receive = one Ctrl-C
-	Label          string
-	RetryPreempt   bool
-	NoBoot         bool
-	SyncOnly       bool // stop after sync + deps (spotexec sync)
-	WaitPush       bool // push a freshly built image before returning (container build)
-	Priority       int  // queue priority when every slot is busy (higher first)
+	Command      string // shell command line
+	Display      string // for status/holder display
+	Timeout      time.Duration
+	Grace        time.Duration
+	QueueTimeout time.Duration
+	Sync         string // auto|in|none
+	Writeback    string // always|on-success|never
+	// WritebackLimits: what a write-back may bring back before it warns
+	// (or holds the new files in the slot). Zero: no limits.
+	WritebackLimits WritebackLimits
+	Pool            []string
+	Exclusive       bool
+	Pull            []string
+	NoDeps          bool
+	NoSetup         bool // skip [setup]
+	ForceLargeSync  bool
+	PreferLast      bool     // exec: reuse last runner+slot without syncing
+	SameSlot        bool     // --same-slot: sync and run in this worktree's last slot
+	LastWithin      []string // with PreferLast/SameSlot: the last runner must be one of these
+	DeferLastRun    bool     // return the last-run record in Result instead of saving it
+	Stdout          io.Writer
+	Stderr          io.Writer
+	Rep             ui.Reporter
+	Interrupt       <-chan struct{} // each receive = one Ctrl-C
+	Label           string
+	RetryPreempt    bool
+	NoBoot          bool
+	SyncOnly        bool // stop after sync + deps (spotexec sync)
+	WaitPush        bool // push a freshly built image before returning (container build)
+	Priority        int  // queue priority when every slot is busy (higher first)
 	// FailOnConflict turns a successful run whose write-back conflicted
 	// into ExitWritebackConflict, so its exit status says the changes
 	// didn't all land.
@@ -111,11 +114,15 @@ type Result struct {
 	BackupDir string   `json:"backup_dir,omitempty"`
 	// Held: deletions write-back kept back (the project's own config, or
 	// most of the synced files).
-	Held      []string `json:"held_deletions,omitempty"`
-	Pulled    int      `json:"pulled"`
-	Synced    int      `json:"synced_files"`
-	SyncBytes int64    `json:"synced_bytes"`
-	Image     string   `json:"image,omitempty"` // the project container image used
+	Held   []string `json:"held_deletions,omitempty"`
+	Pulled int      `json:"pulled"`
+	// HeldFiles, HeldBytes: new files left in the slot, over the
+	// write-back limit.
+	HeldFiles int    `json:"held_files"`
+	HeldBytes int64  `json:"held_bytes"`
+	Synced    int    `json:"synced_files"`
+	SyncBytes int64  `json:"synced_bytes"`
+	Image     string `json:"image,omitempty"` // the project container image used
 	// DepsInstalled is how long the dependency phase took when it ran the
 	// install (a cache miss); zero otherwise.
 	DepsInstalled time.Duration `json:"-"`
@@ -448,6 +455,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			if err != nil {
 				return res, infra(fmt.Errorf("sync to %s: %w", r.Name, err)), lostRunner(lease, err)
 			}
+			// The sync removed whatever an earlier write-back held here.
+			clearHeld(ws, lastRun)
 			res.Synced, res.SyncBytes = syn.Written, syn.Bytes
 			o.Rep.Event("sync_in", map[string]any{"mode": "delta", "files": syn.Written, "deleted": syn.Deleted, "bytes": syn.Bytes, "duration_ms": time.Since(t).Milliseconds()})
 			o.Rep.Status("%s · synced %d files (%s) in %s", label, syn.Written, ui.Bytes(syn.Bytes), ui.Dur(time.Since(t)))
@@ -661,7 +670,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if o.Writeback == "on-success" {
 			proceed = func() bool { return ctx.Err() == nil }
 		}
-		wb, err := writeback(post, sess, ws, m, result, runID, ignoredCreated, proceed)
+		wb, err := writeback(post, sessionFetch(post, sess), ws, m, result, runID, ignoredCreated, proceed, o.WritebackLimits, o.Rep)
 		// Conflicts stashed and files backed up before any failure are
 		// reported either way.
 		reportConflicts(o.Rep, wb.Stashed, runID)
@@ -669,13 +678,21 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		reportOutsideLinks(o.Rep, wb.OutsideLinks, runID)
 		res.BackedUp, res.BackupDir, res.Held = wb.BackedUp, wb.BackupDir, wb.Held
 		res.Conflicts = wb.Conflicts
+		// So are new files held in the slot: they are there whatever
+		// happened next.
+		if len(wb.HeldNew) > 0 {
+			res.HeldFiles, res.HeldBytes = len(wb.HeldNew), wb.HeldNewBytes
+			if err := saveHeld(ws, lastRun, runID, wb.HeldNew); err != nil {
+				o.Rep.Warn("WRITEBACK_HELD", "could not record the held files (%v); `spotexec pull <path>` can still fetch them into a directory outside this worktree with --dest", err)
+			}
+		}
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
 			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)), ""
 		}
 		res.Mutated, res.Deleted = wb.Applied, wb.Deleted
-		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "duration_ms": time.Since(t).Milliseconds()})
+		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "held_files": len(wb.HeldNew), "held_bytes": wb.HeldNewBytes, "duration_ms": time.Since(t).Milliseconds()})
 		if len(wb.Refused) > 0 {
 			o.Rep.Warn("WRITEBACK_REFUSED", "ignored %d path(s) the runner reported that may not be written back (inside .git or .spotexec, or never uploaded): %s", len(wb.Refused), strings.Join(firstN(wb.Refused, 5), ", "))
 		}
@@ -689,7 +706,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// 7. Explicit artifact pulls.
 	pulls := append(append([]string{}, p.Sync.PullArtifacts...), o.Pull...)
 	if len(pulls) > 0 {
-		n, err := PullArtifacts(post, sess, ws, ws.Root, pulls)
+		n, err := PullArtifacts(post, sess, ws, ws.Root, pulls, nil, false)
 		if err != nil {
 			o.Rep.Warn("PULL_FAILED", "pulling %v: %v", pulls, err)
 		}
