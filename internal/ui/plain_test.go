@@ -127,3 +127,12 @@ func TestPlainReporterDetailKeepsPhase(t *testing.T) {
 		t.Fatalf("%d heartbeats, want 1:\n%s", n, got)
 	}
 }
+
+func TestCleanLines(t *testing.T) {
+	got := CleanLines("\x1b[33mwarn\x1b[0m\tdeprecated  \r\n10%\r55%\r100%\n\n\x07done\n" +
+		"\x1b]0;hidden title\x07error\n\x1b]8;;https://x.test\x1b\\link\x1b]8;;\x1b\\ text\n\x1b[38:5:196mred\x1b[m\u0085\u009b\n")
+	want := []string{"warn deprecated", "100%", "", "done", "error", "link text", "red"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("CleanLines = %q, want %q", got, want)
+	}
+}

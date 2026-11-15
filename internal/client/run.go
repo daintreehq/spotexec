@@ -99,6 +99,9 @@ type Result struct {
 	Synced    int      `json:"synced_files"`
 	SyncBytes int64    `json:"synced_bytes"`
 	Image     string   `json:"image,omitempty"` // the project container image used
+	// DepsInstalled is how long the dependency phase took when it ran the
+	// install (a cache miss); zero otherwise.
+	DepsInstalled time.Duration `json:"-"`
 	// LastRun is where this worktree's files now are, when the run
 	// synced (saved already unless Options.DeferLastRun).
 	LastRun *LastRun `json:"-"`
@@ -455,8 +458,12 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 
 	// 5. Dependencies.
 	if p.Deps.Install != "" && !o.NoDeps && o.Sync != "none" {
-		if err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun, imageID, m); err != nil {
+		dr, err := runDeps(ctx, sess, p, r, o, label, ws, lease, crun, imageID, m)
+		if err != nil {
 			return res, infra(err), lostRunner(lease, err)
+		}
+		if dr.Built {
+			res.DepsInstalled = time.Duration(dr.MS) * time.Millisecond
 		}
 	}
 
@@ -1006,21 +1013,21 @@ func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 	return protocol.Entry{Path: name, ID: fsid.Bytes(b), Mode: emode, Size: int64(len(b))}, err
 }
 
-func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string, m *manifest.Manifest) error {
+func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string, m *manifest.Manifest) (protocol.DepsResult, error) {
 	if len(p.Deps.Lockfiles) == 0 {
-		return errors.New("deps.install is set but deps.lockfiles is empty")
+		return protocol.DepsResult{}, errors.New("deps.install is set but deps.lockfiles is empty")
 	}
 	// The runner hashes exactly this list: it never expands patterns itself,
 	// so both sides key the cache on the same files.
 	lockfiles, unmatched, err := DepsLockfiles(m, p.Deps.Lockfiles)
 	if err != nil {
-		return err
+		return protocol.DepsResult{}, err
 	}
 	for _, pat := range unmatched {
 		o.Rep.Warn("DEPS_LOCKFILES", "deps.lockfiles pattern %q matches no synced file, so it adds nothing to the dependency cache key", pat)
 	}
 	if len(lockfiles) == 0 {
-		return errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
+		return protocol.DepsResult{}, errors.New("deps.lockfiles matches no synced file: the dependency cache needs at least one to key on")
 	}
 	o.Rep.Status("%s · checking dependency cache", label)
 	t := time.Now()
@@ -1061,53 +1068,49 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 		}
 	}
 	if err := s.Conn.Send(protocol.TypeDeps, req); err != nil {
-		return err
+		return protocol.DepsResult{}, err
 	}
-	errW := &ui.ClearingWriter{W: o.Stderr, R: o.Rep}
-	for {
-		f, err := s.Next(ctx)
-		if err != nil {
-			return err
-		}
-		switch f.Kind {
-		case protocol.KindStdout, protocol.KindStderr:
-			// Install output goes to stderr so command stdout stays clean.
-			errW.Write(f.Data)
-			continue
-		}
-		env, err := protocol.Decode(f)
-		if err != nil {
-			return err
-		}
-		switch env.Type {
-		case protocol.TypeStarted:
-			continue
-		case protocol.TypeEvent:
-			var ev protocol.Event
-			_ = env.Unmarshal(&ev)
-			if ev.Name == "deps_install" {
-				o.Rep.Status("%s · installing dependencies (%s)", label, ev.Message)
-			}
-			if s.OnEvent != nil {
-				s.OnEvent(ev) // records interruption notices for the pre-exec check
-			} else {
-				o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
-			}
-			continue
-		case protocol.TypeError:
-			var em protocol.ErrorMsg
-			_ = env.Unmarshal(&em)
-			return fmt.Errorf("dependencies: %w", &transport.RemoteError{ErrorMsg: em})
-		case protocol.TypeDepsResult:
-			var dr protocol.DepsResult
-			_ = env.Unmarshal(&dr)
-			o.Rep.Event("deps", map[string]any{"key": dr.Key, "built": dr.Built, "restored": dr.Restored, "uploading": dr.Uploaded,
-				"hydrated": dr.Hydrated, "method": dr.Method, "duration_ms": time.Since(t).Milliseconds()})
-			return nil
-		default:
-			return fmt.Errorf("protocol: unexpected %q during deps", env.Type)
+	onEvent := func(ev protocol.Event) {
+		if s.OnEvent != nil {
+			s.OnEvent(ev) // records interruption notices for the pre-exec check
+		} else {
+			o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
 		}
 	}
+	log := newDepsLog(depsLogDir(), label)
+	dr, err := consumeDeps(ctx, s.Next, onEvent, o.Rep, label, log)
+	log.Close()
+	// The install's status (and plain mode's heartbeat of it) ends here:
+	// the command's own phase starts next.
+	o.Rep.Clear()
+	ms := time.Since(t).Milliseconds()
+	if err != nil {
+		tail, truncated := log.Tail(depsTailLines)
+		var re *transport.RemoteError
+		if errors.As(err, &re) {
+			// The helper reported the failure: no retry follows.
+			ev := map[string]any{"code": re.Code, "message": re.Message, "duration_ms": ms}
+			if log.Bytes() > 0 {
+				ev["output_tail"], ev["output_truncated"] = tail, truncated
+			}
+			if p := log.Path(); p != "" {
+				ev["log"] = p
+			}
+			o.Rep.Event("deps_failed", ev)
+		}
+		if log.Bytes() == 0 || ctx.Err() != nil {
+			return dr, err // nothing to show, or this run was interrupted
+		}
+		// A runner lost mid-install keeps what it printed, too.
+		return dr, &DepsError{Err: err, Tail: tail, Truncated: truncated, Log: log.Path()}
+	}
+	ev := map[string]any{"key": dr.Key, "built": dr.Built, "restored": dr.Restored, "uploading": dr.Uploaded,
+		"hydrated": dr.Hydrated, "method": dr.Method, "duration_ms": ms}
+	if p := log.Path(); p != "" {
+		ev["log"] = p
+	}
+	o.Rep.Event("deps", ev)
+	return dr, nil
 }
 
 // SetupFor is the [setup] command a run starts with ("" when none applies)

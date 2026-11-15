@@ -58,6 +58,7 @@ Other events include:
 - `scale_out`, `provision`, `instance_running`, `instance_ready`;
 - `boot_progress` while a new VM runs its first-boot setup: `elapsed_ms` and the latest `line` of its bootstrap log, at most every 5s;
 - `manifest`, `deps`, `image`, `exec`, `pull`, `cancel`;
+- `deps_failed` when the dependency install fails: the error's `code` and `message`, the install's last 40 lines (`output_tail`, `output_truncated` when earlier lines were left out) and the full `log` on this machine. The install's output never reaches the command's stdout or stderr, in any mode; a successful `deps` event also has its `log` when the install ran;
 - `spot_interruption`, `spot_rebalance`, `retry`;
 - `conflict`, one per write-back conflict: your kept file (`local`), the stashed remote version (`remote`, a marker when `deleted` is true), and a `diff` command to see the remote changes;
 - `warning` events with stable codes (`SYNC_CONFLICT`, `RUNNER_LOST`, `SPOT_INTERRUPTION`, `TIMEOUT`, `LOCAL_FALLBACK`, …);
