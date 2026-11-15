@@ -795,7 +795,7 @@ func TestWritebackLimits(t *testing.T) {
 }
 
 func TestParseBytes(t *testing.T) {
-	for in, want := range map[string]int64{"0": 0, "512": 512, "512B": 512, "4KB": 4096, "4k": 4096, "100MB": 100 << 20, "100 MiB": 100 << 20, "2GB": 2 << 30, "0.5MB": 512 << 10} {
+	for in, want := range map[string]int64{"0": 0, "0.0": 0, "0KB": 0, "512": 512, "512B": 512, "4KB": 4096, "4k": 4096, "100MB": 100 << 20, "100 MiB": 100 << 20, "2GB": 2 << 30, "0.5MB": 512 << 10, "1.5": 1, "1": 1, "1B": 1, "0.0009765625KB": 1, "-0": 0, "0e5": 0} {
 		if got, err := ParseBytes(in); err != nil || got != want {
 			t.Errorf("ParseBytes(%q) = %d, %v; want %d", in, got, err, want)
 		}
@@ -803,6 +803,30 @@ func TestParseBytes(t *testing.T) {
 	for _, in := range []string{"", "MB", "-1", "1TB", "NaN", "1e300GB"} {
 		if _, err := ParseBytes(in); err == nil {
 			t.Errorf("ParseBytes(%q) accepted", in)
+		}
+	}
+	// Below one byte would truncate to 0, which turns a limit off: only an
+	// explicit zero may do that.
+	// (1e-400 underflows to 0 when parsed, but isn't zero.)
+	for _, in := range []string{"0.4", "+0.4", "0.4B", "0.0001KB", "1e-10GB", "0.999", "1e-400", "1e-400GB", "-1e-400", "0x1p-2000"} {
+		if _, err := ParseBytes(in); err == nil || !strings.Contains(err.Error(), "below one byte") {
+			t.Errorf("ParseBytes(%q) = %v, want a below-one-byte error", in, err)
+		}
+	}
+	// In the config, that is an error on load, quoted or not.
+	for v, want := range map[string]int64{`"0.4"`: -1, `0.4`: -1, `0.0000001`: -1, `0.9999999`: -1, `0`: 0, `0.0`: 0, `2048`: 2048, `"2KB"`: 2048, `1024.0`: 1024} {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		if err := os.WriteFile(pp, []byte("version = 1\n[sync]\nwriteback_max_bytes = "+v+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		p, err := LoadProject(pp)
+		switch {
+		case want < 0:
+			if err == nil || !strings.Contains(err.Error(), "below one byte") {
+				t.Errorf("writeback_max_bytes = %s loaded: %v", v, err)
+			}
+		case err != nil || int64(p.Sync.WritebackMaxBytes) != want:
+			t.Errorf("writeback_max_bytes = %s: %v, %v; want %d", v, p, err, want)
 		}
 	}
 }

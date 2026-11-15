@@ -48,6 +48,21 @@ func (b *Bytes) UnmarshalText(t []byte) error {
 	return nil
 }
 
+// UnmarshalTOML takes unquoted numbers too: through UnmarshalText the
+// decoder would format a float with six decimals, so 0.0000001 would read
+// as 0, no limit.
+func (b *Bytes) UnmarshalTOML(v any) error {
+	switch v := v.(type) {
+	case string:
+		return b.UnmarshalText([]byte(v))
+	case int64:
+		return b.UnmarshalText([]byte(strconv.FormatInt(v, 10)))
+	case float64:
+		return b.UnmarshalText([]byte(strconv.FormatFloat(v, 'g', -1, 64)))
+	}
+	return fmt.Errorf("invalid size %v (want bytes, or a number with KB, MB or GB)", v)
+}
+
 // ParseBytes reads a size: a plain integer of bytes, or a number with a
 // unit (B, KB, MB, GB; binary multiples, so "1MB" is 1,048,576 bytes).
 func ParseBytes(s string) (int64, error) {
@@ -66,7 +81,24 @@ func ParseBytes(s string) (int64, error) {
 	if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) || f*float64(mult) > math.MaxInt64/2 {
 		return 0, fmt.Errorf("invalid size %q (want bytes, or a number with KB, MB or GB)", s)
 	}
+	// It would truncate to 0, which means no limit: only an explicit 0 may.
+	// A tiny number (1e-400) parses as 0 too; its significand isn't zero.
+	if n := f * float64(mult); (n > 0 && n < 1) || (n == 0 && !zeroSignificand(t)) {
+		return 0, fmt.Errorf("invalid size %q: below one byte (0 means no limit)", s)
+	}
 	return int64(f * float64(mult)), nil
+}
+
+// zeroSignificand reports whether a number ParseFloat read as 0 is written
+// as zero (0, -0.0, 0e5, 0x0p1) rather than underflowing. t is upper case.
+func zeroSignificand(t string) bool {
+	s := strings.TrimLeft(t, "+-")
+	if h, ok := strings.CutPrefix(s, "0X"); ok {
+		s, _, _ = strings.Cut(h, "P")
+	} else {
+		s, _, _ = strings.Cut(s, "E")
+	}
+	return strings.Trim(s, "0._") == ""
 }
 
 // Runner types.

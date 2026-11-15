@@ -142,7 +142,7 @@ Pulled files never overwrite tracked or non-ignored files, and never land in ano
 
 ### Write-back limits
 
-A command that dumps a heap snapshot, a coverage tree or generated fixtures where Git doesn't ignore them would otherwise flood the worktree, and every later run would upload them again. So a write-back bringing back more than `writeback_max_files` files (default 1000) or `writeback_max_bytes` bytes (default 100 MB) warns before it transfers anything, with `LARGE_WRITEBACK` naming the largest paths: single files, and directories with how many files they hold. Set either limit to `0` to turn it off.
+A command that dumps a heap snapshot, a coverage tree or generated fixtures where Git doesn't ignore them would otherwise flood the worktree, and every later run would upload them again. So a write-back bringing back more than `writeback_max_files` files (default 1000) or `writeback_max_bytes` bytes (default 100 MB) warns before it transfers anything, with `LARGE_WRITEBACK` naming the largest paths: single files, and directories with how many files they hold. Set either limit to `0` to turn it off; a `writeback_max_bytes` above 0 but below one byte (`"0.4"`) is rejected rather than read as 0.
 
 With `writeback_over = "hold"` in `[sync]` (or `--writeback-over hold`, or `SPOTEXEC_WRITEBACK_OVER=hold`), new files over the limit stay in the slot instead: none of them comes back, and a `WRITEBACK_HELD` warning says how many, how big and where. Changes to and deletions of files you synced still come back as usual, so a formatter rewriting 5,000 files only warns. Only the new files count toward holding, so a command that moves a directory gets its deletions applied while the moved files wait in the slot.
 
