@@ -52,15 +52,17 @@ export SPOTEXEC_CONFIG="$WORK/config.toml" SPOTEXEC_STATE_DIR="$WORK/state" SPOT
 P="$WORK/proj"
 mkdir -p "$P" && git -C "$P" init -q
 printf 'version = 1\n[tasks.unit]\nrun = "echo unit"\n' >"$P/.spotexec.toml"
+# Under pipefail, grep -q quitting at the first match can kill sx with
+# SIGPIPE while it still writes, failing the check: grep reads it all.
 code() { local c=0; (cd "$P" && "$@") >"$WORK/code.out" 2>&1 || c=$?; echo "$c"; }
 check "sx status runs a command called status (125: no runners)" \
   "[ \"\$(code '$B/sx' status)\" = 125 ] && grep -q 'no runners configured' '$WORK/code.out'"
 check "sx rejects an unknown flag with 125" "[ \"\$(code '$B/sx' --no-such-flag)\" = 125 ]"
-check "sx -h shows sx's help" "(cd '$P' && '$B/sx' -h) | grep -q 'Tasks in this project'"
+check "sx -h shows sx's help" "(cd '$P' && '$B/sx' -h) | grep 'Tasks in this project' >/dev/null"
 check "a legacy sx hook claude handles the event locally" \
   "out=\$(echo '{}' | '$B/sx' hook claude) && [ -z \"\$out\" ]"
-check "sx completes task names" "(cd '$P' && '$B/sx' __complete '') | grep -q '^unit'"
-check "sx completes its flags" "(cd '$P' && '$B/sx' __complete --same) | grep -q -- '--same-slot'"
+check "sx completes task names" "(cd '$P' && '$B/sx' __complete '') | grep '^unit' >/dev/null"
+check "sx completes its flags" "(cd '$P' && '$B/sx' __complete --same) | grep -- '--same-slot' >/dev/null"
 
 if [ "${SMOKE_PACKAGES:-1}" != 0 ] && command -v docker >/dev/null && docker info >/dev/null 2>&1; then
   echo "== Linux packages (linux/$ARCH)"

@@ -350,7 +350,7 @@ func TestHeldRecord(t *testing.T) {
 	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
 	ws := &Workspace{WorktreeKey: "wk"}
 	lr := LastRun{Runner: "aws", InstanceID: "i-1/x", Slot: 2}
-	es := []protocol.Entry{entry("gen/f1.txt", "1\n"), entry("a*b[1].txt", "2\n")}
+	es := []protocol.Entry{entry("gen/f1.txt", "1\n"), entry("a*b[1].txt", "2\n"), entry(`win\name.txt`, "3\n")}
 	if LoadHeld(ws, lr) != nil {
 		t.Fatal("held before anything was saved")
 	}
@@ -358,7 +358,7 @@ func TestHeldRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	held := LoadHeld(ws, lr)
-	if len(held) != 2 || held["gen/f1.txt"] != es[0] {
+	if len(held) != 3 || held["gen/f1.txt"] != es[0] {
 		t.Fatalf("loaded %v", held)
 	}
 	other := lr
@@ -367,7 +367,7 @@ func TestHeldRecord(t *testing.T) {
 		t.Error("another slot's record was used")
 	}
 	pats, sel, err := HeldPatterns(held, nil)
-	if err != nil || !reflect.DeepEqual(pats, []string{"a?b?1].txt", "gen/f1.txt"}) || len(sel) != 2 {
+	if err != nil || !reflect.DeepEqual(pats, []string{"a?b?1].txt", "gen/f1.txt", "win?name.txt"}) || len(sel) != 3 {
 		t.Errorf("patterns %v, %v, %v", pats, sel, err)
 	}
 	if pats, sel, err := HeldPatterns(held, []string{"gen"}); err != nil || !reflect.DeepEqual(pats, []string{"gen/f1.txt"}) || !reflect.DeepEqual(sel, HeldFiles{"gen/f1.txt": es[0]}) {
@@ -375,6 +375,14 @@ func TestHeldRecord(t *testing.T) {
 	}
 	if _, _, err := HeldPatterns(held, []string{"nope"}); err == nil {
 		t.Error("no match, no error")
+	}
+	for _, p := range pats {
+		if err := fsid.CheckPattern(p); err != nil {
+			t.Errorf("the helper would refuse pattern %q: %v", p, err)
+		}
+	}
+	if !newPullMatcher(pats)(`win\name.txt`) {
+		t.Error("a held name with a backslash isn't asked for")
 	}
 	if !newPullMatcher(pats)("a*b[1].txt") || newPullMatcher(pats)("gen/f2.txt") {
 		t.Error("held patterns don't ask for the held files")

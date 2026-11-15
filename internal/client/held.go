@@ -106,10 +106,11 @@ func HeldPatterns(held HeldFiles, globs []string) ([]string, HeldFiles, error) {
 			continue
 		}
 		sel[p] = e
-		// A pattern is a glob: a name with glob characters asks for itself
-		// with each one as "?", and only held paths are written anyway.
+		// A pattern is a glob: a name with glob characters (or a backslash,
+		// which no pattern may hold) asks for itself with each one as "?",
+		// and only held paths are written anyway.
 		out = append(out, strings.Map(func(r rune) rune {
-			if r == '*' || r == '?' || r == '[' {
+			if r == '*' || r == '?' || r == '[' || r == '\\' {
 				return '?'
 			}
 			return r
