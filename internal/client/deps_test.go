@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,11 +18,20 @@ import (
 
 type statusRep struct {
 	nopRep
+	mu     sync.Mutex
 	status []string
 }
 
 func (r *statusRep) Status(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.status = append(r.status, fmt.Sprintf(format, args...))
+}
+
+func (r *statusRep) last() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status[len(r.status)-1]
 }
 
 // replies encodes what a helper sends in answer to a deps request.
@@ -71,9 +81,8 @@ func TestConsumeDepsCapturesInstallOutput(t *testing.T) {
 	if filepath.Dir(log.Path()) != dir || !strings.Contains(filepath.Base(log.Path()), "aws-spot-3") {
 		t.Fatalf("log path = %s", log.Path())
 	}
-	last := rep.status[len(rep.status)-1]
-	if last != "aws-spot#3 · installing dependencies (npm ci) — added 1438 packages in 1m" {
-		t.Fatalf("status = %q", last)
+	if last := rep.last(); last != "aws-spot#3 · installing dependencies (npm ci) — added 1438 packages in 1m" {
+		t.Fatalf("status = %q", rep.last())
 	}
 }
 
@@ -271,5 +280,40 @@ func TestDepsLogEmptyWriteAndUnwritableDir(t *testing.T) {
 	}
 	if tail, _ := l.Tail(depsTailLines); tail != "first\nsecond\nthird" {
 		t.Fatalf("tail %q", tail)
+	}
+}
+
+func TestConsumeDepsShowsTheLineBeforeASilence(t *testing.T) {
+	old := statusEvery
+	statusEvery = 30 * time.Millisecond
+	t.Cleanup(func() { statusEvery = old })
+	frames := replies(t, func(c *protocol.Conn) {
+		_ = c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: "npm ci"})
+		_ = c.WriteFrame(protocol.KindStdout, []byte("downloading\n"))
+		_ = c.WriteFrame(protocol.KindStdout, []byte("building native extensions\n"))
+		_ = c.Send(protocol.TypeDepsResult, protocol.DepsResult{Key: "k", Built: true})
+	})
+	rep := &statusRep{}
+	var seen string
+	n := 0
+	next := func(ctx context.Context) (protocol.Frame, error) {
+		n++
+		if n == 4 { // a quiet compile before the result
+			time.Sleep(5 * statusEvery)
+			seen = rep.last()
+		}
+		return frames(ctx)
+	}
+	log := newDepsLog(t.TempDir(), "r")
+	if _, err := consumeDeps(context.Background(), next, func(protocol.Event) {}, rep, "r", log); err != nil {
+		t.Fatal(err)
+	}
+	log.Close()
+	if !strings.HasSuffix(seen, "building native extensions") {
+		t.Fatalf("status during the silence = %q", seen)
+	}
+	time.Sleep(3 * statusEvery)
+	if got := rep.last(); !strings.HasSuffix(got, "building native extensions") {
+		t.Fatalf("status changed after the phase ended: %q", got)
 	}
 }

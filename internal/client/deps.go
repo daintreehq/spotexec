@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -58,8 +59,8 @@ var statusEvery = 100 * time.Millisecond
 // The install's output goes to log only, never to the run's stdout or
 // stderr: its latest line is shown as the status's detail instead.
 func consumeDeps(ctx context.Context, next func(context.Context) (protocol.Frame, error), onEvent func(protocol.Event), rep ui.Reporter, label string, log *depsLog) (protocol.DepsResult, error) {
-	status, shown := "", ""
-	var shownAt time.Time
+	st := &depsStatus{rep: rep}
+	defer st.stop()
 	for {
 		f, err := next(ctx)
 		if err != nil {
@@ -68,12 +69,7 @@ func consumeDeps(ctx context.Context, next func(context.Context) (protocol.Frame
 		switch f.Kind {
 		case protocol.KindStdout, protocol.KindStderr:
 			log.Write(f.Data)
-			// At most as often as the spinner turns: a chatty install
-			// sends many small frames.
-			if line := ui.LogLine(lastLine(f.Data)); line != "" && status != "" && line != shown && time.Since(shownAt) >= statusEvery {
-				shown, shownAt = line, time.Now()
-				rep.Status("%s%s%s", status, ui.DetailSep, line)
-			}
+			st.detail(ui.LogLine(lastLine(f.Data)))
 			continue
 		}
 		env, err := protocol.Decode(f)
@@ -87,8 +83,7 @@ func consumeDeps(ctx context.Context, next func(context.Context) (protocol.Frame
 			var ev protocol.Event
 			_ = env.Unmarshal(&ev)
 			if ev.Name == "deps_install" {
-				status = fmt.Sprintf("%s · installing dependencies (%s)", label, ev.Message)
-				rep.Status("%s", status)
+				st.phase(fmt.Sprintf("%s · installing dependencies (%s)", label, ev.Message))
 			}
 			onEvent(ev)
 			continue
@@ -103,6 +98,73 @@ func consumeDeps(ctx context.Context, next func(context.Context) (protocol.Frame
 		default:
 			return protocol.DepsResult{}, fmt.Errorf("protocol: unexpected %q during deps", env.Type)
 		}
+	}
+}
+
+// depsStatus shows the install's latest line as the status's detail, at
+// most every statusEvery (a chatty install sends many small frames): a line
+// held back is shown when the interval is up, even if nothing follows it.
+type depsStatus struct {
+	rep ui.Reporter
+
+	mu      sync.Mutex
+	status  string // the phase, "" until the install starts
+	line    string // the latest line
+	shown   string // the line on screen
+	shownAt time.Time
+	timer   *time.Timer
+	done    bool
+}
+
+func (d *depsStatus) phase(status string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.status, d.line, d.shown = status, "", ""
+	d.rep.Status("%s", status)
+}
+
+func (d *depsStatus) detail(line string) {
+	if line == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.status == "" {
+		return
+	}
+	d.line = line
+	if wait := statusEvery - time.Since(d.shownAt); wait > 0 {
+		if d.timer == nil {
+			d.timer = time.AfterFunc(wait, d.flush)
+		}
+		return
+	}
+	d.showLocked()
+}
+
+func (d *depsStatus) flush() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.timer = nil
+	d.showLocked()
+}
+
+func (d *depsStatus) showLocked() {
+	if d.done || d.line == d.shown {
+		return
+	}
+	d.shown, d.shownAt = d.line, time.Now()
+	d.rep.Status("%s%s%s", d.status, ui.DetailSep, d.line)
+}
+
+// stop ends updates: the phase is over.
+func (d *depsStatus) stop() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.done = true
+	if d.timer != nil {
+		d.timer.Stop()
+		d.timer = nil
 	}
 }
 
