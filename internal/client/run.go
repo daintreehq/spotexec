@@ -102,7 +102,8 @@ type Result struct {
 	// synced (saved already unless Options.DeferLastRun).
 	LastRun *LastRun `json:"-"`
 	// OOMKilled: the kernel killed a process in the command's container
-	// for exceeding its memory limit.
+	// for running out of memory: the shared memory pool's cap, the
+	// container's own limit, or the whole VM's memory.
 	OOMKilled bool `json:"oom_killed,omitempty"`
 	// noReplay, when the runner was lost, is why the run must not be
 	// replayed elsewhere (see replayable).
@@ -201,16 +202,28 @@ func replayable(lost string, res Result, o Options, canceled bool, n int) (retry
 // run that used up its VM's memory would most likely do the same on the
 // next one, and take that VM's other jobs with it), or the VM is still
 // running and gave no Spot notice, so whatever stopped it answering came
-// from inside, quite possibly from this run. A VM that is gone, or noticed
-// its reclamation, is replayed as before.
+// from inside, quite possibly from this run. A VM that announced it was
+// going away (a Spot notice, or its helper reporting the shutdown) is
+// replayed whatever its memory looked like: the cloud took it, not the
+// run. A VM that is gone is replayed too, unless it was out of memory.
 func whyNoReplay(lease *Lease, noticed bool) noReplay {
+	if noticed {
+		return noReplay{}
+	}
 	if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
 		return noReplay{"MEMORY_PRESSURE", "while it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
 	}
-	if !noticed && instanceRunning(lease) {
+	if instanceRunning(lease) {
 		return noReplay{"RUNNER_UNRESPONSIVE", "although EC2 still reports it running, without a Spot notice: the run may be what overloaded it (memory, most often), and the attempt's outcome is unknown. Rerun it, with --exclusive if it may need the whole VM"}
 	}
 	return noReplay{}
+}
+
+// helperShutdown reports whether err is the helper saying the VM began
+// shutting down under the request (protocol.CodeShutdown).
+func helperShutdown(err error) bool {
+	var re *transport.RemoteError
+	return errors.As(err, &re) && re.Code == protocol.CodeShutdown
 }
 
 // lostRunner reports what to exclude when the connection to a lease died.
@@ -222,11 +235,11 @@ func lostRunner(l *Lease, err error) string {
 	// (the command may well have run): never treat that as a lost runner,
 	// unless it says the VM is shutting down (a container killed as dockerd
 	// stops with the VM).
+	if helperShutdown(err) {
+		return shutdownRunner(l)
+	}
 	var re *transport.RemoteError
 	if errors.As(err, &re) {
-		if re.Code == protocol.CodeShutdown {
-			return shutdownRunner(l)
-		}
 		return ""
 	}
 	// Writes to a dead SSH channel fail with plain pipe errors; the session
@@ -323,10 +336,12 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if lease.InstanceID != "" {
 		lease.Sess.SetOnSilent(waitIfRunning(lease, o.Rep))
 	}
-	var noticed atomic.Bool // a reclamation notice arrived
+	// A reclamation notice arrived, or the helper reported the VM shutting
+	// down under the command: either way the VM announced it was going away.
+	var noticed atomic.Bool
 	defer func() {
 		if lost != "" && lease.InstanceID != "" {
-			res.noReplay = whyNoReplay(lease, noticed.Load())
+			res.noReplay = whyNoReplay(lease, noticed.Load() || helperShutdown(err))
 		}
 	}()
 	// Before the command starts, Ctrl-C aborts the session outright (a
@@ -532,7 +547,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		// Killed by the VM shutting down (a Spot reclaim): like a lost
 		// runner, nothing from this attempt is written back, and on a Spot
 		// runner the run is replayed (unless the user interrupted it: then
-		// the CLI exits 130).
+		// the CLI exits 130). EC2 still reports a VM running while its OS
+		// halts, so this counts as the VM's own notice.
+		noticed.Store(true)
 		return res, infra(fmt.Errorf("%s shut down while the command ran (it was stopped with exit %d); nothing was written back", label, result.ExitCode)), shutdownRunner(lease)
 	}
 	checkCanceled()
@@ -1172,11 +1189,13 @@ func instanceRunning(lease *Lease) bool {
 }
 
 // oomMessage explains an OOM_KILLED result; limitMB is the memory pool's
-// cap, 0 when the container wasn't in the pool (container.options set a
-// limit of its own).
+// cap, 0 when the container wasn't in the pool: a job alone on its VM
+// (--exclusive, a single slot), a host without the pool, or a memory
+// option in container.options. Then the kill came from the container's own
+// limit, if container.options set one, or from the whole VM running out.
 func oomMessage(limitMB int64) string {
 	if limitMB <= 0 {
-		return "the command ran out of memory: the kernel killed a process in its container for exceeding the container's memory limit (set in container.options)"
+		return "the command ran out of memory: the kernel killed a process in its container, which either reached its own memory limit (if container.options sets one) or used up the memory of the whole VM. Raise that limit, use a larger instance type, or make it use less"
 	}
 	return fmt.Sprintf("the command ran out of memory: the jobs sharing the runner reached the memory set aside for them (%.1f GiB), and the kernel killed the largest process, in this command's container. Use --exclusive to have the whole VM, fewer max_slots, or make it use less", float64(limitMB)/1024)
 }

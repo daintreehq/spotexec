@@ -192,6 +192,14 @@ func rpc() int {
 	if _, err := os.Stat(filepath.Join(st, "rpc-silent")); err == nil {
 		time.Sleep(time.Hour) // until killed
 	}
+	// rpc-pulse: silent for the file's milliseconds, then one heartbeat, then
+	// silent until killed (a helper that recovers once, then dies).
+	if b, err := os.ReadFile(filepath.Join(st, "rpc-pulse")); err == nil {
+		ms, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		_ = conn.Send(protocol.TypeHeartbeat, nil)
+		time.Sleep(time.Hour)
+	}
 	if _, err := os.Stat(filepath.Join(st, "rpc-heartbeat")); err == nil {
 		go func() { _, _ = io.Copy(io.Discard, os.Stdin); os.Exit(0) }()
 		for {
