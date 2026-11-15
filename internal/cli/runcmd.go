@@ -642,11 +642,13 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			o.DeferLastRun = true
 			subStart := time.Now()
 			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
+			interrupted := ctx.Err() != nil
 			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot}
 			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
 				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, part.label)
 				out.code, err = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(parts)), nil
 				out.runner, out.slot, out.local = "", 0, true
+				interrupted = ctx.Err() != nil
 			}
 			if err != nil {
 				out.code = client.ExitInfra
@@ -658,14 +660,15 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			}
 			mu.Lock()
 			switch {
+			case code == 0 && !res.Canceled:
+				// Finished, even if fail_fast reached for it just after.
+				out.status = partPassed
 			case stopped[i]:
 				out.status = partStopped
-			case res.Canceled || (code != 0 && ctx.Err() != nil):
+			case res.Canceled || interrupted:
 				// Cut short by an interrupt: even a command that handled
 				// the signal and exited 0 didn't finish.
 				out.status = partInterrupted
-			case code == 0:
-				out.status = partPassed
 			default:
 				out.status = partFailed
 			}
@@ -687,7 +690,9 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			}
 			sr.PartDone(summary, code == 0)
 			mu.Unlock()
-			if code != 0 && t.FailFast {
+			// After an interrupt every part is already stopping, and is
+			// interrupted rather than stopped by fail_fast.
+			if code != 0 && t.FailFast && ctx.Err() == nil {
 				failOnce.Do(func() {
 					for j, c := range intrs {
 						mu.Lock()
@@ -722,7 +727,8 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			exit = o.code
 		}
 	}
-	if ctx.Err() != nil {
+	interrupted := ctx.Err() != nil
+	if interrupted {
 		exit = client.ExitInterrupted
 	}
 	took := time.Since(start)
@@ -739,7 +745,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	for _, o := range recapOrder(outs) {
 		rep.PartDone(o.recapLine(), o.status == partPassed)
 	}
-	rep.Done(taskVerdict(name, outs, exit, ctx.Err() != nil, took), exit == 0)
+	rep.Done(taskVerdict(name, outs, exit, interrupted, took), exit == 0)
 	return exit
 }
 

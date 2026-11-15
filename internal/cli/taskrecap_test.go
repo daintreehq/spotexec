@@ -18,6 +18,7 @@ func TestTaskRecap(t *testing.T) {
 		shard(2, partFailed, 1, "aws", 2),
 		shard(3, partStopped, 130, "aws", 0),
 		shard(4, partFailed, 125, "", 0),
+		shard(5, partInterrupted, 130, "aws", 5),
 	}
 	var got []string
 	for _, o := range recapOrder(outs) {
@@ -26,13 +27,14 @@ func TestTaskRecap(t *testing.T) {
 	want := []string{
 		"unit 2/4 · failed · 1m30s on aws#2 · exit 1",
 		"unit 4/4 · failed · 1m30s · exit 125",
+		"unit 5/4 · interrupted · 1m30s on aws#5 · exit 130",
 		"unit 3/4 · stopped (fail_fast) · 1m30s on aws#0",
 		"unit 1/4 · passed · 1m30s on aws#4",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("recap:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	if v := taskVerdict("unit", outs, 125, false, 12*time.Minute); v != "unit · 2 of 4 parts failed (unit 2/4, unit 4/4) · 1 stopped · 12m · exit 125" {
+	if v := taskVerdict("unit", outs, 125, false, 12*time.Minute); v != "unit · 2 of 5 parts failed (unit 2/4, unit 4/4) · 1 stopped · 12m · exit 125" {
 		t.Errorf("verdict: %q", v)
 	}
 

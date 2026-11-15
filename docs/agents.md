@@ -51,7 +51,7 @@ With `--json`, `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1`, lifecycle events go to s
 {"event":"result","exit_code":0,"duration_ms":4120,"timed_out":false}
 ```
 
-A parallel or sharded task's final `result` event (the one without a `shard`) also lists its `parts` in task order, each with its `task`, `label`, `status` (`passed`, `failed`, `stopped` or `interrupted`), `exit_code` and `duration_ms`, its `shard` and `shards` when sharded, and where it ran: `runner` and `slot`, or `"local": true`.
+A parallel or sharded task ends with a `result` event for the whole run, which (unlike each part's own `result`) lists its `parts` in task order, each with its `task`, `label`, `status` (`passed`, `failed`, `stopped` or `interrupted`), `exit_code` and `duration_ms`, its `shard` and `shards` when sharded, and where it ran: `runner` and `slot`, or `"local": true`.
 
 Other events include:
 - `queued`, `queue_position`, `placed`;
