@@ -283,37 +283,44 @@ func TestDepsLogEmptyWriteAndUnwritableDir(t *testing.T) {
 	}
 }
 
-func TestConsumeDepsShowsTheLineBeforeASilence(t *testing.T) {
+func TestDepsStatusShowsAHeldBackLine(t *testing.T) {
 	old := statusEvery
-	statusEvery = 30 * time.Millisecond
+	statusEvery = time.Hour // the timer never fires on its own here
 	t.Cleanup(func() { statusEvery = old })
-	frames := replies(t, func(c *protocol.Conn) {
-		_ = c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: "npm ci"})
-		_ = c.WriteFrame(protocol.KindStdout, []byte("downloading\n"))
-		_ = c.WriteFrame(protocol.KindStdout, []byte("building native extensions\n"))
-		_ = c.Send(protocol.TypeDepsResult, protocol.DepsResult{Key: "k", Built: true})
-	})
 	rep := &statusRep{}
-	var seen string
-	n := 0
-	next := func(ctx context.Context) (protocol.Frame, error) {
-		n++
-		if n == 4 { // a quiet compile before the result
-			time.Sleep(5 * statusEvery)
-			seen = rep.last()
-		}
-		return frames(ctx)
+	d := &depsStatus{rep: rep}
+	d.detail("before the phase") // no phase yet: ignored
+	d.phase("r · installing dependencies (npm ci)")
+	d.detail("downloading") // the first line shows at once
+	if got := rep.last(); got != "r · installing dependencies (npm ci)"+" "[:0]+" — downloading" {
+		t.Fatalf("status = %q", got)
 	}
-	log := newDepsLog(t.TempDir(), "r")
-	if _, err := consumeDeps(context.Background(), next, func(protocol.Event) {}, rep, "r", log); err != nil {
-		t.Fatal(err)
+	d.detail("building native extensions") // within the interval: held back
+	if rep.last() != "r · installing dependencies (npm ci) — downloading" || d.timer == nil {
+		t.Fatalf("status = %q, timer armed %v", rep.last(), d.timer != nil)
 	}
-	log.Close()
-	if !strings.HasSuffix(seen, "building native extensions") {
-		t.Fatalf("status during the silence = %q", seen)
+
+	// The interval not up yet when the timer runs: it waits again.
+	d.flush()
+	if rep.last() != "r · installing dependencies (npm ci) — downloading" || d.timer == nil {
+		t.Fatalf("early flush showed %q", rep.last())
 	}
-	time.Sleep(3 * statusEvery)
-	if got := rep.last(); !strings.HasSuffix(got, "building native extensions") {
-		t.Fatalf("status changed after the phase ended: %q", got)
+	// Once it is up, the held-back line shows though nothing followed it.
+	d.mu.Lock()
+	d.shownAt = time.Now().Add(-statusEvery)
+	d.mu.Unlock()
+	d.flush()
+	if rep.last() != "r · installing dependencies (npm ci) — building native extensions" {
+		t.Fatalf("status = %q", rep.last())
+	}
+
+	d.detail("after")
+	d.stop()
+	d.mu.Lock()
+	d.shownAt = time.Time{}
+	d.mu.Unlock()
+	d.flush()
+	if n := len(rep.status); rep.last() != "r · installing dependencies (npm ci) — building native extensions" || d.timer != nil {
+		t.Fatalf("updated after stop: %q (%d updates, timer %v)", rep.last(), n, d.timer != nil)
 	}
 }

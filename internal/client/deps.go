@@ -146,6 +146,11 @@ func (d *depsStatus) flush() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.timer = nil
+	// A line shown since this was armed restarts the interval.
+	if wait := statusEvery - time.Since(d.shownAt); wait > 0 && !d.done {
+		d.timer = time.AfterFunc(wait, d.flush)
+		return
+	}
 	d.showLocked()
 }
 
