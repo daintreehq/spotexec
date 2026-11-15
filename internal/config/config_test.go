@@ -417,3 +417,180 @@ min_memory_gib = 32
 		t.Fatal("base runner must not be modified")
 	}
 }
+
+// A committed project fleet whose base isn't one of this user's runners must
+// not break commands that don't use it (#66).
+func TestUnresolvedProjectRunnerDoesNotBreakLoading(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.homelab]\ntype = \"ssh\"\nhost = \"box\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte("version = 1\n[runners.aws-big]\nextends = \"aws\"\ninstance_types = [\"m7a.2xlarge\"]\nmax_slots = 1\n"), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Global: g, Project: p}
+	if err := c.MergeProjectRunners(); err != nil {
+		t.Fatalf("an unusable project runner must not fail loading: %v", err)
+	}
+	rs, err := c.Pool(nil)
+	if err != nil || len(rs) != 1 || rs[0].Name != "homelab" {
+		t.Fatalf("the default pool should be the user's own runners: %v %v", rs, err)
+	}
+	if _, err := c.Pool([]string{"aws-big"}); err == nil || !strings.Contains(err.Error(), "aws-big") || !strings.Contains(err.Error(), `"aws"`) {
+		t.Fatalf("targeting the fleet should say what's missing: %v", err)
+	}
+}
+
+func mergeProject(t *testing.T, g *Global, body string) (*Config, error) {
+	t.Helper()
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	if err := os.WriteFile(pp, []byte("version = 1\n"+body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Global: g, Project: p}
+	return c, c.MergeProjectRunners()
+}
+
+func TestProjectRunnerExtendsType(t *testing.T) {
+	const fleet = "[runners.aws-big]\nextends = \"aws\"\nextends_type = \"aws-spot\"\ninstance_types = [\"m7a.2xlarge\"]\nmax_slots = 1\n"
+	// A collaborator whose AWS runner has another name still gets the fleet.
+	g, err := loadGlobalText(t, "[runners.spot]\ntype = \"aws-spot\"\nregion = \"eu-west-1\"\n[runners.homelab]\ntype = \"ssh\"\nhost = \"box\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := mergeProject(t, g, fleet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := c.Runner("aws-big")
+	if err != nil || r.Region != "eu-west-1" || r.MaxSlots != 1 || r.InstanceTypes[0] != "m7a.2xlarge" || r.Type != TypeAWSSpot {
+		t.Fatalf("extends_type should pick the only aws-spot runner: %+v %v", r, err)
+	}
+
+	// The named runner wins when it exists and has the right type.
+	g, _ = loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-2\"\n[runners.spot]\ntype = \"aws-spot\"\nregion = \"eu-west-1\"\n")
+	c, err = mergeProject(t, g, fleet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := c.Runner("aws-big"); r == nil || r.Region != "us-east-2" {
+		t.Fatalf("extends should be preferred: %+v", r)
+	}
+
+	// A named runner of another type doesn't count.
+	g, _ = loadGlobalText(t, "[runners.aws]\ntype = \"ssh\"\nhost = \"box\"\n[runners.spot]\ntype = \"aws-spot\"\nregion = \"eu-west-1\"\n")
+	c, err = mergeProject(t, g, fleet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := c.Runner("aws-big"); r == nil || r.Type != TypeAWSSpot || r.Region != "eu-west-1" {
+		t.Fatalf("the base must have the requested type: %+v", r)
+	}
+
+	// Several candidates: default_pool decides, or the reason says how to choose.
+	const two = "[runners.a]\ntype = \"aws-spot\"\nregion = \"us-east-2\"\n[runners.b]\ntype = \"aws-spot\"\nregion = \"eu-west-1\"\n"
+	g, _ = loadGlobalText(t, two)
+	c, err = mergeProject(t, g, "[runners.aws-big]\nextends_type = \"aws-spot\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Runner("aws-big"); err == nil || !strings.Contains(err.Error(), "several (a, b)") || !strings.Contains(err.Error(), "default_pool") {
+		t.Fatalf("ambiguity should name the candidates: %v", err)
+	}
+	g, _ = loadGlobalText(t, "default_pool = [\"b\", \"a\"]\n"+two)
+	c, err = mergeProject(t, g, "[runners.aws-big]\nextends_type = \"aws-spot\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := c.Runner("aws-big"); r == nil || r.Region != "eu-west-1" {
+		t.Fatalf("default_pool order should break the tie: %+v", r)
+	}
+
+	// No match at all: a clear reason, only when selected.
+	g, _ = loadGlobalText(t, "[runners.homelab]\ntype = \"ssh\"\nhost = \"box\"\n")
+	c, err = mergeProject(t, g, fleet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Runner("aws-big"); err == nil || !strings.Contains(err.Error(), `your runner "aws" or any aws-spot runner`) || !strings.Contains(err.Error(), "homelab (ssh)") {
+		t.Fatalf("reason: %v", err)
+	}
+	if names := c.RunnerNames(); len(names) != 1 || names[0] != "homelab" {
+		t.Fatalf("an unavailable runner isn't a runner: %v", names)
+	}
+	if u := c.UnavailableNames(); len(u) != 1 || u[0] != "aws-big" {
+		t.Fatalf("unavailable: %v", u)
+	}
+
+	// An unsupported type is the repository's mistake: a config error.
+	if _, err := mergeProject(t, g, "[runners.x]\nextends_type = \"aws\"\n"); err == nil || !strings.Contains(err.Error(), "extends_type must be") {
+		t.Fatalf("bad extends_type: %v", err)
+	}
+}
+
+func TestUnavailableProjectRunnerStillValidated(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.homelab]\ntype = \"ssh\"\nhost = \"box\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for body, want := range map[string]string{
+		"[runners.big]\nextends = \"aws\"\nmax_slotz = 1\n":     "unknown keys",
+		"[runners.big]\nextends = \"aws\"\nprofile = \"x\"\n":   "can only be set in the global config",
+		"[runners.big]\nextends = \"aws\"\nmax_slots = \"x\"\n": "runner \"big\"",
+		"pool = [\"nope\"]\n[runners.big]\nextends = \"aws\"\n": "pool references unknown runner \"nope\"",
+	} {
+		if _, err := mergeProject(t, g, body); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want %q, got %v", body, want, err)
+		}
+	}
+
+	// A project pool naming the fleet loads, and fails only where it's used.
+	c, err := mergeProject(t, g, "pool = [\"big\"]\n[runners.big]\nextends = \"aws\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Pool(nil); err == nil || !strings.Contains(err.Error(), `extends "aws"`) {
+		t.Fatalf("project pool: %v", err)
+	}
+	if rs, err := c.Pool([]string{"homelab"}); err != nil || len(rs) != 1 {
+		t.Fatalf("another runner can still be chosen: %v", err)
+	}
+}
+
+func TestUnavailableProjectRunnerMasksSameName(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.spot]\ntype = \"ssh\"\nhost = \"small\"\n[runners.homelab]\ntype = \"ssh\"\nhost = \"box\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := mergeProject(t, g, "[runners.spot]\nextends = \"aws\"\nmax_slots = 1\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Runner("spot"); err == nil || !strings.Contains(err.Error(), `extends "aws"`) {
+		t.Fatalf("the user's own spot is not the project's spot: %v", err)
+	}
+	// Without extends, the same name is the base and the override applies.
+	g, _ = loadGlobalText(t, "[runners.spot]\ntype = \"ssh\"\nhost = \"small\"\n")
+	c, err = mergeProject(t, g, "[runners.spot]\nmax_slots = 3\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, err := c.Runner("spot"); err != nil || r.MaxSlots != 3 {
+		t.Fatalf("override: %+v %v", r, err)
+	}
+	// Overriding a runner the user doesn't have is unavailable, not fatal.
+	c, err = mergeProject(t, g, "[runners.studio]\nmax_slots = 3\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Runner("studio"); err == nil || !strings.Contains(err.Error(), "extends or extends_type") {
+		t.Fatalf("override of a missing runner: %v", err)
+	}
+}

@@ -43,9 +43,10 @@ const (
 
 // Runner is one entry under [runners.<name>].
 type Runner struct {
-	Name    string `toml:"-"`
-	Type    string `toml:"type"`
-	Extends string `toml:"extends"` // project runners: inherit a global runner, then override
+	Name        string `toml:"-"`
+	Type        string `toml:"type"`
+	Extends     string `toml:"extends"`      // project runners: inherit a global runner, then override
+	ExtendsType string `toml:"extends_type"` // project runners: or inherit any of your runners of this type
 
 	// Common
 	MaxSlots        int      `toml:"max_slots"`
@@ -263,6 +264,10 @@ type Project struct {
 type Config struct {
 	Global  *Global
 	Project *Project
+	// Unavailable holds the project runners whose base isn't among this
+	// user's runners, with the reason. They stay out of the runner set, so
+	// only a command that selects one fails, with that reason.
+	Unavailable map[string]error
 }
 
 // Dir returns the global config directory (~/.config/spotexec, honoring
@@ -818,7 +823,10 @@ var (
 // them to the global set (a project runner with the same name as a global
 // one overrides it). `extends = "name"` starts from a copy of a global
 // runner, so a project can keep your account/region settings and change only
-// sizes, slots or bootstrap.
+// sizes, slots or bootstrap; `extends_type = "aws-spot"` starts from your
+// runner of that type, for a repository whose collaborators name their
+// runners differently. A project runner whose base this user doesn't have is
+// recorded in Unavailable instead of failing the whole config.
 func (c *Config) MergeProjectRunners() error {
 	p := c.Project
 	if p == nil {
@@ -852,19 +860,21 @@ func (c *Config) MergeProjectRunners() error {
 		if err := p.md.PrimitiveDecode(prim, &probe); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
 		}
-		base := Runner{}
-		from := probe.Extends
-		if from == "" {
-			from = name
+		if probe.ExtendsType != "" && !oneOf(probe.ExtendsType, TypeSSH, TypeAWSSpot, TypeSim) {
+			return fmt.Errorf("%s: runner %q: extends_type must be %s, %s or %s (got %q)", p.Path, name, TypeSSH, TypeAWSSpot, TypeSim, probe.ExtendsType)
 		}
-		g, ok := global[from]
-		if !ok {
-			if probe.Extends != "" {
-				return fmt.Errorf("%s: runner %q extends unknown runner %q", p.Path, name, probe.Extends)
+		g, err := c.projectBase(global, name, probe)
+		if err != nil {
+			if c.Unavailable == nil {
+				c.Unavailable = map[string]error{}
 			}
-			return fmt.Errorf("%s: runner %q must extend one of your global runners (extends = \"...\")", p.Path, name)
+			c.Unavailable[name] = err
+			// A global runner of the same name is not what the project meant:
+			// selecting it must not quietly run on the wrong machine.
+			delete(c.Global.Runners, name)
+			continue
 		}
-		base = *g
+		base := *g
 		base.Hosts = append([]string(nil), g.Hosts...)
 		base.InstanceTypes = append([]string(nil), g.InstanceTypes...)
 		base.SSHOptions = append([]string(nil), g.SSHOptions...)
@@ -895,7 +905,7 @@ func (c *Config) MergeProjectRunners() error {
 		if err := p.md.PrimitiveDecode(prim, &base); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
 		}
-		base.Name, base.Extends = name, ""
+		base.Name, base.Extends, base.ExtendsType = name, "", ""
 		if err := base.applyDefaults(); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
 		}
@@ -913,11 +923,69 @@ func (c *Config) MergeProjectRunners() error {
 		}
 	}
 	for _, n := range p.Pool {
-		if _, ok := c.Global.Runners[n]; !ok {
+		if _, ok := c.Global.Runners[n]; !ok && c.Unavailable[n] == nil {
 			return fmt.Errorf("%s: pool references unknown runner %q", p.Path, n)
 		}
 	}
 	return nil
+}
+
+// projectBase picks the global runner a project runner builds on: the one
+// extends names (or its own name, with neither key set), else, with
+// extends_type, the user's only runner of that type, or the first of that
+// type in default_pool when there are several. The error says what is
+// missing, for a collaborator whose runners don't match the repository's.
+func (c *Config) projectBase(global map[string]*Runner, name string, probe Runner) (*Runner, error) {
+	want := probe.Extends
+	if want == "" && probe.ExtendsType == "" {
+		want = name
+	}
+	if g, ok := global[want]; ok && (probe.ExtendsType == "" || g.Type == probe.ExtendsType) {
+		return g, nil
+	}
+	var matches []string
+	if probe.ExtendsType != "" {
+		for n, g := range global {
+			if g.Type == probe.ExtendsType {
+				matches = append(matches, n)
+			}
+		}
+		sort.Strings(matches)
+		if len(matches) == 1 {
+			return global[matches[0]], nil
+		}
+		for _, n := range c.Global.DefaultPool {
+			if g, ok := global[n]; ok && g.Type == probe.ExtendsType {
+				return g, nil
+			}
+		}
+	}
+	var yours []string
+	for n, g := range global {
+		yours = append(yours, n+" ("+g.Type+")")
+	}
+	sort.Strings(yours)
+	have := "you have no runners"
+	if len(yours) > 0 {
+		have = "yours: " + strings.Join(yours, ", ")
+	}
+	what := fmt.Sprintf("runner %q from %s", name, c.Project.Path)
+	switch {
+	case len(matches) > 1:
+		return nil, fmt.Errorf("%s can use any of your %s runners, and you have several (%s): list the one to use in default_pool in %s",
+			what, probe.ExtendsType, strings.Join(matches, ", "), c.Global.Path)
+	case probe.ExtendsType != "" && probe.Extends != "":
+		return nil, fmt.Errorf("%s needs your runner %q or any %s runner, and you have neither (%s): add one to %s, or pick another runner with -r",
+			what, probe.Extends, probe.ExtendsType, have, c.Global.Path)
+	case probe.ExtendsType != "":
+		return nil, fmt.Errorf("%s needs one of your %s runners, and you have none (%s): add one to %s, or pick another runner with -r",
+			what, probe.ExtendsType, have, c.Global.Path)
+	case probe.Extends != "":
+		return nil, fmt.Errorf("%s extends %q, which isn't one of your runners (%s): add a runner named %q to %s, or pick another runner with -r",
+			what, probe.Extends, have, probe.Extends, c.Global.Path)
+	}
+	return nil, fmt.Errorf("%s overrides your runner %q, which you don't have (%s); a project runner builds on one of yours with extends or extends_type",
+		what, name, have)
 }
 
 // TaskNames returns sorted task names.
@@ -950,9 +1018,9 @@ func (c *Config) Pool(override []string) ([]*Runner, error) {
 	}
 	var out []*Runner
 	for _, n := range names {
-		r, ok := c.Global.Runners[n]
-		if !ok {
-			return nil, fmt.Errorf("unknown runner %q (configured: %s)", n, strings.Join(c.RunnerNames(), ", "))
+		r, err := c.Runner(n)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, r)
 	}
@@ -970,8 +1038,22 @@ func (c *Config) RunnerNames() []string {
 	return n
 }
 
+// UnavailableNames lists the project runners this user's runners can't
+// back (see Config.Unavailable), sorted.
+func (c *Config) UnavailableNames() []string {
+	var n []string
+	for k := range c.Unavailable {
+		n = append(n, k)
+	}
+	sort.Strings(n)
+	return n
+}
+
 // Runner returns a runner by name.
 func (c *Config) Runner(name string) (*Runner, error) {
+	if err := c.Unavailable[name]; err != nil {
+		return nil, err
+	}
 	r, ok := c.Global.Runners[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown runner %q (configured: %s)", name, strings.Join(c.RunnerNames(), ", "))

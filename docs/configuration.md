@@ -218,16 +218,24 @@ parallel = ["test-all", "lint"]   # 8 shards and lint, 9 parts at once
 A repository can declare its own fleet, built on one of your runners:
 
 ```toml
-pool = ["ci-big"]
-
 [runners.ci-big]
 extends = "aws"                # one of YOUR runners in ~/.config/spotexec/config.toml
+extends_type = "aws-spot"      # or, if you have none by that name, your aws-spot runner
 instance_types = ["c7a.2xlarge", "m7a.2xlarge"]
 max_slots = 2                  # 4 vCPUs per job
 max_instances = 3
+
+[tasks.typecheck]
+run = "npm run typecheck"
+pool = ["ci-big"]              # only this task needs the big fleet
 ```
 
-A project runner **must** build on one of your global runners: name it with `extends`, or reuse its name to override it. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts.
+A project runner builds on one of your global runners. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts. It picks its base this way:
+
+- `extends = "name"` uses your runner of that name. With neither key, a project runner of the same name as one of yours overrides it.
+- `extends_type = "ssh" | "aws-spot" | "sim"` uses your runner of that type when `extends` names none you have (or one of another type). With several of that type, the first one in your `default_pool` wins.
+
+Runner names are personal while `.spotexec.toml` is shared, so a committed fleet should usually set `extends_type`. When the base can't be found on your machine (no such runner, or several candidates and none in `default_pool`), the fleet is unavailable to you, and that's all: commands that don't use it keep working, `spotexec doctor` lists it with the reason, and a command that selects it (through `--runner`, a task's `pool` or the project's `pool`) fails, saying what's missing. It never falls back to another runner, since a fleet sized for a job may be the only place that job fits; choose another runner with `-r` instead. A project-level `pool` makes the fleet the default for every command in the repository, so for a fleet only some tasks need, set `pool` on those tasks.
 
 A project can also size its VMs by requirements. A suite that needs more memory per job than your runner's types have, for example:
 
