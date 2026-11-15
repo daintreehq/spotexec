@@ -414,7 +414,8 @@ group = true
 	os.Remove(filepath.Join(dir, "a.mark"))
 	os.Remove(filepath.Join(dir, "b.mark"))
 	_, stderr = runMain(t, "sx", "-C", dir, "--group=false", "--fallback-local", "--queue-timeout", "5s", "v")
-	if !strings.Contains(stderr, "[a] a1\n[b] b1\n") {
+	a1, b1, a2 := strings.Index(stderr, "[a] a1\n"), strings.Index(stderr, "[b] b1\n"), strings.Index(stderr, "[a] a2\n")
+	if a1 < 0 || b1 < a1 || a2 < b1 {
 		t.Errorf("--group=false still grouped: %q", stderr)
 	}
 }
