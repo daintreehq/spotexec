@@ -289,6 +289,16 @@ func TestDepsStatusShowsAHeldBackLine(t *testing.T) {
 	t.Cleanup(func() { statusEvery = old })
 	rep := &statusRep{}
 	d := &depsStatus{rep: rep}
+	t.Cleanup(d.stop)
+	// Run the armed timer's callback now, stopping the real one.
+	flush := func() {
+		d.mu.Lock()
+		if d.timer != nil {
+			d.timer.Stop()
+		}
+		d.mu.Unlock()
+		d.flush()
+	}
 	d.detail("before the phase") // no phase yet: ignored
 	d.phase("r · installing dependencies (npm ci)")
 	d.detail("downloading") // the first line shows at once
@@ -301,7 +311,7 @@ func TestDepsStatusShowsAHeldBackLine(t *testing.T) {
 	}
 
 	// The interval not up yet when the timer runs: it waits again.
-	d.flush()
+	flush()
 	if rep.last() != "r · installing dependencies (npm ci) — downloading" || d.timer == nil {
 		t.Fatalf("early flush showed %q", rep.last())
 	}
@@ -309,7 +319,7 @@ func TestDepsStatusShowsAHeldBackLine(t *testing.T) {
 	d.mu.Lock()
 	d.shownAt = time.Now().Add(-statusEvery)
 	d.mu.Unlock()
-	d.flush()
+	flush()
 	if rep.last() != "r · installing dependencies (npm ci) — building native extensions" {
 		t.Fatalf("status = %q", rep.last())
 	}
@@ -319,7 +329,7 @@ func TestDepsStatusShowsAHeldBackLine(t *testing.T) {
 	d.mu.Lock()
 	d.shownAt = time.Time{}
 	d.mu.Unlock()
-	d.flush()
+	flush()
 	if n := len(rep.status); rep.last() != "r · installing dependencies (npm ci) — building native extensions" || d.timer != nil {
 		t.Fatalf("updated after stop: %q (%d updates, timer %v)", rep.last(), n, d.timer != nil)
 	}
