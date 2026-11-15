@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUnwrapRTK(t *testing.T) {
@@ -95,6 +96,10 @@ func TestThenOf(t *testing.T) {
 // does, exiting 3), and whose hook answers with a marker.
 func fakeRTK(t *testing.T) string {
 	t.Helper()
+	// A slow first exec of the script mustn't read as "RTK wouldn't rewrite it".
+	old := rtkRewriteTimeout
+	rtkRewriteTimeout = time.Minute
+	t.Cleanup(func() { rtkRewriteTimeout = old })
 	bin := filepath.Join(t.TempDir(), "rtk")
 	script := `#!/bin/sh
 case "$1" in

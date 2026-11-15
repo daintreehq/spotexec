@@ -270,10 +270,14 @@ func (st rtkState) racer(command string) (rtkHook, bool) {
 	return rtkHook{}, false
 }
 
+// rtkRewriteTimeout caps the `rtk rewrite` probe (a var for tests: the first
+// exec of a freshly written script can take seconds on a loaded Mac).
+var rtkRewriteTimeout = 3 * time.Second
+
 // rtkRewrites asks RTK whether its hook would rewrite command (`rtk rewrite`
 // prints the rewrite, or exits 1 with nothing to say).
 func rtkRewrites(bin, command string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rtkRewriteTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, "rewrite", command).Output()
 	var ee *exec.ExitError
