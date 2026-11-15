@@ -14,6 +14,7 @@ import (
 
 	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/transport"
 )
 
@@ -246,6 +247,17 @@ func (r *recordingReporter) Event(name string, f map[string]any) {
 	r.named = append(r.named, name)
 	r.fields = append(r.fields, f)
 }
+
+// byName returns the fields of every event named name, in order.
+func (r *recordingReporter) byName(name string) []map[string]any {
+	var out []map[string]any
+	for i, n := range r.named {
+		if n == name {
+			out = append(out, r.fields[i])
+		}
+	}
+	return out
+}
 func (r *recordingReporter) Status(string, ...any) {}
 func (r *recordingReporter) Clear()                {}
 func (r *recordingReporter) Warn(code, format string, args ...any) {
@@ -391,5 +403,228 @@ func TestNowIgnoredAfterSymlinkRemoved(t *testing.T) {
 	// Only what was unjudged: src/other.log was already answered.
 	if got := nowIgnored(ctx, m, root, writes, unjudged); !reflect.DeepEqual(got, []string{"dist/app.log"}) {
 		t.Fatalf("now ignored = %v", got)
+	}
+}
+
+func TestLinkEscapes(t *testing.T) {
+	cases := []struct {
+		path, target string
+		want         bool
+	}{
+		{"src/abs_link", "/etc/passwd", true},
+		{"src/rel_link", "../../../../../../etc/hosts", true},
+		{"docs", "/tmp", true},
+		{"key", "/Users/me/.ssh/id_ed25519", true},
+		{"src/up", "../..", true},
+		{"src/parent", "..", false},
+		{"link", "a.txt", false},
+		{"src/link", "../README.md", false},
+		{"src/deep/link", "../../src/x", false},
+		{"src/odd", "./../../x", true},
+		{"src/back", "../src/../../x", true},
+		{"src/dots", "..x", false},
+	}
+	for _, c := range cases {
+		if got := linkEscapes(c.path, c.target); got != c.want {
+			t.Errorf("%s -> %s: %v, want %v", c.path, c.target, got, c.want)
+		}
+	}
+}
+
+func TestOutsideLinks(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	links := []Link{
+		{"src/inside", "a.txt"},          // stays in the worktree
+		{"src/dangling", "missing"},      // nowhere yet, but inside
+		{"src/abs", "/etc/passwd"},       // absolute
+		{"src/climb", "../../x"},         // above the root by its text
+		{"out", outside},                 // absolute, to a directory
+		{"src/via", "../out/secret"},     // inside by its text, outside through out
+		{"src/replaced", "/etc/hosts"},   // reported by its text even if replaced since
+		{"src/gone", "a.txt"},            // removed since: nothing to judge
+		{"src/swapped", "../out/secret"}, // replaced since by a link inside: gone
+		{"src/pending", "../out/later"},  // through out to a file that doesn't exist yet
+		{"src/dotdot", "../out/../x"},    // inside by its text; out/.. is outside's parent
+	}
+	for _, l := range links {
+		if l.Path == "src/gone" {
+			continue
+		}
+		if err := os.Symlink(l.Target, filepath.Join(root, filepath.FromSlash(l.Path))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for p, target := range map[string]string{"src/replaced": "a.txt", "src/swapped": "a.txt"} {
+		full := filepath.Join(root, filepath.FromSlash(p))
+		if err := os.Remove(full); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, full); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := outsideLinks(root, links)
+	var paths []string
+	for _, l := range got {
+		paths = append(paths, l.Path)
+	}
+	want := "src/abs,src/climb,out,src/via,src/replaced,src/pending,src/dotdot"
+	if strings.Join(paths, ",") != want {
+		t.Fatalf("outside links %v, want %s", paths, want)
+	}
+}
+
+func TestOutsideLinksAreReported(t *testing.T) {
+	rec := &recordingReporter{}
+	reportOutsideLinks(rec, nil, "r")
+	if len(rec.warnings) != 0 || len(rec.named) != 0 {
+		t.Fatalf("no links, but %v %v", rec.warnings, rec.named)
+	}
+	links := []Link{{"src/abs_link", "/etc/passwd"}, {"docs", "/tmp"}, {"ev\x1bil", "/a\x9b2Jb"}, {"src/up", "../../x"}}
+	reportOutsideLinks(rec, links, "r")
+	if len(rec.warnings) != 4 {
+		t.Fatalf("warnings %v", rec.warnings)
+	}
+	for i, w := range rec.warnings[:2] {
+		if !strings.HasPrefix(w, "WRITEBACK_SYMLINK: ") || !strings.Contains(w, links[i].Path+" a symlink to "+links[i].Target+", an absolute path;") {
+			t.Fatalf("warning doesn't name the link and its target: %s", w)
+		}
+	}
+	if w := rec.warnings[2]; strings.ContainsRune(w, 0x1b) || strings.Contains(w, "\x9b") || !strings.Contains(w, `"ev\x1bil"`) || !strings.Contains(w, `"/a\x9b2Jb"`) {
+		t.Fatalf("control characters must reach the terminal escaped: %q", w)
+	}
+	if w := rec.warnings[3]; !strings.Contains(w, "src/up a symlink to ../../x, outside the worktree;") {
+		t.Fatalf("a relative link out is described as absolute: %s", w)
+	}
+	evs := rec.byName("outside_symlink")
+	if len(evs) != 4 {
+		t.Fatalf("events %v", rec.named)
+	}
+	for i, ev := range evs {
+		if ev["path"] != links[i].Path || ev["target"] != links[i].Target || ev["run_id"] != "r" {
+			t.Fatalf("event %v for %v", ev, links[i])
+		}
+	}
+}
+
+// The issue's cases, applied: links created, a tracked file and a tracked
+// link turned into links out of the worktree, a tracked directory replaced
+// by one. All land, and exactly the ones leading out are reported.
+func TestWritebackReportsLinksOutOfTheWorktree(t *testing.T) {
+	root := t.TempDir()
+	write := func(p, data string) {
+		t.Helper()
+		full := filepath.Join(root, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("src/a.txt", "a\n")
+	write("src/tracked.cfg", "cfg\n")
+	write("src/edited.txt", "edited locally\n")
+	write("docs/x.md", "x\n")
+	if err := os.Symlink("a.txt", filepath.Join(root, "src", "link")); err != nil {
+		t.Fatal(err)
+	}
+	m := &manifest.Manifest{ByPath: map[string]protocol.Entry{}}
+	for p, data := range map[string]string{"src/a.txt": "a\n", "src/tracked.cfg": "cfg\n", "src/edited.txt": "before\n", "docs/x.md": "x\n"} {
+		m.ByPath[p] = protocol.Entry{Path: p, ID: fsid.Bytes([]byte(data)), Mode: fsid.ModeFile}
+	}
+	m.ByPath["src/link"] = protocol.Entry{Path: "src/link", ID: fsid.Bytes([]byte("a.txt")), Mode: fsid.ModeSymlink}
+
+	remote := map[string]version{"docs/x.md": {}}
+	files := map[string]remoteFile{}
+	link := func(p, target string) {
+		rf := remoteFile{link: target, mode: fsid.ModeSymlink, id: fsid.Bytes([]byte(target))}
+		files[p], remote[p] = rf, version{true, rf.id, rf.mode}
+	}
+	link("src/abs_link", "/etc/passwd")
+	link("src/rel_link", "../../../../../../etc/hosts")
+	link("docs", "/tmp")
+	link("src/tracked.cfg", "/home/me/.ssh/id_ed25519")
+	link("src/link", "/etc/hosts")
+	link("src/ok", "a.txt")               // stays inside: applied, not reported
+	link("src/edited.txt", "/etc/shadow") // edited locally: a conflict, not applied
+
+	wb := WritebackResult{}
+	if err := applyWriteback(context.Background(), &Workspace{Root: root}, m, remote, files, nil, "r", &wb); err != nil {
+		t.Fatal(err)
+	}
+	for p, rf := range files {
+		if p == "src/edited.txt" {
+			continue
+		}
+		if got, err := os.Readlink(filepath.Join(root, filepath.FromSlash(p))); err != nil || got != rf.link {
+			t.Errorf("%s: %q %v, want a link to %s", p, got, err, rf.link)
+		}
+	}
+	if len(wb.Conflicts) != 1 || wb.Conflicts[0] != "src/edited.txt" {
+		t.Fatalf("conflicts %v", wb.Conflicts)
+	}
+	var got []string
+	for _, l := range wb.OutsideLinks {
+		got = append(got, l.Path+" -> "+l.Target)
+	}
+	want := "docs -> /tmp, src/abs_link -> /etc/passwd, src/link -> /etc/hosts, src/rel_link -> ../../../../../../etc/hosts, src/tracked.cfg -> /home/me/.ssh/id_ed25519"
+	if strings.Join(got, ", ") != want {
+		t.Fatalf("reported %v\nwant %s", got, want)
+	}
+}
+
+// A worktree reached under another spelling (here a link to it; on macOS
+// also a case variant) is still the worktree.
+func TestWithinOtherSpelling(t *testing.T) {
+	root := resolveExisting(t.TempDir())
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !within(filepath.Join(alias, "src", "missing"), root, info, true) {
+		t.Error("a path under another spelling of the root is outside")
+	}
+	if within(filepath.Dir(root), root, info, true) || within(filepath.Join(filepath.Dir(alias), "x"), root, info, true) {
+		t.Error("a path outside the root is inside")
+	}
+}
+
+// A link applied before write-back fails is still reported.
+func TestWritebackReportsLinksBeforeAFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	root := t.TempDir()
+	ro := filepath.Join(root, "ro")
+	if err := os.Mkdir(ro, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(ro, 0o755) })
+	m := &manifest.Manifest{ByPath: map[string]protocol.Entry{}}
+	link := remoteFile{link: "/etc/passwd", mode: fsid.ModeSymlink, id: fsid.Bytes([]byte("/etc/passwd"))}
+	file := remoteFile{data: []byte("x"), mode: fsid.ModeFile, id: fsid.Bytes([]byte("x"))}
+	remote := map[string]version{"a_link": {true, link.id, link.mode}, "ro/new.txt": {true, file.id, file.mode}}
+	files := map[string]remoteFile{"a_link": link, "ro/new.txt": file}
+	wb := WritebackResult{}
+	if err := applyWriteback(context.Background(), &Workspace{Root: root}, m, remote, files, nil, "r", &wb); err == nil {
+		t.Fatal("want the write into a read-only directory to fail")
+	}
+	if len(wb.OutsideLinks) != 1 || wb.OutsideLinks[0] != (Link{"a_link", "/etc/passwd"}) {
+		t.Fatalf("outside links %v", wb.OutsideLinks)
 	}
 }

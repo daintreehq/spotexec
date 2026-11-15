@@ -124,7 +124,7 @@ Before write-back deletes or replaces a local file, it checks whether Git could 
 
 Some deletions are held back: the local file is kept, and a `WRITEBACK_HELD` warning names it (with `--json`, a `held_deletions` event). That happens to the project's own root `.spotexec.toml` and `.gitignore`, and to every deletion of a run that deleted at least 5 files and at least half of the synced files. If the deletion was intended, delete the files yourself.
 
-Deletions apply deepest-first, then writes. New files only come back if Git wouldn't ignore them (created no more permissively than your umask allows), so `dist/`, `target/` and `node_modules` never travel back. A runner can never write into `.git`, under any spelling.
+Deletions apply deepest-first, then writes. New files only come back if Git wouldn't ignore them (created no more permissively than your umask allows), so `dist/`, `target/` and `node_modules` never travel back. A runner can never write into `.git`, under any spelling. Symlinks come back as symlinks; one the run created or retargeted to point outside the worktree (an absolute target, one that climbs above the root, or one that leads out through another link) is applied with a `WRITEBACK_SYMLINK` warning naming each link and its target, and with `--json` an `outside_symlink` event per link.
 
 A new file the run created that doesn't come back (`--writeback never`, `--sync in`, a failed `on-success` run, a `--sync none` run, a dropped connection) stays in the slot until the next run that syncs into it, which removes it. Until then `spotexec exec` and `sx -s --sync none` can still look at it. Ignored outputs and `cache_dirs` are kept, like any build cache.
 
