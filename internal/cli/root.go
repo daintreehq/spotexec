@@ -32,7 +32,7 @@ command too, unless it is named like one of the commands below.
 // subcommands that take precedence over the shorthand form.
 var subcommands = map[string]bool{
 	"run": true, "exec": true, "sync": true, "sync-plan": true, "pull": true, "status": true,
-	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true,
+	"monitor": true, "up": true, "down": true, "doctor": true, "unlock": true, "prune": true, "backups": true,
 	"init": true, "hook": true, "tasks": true, "version": true, "help": true, "cloud-init": true,
 	"completion": true, "sim": true, "image": true, "prices": true, "daemon": true, "container": true, "setup": true, "teardown": true, "supported": true, "__complete": true, "__completeNoDesc": true,
 }
@@ -141,7 +141,7 @@ func newRoot() *cobra.Command {
 	}
 	root.AddCommand(
 		cmdRun(), cmdExec(), cmdSync(), cmdSyncPlan(), cmdPull(), cmdStatus(), cmdMonitor(),
-		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdInit(), cmdHook(),
+		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdBackups(), cmdInit(), cmdHook(),
 		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdPrices(), cmdDaemon(), cmdContainer(), cmdSetup(), cmdTeardown(), cmdSupported(),
 	)
 	root.SetVersionTemplate("spotexec {{.Version}}\n") // as `spotexec version` and `sx --version`

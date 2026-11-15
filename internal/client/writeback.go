@@ -346,6 +346,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 	}
 	defer unlock()
 	wb.ConflictDir = filepath.Join(keepBase(ws), "conflicts", runID)
+	pruneKept(ws, time.Now())
 	synced := len(m.ByPath)
 
 	// save backs up the local version of p, about to be deleted or replaced,

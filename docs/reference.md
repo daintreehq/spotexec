@@ -13,6 +13,8 @@ spotexec sync [flags]                        pre-sync a slot (and build the cont
 spotexec sync-plan [--json]                  dry-run the sync: files, bytes, largest files, exclusions, deps key files
 spotexec pull <glob>... [--dest DIR] [--json] copy gitignored files from the last slot
 spotexec pull --held [<glob>...]             copy the new files a write-back held in the last slot
+spotexec backups [--json]                    list kept write-back backups and conflict copies, newest first
+spotexec backups clear ([<run-id>...] [--older-than AGE] | --all) [--dry-run]  delete them
 spotexec status [runner...] [--json] [-A]    runners, instances, slot holders, idle timers (-A: every machine's VMs and builders, Spot quota use; with --json, {"instances", "searched", "failed", "spot_quotas"})
 spotexec monitor [runner...] [--interval 2s] live load and burn-rate dashboard
 spotexec up [runner] [--count N]             pre-warm fleet VMs (waits until ready)
@@ -53,7 +55,7 @@ spotexec version
 | `~/.config/spotexec/machines.toml` | The machines `spotexec setup` has set up from here (for `setup --all`). |
 | `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log, dependency install logs (`logs/deps/`), the full output of failed `--rtk-filter` runs (`rtk/`) (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
 | `.spotexec.toml`, `.spotexecignore` | Project config and extra sync excludes. |
-| `.git/spotexec/conflicts/`, `.git/spotexec/backup/` | Remote versions of files that conflicted on write-back, and local versions write-back replaced or deleted that Git had no copy of (`.spotexec/` outside Git). Linked worktrees use the shared git directory (`git rev-parse --git-common-dir`), so removing a worktree keeps them. |
+| `.git/spotexec/conflicts/`, `.git/spotexec/backup/` | Remote versions of files that conflicted on write-back, and local versions write-back replaced or deleted that Git had no copy of (`.spotexec/` outside Git). Linked worktrees use the shared git directory (`git rev-parse --git-common-dir`), so removing a worktree keeps them. Pruned automatically ([policy](running.md#write-back-and-artifacts)); `spotexec backups` lists them. |
 | `.spotexec/Dockerfile` | Project image from `spotexec init` or `spotexec container init`. |
 | `~/.cache/spotexec/` | Local SSH ControlMaster sockets (`cm/`) and helper install markers. |
 | Runner: `~/.cache/spotexec/` | Helper binary, slots, dependency caches (`work_root`). |
