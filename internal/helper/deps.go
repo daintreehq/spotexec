@@ -122,7 +122,7 @@ func (s *Session) deps(d protocol.Deps) error {
 	}
 	start := time.Now()
 	for _, p := range d.CacheDirs {
-		if _, err := fsid.CleanRel(strings.NewReplacer("*", "x", "?", "x", "[", "x", "]", "x").Replace(strings.Trim(p, "/"))); err != nil {
+		if err := fsid.CheckPattern(strings.Trim(p, "/")); err != nil {
 			return perr(protocol.CodeBadRequest, "invalid cache_dirs entry %q", p)
 		}
 	}

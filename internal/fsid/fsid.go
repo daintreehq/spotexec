@@ -98,8 +98,10 @@ func Path(p string) (id string, mode uint32, size int64, err error) {
 
 // CleanRel validates a slash-separated relative path from the wire and
 // returns it in OS form. It rejects absolute paths, "..", and empty segments.
+// A backslash is an ordinary filename byte on macOS and Linux, so it is
+// allowed there; only where it separates paths could it hide a "..".
 func CleanRel(p string) (string, error) {
-	if p == "" || strings.HasPrefix(p, "/") || strings.Contains(p, "\\") || strings.ContainsRune(p, 0) {
+	if p == "" || strings.HasPrefix(p, "/") || (filepath.Separator == '\\' && strings.Contains(p, "\\")) || strings.ContainsRune(p, 0) {
 		return "", fmt.Errorf("invalid path %q", p)
 	}
 	for _, seg := range strings.Split(p, "/") {
@@ -113,6 +115,19 @@ func CleanRel(p string) (string, error) {
 		}
 	}
 	return filepath.FromSlash(p), nil
+}
+
+var globBytes = strings.NewReplacer("*", "x", "?", "x", "[", "x", "]", "x")
+
+// CheckPattern validates a slash-separated glob pattern as CleanRel validates
+// a path, reading *, ?, [ and ] as ordinary bytes. A backslash is refused on
+// every OS: in a pattern it is an escape, never a filename byte.
+func CheckPattern(p string) error {
+	if strings.Contains(p, "\\") {
+		return fmt.Errorf("invalid pattern %q", p)
+	}
+	_, err := CleanRel(globBytes.Replace(p))
+	return err
 }
 
 // SafeJoin joins root and a wire path, and verifies that no existing ancestor

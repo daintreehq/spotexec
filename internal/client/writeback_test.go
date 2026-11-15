@@ -251,3 +251,18 @@ func (r *recordingReporter) Warn(code, format string, args ...any) {
 func (r *recordingReporter) Done(string, bool)     {}
 func (r *recordingReporter) PartDone(string, bool) {}
 func (r *recordingReporter) IsJSON() bool          { return true }
+
+// A file the run created with a backslash in its name is written back under
+// that name, not refused or split into directories (#92).
+func TestWriteLocalBackslashName(t *testing.T) {
+	if filepath.Separator == '\\' {
+		t.Skip(`\ separates paths here`)
+	}
+	dir := t.TempDir()
+	if err := writeLocal(dir, `src/back\slash.txt`, remoteFile{data: []byte("w"), mode: fsid.ModeFile}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "src", `back\slash.txt`)); err != nil || string(b) != "w" {
+		t.Errorf("content %q, %v", b, err)
+	}
+}

@@ -397,7 +397,7 @@ func workspaceNodeModules(pats []string) (dirs, skipped []string) {
 		}
 		d := p + "/node_modules"
 		_, badGlob := path.Match(d, "")
-		_, badPath := fsid.CleanRel(strings.NewReplacer("*", "x", "?", "x", "[", "x", "]", "x").Replace(d))
+		badPath := fsid.CheckPattern(d)
 		if strings.Contains(p, "**") || strings.ContainsAny(p, "{}") || badGlob != nil || badPath != nil {
 			skipped = append(skipped, strconv.Quote(raw))
 			continue
