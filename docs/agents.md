@@ -15,6 +15,16 @@ sx: 2.3s on aws#2 · synced 3 files (12 KB) · pulled 1 modified file
 
 Exit codes are the command's own; `125` means spotexec itself failed (see [Exit codes](running.md#exit-codes)).
 
+A parallel or sharded task prints a line as each part finishes, and ends with a summary of the whole run: every part with its outcome (`failed`, `interrupted`, `stopped (fail_fast)` or `passed`), failed parts first, then a last line with the overall result, the parts that failed, the wall time and the combined exit code:
+
+```console
+sx: unit 2/8 · failed · 5m10s on aws#2 · exit 1
+sx: unit 6/8 · failed · 6m1s on aws#6 · exit 1
+sx: unit 1/8 · passed · 11m41s on aws#4
+…
+sx: ci · 2 of 9 parts failed (unit 2/8, unit 6/8) · 11m52s · exit 1
+```
+
 ## Checking for spotexec
 
 `spotexec supported` prints `true` and exits 0 when a run from the current directory would reach a runner: the project has a valid `.spotexec.toml` (here or above, up to the repository root), it isn't in a directory spotexec never syncs (your home directory, `/` or a credential directory), and a runner is configured for it. Otherwise it prints `false` and exits 1, so an agent or script can choose between `sx` and running locally:
@@ -40,6 +50,8 @@ With `--json`, `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1`, lifecycle events go to s
 {"event":"conflict","path":"src/app.ts","local":"/repo/src/app.ts","remote":"/repo/.git/spotexec/conflicts/20260101-120000-ab12cd34ef56/src/app.ts","deleted":false,"diff":"git diff --no-index -- /repo/src/app.ts /repo/.git/spotexec/conflicts/20260101-120000-ab12cd34ef56/src/app.ts","run_id":"20260101-120000-ab12cd34ef56"}
 {"event":"result","exit_code":0,"duration_ms":4120,"timed_out":false}
 ```
+
+A parallel or sharded task ends with a `result` event for the whole run, which (unlike each part's own `result`) lists its `parts` in task order, each with its `task`, `label`, `status` (`passed`, `failed`, `stopped` or `interrupted`), `exit_code` and `duration_ms`, its `shard` and `shards` when sharded, and where it ran: `runner` and `slot`, or `"local": true`.
 
 Other events include:
 - `queued`, `queue_position`, `placed`;

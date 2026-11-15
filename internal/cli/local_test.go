@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -143,16 +145,34 @@ func TestParallelTasksFallBackLocally(t *testing.T) {
 	if strings.Contains(stderr, "\x1b") {
 		t.Errorf("ANSI in plain output: %q", stderr)
 	}
-	if _, stderr := runMain(t, "sx", "-C", dir, "-q", "--fallback-local", "--queue-timeout", "5s", "v"); strings.Contains(stderr, "sx: l · ") || strings.Contains(stderr, "sx: t · ") {
-		t.Errorf("quiet mode printed results: %q", stderr)
-	} else if !strings.Contains(stderr, "sx: warning: ") {
-		t.Errorf("quiet mode dropped the fallback warning: %q", stderr)
+	code, stderr = runMain(t, "sx", "-C", dir, "-q", "--fallback-local", "--queue-timeout", "5s", "v")
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(line, "sx: ") && !strings.HasPrefix(line, "sx: warning: ") {
+			t.Errorf("quiet mode printed %q", line)
+		}
+	}
+	if code != 0 || !strings.Contains(stderr, "sx: warning: ") {
+		t.Errorf("quiet mode: exit %d, stderr %q", code, stderr)
 	}
 	// Without fallback, the same task fails with 125, and parts that never
 	// reached a runner don't claim one.
 	code, stderr = runMain(t, "sx", "-C", dir, "--queue-timeout", "5s", "v")
 	if code != client.ExitInfra || !strings.Contains(stderr, "sx: l · ") || !strings.Contains(stderr, "exit 125") || strings.Contains(stderr, "#0") {
 		t.Errorf("without fallback: exit %d, stderr %q", code, stderr)
+	}
+	assertTail(t, stderr,
+		`^sx: l · failed · \S+ · exit 125$`,
+		`^sx: t · failed · \S+ · exit 125$`,
+		`^sx: v · 2 of 2 parts failed \(l, t\) · \S+ · exit 125$`)
+	code, stderr = runMain(t, "sx", "-C", dir, "--json", "--queue-timeout", "5s", "v")
+	if parts := resultEventParts(t, stderr); code != client.ExitInfra || len(parts) != 2 {
+		t.Errorf("without fallback, --json: exit %d, parts %v", code, parts)
+	} else {
+		for _, p := range parts {
+			if p["status"] != "failed" || p["exit_code"] != float64(125) || p["runner"] != nil || p["local"] != nil || p["shard"] != nil {
+				t.Errorf("without fallback, --json: part %v", p)
+			}
+		}
 	}
 }
 
@@ -189,6 +209,12 @@ parallel = ["unit", "lint"]
 			t.Errorf("stderr lacks %q: %q", want, stderr)
 		}
 	}
+	// The output ends with every part, failed first, then the verdict.
+	assertTail(t, stderr,
+		`^sx: unit 2/3 · failed · \S+ locally · exit 3$`,
+		`^sx: unit 1/3 · passed · \S+ locally$`,
+		`^sx: unit 3/3 · passed · \S+ locally$`,
+		`^sx: unit · 1 of 3 parts failed \(unit 2/3\) · \S+ · exit 3$`)
 	// NDJSON tells the shards apart, and the result names the shard count.
 	code, stderr = runMain(t, "sx", "-C", dir, "--json", "--fallback-local", "--queue-timeout", "5s", "unit")
 	if code != 3 {
@@ -208,13 +234,52 @@ parallel = ["unit", "lint"]
 		}
 	}
 	if len(shards) != 3 || result == nil || result["task"] != "unit" || result["shards"] != float64(3) || result["exit_code"] != float64(3) {
-		t.Errorf("shards %v, result %v (stderr %q)", shards, result, stderr)
+		t.Fatalf("shards %v, result %v (stderr %q)", shards, result, stderr)
+	}
+	// It has each part's outcome, in shard order.
+	parts, _ := result["parts"].([]any)
+	if len(parts) != 3 {
+		t.Fatalf("result parts: %v", result["parts"])
+	}
+	for i, p := range parts {
+		p := p.(map[string]any)
+		status, code := "passed", float64(0)
+		if i == 1 {
+			status, code = "failed", 3
+		}
+		if p["task"] != "unit" || p["shard"] != float64(i+1) || p["shards"] != float64(3) || p["label"] != fmt.Sprintf("unit %d/3", i+1) ||
+			p["status"] != status || p["exit_code"] != code || p["local"] != true || p["runner"] != nil {
+			t.Errorf("part %d: %v", i+1, p)
+		}
+		if d, ok := p["duration_ms"].(float64); !ok || d < 0 {
+			t.Errorf("part %d duration: %v", i+1, p["duration_ms"])
+		}
+	}
+	if strings.Contains(stderr, "sx: ") {
+		t.Errorf("--json printed a text summary: %q", stderr)
 	}
 	// Named in a parallel task, a sharded task fans out in place.
 	os.Remove(filepath.Join(dir, "s1of3.out"))
 	code, stderr = runMain(t, "sx", "-C", dir, "--fallback-local", "--queue-timeout", "5s", "all")
 	if code != 3 || !strings.Contains(stderr, "sx: lint · ") || !strings.Contains(stderr, "sx: unit 3/3 · ") {
 		t.Errorf("parallel: exit %d, stderr %q", code, stderr)
+	}
+	assertTail(t, stderr,
+		`^sx: unit 2/3 · failed · \S+ locally · exit 3$`,
+		`^sx: unit 1/3 · passed · \S+ locally$`,
+		`^sx: unit 3/3 · passed · \S+ locally$`,
+		`^sx: lint · passed · \S+ locally$`,
+		`^sx: all · 1 of 4 parts failed \(unit 2/3\) · \S+ · exit 3$`)
+	code, stderr = runMain(t, "sx", "-C", dir, "--json", "--fallback-local", "--queue-timeout", "5s", "all")
+	allParts := resultEventParts(t, stderr)
+	if code != 3 || len(allParts) != 4 {
+		t.Fatalf("parallel --json: exit %d, parts %v", code, allParts)
+	}
+	for i, want := range []string{"unit 1/3 passed 1", "unit 2/3 failed 2", "unit 3/3 passed 3", "lint passed <nil>"} {
+		p := allParts[i]
+		if got := fmt.Sprintf("%v %v %v", p["label"], p["status"], p["shard"]); got != want {
+			t.Errorf("parallel --json part %d: %v", i, p)
+		}
 	}
 	if b, err := os.ReadFile(filepath.Join(dir, "s1of3.out")); err != nil || string(b) != "1/3\n" {
 		t.Errorf("parallel shard 1: %q, %v", b, err)
@@ -227,6 +292,95 @@ parallel = ["unit", "lint"]
 	if code != client.ExitInfra || !strings.Contains(stderr, "unit: it's a sharded task, whose 3 shards") {
 		t.Errorf("--same-slot: exit %d, stderr %q", code, stderr)
 	}
+}
+
+// assertTail checks the last lines of stderr against regular expressions.
+func assertTail(t *testing.T, stderr string, res ...string) {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(stderr, "\n"), "\n")
+	if len(lines) < len(res) {
+		t.Fatalf("stderr ends before its summary: %q", stderr)
+	}
+	for i, line := range lines[len(lines)-len(res):] {
+		if !regexp.MustCompile(res[i]).MatchString(line) {
+			t.Errorf("summary line %d: %q, want %s; stderr %q", i, line, res[i], stderr)
+		}
+	}
+}
+
+// resultEventParts returns the parts of a --json run's closing result
+// event, checking that every stderr line is NDJSON.
+func resultEventParts(t *testing.T, stderr string) []map[string]any {
+	t.Helper()
+	var parts []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		var ev struct {
+			Event string           `json:"event"`
+			Parts []map[string]any `json:"parts"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("not NDJSON: %q", line)
+		}
+		if ev.Event == "result" && ev.Parts != nil {
+			parts = ev.Parts
+		}
+	}
+	return parts
+}
+
+// partsTask is a sharded task whose shards 1 and 2 say they're running
+// (r1, r2) and then wait, and whose shard 3 waits for them before exiting
+// with `last`: a stopped part's code then comes before the failure.
+func partsTask(t *testing.T, last string, extra string) string {
+	dir := project(t, `[tasks.unit]
+run = "if [ {shard} = 3 ]; then for i in $(seq 200); do [ -e r1 ] && [ -e r2 ] && break; sleep 0.05; done; `+last+`; fi; touch r{shard}; sleep 20"
+shards = 3
+`+extra)
+	cfg := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfg, []byte("version = 1\n[runners.a]\ntype = \"ssh\"\nhosts = [\"nobody@127.0.0.1\"]\nssh_options = [\"Port=1\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTEXEC_CONFIG", cfg)
+	t.Setenv("HOME", t.TempDir())
+	return dir
+}
+
+func TestFailFastSummaryNamesStoppedParts(t *testing.T) {
+	dir := partsTask(t, "exit 3", "fail_fast = true\n")
+	start := time.Now()
+	code, stderr := runMain(t, "sx", "-C", dir, "--fallback-local", "--queue-timeout", "5s", "unit")
+	if code != 3 || time.Since(start) > 18*time.Second {
+		t.Fatalf("exit %d after %s, stderr %q", code, time.Since(start), stderr)
+	}
+	assertTail(t, stderr,
+		`^sx: unit 3/3 · failed · \S+ locally · exit 3$`,
+		`^sx: unit 1/3 · stopped \(fail_fast\) · \S+ locally$`,
+		`^sx: unit 2/3 · stopped \(fail_fast\) · \S+ locally$`,
+		`^sx: unit · 1 of 3 parts failed \(unit 3/3\) · 2 stopped · \S+ · exit 3$`)
+}
+
+func TestInterruptedTaskSummary(t *testing.T) {
+	// Shard 3 waits too, so all three are running when the interrupt
+	// comes; fail_fast must not claim the parts it interrupted.
+	dir := partsTask(t, "touch r3; sleep 20", "fail_fast = true\n")
+	go func() {
+		for i := 0; i < 400; i++ {
+			if _, err := os.Stat(filepath.Join(dir, "r3")); err == nil {
+				syscall.Kill(os.Getpid(), syscall.SIGINT)
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	code, stderr := runMain(t, "sx", "-C", dir, "--fallback-local", "--queue-timeout", "5s", "unit")
+	if code != client.ExitInterrupted {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	assertTail(t, stderr,
+		`^sx: unit 1/3 · interrupted · \S+ locally · exit 130$`,
+		`^sx: unit 2/3 · interrupted · \S+ locally · exit 130$`,
+		`^sx: unit 3/3 · interrupted · \S+ locally · exit 130$`,
+		`^sx: unit · interrupted · \S+ · exit 130$`)
 }
 
 type lockedBuf struct {

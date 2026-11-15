@@ -601,7 +601,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	ctx, intr, stop := signals()
 	defer stop()
 	var mu sync.Mutex
-	codes := make([]int, len(parts))
+	outs := make([]partOutcome, len(parts))
 	// Each part gets its own context, so fail_fast can stop siblings that
 	// are still queued, syncing or installing (not only running ones).
 	subCtx := make([]context.Context, len(parts))
@@ -642,23 +642,37 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			o.DeferLastRun = true
 			subStart := time.Now()
 			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
-			code, where := res.ExitCode, ""
-			if res.Runner != "" {
-				where = fmt.Sprintf(" on %s#%d", res.Runner, res.Slot)
-			}
+			interrupted := ctx.Err() != nil
+			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot}
 			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
 				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, part.label)
-				code, err, where = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(parts)), nil, " locally"
+				out.code, err = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(parts)), nil
+				out.runner, out.slot, out.local = "", 0, true
+				interrupted = ctx.Err() != nil
 			}
 			if err != nil {
-				code = client.ExitInfra
+				out.code = client.ExitInfra
 			}
-			took := res.Duration
-			if took == 0 {
-				took = time.Since(subStart)
+			code := out.code
+			out.took = res.Duration
+			if out.took == 0 {
+				out.took = time.Since(subStart)
 			}
 			mu.Lock()
-			codes[i], done[i], records[i] = code, true, res.LastRun
+			switch {
+			case code == 0 && !res.Canceled:
+				// Finished, even if fail_fast reached for it just after.
+				out.status = partPassed
+			case stopped[i]:
+				out.status = partStopped
+			case res.Canceled || interrupted:
+				// Cut short by an interrupt: even a command that handled
+				// the signal and exited 0 didn't finish.
+				out.status = partInterrupted
+			default:
+				out.status = partFailed
+			}
+			outs[i], done[i], records[i] = out, true, res.LastRun
 			if stopped[i] {
 				// Cancelled by fail_fast: not a failure of its own.
 				mu.Unlock()
@@ -670,13 +684,15 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 					fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
 				}
 			}
-			summary := fmt.Sprintf("%s · %s%s", part.label, ui.Dur(took), where)
+			summary := fmt.Sprintf("%s · %s%s", part.label, ui.Dur(out.took), out.where())
 			if code != 0 {
 				summary += fmt.Sprintf(" · exit %d", code)
 			}
 			sr.PartDone(summary, code == 0)
 			mu.Unlock()
-			if code != 0 && t.FailFast {
+			// After an interrupt every part is already stopping, and is
+			// interrupted rather than stopped by fail_fast.
+			if code != 0 && t.FailFast && ctx.Err() == nil {
 				failOnce.Do(func() {
 					for j, c := range intrs {
 						mu.Lock()
@@ -703,24 +719,33 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	// Interrupted: 130. A spotexec failure (125) outranks a command's own
 	// failure, so agents can tell "tests failed" from "couldn't run tests".
 	exit := 0
-	for i, c := range codes {
-		if stopped[i] {
+	for _, o := range outs {
+		if o.status == partStopped {
 			continue // the failure that stopped it is what counts
 		}
-		if c != 0 && (exit == 0 || c == client.ExitInfra) {
-			exit = c
+		if o.code != 0 && (exit == 0 || o.code == client.ExitInfra) {
+			exit = o.code
 		}
 	}
-	if ctx.Err() != nil {
-		exit = 130
+	interrupted := ctx.Err() != nil
+	if interrupted {
+		exit = client.ExitInterrupted
 	}
-	result := map[string]any{"task": name, "exit_code": exit, "duration_ms": time.Since(start).Milliseconds()}
+	took := time.Since(start)
+	result := map[string]any{"task": name, "exit_code": exit, "duration_ms": took.Milliseconds(), "parts": resultParts(outs)}
 	if len(t.Parallel) > 0 {
 		result["parallel"] = t.Parallel
 	} else {
 		result["shards"] = t.Shards
 	}
 	rep.Event("result", result)
+	// The end of the output says how the whole run went, however far up
+	// each part's own result scrolled: every part, failed first, then the
+	// verdict as the last line.
+	for _, o := range recapOrder(outs) {
+		rep.PartDone(o.recapLine(), o.status == partPassed)
+	}
+	rep.Done(taskVerdict(name, outs, exit, interrupted, took), exit == 0)
 	return exit
 }
 

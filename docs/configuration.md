@@ -209,7 +209,7 @@ fail_fast = false
 parallel = ["test-all", "lint"]   # 8 shards and lint, 9 parts at once
 ```
 
-`sx test-all` runs eight parts, prefixed `[test-all 1/8]` to `[test-all 8/8]`, and exits as a parallel task does; `sx test-all --bail=1` passes `--bail=1` to all eight. With `--json`, each part's events carry `"shard"` and `"shards"` beside `"task"`, and the final `result` event has `"shards"`. Using `{shard}` or `{shards}` without `shards` is a config error, as is `shards` on a parallel task. With `shards = 1` the task is an ordinary run (so `--same-slot` applies), with `{shard}` and `{shards}` both `1`.
+`sx test-all` runs eight parts, prefixed `[test-all 1/8]` to `[test-all 8/8]`, and exits as a parallel task does; `sx test-all --bail=1` passes `--bail=1` to all eight. With `--json`, each part's events carry `"shard"` and `"shards"` beside `"task"`, and the final `result` event has `"shards"` and each part's outcome in `"parts"`. The run ends with a summary of every part, failed ones first, and a last line with the overall result (see [what an agent sees](agents.md#what-an-agent-sees)). Using `{shard}` or `{shards}` without `shards` is a config error, as is `shards` on a parallel task. With `shards = 1` the task is an ordinary run (so `--same-slot` applies), with `{shard}` and `{shards}` both `1`.
 
 `sx <task>` runs any task, even one named like a spotexec subcommand: `sx sync` runs a task called `sync`. Only `spotexec <task>` gives subcommands precedence, so `spotexec sync` still means the subcommand. A task also wins over a program of the same name; `sx -- <name>` and `spotexec run -- <name>` skip the tasks and run the program. `spotexec tasks` lists them.
 
