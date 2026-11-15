@@ -242,6 +242,7 @@ A project can also size its VMs by requirements. A suite that needs more memory 
 ```toml
 [runners.ci-mem]
 extends = "aws"
+extends_type = "aws-spot"
 vcpus = 8
 min_memory_gib = 32            # whichever 8-vCPU type with 32 GiB or more is cheapest now
 max_slots = 2
