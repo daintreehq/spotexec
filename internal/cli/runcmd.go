@@ -265,38 +265,33 @@ func load(dir string) (*loaded, error) {
 // buildCommand turns argv into a remote shell line. A single argument is
 // taken as a shell snippet (so `sx 'pnpm build && pnpm test'` works); several
 // are quoted individually. Absolute local paths inside the worktree are
-// mapped to the remote workspace: in a snippet to "$SPOTEXEC_WORKSPACE" (so
-// they stay right after a `cd`), or, where the shell won't expand that
-// (single quotes, separate arguments), to a path relative to the mirrored
-// working directory.
+// mapped to the remote workspace's absolute path, "$SPOTEXEC_WORKSPACE", so
+// they still name the same file after the command changes directory
+// (`make -C sub OUT=/repo/build`) and stay absolute for tools that check.
 func buildCommand(ws *client.Workspace, args []string) string {
-	toRoot := "."
-	if ws.Cwd != "." {
-		toRoot = strings.TrimSuffix(strings.Repeat("../", strings.Count(ws.Cwd, "/")+1), "/")
-	}
 	if len(args) == 1 {
-		return rewriteRoot(args[0], ws.Root, toRoot, true)
+		return rewriteRoot(args[0], ws.Root)
 	}
 	q := make([]string, len(args))
 	assigning := true
 	for i, a := range args {
 		// Leading NAME=value words stay environment assignments: quoting
 		// them whole would make bash run "NAME=value" as a command. The
-		// value is quoted on its own, and since the shell expands it, a
-		// worktree path in it can become the absolute remote one.
+		// value is quoted on its own.
 		if name, value, ok := envAssignment(a); ok && assigning {
-			q[i] = name + "=" + quoteValue(value, ws.Root)
+			q[i] = name + "=" + quoteArg(value, ws.Root)
 			continue
 		}
 		assigning = false
-		q[i] = transport.ShellQuote(rewriteRoot(a, ws.Root, toRoot, false))
+		q[i] = quoteArg(a, ws.Root)
 	}
 	return strings.Join(q, " ")
 }
 
-// quoteValue shell-quotes an assignment's value, with each worktree path in
-// it (matched before quoting) turned into the remote workspace's.
-func quoteValue(v, root string) string {
+// quoteArg shell-quotes one word, with each worktree path in it (matched
+// before quoting) turned into the remote workspace's, double-quoted so a
+// workspace path with spaces stays one word.
+func quoteArg(v, root string) string {
 	var b strings.Builder
 	last := 0
 	for i := 0; i+len(root) <= len(v); i++ {
@@ -330,26 +325,28 @@ func envAssignment(s string) (name, value string, ok bool) {
 	return name, value, true
 }
 
-// rewriteRoot replaces root where it appears as a whole path (followed by
-// '/', the end, or a shell delimiter, and not as part of a longer name such
-// as /repo-other).
-func rewriteRoot(s, root, toRoot string, snippet bool) string {
+// rewriteRoot replaces root in a shell snippet with the remote workspace
+// where it appears as a whole path (followed by '/', the end, or a shell
+// delimiter, and not as part of a longer name such as /repo-other). The
+// variable is spliced so it expands to one word whatever the quoting
+// around it, and ${...:?} aborts rather than expanding to "" if unset.
+func rewriteRoot(s, root string) string {
 	var b strings.Builder
 	inSingle, inDouble := false, false
 	for i := 0; i < len(s); {
 		c := s[i]
-		if strings.HasPrefix(s[i:], root) && boundaryBefore(s, i) && boundaryAfter(s, i+len(root)) {
+		if end := matchRoot(s, i, root, !inSingle && !inDouble); end >= 0 && boundaryBefore(s, i) && boundaryAfter(s, end) {
 			switch {
-			case snippet && !inSingle:
-				b.WriteString("${SPOTEXEC_WORKSPACE:?}") // aborts rather than expanding to "" if unset
-			case snippet:
-				// Inside single quotes: close them, splice the variable in
-				// double quotes, reopen ('a/x' -> ''"$W"'/x').
+			case inSingle:
+				// Close the quotes, splice the variable in double quotes,
+				// reopen ('a/x' -> ''"$W"'/x').
 				b.WriteString(`'"${SPOTEXEC_WORKSPACE:?}"'`)
+			case inDouble:
+				b.WriteString("${SPOTEXEC_WORKSPACE:?}")
 			default:
-				b.WriteString(toRoot)
+				b.WriteString(`"${SPOTEXEC_WORKSPACE:?}"`)
 			}
-			i += len(root)
+			i = end
 			continue
 		}
 		switch {
@@ -367,6 +364,30 @@ func rewriteRoot(s, root, toRoot string, snippet bool) string {
 		i++
 	}
 	return b.String()
+}
+
+// matchRoot returns where root ends if it is written at s[i:], or -1.
+// Outside quotes (unquoted) each of its bytes may also be backslash-escaped,
+// as in /Users/me/My\ Projects/repo.
+func matchRoot(s string, i int, root string, unquoted bool) int {
+	if !unquoted {
+		if strings.HasPrefix(s[i:], root) {
+			return i + len(root)
+		}
+		return -1
+	}
+	j := i
+	for k := 0; k < len(root); k++ {
+		switch {
+		case j+1 < len(s) && s[j] == '\\' && s[j+1] == root[k]:
+			j += 2
+		case j < len(s) && s[j] == root[k] && root[k] != '\\':
+			j++
+		default:
+			return -1
+		}
+	}
+	return j
 }
 
 func boundaryBefore(s string, i int) bool {
@@ -658,9 +679,54 @@ func taskCommand(run string, args []string) string {
 		// "$@" too, or the arguments would be word-split or not expanded.
 		body = strings.NewReplacer(`"{args}"`, `"$@"`, `'{args}'`, `"$@"`, "{args}", `"$@"`).Replace(run)
 	} else {
-		body = run + ` "$@"`
+		body = withoutTrailingComment(run) + ` "$@"`
 	}
 	return "set -- " + strings.Join(q, " ") + "\n" + body
+}
+
+// withoutTrailingComment drops a shell comment that ends run, and any
+// comment-only lines before it, so words appended to run reach its last
+// command instead of the comment.
+func withoutTrailingComment(run string) string {
+	for {
+		i := trailingComment(run)
+		if i < 0 {
+			return run
+		}
+		run = strings.TrimRight(run[:i], " \t\r\n")
+	}
+}
+
+// trailingComment returns where the comment on run's last line starts, or
+// -1: a '#' outside quotes that begins a word.
+func trailingComment(run string) int {
+	inSingle, inDouble, wordStart := false, false, true
+	for i := 0; i < len(run); i++ {
+		c := run[i]
+		switch {
+		case inSingle:
+			inSingle = c != '\''
+		case c == '\\' && i+1 < len(run):
+			i++ // escaped, inside double quotes too (\")
+			wordStart = false
+		case inDouble:
+			inDouble = c != '"'
+		case c == '#' && wordStart:
+			nl := strings.IndexByte(run[i:], '\n')
+			if nl < 0 {
+				return i
+			}
+			i += nl // the comment runs to the end of its line
+			wordStart = true
+		case c == '\'':
+			inSingle, wordStart = true, false
+		case c == '"':
+			inDouble, wordStart = true, false
+		default:
+			wordStart = strings.IndexByte(" \t\n;&|()", c) >= 0
+		}
+	}
+	return -1
 }
 
 // taskPart is one run of a task's fan-out: a task of a parallel task, or

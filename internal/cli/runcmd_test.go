@@ -175,3 +175,24 @@ func TestWritebackNote(t *testing.T) {
 		}
 	}
 }
+
+func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
+	cases := []struct{ tmpl, want string }{
+		{`printf "<%s>" # print each`, "<a><two words>"},
+		{"printf \"<%s>\"  # print each\n", "<a><two words>"},
+		{"printf \"<%s>\"\n# trailing note\n  # another\n", "<a><two words>"},
+		{`printf "<%s>" "#not" a#b '# nor'`, "<#not><a#b><# nor><a><two words>"},
+		{"printf \"<%s>\" \"multi\n# line\"", "<multi\n# line><a><two words>"},
+		{`printf "<%s>" \# # escaped`, "<#><a><two words>"},
+	}
+	for _, c := range cases {
+		line := taskCommand(c.tmpl, []string{"a", "two words"})
+		out, err := exec.Command("sh", "-c", line).Output()
+		if err != nil {
+			t.Fatalf("%q: %v", line, err)
+		}
+		if string(out) != c.want {
+			t.Errorf("template %q: line %q printed %q, want %q", c.tmpl, line, out, c.want)
+		}
+	}
+}

@@ -10,20 +10,18 @@ import (
 
 func TestRewriteRoot(t *testing.T) {
 	root := "/Users/me/repo"
-	cases := []struct {
-		in      string
-		snippet bool
-		want    string
-	}{
-		{"cd /Users/me/repo && npm test", true, "cd ${SPOTEXEC_WORKSPACE:?} && npm test"},
-		{"cd /Users/me/repo/pkg && vitest run /Users/me/repo/pkg/a.test.ts", true, "cd ${SPOTEXEC_WORKSPACE:?}/pkg && vitest run ${SPOTEXEC_WORKSPACE:?}/pkg/a.test.ts"},
-		{"cat '/Users/me/repo/x'", true, `cat ''"${SPOTEXEC_WORKSPACE:?}"'/x'`},
-		{"ls /Users/me/repo-other/x", true, "ls /Users/me/repo-other/x"},
-		{"/Users/me/repo/a.txt", false, "../a.txt"},
-		{"--out=/Users/me/repo/dist", true, "--out=${SPOTEXEC_WORKSPACE:?}/dist"},
+	cases := []struct{ in, want string }{
+		{"cd /Users/me/repo && npm test", `cd "${SPOTEXEC_WORKSPACE:?}" && npm test`},
+		{"cd /Users/me/repo/pkg && vitest run /Users/me/repo/pkg/a.test.ts", `cd "${SPOTEXEC_WORKSPACE:?}"/pkg && vitest run "${SPOTEXEC_WORKSPACE:?}"/pkg/a.test.ts`},
+		{"cat '/Users/me/repo/x'", `cat ''"${SPOTEXEC_WORKSPACE:?}"'/x'`},
+		{`cat "/Users/me/repo/x"`, `cat "${SPOTEXEC_WORKSPACE:?}/x"`},
+		{"ls /Users/me/repo-other/x", "ls /Users/me/repo-other/x"},
+		{"--out=/Users/me/repo/dist", `--out="${SPOTEXEC_WORKSPACE:?}"/dist`},
+		{`ls /Users/me/re\po/x`, `ls "${SPOTEXEC_WORKSPACE:?}"/x`},
+		{`ls '/Users/me/re\po'`, `ls '/Users/me/re\po'`},
 	}
 	for _, c := range cases {
-		if got := rewriteRoot(c.in, root, "..", c.snippet); got != c.want {
+		if got := rewriteRoot(c.in, root); got != c.want {
 			t.Errorf("rewriteRoot(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
@@ -71,5 +69,42 @@ func TestBuildCommandKeepsEnvAssignments(t *testing.T) {
 		if out, err := cmd.Output(); err != nil || string(out) != c.want+"\n" {
 			t.Errorf("root %q value %q: got %q %v", c.root, c.value, out, err)
 		}
+	}
+}
+
+// runWith runs a built command line under bash with SPOTEXEC_WORKSPACE set
+// to a remote path containing a space.
+func runWith(t *testing.T, line string) string {
+	t.Helper()
+	cmd := exec.Command("bash", "-c", line)
+	cmd.Env = append(os.Environ(), "SPOTEXEC_WORKSPACE=/remote ws")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("%q: %v", line, err)
+	}
+	return string(out)
+}
+
+func TestBuildCommandArgsGetAbsoluteRemotePaths(t *testing.T) {
+	// A tool that changes directory first (make -C) must still see the
+	// workspace path, not one relative to the mirrored working directory.
+	ws := &client.Workspace{Root: "/Users/me/repo", Cwd: "pkg"}
+	line := buildCommand(ws, []string{"printf", "<%s>", "OUT=/Users/me/repo/build", "/Users/me/repo", "--cfg=/Users/me/repo/a b", "/Users/me/repo-other/x"})
+	if got, want := runWith(t, line), "<OUT=/remote ws/build></remote ws><--cfg=/remote ws/a b></Users/me/repo-other/x>"; got != want {
+		t.Errorf("line %q printed %q, want %q", line, got, want)
+	}
+}
+
+func TestSnippetWorkspaceDoesNotWordSplit(t *testing.T) {
+	ws := &client.Workspace{Root: "/Users/me/repo", Cwd: "."}
+	line := buildCommand(ws, []string{`printf '<%s>' /Users/me/repo/a "/Users/me/repo/b" '/Users/me/repo/c' --out=/Users/me/repo/d /Users/me/repo`})
+	if got, want := runWith(t, line), "</remote ws/a></remote ws/b></remote ws/c><--out=/remote ws/d></remote ws>"; got != want {
+		t.Errorf("line %q printed %q, want %q", line, got, want)
+	}
+	// A worktree whose path has a space, written with it escaped.
+	ws = &client.Workspace{Root: "/Users/me/My Projects/repo", Cwd: "."}
+	line = buildCommand(ws, []string{`printf '<%s>' /Users/me/My\ Projects/repo/x "/Users/me/My Projects/repo/y" /Users/me/My\ Projects/repo-other`})
+	if got, want := runWith(t, line), "</remote ws/x></remote ws/y></Users/me/My Projects/repo-other>"; got != want {
+		t.Errorf("line %q printed %q, want %q", line, got, want)
 	}
 }
