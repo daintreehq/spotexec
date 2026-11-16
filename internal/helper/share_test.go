@@ -504,11 +504,13 @@ func TestImageCopiesFromAnotherRegion(t *testing.T) {
 		name               string
 		inSource, waitPush bool
 		probe, noLogin     bool
+		noRegistry         bool // the runner's own registry couldn't be had (#218)
 	}{
-		{"probe copies and pushes in the background", true, false, true, false},
-		{"container build waits for the push", true, true, false, false},
-		{"a source without it is a miss", false, false, true, false},
-		{"container build can't push without a login", true, true, false, true},
+		{"probe copies and pushes in the background", true, false, true, false, false},
+		{"container build waits for the push", true, true, false, false, false},
+		{"a source without it is a miss", false, false, true, false, false},
+		{"container build can't push without a login", true, true, false, true, false},
+		{"without a registry of its own, copies and pushes nothing", true, false, true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := registryDocker(t)
@@ -529,9 +531,13 @@ func TestImageCopiesFromAnotherRegion(t *testing.T) {
 			}
 			out := &syncBuf{}
 			s.c = protocol.NewConn(strings.NewReader(""), out)
-			err := s.image(protocol.Image{Dockerfile: "Dockerfile", Tag: tag, Probe: tc.probe, WaitPush: tc.waitPush,
+			req := protocol.Image{Dockerfile: "Dockerfile", Tag: tag, Probe: tc.probe, WaitPush: tc.waitPush,
 				Registry: &protocol.RegistryAuth{Server: "reg.example", Repo: "reg.example/spotexec/r", User: "AWS", Password: "pw"},
-				Source:   &protocol.RegistryAuth{Server: "src.example", Repo: "src.example/spotexec/r", User: "AWS", Password: "pw2"}})
+				Source:   &protocol.RegistryAuth{Server: "src.example", Repo: "src.example/spotexec/r", User: "AWS", Password: "pw2"}}
+			if tc.noRegistry {
+				req.Registry = nil
+			}
+			err := s.image(req)
 			if tc.noLogin {
 				if err == nil || !strings.Contains(err.Error(), "could not log in to push") {
 					t.Fatalf("err = %v", err)
@@ -555,6 +561,15 @@ func TestImageCopiesFromAnotherRegion(t *testing.T) {
 			// The source's image, under the local name, with its ID.
 			if res.Missing || !res.Copied || !res.Pulled || res.Built || res.ImageID != "sha256:src" || res.Image != "spotexec-local/r:"+tag {
 				t.Fatalf("result %+v", res)
+			}
+			if tc.noRegistry {
+				if res.Pushed || res.Pushing {
+					t.Fatalf("pushed %v, pushing %v", res.Pushed, res.Pushing)
+				}
+				if _, err := os.Stat(filepath.Join(dir, "pushes")); !os.IsNotExist(err) {
+					t.Fatalf("pushed: %v", err)
+				}
+				return
 			}
 			if tc.waitPush != res.Pushed || tc.waitPush == res.Pushing {
 				t.Fatalf("pushed %v, pushing %v", res.Pushed, res.Pushing)
