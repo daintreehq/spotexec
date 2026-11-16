@@ -620,7 +620,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	if probed {
 		fl.pool.RefreshPrices(ctx) // for the placement cost model (at most every 15m)
 	}
-	if probed && r.Scheduling.EarlyDrain {
+	if probed && r.EarlyDrain() {
 		for _, id := range d.earlyDrain(ctx, fl, running) {
 			view.Draining[id] = true
 		}
@@ -806,56 +806,26 @@ func drainRemote(ctx context.Context, r *config.Runner, in provider.Instance) bo
 	return err == nil && json.Unmarshal(out, &hs) == nil && hs.Draining
 }
 
-// earlyDrain asks idle standby VMs to drain (scheduling.early_drain), so a
-// surplus VM ends once its results have been kept result_retention rather
-// than at idle_timeout. Each drain is committed locally first (BeginDrain),
-// and the VM decides under its lifecycle lock (spotexec-helper try-drain),
-// so a job that reached it meanwhile keeps it. Only VMs this machine
-// already installed the helper on are asked: installing one would touch
-// its idle clock. It returns the VMs drained.
+// earlyDrain hands surplus (standby) VMs their early drains
+// (scheduling.early_drain, client.Pool.EarlyDrain): the same pass every sx
+// process runs as its job ends, here each probe round. It returns the VMs
+// drained now.
 func (d *Daemon) earlyDrain(ctx context.Context, fl *fleet, running []provider.Instance) []string {
 	r := fl.r
-	var wg sync.WaitGroup
-	var mu sync.Mutex
 	var drained []string
-	for _, in := range running {
-		if role := fl.roles[in.ID]; role != "standby" && role != "drain_requested" {
-			continue
+	for _, res := range fl.pool.EarlyDrain(ctx, running) {
+		switch res.Result {
+		case helper.DrainDone, helper.DrainAlready:
+			if res.Idle >= 0 {
+				d.action("%s: %s is surplus and was idle %s: drained early", r.Name, res.ID, res.Idle)
+			} else {
+				d.action("%s: %s is surplus: drained early", r.Name, res.ID)
+			}
+			drained = append(drained, res.ID)
+		case helper.DrainScheduled:
+			d.action("%s: %s is surplus: it ends once idle %s (early drain)", r.Name, res.ID, r.ResultRetention())
 		}
-		c := transport.New(in.Target, r.WorkRoot)
-		if !c.HelperInstalled() {
-			continue
-		}
-		op, ok, err := fl.pool.BeginDrain(ctx, in.ID)
-		if err != nil || !ok {
-			continue
-		}
-		wg.Add(1)
-		go func(in provider.Instance) {
-			defer wg.Done()
-			pctx, cancel := context.WithTimeout(ctx, 25*time.Second)
-			defer cancel()
-			if err := c.EnsureMaster(pctx); err != nil {
-				return // asked again later, with the same operation
-			}
-			out, err := c.HelperCmdInstalled(pctx, "try-drain", "--op", op, "--min-idle", r.ResultRetention().String(), "--reason", "surplus capacity")
-			if err != nil {
-				return
-			}
-			var res helper.TryDrainResult
-			if json.Unmarshal(out, &res) != nil || res.Op != op {
-				return
-			}
-			fl.pool.FinishDrain(in.ID, op, res.Result, res.Detail)
-			if res.Result == helper.DrainDone || res.Result == helper.DrainAlready {
-				d.action("%s: %s is surplus and was idle %s: drained early", r.Name, in.ID, time.Duration(res.IdleS)*time.Second)
-				mu.Lock()
-				drained = append(drained, in.ID)
-				mu.Unlock()
-			}
-		}(in)
 	}
-	wg.Wait()
 	return drained
 }
 

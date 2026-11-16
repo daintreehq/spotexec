@@ -1349,21 +1349,32 @@ func TestSchedulingSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := g.Runners["aws"]
-	if r.SchedPolicy() != PolicyConsolidate || r.SchedMode() != ModeLatency || r.Scheduling.SpareSlots != 2 || !r.Scheduling.EarlyDrain || r.ResultRetention() != 2*time.Minute {
+	if r.SchedPolicy() != PolicyConsolidate || r.SchedMode() != ModeLatency || r.Scheduling.SpareSlots != 2 || !r.EarlyDrain() || r.ResultRetention() != 2*time.Minute {
 		t.Fatalf("scheduling %+v", r.Scheduling)
 	}
-	if p := g.Runners["plain"]; p.SchedPolicy() != PolicyConsolidate || p.SchedMode() != ModeBalanced || p.ResultRetention() != 10*time.Minute {
-		t.Fatalf("defaults: policy %s mode %s retention %s", p.SchedPolicy(), p.SchedMode(), p.ResultRetention())
-	}
-	if !g.Runners["aws"].Scheduling.EarlyDrain || g.Runners["plain"].Scheduling.EarlyDrain {
-		t.Fatal("early_drain defaults to false and is read when set")
+	// Out of the box a surplus VM ends 2m after its last job, not at
+	// idle_timeout.
+	if p := g.Runners["plain"]; p.SchedPolicy() != PolicyConsolidate || p.SchedMode() != ModeBalanced || !p.EarlyDrain() || p.ResultRetention() != DefaultResultRetention {
+		t.Fatalf("defaults: policy %s mode %s early drain %v retention %s", p.SchedPolicy(), p.SchedMode(), p.EarlyDrain(), p.ResultRetention())
 	}
 	g, err = loadGlobalText(t, "[runners.a]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nidle_timeout = \"3m\"\nscheduling = { policy = \"legacy\" }\n[runners.b]\ntype = \"sim\"\nscheduling = { policy = \"shadow\" }\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a := g.Runners["a"]; a.SchedPolicy() != PolicyLegacy || a.ResultRetention() != 3*time.Minute {
+	if a := g.Runners["a"]; a.SchedPolicy() != PolicyLegacy || a.ResultRetention() != 2*time.Minute {
 		t.Fatalf("a: policy %s retention %s", a.SchedPolicy(), a.ResultRetention())
+	}
+	// Retention never outlasts idle_timeout (the watchdog ends the VM
+	// then anyway), and early_drain = false opts out.
+	g, err = loadGlobalText(t, "[runners.a]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nidle_timeout = \"90s\"\n[runners.b]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nidle_timeout = \"5m\"\nscheduling = { early_drain = false, result_retention = \"20m\" }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := g.Runners["a"]; a.ResultRetention() != 90*time.Second || !a.EarlyDrain() {
+		t.Fatalf("a: retention %s early drain %v", a.ResultRetention(), a.EarlyDrain())
+	}
+	if b := g.Runners["b"]; b.ResultRetention() != 5*time.Minute || b.EarlyDrain() {
+		t.Fatalf("b: retention %s early drain %v", b.ResultRetention(), b.EarlyDrain())
 	}
 	if b := g.Runners["b"]; b.SchedPolicy() != PolicyShadow {
 		t.Fatalf("b: policy %s", b.SchedPolicy())
@@ -1372,5 +1383,24 @@ func TestSchedulingSettings(t *testing.T) {
 		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n[runners.aws.scheduling]\n"+bad+"\n"); err == nil || !strings.Contains(err.Error(), "scheduling.") {
 			t.Errorf("%s: %v", bad, err)
 		}
+	}
+}
+
+// A project runner inherits the base's early_drain unless it sets its own,
+// and setting it never changes the base runner.
+func TestProjectEarlyDrainInherits(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n[runners.aws.scheduling]\nearly_drain = true\n[runners.off]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nscheduling = { early_drain = false }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := mergeProject(t, g, "[runners.quiet]\nextends = \"aws\"\nscheduling = { early_drain = false }\n[runners.same]\nextends = \"off\"\nmax_slots = 2\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Global.Runners["quiet"].EarlyDrain() || !c.Global.Runners["aws"].EarlyDrain() {
+		t.Fatalf("project opt-out: quiet %v, base %v", c.Global.Runners["quiet"].EarlyDrain(), c.Global.Runners["aws"].EarlyDrain())
+	}
+	if c.Global.Runners["same"].EarlyDrain() {
+		t.Fatal("a project runner dropped its base's early_drain = false")
 	}
 }

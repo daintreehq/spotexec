@@ -558,12 +558,15 @@ func (s *Session) releaseLocks(teardown bool) {
 		}
 	}
 	s.tokens = nil
+	// The idle clock starts when work ends: touched before the lifecycle
+	// lock goes, so the watchdog never sees the VM free with the clock
+	// still at the last heartbeat.
+	if held {
+		touchActivity(s.layout.Root)
+	}
 	s.gate.Unlock()
 	s.slotLock.Unlock()
 	s.lifecycle.Unlock()
-	if held {
-		touchActivity(s.layout.Root) // the idle clock starts when work ends
-	}
 }
 
 func (s *Session) tokenIdxAt(i int) int {

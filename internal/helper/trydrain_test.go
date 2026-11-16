@@ -67,3 +67,46 @@ func TestTryDrain(t *testing.T) {
 		t.Fatalf("another operation on a drained VM: %+v", r)
 	}
 }
+
+// A scheduled drain hands the wait to the watchdog: it records the least
+// idle time once (whatever sessions hold the VM meanwhile), only on a VM
+// whose watchdog reads it, and a retry of the operation reads as done.
+func TestScheduleDrain(t *testing.T) {
+	root := t.TempDir()
+	if r := scheduleDrain(root, "op1", 2*time.Minute, false); r.Result != DrainUnsupported {
+		t.Fatalf("static runner: %+v", r)
+	}
+	if r := scheduleDrain(root, "op1", 2*time.Minute, true); r.Result != DrainUnsupported {
+		t.Fatalf("a watchdog from before scheduled drains: %+v", r)
+	}
+	if err := os.WriteFile(filepath.Join(root, "features"), []byte("drain_after\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := scheduleDrain(root, "op1", 90*time.Second+time.Millisecond, true); r.Result != DrainScheduled || r.Op != "op1" {
+		t.Fatalf("schedule: %+v", r)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "drain_after")); string(b) != "91\n" {
+		t.Fatalf("drain_after %q, want whole seconds rounded up", b)
+	}
+	if draining(root) {
+		t.Fatal("scheduling drained the VM at once")
+	}
+	// A retry (its answer lost), or another operation: the first record
+	// stands.
+	if r := scheduleDrain(root, "op2", time.Second, true); r.Result != DrainScheduled {
+		t.Fatalf("again: %+v", r)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "drain_after")); string(b) != "91\n" {
+		t.Fatalf("drain_after rewritten: %q", b)
+	}
+	// Once the watchdog has drained it, the operation reads as done.
+	if err := os.WriteFile(filepath.Join(root, "draining"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := scheduleDrain(root, "op1", time.Second, true); r.Result != DrainDone {
+		t.Fatalf("after draining, same op: %+v", r)
+	}
+	if r := scheduleDrain(root, "op9", time.Second, true); r.Result != DrainAlready {
+		t.Fatalf("after draining, another op: %+v", r)
+	}
+}
