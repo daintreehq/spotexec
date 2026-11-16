@@ -266,6 +266,7 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 			var heads, rules atomic.Int32
 			var mu sync.Mutex
 			var stsAsked []string
+			var given []time.Duration
 			rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				resp := func(st int, body string) (*http.Response, error) {
 					return &http.Response{StatusCode: st, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
@@ -275,6 +276,15 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 					case "fail":
 						return nil, &url.Error{Op: r.Method, URL: r.URL.String(), Err: errors.New("connect: connection timed out")}
 					case "hang":
+						// How long the request was given: a step's own
+						// timeout, or what is left of the caller's budget.
+						if dl, ok := r.Context().Deadline(); ok {
+							mu.Lock()
+							given = append(given, time.Until(dl))
+							mu.Unlock()
+						} else {
+							t.Errorf("%s %s has no deadline", r.Method, r.URL)
+						}
 						<-r.Context().Done()
 						return nil, r.Context().Err()
 					case "503":
@@ -314,21 +324,15 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 			}
 			budget := tc.budget
 			if budget == 0 {
-				// Long enough that only the steps' own timeouts keep a
-				// lookup under a second.
-				budget = 5 * time.Second
+				// Far beyond the steps' own timeouts, which must bound them.
+				budget = 30 * time.Second
 			}
 			for range 2 {
 				ctx, cancel := context.WithTimeout(context.Background(), budget)
-				start := time.Now()
 				get, put, err := a.CacheURLs(ctx, "repo", "k")
-				took := time.Since(start)
 				cancel()
 				if err != nil {
 					t.Fatalf("CacheURLs: %v", err)
-				}
-				if took > time.Second {
-					t.Fatalf("lookup took %s: a step outlived its own timeout", took)
 				}
 				for _, u := range []string{get, put} {
 					p, err := url.Parse(u)
@@ -340,6 +344,11 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 			}
 			if int(heads.Load()) != tc.heads || int(rules.Load()) != tc.rules {
 				t.Fatalf("bucket checks %d, expiry rules %d; want %d, %d", heads.Load(), rules.Load(), tc.heads, tc.rules)
+			}
+			for _, d := range given {
+				if d > time.Second {
+					t.Fatalf("a hanging request was given %s: want its step's own timeout", d)
+				}
 			}
 			want := tc.stsAsked
 			if want == nil {
@@ -369,12 +378,17 @@ func TestAccountIDTriesBothRegions(t *testing.T) {
 				mu.Lock()
 				hosts = append(hosts, r.URL.Host)
 				mu.Unlock()
+				if r.URL.Host == "sts.us-east-1.amazonaws.com" {
+					// Denied (a policy keeping the account out of us-east-1).
+					return &http.Response{StatusCode: 403, Request: r, Body: io.NopCloser(strings.NewReader(
+						`<ErrorResponse><Error><Code>AccessDenied</Code><Message>denied</Message></Error></ErrorResponse>`))}, nil
+				}
 				<-r.Context().Done()
 				return nil, r.Context().Err()
 			})}},
 		dir: t.TempDir(),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := a.accountID(ctx)
 	if err == nil || !strings.Contains(err.Error(), "ap-south-1 and us-east-1") {
@@ -390,21 +404,49 @@ func TestAccountIDTriesBothRegions(t *testing.T) {
 // A bucket whose expiry rule couldn't be set, and which has been deleted
 // since, is checked (and created) again rather than trusted as existing.
 func TestEnsureBucketForgetsADeletedBucket(t *testing.T) {
-	a, puts, heads := fakeCacheBucketAWS(t, func(n int) (int, string) {
-		switch n {
-		case 1:
-			return http.StatusInternalServerError, ""
-		case 2:
-			return http.StatusNotFound, `<Error><Code>NoSuchBucket</Code></Error>`
+	var heads, creates, rules int
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		resp := func(st int, body string) (*http.Response, error) {
+			return &http.Response{StatusCode: st, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
 		}
-		return 200, ""
+		switch {
+		case strings.HasPrefix(r.URL.Host, "sts."):
+			return resp(200, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`)
+		case r.Method == http.MethodHead:
+			heads++
+			if heads == 1 {
+				return resp(200, "")
+			}
+			return resp(404, "") // deleted
+		case r.Method == http.MethodPut && r.URL.RawQuery == "lifecycle":
+			rules++
+			switch rules {
+			case 1:
+				return resp(500, "") // not set: the bucket is remembered without it
+			case 2:
+				return resp(404, `<Error><Code>NoSuchBucket</Code></Error>`)
+			}
+			return resp(200, "")
+		case r.Method == http.MethodPut:
+			creates++
+			return resp(200, "")
+		}
+		t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		return resp(500, "")
 	})
-	for range 3 {
-		if _, _, err := a.ensureBucket(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+	a := &AWSSpot{
+		r: &config.Runner{Name: "aws", Region: "us-east-2", Profile: "p"},
+		api: &awsClient{region: "us-east-2", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "s"}},
+			http: &http.Client{Transport: rt}},
+		dir: t.TempDir(),
 	}
-	if puts() != 3 || heads() != 2 {
-		t.Fatalf("PUTs %d, HEADs %d; want 3, 2 (checked again after the 404)", puts(), heads())
+	// After each lookup: bucket checks, creations, rule attempts.
+	for i, want := range [][3]int{{1, 0, 1}, {1, 0, 2}, {2, 1, 3}, {2, 1, 3}} {
+		if _, _, err := a.ensureBucket(context.Background()); err != nil {
+			t.Fatalf("lookup %d: %v", i+1, err)
+		}
+		if got := [3]int{heads, creates, rules}; got != want {
+			t.Fatalf("after lookup %d: checks, creations, rules = %v, want %v", i+1, got, want)
+		}
 	}
 }

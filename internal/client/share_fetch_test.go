@@ -138,7 +138,8 @@ func TestFetchDepsResignsStaleURLs(t *testing.T) {
 		sendDeps(c, protocol.DepsResult{Built: true})
 	})
 	fresh := "https://b.s3.eu-north-1.amazonaws.com/r/k1.tar?sig=fresh"
-	_, _, _, err := depsFetchSigned(ctx, t, c, &recRep{}, sharedDeps(), func(context.Context) (string, string, error) {
+	rep := &recRep{}
+	_, _, _, err := depsFetchSigned(ctx, t, c, rep, sharedDeps(), func(context.Context) (string, string, error) {
 		return fresh, fresh + "-put", nil
 	})
 	if err != nil {
@@ -146,6 +147,9 @@ func TestFetchDepsResignsStaleURLs(t *testing.T) {
 	}
 	if len(gets) != 2 || gets[0] != sharedDeps().CacheGet || gets[1] != fresh {
 		t.Fatalf("cache_get sent %q", gets)
+	}
+	if len(rep.warns) != 0 {
+		t.Fatalf("warnings %q", rep.warns)
 	}
 }
 
@@ -156,11 +160,11 @@ func TestFetchDepsWarnsWhenResigningFails(t *testing.T) {
 	old := resignAfter
 	resignAfter = 0
 	t.Cleanup(func() { resignAfter = old })
-	var gets []string
+	var gets, puts []string
 	c := newScript(t, func(c *protocol.Conn, typ string, msg json.RawMessage) {
 		var d protocol.Deps
 		_ = json.Unmarshal(msg, &d)
-		gets = append(gets, d.CacheGet)
+		gets, puts = append(gets, d.CacheGet), append(puts, d.CachePut)
 		if d.Probe {
 			sendDeps(c, protocol.DepsResult{Missing: true})
 			return
@@ -168,14 +172,16 @@ func TestFetchDepsWarnsWhenResigningFails(t *testing.T) {
 		sendDeps(c, protocol.DepsResult{Built: true})
 	})
 	rep := &recRep{}
+	signs := 0
 	_, _, _, err := depsFetchSigned(ctx, t, c, rep, sharedDeps(), func(context.Context) (string, string, error) {
+		signs++
 		return "", "", errors.New("finding the AWS account: timeout")
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(gets) != 2 || gets[1] != sharedDeps().CacheGet {
-		t.Fatalf("cache_get sent %q, want the old URL", gets)
+	if signs != 1 || len(gets) != 2 || gets[1] != sharedDeps().CacheGet || puts[1] != sharedDeps().CachePut {
+		t.Fatalf("signed %d times; cache_get sent %q, cache_put %q; want the old URLs", signs, gets, puts)
 	}
 	if len(rep.warns) != 1 || !strings.HasPrefix(rep.warns[0], "DEPS_CACHE: signing fresh shared dependency cache URLs failed") || !strings.Contains(rep.warns[0], "finding the AWS account: timeout") {
 		t.Fatalf("warnings %q", rep.warns)
