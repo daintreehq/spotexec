@@ -174,10 +174,7 @@ var (
 )
 
 // spotexecVM reports whether this is one of spotexec's own VMs.
-var spotexecVM = func() bool {
-	_, err := os.Stat(LifecycleDir)
-	return err == nil
-}
+var spotexecVM = onSpotexecVM
 
 // readMemHost gathers memHost from the probe's docker info.
 func readMemHost(info string) memHost {

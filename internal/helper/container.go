@@ -598,7 +598,7 @@ func ImagePush(root string) error {
 	d := dockerRunner{viaSG: lines[0] == "sg"}
 	local, remote, cfgDir, ready := lines[1], lines[2], lines[3], lines[4]
 	defer os.RemoveAll(cfgDir)
-	if _, err := os.Stat(LifecycleLock); err == nil {
+	if hasLifecycleLock() {
 		l, err := lockShared(LifecycleLock, 10*time.Second)
 		if err != nil {
 			return fmt.Errorf("image-push: VM is shutting down: %w", err)

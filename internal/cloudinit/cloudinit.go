@@ -50,7 +50,22 @@ var tmpl = template.Must(template.New("ud").Parse(`#!/bin/bash
 # user's bootstrap scripts.
 set -u
 D=/var/tmp/spotexec
-mkdir -p "$D"
+# /var/tmp is world-writable, so on a custom image another account may
+# already have put a directory, file or symlink at $D. The helper trusts
+# only a real directory root owns, and so does everything below: anything
+# else is removed (the link itself, never its target). Once root owns the
+# entry, /var/tmp's sticky bit keeps everyone else from replacing it.
+sx_rootdir() { [ ! -L "$D" ] && [ -d "$D" ] && [ "$(stat -c %u "$D")" = 0 ]; }
+for _ in 1 2 3; do
+  if [ -e "$D" ] || [ -L "$D" ]; then sx_rootdir || rm -rf "$D"; fi
+  mkdir -p "$D" 2>/dev/null
+  sx_rootdir && break
+done
+if ! sx_rootdir; then
+  logger -t spotexec "$D is not a directory root owns; shutting down" 2>/dev/null
+  {{.SelfDestruct}}
+  exit 1
+fi
 chmod 0755 "$D"   # opened to the runner user's group below
 # User-data runs once per instance, so this is the instance's own birth time
 # (an AMI baked from a runner must not inherit an old one).

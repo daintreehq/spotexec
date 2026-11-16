@@ -201,7 +201,7 @@ func CachePut(root, src, lockPath string) error {
 			time.Sleep(2 * time.Second)
 		}
 	}()
-	if _, err := os.Stat(LifecycleLock); err == nil {
+	if hasLifecycleLock() {
 		if l, err := lockShared(LifecycleLock, 10*time.Second); err == nil {
 			defer l.Unlock()
 		}

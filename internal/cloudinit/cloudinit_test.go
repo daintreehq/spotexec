@@ -4,6 +4,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -98,4 +100,93 @@ func TestRenderMapsLocalhostToIPv6Loopback(t *testing.T) {
 			}
 		})
 	}
+}
+
+// /var/tmp is world-writable: whatever another account left at the state
+// directory (a symlink, a file, a directory it owns) is removed before root
+// writes state there, and a directory root can't make its own stops the
+// boot. Run as an ordinary user, "root" is this test's uid.
+func TestRenderClaimsStateDirForRoot(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the guard uses GNU stat")
+	}
+	s, err := Render(Options{User: "ubuntu", PublicKey: "ssh-ed25519 AAAA test", SelfDestruct: "echo DESTROYED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(s, "D=/var/tmp/spotexec\n")
+	end := strings.Index(s, `chmod 0755 "$D"   # opened`)
+	if start < 0 || end < start {
+		t.Fatal("user-data has no state directory guard before its first chmod")
+	}
+	block := s[start:end]
+	uid := strconv.Itoa(os.Getuid())
+	run := func(t *testing.T, d, owner string) (string, error) {
+		script := strings.NewReplacer("/var/tmp/spotexec", d, `"$D")" = 0 ]`, `"$D")" = `+owner+` ]`).Replace(block)
+		out, err := exec.Command("bash", "-c", "set -u\n"+script).CombinedOutput()
+		return string(out), err
+	}
+	realDir := func(t *testing.T, d string) {
+		t.Helper()
+		if fi, err := os.Lstat(d); err != nil || !fi.IsDir() {
+			t.Fatalf("%s is not a real directory: %v %v", d, fi, err)
+		}
+	}
+	t.Run("missing", func(t *testing.T) {
+		d := filepath.Join(t.TempDir(), "spotexec")
+		if out, err := run(t, d, uid); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		realDir(t, d)
+	})
+	t.Run("symlink", func(t *testing.T) {
+		base := t.TempDir()
+		victim := filepath.Join(base, "victim")
+		os.Mkdir(victim, 0o755)
+		os.WriteFile(filepath.Join(victim, "keep"), []byte("x"), 0o644)
+		d := filepath.Join(base, "spotexec")
+		if err := os.Symlink(victim, d); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := run(t, d, uid); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		realDir(t, d)
+		if _, err := os.Stat(filepath.Join(victim, "keep")); err != nil {
+			t.Fatalf("the symlink's target was touched: %v", err)
+		}
+	})
+	t.Run("file", func(t *testing.T) {
+		d := filepath.Join(t.TempDir(), "spotexec")
+		os.WriteFile(d, nil, 0o644)
+		if out, err := run(t, d, uid); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		realDir(t, d)
+	})
+	t.Run("root's directory is kept", func(t *testing.T) {
+		d := filepath.Join(t.TempDir(), "spotexec")
+		os.Mkdir(d, 0o755)
+		os.WriteFile(filepath.Join(d, "keep"), nil, 0o644)
+		if out, err := run(t, d, uid); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		if _, err := os.Stat(filepath.Join(d, "keep")); err != nil {
+			t.Fatalf("root's own directory was emptied: %v", err)
+		}
+	})
+	t.Run("someone else's directory", func(t *testing.T) {
+		// "root" is a uid this test isn't: every directory it makes is
+		// someone else's, so the planted one goes and the boot stops.
+		d := filepath.Join(t.TempDir(), "spotexec")
+		os.Mkdir(d, 0o755)
+		os.WriteFile(filepath.Join(d, "draining"), nil, 0o644)
+		out, err := run(t, d, strconv.Itoa(os.Getuid()+1))
+		if err == nil || !strings.Contains(out, "DESTROYED") {
+			t.Fatalf("boot went on with a directory root doesn't own: %v: %s", err, out)
+		}
+		if _, err := os.Stat(filepath.Join(d, "draining")); err == nil {
+			t.Fatal("the planted state survived")
+		}
+	})
 }

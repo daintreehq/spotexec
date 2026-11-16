@@ -208,10 +208,8 @@ func readHolders(l Layout) []protocol.Holder {
 func touchActivity(root string) {
 	now := time.Now()
 	for _, p := range []string{filepath.Join(root, "activity"), ActivityFile} {
-		if p == ActivityFile {
-			if _, err := os.Stat(LifecycleDir); err != nil {
-				continue
-			}
+		if p == ActivityFile && !onSpotexecVM() {
+			continue
 		}
 		// Rewriting the content (rather than utimes with explicit times) only
 		// needs write permission, so it works on the root-owned 0666 file that
@@ -223,6 +221,9 @@ func touchActivity(root string) {
 // draining reports whether the runner refuses new work.
 func draining(root string) bool {
 	for _, p := range []string{DrainingFile, filepath.Join(root, "draining")} {
+		if p == DrainingFile && !onSpotexecVM() {
+			continue
+		}
 		if _, err := os.Stat(p); err == nil {
 			return true
 		}
