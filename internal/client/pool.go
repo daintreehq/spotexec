@@ -447,7 +447,7 @@ func (p *Pool) Candidates(ctx context.Context, exclude map[string]bool) (out []p
 		now := time.Now()
 		for _, in := range st.Instances {
 			n := st.Notes[in.ID]
-			if in.State != provider.StateRunning || in.Target.Host == "" || exclude[in.ID] {
+			if in.State != provider.StateRunning || in.Target.Host == "" || excluded(exclude, in) {
 				continue
 			}
 			if !n.closed() {

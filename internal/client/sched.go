@@ -915,7 +915,7 @@ func (p *Pool) retainedRoom(st *poolState, now time.Time, c claim) bool {
 	s := st.sched()
 	owner := processOwner()
 	for _, w := range p.views(st, now) {
-		if !w.eligible || w.v.Role != roleRetained || c.Exclude[w.in.ID] {
+		if !w.eligible || w.v.Role != roleRetained || excluded(c.Exclude, w.in) {
 			continue
 		}
 		if f := s.Fences[w.in.ID]; f != nil && f.Owner != owner {

@@ -319,7 +319,7 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 		var standby []vmView
 		for _, w := range p.views(st, now) {
 			n := st.Notes[w.in.ID]
-			if exclude[w.in.ID] {
+			if excluded(exclude, w.in) {
 				continue
 			}
 			if !n.closed() && (w.v.Role == roleRetained || w.v.Role == roleStandby) {
@@ -486,7 +486,7 @@ func (p *Pool) Fence(ctx context.Context, exclude map[string]bool) string {
 		vs := p.views(st, now)
 		usable := map[string]bool{}
 		for _, w := range vs {
-			usable[w.in.ID] = w.eligible && w.v.Role == roleRetained && !exclude[w.in.ID]
+			usable[w.in.ID] = w.eligible && w.v.Role == roleRetained && !excluded(exclude, w.in)
 		}
 		for vm, f := range s.Fences {
 			if f.Owner != owner {
