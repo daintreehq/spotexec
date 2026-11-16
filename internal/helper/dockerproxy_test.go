@@ -515,7 +515,8 @@ func TestStartDockerProxyNoDaemon(t *testing.T) {
 // statefulDocker is a docker that works and holds the containers, networks
 // and volumes named in its state files (ps, network, volume): listing one
 // by label prints its file, removing it (rm -fv, network rm, volume rm)
-// empties the file, unless stuck. Every call is logged, one per line.
+// empties the file, unless stuck. docker info prints the info file, if
+// any. Every call is logged, one per line.
 func statefulDocker(t *testing.T, stuck bool, ps, network, volume string) (bin, log string) {
 	t.Helper()
 	bin = t.TempDir()
@@ -537,6 +538,7 @@ case "$1 $2" in
 "ps "*) case "$*" in *label=*) cat "$d/ps" ;; esac ;;
 "rm -fv") k=ps; shift 2; ` + rm + ` ;;
 "network ls"|"volume ls") cat "$d/$1" ;;
+"info "*) cat "$d/info" 2>/dev/null ;;
 "network rm") k=network; shift 2; ` + rm + ` ;;
 "volume rm") k=volume; shift 3; ` + rm + ` ;;
 esac

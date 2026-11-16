@@ -102,13 +102,19 @@ func TestContainerScriptChecksOptions(t *testing.T) {
 	}
 }
 
-// A project container's docker run sizes /dev/shm once, before the user's
-// options and the image; a --shm-size or --ipc of the user's own replaces it.
+// A project container's docker run sizes /dev/shm once, from the memory
+// docker info reports, before the user's options and the image; a
+// --shm-size or --ipc of the user's own replaces it.
 func TestContainerScriptSizesShm(t *testing.T) {
 	bin, _ := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	t.Setenv("DOCKER_HOST", "")
+	if err := os.WriteFile(filepath.Join(bin, "info"), []byte(" Context:    default\n Total Memory: 16GiB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	slot := t.TempDir()
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	// One slot: no cpuset or memory pool, and half of all but the reserve.
+	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo", maxSlots: 1}
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -116,8 +122,8 @@ func TestContainerScriptSizesShm(t *testing.T) {
 		options []string
 		want    string
 	}{
-		{nil, "'--shm-size' '"},
-		{[]string{"--label", "x"}, "'--shm-size' '"},
+		{nil, "'--shm-size' '8053063680'"},
+		{[]string{"--label", "x"}, "'--shm-size' '8053063680'"},
 		{[]string{"--shm-size=2g"}, "'--shm-size=2g'"},
 		{[]string{"--ipc=host"}, ""},
 	} {
@@ -130,6 +136,9 @@ func TestContainerScriptSizesShm(t *testing.T) {
 		}
 		if c.want != "" && !(strings.Contains(host, c.want) && strings.Index(host, c.want) < strings.Index(host, "'node:22'")) {
 			t.Errorf("%v: no %s before the image in %s", c.options, c.want, host)
+		}
+		if len(c.options) > 0 && c.options[0] == "--label" && strings.Index(host, c.want) > strings.Index(host, "'--label'") {
+			t.Errorf("%v: %s after the user's options in %s", c.options, c.want, host)
 		}
 		if err := cleanup(); err != nil {
 			t.Fatal(err)

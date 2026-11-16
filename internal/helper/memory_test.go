@@ -396,10 +396,11 @@ func TestShmArgs(t *testing.T) {
 			t.Errorf("%v: %v, want none", o, got)
 		}
 	}
-	// A job alone on the machine gets half of all it can use.
+	// A job alone on the machine (--exclusive, or holding more than one
+	// slot's token) gets half of all it can use.
 	for name, s := range map[string]*Session{
-		"--exclusive": {acq: protocol.Acquire{Exclusive: true}, maxSlots: 4, tokens: []*flock{nil, nil, nil, nil}},
-		"all tokens":  {maxSlots: 4, tokens: []*flock{nil, nil, nil, nil}},
+		"--exclusive": {acq: protocol.Acquire{Exclusive: true}, maxSlots: 4, tokens: []*flock{nil}},
+		"two tokens":  {maxSlots: 4, tokens: []*flock{nil, nil}},
 		"one slot":    {maxSlots: 1, tokens: []*flock{nil}},
 	} {
 		if got := s.shmArgs(&protocol.ContainerRun{}, d); got[1] != strconv.FormatInt(shmSize(16*gb, 1, false), 10) {
@@ -414,6 +415,10 @@ func TestShmArgs(t *testing.T) {
 	}
 	if got := s.shmArgs(&protocol.ContainerRun{}, dockerRunner{info: " Context:    default\n"}); got[1] != strconv.FormatInt(wantLocal, 10) {
 		t.Errorf("local daemon, memory unknown: %v, want %d", got, wantLocal)
+	}
+	// A remote daemon: the runner's memory isn't Docker's.
+	if got := s.shmArgs(&protocol.ContainerRun{}, dockerRunner{info: " Context:    build-box\n"}); got[1] != strconv.FormatInt(shmFallback, 10) {
+		t.Errorf("remote context, memory unknown: %v", got)
 	}
 	t.Setenv("DOCKER_HOST", "tcp://10.0.0.1:2375")
 	if got := s.shmArgs(&protocol.ContainerRun{}, dockerRunner{}); got[1] != strconv.FormatInt(shmFallback, 10) {
