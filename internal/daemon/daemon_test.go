@@ -452,23 +452,33 @@ func TestReloadWaitsForSave(t *testing.T) {
 	d, _ := start(t)
 	ctx := context.Background()
 	d.pass(ctx)
-	reloadSettle = 300 * time.Millisecond
-	writeConfig(t, cfgPath, runnerConfig("b.large", 0))
-	done := make(chan error)
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		done <- os.WriteFile(cfgPath, []byte(runnerConfig("c.large", 0)), 0o600)
-	}()
-	d.pass(ctx)
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	// The save goes on between the reload's two reads.
+	reads := 0
+	readConfig = func(path string) ([]byte, error) {
+		b, err := os.ReadFile(path)
+		if reads++; reads == 1 {
+			writeConfig(t, cfgPath, runnerConfig("c.large", 0))
+		}
+		return b, err
 	}
+	t.Cleanup(func() { readConfig = os.ReadFile })
+	writeConfig(t, cfgPath, runnerConfig("b.large", 0))
+	d.pass(ctx)
 	if got := fleetNamed(d, "pool").r.InstanceTypes[0]; got != "a.large" {
 		t.Fatalf("applied %s while the file was still changing", got)
 	}
 	d.pass(ctx)
 	if got := fleetNamed(d, "pool").r.InstanceTypes[0]; got != "c.large" {
 		t.Fatalf("applied %s, want the settled c.large", got)
+	}
+	// A reload cut short by shutdown applies nothing.
+	writeConfig(t, cfgPath, runnerConfig("d.large", 0))
+	reloadSettle = time.Hour
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	d.reload(cctx)
+	if got := fleetNamed(d, "pool").r.InstanceTypes[0]; got != "c.large" {
+		t.Fatalf("applied %s after shutdown began", got)
 	}
 }
 

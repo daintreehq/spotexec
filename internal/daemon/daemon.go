@@ -75,6 +75,7 @@ var (
 	}
 	drainVM    = drainRemote
 	probeFleet = (*Daemon).probe
+	readConfig = os.ReadFile
 )
 
 // Dir holds the daemon's lock, status and log.
@@ -274,19 +275,23 @@ func New(cfg *config.Config, log func(string, ...any)) (*Daemon, error) {
 // rewriting pool.json's requirements for) the config it started with. A
 // config that doesn't load leaves everything as it was; the error is
 // reported once and the file read again next pass.
-func (d *Daemon) reload() {
+func (d *Daemon) reload(ctx context.Context) {
 	if d.cfgPath == "" {
 		return
 	}
-	raw, err := os.ReadFile(d.cfgPath)
+	raw, err := readConfig(d.cfgPath)
 	if err == nil && d.cfgRaw != nil && bytes.Equal(raw, d.cfgRaw) {
 		return
 	}
-	if err == nil && reloadSettle > 0 {
+	if err == nil {
 		// Maybe mid-save: a valid prefix of the new file (or an empty one)
 		// must not be applied. Changed meanwhile: try again next pass.
-		time.Sleep(reloadSettle)
-		again, err2 := os.ReadFile(d.cfgPath)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reloadSettle):
+		}
+		again, err2 := readConfig(d.cfgPath)
 		if err2 != nil || !bytes.Equal(raw, again) {
 			return
 		}
@@ -414,7 +419,7 @@ func healthSettings(r *config.Runner) config.Runner {
 
 // pass is one management round over every fleet.
 func (d *Daemon) pass(ctx context.Context) {
-	d.reload()
+	d.reload(ctx)
 	d.passes++
 	var statuses []FleetStatus
 	for _, fl := range d.fleets {
