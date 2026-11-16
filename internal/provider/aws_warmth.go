@@ -63,6 +63,14 @@ func projectOf(ctx context.Context) *Project {
 	return p
 }
 
+// repoOf is the repository ID of the project in ctx ("" without one).
+func repoOf(ctx context.Context) string {
+	if p := projectOf(ctx); p != nil {
+		return p.RepoID
+	}
+	return ""
+}
+
 type partState int
 
 const (

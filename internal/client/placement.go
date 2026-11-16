@@ -2,10 +2,12 @@ package client
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/depskey"
 	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 )
 
@@ -88,4 +90,30 @@ func ProjectKeys(p *config.Project, ws *Workspace, m *manifest.Manifest, noDeps 
 // project's manifest: for a dependency key or an image tag.
 func PlacementNeedsManifest(p *config.Project) bool {
 	return p.Deps.Install != "" || p.Container.Enabled() && p.Container.Image == ""
+}
+
+// recordImageBuild keeps how long the run's image build took on the leased
+// runner, for the runner's next launch to price a region without the image
+// by (#195). A pull or a reuse built nothing, and isn't kept.
+func recordImageBuild(lease *Lease, ws *Workspace, r protocol.ImageResult) {
+	if r.Built {
+		recordColdWork(lease, ws, provider.ColdImage, r.MS)
+	}
+}
+
+// recordDepsInstall is recordImageBuild for the dependency install: a
+// restore or a hydration from the runner's cache installed nothing.
+func recordDepsInstall(lease *Lease, ws *Workspace, dr protocol.DepsResult) {
+	if dr.Built {
+		recordColdWork(lease, ws, provider.ColdDeps, dr.MS)
+	}
+}
+
+// recordColdWork records one measurement. Best effort: a failure to save it
+// never fails the run.
+func recordColdWork(lease *Lease, ws *Workspace, part provider.ColdWorkPart, ms int64) {
+	if lease == nil || ws == nil || ms <= 0 {
+		return
+	}
+	_ = provider.RecordColdWork(lease.Runner, ws.RepoID, part, time.Duration(ms)*time.Millisecond)
 }

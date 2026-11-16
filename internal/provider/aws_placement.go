@@ -23,19 +23,21 @@ const (
 	// fastest option's work. A cold start is paid once per VM, so this is
 	// also how long a saving has to make up for one.
 	runHorizon = time.Hour
-	// coldStart is the time a region adds while it holds none of what a
-	// run reuses: Daintree's 17-part test run took 7.1 minutes the first
-	// time in a region and 3.5 the next. It is split by what saves each
-	// part (an estimate: the dependency install is the largest).
-	coldStart = coldBoot + coldDeps + coldImage
+	// The time a region adds while it holds none of what a run reuses:
+	// Daintree's 17-part test run took 7.1 minutes the first time in a
+	// region and 3.5 the next. It is split by what saves each part (an
+	// estimate: the dependency install is the largest). The deps and image
+	// parts are only the defaults before the project's own builds and
+	// installs have been measured (see RecordColdWork).
+	//
 	// coldBoot: booting without a bake of the runner there runs its
 	// bootstrap on the VM.
 	coldBoot = time.Minute
 	// coldDeps: without the project's archive in the region's dependency
-	// cache, the install runs.
+	// cache, the install runs (default).
 	coldDeps = 2 * time.Minute
 	// coldImage: without the project's image in the region's registry,
-	// it is built.
+	// it is built (default).
 	coldImage = time.Minute
 	// warmFor is how long a region counts as warm after a VM of this
 	// runner last ran there, where the project's caches can't be checked:
@@ -123,6 +125,10 @@ type RunCostModel struct {
 	RoundTrips     int     `json:"round_trips"`        // client round trips in that work
 	SpeedByGen     bool    `json:"speed_by_generation"`
 	Regions        bool    `json:"regions"` // warmth and distance weighed (several regions)
+	// DepsFrom and ImageFrom say where DepsMinutes and ImageMinutes came
+	// from: the project's measured installs and builds, or the defaults.
+	DepsFrom  ColdEstimate `json:"cold_deps_estimate"`
+	ImageFrom ColdEstimate `json:"cold_image_estimate"`
 }
 
 // Ranking is the order a launch tries a price table's options in.
@@ -181,7 +187,11 @@ type placementEvidence struct {
 func (g *AWSGlobal) Rank(t PriceTable) Ranking {
 	ev := placementEvidence{now: g.clock(), warm: map[string]time.Time{}, rtt: map[string]time.Duration{}, found: t.warmth}
 	held := map[string]cooldown{}
+	var work *coldWork
 	_ = g.withState(func(st *placementState) {
+		if t.repoID != "" {
+			work = st.ColdWork[t.repoID]
+		}
 		for _, p := range t.Prices {
 			if c, ok := st.Cooldown[reclaimKey(p)]; ok && ev.now.Before(c.Until) {
 				held[poolKey(p)] = c
@@ -201,7 +211,7 @@ func (g *AWSGlobal) Rank(t PriceTable) Ranking {
 	k := Ranking{Order: g.rankOrder(), held: held}
 	ps := append([]SpotPrice(nil), t.Prices...)
 	if k.Order == config.LaunchRunCost {
-		k.Model = g.costModel()
+		k.Model = g.costModel(work, ev.now)
 		k.Cost = runCosts(*k.Model, ps, ev)
 		idx := make([]int, len(ps))
 		for i := range idx {
@@ -225,14 +235,20 @@ func (g *AWSGlobal) Rank(t PriceTable) Ranking {
 	return k
 }
 
-func (g *AWSGlobal) costModel() *RunCostModel {
+// costModel is the model for a launch of the project whose builds and
+// installs work holds (nil: none measured, or outside a project).
+func (g *AWSGlobal) costModel(work *coldWork, now time.Time) *RunCostModel {
+	deps, depsFrom := work.estimate(ColdDeps, coldDeps, now)
+	image, imageFrom := work.estimate(ColdImage, coldImage, now)
 	return &RunCostModel{
 		WaitCost:       g.r.WaitCostPerHour(),
 		HorizonMinutes: runHorizon.Minutes(),
-		ColdMinutes:    coldStart.Minutes(),
+		ColdMinutes:    (coldBoot + deps + image).Minutes(),
 		BootMinutes:    coldBoot.Minutes(),
-		DepsMinutes:    coldDeps.Minutes(),
-		ImageMinutes:   coldImage.Minutes(),
+		DepsMinutes:    deps.Minutes(),
+		ImageMinutes:   image.Minutes(),
+		DepsFrom:       depsFrom,
+		ImageFrom:      imageFrom,
 		WarmDays:       warmFor.Hours() / 24,
 		WarmAfterMin:   warmAfter.Minutes(),
 		GenSpeedup:     genSpeedup,
@@ -584,4 +600,5 @@ func forgetOld(st *placementState, now time.Time) {
 			delete(st.Evidence, k)
 		}
 	}
+	forgetOldColdWork(st, now)
 }

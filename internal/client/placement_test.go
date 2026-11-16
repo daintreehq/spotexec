@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/depskey"
 	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 // What a launch looks for is what the run will use: the dependency key the
@@ -122,5 +125,40 @@ func TestProjectKeysOneRegion(t *testing.T) {
 	if pj, err := ProjectKeys(p, ws, m, false, r); err == nil || pj.ImageTag != "" || !pj.Image ||
 		!strings.Contains(err.Error(), "image tag") || !strings.Contains(err.Error(), "missing/Dockerfile") {
 		t.Fatalf("missing Dockerfile: %+v, %v", pj, err)
+	}
+}
+
+// A run's image build and dependency install are kept for the leased
+// runner's next launch, under the run's repository (#195).
+func TestRecordColdWorkKeepsBuildTimes(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	r := &config.Runner{Name: "aws", Type: config.TypeAWSSpot, Regions: []string{"all"}, Region: "us-east-1"}
+	lease, ws := &Lease{Runner: r}, &Workspace{RepoID: "repo1"}
+	// A pull, a restore or a hydration built nothing; a missing lease or a
+	// zero time measured nothing.
+	recordImageBuild(lease, ws, protocol.ImageResult{Pulled: true, MS: 30000})
+	recordDepsInstall(lease, ws, protocol.DepsResult{Restored: true, Hydrated: true, MS: 40000})
+	recordDepsInstall(nil, ws, protocol.DepsResult{Built: true, MS: 1000})
+	recordDepsInstall(lease, ws, protocol.DepsResult{Built: true})
+	path := filepath.Join(provider.RunnerStateDir("aws"), "placement.json")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("nothing measured, yet state: %v", err)
+	}
+	recordImageBuild(lease, ws, protocol.ImageResult{Built: true, Pushing: true, MS: 720000})
+	recordDepsInstall(lease, ws, protocol.DepsResult{Built: true, Uploaded: true, MS: 900000})
+	var st struct {
+		ColdWork map[string]struct {
+			Image, Deps []struct{ MS int64 }
+		} `json:"cold_work"`
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		t.Fatal(err)
+	}
+	if w := st.ColdWork["repo1"]; len(w.Image) != 1 || w.Image[0].MS != 720000 || len(w.Deps) != 1 || w.Deps[0].MS != 900000 {
+		t.Fatalf("state %s", b)
 	}
 }

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -249,8 +251,8 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 			if v.project != "" {
 				project = "deps and image checked for " + v.project
 			}
-			factors = append(factors, fmt.Sprintf("a cold region (COLD, in minutes: boot %g without a bake of %s there, deps %g without the project's archive in the region's cache, image %g without the project's image in its registry; %s)",
-				m.BootMinutes, r.Name, m.DepsMinutes, m.ImageMinutes, project),
+			factors = append(factors, fmt.Sprintf("a cold region (COLD, in minutes: boot %g without a bake of %s there, deps %s without the project's archive in the region's cache, image %s without the project's image in its registry; %s)",
+				m.BootMinutes, r.Name, coldMinutes(m.DepsMinutes, m.DepsFrom, "install", r.Name, v.project != ""), coldMinutes(m.ImageMinutes, m.ImageFrom, "image build", r.Name, v.project != ""), project),
 				fmt.Sprintf("a farther region (%d round trips at the measured TCP connect time)", m.RoundTrips))
 		}
 		added := "nothing else differs between these options"
@@ -269,4 +271,25 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 		fmt.Fprintf(w, "\n%s uses only %s. To launch in whichever region costs least, set regions = [\"all\"] (or a list) instead of region.\n", r.Name, r.Region)
 	}
 	fmt.Fprintln(w, "\nPrices are Spot compute only; the disk and public IPv4 address add a little per hour, about the same everywhere.")
+}
+
+// coldMinutes is one part of a cold start as the run-cost note shows it:
+// its minutes, and whether they come from the project's measured builds or
+// installs (what, singular) on runner, or are the default.
+func coldMinutes(minutes float64, e provider.ColdEstimate, what, runner string, inProject bool) string {
+	m := strconv.FormatFloat(math.Round(minutes*10)/10, 'f', -1, 64)
+	if e.Source != "measured" {
+		if inProject {
+			return fmt.Sprintf("%s (a default: no %s of the project on %s measured lately)", m, what, runner)
+		}
+		return m + " (a default)"
+	}
+	from := fmt.Sprintf("the project's longest %s on %s lately", what, runner)
+	if !e.At.IsZero() {
+		from += ", " + e.At.Local().Format("Jan 2")
+	}
+	if e.Capped {
+		return fmt.Sprintf("%s (capped: %s, took longer)", m, from)
+	}
+	return fmt.Sprintf("%s (%s)", m, from)
 }
