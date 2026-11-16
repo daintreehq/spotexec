@@ -19,7 +19,7 @@ import (
 
 func TestReplayable(t *testing.T) {
 	retry := Options{RetryPreempt: true, Sync: "auto"}
-	oom := Result{noReplay: noReplay{"MEMORY_PRESSURE", "while it was out of memory (120 MiB of 16000 MiB memory available)"}}
+	oom := Result{noReplay: noReplay{code: "MEMORY_PRESSURE", why: "while it was out of memory (120 MiB of 16000 MiB memory available)"}}
 	for _, c := range []struct {
 		name     string
 		lost     string

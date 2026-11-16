@@ -153,7 +153,8 @@ type Result struct {
 	Zone         string `json:"-"`
 	InstanceType string `json:"-"`
 	// LostCode, when the run lost its runner and wasn't replayed, is why
-	// (RUNNER_UNRESPONSIVE, MEMORY_PRESSURE, CLIENT_SUSPENDED): the code of
+	// (RUNNER_UNRESPONSIVE, MEMORY_PRESSURE, CLIENT_SUSPENDED,
+	// REGION_UNREACHABLE): the code of
 	// the warning that explained it.
 	LostCode string `json:"-"`
 	// noReplay, when the runner was lost, is why the run must not be
@@ -161,6 +162,9 @@ type Result struct {
 	noReplay noReplay
 	// lostAt, when the runner was lost, is how far the attempt had got.
 	lostAt stage
+	// lostWhen is when the attempt gave up on its runner (no earlier than
+	// the last word it sent the helper).
+	lostWhen time.Time
 }
 
 // stage is how far an attempt had got: the phase it was in, whether the
@@ -280,8 +284,14 @@ func (p *progress) get() stage {
 	return p.at
 }
 
-// noReplay is a warning code and the reason behind it.
-type noReplay struct{ code, why string }
+// noReplay is a warning code and the reason behind it. region is set when
+// the VM's whole region went silent (regionSilent): with no code, the run
+// is replayed, outside that region and only once the lost attempt has
+// certainly stopped (regionReplayAfter).
+type noReplay struct {
+	code, why string
+	region    *regionLoss
+}
 
 // InfraError marks failures of spotexec itself (exit 125).
 type InfraError struct{ Err error }
@@ -305,7 +315,8 @@ func infra(err error) error {
 type attempt struct {
 	runID   string
 	n       int
-	exclude map[string]bool // fleet instances lost in earlier attempts
+	exclude map[string]bool // fleet instances lost in earlier attempts (and regions: regionKey)
+	noBoot  bool            // replaying after a regional loss: only on VMs there are
 	fresh   *bool           // an earlier attempt already showed CONTAINER_FRESH
 }
 
@@ -344,8 +355,14 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		if !retry {
 			return res, err
 		}
-		o.Rep.Warn("RUNNER_LOST", "lost %s %s (%v); replaying the run on another slot", lost, res.lostAt.where(), err)
-		o.Rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "lost": lost})
+		if res.noReplay.region != nil {
+			if !replayAfterRegion(ctx, o.Rep, &att, res, lost) {
+				return res, err
+			}
+		} else {
+			o.Rep.Warn("RUNNER_LOST", "lost %s %s (%v); replaying the run on another slot", lost, res.lostAt.where(), err)
+			o.Rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "lost": lost})
+		}
 		if lost != "static" {
 			att.exclude[lost] = true
 			markLost(cfg, res.Runner, lost)
@@ -360,13 +377,19 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 // no notice it was going away after the command was dispatched): that run
 // is never replayed, since a run that used up its VM's memory would most
 // likely do the same on the next one, and take that VM's other jobs with
-// it.
+// it. A run lost to its whole region going silent (noReplay.region, with
+// no code) is replayed like a reclaimed one; when the options rule the
+// replay out, the warning still says the region went silent.
 func replayable(lost string, res Result, o Options, canceled bool, n int) (retry bool, code, why string) {
 	if lost == "" {
 		return false, "", ""
 	}
 	eligible := o.RetryPreempt && !canceled && o.Sync != "none" && !o.PreferLast && !o.SameSlot && n < 2
 	if res.noReplay.why == "" {
+		if rl := res.noReplay.region; rl != nil && !eligible && !canceled {
+			// Safe to replay, but this run isn't: still say why it was lost.
+			return false, "REGION_UNREACHABLE", "lost " + lost + " " + res.lostAt.where() + ": " + rl.String() + ". The attempt's outcome is unknown"
+		}
 		return eligible, "", ""
 	}
 	why = "lost " + lost + " " + res.noReplay.why
@@ -395,6 +418,14 @@ func replayable(lost string, res Result, o Options, canceled bool, n int) (retry
 // likely lost to that, not to the VM or the run: replayed if the command
 // hadn't been dispatched, and otherwise not (its outcome is unknown), with
 // a warning that says so instead of blaming the run or the VM.
+//
+// A VM the cloud still runs that was lost after the command was dispatched,
+// with no memory pressure, may instead have gone silent with its whole
+// region, as this client sees it (regionSilent: a network partition, #229).
+// Then nothing points at the run, and it is replayed outside that region,
+// once the helper there has certainly stopped the lost attempt; unless its
+// heartbeats never showed the VM's memory, so nothing shows the run didn't
+// use it up: REGION_UNREACHABLE, not replayed, and without blaming the run.
 func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay {
 	if noticed {
 		return noReplay{}
@@ -403,13 +434,22 @@ func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay 
 		if !at.dispatched {
 			return noReplay{}
 		}
-		return noReplay{"CLIENT_SUSPENDED", fmt.Sprintf("%s, after this machine was asleep or sx was stopped for %s: a runner may end a run after %s without word from sx, and the attempt's outcome is unknown. Rerun it, and keep this machine awake while it runs", at.where(), ui.Dur(d), transport.HelperPatience.Round(time.Second))}
+		return noReplay{code: "CLIENT_SUSPENDED", why: fmt.Sprintf("%s, after this machine was asleep or sx was stopped for %s: a runner may end a run after %s without word from sx, and the attempt's outcome is unknown. Rerun it, and keep this machine awake while it runs", at.where(), ui.Dur(d), transport.HelperPatience.Round(time.Second))}
 	}
 	if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
-		return noReplay{"MEMORY_PRESSURE", at.where() + ": it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
+		return noReplay{code: "MEMORY_PRESSURE", why: at.where() + ": it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
 	}
 	if !at.dispatched || !instanceRunning(lease) {
 		return noReplay{}
+	}
+	if rl := regionSilentFn(lease); rl != nil {
+		// Not the VM stalling: its whole region went silent. Replayed
+		// (once the lost attempt has certainly stopped), unless nothing
+		// showed the VM's memory: an older helper's heartbeats, or none.
+		if _, ok := lease.Sess.LastMemory(); !ok {
+			return noReplay{code: "REGION_UNREACHABLE", why: at.where() + ", although EC2 still reports it running: " + rl.String() + ". Its heartbeats never reported the VM's memory, so the run isn't replayed, and the attempt's outcome is unknown. Rerun it", region: rl}
+		}
+		return noReplay{region: rl}
 	}
 	what := "the command"
 	if at.phase == phaseSetup || at.phase == phaseStartSetup {
@@ -423,7 +463,7 @@ func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay 
 		if m := lastMemory(lease.Sess); m != "" {
 			why += " (" + m + ")"
 		}
-		return noReplay{"RUNNER_UNRESPONSIVE", why + ". Rerun it"}
+		return noReplay{code: "RUNNER_UNRESPONSIVE", why: why + ". Rerun it"}
 	}
 	why += what + " may be what overloaded it (memory, most often)"
 	if m := lastMemory(lease.Sess); m != "" {
@@ -433,7 +473,7 @@ func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay 
 	if !exclusive {
 		why += ", with --exclusive if it may need the whole VM"
 	}
-	return noReplay{"RUNNER_UNRESPONSIVE", why}
+	return noReplay{code: "RUNNER_UNRESPONSIVE", why: why}
 }
 
 // Phases of an attempt (stage.phase), as warnings name them.
@@ -615,7 +655,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	// Without a sync the slot's files are not ours: don't claim ownership.
 	base.KeepOwner = o.Sync == "none"
-	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority,
+	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot || att.noBoot, Exclude: att.exclude, Priority: o.Priority,
 		Task: TaskKey(ws.RepoID, o.Display)}
 	if o.Sync != "none" {
 		// A launch for this run prefers regions that hold its caches.
@@ -680,7 +720,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			res.spend(k, d)
 		}
 		if lost != "" {
-			res.lostAt = prog.get()
+			res.lostAt, res.lostWhen = prog.get(), time.Now()
 			if lease.InstanceID != "" {
 				res.noReplay = replayVerdict(lease, noticed.Load(), err, res.lostAt, o.Exclusive)
 			}

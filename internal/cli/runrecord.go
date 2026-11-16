@@ -116,7 +116,8 @@ type recordPart struct {
 type recordError struct {
 	Code string `json:"code"` // QUEUE_TIMEOUT, DEPS_FAILED, … or SPOTEXEC_ERROR
 	// Reason, when the run lost its runner and wasn't replayed:
-	// RUNNER_UNRESPONSIVE, MEMORY_PRESSURE or CLIENT_SUSPENDED.
+	// RUNNER_UNRESPONSIVE, MEMORY_PRESSURE, CLIENT_SUSPENDED or
+	// REGION_UNREACHABLE.
 	Reason  string `json:"reason,omitempty"`
 	Message string `json:"message"`
 }

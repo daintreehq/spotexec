@@ -59,9 +59,11 @@ type AcquireRequest struct {
 	// build caches.
 	PreferInstance string
 	Rep            ui.Reporter
-	NoBoot         bool            // never launch fleet instances
-	Priority       int             // queue priority (higher first)
-	Exclude        map[string]bool // fleet instance IDs to avoid (e.g. one being reclaimed)
+	NoBoot         bool // never launch fleet instances
+	Priority       int  // queue priority (higher first)
+	// Exclude: fleet instance IDs to avoid (e.g. one being reclaimed), and
+	// whole regions to avoid as regionKey(region).
+	Exclude map[string]bool
 	// Project: what a launch of a runner for this request looks for in
 	// each region (nil, or a nil result: nothing in particular).
 	Project func(r *config.Runner) *provider.Project

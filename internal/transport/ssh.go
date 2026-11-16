@@ -420,6 +420,15 @@ func (c *Client) runWithin(ctx context.Context, d time.Duration, remoteCmd strin
 	return out, err
 }
 
+// Reachable reports whether the target answers a trivial command within
+// d: an SSH channel opened and closed, a full round trip to the VM (over
+// the runner's ControlMaster when one is up, which itself holds only while
+// the VM answers its keepalives).
+func (c *Client) Reachable(ctx context.Context, d time.Duration) bool {
+	_, err := c.runWithin(ctx, d, "true", nil)
+	return err == nil
+}
+
 // EnsureHelper makes sure the right helper is installed and returns the
 // remote command prefix that invokes it.
 // HelperUploadBudget is the extra time a first contact gets to upload the
