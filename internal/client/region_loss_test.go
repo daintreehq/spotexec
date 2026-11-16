@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -179,6 +181,22 @@ func TestKnownGood(t *testing.T) {
 	got := knownGood(context.Background(), p.R, f)
 	if len(got) != 2 || !got["i-ready"] || !got["i-busy"] {
 		t.Fatalf("known good: %v", got)
+	}
+	// Another process holding the pool lock can't hold the check past its
+	// deadline.
+	fh, err := os.OpenFile(filepath.Join(p.dir, "pool.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fh.Close()
+	if err := syscall.Flock(int(fh.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if got := knownGood(ctx, p.R, f); len(got) != 0 || time.Since(start) > 2*time.Second {
+		t.Fatalf("under a held lock: %v after %s", got, time.Since(start))
 	}
 }
 
