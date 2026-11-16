@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -103,6 +104,10 @@ func dockerProxyHandler(upstream, sock string, labels map[string]string) http.Ha
 			q, err := url.ParseQuery(r.URL.RawQuery)
 			if err == nil {
 				err = scopePrune(q, labels)
+			}
+			// The daemon reads a form body's filters ahead of the query's.
+			if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); err == nil && mt == "application/x-www-form-urlencoded" {
+				err = errors.New("prune: filters go in the query, not a form body")
 			}
 			if err != nil {
 				dockerError(w, http.StatusBadRequest, err.Error())

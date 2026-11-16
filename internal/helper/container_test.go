@@ -1,7 +1,11 @@
 package helper
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -68,5 +72,32 @@ func TestForbiddenOption(t *testing.T) {
 		if got := forbiddenOption(c.options); got != c.want {
 			t.Errorf("forbiddenOption(%q) = %q, want %q", c.options, got, c.want)
 		}
+	}
+}
+
+// containerScript refuses a forbidden option before writing anything, and
+// takes a value that only looks like one.
+func TestContainerScriptChecksOptions(t *testing.T) {
+	bin, _ := statefulDocker(t, false, "", "", "")
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	slot := t.TempDir()
+	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Options: []string{"-e", "A=1", "-iu", "0"}}, "true", s.workspace, map[string]string{})
+	var pe *protoError
+	if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed || !strings.Contains(err.Error(), "container.options may not set -u") {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(slot, "run")); !os.IsNotExist(err) {
+		t.Fatal("files written for a refused run")
+	}
+	_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Options: []string{"--label", "--name", "-e", "NODE_OPTIONS=-d"}}, "true", s.workspace, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
 	}
 }

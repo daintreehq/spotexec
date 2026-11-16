@@ -285,7 +285,7 @@ func TestDockerProxyCanonicalPaths(t *testing.T) {
 		if code := rawRequest(t, sock, "POST", p+"?name=pg", `{"Image":"postgres","HostConfig":{"Binds":["/var/run/docker.sock:/var/run/docker.sock"]}}`); code != 201 {
 			t.Fatalf("%s: status %d", p, code)
 		}
-		got := <-f.created
+		got := f.next(t)
 		if !strings.HasPrefix(got, "/v1.45/containers/create?name=pg ") || !strings.Contains(got, `"io.spotexec.run":"sx-repo-1-abc"`) || strings.Contains(got, `"/var/run/docker.sock:`) {
 			t.Fatalf("%s: daemon got %s", p, got)
 		}
@@ -293,8 +293,20 @@ func TestDockerProxyCanonicalPaths(t *testing.T) {
 	if code := rawRequest(t, sock, "DELETE", "//containers/pg?force=1", ""); code != 204 {
 		t.Fatalf("delete: status %d", code)
 	}
-	if got := <-f.created; got != "DELETE /containers/pg?force=1&v=1" {
+	if got := f.next(t); got != "DELETE /containers/pg?force=1&v=1" {
 		t.Fatalf("daemon got %s", got)
+	}
+}
+
+// next is what the daemon got next.
+func (f *fakeDaemon) next(t *testing.T) string {
+	t.Helper()
+	select {
+	case got := <-f.created:
+		return got
+	case <-time.After(10 * time.Second):
+		t.Fatal("the daemon got nothing")
+		return ""
 	}
 }
 
@@ -307,6 +319,7 @@ func rawRequest(t *testing.T, sock, method, target, body string) int {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: docker\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", method, target, len(body), body)
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
@@ -327,6 +340,8 @@ func TestDockerProxyScopesPrune(t *testing.T) {
 		// The legacy form, with a label of the caller's own.
 		{"/volumes/prune", `{"label":{"keep=no":true},"all":{"true":true}}`, `{"all":["true"],"label":["io.spotexec.run=sx-repo-1-abc","io.spotexec.slot=sx-repo-1-","keep=no"]}`},
 		{"//v1.45/volumes//prune", "", `{"label":["io.spotexec.run=sx-repo-1-abc","io.spotexec.slot=sx-repo-1-"]}`},
+		// Repeats, and a label the proxy adds anyway, count once.
+		{"/networks/prune", `{"label":["a=1","a=1","io.spotexec.run=sx-repo-1-abc"],"label!":["b"]}`, `{"label":["a=1","io.spotexec.run=sx-repo-1-abc","io.spotexec.slot=sx-repo-1-"],"label!":["b"]}`},
 	} {
 		u := q.path
 		if q.filters != "" {
@@ -335,15 +350,48 @@ func TestDockerProxyScopesPrune(t *testing.T) {
 		if code := rawRequest(t, sock, "POST", u, ""); code != 200 {
 			t.Fatalf("%s: status %d", q.path, code)
 		}
-		got := <-f.created
+		got := f.next(t)
 		_, filters, _ := strings.Cut(strings.TrimPrefix(got, "PRUNE "), " ")
 		if filters != q.want {
 			t.Fatalf("%s %s: daemon got %s", q.path, q.filters, got)
 		}
 	}
-	// Filters the proxy can't read can't be scoped: refused.
-	if code := rawRequest(t, sock, "POST", "/networks/prune?filters="+url.QueryEscape(`{"label":`), ""); code != 400 {
-		t.Fatalf("unreadable filters: status %d", code)
+	// Filters the proxy can't read, or can't be sure are the ones the
+	// daemon reads, can't be scoped: refused, and never forwarded.
+	for _, target := range []string{
+		"/networks/prune?filters=" + url.QueryEscape(`{"label":`),
+		"/networks/prune?filters=" + url.QueryEscape(`{"label":42}`),
+		"/networks/prune?filters=%7B%7D&filters=%7B%7D",
+		"/networks/prune?filters=%zz",
+	} {
+		if code := rawRequest(t, sock, "POST", target, ""); code != 400 {
+			t.Fatalf("%s: status %d", target, code)
+		}
+	}
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	form := "filters=%7B%7D"
+	fmt.Fprintf(conn, "POST /networks/prune HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(form), form)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("form body: status %d", resp.StatusCode)
+	}
+	select {
+	case got := <-f.created:
+		t.Fatalf("a refused prune reached the daemon: %s", got)
+	default:
+	}
+	// Without labels to scope it to, nothing is pruned.
+	if err := scopePrune(url.Values{}, nil); err == nil {
+		t.Fatal("prune scoped to no labels")
 	}
 }
 
@@ -464,7 +512,8 @@ func statefulDocker(t *testing.T, stuck bool, ps, network, volume string) (bin, 
 			t.Fatal(err)
 		}
 	}
-	rm := `: > "$d/$1"`
+	// Removal takes exactly the IDs the listing printed.
+	rm := `[ "$*" = "$(cat "$d/$k")" ] && : > "$d/$k"`
 	if stuck {
 		rm = "true"
 	}
@@ -473,9 +522,10 @@ d=` + shq(bin) + `
 echo "$*" >> "$d/calls"
 case "$1 $2" in
 "ps "*) case "$*" in *label=*) cat "$d/ps" ;; esac ;;
-"rm -fv") set -- ps; ` + rm + ` ;;
+"rm -fv") k=ps; shift 2; ` + rm + ` ;;
 "network ls"|"volume ls") cat "$d/$1" ;;
-"network rm"|"volume rm") ` + rm + ` ;;
+"network rm") k=network; shift 2; ` + rm + ` ;;
+"volume rm") k=volume; shift 3; ` + rm + ` ;;
 esac
 exit 0
 `
