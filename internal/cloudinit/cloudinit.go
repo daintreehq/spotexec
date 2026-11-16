@@ -51,19 +51,23 @@ var tmpl = template.Must(template.New("ud").Parse(`#!/bin/bash
 set -u
 D=/var/tmp/spotexec
 # /var/tmp is world-writable, so on a custom image another account may
-# already have put a directory, file or symlink at $D. The helper trusts
-# only a real directory root owns, and so does everything below: anything
-# else is removed (the link itself, never its target). Once root owns the
-# entry, /var/tmp's sticky bit keeps everyone else from replacing it.
-sx_rootdir() { [ ! -L "$D" ] && [ -d "$D" ] && [ "$(stat -c %u "$D")" = 0 ]; }
+# already have put a directory, file or symlink at $D, or files in a
+# world-writable one (a planted created_at -> /etc/passwd, written below as
+# root). The helper trusts only a real directory root owns that others
+# can't write to, and so does everything below: anything else is removed
+# (a link itself, never its target). Once root owns the entry, /var/tmp's
+# sticky bit keeps everyone else from replacing it.
+sx_rootdir() { [ ! -L "$D" ] && [ -d "$D" ] && [ "$(stat -c %u "$D")" = 0 ] && [ -z "$(find "$D" -maxdepth 0 -perm -0002)" ]; }
 for _ in 1 2 3; do
-  if [ -e "$D" ] || [ -L "$D" ]; then sx_rootdir || rm -rf "$D"; fi
+  if [ -e "$D" ] || [ -L "$D" ]; then sx_rootdir || timeout 60 rm -rf "$D"; fi
   mkdir -p "$D" 2>/dev/null
   sx_rootdir && break
 done
 if ! sx_rootdir; then
+  # The watchdog isn't armed yet: nothing else would ever stop this VM.
   logger -t spotexec "$D is not a directory root owns; shutting down" 2>/dev/null
   {{.SelfDestruct}}
+  sleep 120; poweroff -f
   exit 1
 fi
 chmod 0755 "$D"   # opened to the runner user's group below

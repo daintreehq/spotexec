@@ -122,7 +122,7 @@ func TestRenderClaimsStateDirForRoot(t *testing.T) {
 	block := s[start:end]
 	uid := strconv.Itoa(os.Getuid())
 	run := func(t *testing.T, d, owner string) (string, error) {
-		script := strings.NewReplacer("/var/tmp/spotexec", d, `"$D")" = 0 ]`, `"$D")" = `+owner+` ]`).Replace(block)
+		script := strings.NewReplacer("/var/tmp/spotexec", d, `"$D")" = 0 ]`, `"$D")" = `+owner+` ]`, "sleep 120; poweroff -f", ":").Replace(block)
 		out, err := exec.Command("bash", "-c", "set -u\n"+script).CombinedOutput()
 		return string(out), err
 	}
@@ -163,6 +163,30 @@ func TestRenderClaimsStateDirForRoot(t *testing.T) {
 			t.Fatalf("%v: %s", err, out)
 		}
 		realDir(t, d)
+	})
+	t.Run("world-writable directory", func(t *testing.T) {
+		// Root's, but anyone could have planted links in it for root to
+		// write through.
+		base := t.TempDir()
+		target := filepath.Join(base, "passwd")
+		os.WriteFile(target, []byte("keep"), 0o644)
+		d := filepath.Join(base, "spotexec")
+		os.Mkdir(d, 0o700)
+		os.Chmod(d, 0o1777)
+		os.Symlink(target, filepath.Join(d, "created_at"))
+		if out, err := run(t, d, uid); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		realDir(t, d)
+		if _, err := os.Lstat(filepath.Join(d, "created_at")); err == nil {
+			t.Fatal("the planted link survived")
+		}
+		if fi, _ := os.Stat(d); fi.Mode().Perm()&0o002 != 0 {
+			t.Fatalf("still world-writable: %s", fi.Mode())
+		}
+		if b, _ := os.ReadFile(target); string(b) != "keep" {
+			t.Fatalf("the link's target changed: %q", b)
+		}
 	})
 	t.Run("root's directory is kept", func(t *testing.T) {
 		d := filepath.Join(t.TempDir(), "spotexec")
