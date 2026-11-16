@@ -83,6 +83,12 @@ type Conflict struct {
 // ReasonSymlinkParent marks a conflict caused by a symlinked local parent.
 const ReasonSymlinkParent = "symlink_parent"
 
+// ReasonSpotexecConfig marks a runner's change to spotexec's own config (a
+// .spotexec.toml, .spotexecignore, or a file under .spotexec/): never
+// applied, only stashed for review (a deletion is a marker, as for any
+// conflict).
+const ReasonSpotexecConfig = "spotexec_config"
+
 // conflict stashes the remote version of p and records the conflict; with
 // names the path p collides with, if that is why ("" for a local edit).
 func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile, with string) error {
@@ -237,14 +243,16 @@ func writeback(ctx context.Context, fetchFiles fetchFunc, ws *Workspace, m *mani
 	}
 	// The new side of a case-only rename (foo -> Foo) is never held: on a
 	// case-insensitive filesystem it is the same file as the deleted one,
-	// renamed in place below.
+	// renamed in place below. Nor is spotexec's own config: it is stashed
+	// for review below, never pulled into place.
 	gone := map[string]bool{}
 	for _, d := range deleted {
 		gone[strings.ToLower(d)] = true
 	}
+	isConfig := configGuard(ws.Root, configLinks(ctx, ws, m, false))
 	var renamed, holdable []protocol.Entry
 	for _, c := range fresh {
-		if gone[strings.ToLower(c.Path)] {
+		if gone[strings.ToLower(c.Path)] || isConfig(c.Path) {
 			renamed = append(renamed, c)
 		} else {
 			holdable = append(holdable, c)
@@ -382,15 +390,49 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 	}
 	defer func() { wb.OutsideLinks = outsideLinks(ws.Root, links) }()
 
+	// spotexec's own config is never written, replaced or deleted by a run,
+	// nor is what it leads to through a symlink: the runner's version of
+	// each such path is stashed for review and the local one left as it is
+	// (see configGuard).
+	isConfig := configGuard(ws.Root, configLinks(ctx, ws, m, false))
+	config := map[string]bool{}
+	for _, p := range paths {
+		if !isConfig(p) {
+			continue
+		}
+		handled[p], config[p] = true, true
+		want := remote[p]
+		rf, fetched := files[p]
+		if want.exists {
+			if !fetched {
+				continue // vanished remotely between diff and fetch
+			}
+			want = version{true, rf.id, rf.mode}
+		}
+		local, err := localVersion(ws.Root, p)
+		if err != nil {
+			return err
+		}
+		if local.eq(want) {
+			continue
+		}
+		if err := wb.conflict(ws.Root, p, want, rf, ""); err != nil {
+			return err
+		}
+		if c := &wb.Stashed[len(wb.Stashed)-1]; c.Reason == "" {
+			c.Reason = ReasonSpotexecConfig
+		}
+	}
+
 	// Case-only renames (foo -> Foo) on a case-insensitive filesystem (the
 	// macOS default): both names resolve to one file, so applying "create Foo"
 	// and "delete foo" independently would delete it. Rename in place instead.
 	for _, del := range paths {
-		if remote[del].exists {
+		if remote[del].exists || handled[del] {
 			continue
 		}
 		for _, q := range paths {
-			if q == del || !remote[q].exists || !strings.EqualFold(q, del) {
+			if q == del || handled[q] || !remote[q].exists || !strings.EqualFold(q, del) {
 				continue
 			}
 			fd, err1 := fsid.SafeJoin(ws.Root, del)
@@ -556,10 +598,11 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 	}
 	sort.SliceStable(dels, func(i, j int) bool { return strings.Count(dels[i], "/") > strings.Count(dels[j], "/") })
 	// A deletion loses nothing when git has the file committed or the run
-	// wrote the same content back under another path (a move).
+	// wrote the same content back under another path (a move). Config the
+	// run wrote is stashed, not written, so it gives nothing back.
 	cameBack := map[string]bool{}
 	for p, rf := range files {
-		if !unjudged[p] { // may yet turn out ignored, and stay remote
+		if !unjudged[p] && !config[p] { // may yet turn out ignored, and stay remote
 			cameBack[rf.id] = true
 		}
 	}
@@ -590,7 +633,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 }
 
 // holdDeletions keeps back the deletions a run should not make on its own:
-// the project's own root .spotexec.toml or .gitignore, or, when the run
+// the project's own root .gitignore, or, when the run
 // deleted most of the synced files, all of them that recoverable can't give
 // back (so a restructuring move, or deleting committed files, applies).
 // Only deletions that would apply count (the local file still matches what
@@ -1315,6 +1358,7 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 		}
 	}
 	if len(inWS) > 0 {
+		isConfig := configGuard(ws.Root, configLinks(ctx, ws, nil, true))
 		prot, err := protectedPaths(ctx, ws.Root, inWS)
 		if err != nil {
 			return 0, err
@@ -1322,9 +1366,11 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 		for p, l := range landing {
 			// Judged where it lands too: a --dest above the worktree
 			// must not reach its spotexec state (conflicts, backups).
-			protected[p] = prot[l] != 0 || reservedPath(l, ws.Git)
+			// Nor may spotexec's own config land (or what it links to),
+			// held or ignored or not.
+			protected[p] = prot[l] != 0 || reservedPath(l, ws.Git) || isConfig(l)
 			_, isHeld := held[p]
-			heldOK[p] = isHeld && rel == "." && prot[l] == protNotIgnored
+			heldOK[p] = isHeld && rel == "." && prot[l] == protNotIgnored && !isConfig(l)
 		}
 	}
 	// Outside this worktree, anything inside some git repository (a sibling
@@ -1375,7 +1421,7 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 	var skipped, kept, stale []string
 	defer func() {
 		if len(skipped) > 0 {
-			fmt.Fprintf(os.Stderr, "spotexec: pull skipped %d source file(s) (tracked or not gitignored): %s\n", len(skipped), strings.Join(firstN(skipped, 5), ", "))
+			fmt.Fprintf(os.Stderr, "spotexec: pull skipped %d source file(s) (tracked, not gitignored, or spotexec's own config): %s\n", len(skipped), strings.Join(firstN(skipped, 5), ", "))
 		}
 		if len(kept) > 0 {
 			fmt.Fprintf(os.Stderr, "spotexec: pull kept %d local file(s) where a held file would land: %s\n", len(kept), strings.Join(firstN(kept, 5), ", "))
