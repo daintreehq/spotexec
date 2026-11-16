@@ -84,6 +84,7 @@ The release also has `.tar.gz` archives for macOS and Linux on amd64 and arm64. 
 
 ```sh
 tar -xzf spotexec_*.tar.gz spotexec
+sudo mkdir -p /usr/local/bin
 sudo install -m 755 spotexec /usr/local/bin/spotexec
 sudo ln -sf spotexec /usr/local/bin/sx
 ```

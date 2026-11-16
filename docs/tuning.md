@@ -89,7 +89,7 @@ Shard only a suite that runs many times longer than a cold start, with the test 
 
 - **Make every task say what it ran.** A loop over an empty list exits 0 without output, which looks like a pass. Print a line per unit of work, and fail when there's nothing to do.
 - **Test on a fresh slot before trusting a pass.** `spotexec down` and a rerun proves a task doesn't depend on files an earlier run left in its slot.
-- **Check for fixed ports and Docker.** Tests that bind fixed ports can collide with another slot's on the same VM; [`network = "private"`](environments.md#settings) in `[container]` gives each run a network of its own. Tests that start their own containers need [`docker = true`](environments.md#docker-inside-the-container), which gives the command the runner's Docker daemon, and with it root on the runner.
+- **Check for fixed ports and Docker.** Tests that bind fixed ports can collide with another slot's on the same VM; [`network = "private"`](environments.md#settings) in `[container]` gives each run a network of its own. Tests that start their own containers need [`docker = true`](environments.md#docker-inside-the-container), which gives the command the runner's Docker daemon, and with it root on the runner. Those containers run beside the project container on the runner's own network, so a fixed port or name they publish still collides; the two settings solve different problems rather than combining.
 
 ## Debugging a runner
 
