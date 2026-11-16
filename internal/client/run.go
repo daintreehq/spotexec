@@ -1330,19 +1330,34 @@ func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 	if !fi.Mode().IsRegular() {
 		return protocol.Entry{}, fmt.Errorf("%s is no longer a regular file; re-run", name)
 	}
-	b, err := os.ReadFile(full)
+	// Streamed, never read whole, and hashed as it goes: the entry is for
+	// exactly the bytes in the tar.
+	f, err := os.Open(full)
 	if err != nil {
 		return protocol.Entry{}, err
+	}
+	defer f.Close()
+	if fi, err = f.Stat(); err != nil {
+		return protocol.Entry{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		return protocol.Entry{}, fmt.Errorf("%s is no longer a regular file; re-run", name)
 	}
 	mode, emode := int64(0o644), fsid.ModeFile
 	if fi.Mode()&0o111 != 0 {
 		mode, emode = 0o755, fsid.ModeExec
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Size: int64(len(b)), Mode: mode, ModTime: fi.ModTime()}); err != nil {
+	size := fi.Size()
+	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Size: size, Mode: mode, ModTime: fi.ModTime()}); err != nil {
 		return protocol.Entry{}, err
 	}
-	_, err = tw.Write(b)
-	return protocol.Entry{Path: name, ID: fsid.Bytes(b), Mode: emode, Size: int64(len(b))}, err
+	// A file that grows meanwhile is cut at the header's size (the hash
+	// covers what was sent); one that shrinks can't fill the entry.
+	id, err := fsid.Reader(io.TeeReader(io.LimitReader(f, size), tw), size)
+	if err != nil {
+		return protocol.Entry{}, fmt.Errorf("sending %s: %w; re-run", name, err)
+	}
+	return protocol.Entry{Path: name, ID: id, Mode: emode, Size: size}, nil
 }
 
 func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string, m *manifest.Manifest) (protocol.DepsResult, error) {
