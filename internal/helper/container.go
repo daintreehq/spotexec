@@ -761,6 +761,24 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		select {}
 	}
 	defer s.procMu.Unlock()
+	// Under procMu, so teardown waits for the container it creates.
+	var users []string
+	if uid, gid := os.Getuid(), os.Getgid(); !run.Root && uid != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		passwd, group, err := s.runUserFiles(ctx, d, run.Image, uid, gid)
+		cancel()
+		if err != nil {
+			return "", nil, nil, perr(protocol.CodeImageFailed, "%v", err)
+		}
+		// --mount, not -v: a missing source fails the run instead of
+		// becoming an empty directory. A file container.options already
+		// mounts there is left to it (Docker refuses two mounts at one path).
+		for _, m := range [][2]string{{passwd, "/etc/passwd"}, {group, "/etc/group"}} {
+			if !mountsAt(run.Options, m[1]) {
+				users = append(users, "--mount", "type=bind,source="+m[0]+",target="+m[1]+",readonly")
+			}
+		}
+	}
 	runDir := filepath.Join(s.slotDir, "run")
 	home := filepath.Join(s.slotDir, "home")
 	for _, dd := range []string{runDir, home} {
@@ -864,7 +882,8 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 
 	if !run.Root {
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
-			"-v", home+":/home/spotexec", "-e", "HOME=/home/spotexec")
+			"-v", home+":"+runUserHome, "-e", "HOME="+runUserHome)
+		args = append(args, users...)
 	}
 	args = append(args, limits...)
 	args = append(args, run.Options...)
@@ -1167,7 +1186,8 @@ func (s *Session) removeContainers(prefixOnly bool) string {
 // returns those that still exist.
 func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) string {
 	filter := "--filter " + shq("name=^"+s.containerPrefix())
-	_, _ = runShell(ctx, d.cmd("ps -aq "+filter+" | xargs -r docker rm -f")+" >/dev/null 2>&1")
+	// -v: anonymous volumes too (an image's VOLUME makes them at create).
+	_, _ = runShell(ctx, d.cmd("ps -aq "+filter+" | xargs -r docker rm -fv")+" >/dev/null 2>&1")
 	out, err := runShell(ctx, d.cmd("ps -a --format '{{.Names}}' "+filter))
 	if err != nil {
 		return "(docker ps failed: " + strings.TrimSpace(string(out)) + ")"

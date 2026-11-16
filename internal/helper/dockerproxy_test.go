@@ -551,6 +551,12 @@ case "$1 $2" in
 "info "*) cat "$d/info" 2>/dev/null ;;
 "network rm") k=network; shift 2; ` + rm + ` ;;
 "volume rm") k=volume; shift 3; ` + rm + ` ;;
+"image inspect") echo sha256:` + strings.Repeat("0", 64) + ` ;;
+"cp -L")
+	[ -f "$d/cp-fail" ] && { echo "Error response from daemon: boom" >&2; exit 1; }
+	f="$d/tar-${3##*/}"
+	[ -f "$f" ] || { echo "Error: No such container:path: $3" >&2; exit 1; }
+	cat "$f" ;;
 esac
 exit 0
 `
