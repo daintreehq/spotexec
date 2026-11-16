@@ -12,7 +12,9 @@ import (
 
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/transport"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
 
@@ -125,6 +127,16 @@ func TestRunLeavesARecord(t *testing.T) {
 		if strings.Contains(raw[0], out) {
 			t.Errorf("the record holds the command's output %q:\n%s", out, raw[0])
 		}
+	}
+
+	// A command that exits 130 itself failed: nobody interrupted it.
+	state = t.TempDir()
+	t.Setenv("SPOTEXEC_STATE_DIR", state)
+	if code, stderr = runMain(t, "sx", "-C", dir, "--fallback-local", "--queue-timeout", "5s", "exit 130"); code != 130 {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	if recs, _ = records(t, state); len(recs) != 1 || recs[0].Parts[0].Status != "failed" || recs[0].Parts[0].ExitCode != 130 {
+		t.Errorf("exit 130: %+v", recs[0].Parts[0])
 	}
 
 	// Without the fallback spotexec fails the run (125), and says why.
@@ -365,5 +377,89 @@ func TestUnwritableRecordDirIsSilent(t *testing.T) {
 	r.settle()
 	if r.Path() != "" {
 		t.Errorf("saved to %s", r.Path())
+	}
+}
+
+// captureWarn keeps the warnings a reporter is given, as it would show them.
+type captureWarn struct {
+	ui.Reporter
+	shown []string
+}
+
+func (c *captureWarn) Warn(code, format string, args ...any) {
+	c.shown = append(c.shown, code+": "+fmt.Sprintf(format, args...))
+}
+
+func TestRecordLeavesOutOtherProgramsOutput(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("SPOTEXEC_STATE_DIR", state)
+	r := newRecorder(nil, "")
+	quiet, _ := ui.New(ui.ModeQuiet, os.Stderr, "")
+	base := &captureWarn{Reporter: quiet}
+	p, rep := r.part(base, "", "go test -json ./...")
+	// What RTK printed is shown, never recorded.
+	rep.Warn("RTK_FILTER", "rtk pipe -f %s failed (%v%s); the output below is unfiltered", "go-test", errors.New("exit status 1"), outputText(": --- FAIL: TestSecret"))
+	// A failed bootstrap's log lines are the project's output.
+	boot := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeBootFailed, Message: "bootstrap_script failed (exit 2) on this VM; last lines of /var/log/spotexec-bootstrap.log:\nSECRET-BOOT-LINE"}}
+	r.end(p, client.Result{}, boot, client.ExitInfra, partFailed, false)
+	r.finish(client.ExitInfra)
+	r.settle()
+	if len(base.shown) != 1 || !strings.Contains(base.shown[0], "--- FAIL: TestSecret") {
+		t.Errorf("shown: %q", base.shown)
+	}
+	recs, raw := records(t, state)
+	if strings.Contains(raw[0], "TestSecret") || strings.Contains(raw[0], "SECRET-BOOT-LINE") {
+		t.Errorf("record holds another program's output:\n%s", raw[0])
+	}
+	pt := recs[0].Parts[0]
+	if len(pt.Warnings) != 1 || pt.Warnings[0].Message != "rtk pipe -f go-test failed (exit status 1); the output below is unfiltered" {
+		t.Errorf("warning: %+v", pt.Warnings)
+	}
+	if pt.Error == nil || pt.Error.Code != protocol.CodeBootFailed || !strings.HasPrefix(pt.Error.Message, "BOOTSTRAP_FAILED: bootstrap_script failed (exit 2)") {
+		t.Errorf("error: %+v", pt.Error)
+	}
+}
+
+func TestRecordWideCaps(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("SPOTEXEC_STATE_DIR", state)
+	r := newRecorder(nil, "t")
+	base, _ := ui.New(ui.ModeQuiet, os.Stderr, "")
+	var parts []*recordPart
+	for i := 0; i < 10; i++ {
+		p, rep := r.part(base, fmt.Sprint(i), "true")
+		parts = append(parts, p)
+		for j := 0; j < recordWarnMax; j++ {
+			rep.Warn("W", "w")
+		}
+		for j := 0; j < recordLaunchMax; j++ {
+			id := fmt.Sprint("L", i, "-", j)
+			rep.Event("scale_out", map[string]any{"runner": "aws", "launch_id": id})
+			rep.Event("provision", map[string]any{"runner": "aws", "launch_id": id, "message": "m"})
+			rep.Event("provision", map[string]any{"runner": "aws", "launch_id": id, "message": "m"})
+		}
+	}
+	for _, p := range parts {
+		r.end(p, client.Result{}, nil, 0, partPassed, false)
+	}
+	r.finish(0)
+	r.settle()
+	recs, _ := records(t, state)
+	var warns, dropped, launches, ldropped, logs, logDropped int
+	for _, p := range recs[0].Parts {
+		warns, dropped = warns+len(p.Warnings), dropped+p.WarningsDropped
+		launches, ldropped = launches+len(p.Launches), ldropped+p.LaunchesDropped
+		for _, l := range p.Launches {
+			logs, logDropped = logs+len(l.Log), logDropped+l.LogDropped
+		}
+	}
+	if warns != recordWarnTotal || warns+dropped != 10*recordWarnMax {
+		t.Errorf("warnings: %d kept, %d dropped", warns, dropped)
+	}
+	if launches != recordLaunchTotal || launches+ldropped != 10*recordLaunchMax {
+		t.Errorf("launches: %d kept, %d dropped", launches, ldropped)
+	}
+	if logs != 2*recordLaunchTotal || logDropped != 0 {
+		t.Errorf("launch logs: %d kept, %d dropped", logs, logDropped)
 	}
 }

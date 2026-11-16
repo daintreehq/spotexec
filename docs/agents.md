@@ -74,7 +74,7 @@ Other events include:
 
 ## Run records
 
-Every run also leaves a record on your machine, whatever mode it ran in, so a busy period can be looked into after the terminals that showed it are gone: one JSON file per `sx`, `spotexec run`, `exec` or task, in `~/.local/state/spotexec/logs/runs/` (under `SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` when set), named by when it started. The newest 2000 are kept, and no more than 32 MB of them.
+Every run also leaves a record on your machine, whatever mode it ran in, so a busy period can be looked into after the terminals that showed it are gone: one JSON file per `sx`, `spotexec run`, `exec` or task that gets past checking its flags, in `~/.local/state/spotexec/logs/runs/` (under `SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` when set), named by when it started. It is written when the run ends, and again once a VM launch it started has reported. The newest 2000 are kept, and no more than 32 MB of them; a run force-quit with a third Ctrl-C, or killed, leaves none.
 
 A record has the run's `started_at` and `ended_at`, `duration_ms`, `exit_code`, `worktree` and `pid`, any `warnings` raised for a whole task, and `parts`: one for a single run, one per part of a parallel or sharded task (its `name`). Each part has:
 
@@ -85,7 +85,7 @@ A record has the run's `started_at` and `ended_at`, `duration_ms`, `exit_code`, 
 - `error` when spotexec failed it (exit `125`, or `123`): the `code` its `error` event has, its `message`, and, when it lost its runner and wasn't replayed, the `reason` (`RUNNER_UNRESPONSIVE`, `MEMORY_PRESSURE` or `CLIENT_SUSPENDED`);
 - `launches`, the VMs its demand launched or tried to: each `launch_id`, `runner`, `status` (`requested`, `launched`, `running` or `failed`), the `demand` and live `instances` when it was asked for, the `instance_id`, `region`, `zone`, `instance_type` and `placement` it got, its `error`, and `log`, the provider's messages, which name the options it skipped before the one it launched.
 
-The command's output is never recorded; warnings, errors and messages are cut to 1 KB, and each list is capped (`*_dropped` counts what was left out). For example, `jq -r 'select(any(.parts[]; .error.reason == "RUNNER_UNRESPONSIVE")) | .started_at' ~/.local/state/spotexec/logs/runs/*.json` lists the runs that ended that way.
+The command's output is never recorded, nor what other programs print (RTK's messages, a failed `bootstrap_script`'s log); warnings, errors and messages are cut to 1 KB, and each list is capped, per part and for the whole record (`*_dropped` counts what was left out). For example, `jq -r 'select(any(.parts[]; .error.reason == "RUNNER_UNRESPONSIVE")) | .started_at' ~/.local/state/spotexec/logs/runs/*.json` lists the runs that ended that way.
 
 ## Claude Code hook
 

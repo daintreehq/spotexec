@@ -600,3 +600,85 @@ func TestUncappedFleetLaunchesForDemand(t *testing.T) {
 		t.Fatalf("Reserve without a ceiling: %d %v", len(ids), err)
 	}
 }
+
+// A failed launch is reported, as an event and a warning, before its hold
+// ends, so a process exiting (WaitLaunches) still hears of it; a VM lost
+// while booting is reported too.
+func TestProvisionFailureReportedWithinTheHold(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 2)
+	ids, _ := p.EnsureMin(ctx, 1)
+	f.mu.Lock()
+	f.fail = errors.New("InsufficientInstanceCapacity")
+	f.mu.Unlock()
+	m := &member{r: p.R, pool: p}
+	rep := &blockingWarn{namedEvents: &namedEvents{}, in: make(chan struct{}), release: make(chan struct{})}
+	HoldLaunch()
+	go m.provision(ctx, ids[0], rep)
+	<-rep.in
+	waited := make(chan struct{})
+	go func() { WaitLaunches(time.Minute); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("WaitLaunches returned before the failed launch was reported")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(rep.release)
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("WaitLaunches never returned")
+	}
+	ev := rep.event("launch_failed")
+	if ev == nil || ev["launch_id"] != ids[0] || ev["runner"] != "fake" || ev["message"] != "InsufficientInstanceCapacity" {
+		t.Fatalf("launch_failed: %v", ev)
+	}
+	if rep.warned() != 1 {
+		t.Fatalf("%d LAUNCH_FAILED warnings", rep.warned())
+	}
+
+	// Launched, then lost while booting: reported once, after the hold.
+	p2, f2 := testPool(t, 2)
+	f2.goneOnWait = true
+	ids2, _ := p2.EnsureMin(ctx, 1)
+	rep2 := &blockingWarn{namedEvents: &namedEvents{}}
+	HoldLaunch()
+	(&member{r: p2.R, pool: p2}).provision(ctx, ids2[0], rep2)
+	if rep2.event("instance_launched") == nil || rep2.event("launch_failed") == nil || rep2.warned() != 1 {
+		t.Fatalf("lost while booting: events %v, %d warnings", rep2.fields, rep2.warned())
+	}
+}
+
+// blockingWarn records events and counts LAUNCH_FAILED warnings, blocking
+// in the first until released (when in is set).
+type blockingWarn struct {
+	*namedEvents
+	in, release chan struct{}
+	n           int
+}
+
+func (b *blockingWarn) Warn(code, _ string, _ ...any) {
+	if code != "LAUNCH_FAILED" {
+		return
+	}
+	b.mu.Lock()
+	b.n++
+	first := b.n == 1
+	b.mu.Unlock()
+	if first && b.in != nil {
+		close(b.in)
+		<-b.release
+	}
+}
+
+func (b *blockingWarn) warned() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.n
+}
+
+func (b *blockingWarn) event(name string) map[string]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fields[name]
+}

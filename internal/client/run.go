@@ -143,8 +143,8 @@ type Result struct {
 	// Phases is where the run's time went (PhaseQueued, PhaseSync, …),
 	// summed over its attempts. A phase the run never reached is absent.
 	Phases map[string]time.Duration `json:"-"`
-	// Attempts is how many attempts the run made (2 when it was replayed
-	// after losing its runner; 0 when it failed before acquiring one).
+	// Attempts is how many attempts the run made: 2 when it was replayed
+	// after losing its runner, 0 when it failed before its first.
 	Attempts int `json:"-"`
 	// Where the last attempt ran, when it got a fleet VM: its instance,
 	// region, zone and type (empty for a static runner).
@@ -208,11 +208,11 @@ func (p *progress) clock() time.Time {
 // enter ends the current phase's timing and starts phase's (p.mu held).
 func (p *progress) enter(phase string) {
 	now := p.clock()
-	if k := phaseKind[p.at.phase]; k != "" && !p.since.IsZero() && now.After(p.since) {
+	if k := phaseKind[p.at.phase]; k != "" && !p.since.IsZero() && !now.Before(p.since) {
 		if p.spent == nil {
 			p.spent = map[string]time.Duration{}
 		}
-		p.spent[k] += now.Sub(p.since)
+		p.spent[k] += now.Sub(p.since) // reached, even for no measurable time
 	}
 	p.since = now
 	p.at.phase = phase

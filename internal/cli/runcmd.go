@@ -619,13 +619,14 @@ func (f *runFlags) execute(l *loaded, s runSpec) (code int) {
 	part, rep := rec.part(rep, "", s.display)
 	var res client.Result
 	local, localStart := false, time.Time{}
+	interrupted := false // by the user: not a command that exited 130
 	defer func() {
 		if local {
 			rec.localPhase(part, time.Since(localStart))
 		}
 		status := partFailed
 		switch {
-		case code == client.ExitInterrupted:
+		case interrupted || res.Canceled:
 			status = partInterrupted
 		case code == 0:
 			status = partPassed
@@ -666,6 +667,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) (code int) {
 	}
 	if err != nil {
 		if ctx.Err() != nil {
+			interrupted = true
 			rep.Clear()
 			return finish(client.ExitInterrupted)
 		}
@@ -675,6 +677,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) (code int) {
 			o.Stderr, o.Rep = os.Stderr, rep
 			local, localStart = true, time.Now()
 			code := runLocal(ctx, intr, l, o, rep, 0, 1)
+			interrupted = ctx.Err() != nil
 			if ctx.Err() == nil {
 				stdin.check(rep)
 			}

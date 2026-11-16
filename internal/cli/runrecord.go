@@ -17,6 +17,7 @@ import (
 
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
 
@@ -37,8 +38,19 @@ const (
 	recordLaunchMax = 20   // launches kept per part
 	recordLogMax    = 40   // provider messages kept per launch
 	recordPartsMax  = 256  // parts of a task kept
-	recordTmpPrefix = ".tmp-"
+	// What the whole record keeps, however many parts share it, so it
+	// stays well under a megabyte or two.
+	recordWarnTotal   = 400
+	recordLaunchTotal = 100
+	recordLogTotal    = 400
+	recordTmpPrefix   = ".tmp-"
 )
+
+// outputText is a warning argument that may hold another program's output
+// (what RTK printed): reporters show it, records leave it out.
+type outputText string
+
+func (t outputText) String() string { return string(t) }
 
 // runRecordDir is where records go (a variable for tests).
 var runRecordDir = func() string { return filepath.Join(config.StateDir(), "logs", "runs") }
@@ -98,7 +110,7 @@ type recordPart struct {
 	Launches        []*recordLaunch `json:"launches,omitempty"`
 	LaunchesDropped int             `json:"launches_dropped,omitempty"`
 
-	launchIdx map[string]*recordLaunch
+	launchIdx map[string]*recordLaunch // nil for a launch left out
 }
 
 type recordError struct {
@@ -148,6 +160,8 @@ type recorder struct {
 	dirty  bool      // changed since last saved
 	path   string    // where it was saved
 	now    func() time.Time
+	// What the whole record holds so far, against the record-wide caps.
+	warnings, launches, logs int
 }
 
 func newRecorder(ws *client.Workspace, task string) *recorder {
@@ -210,7 +224,12 @@ func (r *recorder) end(p *recordPart, res client.Result, err error, code int, st
 	}
 	p.TimedOut, p.OOMKilled, p.SetupFailed = res.TimedOut, res.OOMKilled, res.SetupFailed
 	if err != nil {
-		p.Error = &recordError{Code: errorCode(err), Reason: res.LostCode, Message: clip(err.Error())}
+		code, msg := errorCode(err), err.Error()
+		if code == protocol.CodeBootFailed {
+			// The bootstrap log's last lines follow: the project's output.
+			msg, _, _ = strings.Cut(msg, "\n")
+		}
+		p.Error = &recordError{Code: code, Reason: res.LostCode, Message: clip(msg)}
 	}
 }
 
@@ -258,12 +277,9 @@ func (r *recorder) save() {
 	dir := runRecordDir()
 	if p, err := writeRecord(dir, r.rec.ID+".json", append(b, '\n')); err == nil {
 		r.mu.Lock()
-		first := r.path == ""
 		r.path = p
 		r.mu.Unlock()
-		if first {
-			pruneRunRecords(dir, runRecordsKept, runRecordsBytes)
-		}
+		pruneRunRecords(dir, runRecordsKept, runRecordsBytes)
 	}
 }
 
@@ -282,19 +298,16 @@ func (r *recorder) warn(p *recordPart, code, msg string) {
 	}
 	r.dirty = true
 	w := recordWarning{At: r.now().UTC(), Code: clip(code), Message: clip(msg)}
-	if p == nil {
-		if len(r.rec.Warnings) < recordWarnMax {
-			r.rec.Warnings = append(r.rec.Warnings, w)
-		} else {
-			r.rec.WarningsDropped++
-		}
+	list, dropped := &r.rec.Warnings, &r.rec.WarningsDropped
+	if p != nil {
+		list, dropped = &p.Warnings, &p.WarningsDropped
+	}
+	if len(*list) >= recordWarnMax || r.warnings >= recordWarnTotal {
+		*dropped++
 		return
 	}
-	if len(p.Warnings) < recordWarnMax {
-		p.Warnings = append(p.Warnings, w)
-	} else {
-		p.WarningsDropped++
-	}
+	*list = append(*list, w)
+	r.warnings++
 }
 
 // event records the launch events of part p's run; every other event is
@@ -315,19 +328,25 @@ func (r *recorder) event(p *recordPart, name string, f map[string]any) {
 		return
 	}
 	now := r.now().UTC()
-	l := p.launchIdx[id]
-	if l == nil {
-		if len(p.Launches) >= recordLaunchMax {
-			p.LaunchesDropped++
-			return
-		}
-		runner, _ := f["runner"].(string)
-		l = &recordLaunch{LaunchID: clip(id), Runner: clip(runner), Status: "requested", RequestedAt: now}
+	l, seen := p.launchIdx[id]
+	if !seen {
 		if p.launchIdx == nil {
 			p.launchIdx = map[string]*recordLaunch{}
 		}
+		if len(p.Launches) >= recordLaunchMax || r.launches >= recordLaunchTotal {
+			p.launchIdx[id] = nil
+			p.LaunchesDropped++
+			r.dirty = true
+			return
+		}
+		r.launches++
+		runner, _ := f["runner"].(string)
+		l = &recordLaunch{LaunchID: clip(id), Runner: clip(runner), Status: "requested", RequestedAt: now}
 		p.launchIdx[id] = l
 		p.Launches = append(p.Launches, l)
+	}
+	if l == nil {
+		return // left out
 	}
 	r.dirty = true
 	switch name {
@@ -340,8 +359,9 @@ func (r *recorder) event(p *recordPart, name string, f map[string]any) {
 		}
 	case "provision":
 		msg, _ := f["message"].(string)
-		if len(l.Log) < recordLogMax {
+		if len(l.Log) < recordLogMax && r.logs < recordLogTotal {
 			l.Log = append(l.Log, clip(msg))
+			r.logs++
 		} else {
 			l.LogDropped++
 		}
@@ -390,7 +410,14 @@ func (rr *recordingReporter) Event(name string, fields map[string]any) {
 }
 
 func (rr *recordingReporter) Warn(code, format string, args ...any) {
-	rr.r.warn(rr.p, code, fmt.Sprintf(format, args...))
+	kept := make([]any, len(args))
+	for i, a := range args {
+		if _, ok := a.(outputText); ok {
+			a = ""
+		}
+		kept[i] = a
+	}
+	rr.r.warn(rr.p, code, fmt.Sprintf(format, kept...))
 	rr.Reporter.Warn(code, format, args...)
 }
 

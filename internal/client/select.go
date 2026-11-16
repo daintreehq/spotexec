@@ -753,12 +753,19 @@ func (m *member) provision(ctx context.Context, id string, rep ui.Reporter) {
 		// known (the scale_out event comes before the choice).
 		rep.Event("instance_launched", placed(map[string]any{"runner": m.r.Name, "launch_id": id, "instance_id": in.ID}, in))
 	}
+	reported := false
 	failed := func(err error) {
+		reported = true
 		rep.Event("launch_failed", map[string]any{"runner": m.r.Name, "launch_id": id, "message": firstLine(err.Error())})
 		rep.Warn("LAUNCH_FAILED", "%s: %v", m.r.Name, firstLine(err.Error()))
 	}
+	// A failed launch request is reported before its hold ends; a VM
+	// lost while booting, after it.
 	in, err := m.pool.provisionHeld(pctx, id, logf, launched, failed)
 	if err != nil {
+		if !reported {
+			failed(err)
+		}
 		return
 	}
 	rep.Event("instance_running", placed(map[string]any{"runner": m.r.Name, "launch_id": id, "instance_id": in.ID, "host": in.Target.String()}, in))

@@ -92,6 +92,21 @@ echo "== fingerprint short-circuit"
 run true
 check "second run skips sync" "ev fingerprint_hit | grep -q ."
 
+echo "== run records"
+run "printf 'REC%sOUT\\n' ORD; exit 4" || true
+REC=$(ls -t "$SPOTEXEC_STATE_DIR"/logs/runs/*.json 2>/dev/null | head -1)
+check "a run leaves a record" "test -n '$REC'"
+check "the record says where the run ran, how it ended and where its time went" "python3 - '$REC' <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+p = r['parts'][0]
+assert r['exit_code'] == 4 and p['exit_code'] == 4 and p['status'] == 'failed', r
+assert p['runner'] == 'box' and p['slot'] >= 1 and p['attempts'] == 1, p
+assert {'queued', 'sync', 'command'} <= set(p['phases_ms']), p['phases_ms']
+assert r['duration_ms'] >= 0 and r['started_at'] and 'REC%sOUT' in p['command'], r
+PY"
+check "the record leaves out the command's output" "! grep -q RECORDOUT '$REC'"
+
 echo "== write-back"
 run 'sed -i s/a/A/ src/a.txt; echo created > src/gen.txt; rm src/b.txt; mkdir -p dist; echo x > dist/out.js; chmod +x src/new.txt' || true
 check "modified file written back" "grep -qx A src/a.txt"

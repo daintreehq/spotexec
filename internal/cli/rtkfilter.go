@@ -138,10 +138,12 @@ func (r *rtkOutput) finish(failed bool) {
 	case err == nil:
 		err = fmt.Errorf("no output")
 	}
+	// What RTK printed may echo the command's output: shown, never recorded.
+	var said outputText
 	if msg := bytes.TrimSpace(errOut.Bytes()); len(msg) > 0 {
-		err = fmt.Errorf("%v: %s", err, msg)
+		said = outputText(": " + string(msg))
 	}
-	r.rep.Warn("RTK_FILTER", "rtk pipe -f %s failed (%v); the output below is unfiltered", r.filter, err)
+	r.rep.Warn("RTK_FILTER", "rtk pipe -f %s failed (%v%s); the output below is unfiltered", r.filter, err, said)
 	r.replay()
 }
 
