@@ -111,6 +111,9 @@ func TestBurnLine(t *testing.T) {
 			"estimated burn: $0.129/hour (from Spot prices), not counting 1 running VM(s) with no known price"},
 		{"pending and static runners left out", []runnerStatus{row(aws, provider.StatePending, 0.2, costSpot), row(ssh, provider.StateRunning, 1, costSetting), row(aws, provider.StateRunning, 0.1, costSpot)},
 			"estimated burn: $0.100/hour (from Spot prices)"},
+		{"unlisted region", []runnerStatus{row(aws, provider.StateRunning, 0.129, costSpot),
+			{r: aws, unlisted: true, Info: provider.Info{State: provider.StateUnknown, Region: "ap-south-1"}}},
+			"estimated burn: $0.129/hour (from Spot prices), not counting VMs in ap-south-1 (not listed)"},
 		{"nothing priced", []runnerStatus{row(aws, provider.StateRunning, 0, "")}, ""},
 		{"nothing running", nil, ""},
 	} {

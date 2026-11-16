@@ -40,6 +40,7 @@ type fakeRegionsEC2 struct {
 	instances   map[string]map[string]string // region -> id -> type
 	quota       map[string]int               // region -> standard Spot vCPU quota (unset: GetServiceQuota fails)
 	dead        map[string]bool              // regions whose endpoint never answers (not enabled); set before use
+	hangOwned   map[string]bool              // regions whose by-owner (leftovers) listing never answers
 	deny        map[string]bool              // regions answering AuthFailure to everything (not enabled); set before use
 	noRegions   bool                         // DescribeRegions is denied everywhere
 	priceErr    map[string]string            // region -> error code DescribeSpotPriceHistory answers
@@ -401,6 +402,12 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			byOwner := p.Get("Filter.1.Name") == "tag:spotexec-owner"
 			if byOwner {
 				f.log(region, act+" owned")
+				if f.hangOwned[region] {
+					f.mu.Unlock()
+					<-r.Context().Done()
+					f.mu.Lock()
+					return
+				}
 			} else {
 				f.log(region, act)
 			}
@@ -726,6 +733,139 @@ func TestGlobalListFailsIfARegionFails(t *testing.T) {
 	}
 	if where["i-a"] != "r-one-1/r-one-1a" || where["i-b"] != "r-two-1/r-two-1a" {
 		t.Fatalf("locations %v", where)
+	}
+}
+
+// Status lists what it can reach: a stalled region is reported by name
+// after a short wait, the others' instances still show, and the stalled
+// region is neither forgotten nor allowed to make List itself lenient.
+func TestGlobalListReachableSkipsStalledRegion(t *testing.T) {
+	f := &fakeRegionsEC2{
+		instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}, "r-two-1": {"i-b": "c7a.2xlarge"}},
+		dead:      map[string]bool{"r-two-1": true},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	discovered(t, g)
+	g.markActive("r-one-1", time.Now().Add(time.Hour))
+	g.markActive("r-two-1", time.Now().Add(-time.Minute)) // due to be dropped once seen empty
+	defer func(d time.Duration) { regionListTimeout = d }(regionListTimeout)
+	regionListTimeout = 200 * time.Millisecond
+	start := time.Now()
+	ins, unlisted, err := g.ListReachable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("waited %s on the stalled region", d)
+	}
+	if len(ins) != 1 || ins[0].ID != "i-a" {
+		t.Fatalf("listed %v", ins)
+	}
+	if len(unlisted) != 1 || unlisted["r-two-1"] == nil || !strings.Contains(unlisted["r-two-1"].Error(), "no answer within 200ms") || !errors.Is(unlisted["r-two-1"], context.DeadlineExceeded) {
+		t.Fatalf("unlisted %v", unlisted)
+	}
+	if got := active(t, g); got != "r-one-1,r-two-1" {
+		t.Fatalf("a region that couldn't be listed was forgotten: %q", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := g.List(ctx); err == nil {
+		t.Fatal("List must still fail when a region can't be listed")
+	}
+}
+
+// A region that answers with an error is reported the same way, at once.
+func TestGlobalListReachableReportsRegionError(t *testing.T) {
+	f := &fakeRegionsEC2{
+		instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}, "r-two-1": {"i-b": "c7a.2xlarge"}},
+		listErr:   map[string]string{"r-two-1": "UnauthorizedOperation"},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	discovered(t, g)
+	g.markActive("r-one-1", time.Now().Add(time.Hour))
+	g.markActive("r-two-1", time.Now().Add(time.Hour))
+	ins, unlisted, err := g.ListReachable(context.Background())
+	if err != nil || len(ins) != 1 || ins[0].ID != "i-a" {
+		t.Fatalf("list = %v, %v", ins, err)
+	}
+	if e := unlisted["r-two-1"]; e == nil || !strings.Contains(e.Error(), "UnauthorizedOperation") {
+		t.Fatalf("unlisted %v", unlisted)
+	}
+}
+
+// The first listing only counts as discovery once every region answered:
+// a region that couldn't be listed is looked at again next time.
+func TestGlobalListReachableKeepsDiscoveringFailedRegion(t *testing.T) {
+	f := &fakeRegionsEC2{
+		instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}, "r-two-1": {"i-b": "c7a.2xlarge"}},
+		listErr:   map[string]string{"r-two-1": "RequestLimitExceeded"},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	ins, unlisted, err := g.ListReachable(context.Background())
+	if err != nil || len(ins) != 1 || unlisted["r-two-1"] == nil {
+		t.Fatalf("list = %v, %v, %v", ins, unlisted, err)
+	}
+	f.mu.Lock()
+	delete(f.listErr, "r-two-1")
+	f.mu.Unlock()
+	ins, unlisted, err = g.ListReachable(context.Background())
+	if err != nil || len(ins) != 2 || len(unlisted) != 0 {
+		t.Fatalf("list = %v, %v, %v", ins, unlisted, err)
+	}
+}
+
+// A first listing doesn't wait out a home region that never answers the
+// enabled-regions lookup: it lists what it can and stays undiscovered.
+func TestGlobalListReachableBoundsDiscovery(t *testing.T) {
+	f := &fakeRegionsEC2{
+		instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}},
+		dead:      map[string]bool{"r-off-1": true},
+	}
+	g := newGlobalEnv(t, f, "r-off-1", "r-one-1")
+	g.r.Region = "r-off-1"
+	defer func(d time.Duration) { regionListTimeout = d }(regionListTimeout)
+	regionListTimeout = 300 * time.Millisecond
+	start := time.Now()
+	ins, unlisted, err := g.ListReachable(context.Background())
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("waited %s on discovery", d)
+	}
+	if err != nil || len(ins) != 1 || ins[0].ID != "i-a" || unlisted["r-off-1"] == nil {
+		t.Fatalf("list = %v, %v, %v", ins, unlisted, err)
+	}
+	var disc bool
+	_ = g.withState(func(st *placementState) { disc = st.Discovered })
+	if disc {
+		t.Fatal("discovery counted done with a region unlisted")
+	}
+}
+
+// A region found empty but whose leftovers check stalls is kept, and the
+// listing doesn't wait the stall out.
+func TestGlobalListReachableBoundsLeftovers(t *testing.T) {
+	f := &fakeRegionsEC2{
+		instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}},
+		hangOwned: map[string]bool{"r-two-1": true},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	discovered(t, g)
+	g.markActive("r-one-1", time.Now().Add(time.Hour))
+	g.markActive("r-two-1", time.Now().Add(-time.Minute)) // empty and due to be dropped
+	defer func(d time.Duration) { regionListTimeout = d }(regionListTimeout)
+	regionListTimeout = 300 * time.Millisecond
+	start := time.Now()
+	ins, unlisted, err := g.ListReachable(context.Background())
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("waited %s on leftovers", d)
+	}
+	if err != nil || len(ins) != 1 || len(unlisted) != 0 {
+		t.Fatalf("list = %v, %v, %v", ins, unlisted, err)
+	}
+	if len(f.callsOf("DescribeInstances owned")) == 0 {
+		t.Fatal("leftovers never checked")
+	}
+	if got := active(t, g); got != "r-one-1,r-two-1" {
+		t.Fatalf("a region whose leftovers weren't checked was forgotten: %q", got)
 	}
 }
 

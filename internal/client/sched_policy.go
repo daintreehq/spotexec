@@ -568,9 +568,9 @@ type Role struct {
 }
 
 // Roles reports every known VM's role without changing anything.
-func (p *Pool) Roles() map[string]Role {
+func (p *Pool) Roles(ctx context.Context) map[string]Role {
 	out := map[string]Role{}
-	_ = p.with(func(st *poolState) error {
+	_ = p.withCtx(ctx, func(st *poolState) error {
 		if st.Sched == nil {
 			return nil
 		}

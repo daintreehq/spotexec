@@ -87,6 +87,9 @@ type runnerStatus struct {
 	// why (on the fleet's first row).
 	LaunchHolds map[string]provider.RegionHold `json:"launch_holds,omitempty"`
 	r           *config.Runner
+	// unlisted marks a row standing for a region whose instances
+	// couldn't be listed.
+	unlisted bool
 	// reclaimed records a Spot interruption notice the VM reports.
 	reclaimed func()
 	// answered: this status request reached the VM over SSH.
@@ -208,6 +211,53 @@ func fleetMismatches(ctx context.Context, f provider.Fleet, insts []provider.Ins
 	return m.Mismatches(ctx, insts)
 }
 
+// listFleet lists a fleet's instances for showing them: a fleet spread
+// over regions lists the ones it reaches and names the others, so one
+// region's stalled API doesn't hide the rest.
+func listFleet(ctx context.Context, f provider.Fleet) ([]provider.Instance, map[string]error, error) {
+	if rl, ok := f.(provider.RegionLister); ok {
+		return rl.ListReachable(ctx)
+	}
+	insts, err := f.List(ctx)
+	return insts, nil, err
+}
+
+// unlistedRows are one unknown row per region a fleet couldn't list, in
+// region order. They carry the fleet's name, so its launch holds still
+// show when no instance was listed.
+func unlistedRows(r *config.Runner, unlisted map[string]error) []runnerStatus {
+	regions := make([]string, 0, len(unlisted))
+	for rg := range unlisted {
+		regions = append(regions, rg)
+	}
+	sort.Strings(regions)
+	var rows []runnerStatus
+	for _, rg := range regions {
+		rows = append(rows, runnerStatus{Name: r.Name + "/" + rg, Type: r.Type, r: r, Fleet: r.Name, unlisted: true,
+			Error: fmt.Sprintf("couldn't list %s: %v", rg, unlisted[rg]),
+			Info:  provider.Info{State: provider.StateUnknown, Region: rg, Detail: "instances not listed"}})
+	}
+	return rows
+}
+
+// rolesTimeout bounds the wait for the pool's lock when status reads VM
+// roles: the pool manager holds it while its own listing runs.
+var rolesTimeout = 5 * time.Second
+
+// fleetRoles are a consolidating fleet's VM roles (none for other
+// policies, whose roles are hypothetical, or when the pool is busy).
+func fleetRoles(ctx context.Context, r *config.Runner, pool *client.Pool) map[string]client.Role {
+	if r.SchedPolicy() != config.PolicyConsolidate {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, rolesTimeout)
+	defer cancel()
+	return pool.Roles(ctx)
+}
+
+// newProvider builds a runner's provider for status (tests replace it).
+var newProvider = provider.New
+
 func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []runnerStatus {
 	var rows []runnerStatus
 	var fleets []fleetInstances
@@ -219,19 +269,20 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 	}
 	var holders []holder
 	for _, r := range rs {
-		p, err := provider.New(r)
+		p, err := newProvider(r)
 		if err != nil {
 			rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, Error: err.Error(), r: r})
 			continue
 		}
 		if f, ok := p.(provider.Fleet); ok {
-			insts, err := f.List(ctx)
+			insts, unlisted, err := listFleet(ctx, f)
 			if err != nil {
 				rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, Error: err.Error(), r: r, Info: provider.Info{State: provider.StateUnknown}})
 				continue
 			}
 			first := len(rows)
-			if len(insts) == 0 {
+			rows = append(rows, unlistedRows(r, unlisted)...)
+			if len(insts) == 0 && len(unlisted) == 0 {
 				detail := "0 instances; scales on demand"
 				if r.Capped() {
 					detail = fmt.Sprintf("0 of max %d instances; scales on demand", r.MaxInstances)
@@ -242,13 +293,13 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			fleets = append(fleets, fleetInstances{r, insts})
 			mismatch := fleetMismatches(ctx, f, insts)
 			pool := client.NewPool(r, f)
-			roles := pool.Roles()
+			roles := fleetRoles(ctx, r, pool)
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
 				st := runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
 					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}}
-				if r.SchedPolicy() == config.PolicyConsolidate { // shadow roles are hypothetical
-					st.Role, st.RoleReason = roles[in.ID].Role, roles[in.ID].Reason
+				if ro, ok := roles[in.ID]; ok {
+					st.Role, st.RoleReason = ro.Role, ro.Reason
 				}
 				if rc, ok := f.(provider.Reclaimer); ok {
 					st.reclaimed = func() { rc.Reclaimed(in) }
@@ -509,7 +560,12 @@ func cmdMonitor() *cobra.Command {
 func burnLine(sts []runnerStatus) string {
 	burn, unpriced := 0.0, 0
 	from := map[string]bool{}
+	var unlisted []string
 	for _, s := range sts {
+		if s.unlisted && s.r != nil && s.r.Ephemeral() {
+			unlisted = append(unlisted, s.Info.Region)
+			continue
+		}
 		if s.Info.State != provider.StateRunning || s.r == nil || !s.r.Ephemeral() {
 			continue
 		}
@@ -533,6 +589,9 @@ func burnLine(sts []runnerStatus) string {
 	line := fmt.Sprintf("estimated burn: $%.3f/hour (from %s)", burn, src)
 	if unpriced > 0 {
 		line += fmt.Sprintf(", not counting %d running VM(s) with no known price", unpriced)
+	}
+	if len(unlisted) > 0 {
+		line += ", not counting VMs in " + strings.Join(unlisted, ", ") + " (not listed)"
 	}
 	return line
 }
