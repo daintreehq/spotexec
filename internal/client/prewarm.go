@@ -57,6 +57,11 @@ func (p *Pool) Prewarm(ctx context.Context, id string, log provider.Logger, read
 		err = ready(ctx, in)
 	}
 	if err == nil {
+		// Watched until it finished setup: an exact launch lead for Plan.
+		_ = p.with(func(st *poolState) error {
+			st.timeLaunch(in.ID, time.Now())
+			return nil
+		})
 		return in, nil
 	}
 	bg := context.WithoutCancel(ctx)

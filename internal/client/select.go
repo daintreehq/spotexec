@@ -438,11 +438,12 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				continue // can't grow: don't signal demand others would launch for
 			}
 			if waiters[m.r.Name] == nil {
+				register := m.pool.Register
 				weight := 1
 				if req.Base.Exclusive {
-					weight = m.pool.SlotsPerInstance()
+					register, weight = m.pool.RegisterExclusive, m.pool.SlotsPerInstance()
 				}
-				w, err := m.pool.Register(weight)
+				w, err := register(weight)
 				if err != nil {
 					return nil, err
 				}
@@ -511,6 +512,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					status += "; "
 				}
 				status += fmt.Sprintf("%d instance(s) starting on %s", d.Pending, m.r.Name)
+				if d.Held {
+					status += "; " + d.Reason
+				}
 			} else if status == "" && d.Demand > 0 {
 				status = fmt.Sprintf("%s: %s", m.r.Name, d.Reason)
 			}

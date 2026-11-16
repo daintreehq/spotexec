@@ -53,8 +53,9 @@ type note struct {
 	Ready        bool      `json:"ready,omitempty"`
 	ReadyAt      time.Time `json:"ready_at,omitempty"`
 	SawFull      bool      `json:"saw_full,omitempty"` // observed with every slot taken
-	// BootSeenAt: when a probe last found it still booting (or not
-	// answering yet), so its first ready probe times its launch.
+	// BootSeenAt: when a probe last found its helper still running
+	// first-boot setup, so its first ready probe times its launch. (Not a
+	// failure to answer: a VM that was ready unobserved can fail one too.)
 	BootSeenAt   time.Time `json:"boot_seen_at,omitempty"`
 	BootFailed   bool      `json:"boot_failed,omitempty"`
 	BootFailedAt time.Time `json:"boot_failed_at,omitempty"`
@@ -260,14 +261,20 @@ func (n *note) markReady(now time.Time) {
 func (st *poolState) markReady(id string, now time.Time) {
 	n := st.note(id)
 	if !n.Ready && !n.BootSeenAt.IsZero() && now.Sub(n.BootSeenAt) <= leadGap {
-		for _, l := range st.Launches {
-			if l.InstanceID == id && !l.Failed && !l.Started.IsZero() {
-				st.sched().observeLaunch(id, now.Sub(l.Started), now)
-				break
-			}
-		}
+		st.timeLaunch(id, now)
 	}
 	n.markReady(now)
+}
+
+// timeLaunch records how long instance id's launch took to serve, from
+// its launch record.
+func (st *poolState) timeLaunch(id string, now time.Time) {
+	for _, l := range st.Launches {
+		if l.InstanceID == id && !l.Failed && !l.Started.IsZero() {
+			st.sched().observeLaunch(id, now.Sub(l.Started), now)
+			return
+		}
+	}
 }
 
 func readyFor(n *note) time.Duration {
@@ -560,9 +567,6 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 			// suspect (but still counts toward capacity: unreachable is not
 			// absent).
 			n.Failures++
-			if !n.Ready {
-				n.BootSeenAt = now
-			}
 			if time.Since(launchedAt) < p.R.BootTimeout.Duration || n.Failures < 2 {
 				n.BusyUntil = now.Add(3 * time.Second)
 			} else {
@@ -1033,26 +1037,46 @@ type Waiter struct {
 
 // Register adds a waiter with weight (1, or a whole instance for --exclusive).
 func (p *Pool) Register(weight int) (*Waiter, error) {
+	return p.registerAs(weight, false)
+}
+
+// RegisterExclusive adds a waiter for a whole VM (--exclusive), weighing
+// one instance: freeing slots don't serve it, so Plan never holds a launch
+// for them while it waits (even when its weight, the planning slot count,
+// is 1 on a fleet of mixed sizes).
+func (p *Pool) RegisterExclusive(weight int) (*Waiter, error) {
+	return p.registerAs(weight, true)
+}
+
+func (p *Pool) registerAs(weight int, exclusive bool) (*Waiter, error) {
 	var w *Waiter
 	err := p.with(func(*poolState) error {
 		var err error
-		w, err = p.register(weight)
+		w, err = p.register(weight, exclusive)
 		return err
 	})
 	return w, err
 }
 
+// exclusiveWaiter marks a whole-VM waiter's file name (older versions
+// count it by its weight alone).
+const exclusiveWaiter = ".x.w"
+
 // register must run under pool.lock: waiterDemand (also under the lock)
 // unlinks unlocked waiter files, so creation and locking must be atomic
 // with respect to it.
-func (p *Pool) register(weight int) (*Waiter, error) {
+func (p *Pool) register(weight int, exclusive bool) (*Waiter, error) {
 	dir := filepath.Join(p.dir, "waiters")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	var b [4]byte
 	_, _ = rand.Read(b[:])
-	path := filepath.Join(dir, fmt.Sprintf("%d-%s.w", os.Getpid(), hex.EncodeToString(b[:])))
+	ext := ".w"
+	if exclusive {
+		ext = exclusiveWaiter
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d-%s%s", os.Getpid(), hex.EncodeToString(b[:]), ext))
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -1170,7 +1194,7 @@ func (p *Pool) waiters() (total int, wholeVM bool) {
 			w = 1
 		}
 		total += w
-		wholeVM = wholeVM || w > 1
+		wholeVM = wholeVM || w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter)
 	}
 	return total, wholeVM
 }
