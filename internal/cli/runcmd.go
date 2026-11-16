@@ -654,7 +654,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		rep.Event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 		if !rep.IsJSON() {
 			fmt.Fprintf(os.Stderr, "spotexec: %v\n", err)
-			depsDetail(os.Stderr, "", err)
+			errDetail(os.Stderr, "", err)
 		}
 		return client.ExitInfra
 	}
@@ -1153,7 +1153,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 					sr.event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 					if !rep.IsJSON() {
 						fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
-						depsDetail(os.Stderr, prefix, err)
+						errDetail(os.Stderr, prefix, err)
 					}
 				}
 				sr.Reporter.PartDone(out.doneLine(res.DepsInstalled), code == 0)
@@ -1295,11 +1295,12 @@ var errorCodes = map[string]bool{
 	protocol.CodeShutdown: true,
 }
 
-// depsDetail prints, under a failed dependency install's error, the end of
-// the install's output and where its full log is. prefix starts every line
+// errDetail prints, under a failed dependency install's or image build's
+// error (client.DepsError, client.ImageBuildError), the end of its output,
+// where its full log is and what to do about it. prefix starts every line
 // (a parallel task's "[name] ").
-func depsDetail(w io.Writer, prefix string, err error) {
-	var de *client.DepsError
+func errDetail(w io.Writer, prefix string, err error) {
+	var de interface{ Detail() []string }
 	if !errors.As(err, &de) {
 		return
 	}

@@ -47,7 +47,7 @@ func cmdContainer() *cobra.Command {
 	var f runFlags
 	build := &cobra.Command{
 		Use:   "build [flags]",
-		Short: "Build (or pull) the project image on a runner now; on AWS it is pushed to ECR for every VM",
+		Short: "Build (or pull) the project image on a runner now, even if its last build failed; on AWS it is pushed to ECR for every VM",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load(f.dir)

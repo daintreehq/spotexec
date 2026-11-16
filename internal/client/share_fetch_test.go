@@ -314,7 +314,7 @@ func TestFetchImageColdBuildsAndWaitsForItsPush(t *testing.T) {
 			_ = c.Send(protocol.TypeShareDone, protocol.ShareDone{OK: true, MS: 99})
 		}
 	})
-	r, shared, push, err := fetchImage(ctx, c, Options{Rep: rep}, "aws#1", io.Discard, sharedImage(), time.Minute)
+	r, shared, push, err := fetchImage(ctx, c, Options{Rep: rep}, "aws#1", io.Discard, nil, imageMemo{}, sharedImage(), time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestFetchImageWithoutRegistrySendsOneRequest(t *testing.T) {
 	c := newScript(t, func(c *protocol.Conn, typ string, msg json.RawMessage) {
 		_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Image: "node:22", Pulled: true})
 	})
-	r, shared, push, err := fetchImage(ctx, c, Options{Rep: &recRep{}}, "aws#1", io.Discard, protocol.Image{Ref: "node:22"}, time.Minute)
+	r, shared, push, err := fetchImage(ctx, c, Options{Rep: &recRep{}}, "aws#1", io.Discard, nil, imageMemo{}, protocol.Image{Ref: "node:22"}, time.Minute)
 	if err != nil || r.Image != "node:22" || shared.led || push != nil {
 		t.Fatalf("r %+v, shared %+v, push %+v, %v", r, shared, push, err)
 	}
