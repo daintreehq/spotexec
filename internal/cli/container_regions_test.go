@@ -24,7 +24,7 @@ func regionsTestView() regionsView {
 				Deps: provider.Holding{State: provider.HoldPresent}, DepsKey: "k1",
 				Kept: []provider.ECRImage{{Tags: []string{"0123456789abcdef"}, Digest: "sha256:m1", PushedAt: pushed}}},
 			{Region: "ap-south-1", Image: provider.Holding{State: provider.HoldUnknown, Why: "BatchGetImage: ThrottlingException"},
-				Deps: provider.Holding{State: provider.HoldUnknown, Why: "keyed by this region's image, which couldn't be looked up"},
+				Deps:    provider.Holding{State: provider.HoldUnknown, Why: "keyed by this region's image, which couldn't be looked up"},
 				KeptErr: "DescribeImages: AccessDeniedException"},
 		}}
 }
