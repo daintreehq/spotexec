@@ -25,6 +25,7 @@ func TestRunFlagsBeforeASubcommandExit125(t *testing.T) {
 		{"--exclusive", "doctor"},
 		{"--json=false", "status"},
 		{"--json", "--help=false", "status"},
+		{"--help=false", "--json", "status", "pull"},
 		{"-C", dir, "status"},
 		{"-C" + dir, "version"},
 		{"-C", dir, "--json", "help"},

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -103,8 +104,14 @@ type nopWriter struct{}
 
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
+// isHelpFlag reports a first word that asks for the help or the version.
+// --help=false asks for neither: the run flags after it are parsed as run
+// flags, not handed to Cobra's root, which doesn't know them.
 func isHelpFlag(s string) bool {
-	s, _, _ = strings.Cut(s, "=") // --help=true too
+	s, v, valued := strings.Cut(s, "=") // --help=true too
+	if on, err := strconv.ParseBool(v); s == "--help" && valued && (err != nil || !on) {
+		return false
+	}
 	return s == "-h" || s == "--help" || s == "--version" || s == "-v"
 }
 
