@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -118,7 +119,8 @@ func TestProjectKeysOneRegion(t *testing.T) {
 	}
 	// A Dockerfile that isn't in the checkout: no tag, and the reason.
 	p.Container.Dockerfile = "missing/Dockerfile"
-	if pj, err := ProjectKeys(p, ws, m, false, r); err == nil || pj.ImageTag != "" || !pj.Image {
+	if pj, err := ProjectKeys(p, ws, m, false, r); err == nil || pj.ImageTag != "" || !pj.Image ||
+		!strings.Contains(err.Error(), "image tag") || !strings.Contains(err.Error(), "missing/Dockerfile") {
 		t.Fatalf("missing Dockerfile: %+v, %v", pj, err)
 	}
 }

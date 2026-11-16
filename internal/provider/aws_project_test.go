@@ -15,11 +15,12 @@ func holdingsEnv(t *testing.T) (*AWSGlobal, *fakeRegionsEC2) {
 	t.Helper()
 	g, f := twoRegionEnv(t, "0.100", "0.096", nil)
 	f.images = map[string]map[string]string{
-		"r-one-1": {"t1": "sha256:one", "t0": "sha256:old"},
+		"r-one-1": {"t1": "sha256:one", "t0": "sha256:old", "t2": "sha256:oldest"},
 		"r-two-1": {"t0": "sha256:old2"},
 	}
 	f.pushed = map[string]map[string]int64{
-		"r-one-1": {"t1": 1794739200123, "t0": 1794652800000},
+		// Listed by name, newest name first (t2, t1, t0): not by push time.
+		"r-one-1": {"t1": 1794739200123, "t0": 1794652800000, "t2": 1794500000000},
 		"r-two-1": {"t0": 1794600000000},
 	}
 	return g, f
@@ -49,6 +50,7 @@ func TestProjectHoldingsImageAndDeps(t *testing.T) {
 	want := []ECRImage{
 		{Tags: []string{"t1"}, Digest: "sha256:m-t1", PushedAt: pushed, Bytes: 1000},
 		{Tags: []string{"t0"}, Digest: "sha256:m-t0", PushedAt: time.UnixMilli(1794652800000).UTC(), Bytes: 1000},
+		{Tags: []string{"t2"}, Digest: "sha256:m-t2", PushedAt: time.UnixMilli(1794500000000).UTC(), Bytes: 1000},
 	}
 	if !reflect.DeepEqual(one.Kept, want) || one.KeptErr != "" {
 		t.Fatalf("r-one-1 kept %+v (%s), want %+v", one.Kept, one.KeptErr, want)
@@ -64,8 +66,8 @@ func TestProjectHoldingsImageAndDeps(t *testing.T) {
 	if c := f.callsOf("HEAD s3"); len(c) != 1 || !strings.HasPrefix(c[0], "r-one-1 ") {
 		t.Fatalf("cache lookups %v", c)
 	}
-	// Both images were listed page by page.
-	if c := f.callsOf("DescribeImages spotexec/repo1"); len(c) != 3 {
+	// Every image was listed page by page.
+	if c := f.callsOf("DescribeImages spotexec/repo1"); len(c) != 4 {
 		t.Fatalf("listing calls %v", c)
 	}
 	// Read-only: nothing is created, logged into or configured.
@@ -73,6 +75,20 @@ func TestProjectHoldingsImageAndDeps(t *testing.T) {
 		if !strings.Contains(c, " DescribeImages ") && !strings.Contains(c, " BatchGetImage ") && !strings.Contains(c, " HEAD s3") && !strings.Contains(c, " DescribeRegions") {
 			t.Errorf("unexpected call %q", c)
 		}
+	}
+
+	// The same tag in another region is another image: its archive is the
+	// one keyed by that region's image ID.
+	f.mu.Lock()
+	f.images["r-two-1"]["t1"] = "sha256:two"
+	f.cached["r-two-1"] = map[string]bool{"repo1/k-sha256:one.tar": true}
+	f.mu.Unlock()
+	hs, _ = g.ProjectHoldings(context.Background(), pj)
+	if two := hs[1]; two.Image.State != HoldPresent || two.ImageID != "sha256:two" || two.DepsKey != "k-sha256:two" || two.Deps.State != HoldMissing {
+		t.Fatalf("r-two-1 with its own image: %+v", two)
+	}
+	if one := hs[0]; one.Deps.State != HoldPresent || one.DepsKey != "k-sha256:one" {
+		t.Fatalf("r-one-1 again: %+v", one)
 	}
 }
 

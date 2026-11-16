@@ -92,10 +92,13 @@ first. Nothing is created or changed.`,
 			v := regionsView{runner: r.Name, project: l.ws.RepoName, repoID: l.ws.RepoID, platform: "linux/" + r.Arch,
 				dockerfile: ctr.Dockerfile, pj: pj, holdings: hs, regionsErr: err, now: time.Now()}
 			if asJSON {
-				return v.writeJSON(os.Stdout)
+				if err := v.writeJSON(os.Stdout); err != nil {
+					return err
+				}
+			} else {
+				v.writeText(os.Stdout)
 			}
-			v.writeText(os.Stdout)
-			return nil
+			return v.failed()
 		},
 	}
 	c.Flags().BoolVar(&asJSON, "json", false, "JSON output")
@@ -154,6 +157,21 @@ func (v regionsView) writeJSON(w io.Writer) error {
 	return enc.Encode(out)
 }
 
+// failed is the command's error when no region could be looked up at
+// all (expired credentials, the deadline), so scripts can tell that from
+// regions that hold nothing; partial failures show in the rows.
+func (v regionsView) failed() error {
+	for _, h := range v.holdings {
+		known := func(x provider.Holding) bool {
+			return x.State == provider.HoldPresent || x.State == provider.HoldMissing
+		}
+		if known(h.Image) || known(h.Deps) {
+			return nil
+		}
+	}
+	return fmt.Errorf("no region of %s could be looked up", v.runner)
+}
+
 // holdingText is a holding as the table shows it.
 func holdingText(h provider.Holding) string {
 	s := map[string]string{provider.HoldPresent: "yes", provider.HoldMissing: "no", provider.HoldNotUsed: "-", provider.HoldUnknown: "unknown"}[h.State]
@@ -200,20 +218,25 @@ func (v regionsView) writeText(w io.Writer) {
 	if v.regionsErr != nil {
 		fmt.Fprintf(w, "\nThe runner's regions may be incomplete: %v\n", v.regionsErr)
 	}
-	fmt.Fprintln(w, "\nEach region builds and keeps its own image, and the dependency archive is keyed by it: a run that lands where either is missing builds the image or installs dependencies first.")
+	if image {
+		fmt.Fprintln(w, "\nEach region builds and keeps its own image, and the dependency archive is keyed by it: a run that lands where either is missing builds the image or installs dependencies first.")
+	} else {
+		fmt.Fprintln(w, "\nEach region keeps its own dependency cache: a run that lands where the archive is missing installs dependencies first.")
+	}
 }
 
 // writeKept lists the other tags each region's repository keeps.
 func (v regionsView) writeKept(w io.Writer) {
 	fmt.Fprintf(w, "\nOther tags kept (ECR keeps a region's newest 10 images):\n")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	rows := 0
+	rows, listed := 0, 0
 	var failed []string
 	for _, h := range v.holdings {
 		if h.KeptErr != "" {
 			failed = append(failed, fmt.Sprintf("  %s: couldn't list images: %s", h.Region, h.KeptErr))
 			continue
 		}
+		listed++
 		for _, img := range h.Kept {
 			var other []string
 			for _, t := range img.Tags {
@@ -232,7 +255,12 @@ func (v regionsView) writeKept(w io.Writer) {
 			rows++
 		}
 	}
-	if rows == 0 {
+	switch {
+	case rows == 0 && listed == 0:
+		fmt.Fprintln(tw, "  unknown: no region's images could be listed")
+	case rows == 0 && len(failed) > 0:
+		fmt.Fprintln(tw, "  none in the regions listed")
+	case rows == 0:
 		fmt.Fprintln(tw, "  none")
 	}
 	tw.Flush()
