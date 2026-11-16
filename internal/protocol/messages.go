@@ -56,7 +56,12 @@ const (
 	CodeSyncFailed   = "SYNC_FAILED"
 	CodeDepsFailed   = "DEPS_FAILED"
 	CodeImageFailed  = "IMAGE_FAILED"
-	CodeShutdown     = "RUNNER_SHUTTING_DOWN" // the VM began shutting down under the request
+	// CodeImageBuildFailed: the project's own Dockerfile failed to build
+	// (a RUN step failing, a syntax error, a COPY source missing), the
+	// project's failure rather than spotexec's. Detail is the end of the
+	// build's output.
+	CodeImageBuildFailed = "IMAGE_BUILD_FAILED"
+	CodeShutdown         = "RUNNER_SHUTTING_DOWN" // the VM began shutting down under the request
 )
 
 // ErrorMsg is sent by the helper for any failed request.

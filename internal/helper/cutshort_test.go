@@ -23,6 +23,8 @@ func TestCutShortOnlyWhileStopping(t *testing.T) {
 		{perr(protocol.CodeImageFailed, "docker build: exit 1"), true, protocol.CodeShutdown},
 		{perr(protocol.CodeDepsFailed, "install command exited 1"), false, protocol.CodeDepsFailed},
 		{perr(protocol.CodeImageFailed, "docker build: exit 1"), false, protocol.CodeImageFailed},
+		{perr(protocol.CodeImageBuildFailed, "a RUN step exited 137"), true, protocol.CodeShutdown},
+		{perr(protocol.CodeImageBuildFailed, "a RUN step exited 1"), false, protocol.CodeImageBuildFailed},
 		{perr(protocol.CodeBadRequest, "no"), true, protocol.CodeBadRequest},
 	} {
 		stoppingNow = func() bool { return tc.stopping }

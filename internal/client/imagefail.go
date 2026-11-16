@@ -49,8 +49,9 @@ func newImageMemo(repo string) imageMemo { return imageMemo{dir: imageFailDir(),
 type imageFailure struct {
 	Repo      string    `json:"repo"`
 	Tag       string    `json:"tag"`
-	Message   string    `json:"message"` // the helper's error
-	Who       string    `json:"who"`     // the run that built it: "aws#3"
+	Code      string    `json:"code,omitempty"` // the helper's error code ("": IMAGE_FAILED)
+	Message   string    `json:"message"`        // the helper's error
+	Who       string    `json:"who"`            // the run that built it: "aws#3"
 	At        time.Time `json:"at"`
 	Tail      string    `json:"tail,omitempty"` // its last lines of output
 	Truncated bool      `json:"truncated,omitempty"`
@@ -134,36 +135,50 @@ func (m imageMemo) prune() {
 
 // ImageBuildError is a failed build of the project's image: this run's own
 // build, or (Cached) one an earlier run made, which this run didn't repeat.
-// Its message stays one line; Detail explains it.
+// Its message stays one line; Detail explains it. When the project's own
+// Dockerfile is at fault (Project), the run exits ExitImageBuild rather
+// than ExitInfra and is neither replayed nor run locally instead (#193).
 type ImageBuildError struct {
 	Err    error
 	Cached bool
-	Until  time.Time // builds of this image fail at once until then
+	Until  time.Time // builds of this image fail at once until then (zero: not remembered)
 	imageFailure
 }
 
 func (e *ImageBuildError) Error() string { return e.Err.Error() }
 func (e *ImageBuildError) Unwrap() error { return e.Err }
 
+// Project reports whether the project's Dockerfile itself failed to build
+// (IMAGE_BUILD_FAILED): the project's failure, not spotexec's.
+func (e *ImageBuildError) Project() bool { return e.Code == protocol.CodeImageBuildFailed }
+
 // cachedError is the error of a run that needs an image whose build f
 // failed: the original build's, marked as not repeated.
 func (f imageFailure) cachedError(now time.Time) *ImageBuildError {
 	msg := fmt.Sprintf("%s (from %s's build %s ago; not building it again)", f.Message, f.Who, ui.Dur(now.Sub(f.At).Round(time.Second)))
-	re := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: msg, BuildFailed: true}}
+	code := f.Code
+	if code == "" {
+		code = protocol.CodeImageFailed
+	}
+	re := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: code, Message: msg, BuildFailed: true}}
 	return &ImageBuildError{Err: fmt.Errorf("container image: %w", re), Cached: true, Until: f.At.Add(imageFailAge), imageFailure: f}
 }
 
 // Detail is what to show under the error: the build's output (a fresh
-// build's was shown as it ran), where its full log is, and how to build
-// the image again.
+// build's was shown as it ran, but the end of it is shown again when the
+// Dockerfile is at fault), where its full log is, and how to build the
+// image again.
 func (e *ImageBuildError) Detail() []string {
 	var out []string
-	if e.Cached && e.Tail != "" {
+	if (e.Cached || e.Project()) && e.Tail != "" {
 		lines := ui.CleanLines(e.Tail)
-		if e.Truncated {
+		switch {
+		case e.Truncated:
 			out = append(out, fmt.Sprintf("last %d lines of the build's output:", len(lines)))
-		} else {
+		case e.Cached:
 			out = append(out, "the build's output:")
+		default:
+			out = append(out, "end of the build's output:")
 		}
 		for _, l := range lines {
 			out = append(out, "  "+l)
@@ -174,7 +189,9 @@ func (e *ImageBuildError) Detail() []string {
 			out = append(out, "full log: "+e.Log)
 		}
 	}
-	out = append(out, fmt.Sprintf("runs needing this image fail at once until %s, unless its Dockerfile or build context changes; `spotexec container build` builds it again now",
-		e.Until.Local().Format("15:04")))
+	if !e.Until.IsZero() {
+		out = append(out, fmt.Sprintf("runs needing this image fail at once until %s, unless its Dockerfile or build context changes; `spotexec container build` builds it again now",
+			e.Until.Local().Format("15:04")))
+	}
 	return out
 }

@@ -119,8 +119,15 @@ type procResult struct {
 	startErr error
 }
 
+// teeOut, passed to runProc as out, sees the output as it goes to the
+// client as frames (kind is the frame's kind).
+type teeOut func(kind byte, p []byte)
+
+// Write is never called: runProc hands teeOut each chunk with its kind.
+func (t teeOut) Write(p []byte) (int, error) { t(protocol.KindStdout, p); return len(p), nil }
+
 // Output goes to the client as frames, or into out when it is set (and
-// nothing reaches the client).
+// nothing reaches the client), unless out is a teeOut: then it goes to both.
 func (s *Session) runProc(script, dir string, env map[string]string, timeout, grace time.Duration, spotWatch bool, out io.Writer) procResult {
 	pr := s.runProc1(script, dir, env, timeout, grace, spotWatch, out)
 	if s.stopping.Load() {
@@ -203,12 +210,16 @@ func (s *Session) runProc1(script, dir string, env map[string]string, timeout, g
 	_ = s.c.Send(protocol.TypeStarted, protocol.Started{PID: pgid})
 
 	var wg sync.WaitGroup
+	tee, teeing := out.(teeOut)
 	pump := func(r *os.File, kind byte) {
 		defer wg.Done()
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := r.Read(buf)
-			if n > 0 && out != nil {
+			if n > 0 && teeing {
+				tee(kind, buf[:n])
+			}
+			if n > 0 && !teeing && out != nil {
 				_, _ = out.Write(buf[:n])
 			} else if n > 0 {
 				if werr := s.c.WriteFrame(kind, append([]byte(nil), buf[:n]...)); werr != nil {

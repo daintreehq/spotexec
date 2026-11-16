@@ -186,6 +186,10 @@ func TestShutdownIsALostRunner(t *testing.T) {
 	if got := lostRunner(spot, other); got != "" {
 		t.Fatalf("an ordinary helper error counted as a lost runner (%q)", got)
 	}
+	broken := imageBuildError(fmt.Errorf("container image: %w", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageBuildFailed, Message: "x"}}))
+	if got := lostRunner(spot, broken); got != "" {
+		t.Fatalf("a broken Dockerfile counted as a lost runner (%q)", got)
+	}
 	static := &Lease{Runner: &config.Runner{Type: config.TypeSSH}}
 	if got := lostRunner(static, shutdown); got != "" {
 		t.Fatalf("a static runner is never replayed (%q)", got)

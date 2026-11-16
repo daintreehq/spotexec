@@ -281,7 +281,7 @@ var stoppingNow = systemStopping
 // replayed elsewhere.
 func cutShort(err error) error {
 	var pe *protoError
-	if errors.As(err, &pe) && (pe.code == protocol.CodeDepsFailed || pe.code == protocol.CodeImageFailed) && stoppingNow() {
+	if errors.As(err, &pe) && (pe.code == protocol.CodeDepsFailed || pe.code == protocol.CodeImageFailed || pe.code == protocol.CodeImageBuildFailed) && stoppingNow() {
 		return &protoError{code: protocol.CodeShutdown, msg: "the runner is shutting down: " + pe.msg, detail: pe.detail}
 	}
 	return err

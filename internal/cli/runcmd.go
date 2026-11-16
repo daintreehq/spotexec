@@ -649,14 +649,15 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 			warnUnknownTask(rep, l.cfg.Project, s.taskLike, code, s.taskLike != "" && code == 127 && !localCommand(l, o, s.taskLike), true)
 			return code
 		}
-		finish(client.ExitInfra)
+		code := failExit(err)
+		finish(code)
 		rep.Clear()
 		rep.Event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 		if !rep.IsJSON() {
 			fmt.Fprintf(os.Stderr, "spotexec: %v\n", err)
 			errDetail(os.Stderr, "", err)
 		}
-		return client.ExitInfra
+		return code
 	}
 	if ctx.Err() != nil && !res.Canceled {
 		// Interrupted after the command finished (while the session closed).
@@ -1118,7 +1119,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 				interrupted = ctx.Err() != nil
 			}
 			if err != nil {
-				out.code = client.ExitInfra
+				out.code = failExit(err)
 			}
 			code := out.code
 			out.took = res.Duration
@@ -1292,7 +1293,17 @@ var errorCodes = map[string]bool{
 	protocol.CodeDraining: true, protocol.CodeBooting: true, protocol.CodeBootFailed: true,
 	protocol.CodeQueueTimeout: true, protocol.CodeBadRequest: true, protocol.CodeInternal: true,
 	protocol.CodeSyncFailed: true, protocol.CodeDepsFailed: true, protocol.CodeImageFailed: true,
-	protocol.CodeShutdown: true,
+	protocol.CodeImageBuildFailed: true, protocol.CodeShutdown: true,
+}
+
+// failExit is the exit code of a run that failed with err: 123 when the
+// project's Dockerfile failed to build, else 125 (spotexec failed).
+func failExit(err error) int {
+	var be *client.ImageBuildError
+	if errors.As(err, &be) && be.Project() {
+		return client.ExitImageBuild
+	}
+	return client.ExitInfra
 }
 
 // errDetail prints, under a failed dependency install's or image build's

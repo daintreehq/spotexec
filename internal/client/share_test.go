@@ -267,7 +267,7 @@ func TestShareLostLeaderHandsOver(t *testing.T) {
 // the waiting parts go on at once, each on its own, instead of retrying it
 // one after another. prepareImage wraps the runner's error.
 func TestShareFailedInstallReleasesTheWaiters(t *testing.T) {
-	for _, code := range []string{protocol.CodeImageFailed, protocol.CodeDepsFailed} {
+	for _, code := range []string{protocol.CodeImageFailed, protocol.CodeImageBuildFailed, protocol.CodeDepsFailed} {
 		t.Run(code, func(t *testing.T) {
 			ctx := fastShare(t)
 			bad := fmt.Errorf("prepare: %w", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: code, Message: "exit 1"}})
