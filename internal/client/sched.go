@@ -537,6 +537,10 @@ type claim struct {
 // ordinary work; skip it without contacting it.
 var errNoRoom = errors.New("no room on this instance")
 
+// errReaping: the VM is being terminated to make room (reach.go): not even
+// an exact slot may reserve it.
+var errReaping = errors.New("being terminated: this client couldn't reach it, and the fleet needed the room")
+
 // ReserveOn records an attempt on instance in for this process, before any
 // contact with it. Ordinary jobs are refused (errNoRoom) on a VM the ledger
 // shows full with other live jobs, on one fenced for an exclusive job, and
@@ -554,7 +558,10 @@ func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 		s.reconcileOwners(now)
 		v := s.vm(in.ID, now)
 		if n := st.Notes[in.ID]; n.reaping(now) {
-			if !c.Force {
+			switch {
+			case n.ReapCommitted:
+				return errReaping
+			case !c.Force:
 				return errNoRoom // being ended to make room: it can't be reached anyway
 			}
 			n.Reaping = time.Time{} // an exact slot wins: the reaper sees its claim and stands down

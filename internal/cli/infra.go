@@ -294,8 +294,8 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			b, err := c.HelperCmd(cctx, "status")
 			// Reached it, even if its helper failed (an existing SSH master
 			// may answer for a connection that is gone: only the command
-			// says).
-			st.answered = err == nil || !transport.IsConnError(err)
+			// says, and one cut short by the deadline says nothing).
+			st.answered = err == nil || (!transport.IsConnError(err) && cctx.Err() == nil)
 			if err != nil {
 				st.Error = err.Error()
 				return

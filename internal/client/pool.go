@@ -70,6 +70,9 @@ type note struct {
 	// Reaping: when a process began ending the VM to make room (reach.go):
 	// no new runs go there meanwhile.
 	Reaping time.Time `json:"reaping,omitempty"`
+	// ReapCommitted: its termination request is going out: no claim at
+	// all, an exact slot's included, reserves it now.
+	ReapCommitted bool `json:"reap_committed,omitempty"`
 }
 
 // closed reports whether an instance takes no new runs and isn't capacity:
@@ -645,7 +648,8 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
 			if id, region := p.reapable(st, time.Now()); id != "" {
 				d.Reap = []string{id}
-				st.note(id).Reaping = time.Now()
+				n := st.note(id)
+				n.Reaping, n.ReapCommitted = time.Now(), false
 				d.Reason += fmt.Sprintf("; ending %s, in %s, which this client can't reach, to make room", id, region)
 			}
 		case p.R.Capped() && total >= 2*p.R.MaxInstances:

@@ -456,7 +456,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				continue
 			}
 			for _, id := range d.Reap {
-				if !m.pool.stillReaping(id) {
+				if !m.pool.commitReap(id) {
 					continue // a run reserved it meanwhile
 				}
 				// At max_instances with VMs this client can't reach: end one,
@@ -1039,7 +1039,11 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 		if syncing {
 			c.Worktree = ws.WorktreeKey
 		}
-		if id, err := pool.reserveOn(in, c); err == nil {
+		id, err := pool.reserveOn(in, c)
+		if errors.Is(err, errReaping) {
+			return nil, fmt.Errorf("%w: %s, which held it, is %v", ErrSlotGone, lr.InstanceID, err)
+		}
+		if err == nil {
 			aid = id
 			req.Base.Client.Attempt = aid
 			req.onSend = func() error {

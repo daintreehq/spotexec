@@ -309,14 +309,22 @@ func TestExactSlotStopsReap(t *testing.T) {
 	p, _ := regionPool(t, 2, a1, a2)
 	failTwice(p, a1)
 	failTwice(p, a2)
-	if d := planOnce(t, p); len(d.Reap) != 1 || d.Reap[0] != "i-a2" || !p.stillReaping("i-a2") {
+	if d := planOnce(t, p); len(d.Reap) != 1 || d.Reap[0] != "i-a2" {
 		t.Fatalf("%+v", d)
 	}
 	if _, err := p.reserveOn(a2, claim{Exact: true, Force: true}); err != nil {
 		t.Fatal(err)
 	}
-	if p.stillReaping("i-a2") {
+	if p.commitReap("i-a2") {
 		t.Fatal("reaping a VM an exact slot reserved")
+	}
+	// Once committed, not even an exact slot reserves it.
+	d := planOnce(t, p)
+	if len(d.Reap) != 1 || d.Reap[0] != "i-a1" || !p.commitReap("i-a1") {
+		t.Fatalf("%+v", d)
+	}
+	if _, err := p.reserveOn(a1, claim{Exact: true, Force: true}); err != errReaping {
+		t.Fatalf("reserved a VM being terminated: %v", err)
 	}
 }
 

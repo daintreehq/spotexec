@@ -142,13 +142,17 @@ func (n *note) reaping(now time.Time) bool {
 	return n != nil && !n.Reaping.IsZero() && now.Sub(n.Reaping) < time.Minute
 }
 
-// stillReaping reports, just before it is terminated, whether a VM Plan
-// chose to end still is: no run reserved it since (an exact slot clears
-// the mark).
-func (p *Pool) stillReaping(id string) bool {
+// commitReap reports, just before it is terminated, whether a VM Plan
+// chose to end still is (no run reserved it since: an exact slot clears
+// the mark), and if so commits to it: from then on no claim reserves it.
+func (p *Pool) commitReap(id string) bool {
 	ok := false
 	_ = p.with(func(st *poolState) error {
-		ok = st.Notes[id].reaping(time.Now()) && !st.sched().protected(id)
+		n := st.Notes[id]
+		ok = n.reaping(time.Now()) && !st.sched().protected(id)
+		if ok {
+			n.ReapCommitted = true
+		}
 		return nil
 	})
 	return ok
