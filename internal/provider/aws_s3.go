@@ -124,8 +124,13 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 		}
 	case status == 404:
 		return "", "", fmt.Errorf("cache bucket %s does not exist (create it, or use cache_bucket = \"auto\")", bucket)
+	case status == 403 && auto:
+		return "", "", fmt.Errorf("cache bucket %s: access denied: the key needs the S3 statement of spotexec's policy (re-run `spotexec setup` to refresh it), or set cache_bucket = \"off\"", bucket)
 	case status == 403:
-		return "", "", fmt.Errorf("cache bucket %s is not owned by account %s or not accessible (set cache_bucket to another name, or \"off\")", bucket, acct)
+		// S3 says 403 both for a bucket another account owns and for one
+		// this key may not read; spotexec's policy only covers its own
+		// spotexec-cache-* buckets, so a named one needs its own grant.
+		return "", "", fmt.Errorf("cache bucket %s: access denied: either it isn't owned by account %s, or the key has no access to it. spotexec's policy only covers spotexec-cache-* buckets, so a bucket you name needs its own grant of s3:ListBucket on the bucket and s3:GetObject and s3:PutObject on its objects (see docs/aws.md); or use cache_bucket = \"auto\" or \"off\"", bucket, acct)
 	default:
 		return "", "", fmt.Errorf("checking cache bucket %s: HTTP %d", bucket, status)
 	}

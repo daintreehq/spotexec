@@ -69,8 +69,9 @@ var accountResolver = func(profile string) *awsCredResolver { return &awsCredRes
 var accountEndpoints map[string]string
 
 func accountClient(region string, creds *awsCredResolver) *awsClient {
-	// IAM is global; ECR's API host is api.ecr.<region>.
-	ep := map[string]string{"iam": "https://iam.amazonaws.com/", "ecr": "https://api.ecr." + region + ".amazonaws.com/"}
+	// IAM's endpoint is its partition's (awsClient.endpoint); ECR's API
+	// host is api.ecr.<region>.
+	ep := map[string]string{"ecr": "https://api.ecr." + region + ".amazonaws.com/"}
 	for k, v := range accountEndpoints {
 		ep[k] = v
 	}

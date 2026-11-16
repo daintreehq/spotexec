@@ -45,6 +45,7 @@ type TeardownPlan struct {
 	Failed   []string       `json:"failed,omitempty"` // what couldn't be listed
 
 	adminProfile string
+	home         string // the partition's account-wide region (IAM, STS, ListBuckets)
 }
 
 // Teardown timings (tests shorten them).
@@ -60,7 +61,11 @@ var (
 // Only resources carrying spotexec's tags, or its exact names, are
 // included. regions defaults to every region enabled in the account.
 func PlanTeardown(ctx context.Context, adminProfile string, regions []string) (*TeardownPlan, error) {
-	admin := accountClient("us-east-1", accountResolver(adminProfile))
+	home, err := AccountRegion(adminProfile, regions)
+	if err != nil {
+		return nil, err
+	}
+	admin := accountClient(home, accountResolver(adminProfile))
 	acct, arn, err := callerIdentity(ctx, admin)
 	if err != nil {
 		return nil, fmt.Errorf("removing spotexec from an AWS account needs an admin session: %w", err)
@@ -68,19 +73,16 @@ func PlanTeardown(ctx context.Context, adminProfile string, regions []string) (*
 	if strings.Contains(arn, ":user"+iamUserPath) {
 		return nil, fmt.Errorf("signed in as %s, a spotexec machine user, which can't remove spotexec: sign in as an administrator (or pass --admin-profile)", arn)
 	}
-	p := &TeardownPlan{Account: acct, AdminARN: arn, adminProfile: adminProfile}
+	p := &TeardownPlan{Account: acct, AdminARN: arn, adminProfile: adminProfile, home: home}
 	if len(regions) == 0 {
 		b, err := admin.ec2(ctx, "DescribeRegions", nil)
 		if err != nil {
 			return nil, fmt.Errorf("listing the account's regions: %w", err)
 		}
-		var v struct {
-			Regions []string `xml:"regionInfo>item>regionName"`
+		// Regions the account hasn't opted into can't be searched.
+		if regions, err = parseDescribeRegions(b); err != nil {
+			return nil, fmt.Errorf("listing the account's regions: %w", err)
 		}
-		if err := xml.Unmarshal(b, &v); err != nil || len(v.Regions) == 0 {
-			return nil, fmt.Errorf("listing the account's regions: %v", err)
-		}
-		regions = v.Regions
 	}
 	sort.Strings(regions)
 	p.Regions = regions
@@ -120,6 +122,14 @@ func PlanTeardown(ctx context.Context, adminProfile string, regions []string) (*
 		failed("IAM users", err)
 	}
 	return p, nil
+}
+
+// homeRegion is where the plan's account-wide calls go.
+func (p *TeardownPlan) homeRegion() string {
+	if p.home == "" {
+		return homeAWS
+	}
+	return p.home
 }
 
 // Err reports what couldn't be listed.
@@ -261,7 +271,7 @@ func (p *TeardownPlan) listBuckets(ctx context.Context, admin *awsClient) error 
 		if token != "" {
 			q.Set("continuation-token", token)
 		}
-		st, b, err := s3Call(ctx, admin, "us-east-1", http.MethodGet, "", "/", q, nil, nil)
+		st, b, err := s3Call(ctx, admin, p.homeRegion(), http.MethodGet, "", "/", q, nil, nil)
 		if err != nil {
 			return "", err
 		}
@@ -284,39 +294,13 @@ func (p *TeardownPlan) listBuckets(ctx context.Context, admin *awsClient) error 
 	})
 }
 
-// listUsers finds the IAM users setup creates: exactly under /spotexec/
-// (PathPrefix would also match /spotexec/anything/).
+// listUsers finds the IAM users setup creates.
 func (p *TeardownPlan) listUsers(ctx context.Context, admin *awsClient) error {
-	return paginate(func(marker string) (string, error) {
-		q := url.Values{"PathPrefix": {iamUserPath}, "MaxItems": {"1000"}}
-		if marker != "" {
-			q.Set("Marker", marker)
-		}
-		b, err := admin.query(ctx, "iam", iamAPIVersion, "ListUsers", q)
-		if err != nil {
-			return "", iamHint(err)
-		}
-		var v struct {
-			Users []struct {
-				Name string `xml:"UserName"`
-				Path string `xml:"Path"`
-			} `xml:"ListUsersResult>Users>member"`
-			Truncated bool   `xml:"ListUsersResult>IsTruncated"`
-			Marker    string `xml:"ListUsersResult>Marker"`
-		}
-		if err := xml.Unmarshal(b, &v); err != nil {
-			return "", err
-		}
-		for _, u := range v.Users {
-			if u.Path == iamUserPath {
-				p.Items = append(p.Items, TeardownItem{Kind: KindIAMUser, ID: u.Name})
-			}
-		}
-		if !v.Truncated {
-			return "", nil
-		}
-		return v.Marker, nil
-	})
+	users, err := listSpotexecUsers(ctx, admin)
+	for _, u := range users {
+		p.Items = append(p.Items, TeardownItem{Kind: KindIAMUser, ID: u.Name})
+	}
+	return err
 }
 
 // Apply deletes everything in the plan. In order: the machines' access keys
@@ -328,7 +312,7 @@ func (p *TeardownPlan) listUsers(ctx context.Context, admin *awsClient) error {
 // remain, the security groups and IAM users are kept, so a re-run can
 // still find and finish them.
 func (p *TeardownPlan) Apply(ctx context.Context, log func(string, ...any)) error {
-	admin := accountClient("us-east-1", accountResolver(p.adminProfile))
+	admin := accountClient(p.homeRegion(), accountResolver(p.adminProfile))
 	// The session may have changed accounts while the plan was on screen.
 	if acct, _, err := callerIdentity(ctx, admin); err != nil {
 		return fmt.Errorf("checking the admin session again: %w", err)

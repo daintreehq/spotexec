@@ -70,7 +70,7 @@ and keeps a working key. --rotate replaces the key.
 				return fmt.Errorf("--hooks and --no-hooks can't be used together")
 			}
 			if printPolicy {
-				fmt.Println(provider.SpotexecPolicy)
+				fmt.Println(provider.PolicyFor(policyRegion(adminProfile)))
 				return nil
 			}
 			if list {
@@ -186,7 +186,7 @@ and keeps a working key. --rotate replaces the key.
 					case len(quotaRegions) > 0:
 						region = quotaRegions[0]
 					default:
-						region = "us-east-1" // no account can disable it
+						region, _ = provider.AccountRegion("", []string{region}) // no account can disable its partition's home
 					}
 				}
 				s := &provider.AWSUserSetup{
@@ -727,6 +727,19 @@ func awsRegions(ctx context.Context, adminProfile string) ([]string, error) {
 	}
 	// "all" is not a region.
 	return slices.DeleteFunc(out, func(s string) bool { return s == config.AllRegions }), errors.Join(errs...)
+}
+
+// policyRegion is a region in the partition the policy is printed for:
+// the first AWS runner's, else the admin profile's (commercial when
+// neither says).
+func policyRegion(adminProfile string) string {
+	if g, err := config.LoadGlobal(); err == nil {
+		if aws := awsRunners(g); len(aws) > 0 {
+			return aws[0].Region
+		}
+	}
+	rg, _ := provider.ProfileRegion(adminProfile)
+	return rg
 }
 
 func listMachines(ctx context.Context, adminProfile string) error {
