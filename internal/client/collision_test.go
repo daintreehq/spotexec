@@ -58,7 +58,7 @@ func (c *collisionRun) local(p, base, now string) {
 
 // wrote records that the remote command left p holding data.
 func (c *collisionRun) wrote(p, data string) {
-	rf := remoteFile{data: []byte(data), mode: fsid.ModeFile, id: fsid.Bytes([]byte(data))}
+	rf := spooled(c.t, data, fsid.ModeFile)
 	c.remote[p] = version{true, rf.id, rf.mode}
 	c.files[p] = rf
 }
@@ -316,7 +316,7 @@ func TestOnDiskNameWithHardLinks(t *testing.T) {
 func TestStashNeverOverwritesAnEarlierVersion(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "conflicts", "run-1")
 	file := func(data string) (version, remoteFile) {
-		rf := remoteFile{data: []byte(data), mode: fsid.ModeFile, id: fsid.Bytes([]byte(data))}
+		rf := spooled(t, data, fsid.ModeFile)
 		return version{true, rf.id, rf.mode}, rf
 	}
 	read := func(p string) string {
@@ -375,7 +375,7 @@ func TestStashFallbackForADeepPath(t *testing.T) {
 	p := strings.Repeat("d/", 120) + strings.Repeat("x", 120) + ".txt"
 	var got []string
 	for _, data := range []string{"one", "two"} {
-		rf := remoteFile{data: []byte(data), mode: fsid.ModeFile, id: fsid.Bytes([]byte(data))}
+		rf := spooled(t, data, fsid.ModeFile)
 		s, err := stashConflict(dir, p, version{true, rf.id, rf.mode}, rf)
 		if err != nil {
 			t.Fatal(err)

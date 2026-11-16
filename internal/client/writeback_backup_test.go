@@ -110,7 +110,7 @@ func (f wbFixture) apply(t *testing.T, dels []string, writes map[string]string) 
 		remote[p] = version{}
 	}
 	for p, b := range writes {
-		rf := remoteFile{data: []byte(b), id: fsid.Bytes([]byte(b)), mode: fsid.ModeFile}
+		rf := spooled(t, b, fsid.ModeFile)
 		remote[p] = version{true, rf.id, rf.mode}
 		files[p] = rf
 	}

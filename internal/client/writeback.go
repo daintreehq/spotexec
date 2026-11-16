@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -109,12 +110,14 @@ func (wb *WritebackResult) conflict(root, p string, want version, rf remoteFile,
 	return nil
 }
 
-// remoteFile is a fetched file version.
+// remoteFile is a fetched file version: a symlink's target, or a regular
+// file's content in a spool.
 type remoteFile struct {
-	data []byte
-	link string
-	mode uint32
-	id   string
+	spool string // where a regular file's content is (see spool.add)
+	size  int64  // content bytes; a symlink's target length
+	link  string
+	mode  uint32
+	id    string
 }
 
 // state of a path: absent, or (id, mode).
@@ -300,30 +303,44 @@ func writeback(ctx context.Context, fetchFiles fetchFunc, ws *Workspace, m *mani
 	}
 	sort.Strings(fetch)
 
+	// What comes back is held to the sizes the runner reported: no file
+	// larger than its entry, and no more archive than they add up to.
+	declared := map[string]int64{}
+	budget := int64(archiveSlack)
+	for _, c := range append(append([]protocol.Entry(nil), changed...), fresh...) {
+		declared[c.Path] = max(c.Size, 0)
+		budget = addCapped(budget, max(c.Size, 0)+entryOverhead)
+	}
+	sp, err := newSpool(ws)
+	if err != nil {
+		return wb, err
+	}
+	defer sp.Close()
 	files := map[string]remoteFile{}
 	blob, err := fetchFiles(protocol.Fetch{Paths: fetch, Accept: accept})
 	if err != nil {
 		return wb, err
 	}
-	if err := readTar(blob, func(h *tar.Header, rd io.Reader) error {
-		rf := remoteFile{}
+	if err := readTar(blob, budget, func(h *tar.Header, rd io.Reader) error {
+		if v, ok := remote[h.Name]; !ok || !v.exists {
+			return nil // not something we asked for
+		}
+		if _, dup := files[h.Name]; dup {
+			return fmt.Errorf("write-back: the runner sent %s twice", h.Name)
+		}
+		var rf remoteFile
 		switch h.Typeflag {
 		case tar.TypeSymlink:
-			rf.link, rf.mode, rf.id = h.Linkname, fsid.ModeSymlink, fsid.Bytes([]byte(h.Linkname))
+			rf = remoteFile{link: h.Linkname, size: int64(len(h.Linkname)), mode: fsid.ModeSymlink, id: fsid.Bytes([]byte(h.Linkname))}
 		case tar.TypeReg:
-			b, err := io.ReadAll(rd)
-			if err != nil {
-				return err
+			if h.Size > declared[h.Name] {
+				return fmt.Errorf("write-back: the runner sent %s at %s, larger than the %s it reported; nothing was applied, re-run", h.Name, ui.Bytes(h.Size), ui.Bytes(declared[h.Name]))
 			}
-			rf.data, rf.id, rf.mode = b, fsid.Bytes(b), fsid.ModeFile
-			if h.Mode&0o111 != 0 {
-				rf.mode = fsid.ModeExec
+			if rf, err = sp.add(h, rd); err != nil {
+				return err
 			}
 		default:
 			return nil
-		}
-		if v, ok := remote[h.Name]; !ok || !v.exists {
-			return nil // not something we asked for
 		}
 		files[h.Name] = rf
 		return nil
@@ -495,7 +512,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 			wb.Applied = append(wb.Applied, q)
 			appliedLink(q, rf)
 			wb.Deleted = append(wb.Deleted, del)
-			m.Update(protocol.Entry{Path: q, ID: rf.id, Mode: rf.mode, Size: int64(len(rf.data))})
+			m.Update(protocol.Entry{Path: q, ID: rf.id, Mode: rf.mode, Size: rf.size})
 			break
 		}
 	}
@@ -556,7 +573,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 				}
 				wb.Applied = append(wb.Applied, p)
 				appliedLink(p, rf)
-				m.Update(protocol.Entry{Path: p, ID: rf.id, Mode: rf.mode, Size: int64(len(rf.data))})
+				m.Update(protocol.Entry{Path: p, ID: rf.id, Mode: rf.mode, Size: rf.size})
 			} else {
 				full, err := fsid.SafeJoin(ws.Root, p)
 				if errors.Is(err, fsid.ErrSymlinkParent) {
@@ -1066,7 +1083,7 @@ func writeLocal(root, p string, rf remoteFile, expect *version) error {
 		if _, existing := replacementPerm(full, rf.mode); existing {
 			stage = 0o600
 		}
-		if err := os.WriteFile(tmp, rf.data, stage); err != nil {
+		if err := copyContent(tmp, rf, stage); err != nil {
 			os.Remove(tmp)
 			return err
 		}
@@ -1146,32 +1163,109 @@ func pruneEmptyDirs(root string, dirs []string) {
 	}
 }
 
-func readTar(r io.Reader, fn func(*tar.Header, io.Reader) error) error {
+// readTar calls fn for each entry of r, a gzip'd tar blob, then reads r to
+// its end. It fails when the gzip stream is truncated or corrupt (its CRC and
+// length are checked) and when the sender ended the blob with an error; a
+// read that fails mid-stream reports the sender's error, when it sent one,
+// rather than what its absence did to the decompressor (unexpected EOF).
+//
+// limit, when above 0, caps the decompressed archive: past it, readTar fails
+// without reading further.
+func readTar(r io.Reader, limit int64, fn func(*tar.Header, io.Reader) error) error {
 	zr, err := gzip.NewReader(r)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil
+			return drainBlob(r, nil) // nothing sent: only how it ended
 		}
-		return err
+		return drainBlob(r, err)
 	}
-	tr := tar.NewReader(zr)
+	defer zr.Close()
+	zr.Multistream(false) // the sender writes one gzip member; nothing follows it
+	var archive io.Reader = zr
+	if limit > 0 {
+		archive = &capReader{r: zr, left: limit, max: limit}
+	}
+	tr := tar.NewReader(archive)
 	for {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return err
+			return drainBlob(r, err)
 		}
 		if _, err := fsid.CleanRel(h.Name); err != nil {
 			continue // never a name we asked for: skip it, don't abort
 		}
-		if err := fn(h, tr); err != nil {
+		if err := fn(h, entryReader{tr}); err != nil {
+			if rerr := (*streamError)(nil); errors.As(err, &rerr) {
+				return drainBlob(r, rerr.err)
+			}
 			return err
 		}
 	}
-	_, _ = io.Copy(io.Discard, r)
-	return nil
+	// The tar ends before the gzip trailer: reading on to the end of the
+	// gzip stream is what checks its CRC and length. A tar writer leaves
+	// nothing after the archive, or a little padding; more is refused
+	// rather than decompressed.
+	if n, err := io.Copy(io.Discard, io.LimitReader(archive, maxTrailing+1)); err != nil {
+		return drainBlob(r, err)
+	} else if n > maxTrailing {
+		return fmt.Errorf("%w: data after the end of the archive", errArchiveTooLarge)
+	}
+	if err := zr.Close(); err != nil {
+		return drainBlob(r, err)
+	}
+	return drainBlob(r, nil)
+}
+
+const (
+	// maxTrailing is how much decompressed data may follow a tar's end.
+	maxTrailing = 64 << 10
+	// entryOverhead bounds one entry's tar metadata (header, long-name
+	// records, padding); archiveSlack covers the end of the archive.
+	entryOverhead = 8 << 10
+	archiveSlack  = 1 << 20
+)
+
+// addCapped adds b to a, saturating instead of overflowing.
+func addCapped(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// entryReader reads one entry for fn, marking a failed read as the stream's
+// (a streamError) so readTar can report the sender's error in its place.
+type entryReader struct{ r io.Reader }
+
+func (e entryReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		err = &streamError{err}
+	}
+	return n, err
+}
+
+// streamError marks an error fn got reading an entry, as opposed to one of
+// its own: readTar reports the sender's error in its place, when there is one.
+type streamError struct{ err error }
+
+func (e *streamError) Error() string { return e.err.Error() }
+func (e *streamError) Unwrap() error { return e.err }
+
+// drainBlob reads r to its end and returns the error it ends with (the
+// sender's, for a blob it closed with one), else err. An archive over its
+// cap is not read on: err is returned as it is.
+func drainBlob(r io.Reader, err error) error {
+	if errors.Is(err, errArchiveTooLarge) {
+		return err
+	}
+	if _, derr := io.Copy(io.Discard, r); derr != nil {
+		return derr
+	}
+	return err
 }
 
 // lockFile takes the worktree's write-back lock, waiting no longer than ctx
@@ -1430,40 +1524,58 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 			fmt.Fprintf(os.Stderr, "spotexec: pull skipped %d held file(s) that changed in the slot after the run: %s\n", len(stale), strings.Join(firstN(stale, 5), ", "))
 		}
 	}()
-	n := 0
-	err = readTar(blob, func(h *tar.Header, rd io.Reader) error {
-		if !allowed[h.Name] {
-			return nil
+	// Every file is spooled and the archive checked whole before any is
+	// written: a stream that turns out truncated or corrupt writes nothing.
+	sp, err := newSpool(ws)
+	if err != nil {
+		return 0, err
+	}
+	defer sp.Close()
+	type pulled struct {
+		name string
+		rf   remoteFile
+	}
+	var got []pulled
+	seen := map[string]bool{}
+	err = readTar(blob, 0, func(h *tar.Header, rd io.Reader) error {
+		if !allowed[h.Name] || seen[h.Name] {
+			return nil // an older runner may send a file twice: the first counts
 		}
 		if protected[h.Name] && !heldOK[h.Name] {
+			seen[h.Name] = true
 			skipped = append(skipped, h.Name)
 			return nil
 		}
-		rf := remoteFile{}
+		var rf remoteFile
 		switch h.Typeflag {
 		case tar.TypeSymlink:
-			rf.link, rf.mode, rf.id = h.Linkname, fsid.ModeSymlink, fsid.Bytes([]byte(h.Linkname))
+			rf = remoteFile{link: h.Linkname, size: int64(len(h.Linkname)), mode: fsid.ModeSymlink, id: fsid.Bytes([]byte(h.Linkname))}
 		case tar.TypeReg:
-			b, err := io.ReadAll(rd)
-			if err != nil {
+			var err error
+			if rf, err = sp.add(h, rd); err != nil {
 				return err
-			}
-			rf.data, rf.mode, rf.id = b, fsid.ModeFile, fsid.Bytes(b)
-			if h.Mode&0o111 != 0 {
-				rf.mode = fsid.ModeExec
 			}
 		default:
 			return nil
 		}
+		seen[h.Name] = true
+		got = append(got, pulled{h.Name, rf})
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	place := func(name string, rf remoteFile) error {
 		// A held file, wherever it lands, comes back only as it was held and
 		// only into an empty place, ignored there or not.
-		if e, isHeld := held[h.Name]; isHeld {
+		if e, isHeld := held[name]; isHeld {
 			if rf.id != e.ID || rf.mode != e.Mode {
-				stale = append(stale, h.Name)
+				stale = append(stale, name)
 				return nil
 			}
 			want := version{true, rf.id, rf.mode}
-			local, err := localVersion(root, h.Name)
+			local, err := localVersion(root, name)
 			if err != nil {
 				return err
 			}
@@ -1471,31 +1583,36 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 				return nil // already here
 			}
 			if local.exists {
-				kept = append(kept, h.Name)
+				kept = append(kept, name)
 				return nil
 			}
-			err = writeLocal(root, h.Name, rf, &version{})
+			err = writeLocal(root, name, rf, &version{})
 			if errors.Is(err, errChangedUnderUs) || errors.Is(err, fsid.ErrSymlinkParent) || stashCollision(err) {
-				kept = append(kept, h.Name)
+				kept = append(kept, name)
 				return nil
 			}
 			if err == nil {
 				n++
-				appliedLink(h.Name, rf)
+				appliedLink(name, rf)
 			}
 			return err
 		}
-		if fi, err := os.Lstat(filepath.Join(root, filepath.FromSlash(h.Name))); err == nil && fi.IsDir() {
+		if fi, err := os.Lstat(filepath.Join(root, filepath.FromSlash(name))); err == nil && fi.IsDir() {
 			return nil
 		}
 		n++
-		if err := writeLocal(root, h.Name, rf, nil); err != nil {
+		if err := writeLocal(root, name, rf, nil); err != nil {
 			return err
 		}
-		appliedLink(h.Name, rf)
+		appliedLink(name, rf)
 		return nil
-	})
-	return n, err
+	}
+	for _, g := range got {
+		if err := place(g.name, g.rf); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // pulledOutsideLinks returns the pulled links (named relative to root) that
