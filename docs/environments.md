@@ -28,7 +28,7 @@ The Dockerfile is commented and pinned as precisely as the repository allows:
 | Maven / Gradle | `eclipse-temurin:<major>-jdk`, from `.java-version`, `.sdkmanrc`, `.tool-versions`, or the build's release / toolchain setting, else 21; plus `maven` when there's no `./mvnw` (Gradle projects use `./gradlew`) |
 | Anything else | `ubuntu:24.04` with build-essential (`container init` only) |
 
-Every image except the Java one, whose base image already sets `en_US.UTF-8`, sets `LANG=C.UTF-8` as GitHub's Linux runners do, so tools that read the locale (Python's default encoding, `sort` collation, `Intl`, git's path quoting) behave as they do in CI.
+Every image except the Java one, whose base image already sets `en_US.UTF-8`, sets `LANG=C.UTF-8` as GitHub's Linux runners do, so tools that read the locale (Python's default encoding, `sort` collation, `Intl` defaults) see the same UTF-8 locale as in CI.
 
 The image is built on the first toolchain in that order. When the repository also has a `go.mod` or a `uv.lock`, Go, or uv with its Python, is added to the image too; any other toolchain it uses is named in a comment and in the command's output, for you to add. The `[deps]` install that `init` writes uses the same package manager as the image (`packageManager` wins over a leftover lockfile).
 
