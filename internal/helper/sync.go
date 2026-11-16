@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -259,6 +260,7 @@ func (s *Session) extract(r io.Reader, needSet map[string]bool, want map[string]
 		return 0, 0, nil, err
 	}
 	defer zr.Close()
+	zr.Multistream(false) // the client writes one gzip member
 	tr := tar.NewReader(zr)
 	written := 0
 	var bytes int64
@@ -274,6 +276,9 @@ func (s *Session) extract(r io.Reader, needSet map[string]bool, want map[string]
 		if !needSet[h.Name] {
 			return written, bytes, corrected, fmt.Errorf("unexpected path in archive: %q", h.Name)
 		}
+		// Each needed file arrives once: a second entry for one name must
+		// not stand in for another that never came.
+		delete(needSet, h.Name)
 		full, err := fsid.PrepareParent(s.workspace, h.Name)
 		if err != nil {
 			return written, bytes, corrected, err
@@ -294,7 +299,16 @@ func (s *Session) extract(r io.Reader, needSet map[string]bool, want map[string]
 		written++
 		bytes += h.Size
 	}
-	return written, bytes, corrected, nil
+	// The tar ends before the gzip trailer is read: reading on to the end
+	// is what checks the stream's CRC and length. More than a little
+	// padding after the archive is refused rather than decompressed.
+	const maxTrailing = 64 << 10
+	if n, err := io.Copy(io.Discard, io.LimitReader(zr, maxTrailing+1)); err != nil {
+		return written, bytes, corrected, err
+	} else if n > maxTrailing {
+		return written, bytes, corrected, errors.New("unexpected data after the end of the archive")
+	}
+	return written, bytes, corrected, zr.Close()
 }
 
 // writeEntry atomically materializes one tar entry at full and returns its ID.
@@ -548,15 +562,34 @@ func addTar(tw *tar.Writer, full, name string) error {
 	if !fi.Mode().IsRegular() {
 		return nil
 	}
-	b, err := os.ReadFile(full)
+	// Streamed, never read whole: the helper runs outside the job's memory
+	// limit, and an artifact can be larger than all the memory it keeps back.
+	f, err := os.Open(full)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Size: int64(len(b)), Mode: int64(fi.Mode().Perm()), ModTime: fi.ModTime()}); err != nil {
+	defer f.Close()
+	if fi, err = f.Stat(); err != nil {
 		return err
 	}
-	_, err = tw.Write(b)
-	return err
+	if !fi.Mode().IsRegular() {
+		return nil // replaced between the Lstat and the open
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Size: fi.Size(), Mode: int64(fi.Mode().Perm()), ModTime: fi.ModTime()}); err != nil {
+		return err
+	}
+	// The header's size is what is sent: a file that grows meanwhile is cut
+	// there, and one that shrinks fails the stream (a tar can't carry it).
+	if _, err := io.CopyN(tw, f, fi.Size()); err != nil {
+		if errors.Is(err, io.EOF) {
+			return fmt.Errorf("%s shrank while being sent", name)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Session) fetch(f protocol.Fetch) error {
@@ -629,7 +662,9 @@ func (s *Session) pull(p protocol.Pull) error {
 			})
 		}
 	}
+	// Overlapping patterns (pull_artifacts and --pull) match a file once.
 	sort.Strings(files)
+	files = slices.Compact(files)
 	if err := s.c.Send(protocol.TypeFetched, protocol.Need{Paths: files}); err != nil {
 		return err
 	}
