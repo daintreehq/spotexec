@@ -26,6 +26,7 @@ func main() {
 	dryRun := fs.Bool("dry-run", false, "prune dry run")
 	src := fs.String("src", "", "cache-put: directory to archive")
 	lockPath := fs.String("lock", "", "cache-put: dependency key lock to hold shared")
+	lifecycleFD := fs.Int("lifecycle-fd", 0, "cache-put: inherited descriptor holding the lifecycle lock shared")
 	_ = fs.Parse(os.Args[2:])
 	root, err := helper.ExpandRoot(*workRoot)
 	if err != nil {
@@ -70,7 +71,7 @@ func main() {
 	case "docker-proxy":
 		fail(helper.DockerProxy())
 	case "cache-put":
-		fail(helper.CachePut(root, *src, *lockPath))
+		fail(helper.CachePut(root, *src, *lockPath, *lifecycleFD))
 	case "version":
 		fmt.Println(helper.Version)
 	default:
