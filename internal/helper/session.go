@@ -243,7 +243,7 @@ func Serve(in io.Reader, out io.Writer) error {
 			}
 			var pe *protoError
 			if errors.As(err, &pe) {
-				_ = s.c.Send(protocol.TypeError, protocol.ErrorMsg{Code: pe.code, Message: pe.msg, Detail: pe.detail})
+				_ = s.c.Send(protocol.TypeError, protocol.ErrorMsg{Code: pe.code, Message: pe.msg, Detail: pe.detail, BuildFailed: pe.buildFailed})
 				continue
 			}
 			_ = s.c.Send(protocol.TypeError, protocol.ErrorMsg{Code: protocol.CodeInternal, Message: err.Error()})
@@ -254,7 +254,10 @@ func Serve(in io.Reader, out io.Writer) error {
 
 var errBye = errors.New("bye")
 
-type protoError struct{ code, msg, detail string }
+type protoError struct {
+	code, msg, detail string
+	buildFailed       bool // ErrorMsg.BuildFailed
+}
 
 func (e *protoError) Error() string { return e.code + ": " + e.msg }
 

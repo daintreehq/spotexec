@@ -32,6 +32,11 @@ func TestCutShortOnlyWhileStopping(t *testing.T) {
 		}
 	}
 	stoppingNow = func() bool { return true }
+	// A build cut short is no failure to remember (#194).
+	var pe *protoError
+	if !errors.As(cutShort(&protoError{code: protocol.CodeImageFailed, msg: "docker build: exit 1", buildFailed: true}), &pe) || pe.buildFailed {
+		t.Errorf("a build cut short is still marked failed: %+v", pe)
+	}
 	if err := cutShort(nil); err != nil {
 		t.Errorf("success became %v", err)
 	}

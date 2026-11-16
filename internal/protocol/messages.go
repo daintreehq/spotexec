@@ -66,6 +66,11 @@ type ErrorMsg struct {
 	// Detail adds context for some codes: with RUNNER_BOOTING, the latest
 	// line of the VM's bootstrap log.
 	Detail string `json:"detail,omitempty"`
+	// BuildFailed marks an IMAGE_FAILED from the image build itself exiting
+	// non-zero (not a pull, login, push or setup failure, nor a timeout or
+	// cancellation): building the same tag again would fail the same way,
+	// so the client remembers it (#194).
+	BuildFailed bool `json:"build_failed,omitempty"`
 }
 
 // Hello opens a session.

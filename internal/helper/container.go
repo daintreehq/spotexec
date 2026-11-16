@@ -178,6 +178,18 @@ func imageName(repoID string) string {
 	return strings.Trim(b.String(), "-")
 }
 
+// streamExit is a streamed docker command exiting non-zero.
+type streamExit struct {
+	code int
+	ran  bool // it ran to its own exit: not timed out, canceled or killed
+}
+
+func (e *streamExit) Error() string { return fmt.Sprintf("exit %d", e.code) }
+
+// built reports whether docker itself ran and failed, rather than the
+// shell or sg in front of it (126: not executable, 127: not found).
+func (e *streamExit) built() bool { return e.ran && e.code != 126 && e.code != 127 }
+
 func (s *Session) image(m protocol.Image) error {
 	if s.slotLock == nil {
 		return perr(protocol.CodeBadRequest, "acquire required before image")
@@ -208,7 +220,7 @@ func (s *Session) image(m protocol.Image) error {
 			return pr.startErr
 		}
 		if pr.code != 0 {
-			return fmt.Errorf("exit %d", pr.code)
+			return &streamExit{code: pr.code, ran: !pr.timedOut && !pr.canceled && !pr.spotIntr && pr.signal == ""}
 		}
 		return nil
 	}
@@ -312,7 +324,10 @@ func (s *Session) image(m protocol.Image) error {
 		defer cleanup()
 		_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_build", Message: m.Dockerfile})
 		if err := stream(d.cmd("build -f " + shq(dockerfile) + " -t " + shq(local) + " " + shq(buildCtx))); err != nil {
-			return perr(protocol.CodeImageFailed, "docker build %s: %v", m.Dockerfile, err)
+			e := &protoError{code: protocol.CodeImageFailed, msg: fmt.Sprintf("docker build %s: %v", m.Dockerfile, err)}
+			var se *streamExit
+			e.buildFailed = errors.As(err, &se) && se.built()
+			return e
 		}
 		res.Built = true
 		if m.Registry != nil && cfgDir != "" {
