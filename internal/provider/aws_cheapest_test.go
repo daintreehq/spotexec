@@ -180,11 +180,11 @@ func TestSingleRegionWithoutPricesUsesListedOrder(t *testing.T) {
 
 // Without prices to compare, EC2 refuses a bid over max_price
 // (SpotMaxPriceTooLow), and on_demand_fallback must not launch that type
-// on-demand: its on-demand price is above the cap too (#153). The bid goes
-// out as the plain decimal EC2 takes, whatever spelling the config used.
+// on-demand: its on-demand price is above the cap too (#153). Every Spot
+// request carries the cap as the plain decimal EC2 takes.
 func TestSingleRegionWithoutPricesKeepsMaxPriceOnDemand(t *testing.T) {
 	capped := func(r *config.Runner) {
-		r.MaxPrice, r.OnDemandFallback = config.Dollars{V: 0.40, Set: true}, true
+		r.MaxPrice, r.OnDemandFallback = config.Dollars{V: 1.25, Set: true}, true
 	}
 	f := &fakeRegionsEC2{priceErr: map[string]string{"r-one-1": "UnauthorizedOperation"},
 		runErr: map[string]string{"r-one-1/c7a.2xlarge": "SpotMaxPriceTooLow", "r-one-1/c6a.2xlarge": "InsufficientInstanceCapacity"}}
@@ -196,8 +196,11 @@ func TestSingleRegionWithoutPricesKeepsMaxPriceOnDemand(t *testing.T) {
 	if in.Type != "c6a.2xlarge" || in.Spot || len(f.callsOf("RunInstances")) != 3 {
 		t.Fatalf("launched %+v via %s", in, runsOf(f))
 	}
-	if bids := f.callsOf("bid"); len(bids) != 2 || bids[0] != "r-one-1 bid 0.4" {
+	if bids := f.callsOf("bid"); strings.Join(bids, ",") != "r-one-1 bid 1.25,r-one-1 bid 1.25" {
 		t.Fatalf("bids %v", bids)
+	}
+	if markets := f.callsOf("market"); strings.Join(markets, ",") != "r-one-1 market spot,r-one-1 market spot,r-one-1 market on-demand" {
+		t.Fatalf("markets %v", markets)
 	}
 	// Every type above the cap: no on-demand at all, and the error names
 	// the price refusal.

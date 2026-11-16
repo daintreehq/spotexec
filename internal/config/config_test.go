@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -609,6 +610,12 @@ func TestMaxPrice(t *testing.T) {
 	if _, err := loadGlobalText(t, "[runners.box]\ntype = \"ssh\"\nhost = \"box\"\nhourly_cost = -1\n"); err == nil {
 		t.Fatal("ssh runner with a negative hourly_cost accepted")
 	}
+	for _, c := range []float64{0, 0.25} {
+		g, err := loadGlobalText(t, fmt.Sprintf("[runners.box]\ntype = \"ssh\"\nhost = \"box\"\nhourly_cost = %g\n[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nhourly_cost = %g\n", c, c))
+		if err != nil || g.Runners["box"].HourlyCost != c || g.Runners["aws"].HourlyCost != c {
+			t.Fatalf("hourly_cost = %g: %v", c, err)
+		}
+	}
 }
 
 // A project switches how types are chosen: requirements replace an
@@ -795,6 +802,10 @@ func TestUnavailableProjectRunnerStillValidated(t *testing.T) {
 		"pool = [\"nope\"]\n[runners.big]\nextends = \"aws\"\n":                "pool references unknown runner \"nope\"",
 		"[runners.big]\nextends = \"aws\"\nmax_slots = -1\n":                   "max_slots must be between",
 		"[runners.big]\nextends_type = \"aws-spot\"\nidle_timeout = \"-1m\"\n": "idle_timeout must not be negative",
+		"[runners.big]\nextends = \"aws\"\nmax_price = 0\n":                    "max_price must be",
+		"[runners.big]\nextends = \"aws\"\nmax_price = nan\n":                  "max_price must be",
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"$10001\"\n":           "max_price must be",
+		"[runners.big]\nextends = \"aws\"\nhourly_cost = -1\n":                 "hourly_cost must be",
 	} {
 		if _, err := mergeProject(t, g, body); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: want %q, got %v", body, want, err)

@@ -1153,14 +1153,15 @@ func (g *AWSGlobal) record(in Instance) {
 // doesn't look up), then any usable type without a Spot price there.
 //
 // With max_price, a type whose Spot price is above it in any of the
-// region's zones is left out: a Spot price is never above the on-demand
-// price, so that type would launch above the cap. Types without a Spot
-// price are left out too, their price unknown.
-func (g *AWSGlobal) onDemandTypes(ctx context.Context, t PriceTable, region string) []string {
+// region's zones is left out, and so is one EC2 refused at the cap
+// (atCap, by region/type: the cached price may be stale): a Spot price is
+// never above the on-demand price, so that type would launch above the
+// cap. Types without a Spot price are left out too, their price unknown.
+func (g *AWSGlobal) onDemandTypes(ctx context.Context, t PriceTable, region string, atCap map[string]bool) []string {
 	maxPrice := g.r.MaxPriceUSD()
 	over := map[string]bool{}
 	for _, p := range t.Prices {
-		if p.Region == region && maxPrice > 0 && p.USD() > maxPrice {
+		if p.Region == region && (atCap[region+"/"+p.Type] || (maxPrice > 0 && p.USD() > maxPrice)) {
 			over[p.Type] = true
 		}
 	}
@@ -1211,6 +1212,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	skipRegion := map[string]string{}
 	skipQuota := map[string][]quotaSkip{} // region -> what its quota refused during this launch
 	skipZone := map[string]bool{}
+	atCap := map[string]bool{}  // region/type refused at max_price (SpotMaxPriceTooLow)
 	broken := g.brokenRegions() // regions whose setup failed (no on-demand there either)
 	var tried []string
 	// When quota is all that stopped every option (others can't work as
@@ -1251,6 +1253,9 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		}
 		if cd, ok := cool[poolKey(c)]; ok {
 			ahead.add("cooling down")
+			if strings.Contains(cd.Why, "SpotMaxPriceTooLow") {
+				atCap[c.Region+"/"+c.Type] = true
+			}
 			switch {
 			case cd.Transient:
 				otherFailure = true // may have cleared since
@@ -1366,6 +1371,9 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		case classifyAWSError(err) == errNextType:
 			g.coolPool(c, code)
 			log("skipping %s in %s: %s", c.Type, c.Zone, code)
+			if code == "SpotMaxPriceTooLow" {
+				atCap[c.Region+"/"+c.Type] = true
+			}
 			if shortOfCapacity(code) {
 				capacity = append(capacity, c) // (not Unsupported or a max price: those won't change)
 			}
@@ -1401,7 +1409,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		// (Capped, onDemandTypes reads only the price table.)
 		var regions []string
 		for _, c := range t.Prices {
-			if !broken[c.Region] && !contains(regions, c.Region) && (maxPrice == 0 || len(g.onDemandTypes(ctx, t, c.Region)) > 0) {
+			if !broken[c.Region] && !contains(regions, c.Region) && (maxPrice == 0 || len(g.onDemandTypes(ctx, t, c.Region, atCap)) > 0) {
 				regions = append(regions, c.Region)
 			}
 		}
@@ -1411,7 +1419,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		for _, rg := range regions[:min(len(regions), 2)] {
 			log("no spot capacity; falling back to on-demand in %s", rg)
 			a := g.Regional(rg)
-			inst, err := a.launchOrUnbaked(ctx, log, launchSpec{onDemand: true, types: g.onDemandTypes(ctx, t, rg), beforeSend: g.mark(rg)})
+			inst, err := a.launchOrUnbaked(ctx, log, launchSpec{onDemand: true, types: g.onDemandTypes(ctx, t, rg, atCap), beforeSend: g.mark(rg)})
 			if err == nil {
 				in := a.instance(inst)
 				g.record(in)
@@ -1458,7 +1466,11 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	if len(tried) == 0 {
 		return Instance{}, fmt.Errorf("every Spot option in %s is cooling down after recent capacity or quota failures; retry in a few minutes (`spotexec prices %s` shows them)", g.Where(), g.r.Name)
 	}
-	return Instance{}, fmt.Errorf("no Spot capacity in the %d cheapest options (%s); %s, or set on_demand_fallback = true", len(tried), strings.Join(tried, ", "), widenHint(g.r))
+	hint := ", or set on_demand_fallback = true"
+	if g.r.OnDemandFallback {
+		hint = ""
+	}
+	return Instance{}, fmt.Errorf("no Spot capacity in the %d cheapest options (%s); %s%s", len(tried), strings.Join(tried, ", "), widenHint(g.r), hint)
 }
 
 func plural(n int, s string) string {

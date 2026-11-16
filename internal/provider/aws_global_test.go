@@ -1027,6 +1027,65 @@ func TestGlobalMaxPriceCapsOnDemandFallback(t *testing.T) {
 	if markets := fm.callsOf("market"); len(markets) != 2 || markets[1] != "r-one-1 market on-demand" {
 		t.Fatalf("markets %v", markets)
 	}
+	// A type above the cap in any zone of the region is above it
+	// on-demand there, and so is one EC2 just refused at the cap however
+	// cheap its cached price: neither falls back.
+	fz := &fakeRegionsEC2{
+		prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.03"}, {"r-one-1b", "c7a.2xlarge", "0.10"}, {"r-one-1a", "c6a.2xlarge", "0.02"}}},
+		runErr: map[string]string{"r-one-1/c7a.2xlarge": "InsufficientInstanceCapacity", "r-one-1/c6a.2xlarge": "SpotMaxPriceTooLow"},
+	}
+	gz := newGlobalEnv(t, fz, "r-one-1", "r-two-1")
+	gz.r.MaxPrice, gz.r.OnDemandFallback = capUSD, true
+	if in, err := gz.Launch(context.Background(), t.Logf); err == nil || errors.As(err, &pe) || strings.Contains(err.Error(), "set on_demand_fallback") {
+		t.Fatalf("over the cap in another zone, or refused at it: launched %+v, err %v", in, err)
+	}
+	if markets := fz.callsOf("market"); len(markets) != 2 || len(fz.callsOf("market on-demand")) != 0 {
+		t.Fatalf("markets %v", markets)
+	}
+	// Per region: the same type over the cap in one region and at it in
+	// another falls back only where it's at the cap.
+	fr := &fakeRegionsEC2{
+		prices: map[string][][3]string{
+			"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.10"}},
+			"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.04"}},
+		},
+		runErr: map[string]string{"r-two-1/c7a.2xlarge": "InsufficientInstanceCapacity"},
+	}
+	gr := newGlobalEnv(t, fr, "r-one-1", "r-two-1")
+	gr.r.MaxPrice, gr.r.OnDemandFallback = capUSD, true
+	in, err := gr.Launch(context.Background(), t.Logf)
+	if err != nil || in.Region != "r-two-1" {
+		t.Fatalf("at the cap in r-two-1: launched %+v, err %v", in, err)
+	}
+	if markets := fr.callsOf("market"); strings.Join(markets, ",") != "r-two-1 market spot,r-two-1 market on-demand" {
+		t.Fatalf("markets %v", markets)
+	}
+	// A vcpus runner: types without a Spot price have no known price, so
+	// a capped fallback leaves them out (uncapped, they're tried last).
+	newVCPUs := func(capped bool) (*AWSGlobal, *fakeRegionsEC2) {
+		fv := &fakeRegionsEC2{
+			prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.03"}}},
+			types:  map[string][]string{"r-one-1": {typeXML("c7a.2xlarge", 8, 16, "x86_64", ""), typeXML("m7a.2xlarge", 8, 32, "x86_64", "")}},
+			runErr: map[string]string{"r-one-1/c7a.2xlarge": "InsufficientInstanceCapacity", "r-one-1/c7a.2xlarge/on-demand": "InsufficientInstanceCapacity"},
+		}
+		gv := newGlobalEnv(t, fv, "r-one-1")
+		gv.r.InstanceTypes, gv.r.VCPUs, gv.r.OnDemandFallback = nil, 8, true
+		if capped {
+			gv.r.MaxPrice = capUSD
+		}
+		return gv, fv
+	}
+	gv, fv := newVCPUs(true)
+	if in, err := gv.Launch(context.Background(), t.Logf); err == nil {
+		t.Fatalf("capped vcpus runner launched an unpriced type: %+v", in)
+	}
+	if runs := fv.callsOf("RunInstances"); len(runs) != 2 || strings.Contains(strings.Join(runs, ","), "m7a") {
+		t.Fatalf("capped vcpus runner: runs %v", runs)
+	}
+	gv, fv = newVCPUs(false)
+	if in, err := gv.Launch(context.Background(), t.Logf); err != nil || in.Type != "m7a.2xlarge" {
+		t.Fatalf("uncapped vcpus runner: launched %+v, err %v via %v", in, err, fv.callsOf("RunInstances"))
+	}
 }
 
 // provider.New picks the coordinator for several regions, and keeps it for
