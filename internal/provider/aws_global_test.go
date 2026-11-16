@@ -242,6 +242,9 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			}
 			f.log(region, act+" "+typ+" "+p.Get("NetworkInterface.1.SubnetId"))
 			f.log(region, "market "+market)
+			if bid := p.Get("InstanceMarketOptions.SpotOptions.MaxPrice"); bid != "" {
+				f.log(region, "bid "+bid)
+			}
 			if f.hang {
 				f.mu.Unlock()
 				<-r.Context().Done()

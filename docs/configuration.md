@@ -86,7 +86,7 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | `work_root` | `~/.cache/spotexec` | Where slots, caches and the helper live on the runner. |
 | `remote_path_setup` | (none) | Shell run before each command, after the login profile (for example `PATH` for mise or nvm). Not used inside a [project container](environments.md#project-containers). |
 | `ssh_options` | (none) | Extra `-o` options for `ssh`, for example `["Port=2222", "ProxyJump=bastion"]`. They override spotexec's defaults (`ConnectTimeout=10`, `ServerAliveInterval=10`, `ServerAliveCountMax=3`, `LogLevel=ERROR`), and runners whose options differ never share a connection. |
-| `hourly_cost` | (none) | Price per machine-hour, for the burn estimates in `spotexec status` and `spotexec monitor`. `aws-spot` VMs are priced at the current Spot price of their own instance type in their zone, so for them this is only the fallback when that price is unknown (an on-demand VM, or prices that can't be read). |
+| `hourly_cost` | (none) | Price per machine-hour, for the burn estimates in `spotexec status` and `spotexec monitor`. `aws-spot` VMs are priced at the current Spot price of their own instance type in their zone, so for them this is only the fallback when that price is unknown (an on-demand VM, or prices that can't be read). A non-negative number. |
 
 ### `ssh` runners
 
@@ -121,8 +121,8 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `boot_timeout` | `15m` | Longest wait for first-boot setup; a VM that takes longer is terminated. |
 | `bootstrap_script` | (none) | Runs as root on first boot, after the watchdog is armed. Bounded by `boot_timeout`. |
 | `user_bootstrap_script` | (none) | Then runs as the login user, in a login shell. |
-| `max_price` | the on-demand price | Spot bid cap in USD per hour, as a string of a positive number (`"0.40"`). |
-| `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available, trying the types in their Spot-price order. |
+| `max_price` | the on-demand price | Spot bid cap in USD per hour: a positive number or string (`0.40`, `"0.40"`, `"$0.40"`), at most 10000. Options priced above it are skipped, and so is their on-demand fallback. |
+| `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available, trying the types in their Spot-price order. With `max_price`, only the types whose Spot price is at or under it. |
 | `volume_gb` | `64` | Root gp3 volume, from 8 to 16384. |
 | `ami` | `auto` | `auto` uses the newest matching bake, else Ubuntu 24.04. `base` ignores bakes. An `ami-…` ID pins one image. |
 | `user` | `ubuntu` | Login user of the AMI. |

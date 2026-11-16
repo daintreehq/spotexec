@@ -1151,12 +1151,27 @@ func (g *AWSGlobal) record(in Instance) {
 // onDemandTypes is the order to try on-demand in region: the types by
 // their Spot rank there (a stand-in for the on-demand price, which spotexec
 // doesn't look up), then any usable type without a Spot price there.
+//
+// With max_price, a type whose Spot price is above it in any of the
+// region's zones is left out: a Spot price is never above the on-demand
+// price, so that type would launch above the cap. Types without a Spot
+// price are left out too, their price unknown.
 func (g *AWSGlobal) onDemandTypes(ctx context.Context, t PriceTable, region string) []string {
+	maxPrice := g.r.MaxPriceUSD()
+	over := map[string]bool{}
+	for _, p := range t.Prices {
+		if p.Region == region && maxPrice > 0 && p.USD() > maxPrice {
+			over[p.Type] = true
+		}
+	}
 	var out []string
 	for _, p := range t.Prices {
-		if p.Region == region && !contains(out, p.Type) {
+		if p.Region == region && !over[p.Type] && !contains(out, p.Type) {
 			out = append(out, p.Type)
 		}
+	}
+	if maxPrice > 0 {
+		return out
 	}
 	rest, _ := g.Regional(region).launchTypes(ctx) // vcpus: the cached eligible list
 	for _, it := range rest {
@@ -1380,9 +1395,13 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		}
 	}
 	if g.r.OnDemandFallback {
+		// Only regions with a type that may launch under max_price: with
+		// every Spot price above it, on-demand is above it too, and the
+		// launch ends in the PriceCapError below instead.
+		// (Capped, onDemandTypes reads only the price table.)
 		var regions []string
 		for _, c := range t.Prices {
-			if !broken[c.Region] && !contains(regions, c.Region) {
+			if !broken[c.Region] && !contains(regions, c.Region) && (maxPrice == 0 || len(g.onDemandTypes(ctx, t, c.Region)) > 0) {
 				regions = append(regions, c.Region)
 			}
 		}
