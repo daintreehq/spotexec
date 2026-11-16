@@ -31,14 +31,19 @@ type snapshot struct {
 
 func (s *Session) takeSnapshot(skip []string) snapshot {
 	snap := snapshot{sig: map[string]statSig{}, unknown: map[string]bool{}, gitDirs: map[string]bool{}}
+	// A bare name ("node_modules") is skipped at any depth. An entry with a
+	// leading "/" or "./" ("/target", "./build"), a "/" inside it, or a glob
+	// is a path from the workspace root and is skipped only there, as the
+	// manifest anchors /target/ and cache_dirs.
 	skipNames := map[string]bool{}
 	var skipPaths []string
 	for _, k := range skip {
-		k = strings.Trim(k, "/")
+		anchored := strings.HasPrefix(k, "/") || strings.HasPrefix(k, "./")
+		k = strings.Trim(strings.TrimPrefix(k, "./"), "/")
 		if k == "" {
 			continue
 		}
-		if strings.Contains(k, "/") || strings.ContainsAny(k, "*?[") {
+		if anchored || strings.Contains(k, "/") || strings.ContainsAny(k, "*?[") {
 			skipPaths = append(skipPaths, k)
 		} else {
 			skipNames[k] = true

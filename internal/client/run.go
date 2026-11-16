@@ -698,8 +698,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	for k, v := range o.Env {
 		env[k] = v
 	}
-	skip := append([]string{}, manifest.HeavyDirs...)
-	skip = append(skip, p.Deps.CacheDirs...)
+	skip := manifest.SnapshotSkip(p.Deps.CacheDirs)
 	ex := protocol.Exec{
 		Shell: o.Command, Cwd: ws.Cwd, Env: env, Setup: r.RemotePathSetup,
 		TimeoutMS: o.Timeout.Milliseconds(), GraceMS: o.Grace.Milliseconds(),

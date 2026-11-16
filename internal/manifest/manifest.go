@@ -52,10 +52,25 @@ var NeverSync = append(append([]string{}, config.CredentialDirs...), "**/.spotex
 var textAttr = regexp.MustCompile(`(^|\s)-?(text|crlf)(=|\s|$)`)
 
 // HeavyDirs are skipped by the remote post-run walk (they are build outputs
-// or dependency trees, never source).
+// or dependency trees, never source). A bare name is skipped at any depth;
+// "/target" only at the root, as BuiltinExcludes anchors it. .spotexec/ is
+// walked: project files in it sync, so a run's new ones come back too.
 var HeavyDirs = []string{
-	".git", "node_modules", ".venv", "venv", "__pycache__", ".next", ".turbo", "target",
-	".cache", ".pytest_cache", ".mypy_cache", ".gradle", ".spotexec",
+	".git", "node_modules", ".venv", "venv", "__pycache__", ".next", ".turbo", "/target",
+	".cache", ".pytest_cache", ".mypy_cache", ".gradle",
+}
+
+// SnapshotSkip is what the remote post-run walk skips: HeavyDirs, plus each
+// deps.cache_dirs entry anchored at the root, as Build anchors Protect (so
+// "build" or "./build" skips build/ but not cmd/build/).
+func SnapshotSkip(cacheDirs []string) []string {
+	skip := append([]string{}, HeavyDirs...)
+	for _, p := range cacheDirs {
+		if p = strings.Trim(strings.TrimPrefix(p, "./"), "/"); p != "" {
+			skip = append(skip, "/"+p)
+		}
+	}
+	return skip
 }
 
 // Options controls enumeration.
