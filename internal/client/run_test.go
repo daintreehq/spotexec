@@ -291,6 +291,7 @@ func TestSubdirDockerfileSyncsOnlyBuildInputs(t *testing.T) {
 		"services/api/Dockerfile":    "FROM scratch\nCOPY main.go /\n",
 		"services/api/.dockerignore": "*.md\n",
 		"services/api/main.go":       "package main\n",
+		"services/api/README.md":     "# api\n",
 		"services/api/secrets.json":  "{}\n",
 		"services/api/dist/app.js":   "1\n",
 		".gitignore":                 "Dockerfile\n.dockerignore\nsecrets.json\ndist/\n",
@@ -304,20 +305,41 @@ func TestSubdirDockerfileSyncsOnlyBuildInputs(t *testing.T) {
 		}
 	}
 	p := &config.Project{Container: config.Container{Dockerfile: "services/api/Dockerfile"}}
-	m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got []string
-	for _, e := range m.Entries {
-		got = append(got, e.Path)
-	}
-	if want := ".gitignore services/api/.dockerignore services/api/Dockerfile services/api/main.go"; strings.Join(got, " ") != want {
-		t.Fatalf("synced %q, want %q", strings.Join(got, " "), want)
-	}
 	read := func(rel string) ([]byte, error) { return os.ReadFile(filepath.Join(root, filepath.FromSlash(rel))) }
-	if _, err := imageTag(m, "services/api/Dockerfile", "", "linux/amd64", read); err != nil {
-		t.Fatalf("imageTag: %v", err)
+	tag := func() string {
+		t.Helper()
+		m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, e := range m.Entries {
+			got = append(got, e.Path)
+		}
+		// README.md is project source: it syncs though .dockerignore
+		// keeps it out of the build.
+		if want := ".gitignore services/api/.dockerignore services/api/Dockerfile services/api/README.md services/api/main.go"; strings.Join(got, " ") != want {
+			t.Fatalf("synced %q, want %q", strings.Join(got, " "), want)
+		}
+		tag, err := imageTag(m, "services/api/Dockerfile", "", "linux/amd64", read)
+		if err != nil {
+			t.Fatalf("imageTag: %v", err)
+		}
+		return tag
+	}
+	write := func(f, body string) {
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(f)), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := tag()
+	write("services/api/README.md", "# api, edited\n")
+	if got := tag(); got != first {
+		t.Fatal("editing a dockerignored file changed the image tag: the synced .dockerignore wasn't applied")
+	}
+	write("services/api/main.go", "package main // edited\n")
+	if tag() == first {
+		t.Fatal("editing a build input left the image tag unchanged")
 	}
 }
 

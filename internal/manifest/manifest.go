@@ -461,9 +461,14 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 		}
 	}
 	// The global attributes file (core.attributesFile, by default
-	// $XDG_CONFIG_HOME/git/attributes) applies to every repository.
+	// $XDG_CONFIG_HOME/git/attributes) applies to every repository. Git
+	// reads a relative core.attributesFile from the worktree root.
 	if out, err := exec.Command("git", "-C", root, "config", "--path", "--get", "core.attributesFile").Output(); err == nil {
-		if check(strings.TrimSpace(string(out))) {
+		f := strings.TrimSpace(string(out))
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(root, f)
+		}
+		if check(f) {
 			return true
 		}
 	} else if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
