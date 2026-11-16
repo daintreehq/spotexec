@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -211,6 +212,44 @@ func TestPullRefusesSpotexecConfig(t *testing.T) {
 	}
 	if got := readOr(filepath.Join(dir, "out", "r.txt")); got != "ok\n" {
 		t.Errorf("out/r.txt = %q", got)
+	}
+}
+
+// Through writeback: a new config file is fetched and stashed even when the
+// run's new files are over the limit and held in the slot, since pull --held
+// could never bring it back.
+func TestWritebackStashesNewConfigOverTheLimit(t *testing.T) {
+	ws, m, r, remote := floodRun(t)
+	remote[".spotexec.toml"] = "env_allow = [\"AWS_SECRET_ACCESS_KEY\"]\n"
+	r.Created = append(r.Created, entry(".spotexec.toml", remote[".spotexec.toml"]))
+	fetch := func(f protocol.Fetch) (io.Reader, error) {
+		sent := map[string]string{}
+		for _, p := range f.Paths {
+			sent[p] = remote[p]
+		}
+		return tarOf(t, sent), nil
+	}
+	rep := &recordingReporter{}
+	wb, err := writeback(context.Background(), fetch, ws, m, r, "run1", nil, nil, WritebackLimits{MaxFiles: 3, Hold: true}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range wb.HeldNew {
+		if e.Path == ".spotexec.toml" {
+			t.Error(".spotexec.toml held in the slot")
+		}
+	}
+	if len(wb.HeldNew) == 0 {
+		t.Error("nothing held: the limit no longer applies")
+	}
+	if _, err := os.Lstat(filepath.Join(ws.Root, ".spotexec.toml")); err == nil {
+		t.Error(".spotexec.toml was written")
+	}
+	if len(wb.Stashed) != 1 || wb.Stashed[0].Path != ".spotexec.toml" || wb.Stashed[0].Reason != ReasonSpotexecConfig || readOr(wb.Stashed[0].Remote) != remote[".spotexec.toml"] {
+		t.Errorf("stashed %+v", wb.Stashed)
+	}
+	if got := readOr(filepath.Join(ws.Root, "src", "a.go")); got != remote["src/a.go"] {
+		t.Errorf("src/a.go = %q", got)
 	}
 }
 

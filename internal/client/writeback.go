@@ -243,14 +243,15 @@ func writeback(ctx context.Context, fetchFiles fetchFunc, ws *Workspace, m *mani
 	}
 	// The new side of a case-only rename (foo -> Foo) is never held: on a
 	// case-insensitive filesystem it is the same file as the deleted one,
-	// renamed in place below.
+	// renamed in place below. Nor is spotexec's own config: it is stashed
+	// for review below, never pulled into place.
 	gone := map[string]bool{}
 	for _, d := range deleted {
 		gone[strings.ToLower(d)] = true
 	}
 	var renamed, holdable []protocol.Entry
 	for _, c := range fresh {
-		if gone[strings.ToLower(c.Path)] {
+		if gone[strings.ToLower(c.Path)] || spotexecConfigPath(c.Path) {
 			renamed = append(renamed, c)
 		} else {
 			holdable = append(holdable, c)
