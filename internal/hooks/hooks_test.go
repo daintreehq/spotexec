@@ -724,6 +724,7 @@ func TestLocalCommandGuards(t *testing.T) {
 		"sx pnpm test", "spotexec run -- pytest", "/usr/local/bin/spotexec run -- pytest", "'/my tools/sx' pytest",
 		"pnpm exec sx pytest", "npm start", "yarn dev", "pnpm dev", "npm run dev", "bun run dev:server",
 		"pnpm run test:watch", "ng serve", "vitest watch", "vitest --no-color watch", "npx vitest dev",
+		"vitest --reporter dot watch",
 	} {
 		if d.ShouldOffload(c) {
 			t.Errorf("expected local: %q", c)
@@ -731,7 +732,7 @@ func TestLocalCommandGuards(t *testing.T) {
 	}
 	for _, c := range []string{
 		"go test ./cmd/spotexec", "cargo test -p sx", "pytest -k watch", "cargo test --features dev",
-		"vitest run -t watch", "pnpm vitest run dev", "pnpm vitest run src/watch.test.ts", "npm run test:dev",
+		"vitest run -t watch", "pnpm vitest run dev", "vitest --reporter dot run src/a.test.ts", "pnpm vitest run src/watch.test.ts", "npm run test:dev",
 	} {
 		if !d.ShouldOffload(c) {
 			t.Errorf("expected offload: %q", c)
@@ -760,5 +761,22 @@ func TestInstallLeavesUncertainRTKUnchained(t *testing.T) {
 	]}}`), 0o644)
 	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || !ok || !HasClaude(p) {
 		t.Fatal("no Bash entry beside an uncertain chain", ok, err)
+	}
+}
+
+// Beside a chain, an RTK hook under an uncertain matcher isn't folded in:
+// it stays, still racing, and installing again changes nothing.
+func TestInstallKeepsUncertainRTKBesideChain(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "settings.json")
+	os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[
+	  {"matcher":"Bash","hooks":[{"type":"command","command":"spotexec hook claude --then 'rtk hook claude'"}]},
+	  {"matcher":"^(?=Bash$)Bash$","hooks":[{"type":"command","command":"rtk hook claude"}]}
+	]}}`), 0o644)
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || ok {
+		t.Fatal("want no change", ok, err)
+	}
+	b, _ := os.ReadFile(p)
+	if !HasRTK(p) || strings.Count(string(b), "--then") != 1 {
+		t.Fatalf("lost the RTK hook or the chain:\n%s", b)
 	}
 }

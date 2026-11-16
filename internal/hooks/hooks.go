@@ -378,17 +378,22 @@ func localCommand(seg string) bool {
 	}
 	// The script or tool's name and its subcommand, the plain word after it
 	// (`test:watch`, `ng serve`, `dev:server`): anything after an option or
-	// path is an argument. vitest's subcommand may follow its options
-	// (`vitest --no-color watch`), so for vitest it is the first plain word.
+	// path is an argument. vitest's subcommand may follow its options and
+	// their values (`vitest --reporter dot watch`), so for vitest it is the
+	// first of its own subcommands.
 	words := []string{tool}
 	for _, w := range toks[1:] {
+		if tool == "vitest" {
+			if vitestCommands[w] {
+				words = append(words, w)
+				break
+			}
+			continue
+		}
 		if commandWord.MatchString(w) {
 			words = append(words, w)
-			break
 		}
-		if tool != "vitest" {
-			break
-		}
+		break
 	}
 	for _, w := range words {
 		parts := strings.Split(w, ":")
@@ -403,6 +408,9 @@ func localCommand(seg string) bool {
 	}
 	return false
 }
+
+// vitestCommands are vitest's subcommands.
+var vitestCommands = map[string]bool{"run": true, "watch": true, "dev": true, "related": true, "bench": true, "list": true, "init": true, "typecheck": true}
 
 // shellWords splits a command without operators into its words, unquoted.
 func shellWords(s string) []string {
