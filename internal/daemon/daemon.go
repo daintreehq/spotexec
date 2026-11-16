@@ -292,7 +292,7 @@ func (d *Daemon) reload(ctx context.Context) {
 		case <-time.After(reloadSettle):
 		}
 		again, err2 := readConfig(d.cfgPath)
-		if err2 != nil || !bytes.Equal(raw, again) {
+		if err2 != nil || !bytes.Equal(raw, again) || ctx.Err() != nil {
 			return
 		}
 	}

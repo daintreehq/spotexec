@@ -473,12 +473,14 @@ func TestReloadWaitsForSave(t *testing.T) {
 	}
 	// A reload cut short by shutdown applies nothing.
 	writeConfig(t, cfgPath, runnerConfig("d.large", 0))
-	reloadSettle = time.Hour
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
-	d.reload(cctx)
-	if got := fleetNamed(d, "pool").r.InstanceTypes[0]; got != "c.large" {
-		t.Fatalf("applied %s after shutdown began", got)
+	for _, settle := range []time.Duration{0, time.Hour} {
+		reloadSettle = settle
+		d.reload(cctx)
+		if got := fleetNamed(d, "pool").r.InstanceTypes[0]; got != "c.large" {
+			t.Fatalf("applied %s after shutdown began (settle %s)", got, settle)
+		}
 	}
 }
 
