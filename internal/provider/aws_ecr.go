@@ -213,9 +213,10 @@ func (a *AWSSpot) projectImage(ctx context.Context, repoID, tag string) (string,
 // regions, each with its own registry: an image one region holds is copied
 // to another, never built there again (#192).
 type ImageSource interface {
-	// ImageSource returns a pull login for the repository of repoID in
-	// another of the runner's regions that holds tag, for the region of
-	// instanceID to copy it from; nil when no other region holds it.
+	// ImageSource returns a login for the repository of repoID in another
+	// of the runner's regions that holds tag, for the region of instanceID
+	// to copy it from. It is nil with no error when no other region holds
+	// it, and an error when one that might couldn't be asked.
 	ImageSource(ctx context.Context, instanceID, repoID, tag string) (*protocol.RegistryAuth, error)
 }
 
@@ -263,10 +264,8 @@ func (g *AWSGlobal) ImageSource(ctx context.Context, instanceID, repoID, tag str
 		auth.Repo = auth.Server + "/spotexec/" + ecrName(repoID)
 		return auth, nil
 	}
-	if len(errs) > 0 && len(holds) == 0 {
-		return nil, joinRegionErrors(errs)
-	}
-	return nil, nil
+	// A region that couldn't be asked, or logged into, may hold it.
+	return nil, joinRegionErrors(errs)
 }
 
 // imageSourceOrder orders regions: those listed (in their order), then
