@@ -59,7 +59,7 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 				markDraining(s.layout.Root, "bootstrap failed") // ephemeral: let it go
 			}
 			tail, _ := exec.Command("tail", "-n", "15", "/var/log/spotexec-bootstrap.log").Output()
-			return perr(protocol.CodeBootFailed, "bootstrap_script failed (exit %s) on this VM; last lines of /var/log/spotexec-bootstrap.log:\n%s", st, strings.TrimSpace(string(tail)))
+			return perr(protocol.CodeBootFailed, "bootstrap_script failed (exit %s) on this VM; %s\n%s", st, protocol.BootTailMark, strings.TrimSpace(string(tail)))
 		}
 	}
 	if draining(s.layout.Root) {

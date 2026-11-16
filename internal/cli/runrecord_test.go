@@ -401,10 +401,12 @@ func TestRecordLeavesOutOtherProgramsOutput(t *testing.T) {
 	rep.Warn("RTK_FILTER", "rtk pipe -f %s failed (%v%s); the output below is unfiltered", "go-test", errors.New("exit status 1"), outputText(": --- FAIL: TestSecret"))
 	// A failed bootstrap's log lines are the project's output.
 	boot := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeBootFailed, Message: "bootstrap_script failed (exit 2) on this VM; last lines of /var/log/spotexec-bootstrap.log:\nSECRET-BOOT-LINE"}}
+	// Quoted by a fallback's warning too, among other runners' errors.
+	rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", fmt.Errorf("no runner available:\n  aws: %w\n  box: refused", boot))
 	r.end(p, client.Result{}, boot, client.ExitInfra, partFailed, false)
 	r.finish(client.ExitInfra)
 	r.settle()
-	if len(base.shown) != 1 || !strings.Contains(base.shown[0], "--- FAIL: TestSecret") {
+	if len(base.shown) != 2 || !strings.Contains(base.shown[0], "--- FAIL: TestSecret") || !strings.Contains(base.shown[1], "SECRET-BOOT-LINE") {
 		t.Errorf("shown: %q", base.shown)
 	}
 	recs, raw := records(t, state)
@@ -412,10 +414,11 @@ func TestRecordLeavesOutOtherProgramsOutput(t *testing.T) {
 		t.Errorf("record holds another program's output:\n%s", raw[0])
 	}
 	pt := recs[0].Parts[0]
-	if len(pt.Warnings) != 1 || pt.Warnings[0].Message != "rtk pipe -f go-test failed (exit status 1); the output below is unfiltered" {
+	if len(pt.Warnings) != 2 || pt.Warnings[0].Message != "rtk pipe -f go-test failed (exit status 1); the output below is unfiltered" ||
+		!strings.HasSuffix(pt.Warnings[1].Message, "its last lines aren't recorded") {
 		t.Errorf("warning: %+v", pt.Warnings)
 	}
-	if pt.Error == nil || pt.Error.Code != protocol.CodeBootFailed || !strings.HasPrefix(pt.Error.Message, "BOOTSTRAP_FAILED: bootstrap_script failed (exit 2)") {
+	if pt.Error == nil || pt.Error.Code != protocol.CodeBootFailed || pt.Error.Message != "BOOTSTRAP_FAILED: bootstrap_script failed (exit 2) on this VM; its last lines aren't recorded" {
 		t.Errorf("error: %+v", pt.Error)
 	}
 }
@@ -435,8 +438,9 @@ func TestRecordWideCaps(t *testing.T) {
 		for j := 0; j < recordLaunchMax; j++ {
 			id := fmt.Sprint("L", i, "-", j)
 			rep.Event("scale_out", map[string]any{"runner": "aws", "launch_id": id})
-			rep.Event("provision", map[string]any{"runner": "aws", "launch_id": id, "message": "m"})
-			rep.Event("provision", map[string]any{"runner": "aws", "launch_id": id, "message": "m"})
+			for k := 0; k < 5; k++ {
+				rep.Event("provision", map[string]any{"runner": "aws", "launch_id": id, "message": "m"})
+			}
 		}
 	}
 	for _, p := range parts {
@@ -459,7 +463,7 @@ func TestRecordWideCaps(t *testing.T) {
 	if launches != recordLaunchTotal || launches+ldropped != 10*recordLaunchMax {
 		t.Errorf("launches: %d kept, %d dropped", launches, ldropped)
 	}
-	if logs != 2*recordLaunchTotal || logDropped != 0 {
+	if logs != recordLogTotal || logs+logDropped != 5*recordLaunchTotal {
 		t.Errorf("launch logs: %d kept, %d dropped", logs, logDropped)
 	}
 }

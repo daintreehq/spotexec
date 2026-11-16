@@ -613,9 +613,20 @@ func TestProvisionFailureReportedWithinTheHold(t *testing.T) {
 	f.mu.Unlock()
 	m := &member{r: p.R, pool: p}
 	rep := &blockingWarn{namedEvents: &namedEvents{}, in: make(chan struct{}), release: make(chan struct{})}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(rep.release)
+		}
+	})
 	HoldLaunch()
-	go m.provision(ctx, ids[0], rep)
-	<-rep.in
+	provisioned := make(chan struct{})
+	go func() { m.provision(ctx, ids[0], rep); close(provisioned) }()
+	select {
+	case <-rep.in:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the failed launch was never reported")
+	}
 	waited := make(chan struct{})
 	go func() { WaitLaunches(time.Minute); close(waited) }()
 	select {
@@ -624,10 +635,13 @@ func TestProvisionFailureReportedWithinTheHold(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	close(rep.release)
-	select {
-	case <-waited:
-	case <-time.After(10 * time.Second):
-		t.Fatal("WaitLaunches never returned")
+	released = true
+	for _, c := range []chan struct{}{waited, provisioned} {
+		select {
+		case <-c:
+		case <-time.After(10 * time.Second):
+			t.Fatal("WaitLaunches or the launch never returned")
+		}
 	}
 	ev := rep.event("launch_failed")
 	if ev == nil || ev["launch_id"] != ids[0] || ev["runner"] != "fake" || ev["message"] != "InsufficientInstanceCapacity" {

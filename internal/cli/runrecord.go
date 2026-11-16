@@ -224,12 +224,7 @@ func (r *recorder) end(p *recordPart, res client.Result, err error, code int, st
 	}
 	p.TimedOut, p.OOMKilled, p.SetupFailed = res.TimedOut, res.OOMKilled, res.SetupFailed
 	if err != nil {
-		code, msg := errorCode(err), err.Error()
-		if code == protocol.CodeBootFailed {
-			// The bootstrap log's last lines follow: the project's output.
-			msg, _, _ = strings.Cut(msg, "\n")
-		}
-		p.Error = &recordError{Code: code, Reason: res.LostCode, Message: clip(msg)}
+		p.Error = &recordError{Code: errorCode(err), Reason: res.LostCode, Message: clip(err.Error())}
 	}
 }
 
@@ -423,10 +418,16 @@ func (rr *recordingReporter) Warn(code, format string, args ...any) {
 
 var ansiSeq = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)?`)
 
-// clip makes s safe and short for a record: no escape sequences or other
-// control characters (a newline becomes a space), valid UTF-8, at most
-// recordTextMax bytes.
+// clip makes s safe and short for a record: no bootstrap log lines, escape
+// sequences or other control characters (a newline becomes a space), valid
+// UTF-8, at most recordTextMax bytes.
 func clip(s string) string {
+	// A failed bootstrap_script's last lines (the project's output) follow
+	// this in its error, wherever that is quoted: a fallback's warning, the
+	// errors of several runners.
+	if i := strings.Index(s, protocol.BootTailMark); i >= 0 {
+		s = s[:i] + "its last lines aren't recorded"
+	}
 	s = ansiSeq.ReplaceAllString(s, "")
 	s = strings.ToValidUTF8(s, "�")
 	s = strings.Map(func(c rune) rune {
