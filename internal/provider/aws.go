@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,10 +39,12 @@ const (
 // owner tags. Scheduling across the fleet happens in the client (see
 // docs/POOL.md); each instance terminates itself when idle.
 type AWSSpot struct {
-	r     *config.Runner
-	api   *awsClient
-	dir   string
-	owner string
+	r   *config.Runner
+	api *awsClient
+	dir string
+	// ownerMu guards owner, filled lazily by concurrent callers.
+	ownerMu sync.Mutex
+	owner   string
 	// placed: one region of a multi-region runner, which uses default VPCs
 	// only (messages mustn't suggest subnet_id).
 	placed bool
@@ -124,6 +127,8 @@ func ownerID() (string, error) {
 }
 
 func (a *AWSSpot) ownerTag() (string, error) {
+	a.ownerMu.Lock()
+	defer a.ownerMu.Unlock()
 	if a.owner == "" {
 		o, err := ownerID()
 		if err != nil {

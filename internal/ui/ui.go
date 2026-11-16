@@ -186,7 +186,9 @@ func (p *prettyReporter) Event(name string, fields map[string]any) {
 			m[k] = v
 		}
 		b, _ := json.Marshal(orderedEvent(name, m))
+		p.mu.Lock()
 		p.extra.Write(append(b, '\n'))
+		p.mu.Unlock()
 	}
 }
 

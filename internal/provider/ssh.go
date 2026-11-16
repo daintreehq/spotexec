@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -17,8 +18,11 @@ import (
 // address first, Tailscale name second) it dials them in parallel and prefers
 // the earliest-listed one if it answers within a 500ms grace window.
 type SSH struct {
-	r      *config.Runner
-	chosen *Target
+	r *config.Runner
+
+	mu     sync.Mutex
+	chosen *Target // the host pick settled on; nil until then or after Forget
+	gen    int     // bumped by Forget, so a pick begun before it isn't kept
 }
 
 func (s *SSH) Runner() *config.Runner { return s.r }
@@ -45,7 +49,12 @@ func (s *SSH) Up(ctx context.Context, log Logger) (Info, error) {
 
 func (s *SSH) Down(ctx context.Context, log Logger) error { return nil }
 
-func (s *SSH) Forget() { s.chosen = nil }
+func (s *SSH) Forget() {
+	s.mu.Lock()
+	s.chosen = nil
+	s.gen++
+	s.mu.Unlock()
+}
 
 func (s *SSH) Doctor(ctx context.Context) []Check {
 	var out []Check
@@ -66,21 +75,36 @@ func (s *SSH) Doctor(ctx context.Context) []Check {
 	return out
 }
 
+// pick returns the cached host, or settles on one. The dial runs unlocked so
+// a slow happyEyeballs doesn't hold up callers with their own contexts.
 func (s *SSH) pick(ctx context.Context) (Target, error) {
+	s.mu.Lock()
 	if s.chosen != nil {
-		return *s.chosen, nil
-	}
-	if len(s.r.Hosts) == 1 {
-		t := s.target(s.r.Hosts[0])
-		s.chosen = &t
+		t := *s.chosen
+		s.mu.Unlock()
 		return t, nil
 	}
-	idx, err := happyEyeballs(ctx, s.r.Hosts, s.r.SSHOptions, 500*time.Millisecond, 5*time.Second)
-	if err != nil {
-		return Target{}, err
+	gen := s.gen
+	s.mu.Unlock()
+
+	idx := 0
+	if len(s.r.Hosts) != 1 {
+		var err error
+		idx, err = happyEyeballs(ctx, s.r.Hosts, s.r.SSHOptions, 500*time.Millisecond, 5*time.Second)
+		if err != nil {
+			return Target{}, err
+		}
 	}
 	t := s.target(s.r.Hosts[idx])
-	s.chosen = &t
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.chosen != nil {
+		return *s.chosen, nil // a concurrent pick settled first
+	}
+	if s.gen == gen {
+		s.chosen = &t
+	}
 	return t, nil
 }
 
