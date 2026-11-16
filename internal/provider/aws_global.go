@@ -311,6 +311,9 @@ type placementState struct {
 	Where     map[string]placedAt  `json:"where,omitempty"`     // instance ID -> region (a routing cache)
 	Cooldown  map[string]cooldown  `json:"cooldown,omitempty"`  // "region", "zone:<zone>", "region/zone/type" or "reclaimed:region/zone/type"
 	Reclaimed map[string]time.Time `json:"reclaimed,omitempty"` // instance ID -> when its Spot interruption was recorded
+	// Failures: "region/zone/type" -> its recent capacity refusals and
+	// early reclaims, decaying (see recordFailure).
+	Failures map[string]poolFailures `json:"failures,omitempty"`
 	// Warm: region -> when a VM of this runner was last seen there, running
 	// for warmAfter or more (under profile WarmProfile), so its caches are
 	// likely there too.
@@ -970,14 +973,20 @@ func (g *AWSGlobal) refusedAtCap(ps []SpotPrice) map[string]bool {
 	return out
 }
 
+// coolPool skips p's zone and type for a while after a refusal (why: its
+// code); a refusal for capacity also counts in its failure history.
 func (g *AWSGlobal) coolPool(p SpotPrice, why string) {
 	_ = g.withState(func(st *placementState) {
+		now := g.clock()
 		c := st.Cooldown[poolKey(p)]
 		step := poolCoolMin
 		if c.Step > 0 {
 			step = min(2*c.Step, poolCoolMax)
 		}
-		st.Cooldown[poolKey(p)] = cooldown{Until: g.clock().Add(step), Step: step, Why: why}
+		st.Cooldown[poolKey(p)] = cooldown{Until: now.Add(step), Step: step, Why: why}
+		if shortOfCapacity(why) {
+			recordFailure(st, p, true, now)
+		}
 	})
 }
 
