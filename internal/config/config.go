@@ -535,11 +535,22 @@ func CheckVersion(path string) error {
 
 // LoadGlobal reads the global config; a missing file yields an empty config.
 func LoadGlobal() (*Global, error) {
-	g := &Global{Runners: map[string]*Runner{}, Path: GlobalPath()}
-	if _, err := os.Stat(g.Path); errors.Is(err, os.ErrNotExist) {
-		return g, nil
+	path := GlobalPath()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &Global{Runners: map[string]*Runner{}, Path: path}, nil
 	}
-	md, err := toml.DecodeFile(g.Path, g)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGlobal(path, data)
+}
+
+// ParseGlobal reads a global config from data (the contents of the file at
+// path), with the same defaults and validation as LoadGlobal.
+func ParseGlobal(path string, data []byte) (*Global, error) {
+	g := &Global{Runners: map[string]*Runner{}, Path: path}
+	md, err := toml.Decode(string(data), g)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", g.Path, err)
 	}
