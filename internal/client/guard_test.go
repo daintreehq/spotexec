@@ -40,7 +40,8 @@ func TestSpotexecConfigPath(t *testing.T) {
 		"spotexec.toml":          false,
 		"spotexec/Dockerfile":    false,
 		"docker/Dockerfile":      false,
-		"a/.spotexec.toml/b":     false,
+		"a/.spotexec.toml/b":     true,
+		".spotexecignore/x":      true,
 		"x.spotexec/y":           false,
 	} {
 		if got := spotexecConfigPath(p); got != want {

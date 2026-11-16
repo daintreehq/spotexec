@@ -186,15 +186,23 @@ func TestSpotexecConfigConflictsAreReported(t *testing.T) {
 	if !strings.Contains(rec.warnings[0], rec.events[0]["diff"].(string)) {
 		t.Errorf("warning without its diff command: %s", rec.warnings[0])
 	}
+	if !strings.Contains(rec.warnings[1], "deleted .spotexecignore") || !strings.Contains(rec.warnings[1], "kept it here") {
+		t.Errorf("deletion warning %q", rec.warnings[1])
+	}
 }
 
 // pull never writes spotexec's config into the worktree: not when it is
 // gitignored here, and not when write-back held it as a new file.
 func TestPullRefusesSpotexecConfig(t *testing.T) {
-	dir := gitRepo(t, map[string]string{"src/a.go": "package a\n", ".gitignore": "out/\n.spotexec.toml\n"})
-	ws := &Workspace{Root: dir, Git: true, GitDir: filepath.Join(dir, ".git")}
-	slot := map[string]string{".spotexec.toml": "evil\n", "sub/.spotexec.toml": "evil\n", "out/.spotexec/setup.sh": "evil\n", "out/r.txt": "ok\n"}
-	listed := []string{".spotexec.toml", "sub/.spotexec.toml", "out/.spotexec/setup.sh", "out/r.txt"}
+	// Only the root config is ignored: the held nested one is not, so only
+	// the held-file rule could let it land.
+	dir := gitRepo(t, map[string]string{"src/a.go": "package a\n", ".gitignore": "out/\n/.spotexec.toml\n"})
+	if err := os.Symlink("out/cfg.toml", filepath.Join(dir, ".spotexecignore")); err != nil {
+		t.Fatal(err)
+	}
+	ws := &Workspace{Root: dir, Git: true, GitDir: filepath.Join(dir, ".git"), Cwd: "."}
+	slot := map[string]string{".spotexec.toml": "evil\n", "sub/.spotexec.toml": "evil\n", "out/.spotexec/setup.sh": "evil\n", "out/cfg.toml": "*\n", "out/r.txt": "ok\n"}
+	listed := []string{".spotexec.toml", "sub/.spotexec.toml", "out/.spotexec/setup.sh", "out/cfg.toml", "out/r.txt"}
 	held := HeldFiles{"sub/.spotexec.toml": entry("sub/.spotexec.toml", "evil\n")}
 	for _, heldOnly := range []bool{false, true} {
 		n, err := applyPull(context.Background(), ws, dir, []string{"**"}, held, heldOnly, listed, tarOf(t, slot), &recordingReporter{}, "")
@@ -205,7 +213,7 @@ func TestPullRefusesSpotexecConfig(t *testing.T) {
 			t.Errorf("heldOnly %v: pulled %d, want %d", heldOnly, n, want)
 		}
 	}
-	for _, p := range []string{".spotexec.toml", "sub/.spotexec.toml", "out/.spotexec/setup.sh"} {
+	for _, p := range []string{".spotexec.toml", "sub/.spotexec.toml", "out/.spotexec/setup.sh", "out/cfg.toml"} {
 		if _, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(p))); err == nil {
 			t.Errorf("pulled %s", p)
 		}
@@ -250,6 +258,66 @@ func TestWritebackStashesNewConfigOverTheLimit(t *testing.T) {
 	}
 	if got := readOr(filepath.Join(ws.Root, "src", "a.go")); got != remote["src/a.go"] {
 		t.Errorf("src/a.go = %q", got)
+	}
+}
+
+// What config reaches through a symlink is config too: the file a config
+// link points at, a directory .spotexec links to, and every hop of a chain
+// through a symlinked directory, including the directory link itself.
+func TestWritebackHoldsWhatConfigLinksTo(t *testing.T) {
+	f := newWBFixture(t, true, map[string]string{
+		"conf/spotexec.toml": "[sync]\n", "docker/Dockerfile": "FROM a\n", "real/x.toml": "[sync]\n", "a.txt": "a\n",
+	}, nil)
+	root := f.ws.Root
+	for link, target := range map[string]string{".spotexec.toml": "conf/spotexec.toml", ".spotexec": "docker", "sub/.spotexec.toml": "../cfg/x.toml", "cfg": "real"} {
+		full := filepath.Join(root, filepath.FromSlash(link))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, full); err != nil {
+			t.Fatal(err)
+		}
+		uploadedToo(t, f, link)
+	}
+	evil := "[sync]\nenv_allow = [\"AWS_SECRET_ACCESS_KEY\"]\n"
+	writes := map[string]string{"conf/spotexec.toml": evil, "docker/Dockerfile": "FROM evil\n", "docker/setup.sh": "evil\n", "real/x.toml": evil, "a.txt": "b\n"}
+	wb := f.apply(t, []string{"cfg"}, writes)
+	for p, want := range map[string]string{"conf/spotexec.toml": "[sync]\n", "docker/Dockerfile": "FROM a\n", "real/x.toml": "[sync]\n", "a.txt": "b\n"} {
+		if got := readOr(filepath.Join(root, filepath.FromSlash(p))); got != want {
+			t.Errorf("%s = %q, want %q", p, got, want)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(root, "docker", "setup.sh")); err == nil {
+		t.Error("docker/setup.sh was created")
+	}
+	if got, err := os.Readlink(filepath.Join(root, "cfg")); err != nil || got != "real" {
+		t.Errorf("cfg -> %q, %v: the link the config goes through was deleted", got, err)
+	}
+	var stashed []string
+	for _, c := range wb.Stashed {
+		if c.Reason != ReasonSpotexecConfig {
+			t.Errorf("%s: reason %q", c.Path, c.Reason)
+		}
+		stashed = append(stashed, c.Path)
+	}
+	sort.Strings(stashed)
+	if got := strings.Join(stashed, ","); got != "cfg,conf/spotexec.toml,docker/Dockerfile,docker/setup.sh,real/x.toml" {
+		t.Errorf("stashed %s", got)
+	}
+}
+
+// A run can't make a config name a directory either: the next run would
+// find it and fail to read it.
+func TestWritebackHoldsConfigNamedDirectory(t *testing.T) {
+	f := newWBFixture(t, true, map[string]string{"a.txt": "a\n"}, nil)
+	wb := f.apply(t, nil, map[string]string{".spotexec.toml/payload": "x\n", "sub/.spotexecignore/x": "x\n"})
+	for _, p := range []string{".spotexec.toml", "sub/.spotexecignore"} {
+		if _, err := os.Lstat(filepath.Join(f.ws.Root, filepath.FromSlash(p))); err == nil {
+			t.Errorf("%s was created", p)
+		}
+	}
+	if len(wb.Stashed) != 2 || len(wb.Applied) != 0 {
+		t.Errorf("stashed %v, applied %v", wb.Stashed, wb.Applied)
 	}
 }
 

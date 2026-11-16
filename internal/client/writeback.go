@@ -249,9 +249,10 @@ func writeback(ctx context.Context, fetchFiles fetchFunc, ws *Workspace, m *mani
 	for _, d := range deleted {
 		gone[strings.ToLower(d)] = true
 	}
+	isConfig := configGuard(ws.Root, configLinks(ws, m))
 	var renamed, holdable []protocol.Entry
 	for _, c := range fresh {
-		if gone[strings.ToLower(c.Path)] || spotexecConfigPath(c.Path) {
+		if gone[strings.ToLower(c.Path)] || isConfig(c.Path) {
 			renamed = append(renamed, c)
 		} else {
 			holdable = append(holdable, c)
@@ -389,12 +390,14 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 	}
 	defer func() { wb.OutsideLinks = outsideLinks(ws.Root, links) }()
 
-	// spotexec's own config is never written, replaced or deleted by a run:
-	// the runner's version of each config path is stashed for review and
-	// the local one left as it is (see spotexecConfigPath).
+	// spotexec's own config is never written, replaced or deleted by a run,
+	// nor is what it leads to through a symlink: the runner's version of
+	// each such path is stashed for review and the local one left as it is
+	// (see configGuard).
+	isConfig := configGuard(ws.Root, configLinks(ws, m))
 	config := map[string]bool{}
 	for _, p := range paths {
-		if !spotexecConfigPath(p) {
+		if !isConfig(p) {
 			continue
 		}
 		handled[p], config[p] = true, true
@@ -1355,6 +1358,7 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 		}
 	}
 	if len(inWS) > 0 {
+		isConfig := configGuard(ws.Root, configLinks(ws, nil))
 		prot, err := protectedPaths(ctx, ws.Root, inWS)
 		if err != nil {
 			return 0, err
@@ -1362,10 +1366,11 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 		for p, l := range landing {
 			// Judged where it lands too: a --dest above the worktree
 			// must not reach its spotexec state (conflicts, backups).
-			// Nor may spotexec's own config land, held or ignored or not.
-			protected[p] = prot[l] != 0 || reservedPath(l, ws.Git) || spotexecConfigPath(l)
+			// Nor may spotexec's own config land (or what it links to),
+			// held or ignored or not.
+			protected[p] = prot[l] != 0 || reservedPath(l, ws.Git) || isConfig(l)
 			_, isHeld := held[p]
-			heldOK[p] = isHeld && rel == "." && prot[l] == protNotIgnored && !spotexecConfigPath(l)
+			heldOK[p] = isHeld && rel == "." && prot[l] == protNotIgnored && !isConfig(l)
 		}
 	}
 	// Outside this worktree, anything inside some git repository (a sibling

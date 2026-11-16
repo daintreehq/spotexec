@@ -1,8 +1,14 @@
 package client
 
 import (
+	"io/fs"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
+
+	"github.com/daintreehq/spotexec/internal/fsid"
+	"github.com/daintreehq/spotexec/internal/manifest"
 )
 
 // reservedPath reports whether write-back or pull must never touch p: any
@@ -34,16 +40,108 @@ func reservedPath(p string, git bool) bool {
 // container's Dockerfile, [setup] scripts). A runner may not write these
 // into the worktree: the next run would load what it wrote, and a single
 // env_allow line forwards local secrets to whoever controls the runner.
-// Case is folded, as macOS and Windows filesystems fold it.
+// Case is folded, as macOS and Windows filesystems fold it. A config name
+// anywhere in p counts, so a run can't make .spotexec.toml a directory.
 func spotexecConfigPath(p string) bool {
-	segs := strings.Split(p, "/")
-	for _, seg := range segs {
-		if strings.EqualFold(seg, ".spotexec") {
+	for _, seg := range strings.Split(p, "/") {
+		if strings.EqualFold(seg, ".spotexec") || strings.EqualFold(seg, ".spotexec.toml") || strings.EqualFold(seg, ".spotexecignore") {
 			return true
 		}
 	}
-	base := segs[len(segs)-1]
-	return strings.EqualFold(base, ".spotexec.toml") || strings.EqualFold(base, ".spotexecignore")
+	return false
+}
+
+// configLinks lists the config paths here that may be symlinks for
+// configGuard: those m synced as links (m may be nil), and the ones the next
+// run here loads (the root's, and each .spotexec.toml from the working
+// directory up).
+func configLinks(ws *Workspace, m *manifest.Manifest) []string {
+	links := []string{".spotexec.toml", ".spotexecignore", ".spotexec"}
+	for d := filepath.ToSlash(ws.Cwd); d != "." && d != "" && d != "/"; d = path.Dir(d) {
+		links = append(links, path.Join(d, ".spotexec.toml"))
+	}
+	if m != nil {
+		for p, e := range m.ByPath {
+			if e.Mode == fsid.ModeSymlink && spotexecConfigPath(p) {
+				links = append(links, p)
+			}
+		}
+	}
+	return links
+}
+
+// configGuard returns whether a run may not write p: spotexec's own config
+// (spotexecConfigPath), or a path that config reaches here through a
+// symlink among links (worktree-relative config paths that may be links):
+// every hop of the chain and every symlinked directory on the way, and
+// anything below them. Writing config.toml rewrites the config as surely as
+// writing .spotexec.toml when .spotexec.toml -> config.toml. Case is folded.
+func configGuard(root string, links []string) func(string) bool {
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
+	}
+	reached := map[string]bool{}
+	add := func(p string) { reached[strings.ToLower(p)] = true }
+	inside := func(p string) bool { return p != ".." && !strings.HasPrefix(p, "../") && !path.IsAbs(p) }
+	isLink := func(p string) bool {
+		fi, err := os.Lstat(filepath.Join(root, filepath.FromSlash(p)))
+		return err == nil && fi.Mode()&fs.ModeSymlink != 0
+	}
+	for _, cur := range links {
+		for hop := 0; hop < 40; hop++ {
+			// cur as spelled (its directory may not exist yet), then where
+			// it really is: through any symlinked directories, each of which
+			// the config also depends on.
+			add(cur)
+			dir, base := path.Split(cur)
+			if dir = strings.TrimSuffix(dir, "/"); dir != "" {
+				for d := dir; d != "."; d = path.Dir(d) {
+					if isLink(d) {
+						add(d)
+					}
+				}
+				rd, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(dir)))
+				if err != nil {
+					break
+				}
+				rel, err := filepath.Rel(root, rd)
+				if rel = filepath.ToSlash(rel); err != nil || !inside(rel) {
+					break
+				}
+				cur = path.Join(rel, base)
+			}
+			add(cur)
+			if !isLink(cur) {
+				break
+			}
+			t, err := os.Readlink(filepath.Join(root, filepath.FromSlash(cur)))
+			if err != nil {
+				break
+			}
+			if filepath.IsAbs(t) {
+				if t, err = filepath.Rel(root, t); err != nil {
+					break
+				}
+				cur = path.Clean(filepath.ToSlash(t))
+			} else {
+				cur = path.Join(path.Dir(cur), filepath.ToSlash(t))
+			}
+			if !inside(cur) {
+				break
+			}
+		}
+	}
+	return func(p string) bool {
+		if spotexecConfigPath(p) {
+			return true
+		}
+		for q := strings.ToLower(p); q != "." && q != "/" && q != ""; q = path.Dir(q) {
+			if reached[q] {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 // pullMatches reports whether p (workspace-relative) was asked for by one of
