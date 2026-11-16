@@ -177,6 +177,7 @@ func TestWritebackNote(t *testing.T) {
 }
 
 func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
+	// Under bash, as tasks run ($'...' and <<< are not POSIX sh).
 	cases := []struct{ tmpl, want string }{
 		{`printf "<%s>" # print each`, "<a><two words>"},
 		{"printf \"<%s>\"  # print each\n", "<a><two words>"},
@@ -209,7 +210,7 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 	}
 	for _, c := range cases {
 		line := taskCommand(c.tmpl, []string{"a", "two words"})
-		out, err := exec.Command("sh", "-c", line).Output()
+		out, err := exec.Command("bash", "-c", line).Output()
 		if err != nil {
 			t.Fatalf("%q: %v", line, err)
 		}
@@ -233,7 +234,7 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 		if c.tmpl == "echo x 2>&" {
 			line = taskCommand(c.tmpl, []string{"1"})
 		}
-		if out, err := exec.Command("sh", "-c", line+"\necho done").Output(); err != nil || string(out) != c.want {
+		if out, err := exec.Command("bash", "-c", line+"\necho done").Output(); err != nil || string(out) != c.want {
 			t.Errorf("template %q: line %q printed %q %v, want %q", c.tmpl, line, out, err, c.want)
 		}
 	}
