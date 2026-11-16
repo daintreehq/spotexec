@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/helper"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 )
 
@@ -55,5 +58,31 @@ func TestFleetMismatches(t *testing.T) {
 	var plain provider.Fleet = matcherFleet{}.Fleet
 	if got := fleetMismatches(context.Background(), plain, insts); got != nil {
 		t.Fatalf("%q", got)
+	}
+}
+
+// The SLOTS column shows the slot count the VM's running jobs agreed on,
+// not the viewer's max_slots; an idle VM, or one whose helper doesn't
+// report it, falls back to the viewer's setting.
+func TestStatusSlotsShowVMCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running := provider.Info{State: provider.StateRunning}
+	three := []protocol.Holder{{Token: 1}, {Token: 2}, {Token: 3}}
+	printStatus(f, []runnerStatus{
+		{Name: "busy", r: &config.Runner{MaxSlots: 2}, Info: running, Helper: &helper.Status{CPUs: 8, Holders: three, SlotCount: 4}},
+		{Name: "idle", r: &config.Runner{MaxSlots: 2}, Info: running, Helper: &helper.Status{CPUs: 8, Holders: []protocol.Holder{}}},
+		{Name: "older", r: &config.Runner{}, Info: running, Helper: &helper.Status{CPUs: 8, Holders: three[:1]}},
+	}, nil)
+	f.Close()
+	b, _ := os.ReadFile(path)
+	lines := strings.Split(string(b), "\n")
+	for i, want := range []string{"3/4", "0/2", "1/2"} {
+		if !strings.Contains(lines[i+1], " "+want+" ") {
+			t.Fatalf("row %d: want slots %s:\n%s", i+1, want, b)
+		}
 	}
 }

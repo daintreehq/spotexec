@@ -313,7 +313,10 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		}
 		slots, load, mem, idle := "-", "-", "-", "-"
 		if h := s.Helper; h != nil {
-			n := s.r.MaxSlots
+			n := h.SlotCount // what the VM's running jobs agreed on
+			if n == 0 {
+				n = s.r.MaxSlots // idle: the next job's count, likely this one
+			}
 			if n == 0 {
 				n = min(max(h.CPUs/4, 1), protocol.MaxSlots)
 			}

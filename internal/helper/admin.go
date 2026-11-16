@@ -46,9 +46,13 @@ type Status struct {
 	Ephemeral   bool              `json:"ephemeral"`
 	IdleTimeout string            `json:"idle_timeout,omitempty"`
 	Holders     []protocol.Holder `json:"holders"`
-	Waiters     []protocol.Holder `json:"waiters,omitempty"` // runs waiting for their exact workspace slot (no token yet)
-	Slots       []SlotInfo        `json:"slots"`
-	DiskFreeMB  int64             `json:"disk_free_mb"`
+	// SlotCount is the slot count the holders' runs agree on (see
+	// slots.go), whatever max_slots each sent; 0 while there are none (the
+	// next run sets it) or from a helper before spotexec recorded it.
+	SlotCount  int               `json:"slot_count,omitempty"`
+	Waiters    []protocol.Holder `json:"waiters,omitempty"` // runs waiting for their exact workspace slot (no token yet)
+	Slots      []SlotInfo        `json:"slots"`
+	DiskFreeMB int64             `json:"disk_free_mb"`
 }
 
 // GetStatus inspects the work root without taking any locks.
@@ -60,6 +64,8 @@ func GetStatus(root string) Status {
 	st.Holders = readHolders(l)
 	if st.Holders == nil {
 		st.Holders = []protocol.Holder{}
+	} else {
+		st.SlotCount = readSlotCount(l)
 	}
 	st.Waiters = readWaiters(l)
 	vm := onSpotexecVM()

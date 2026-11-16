@@ -272,3 +272,37 @@ func TestAcquireRecordsSlotCount(t *testing.T) {
 		t.Fatalf("maxSlots %d, want 3", s.maxSlots)
 	}
 }
+
+// Jobs from checkouts with different max_slots, sharing one VM, are pinned
+// to disjoint CPU blocks of one size.
+func TestMixedMaxSlotsPinDisjointCPUs(t *testing.T) {
+	root := t.TempDir()
+	used := map[int]bool{}
+	size := 0
+	for _, n := range []int{2, 4, 4} {
+		s := testSession(t, root)
+		if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: n}); err != nil {
+			t.Fatal(err)
+		}
+		if s.slotLock == nil {
+			continue // the VM's slots are all taken
+		}
+		set, _ := planCPUSet(host(8), s.tokenIdx, s.maxSlots, false, nil)
+		cpus, err := parseCPUList(set)
+		if err != nil {
+			t.Fatalf("token %d: %v", s.tokenIdx, err)
+		}
+		if size == 0 {
+			size = len(cpus)
+		}
+		for _, c := range cpus {
+			if used[c] || len(cpus) != size {
+				t.Fatalf("token %d (%d slots) pinned to %s: overlaps, or not %d CPUs", s.tokenIdx, s.maxSlots, set, size)
+			}
+			used[c] = true
+		}
+	}
+	if len(used) != 8 {
+		t.Fatalf("pinned CPUs %v, want all 8 split between the runs", used)
+	}
+}

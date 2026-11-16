@@ -2,7 +2,6 @@ package helper
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -80,16 +79,14 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 			return perr(protocol.CodeDraining, "runner is draining")
 		}
 	}
-	max := a.MaxSlots
-	if max <= 0 {
-		max = autoSlots(runtime.NumCPU())
+	own := a.MaxSlots
+	if own <= 0 {
+		own = autoSlots(runtime.NumCPU())
 	}
-	max = min(max, protocol.MaxSlots)
+	own = min(own, protocol.MaxSlots)
+	max := own // the slot count the VM's runs agree on, once capacity is taken
 	// exec, pull and --same-slot need one exact workspace.
 	only := a.OnlySlot && a.PreferSlot >= 1
-	if only && a.PreferSlot > max {
-		return perr(protocol.CodeBadRequest, "workspace slot %d no longer exists: this runner now has %d slots (max_slots)", a.PreferSlot, max)
-	}
 	start := time.Now()
 	deadline := start.Add(time.Duration(a.QueueMS) * time.Millisecond)
 	lastNotice := time.Time{}
@@ -110,62 +107,19 @@ capacity:
 				return err
 			}
 		}
-		how := syscall.LOCK_SH
-		if a.Exclusive {
-			how = syscall.LOCK_EX
-		}
-		gate, gotGate, err := tryFlock(s.layout.Gate(), how)
+		n, got, err := s.reserveCapacity(a, own, only)
 		if err != nil {
 			return err
 		}
-		if gotGate && a.Exclusive {
-			ok := s.tryAll(max)
-			if !ok { // a status probe may hold one token for an instant
-				time.Sleep(25 * time.Millisecond)
-				ok = s.tryAll(max)
-			}
-			if ok {
-				s.own(func() { s.gate = gate })
-				if ok, err := s.takeOnlySlot(a, only, &holder); err != nil || ok {
-					if err != nil {
-						return err
-					}
-					break capacity
+		if got {
+			max = n
+			if ok, err := s.takeOnlySlot(a, only, &holder); err != nil || ok {
+				if err != nil {
+					return err
 				}
-				continue
+				break capacity
 			}
-			gate.Unlock()
-		} else if gotGate {
-			// Status probes (spotexec status, the pool manager) test free
-			// tokens by locking them for an instant: on an all-busy first
-			// pass, look again after a moment before reporting busy, or a
-			// probe would make an idle VM look full (and scale out).
-			for pass := 0; pass < 2 && len(s.tokens) == 0; pass++ {
-				if pass > 0 {
-					time.Sleep(25 * time.Millisecond)
-				}
-				for i := 1; i <= max; i++ {
-					l, ok, err := tryLock(s.layout.TokenLock(i))
-					if err != nil {
-						return err
-					}
-					if ok {
-						s.own(func() { s.tokens, s.tokenIdx = []*flock{l}, i })
-						break
-					}
-				}
-			}
-			if len(s.tokens) > 0 {
-				s.own(func() { s.gate = gate })
-				if ok, err := s.takeOnlySlot(a, only, &holder); err != nil || ok {
-					if err != nil {
-						return err
-					}
-					break capacity
-				}
-				continue
-			}
-			gate.Unlock()
+			continue
 		}
 		if !a.Wait {
 			return s.c.Send(protocol.TypeBusy, protocol.Busy{Holders: readHolders(s.layout)})
@@ -250,7 +204,8 @@ capacity:
 			}
 		}
 		if s.slotLock == nil {
-			// Otherwise only possible if max_slots differs between clients.
+			// Only possible beside a helper from an older spotexec, which
+			// sizes slots by its own max_slots.
 			if time.Now().After(slotDeadline) {
 				return perr(protocol.CodeQueueTimeout, "no free workspace slot for repo %s", a.RepoID)
 			}
@@ -355,12 +310,9 @@ func (s *Session) rollbackAcquire() {
 	s.lifecycle = nil
 }
 
-// tryAll locks every token: 1..max plus any higher-numbered token a client
-// with a larger max_slots has created, so exclusive really is host-wide.
+// tryAll locks every token, 1..max. The exclusive gate keeps out every
+// other session, so no token above the VM's slot count needs taking.
 func (s *Session) tryAll(max int) bool {
-	if n := highestToken(s.layout); n > max {
-		max = n
-	}
 	var got []*flock
 	for i := 1; i <= max; i++ {
 		l, ok, err := tryLock(s.layout.TokenLock(i))
@@ -390,18 +342,6 @@ func (s *Session) setChildPGID(pgid int) {
 	_ = readJSON(filepath.Join(s.slotDir, "holder.json"), &h)
 	h.ChildPGID = pgid
 	s.writeHolder(h)
-}
-
-func highestToken(l Layout) int {
-	n := 0
-	ents, _ := os.ReadDir(filepath.Join(l.Root, "tokens"))
-	for _, e := range ents {
-		var i int
-		if _, err := fmt.Sscanf(e.Name(), "token-%d.lock", &i); err == nil && i > n {
-			n = i
-		}
-	}
-	return n
 }
 
 // waitForSlot waits, holding nothing, until the exact workspace slot an
@@ -439,6 +379,76 @@ func (s *Session) waitForSlot(a protocol.Acquire, w *slotWaiter, h protocol.Hold
 		time.Sleep(200 * time.Millisecond)
 	}
 	return false, nil
+}
+
+// reserveCapacity takes the gate and a token (every token for an
+// exclusive run) if they are free, under the slot count the VM's runs agree
+// on (see slots.go), which it returns as n. Nothing is taken (got false)
+// while the VM's runs agree on fewer slots than the exact workspace an
+// exec, pull or --same-slot names: that frees up once the VM is idle.
+func (s *Session) reserveCapacity(a protocol.Acquire, own int, only bool) (n int, got bool, err error) {
+	mu, ok, err := lockSlots(s.layout)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	defer mu.Unlock()
+	n = agreedSlots(s.layout, own)
+	if only && a.PreferSlot > n {
+		if a.PreferSlot > own {
+			return 0, false, perr(protocol.CodeBadRequest, "workspace slot %d no longer exists: this runner now has %d slots (max_slots)", a.PreferSlot, n)
+		}
+		return n, false, nil
+	}
+	how := syscall.LOCK_SH
+	if a.Exclusive {
+		how = syscall.LOCK_EX
+	}
+	gate, gotGate, err := tryFlock(s.layout.Gate(), how)
+	if err != nil || !gotGate {
+		return n, false, err
+	}
+	if a.Exclusive {
+		got = s.tryAll(n)
+		if !got { // a status probe may hold one token for an instant
+			time.Sleep(25 * time.Millisecond)
+			got = s.tryAll(n)
+		}
+	} else {
+		// Status probes (spotexec status, the pool manager) test free
+		// tokens by locking them for an instant: on an all-busy first
+		// pass, look again after a moment before reporting busy, or a
+		// probe would make an idle VM look full (and scale out).
+		for pass := 0; pass < 2 && len(s.tokens) == 0; pass++ {
+			if pass > 0 {
+				time.Sleep(25 * time.Millisecond)
+			}
+			for i := 1; i <= n; i++ {
+				l, ok, err := tryLock(s.layout.TokenLock(i))
+				if err != nil {
+					gate.Unlock()
+					return n, false, err
+				}
+				if ok {
+					s.own(func() { s.tokens, s.tokenIdx = []*flock{l}, i })
+					break
+				}
+			}
+		}
+		got = len(s.tokens) > 0
+	}
+	if !got {
+		gate.Unlock()
+		return n, false, nil
+	}
+	s.own(func() { s.gate = gate })
+	// Recorded before the mutex goes, so the next run agrees. (A write
+	// failure leaves the capacity to acquire's rollback.)
+	if readSlotCount(s.layout) != n {
+		if err := writeSlotCount(s.layout, n); err != nil {
+			return n, false, err
+		}
+	}
+	return n, true, nil
 }
 
 // takeOnlySlot runs with capacity (token and gate) just taken. For a run
