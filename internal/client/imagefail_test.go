@@ -205,6 +205,7 @@ func TestFetchImageForcedBuildForgetsTheFailureOnlyOnceItHasTheImage(t *testing.
 		forgotten bool
 	}{
 		{"built, push failed", true, false, true},
+		{"on the runner, push failed", true, false, true},
 		{"cancelled", false, true, false},
 		{"failed before building", false, false, false},
 	} {
@@ -218,7 +219,8 @@ func TestFetchImageForcedBuildForgetsTheFailureOnlyOnceItHasTheImage(t *testing.
 			c := newScript(t, func(c *protocol.Conn, typ string, msg json.RawMessage) {
 				var m protocol.Image
 				_ = json.Unmarshal(msg, &m)
-				if m.Probe {
+				onRunner := strings.HasPrefix(tc.name, "on the runner")
+				if m.Probe && !onRunner {
 					_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Missing: true})
 					return
 				}
@@ -232,7 +234,11 @@ func TestFetchImageForcedBuildForgetsTheFailureOnlyOnceItHasTheImage(t *testing.
 				_ = c.Send(protocol.TypeError, protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "registry login: denied"})
 			})
 			_, _, _, err := fetchImage(cctx, c, Options{Rep: &recRep{}, WaitPush: true}, "aws#1", io.Discard, nil, newImageMemo("repo"), sharedImage(), time.Minute)
-			if err == nil || fmt.Sprint(c.sent) != "[image:probe image]" {
+			want := "[image:probe image]"
+			if strings.HasPrefix(tc.name, "on the runner") {
+				want = "[image:probe]" // the probe finds it and pushes it
+			}
+			if err == nil || fmt.Sprint(c.sent) != want {
 				t.Fatalf("sent %v, %v", c.sent, err)
 			}
 			if f := newImageMemo("repo").recall(sharedImage().Tag); (f == nil) != tc.forgotten {

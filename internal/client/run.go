@@ -2187,7 +2187,7 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 		return &ImageBuildError{Err: err, Until: f.At.Add(imageFailAge), imageFailure: f}
 	}
 	defer func() {
-		if err == nil && r.Image != "" {
+		if pushing || err == nil && r.Image != "" {
 			memo.forget(req.Tag)
 		}
 	}()
