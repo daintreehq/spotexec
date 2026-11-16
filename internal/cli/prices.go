@@ -189,7 +189,7 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 	}
 	head += "USD/HOUR\t"
 	if runCost {
-		head += "RUN COST\tSPEED\tCOLD\tDISTANCE\t"
+		head += "RUN COST\tSPEED\tCOLD\tDISTANCE\tFAILURES\t"
 	}
 	fmt.Fprintln(tw, head)
 	for i, sp := range k.Prices {
@@ -223,7 +223,14 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 			case c.ColdParts != nil && c.ColdParts.Paid() != "":
 				cold += " " + c.ColdParts.Paid()
 			}
-			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t", c.Score, added(c.Speed), cold, added(c.Distance))
+			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t%s\t", c.Score, added(c.Speed), cold, added(c.Distance), added(c.Failures))
+			if c.FailedHere != nil && c.Failures >= 0.0005 {
+				failed := "failed here lately: " + c.FailedHere.String()
+				if note != "" {
+					failed = "; " + failed
+				}
+				note += failed
+			}
 		}
 		fmt.Fprintln(tw, row+note)
 	}
@@ -262,8 +269,8 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 		case n > 1:
 			added = "the VM time and waiting that " + strings.Join(factors[:n-1], ", ") + " or " + factors[n-1] + " adds"
 		}
-		fmt.Fprintf(w, "\nlaunch_order = \"run_cost\": ranked by the expected cost of an hour of work (RUN COST, USD): its Spot bill, plus %s, with waiting valued at $%g/h (wait_cost). VMs reclaimed in a zone rank last for a while. launch_order = \"cheapest\" ranks by price alone.\n",
-			added, m.WaitCost)
+		fmt.Fprintf(w, "\nlaunch_order = \"run_cost\": ranked by the expected cost of an hour of work (RUN COST, USD): its Spot bill, plus %s, with waiting valued at $%g/h (wait_cost). A zone and type that failed lately (refused for capacity, or a VM reclaimed within an hour of launch) adds %g minutes of that for each failure (FAILURES), counting half as much every %g hours. VMs reclaimed in a zone rank last for a while. launch_order = \"cheapest\" ranks by price alone.\n",
+			added, m.WaitCost, m.FailureMinutes, m.FailureHalfLifeHours)
 	case r.LaunchOrder == config.LaunchListed:
 		fmt.Fprintf(w, "\nlaunch_order = \"listed\": instance_types are tried in the listed order, each in its cheapest zone first.\n")
 	}

@@ -70,6 +70,9 @@ type RunCost struct {
 	Speed    float64 `json:"speed"`    // a slower type: the extra VM time and waiting (vcpus runners)
 	Cold     float64 `json:"cold"`     // a cold start: the sum of ColdParts
 	Distance float64 `json:"distance"` // round trips to a farther region
+	Failures float64 `json:"failures"` // the zone and type's recent failures (see FailureHistory)
+	// FailedHere is the history behind Failures (nil: none lately).
+	FailedHere *FailureHistory `json:"failure_history,omitempty"`
 	// ColdParts says which parts of a cold start the region pays, and why
 	// (several regions only).
 	ColdParts *ColdParts `json:"cold_parts,omitempty"`
@@ -123,8 +126,13 @@ type RunCostModel struct {
 	WarmAfterMin   float64 `json:"warm_after_minutes"` // how long that VM must have been up
 	GenSpeedup     float64 `json:"gen_speedup"`        // speed per vCPU each generation adds (vcpus runners)
 	RoundTrips     int     `json:"round_trips"`        // client round trips in that work
-	SpeedByGen     bool    `json:"speed_by_generation"`
-	Regions        bool    `json:"regions"` // warmth and distance weighed (several regions)
+	// FailureMinutes is what each recent failure of a zone and type adds,
+	// as minutes of the VM and waiting; FailureHalfLifeHours is how long a
+	// failure takes to count half as much.
+	FailureMinutes       float64 `json:"failure_minutes"`
+	FailureHalfLifeHours float64 `json:"failure_half_life_hours"`
+	SpeedByGen           bool    `json:"speed_by_generation"`
+	Regions              bool    `json:"regions"` // warmth and distance weighed (several regions)
 	// DepsFrom and ImageFrom say where DepsMinutes and ImageMinutes came
 	// from: the project's measured installs and builds, or the defaults.
 	DepsFrom  ColdEstimate `json:"cold_deps_estimate"`
@@ -179,6 +187,7 @@ type placementEvidence struct {
 	warm  map[string]time.Time     // region -> last VM of this runner seen running there
 	rtt   map[string]time.Duration // region -> measured round trip
 	found map[string]regionWarmth  // region -> what its caches hold (see warmth)
+	fails map[string]poolFailures  // pool key -> its failure history, decayed to now
 }
 
 // Rank orders t's options for the next launch: by run cost (or price, or
@@ -197,6 +206,7 @@ func (g *AWSGlobal) Rank(t PriceTable) Ranking {
 				held[poolKey(p)] = c
 			}
 		}
+		ev.fails = failureEvidence(st, t.Prices, ev.now)
 		if st.WarmProfile == g.r.Profile {
 			for rg, at := range st.Warm {
 				ev.warm[rg] = at
@@ -241,20 +251,22 @@ func (g *AWSGlobal) costModel(work *coldWork, now time.Time) *RunCostModel {
 	deps, depsFrom := work.estimate(ColdDeps, coldDeps, now)
 	image, imageFrom := work.estimate(ColdImage, coldImage, now)
 	return &RunCostModel{
-		WaitCost:       g.r.WaitCostPerHour(),
-		HorizonMinutes: runHorizon.Minutes(),
-		ColdMinutes:    (coldBoot + deps + image).Minutes(),
-		BootMinutes:    coldBoot.Minutes(),
-		DepsMinutes:    deps.Minutes(),
-		ImageMinutes:   image.Minutes(),
-		DepsFrom:       depsFrom,
-		ImageFrom:      imageFrom,
-		WarmDays:       warmFor.Hours() / 24,
-		WarmAfterMin:   warmAfter.Minutes(),
-		GenSpeedup:     genSpeedup,
-		RoundTrips:     runRoundTrips,
-		SpeedByGen:     g.r.ByRequirements(),
-		Regions:        !g.oneRegion(),
+		WaitCost:             g.r.WaitCostPerHour(),
+		HorizonMinutes:       runHorizon.Minutes(),
+		ColdMinutes:          (coldBoot + deps + image).Minutes(),
+		BootMinutes:          coldBoot.Minutes(),
+		DepsMinutes:          deps.Minutes(),
+		ImageMinutes:         image.Minutes(),
+		DepsFrom:             depsFrom,
+		ImageFrom:            imageFrom,
+		WarmDays:             warmFor.Hours() / 24,
+		WarmAfterMin:         warmAfter.Minutes(),
+		GenSpeedup:           genSpeedup,
+		RoundTrips:           runRoundTrips,
+		FailureMinutes:       failCost.Minutes(),
+		FailureHalfLifeHours: failHalfLife.Hours(),
+		SpeedByGen:           g.r.ByRequirements(),
+		Regions:              !g.oneRegion(),
 	}
 }
 
@@ -303,7 +315,11 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 				c.Distance = (price + wait) * float64(m.RoundTrips) * (d - minRTT).Hours()
 			}
 		}
-		c.Score = c.Compute + c.Speed + c.Cold + c.Distance
+		if f, ok := ev.fails[poolKey(p)]; ok {
+			c.FailedHere = &FailureHistory{Capacity: f.Capacity, Reclaims: f.Reclaims, LastCapacity: f.LastCapacity, LastReclaim: f.LastReclaim}
+			c.Failures = (price + wait) * f.weight() * m.FailureMinutes / 60
+		}
+		c.Score = c.Compute + c.Speed + c.Cold + c.Distance + c.Failures
 		out[poolKey(p)] = c
 	}
 	return out
@@ -378,6 +394,9 @@ func (c RunCost) Factors() string {
 	}
 	add(c.Cold, cold)
 	add(c.Distance, fmt.Sprintf("distance (%d ms)", c.RTTMS))
+	if c.FailedHere != nil {
+		add(c.Failures, "failed here lately ("+c.FailedHere.String()+")")
+	}
 	return strings.Join(parts, ", ")
 }
 
@@ -601,4 +620,5 @@ func forgetOld(st *placementState, now time.Time) {
 		}
 	}
 	forgetOldColdWork(st, now)
+	forgetOldFailures(st, now)
 }

@@ -34,7 +34,9 @@ func reclaimKey(p SpotPrice) string { return reclaimPrefix + poolKey(p) }
 
 // Reclaimed holds in's zone and type back for reclaimHoldMin, doubling (up
 // to reclaimHoldMax) for each further VM reclaimed there while the last
-// hold is remembered (up to reclaimHoldMax after it ends).
+// hold is remembered (up to reclaimHoldMax after it ends). A VM reclaimed
+// within earlyReclaim of its launch also counts in the pool's failure
+// history, which outlasts the hold.
 func (a *AWSSpot) Reclaimed(in Instance) { a.ranker().Reclaimed(in) }
 
 // Reclaimed implements Reclaimer.
@@ -45,7 +47,8 @@ func (g *AWSGlobal) Reclaimed(in Instance) {
 	if in.Region == "" {
 		in.Region = g.r.Region
 	}
-	key := reclaimKey(SpotPrice{Region: in.Region, Zone: in.Zone, Type: in.Type})
+	pool := SpotPrice{Region: in.Region, Zone: in.Zone, Type: in.Type}
+	key := reclaimKey(pool)
 	now := g.clock()
 	_ = g.withState(func(st *placementState) {
 		for id, at := range st.Reclaimed {
@@ -66,6 +69,10 @@ func (g *AWSGlobal) Reclaimed(in Instance) {
 		}
 		st.Cooldown[key] = cooldown{Until: now.Add(step), Step: step,
 			Why: fmt.Sprintf("Spot interruption notice to %s at %s", in.ID, now.Local().Format("15:04"))}
+		// An unknown or future launch time says nothing about how soon.
+		if up := now.Sub(in.LaunchedAt); !in.LaunchedAt.IsZero() && up >= 0 && up <= earlyReclaim {
+			recordFailure(st, pool, false, now)
+		}
 	})
 }
 

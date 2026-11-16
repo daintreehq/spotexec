@@ -29,6 +29,7 @@ var (
 			Image: provider.ColdPart{Warm: true, Why: "the project's image"}}},
 	}
 	model = &provider.RunCostModel{WaitCost: 1, HorizonMinutes: 60, ColdMinutes: 4, BootMinutes: 1, DepsMinutes: 2, ImageMinutes: 1, WarmDays: 7, WarmAfterMin: 10, GenSpeedup: 1.1, RoundTrips: 300, SpeedByGen: true, Regions: true,
+		FailureMinutes: 3, FailureHalfLifeHours: 2,
 		DepsFrom: provider.ColdEstimate{Source: "default"}, ImageFrom: provider.ColdEstimate{Source: "default"}}
 )
 
@@ -57,19 +58,20 @@ func TestPricesShowRunCostBreakdown(t *testing.T) {
 	out := b.String()
 	t.Log("\n" + out)
 	lines := strings.Split(out, "\n")
-	if f := strings.Fields(lines[1]); strings.Join(f, " ") != "REGION ZONE TYPE USD/HOUR RUN COST SPEED COLD DISTANCE" {
+	if f := strings.Fields(lines[1]); strings.Join(f, " ") != "REGION ZONE TYPE USD/HOUR RUN COST SPEED COLD DISTANCE FAILURES" {
 		t.Fatalf("header: %q", lines[1])
 	}
 	for i, want := range []string{
-		"→ us-east-1 us-east-1a m7a.2xlarge 0.100 0.100 - warm - next launch",
-		"eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.169 - +0.073 boot,deps,image -",
-		"ap-south-2 ap-south-2a m6a.2xlarge 0.030 0.252 +0.103 +0.034 deps +0.085",
+		"→ us-east-1 us-east-1a m7a.2xlarge 0.100 0.100 - warm - - next launch",
+		"eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.169 - +0.073 boot,deps,image - -",
+		"ap-south-2 ap-south-2a m6a.2xlarge 0.030 0.252 +0.103 +0.034 deps +0.085 -",
 	} {
 		if got := strings.Join(strings.Fields(lines[2+i]), " "); got != want {
 			t.Errorf("row %d: %q, want %q", i+1, got, want)
 		}
 	}
 	for _, want := range []string{`launch_order = "run_cost"`, "with waiting valued at $1/h (wait_cost)", "a slower type (each instance generation counts as 10% faster per vCPU)",
+		"A zone and type that failed lately (refused for capacity, or a VM reclaimed within an hour of launch) adds 3 minutes of that for each failure (FAILURES), counting half as much every 2 hours.",
 		"a cold region (COLD, in minutes: boot 1 without a bake of aws there, deps 2 (a default) without the project's archive in the region's cache, image 1 (a default) without the project's image in its registry; outside a project, deps and image count as warm where a VM of aws was up 10 minutes or more in the last 7 days)", `"cheapest" ranks by price alone`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
@@ -111,6 +113,38 @@ func TestPricesShowRunCostBreakdown(t *testing.T) {
 	runCostView().writeText(&b, 1)
 	if out := b.String(); row(strings.Split(out, "\n"), "eu-north-1b") != "" || !strings.Contains(out, "… 2 more (--limit 0 for all)") {
 		t.Fatalf("limited:\n%s", out)
+	}
+}
+
+// A zone and type that failed lately shows what that added (FAILURES) and
+// why, beside any cooldown.
+func TestPricesShowFailureHistory(t *testing.T) {
+	last := time.Date(2026, 11, 15, 14, 5, 0, 0, time.Local)
+	v := runCostView()
+	v.k.Cost = map[string]provider.RunCost{}
+	for k, c := range costs {
+		v.k.Cost[k] = c
+	}
+	failed := v.k.Cost[optionKey(coldOpt)]
+	failed.Failures, failed.Score = 0.1074, failed.Score+0.1074
+	failed.FailedHere = &provider.FailureHistory{Capacity: 1.83, Reclaims: 0.5, LastCapacity: last, LastReclaim: last}
+	v.k.Cost[optionKey(coldOpt)] = failed
+	v.cool = map[string]string{optionKey(coldOpt): "InsufficientInstanceCapacity"}
+	var b bytes.Buffer
+	v.writeText(&b, 20)
+	want := "eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.276 - +0.073 boot,deps,image - +0.107 skipped for now: InsufficientInstanceCapacity; " +
+		"failed here lately: 1.8 capacity refusals, last 14:05; 0.5 VMs reclaimed within 1 hour of launch, last 14:05"
+	if got := strings.Join(strings.Fields(row(strings.Split(b.String(), "\n"), "eu-north-1b")), " "); got != want {
+		t.Fatalf("row:\n%s\nwant:\n%s", got, want)
+	}
+	b.Reset()
+	if err := v.writeJSON(&b); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"failures": 0.1074`, `"capacity_refusals": 1.83`, `"early_reclaims": 0.5`, `"last_capacity_refusal": "`, `"failure_minutes": 3`, `"failure_half_life_hours": 2`} {
+		if !strings.Contains(b.String(), key) {
+			t.Errorf("json missing %s:\n%s", key, b.String())
+		}
 	}
 }
 
