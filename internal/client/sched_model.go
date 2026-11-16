@@ -305,3 +305,63 @@ func (p *Pool) RefreshPrices(ctx context.Context) {
 		return nil
 	})
 }
+
+// --- launch lead ------------------------------------------------------------
+
+const (
+	// leadSamples: launch leads kept per fleet (the newest).
+	leadSamples = 16
+	// leadDefault is the launch lead assumed before leadMin launches have
+	// been timed: a new VM is rarely serving sooner (capacity retries,
+	// boot, bootstrap), and an unlearned guess must not hold jobs long.
+	leadDefault = 2 * time.Minute
+	// leadMax bounds a learned lead, so a run of slow launches never holds
+	// waiting jobs back for longer.
+	leadMax = 10 * time.Minute
+	// leadGap: a VM first seen ready more than this after it was last seen
+	// booting was ready unobserved for an unknown time, so its launch isn't
+	// timed.
+	leadGap = 30 * time.Second
+)
+
+// leadSample is one launch timed from its planning to its VM first taking
+// a job (or turning one away as full).
+type leadSample struct {
+	Instance string    `json:"instance"`
+	S        float64   `json:"s"`
+	At       time.Time `json:"at"`
+}
+
+// observeLaunch records how long instance's launch took to serve, once.
+func (s *schedState) observeLaunch(instance string, d time.Duration, now time.Time) {
+	if instance == "" || d <= 0 {
+		return
+	}
+	for _, l := range s.Leads {
+		if l.Instance == instance {
+			return
+		}
+	}
+	s.Leads = append(s.Leads, leadSample{Instance: instance, S: d.Seconds(), At: now})
+	if len(s.Leads) > leadSamples {
+		s.Leads = s.Leads[len(s.Leads)-leadSamples:]
+	}
+}
+
+// launchLead is how long a launch planned now is expected to take before
+// its VM serves: the median of the recent timed launches, or leadDefault
+// with fewer than modelMin of them. learned says which.
+func (s *schedState) launchLead(now time.Time) (lead time.Duration, learned bool) {
+	var v []float64
+	for _, l := range s.Leads {
+		if now.Sub(l.At) <= modelAge {
+			v = append(v, l.S)
+		}
+	}
+	if len(v) < modelMin {
+		return leadDefault, false
+	}
+	sort.Float64s(v)
+	lead = time.Duration(v[(len(v)-1)/2] * float64(time.Second))
+	return min(lead, leadMax), true
+}

@@ -202,6 +202,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		}
 	}()
 	provisioning := map[string]bool{}
+	held := map[string]bool{} // fleets holding launches for slots about to free
 	var lastHolders []protocol.Holder
 	lastPos := -1
 	queued := false
@@ -437,11 +438,12 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				continue // can't grow: don't signal demand others would launch for
 			}
 			if waiters[m.r.Name] == nil {
+				register := m.pool.Register
 				weight := 1
 				if req.Base.Exclusive {
-					weight = m.pool.SlotsPerInstance()
+					register, weight = m.pool.RegisterExclusive, m.pool.SlotsPerInstance()
 				}
-				w, err := m.pool.Register(weight)
+				w, err := register(weight)
 				if err != nil {
 					return nil, err
 				}
@@ -482,9 +484,17 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					blockErr = fmt.Errorf("%s: %s", m.r.Name, d.QuotaErr)
 				}
 			}
+			if d.Held && !held[m.r.Name] {
+				// Once per hold, so a run can say why it didn't launch.
+				req.Rep.Event("scale_held", map[string]any{"runner": m.r.Name, "demand": d.Demand, "deferred": d.Deferred,
+					"free_in_ms": d.FreeIn.Milliseconds(), "lead_ms": d.Lead.Milliseconds(), "lead_learned": d.LeadLearned,
+					"waited_ms": d.Waited.Milliseconds(), "reason": d.Reason})
+			}
+			held[m.r.Name] = d.Held
 			if d.Launch && !provisioning[d.ID] {
 				provisioning[d.ID] = true
-				req.Rep.Event("scale_out", map[string]any{"runner": m.r.Name, "launch_id": d.ID, "demand": d.Demand, "instances": d.Live})
+				req.Rep.Event("scale_out", map[string]any{"runner": m.r.Name, "launch_id": d.ID, "demand": d.Demand, "instances": d.Live,
+					"lead_ms": d.Lead.Milliseconds(), "lead_learned": d.LeadLearned, "waited_ms": d.Waited.Milliseconds()})
 				// Registered before the goroutine starts, so a process exiting
 				// right now still waits for it (WaitLaunches).
 				HoldLaunch()
@@ -494,12 +504,17 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				}
 				go m.provision(pctx, d.ID, req.Rep)
 			}
-			covered += d.Capacity
+			// Demand held for slots about to free is covered too: a
+			// lower-priority fleet mustn't launch for it instead.
+			covered += d.Capacity + d.Deferred
 			if d.Pending > 0 || d.Launch {
 				if status != "" {
 					status += "; "
 				}
 				status += fmt.Sprintf("%d instance(s) starting on %s", d.Pending, m.r.Name)
+				if d.Held {
+					status += "; " + d.Reason
+				}
 			} else if status == "" && d.Demand > 0 {
 				status = fmt.Sprintf("%s: %s", m.r.Name, d.Reason)
 			}

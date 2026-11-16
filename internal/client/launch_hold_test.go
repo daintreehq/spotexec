@@ -1,0 +1,409 @@
+package client
+
+import (
+	"context"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/daintreehq/spotexec/internal/provider"
+)
+
+// holdOn is hold with a predicted release (zero: unknown).
+func holdOn(s *schedState, vm, worktree string, now, expect time.Time) {
+	hold(s, vm, worktree, now)
+	for _, a := range s.Attempts {
+		if a.VM == vm && a.Worktree == worktree {
+			a.Expect = expect
+		}
+	}
+}
+
+// fullFleet is one ready two-slot VM whose two jobs end at the given
+// times, with `waiting` jobs waiting for a slot (-1: one exclusive job,
+// waiting for the whole VM; -2: the same, weighing one slot as on a fleet
+// of mixed sizes), as seen by a process that has waited `waited`.
+func fullFleet(t *testing.T, waiting int, waited time.Duration, ends ...time.Time) *Pool {
+	t.Helper()
+	p, _ := schedPool(t, 1, 2)
+	now := time.Now()
+	p.loaded(t, func(st *poolState) {
+		s := st.sched()
+		allReady(st, now)
+		p.views(st, now)
+		for i, e := range ends {
+			holdOn(s, "i-0", "wt"+string(rune('a'+i)), now, e)
+		}
+	})
+	register := func(n int, excl bool) {
+		t.Helper()
+		reg := p.Register
+		if excl {
+			reg = p.RegisterExclusive
+		}
+		w, err := reg(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(w.Done)
+	}
+	switch waiting {
+	case -1:
+		register(p.SlotsPerInstance(), true)
+	case -2:
+		register(1, true)
+	default:
+		for range waiting {
+			register(1, false)
+		}
+	}
+	p.since = now.Add(-waited)
+	return p
+}
+
+// #226: a burst that fills every slot, on a VM whose jobs end in seconds,
+// waits for those slots instead of launching a VM that would serve only
+// after the burst is over; and says why.
+func TestShortBurstWaitsForSlotsAboutToFree(t *testing.T) {
+	now := time.Now()
+	p := fullFleet(t, 1, time.Second, now.Add(10*time.Second), now.Add(20*time.Second))
+	d, err := p.Plan(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Launch || !d.Held || d.Deferred != 1 || d.Lead != leadDefault || d.LeadLearned {
+		t.Fatalf("burst: %+v, want held for the slot freeing in 10s", d)
+	}
+	if d.FreeIn <= 0 || d.FreeIn > 10*time.Second || !strings.Contains(d.Reason, "sooner than a new VM") {
+		t.Fatalf("hold: free in %s, reason %q", d.FreeIn, d.Reason)
+	}
+
+	// Two waiting: both slots must free within the lead.
+	p = fullFleet(t, 2, time.Second, now.Add(10*time.Second), now.Add(20*time.Second))
+	if d, _ := p.Plan(context.Background(), 0); d.Launch || d.Deferred != 2 || d.FreeIn <= 10*time.Second {
+		t.Fatalf("two waiting: %+v, want held until the second slot frees", d)
+	}
+}
+
+// Demand still waiting after a launch's lead is sustained: it launches as
+// before, whatever is predicted to free.
+func TestSustainedWaitLaunches(t *testing.T) {
+	now := time.Now()
+	p := fullFleet(t, 1, leadDefault+time.Second, now.Add(10*time.Second), now.Add(20*time.Second))
+	if d, _ := p.Plan(context.Background(), 0); !d.Launch || d.Held || d.Waited < leadDefault {
+		t.Fatalf("sustained: %+v, want a launch", d)
+	}
+}
+
+// A prediction that is missing, already overdue, or later than a launch
+// would serve holds nothing; nor do too few releases, or a whole-VM waiter.
+func TestHoldNeedsPredictedReleases(t *testing.T) {
+	now := time.Now()
+	soon := now.Add(5 * time.Second)
+	for _, c := range []struct {
+		name    string
+		waiting int
+		ends    []time.Time
+	}{
+		{"unknown", 1, []time.Time{{}, {}}},
+		{"overdue", 1, []time.Time{now.Add(-time.Second), now.Add(-time.Second)}},
+		{"after the lead", 1, []time.Time{now.Add(leadDefault + time.Minute), now.Add(leadDefault + time.Minute)}},
+		{"too few", 2, []time.Time{soon, {}}},
+		// An exclusive job needs a VM to empty, which freeing slots don't
+		// show (two may free on different VMs).
+		{"whole VM", -1, []time.Time{soon, soon}},
+		{"whole VM weighing a slot", -2, []time.Time{soon, soon}},
+	} {
+		p := fullFleet(t, c.waiting, time.Second, c.ends...)
+		if d, err := p.Plan(context.Background(), 0); err != nil || !d.Launch || d.Held {
+			t.Errorf("%s: %+v %v, want a launch", c.name, d, err)
+		}
+	}
+}
+
+// Slots freeing hold nothing on a VM that won't take the waiting job, nor
+// from a job not known to hold its slot.
+func TestHoldIgnoresUnservingVMs(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		fn   func(st *poolState)
+	}{
+		{"draining", func(st *poolState) { st.note("i-0").Draining = true }},
+		{"retiring", func(st *poolState) { st.note("i-0").Retiring = true }},
+		{"outdated", func(st *poolState) { st.note("i-0").Mismatch = "wrong type" }},
+		{"suspect", func(st *poolState) { st.note("i-0").SuspectUntil = time.Now().Add(time.Minute) }},
+		{"never ready", func(st *poolState) { st.note("i-0").Ready = false }},
+		{"no note", func(st *poolState) { delete(st.Notes, "i-0") }},
+		{"fenced", func(st *poolState) { st.sched().Fences["i-0"] = &fence{Owner: "other", At: time.Now()} }},
+		{"not listed", func(st *poolState) {
+			for _, a := range st.sched().Attempts {
+				a.VM = "i-gone"
+			}
+		}},
+	} {
+		now := time.Now()
+		p := fullFleet(t, 1, time.Second, now.Add(5*time.Second), now.Add(5*time.Second))
+		p.loaded(t, c.fn)
+		if d, _ := p.Plan(context.Background(), 0); d.Held {
+			t.Errorf("%s: %+v, want no hold", c.name, d)
+		}
+	}
+	for _, state := range []string{attReserved, attSent, attUncertain} {
+		now := time.Now()
+		p := fullFleet(t, 1, time.Second, now.Add(5*time.Second), now.Add(5*time.Second))
+		p.loaded(t, func(st *poolState) {
+			for _, a := range st.sched().Attempts {
+				a.State = state
+			}
+		})
+		if d, _ := p.Plan(context.Background(), 0); d.Held {
+			t.Errorf("%s attempts: %+v, want no hold", state, d)
+		}
+	}
+}
+
+// Only demand nothing else covers waits, and only for releases that aren't
+// already counted as starting capacity.
+func TestHoldCoversOnlyResidualDemand(t *testing.T) {
+	now := time.Now()
+	soon := now.Add(5 * time.Second)
+	ctx := context.Background()
+
+	// Three waiting, two covered by a higher-priority fleet: one slot
+	// freeing is enough.
+	p := fullFleet(t, 3, time.Second, soon, time.Time{})
+	if d, _ := p.Plan(ctx, 2); !d.Held || d.Demand != 1 || d.Deferred != 1 {
+		t.Fatalf("covered upstream: %+v, want one slot held", d)
+	}
+	// Fully covered upstream: nothing to hold for.
+	if d, _ := p.Plan(ctx, 3); d.Held || d.Launch || d.Deferred != 0 {
+		t.Fatalf("all covered: %+v", d)
+	}
+
+	// A job holding two slots (exclusive) frees both for two shared jobs.
+	p = fullFleet(t, 2, time.Second)
+	p.loaded(t, func(st *poolState) {
+		holdOn(st.sched(), "i-0", "x", now, soon)
+		for _, a := range st.sched().Attempts {
+			a.Units, a.Exclusive = 2, true
+		}
+	})
+	if d, _ := p.Plan(ctx, 0); !d.Held || d.Deferred != 2 {
+		t.Fatalf("exclusive job ending: %+v, want both slots held", d)
+	}
+
+	// The VM is young enough that its launch still counts its two slots as
+	// starting: its job ending soon isn't a second source of slots, so the
+	// third waiting job launches.
+	p = fullFleet(t, 3, time.Second, soon, soon)
+	p.loaded(t, func(st *poolState) {
+		st.Launches = []launchRec{{ID: "l1", InstanceID: "i-0", Started: now.Add(-time.Minute), PID: os.Getpid()}}
+		st.note("i-0").ReadyAt = now
+	})
+	if d, _ := p.Plan(ctx, 0); !d.Launch || d.Held {
+		t.Fatalf("release on a starting VM: %+v, want a launch", d)
+	}
+
+	// Without a waiting clock (no Acquire behind it), Plan never holds.
+	p = fullFleet(t, 1, time.Second, soon, soon)
+	p.since = time.Time{}
+	if d, _ := p.Plan(ctx, 0); !d.Launch {
+		t.Fatalf("no waiting clock: %+v, want a launch", d)
+	}
+}
+
+// The lead is learned from timed launches: a fleet that serves in 30s
+// launches rather than wait 45s for a slot.
+func TestLearnedLeadDecides(t *testing.T) {
+	now := time.Now()
+	p := fullFleet(t, 1, time.Second, now.Add(45*time.Second), now.Add(45*time.Second))
+	p.loaded(t, func(st *poolState) {
+		for i, id := range []string{"i-x", "i-y", "i-z"} {
+			st.sched().observeLaunch(id, time.Duration(25+5*i)*time.Second, now)
+		}
+	})
+	d, _ := p.Plan(context.Background(), 0)
+	if !d.Launch || d.Lead != 30*time.Second || !d.LeadLearned {
+		t.Fatalf("fast fleet: %+v, want a launch with a learned 30s lead", d)
+	}
+}
+
+func TestLaunchLead(t *testing.T) {
+	now := time.Now()
+	s := &schedState{}
+	if l, ok := s.launchLead(now); l != leadDefault || ok {
+		t.Fatalf("no samples: %s %v", l, ok)
+	}
+	s.observeLaunch("i-a", 4*time.Minute, now)
+	s.observeLaunch("i-a", time.Second, now) // the same VM once
+	s.observeLaunch("i-b", 6*time.Minute, now)
+	if l, ok := s.launchLead(now); l != leadDefault || ok || len(s.Leads) != 2 {
+		t.Fatalf("two samples: %s %v %+v", l, ok, s.Leads)
+	}
+	s.observeLaunch("i-c", 5*time.Minute, now)
+	if l, ok := s.launchLead(now); l != 5*time.Minute || !ok {
+		t.Fatalf("three samples: %s %v", l, ok)
+	}
+	for i := 0; i < leadSamples; i++ {
+		s.observeLaunch("i-slow"+string(rune('a'+i)), time.Hour, now)
+	}
+	if l, _ := s.launchLead(now); l != leadMax || len(s.Leads) != leadSamples {
+		t.Fatalf("slow launches: %s, %d samples", l, len(s.Leads))
+	}
+	if l, ok := s.launchLead(now.Add(modelAge + time.Hour)); l != leadDefault || ok {
+		t.Fatalf("old samples: %s %v", l, ok)
+	}
+}
+
+// A launch is timed when its VM, watched booting, first serves; not when
+// it was first seen ready after nobody had probed it for a while, nor
+// after a failure to answer (a VM ready unobserved fails those too).
+func TestReadyTimesItsLaunch(t *testing.T) {
+	p, f := testPool(t, 4)
+	now := time.Now()
+	for _, id := range []string{"i-new", "i-busy", "i-quiet", "i-flaky"} {
+		f.insts = append(f.insts, provider.Instance{ID: id, State: provider.StateRunning, LaunchedAt: now, Target: provider.Target{Host: "192.0.2.9"}})
+	}
+	p.loaded(t, func(st *poolState) {
+		for _, id := range []string{"i-new", "i-busy", "i-quiet", "i-flaky"} {
+			st.Launches = append(st.Launches, launchRec{ID: "l-" + id, InstanceID: id, Started: now.Add(-3 * time.Minute), PID: os.Getpid()})
+		}
+	})
+	p.Observe("i-new", OutBooting, now)
+	p.Observe("i-new", OutAcquired, now)
+	p.Observe("i-new", OutAcquired, now)
+	p.Observe("i-busy", OutBooting, now)
+	p.Observe("i-busy", OutBusy, now)
+	p.Observe("i-quiet", OutBusy, now) // never seen booting
+	p.Observe("i-flaky", OutUnreachable, now)
+	p.Observe("i-flaky", OutAcquired, now)
+	got := map[string]float64{}
+	for _, l := range p.state(t).Leads {
+		got[l.Instance] = l.S
+	}
+	if len(got) != 2 || got["i-new"] < 179 || got["i-new"] > 200 || got["i-busy"] < 179 {
+		t.Fatalf("leads %v, want ~3m samples for i-new and i-busy only", got)
+	}
+}
+
+// The booting sighting must be recent: a VM last seen booting longer ago
+// than leadGap may have been ready unobserved since.
+func TestReadyAfterUnwatchedGapIsNotTimed(t *testing.T) {
+	now := time.Now()
+	for _, c := range []struct {
+		seen time.Time
+		want int
+	}{{now.Add(-leadGap), 1}, {now.Add(-leadGap - time.Second), 0}} {
+		st := &poolState{Notes: map[string]*note{}}
+		st.Launches = []launchRec{{ID: "l1", InstanceID: "i-a", Started: now.Add(-3 * time.Minute)}}
+		st.note("i-a").BootSeenAt = c.seen
+		st.markReady("i-a", now)
+		if n := len(st.sched().Leads); n != c.want || !st.Notes["i-a"].Ready {
+			t.Errorf("seen booting %s before ready: %d samples, want %d", now.Sub(c.seen), n, c.want)
+		}
+	}
+}
+
+// spotexec up watches its VM until it is ready, so it times the launch.
+func TestPrewarmTimesItsLaunch(t *testing.T) {
+	ctx := context.Background()
+	p, _ := testPool(t, 2)
+	ids, _ := p.Reserve(ctx, 1)
+	in, err := p.Prewarm(ctx, ids[0], nil, func(context.Context, provider.Instance) error {
+		// A setup slow enough that the launch record is pruned meanwhile.
+		return p.with(func(st *poolState) error { st.Launches = nil; return nil })
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l := p.state(t).Leads; len(l) != 1 || l[0].Instance != in.ID {
+		t.Fatalf("leads %+v, want one for %s", l, in.ID)
+	}
+}
+
+// Demand a fleet holds for slots about to free is covered: a
+// lower-priority fleet doesn't launch for it, and the job gets the slot
+// that frees, with the hold on record.
+func TestHeldDemandIsCoveredAcrossFleets(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"broken": {"b1"}, "healthy": {"h1"}}, 4)
+	first, second := NewPool(pool[0], fleets["broken"]), NewPool(pool[1], fleets["healthy"])
+	now := time.Now()
+	for _, c := range []struct {
+		p    *Pool
+		vm   string
+		ends time.Time
+	}{{first, "i-b1", now.Add(30 * time.Second)}, {second, "i-h1", time.Time{}}} {
+		c.p.loaded(t, func(st *poolState) {
+			s := st.sched()
+			allReady(st, now)
+			c.p.views(st, now)
+			s.EpochAt = now
+			holdOn(s, c.vm, "a", now, c.ends)
+			holdOn(s, c.vm, "b", now, c.ends)
+		})
+	}
+	rep := &roundRep{rounds: make(chan struct{}, 64)}
+	released := make(chan error, 1)
+	go func() {
+		// Once the job has planned (and held) a few rounds, the first
+		// fleet's job ends as predicted.
+		for range 3 {
+			<-rep.rounds
+		}
+		released <- first.with(func(st *poolState) error {
+			s := st.sched()
+			for id, a := range s.Attempts {
+				if a.Worktree == "a" {
+					delete(s.Attempts, id)
+				}
+			}
+			return nil
+		})
+	}()
+	scriptHelpers(t, func(_ AcquireRequest, host string, _ int) (*Lease, error) {
+		if host == "b1" {
+			return &Lease{}, nil
+		}
+		return nil, nil // busy
+	})
+	l, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: rep})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := <-released; err != nil {
+		t.Fatal(err)
+	}
+	if l.InstanceID != "i-b1" {
+		t.Fatalf("placed on %s, want the slot freeing on i-b1", l.InstanceID)
+	}
+	held := 0
+	for i, n := range rep.names {
+		switch {
+		case n == "scale_out":
+			t.Fatalf("launched for demand held for a slot about to free: %v", rep.events[i])
+		case n == "scale_held":
+			held++
+			if rep.events[i]["runner"] != "broken" || rep.events[i]["reason"] == nil {
+				t.Fatalf("scale_held %v", rep.events[i])
+			}
+		}
+	}
+	if held != 1 {
+		t.Fatalf("%d scale_held events over several held rounds, want 1: %v", held, rep.names)
+	}
+}
+
+// roundRep records events, and signals each queue round (its status line).
+type roundRep struct {
+	placeRep
+	rounds chan struct{}
+}
+
+func (r *roundRep) Status(string, ...any) {
+	select {
+	case r.rounds <- struct{}{}:
+	default:
+	}
+}

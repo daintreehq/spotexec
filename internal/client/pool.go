@@ -20,6 +20,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // Pool is the local view of one autoscaled fleet runner, shared by every sx
@@ -52,6 +53,10 @@ type note struct {
 	Ready        bool      `json:"ready,omitempty"`
 	ReadyAt      time.Time `json:"ready_at,omitempty"`
 	SawFull      bool      `json:"saw_full,omitempty"` // observed with every slot taken
+	// BootSeenAt: when a probe last found its helper still running
+	// first-boot setup, so its first ready probe times its launch. (Not a
+	// failure to answer: a VM that was ready unobserved can fail one too.)
+	BootSeenAt   time.Time `json:"boot_seen_at,omitempty"`
 	BootFailed   bool      `json:"boot_failed,omitempty"`
 	BootFailedAt time.Time `json:"boot_failed_at,omitempty"`
 	// Why the instance no longer satisfies the runner's requirements (""
@@ -247,6 +252,28 @@ const readyGrace = 20 * time.Second
 func (n *note) markReady(now time.Time) {
 	if !n.Ready {
 		n.Ready, n.ReadyAt = true, now
+	}
+}
+
+// markReady records instance id as serving, and times its launch when it
+// was watched booting until now (leadGap), so the time isn't inflated by
+// a stretch nobody probed it.
+func (st *poolState) markReady(id string, now time.Time) {
+	n := st.note(id)
+	if !n.Ready && !n.BootSeenAt.IsZero() && now.Sub(n.BootSeenAt) <= leadGap {
+		st.timeLaunch(id, now)
+	}
+	n.markReady(now)
+}
+
+// timeLaunch records how long instance id's launch took to serve, from
+// its launch record.
+func (st *poolState) timeLaunch(id string, now time.Time) {
+	for _, l := range st.Launches {
+		if l.InstanceID == id && !l.Failed && !l.Started.IsZero() {
+			st.sched().observeLaunch(id, now.Sub(l.Started), now)
+			return
+		}
 	}
 }
 
@@ -505,10 +532,10 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 		now := time.Now()
 		switch o {
 		case OutAcquired:
-			n.markReady(now)
+			st.markReady(id, now)
 			n.LastUsed, n.SuspectUntil, n.Failures, n.Reached = now, time.Time{}, 0, now
 		case OutBusy:
-			n.markReady(now)
+			st.markReady(id, now)
 			n.SawFull = true
 			n.BusyUntil, n.SuspectUntil, n.Failures, n.Reached = now.Add(busyHintFor), time.Time{}, 0, now
 		case OutDraining:
@@ -527,6 +554,9 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 		case OutBooting:
 			n.BusyUntil = now.Add(2 * time.Second)
 			n.Failures, n.Reached = 0, now
+			if !n.Ready {
+				n.BootSeenAt = now
+			}
 		case OutUnreachable, outRefused:
 			if o == OutUnreachable {
 				n.Silent = now
@@ -566,19 +596,35 @@ type LaunchDecision struct {
 	// Reap: VMs to terminate before a launch can make room under
 	// max_instances: they are in a region this client can't reach.
 	Reap []string
+	// Held is set when slots on running VMs are expected to free sooner
+	// than a launch would serve (Reason says so): Deferred slots of demand
+	// wait for them, FreeIn after which the last of them frees.
+	Held     bool
+	Deferred int
+	FreeIn   time.Duration
+	// Lead is how long a launch is expected to take to serve (LeadLearned:
+	// from timed launches, not the default), and Waited how long this
+	// process has waited: past Lead, demand is sustained and launches.
+	Lead        time.Duration
+	LeadLearned bool
+	Waited      time.Duration
 }
 
 // Plan decides, under the pool lock, whether this process should launch one
 // more instance: only if waiting demand (minus `covered`, the capacity that
-// higher-priority fleets are already launching) exceeds the capacity this
-// fleet is launching, and the fleet is below max_instances (when it has one).
+// higher-priority fleets are already launching or waiting for) exceeds the
+// capacity this fleet is launching, the fleet is below max_instances (when
+// it has one), and slots on its running VMs aren't expected to free sooner
+// than a new VM would serve (a short burst waits for them; demand still
+// waiting after a launch's lead launches).
 func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
 			return err
 		}
-		d.Demand = p.waiterDemand() - covered
+		demand, wholeVM := p.waiters()
+		d.Demand = demand - covered
 		listed := map[string]bool{}
 		usable, total := 0, 0
 		for _, in := range st.Instances {
@@ -590,6 +636,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		}
 		slots := p.SlotsPerInstance()
 		inLedger := map[string]bool{}
+		pendingVM := map[string]bool{} // instances whose slots count as pending
 		for _, l := range st.Launches {
 			if l.Failed {
 				continue
@@ -611,6 +658,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 				usable++
 				total++
 			}
+			pendingVM[l.InstanceID] = true
 			d.Pending++
 			d.Capacity += slots
 		}
@@ -624,11 +672,17 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 				continue
 			}
 			if time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
+				pendingVM[in.ID] = true
 				d.Pending++
 				d.Capacity += slots
 			}
 		}
 		d.Live = usable
+		now := time.Now()
+		d.Lead, d.LeadLearned = st.sched().launchLead(now)
+		if !p.since.IsZero() {
+			d.Waited = now.Sub(p.since)
+		}
 		d.QuotaErr = st.quotaBlocked(p.since)
 		bootFailed := ""
 		for id, n := range st.Notes {
@@ -658,6 +712,10 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = blockedReason(st.QuotaPrice)
 		case time.Now().Before(st.BackoffUntil):
 			d.Reason = "backing off after a failed launch: " + st.LastLaunchErr
+		case p.releaseSoon(st, &d, wholeVM, pendingVM, now):
+			d.Held, d.Deferred = true, d.Demand-d.Capacity
+			d.Reason = fmt.Sprintf("%s on running VMs expected to free within %s, sooner than a new VM (~%s)",
+				plural(d.Deferred, "slot"), ui.Dur(d.FreeIn), ui.Dur(d.Lead))
 		default:
 			var b [6]byte
 			_, _ = rand.Read(b[:])
@@ -979,26 +1037,46 @@ type Waiter struct {
 
 // Register adds a waiter with weight (1, or a whole instance for --exclusive).
 func (p *Pool) Register(weight int) (*Waiter, error) {
+	return p.registerAs(weight, false)
+}
+
+// RegisterExclusive adds a waiter for a whole VM (--exclusive), weighing
+// one instance: freeing slots don't serve it, so Plan never holds a launch
+// for them while it waits (even when its weight, the planning slot count,
+// is 1 on a fleet of mixed sizes).
+func (p *Pool) RegisterExclusive(weight int) (*Waiter, error) {
+	return p.registerAs(weight, true)
+}
+
+func (p *Pool) registerAs(weight int, exclusive bool) (*Waiter, error) {
 	var w *Waiter
 	err := p.with(func(*poolState) error {
 		var err error
-		w, err = p.register(weight)
+		w, err = p.register(weight, exclusive)
 		return err
 	})
 	return w, err
 }
 
+// exclusiveWaiter marks a whole-VM waiter's file name (older versions
+// count it by its weight alone).
+const exclusiveWaiter = ".x.w"
+
 // register must run under pool.lock: waiterDemand (also under the lock)
 // unlinks unlocked waiter files, so creation and locking must be atomic
 // with respect to it.
-func (p *Pool) register(weight int) (*Waiter, error) {
+func (p *Pool) register(weight int, exclusive bool) (*Waiter, error) {
 	dir := filepath.Join(p.dir, "waiters")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	var b [4]byte
 	_, _ = rand.Read(b[:])
-	path := filepath.Join(dir, fmt.Sprintf("%d-%s.w", os.Getpid(), hex.EncodeToString(b[:])))
+	ext := ".w"
+	if exclusive {
+		ext = exclusiveWaiter
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d-%s%s", os.Getpid(), hex.EncodeToString(b[:]), ext))
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -1030,10 +1108,67 @@ func (w *Waiter) Done() {
 	w.f = nil
 }
 
+// releaseSoon reports whether the demand this fleet isn't launching for
+// (d.Demand - d.Capacity) can wait for slots on its running VMs, setting
+// d.FreeIn: only while this process has waited less than a launch's lead
+// (past it, demand is sustained), and only for slots that jobs predicted
+// to end within the lead hold now. A job whose end is unknown, or already
+// overdue, frees nothing here: the prediction has no say then. A
+// whole-VM (exclusive) waiter needs a VM to empty, which freeing slots
+// don't show, so it never waits here.
+func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendingVM map[string]bool, now time.Time) bool {
+	need := d.Demand - d.Capacity
+	if need <= 0 || wholeVM || p.since.IsZero() || d.Waited >= d.Lead {
+		return false
+	}
+	s := st.sched()
+	eligible := map[string]bool{}
+	for _, in := range st.Instances {
+		n := st.Notes[in.ID]
+		if n == nil || !n.Ready || n.closed() || now.Before(n.SuspectUntil) || pendingVM[in.ID] || s.Fences[in.ID] != nil {
+			continue
+		}
+		eligible[in.ID] = true
+	}
+	type release struct {
+		at    time.Time
+		units int
+	}
+	var rs []release
+	for _, a := range s.Attempts {
+		if a.State != attAcquired || !eligible[a.VM] || !a.Expect.After(now) || !a.Expect.Before(now.Add(d.Lead)) {
+			continue
+		}
+		rs = append(rs, release{a.Expect, max(a.Units, 1)})
+	}
+	sort.Slice(rs, func(i, j int) bool { return rs[i].at.Before(rs[j].at) })
+	freed := 0
+	for _, r := range rs {
+		if freed += r.units; freed >= need {
+			d.FreeIn = r.at.Sub(now)
+			return true
+		}
+	}
+	return false
+}
+
+func plural(n int, what string) string {
+	if n == 1 {
+		return "1 " + what
+	}
+	return fmt.Sprintf("%d %ss", n, what)
+}
+
 func (p *Pool) waiterDemand() int {
+	total, _ := p.waiters()
+	return total
+}
+
+// waiters is the waiting demand in slots, and whether any waiter needs a
+// whole VM (an exclusive job on a fleet of several-slot VMs).
+func (p *Pool) waiters() (total int, wholeVM bool) {
 	dir := filepath.Join(p.dir, "waiters")
 	ents, _ := os.ReadDir(dir)
-	total := 0
 	for _, e := range ents {
 		path := filepath.Join(dir, e.Name())
 		f, err := os.OpenFile(path, os.O_RDWR, 0)
@@ -1059,8 +1194,9 @@ func (p *Pool) waiterDemand() int {
 			w = 1
 		}
 		total += w
+		wholeVM = wholeVM || w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter)
 	}
-	return total
+	return total, wholeVM
 }
 
 // Snapshot returns the cached state (for status displays).
