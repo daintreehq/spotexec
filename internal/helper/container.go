@@ -330,6 +330,10 @@ func (s *Session) image(m protocol.Image) error {
 			}
 			if copied {
 				res.Pulled, res.Copied = true, true
+				if m.WaitPush && m.Registry != nil && cfgDir == "" {
+					// container build promises the push: the login failed.
+					return perr(protocol.CodeImageFailed, "copied %s from %s but could not log in to push it to %s", m.Dockerfile, m.Source.Server, m.Registry.Repo)
+				}
 				if m.Registry != nil && cfgDir != "" {
 					remote := m.Registry.Repo + ":" + m.Tag
 					if m.WaitPush {

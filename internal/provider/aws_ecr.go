@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -264,8 +265,9 @@ func (g *AWSGlobal) ImageSource(ctx context.Context, instanceID, repoID, tag str
 		auth.Repo = auth.Server + "/spotexec/" + ecrName(repoID)
 		return auth, nil
 	}
-	// A region that couldn't be asked, or logged into, may hold it.
-	return nil, joinRegionErrors(errs)
+	// A region that couldn't be asked, or logged into, or listed, may hold
+	// it.
+	return nil, errors.Join(merr, joinRegionErrors(errs))
 }
 
 // imageSourceOrder orders regions: those listed (in their order), then

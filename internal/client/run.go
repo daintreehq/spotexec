@@ -2221,7 +2221,6 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 	}
 	holder := ""
 	installed := false // a probe installed Docker
-	waited := false    // another run held the lock first
 	// find looks for another region holding the image, for the requests
 	// that follow to copy it from. A failed lookup only warns: the image is
 	// then built here, as before.
@@ -2235,12 +2234,8 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			probe.Source, req.Source = src, src
 		}
 	}
-	lockID := req.Registry.Repo + ":" + req.Tag
-	if locate != nil {
-		lockID = imageLockID(req.Registry, req.Tag)
-	}
 	sh := sharer{
-		lock:  shareLockFor("image", lockID),
+		lock:  shareLockFor("image", imageLockID(req.Registry, req.Tag)),
 		who:   shareWho(o, label),
 		limit: limit,
 		probe: func(ctx context.Context) (bool, error) {
@@ -2267,9 +2262,9 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			if failed := recall(); failed != nil {
 				return failed
 			}
-			// The run that held the lock may have pushed the image in
-			// another region meanwhile.
-			if waited && req.Source == nil && locate != nil {
+			// A run that held the lock may have pushed the image in another
+			// region since the probe looked.
+			if req.Source == nil && locate != nil {
 				find(ctx)
 			}
 			r, err = ask(req)
@@ -2291,7 +2286,7 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			return nil
 		},
 		waiting: func(h string) {
-			holder, waited = h, true
+			holder = h
 			o.Rep.Status("%s · waiting for %s to build the container image", label, h)
 			o.Rep.Event("image_wait", map[string]any{"tag": req.Tag, "holder": h,
 				"message": "waiting for " + h + " to build the same image, to pull it from the registry"})
@@ -2309,7 +2304,8 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 // imageLockID names what an image share lock is for: the registry's
 // account, the repository's path and the tag, but not the registry's
 // region, so the runs on this machine that need one image in different
-// regions build it once, and the others copy it (#192).
+// regions build it once, and the others copy it (#192). Every runner uses
+// it, so runners of one account that share a region share the lock too.
 func imageLockID(reg *protocol.RegistryAuth, tag string) string {
 	account, _, _ := strings.Cut(reg.Server, ".")
 	return account + "/" + strings.TrimPrefix(strings.TrimPrefix(reg.Repo, reg.Server), "/") + ":" + tag

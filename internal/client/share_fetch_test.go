@@ -382,17 +382,18 @@ func regionScript(t *testing.T, has bool, sources *[]string) *scriptRPC {
 func TestFetchImageCopiesFromAnotherRegion(t *testing.T) {
 	src := &protocol.RegistryAuth{Server: "1.dkr.ecr.us-east-1.amazonaws.com", Repo: "1.dkr.ecr.us-east-1.amazonaws.com/spotexec/r"}
 	for _, tc := range []struct {
-		name    string
-		found   *protocol.RegistryAuth
-		err     error
-		sent    string
-		sources string
-		copied  bool
-		warns   int
+		name          string
+		found         *protocol.RegistryAuth
+		err           error
+		sent          string
+		sources       string
+		copied        bool
+		looked, warns int
 	}{
-		{"another region holds it", src, nil, "[image:probe image:probe]", "[ " + src.Repo + "]", true, 0},
-		{"no region holds it", nil, nil, "[image:probe image share_wait]", "[  ]", false, 0},
-		{"the lookup fails", nil, fmt.Errorf("denied"), "[image:probe image share_wait]", "[  ]", false, 1},
+		{"another region holds it", src, nil, "[image:probe image:probe]", "[ " + src.Repo + "]", true, 1, 0},
+		// Looked for again before building: another run may have pushed it.
+		{"no region holds it", nil, nil, "[image:probe image share_wait]", "[  ]", false, 2, 0},
+		{"the lookup fails", nil, fmt.Errorf("denied"), "[image:probe image share_wait]", "[  ]", false, 2, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := fastShare(t)
@@ -414,7 +415,7 @@ func TestFetchImageCopiesFromAnotherRegion(t *testing.T) {
 			if got := fmt.Sprint(sources); got != tc.sources {
 				t.Fatalf("sources %s", got)
 			}
-			if looked != 1 || r.Copied != tc.copied || r.Built == tc.copied || !r.InstalledDocker || len(rep.warns) != tc.warns {
+			if looked != tc.looked || r.Copied != tc.copied || r.Built == tc.copied || !r.InstalledDocker || len(rep.warns) != tc.warns {
 				t.Fatalf("looked %d, r %+v, warns %v", looked, r, rep.warns)
 			}
 			// A run that copied it never led a build; one that built it
@@ -465,6 +466,39 @@ func TestFetchImageWaitsForABuildInAnotherRegion(t *testing.T) {
 		t.Fatalf("sent %s", got)
 	}
 	if got := fmt.Sprint(sources); got != "[ "+other.Registry.Repo+"]" {
+		t.Fatalf("sources %s", got)
+	}
+}
+
+// #192: a region found holding the image only once this run leads (the
+// other run's push ended between the probe and the lock, without a wait)
+// is copied from, and the leader waits for the copy's push to its own
+// region, as for a build.
+func TestFetchImageLeaderCopiesAndWaitsForThePush(t *testing.T) {
+	ctx := fastShare(t)
+	src := regionImage("us-east-1").Registry
+	rep := &recRep{}
+	var sources []string
+	c := regionScript(t, true, &sources)
+	looked := 0
+	locate := func(context.Context) (*protocol.RegistryAuth, error) {
+		looked++
+		if looked == 1 {
+			return nil, nil
+		}
+		return src, nil
+	}
+	r, shared, push, err := fetchImage(ctx, c, Options{Rep: rep}, "aws#1", io.Discard, nil, imageMemo{}, regionImage("ap-south-1"), locate, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Copied || r.Built || !shared.led || shared.waited != 0 || push == nil || !push.OK {
+		t.Fatalf("r %+v, shared %+v, push %+v", r, shared, push)
+	}
+	if got := fmt.Sprint(c.sent); got != "[image:probe image share_wait:image]" {
+		t.Fatalf("sent %s", got)
+	}
+	if got := fmt.Sprint(sources); got != "[ "+src.Repo+" ]" {
 		t.Fatalf("sources %s", got)
 	}
 }

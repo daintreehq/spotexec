@@ -12,6 +12,8 @@ import (
 func TestImageSource(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
+		regions  []string // default r-two-1, r-one-1, r-three-1
+		noList   bool     // the account's regions can't be listed
 		images   map[string]map[string]string
 		imageErr map[string]string
 		loginErr map[string]bool
@@ -34,10 +36,17 @@ func TestImageSource(t *testing.T) {
 		{name: "a region that can't be asked is an error",
 			imageErr: map[string]string{"r-three-1": "AccessDeniedException"},
 			err:      "AccessDeniedException"},
+		{name: "regions that can't be listed may hold it",
+			regions: []string{"all"}, noList: true,
+			err: "UnauthorizedOperation"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeRegionsEC2{images: tc.images, imageErr: tc.imageErr, loginErr: tc.loginErr}
-			g := newGlobalEnv(t, f, "r-two-1", "r-one-1", "r-three-1")
+			f := &fakeRegionsEC2{images: tc.images, imageErr: tc.imageErr, loginErr: tc.loginErr, noRegions: tc.noList}
+			regions := tc.regions
+			if regions == nil {
+				regions = []string{"r-two-1", "r-one-1", "r-three-1"}
+			}
+			g := newGlobalEnv(t, f, regions...)
 			discovered(t, g)
 			if err := g.remember([]Instance{{ID: "i-1", Region: "r-one-1", LaunchedAt: time.Now()}}); err != nil {
 				t.Fatal(err)
