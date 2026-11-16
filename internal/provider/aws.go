@@ -703,10 +703,16 @@ func (a *AWSSpot) launchAcross(markets []bool, types []string, log Logger, try f
 	var errs []string
 	var quota *QuotaError
 	quotaEveryMarket := true
+	// Types refused on Spot at max_price: a Spot price is never above the
+	// on-demand price, so on-demand would launch them above the cap too.
+	overCap := map[string]bool{}
 	for _, spot := range markets {
 		var mq *QuotaError        // this market's quota refusal (smallest launch)
 		short := map[string]int{} // smallest type refused for capacity or price, by quota
 		for _, itype := range types {
+			if !spot && overCap[itype] {
+				continue
+			}
 			inst, err := try(itype, spot)
 			if err == nil {
 				kind := "spot"
@@ -731,6 +737,9 @@ func (a *AWSSpot) launchAcross(markets []bool, types []string, log Logger, try f
 				log("skipping %s: %v", itype, err)
 			}
 			errs = append(errs, itype+": "+code)
+			if spot && code == "SpotMaxPriceTooLow" {
+				overCap[itype] = true
+			}
 			switch {
 			case class == errQuota && (mq == nil || vcpusOf(itype) < mq.VCPUs):
 				if isChecked {
@@ -760,9 +769,16 @@ func (a *AWSSpot) launchAcross(markets []bool, types []string, log Logger, try f
 			quota = mq // the Spot quota is the one to report when both refused
 		}
 		if spot && a.r.OnDemandFallback {
-			if mq != nil {
+			left := false
+			for _, it := range types {
+				left = left || !overCap[it]
+			}
+			switch {
+			case !left:
+				log("every type's Spot price is above max_price, so its on-demand price is too; not falling back to on-demand")
+			case mq != nil:
 				log("spot vCPU quota reached; falling back to on-demand")
-			} else {
+			default:
 				log("no spot capacity; falling back to on-demand")
 			}
 		}
@@ -774,7 +790,11 @@ func (a *AWSSpot) launchAcross(markets []bool, types []string, log Logger, try f
 		quota.Desired = max(quota.Desired, quota.VCPUs, a.r.MaxInstances*VMVCPUs(a.r))
 		return ec2Instance{}, quota
 	}
-	return ec2Instance{}, fmt.Errorf("no instance type could be launched in %s (%s); %s, raise max_price, or set on_demand_fallback = true", a.r.Region, strings.Join(errs, ", "), widenHint(a.r))
+	hint := "raise max_price, or set on_demand_fallback = true"
+	if a.r.OnDemandFallback {
+		hint = "or raise max_price"
+	}
+	return ec2Instance{}, fmt.Errorf("no instance type could be launched in %s (%s); %s, %s", a.r.Region, strings.Join(errs, ", "), widenHint(a.r), hint)
 }
 
 // capacityCode reports refusals that pass with time (capacity, price), as
@@ -805,8 +825,8 @@ func (a *AWSSpot) runOne(ctx context.Context, base url.Values, itype string, spo
 		p.Set("InstanceMarketOptions.MarketType", "spot")
 		p.Set("InstanceMarketOptions.SpotOptions.SpotInstanceType", "one-time")
 		p.Set("InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior", "terminate")
-		if a.r.MaxPrice != "" {
-			p.Set("InstanceMarketOptions.SpotOptions.MaxPrice", a.r.MaxPrice)
+		if a.r.MaxPrice.Set {
+			p.Set("InstanceMarketOptions.SpotOptions.MaxPrice", a.r.MaxPrice.String())
 		}
 	}
 	var lastErr error

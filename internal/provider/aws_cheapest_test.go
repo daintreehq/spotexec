@@ -178,6 +178,44 @@ func TestSingleRegionWithoutPricesUsesListedOrder(t *testing.T) {
 	}
 }
 
+// Without prices to compare, EC2 refuses a bid over max_price
+// (SpotMaxPriceTooLow), and on_demand_fallback must not launch that type
+// on-demand: its on-demand price is above the cap too (#153). Every Spot
+// request carries the cap as the plain decimal EC2 takes.
+func TestSingleRegionWithoutPricesKeepsMaxPriceOnDemand(t *testing.T) {
+	capped := func(r *config.Runner) {
+		r.MaxPrice, r.OnDemandFallback = config.Dollars{V: 1.25, Set: true}, true
+	}
+	f := &fakeRegionsEC2{priceErr: map[string]string{"r-one-1": "UnauthorizedOperation"},
+		runErr: map[string]string{"r-one-1/c7a.2xlarge": "SpotMaxPriceTooLow", "r-one-1/c6a.2xlarge": "InsufficientInstanceCapacity"}}
+	a := newSingleEnv(t, f, capped)
+	in, err := a.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Type != "c6a.2xlarge" || in.Spot || len(f.callsOf("RunInstances")) != 3 {
+		t.Fatalf("launched %+v via %s", in, runsOf(f))
+	}
+	if bids := f.callsOf("bid"); strings.Join(bids, ",") != "r-one-1 bid 1.25,r-one-1 bid 1.25" {
+		t.Fatalf("bids %v", bids)
+	}
+	if markets := f.callsOf("market"); strings.Join(markets, ",") != "r-one-1 market spot,r-one-1 market spot,r-one-1 market on-demand" {
+		t.Fatalf("markets %v", markets)
+	}
+	// Every type above the cap: no on-demand at all, and the error names
+	// the price refusal.
+	f = &fakeRegionsEC2{priceErr: map[string]string{"r-one-1": "UnauthorizedOperation"},
+		runErr: map[string]string{"r-one-1/c7a.2xlarge": "SpotMaxPriceTooLow", "r-one-1/c6a.2xlarge": "SpotMaxPriceTooLow"}}
+	a = newSingleEnv(t, f, capped)
+	_, err = a.Launch(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "SpotMaxPriceTooLow") || strings.Contains(err.Error(), "set on_demand_fallback") {
+		t.Fatalf("err %v", err)
+	}
+	if markets := f.callsOf("market on-demand"); len(markets) != 0 {
+		t.Fatalf("fell back to on-demand above max_price: %s", runsOf(f))
+	}
+}
+
 // With no Spot capacity anywhere, on_demand_fallback tries the types by
 // their Spot rank (a stand-in for the on-demand price).
 func TestSingleRegionOnDemandByPriceRank(t *testing.T) {
