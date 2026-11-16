@@ -925,7 +925,7 @@ func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
 		"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.30"}},
 	}}
 	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
-	g.r.MaxPrice = "0.04"
+	g.r.MaxPrice = config.Dollars{V: 0.04, Set: true}
 	_, err := g.Launch(context.Background(), t.Logf)
 	// Typed, so a run with no VM to wait for fails at once naming it.
 	var pe *PriceCapError
@@ -941,7 +941,7 @@ func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
 	f.priceErr = map[string]string{"r-three-1": "RequestLimitExceeded"}
 	f.mu.Unlock()
 	gu := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
-	gu.r.MaxPrice = "0.04"
+	gu.r.MaxPrice = config.Dollars{V: 0.04, Set: true}
 	if _, err := gu.Launch(context.Background(), t.Logf); err == nil || errors.As(err, &pe) {
 		t.Fatalf("with a region unpriced: %v", err)
 	}
@@ -954,13 +954,13 @@ func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
 		"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.10"}, {"r-one-1b", "c6a.2xlarge", "0.02"}},
 	}}
 	gl := newGlobalEnv(t, fl, "r-one-1", "r-two-1")
-	gl.r.MaxPrice, gl.r.LaunchOrder = "0.01", config.LaunchListed
+	gl.r.MaxPrice, gl.r.LaunchOrder = config.Dollars{V: 0.01, Set: true}, config.LaunchListed
 	if _, err := gl.Launch(context.Background(), t.Logf); !errors.As(err, &pe) || pe.Cheapest.Type != "c6a.2xlarge" {
 		t.Fatalf("listed order: %v", err)
 	}
 	// At the cap is fine.
 	g2 := newGlobalEnv(t, f, "r-one-1", "r-two-1")
-	g2.r.MaxPrice = "0.05"
+	g2.r.MaxPrice = config.Dollars{V: 0.05, Set: true}
 	if in, err := g2.Launch(context.Background(), t.Logf); err != nil || in.Region != "r-one-1" {
 		t.Fatalf("at the cap: %+v %v", in, err)
 	}
@@ -969,12 +969,60 @@ func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
 	f.calls, f.runErr = nil, map[string]string{"r-one-1/c7a.2xlarge": "InsufficientInstanceCapacity"}
 	f.mu.Unlock()
 	g3 := newGlobalEnv(t, f, "r-one-1", "r-two-1")
-	g3.r.MaxPrice = "0.05"
+	g3.r.MaxPrice = config.Dollars{V: 0.05, Set: true}
 	if _, err := g3.Launch(context.Background(), t.Logf); err == nil || errors.As(err, &pe) {
 		t.Fatalf("fell back above max_price, or blamed the cap for a capacity refusal: %v", err)
 	}
 	if runs := f.callsOf("RunInstances"); len(runs) != 1 || !strings.HasPrefix(runs[0], "r-one-1 ") {
 		t.Fatalf("runs %v", runs)
+	}
+}
+
+// A Spot price is never above the on-demand price, so a type priced above
+// max_price on Spot is above it on-demand too: on_demand_fallback must not
+// launch it, and a launch with every option over the cap stays a
+// PriceCapError rather than a fallback (#153).
+func TestGlobalMaxPriceCapsOnDemandFallback(t *testing.T) {
+	cap := config.Dollars{V: 0.04, Set: true}
+	f := &fakeRegionsEC2{prices: map[string][][3]string{
+		"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}},
+		"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.30"}},
+	}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	g.r.MaxPrice, g.r.OnDemandFallback = capUSD, true
+	var pe *PriceCapError
+	if in, err := g.Launch(context.Background(), t.Logf); !errors.As(err, &pe) {
+		t.Fatalf("every option above max_price: launched %+v, err %v", in, err)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 0 {
+		t.Fatalf("fell back to on-demand above max_price: %v", runs)
+	}
+	// One region: the same.
+	a := newSingleEnv(t, f, func(r *config.Runner) { r.MaxPrice, r.OnDemandFallback = capUSD, true })
+	if in, err := a.Launch(context.Background(), t.Logf); !errors.As(err, &pe) {
+		t.Fatalf("one region: launched %+v, err %v", in, err)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 0 {
+		t.Fatalf("one region fell back to on-demand above max_price: %v", runs)
+	}
+	// Under the cap but out of Spot capacity: on-demand tries only the type
+	// whose Spot price is under the cap.
+	fm := &fakeRegionsEC2{
+		prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c6a.2xlarge", "0.03"}, {"r-one-1b", "c7a.2xlarge", "0.10"}}},
+		runErr: map[string]string{"r-one-1/c6a.2xlarge/on-demand": "InsufficientInstanceCapacity", "r-one-1/c6a.2xlarge": "InsufficientInstanceCapacity"},
+	}
+	gm := newGlobalEnv(t, fm, "r-one-1", "r-two-1")
+	gm.r.MaxPrice, gm.r.OnDemandFallback = capUSD, true
+	if in, err := gm.Launch(context.Background(), t.Logf); err == nil || errors.As(err, &pe) {
+		t.Fatalf("capacity short under the cap: launched %+v, err %v", in, err)
+	}
+	for _, run := range fm.callsOf("RunInstances") {
+		if strings.Contains(run, "c7a.2xlarge") {
+			t.Fatalf("tried the type above max_price: %v", fm.callsOf("RunInstances"))
+		}
+	}
+	if markets := fm.callsOf("market"); len(markets) != 2 || markets[1] != "r-one-1 market on-demand" {
+		t.Fatalf("markets %v", markets)
 	}
 }
 

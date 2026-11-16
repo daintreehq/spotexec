@@ -484,7 +484,7 @@ func TestRunCostKeepsHoldBackAndPriceCap(t *testing.T) {
 		t.Fatalf("why: %s", why)
 	}
 
-	g, f = twoRegionEnv(t, "0.100", "0.096", func(r *config.Runner) { r.MaxPrice = "0.098" })
+	g, f = twoRegionEnv(t, "0.100", "0.096", func(r *config.Runner) { r.MaxPrice = config.Dollars{V: 0.098, Set: true} })
 	warmUp(t, g, f, "r-one-1")
 	if rg := nextRegion(t, g); rg != "r-two-1" {
 		t.Fatalf("next launch above max_price: %s", rg)

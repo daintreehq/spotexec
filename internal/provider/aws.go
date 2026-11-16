@@ -805,8 +805,8 @@ func (a *AWSSpot) runOne(ctx context.Context, base url.Values, itype string, spo
 		p.Set("InstanceMarketOptions.MarketType", "spot")
 		p.Set("InstanceMarketOptions.SpotOptions.SpotInstanceType", "one-time")
 		p.Set("InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior", "terminate")
-		if a.r.MaxPrice != "" {
-			p.Set("InstanceMarketOptions.SpotOptions.MaxPrice", a.r.MaxPrice)
+		if a.r.MaxPrice.Set {
+			p.Set("InstanceMarketOptions.SpotOptions.MaxPrice", a.r.MaxPrice.String())
 		}
 	}
 	var lastErr error

@@ -71,8 +71,11 @@ func (d Dollars) MarshalText() ([]byte, error) {
 	if !d.Set {
 		return nil, nil
 	}
-	return []byte(strconv.FormatFloat(d.V, 'f', -1, 64)), nil
+	return []byte(d.String()), nil
 }
+
+// String is the amount as a plain decimal ("0.4"), the form EC2 takes.
+func (d Dollars) String() string { return strconv.FormatFloat(d.V, 'f', -1, 64) }
 
 // Bytes is a size in bytes, written as a plain integer or with a binary unit:
 // "512KB", "100MB", "1.5GB" (KiB, MiB and GiB spell the same).
@@ -189,7 +192,7 @@ type Runner struct {
 	MinGeneration        int      `toml:"min_generation"`
 	ExcludeInstanceTypes []string `toml:"exclude_instance_types"`
 	LaunchOrder          string   `toml:"launch_order"` // run_cost (default) | cheapest | listed
-	MaxPrice             string   `toml:"max_price"`
+	MaxPrice             Dollars  `toml:"max_price"`    // Spot bid cap in USD per hour; unset: the on-demand price
 	AMI                  string   `toml:"ami"`
 	Arch                 string   `toml:"arch"` // amd64|arm64 (derived from instance types if empty)
 	SubnetID             string   `toml:"subnet_id"`
@@ -234,6 +237,15 @@ const (
 // DefaultWaitCost is what an hour of waiting is worth, in USD, unless a
 // runner sets wait_cost: more than an 8-vCPU Spot VM costs for an hour.
 const DefaultWaitCost = 1.0
+
+// MaxPriceUSD is the runner's max_price, or 0 when it isn't set (the bid
+// is then capped at the on-demand price).
+func (r *Runner) MaxPriceUSD() float64 {
+	if r.MaxPrice.Set {
+		return r.MaxPrice.V
+	}
+	return 0
+}
 
 // WaitCostPerHour is the runner's wait_cost, or DefaultWaitCost.
 func (r *Runner) WaitCostPerHour() float64 {
@@ -695,11 +707,13 @@ func (r *Runner) validate() error {
 			return fmt.Errorf("%s must not be negative", name)
 		}
 	}
-	if r.MaxPrice != "" {
-		// The launch filter reads an unparsable or non-positive cap as none.
-		if v, err := strconv.ParseFloat(r.MaxPrice, 64); err != nil || !(v > 0) || math.IsInf(v, 0) {
-			return fmt.Errorf("max_price must be a positive number of US dollars an hour, such as \"0.40\" (got %q)", r.MaxPrice)
-		}
+	if c := r.HourlyCost; c < 0 || math.IsNaN(c) || math.IsInf(c, 0) {
+		return fmt.Errorf("hourly_cost must be a non-negative number of US dollars per hour (got %g)", c)
+	}
+	// A zero cap would quietly turn off the client-side checks while EC2
+	// refuses every bid (an unparsable one fails to decode).
+	if p := r.MaxPrice.V; r.MaxPrice.Set && !(p > 0 && p <= 1e4) {
+		return fmt.Errorf("max_price must be a positive number of US dollars an hour, at most 10000, such as \"0.40\" (got %g)", p)
 	}
 	if !r.Ephemeral() {
 		return nil
@@ -1322,16 +1336,14 @@ func (r *Runner) withinBase(g *Runner) error {
 			return fmt.Errorf("%s = %s is longer than %s allows (%s); a project can shorten it, not lengthen it", d.key, d.got, yours, d.base)
 		}
 	}
-	if g.MaxPrice == "" || r.MaxPrice == g.MaxPrice {
+	if !g.MaxPrice.Set {
 		return nil
 	}
-	if r.MaxPrice == "" {
+	if !r.MaxPrice.Set {
 		return fmt.Errorf("max_price can't be removed: %s caps the Spot price at %s an hour", yours, g.MaxPrice)
 	}
-	// Both parse: validate checked them.
-	limit, _ := strconv.ParseFloat(g.MaxPrice, 64)
-	if v, _ := strconv.ParseFloat(r.MaxPrice, 64); v > limit {
-		return fmt.Errorf("max_price = %q is more than %s allows (%s an hour); a project can lower it, not raise it", r.MaxPrice, yours, g.MaxPrice)
+	if r.MaxPrice.V > g.MaxPrice.V {
+		return fmt.Errorf("max_price = %q is more than %s allows (%s an hour); a project can lower it, not raise it", r.MaxPrice.String(), yours, g.MaxPrice)
 	}
 	return nil
 }

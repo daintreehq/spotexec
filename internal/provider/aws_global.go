@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1193,10 +1192,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	cool := g.cooldowns(t.Prices)
 	// An explicit max_price is AWS's cap on the Spot bid: options already
 	// above it would only be refused.
-	maxPrice := 0.0
-	if g.r.MaxPrice != "" {
-		maxPrice, _ = strconv.ParseFloat(g.r.MaxPrice, 64)
-	}
+	maxPrice := g.r.MaxPriceUSD()
 	skipRegion := map[string]string{}
 	skipQuota := map[string][]quotaSkip{} // region -> what its quota refused during this launch
 	skipZone := map[string]bool{}
@@ -1434,7 +1430,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	}
 	// (Prices[0] is first in launch order, not always the cheapest.)
 	if cheapest := cheapestOf(t.Prices); len(tried) == 0 && maxPrice > 0 && len(t.Prices) > 0 && cheapest.USD() > maxPrice {
-		pe := &PriceCapError{Where: g.Where(), MaxPrice: g.r.MaxPrice, Cheapest: cheapest}
+		pe := &PriceCapError{Where: g.Where(), MaxPrice: g.r.MaxPrice.String(), Cheapest: cheapest}
 		if otherFailure { // e.g. a region unpriced just now: may be under the cap
 			return Instance{}, errors.New(pe.Error())
 		}
@@ -1846,7 +1842,7 @@ func (g *AWSGlobal) NextLaunch(t PriceTable) (SpotPrice, bool) {
 
 func (g *AWSGlobal) nextIn(k Ranking) (SpotPrice, bool) {
 	cool := g.cooldowns(k.Prices)
-	maxPrice, _ := strconv.ParseFloat(g.r.MaxPrice, 64)
+	maxPrice := g.r.MaxPriceUSD()
 	for _, p := range k.Prices {
 		if _, ok := cool[poolKey(p)]; ok || (maxPrice > 0 && p.USD() > maxPrice) {
 			continue

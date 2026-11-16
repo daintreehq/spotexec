@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -131,7 +130,7 @@ func (v pricesView) writeJSON(w io.Writer) error {
 		// an hour of work; launch_order = "run_cost").
 		RunCost *provider.RunCost `json:"run_cost,omitempty"`
 	}
-	maxPrice, _ := strconv.ParseFloat(v.r.MaxPrice, 64)
+	maxPrice := v.r.MaxPriceUSD()
 	rows := make([]row, 0, len(v.k.Prices))
 	for _, sp := range v.k.Prices {
 		why := v.cool[optionKey(sp)]
@@ -179,7 +178,7 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 	if r.SubnetID != "" && len(t.Prices) > 0 {
 		fmt.Fprintf(w, "subnet_id %s is in %s, so only that zone is used.\n", r.SubnetID, t.Prices[0].Zone)
 	}
-	maxPrice, _ := strconv.ParseFloat(r.MaxPrice, 64)
+	maxPrice := r.MaxPriceUSD()
 	runCost := k.Order == config.LaunchRunCost
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	head := "\tREGION\tZONE\tTYPE\t"
@@ -200,7 +199,7 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 		if why := v.cool[optionKey(sp)]; why != "" {
 			note = "skipped for now: " + why
 		} else if maxPrice > 0 && sp.USD() > maxPrice {
-			note = "above max_price " + r.MaxPrice
+			note = "above max_price " + r.MaxPrice.String()
 		} else if v.hasNext && sp == v.next {
 			mark, note = "→", "next launch"
 			if why := v.held[optionKey(sp)]; why != "" {
