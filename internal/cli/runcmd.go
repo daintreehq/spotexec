@@ -351,8 +351,8 @@ func rewriteRoot(s, root string) string {
 	// $(...) or a subshell, where quoting starts afresh. Single quotes nest
 	// in neither.
 	ctx := []byte{0}
-	inSingle, heredoc := false, false
-	atBoundary := true // where a path may start: not mid-word, as after My\ x
+	inSingle, heredoc, braces := false, false, 0 // braces: open ${...}
+	atBoundary := true                           // where a path may start: not mid-word, as after My\ x
 	for i := 0; i < len(s); {
 		c := s[i]
 		inDouble := ctx[len(ctx)-1] == '"'
@@ -396,9 +396,14 @@ func rewriteRoot(s, root string) string {
 			i += 2
 			atBoundary = true
 			continue
+		case c == '$' && i+1 < len(s) && s[i+1] == '{':
+			braces++
+		case c == '}' && braces > 0:
+			braces--
 		case inDouble:
 		case c == '\'':
 			inSingle = true
+		case braces > 0: // ${x//(/} is a pattern, not a subshell
 		case c == '(':
 			ctx = append(ctx, '(')
 		case c == ')' && len(ctx) > 1:
@@ -846,7 +851,7 @@ func closeParen(run string, i int) int {
 	depth, cases := 0, 0
 	for j := i; j < len(run); j++ {
 		c := run[j]
-		if j > i && strings.IndexByte(" \t\n;&|(", run[j-1]) >= 0 {
+		if j > i && strings.IndexByte(" \t\n;&|(", run[j-1]) >= 0 && commandPos(run, i, j) {
 			switch {
 			case keywordAt(run, j, "case"):
 				cases, j = cases+1, j+3
@@ -881,17 +886,26 @@ func closeParen(run string, i int) int {
 	return len(run) - 1
 }
 
+// commandPos reports whether a word at run[j] (inside the parenthesis at
+// run[i]) is where a command starts: first, or after ( ; & | or a newline.
+func commandPos(run string, i, j int) bool {
+	k := j - 1
+	for k > i && (run[k] == ' ' || run[k] == '\t') {
+		k--
+	}
+	return k == i || strings.IndexByte("(;&|\n", run[k]) >= 0
+}
+
 // keywordAt reports whether the word at run[j:] is kw.
 func keywordAt(run string, j int, kw string) bool {
 	k := j + len(kw)
 	return strings.HasPrefix(run[j:], kw) && (k == len(run) || strings.IndexByte(" \t\n;&|)", run[k]) >= 0)
 }
 
-// closeBrace returns the index of the '}' matching the '{' at run[i] (of a
-// ${...}), or the last index.
+// closeBrace returns the index of the '}' closing the ${ whose '{' is at
+// run[i], or the last index. A bare '{' inside (${x//{/}) is text.
 func closeBrace(run string, i int) int {
-	depth := 0
-	for j := i; j < len(run); j++ {
+	for j := i + 1; j < len(run); j++ {
 		switch c := run[j]; {
 		case c == '\\':
 			j++
@@ -903,12 +917,10 @@ func closeBrace(run string, i int) int {
 			j = closeBacktick(run, j)
 		case c == '$' && j+1 < len(run) && run[j+1] == '(':
 			j = closeParen(run, j+1)
-		case c == '{':
-			depth++
+		case c == '$' && j+1 < len(run) && run[j+1] == '{':
+			j = closeBrace(run, j+1)
 		case c == '}':
-			if depth--; depth <= 0 {
-				return j
-			}
+			return j
 		}
 	}
 	return len(run) - 1

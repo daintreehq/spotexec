@@ -204,6 +204,8 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 		{`printf "<%s>" $((1+2)) <<< x # c`, "<3><a><two words>"},
 		{`n=d#1; printf "<%s>" ${n//[ #]/_}`, "<d_1><a><two words>"},
 		{`printf "<%s>" "${n:-"x #"}" # c`, "<x #><a><two words>"},
+		{`t='{v'; printf "<%s>" "${t//\{/}" # strip braces`, "<v><a><two words>"},
+		{`printf "<%s>" "$(printf '%s' case)" # label`, "<case><a><two words>"},
 	}
 	for _, c := range cases {
 		line := taskCommand(c.tmpl, []string{"a", "two words"})
