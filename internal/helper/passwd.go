@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -36,8 +37,7 @@ func withRunUser(passwd, group []byte, uid, gid int) ([]byte, []byte) {
 
 	lines, found := splitLines(passwd), false
 	for i, l := range lines {
-		f := strings.Split(l, ":")
-		if len(f) == 7 && f[2] == u {
+		if f := strings.Split(l, ":"); isEntry(f, 7, uid) {
 			f[3], f[5] = g, runUserHome
 			lines[i] = strings.Join(f, ":")
 			found = true
@@ -45,7 +45,7 @@ func withRunUser(passwd, group []byte, uid, gid int) ([]byte, []byte) {
 		}
 	}
 	if !found {
-		if !hasID(lines, 7, "0") && uid != 0 {
+		if !hasID(lines, 7, 0) && uid != 0 {
 			lines = append([]string{"root:x:0:0:root:/root:/bin/sh"}, lines...)
 		}
 		name := freeName(lines, u)
@@ -54,8 +54,8 @@ func withRunUser(passwd, group []byte, uid, gid int) ([]byte, []byte) {
 	newPasswd := joinLines(lines)
 
 	glines := splitLines(group)
-	if !hasID(glines, 4, g) {
-		if !hasID(glines, 4, "0") && gid != 0 {
+	if !hasID(glines, 4, gid) {
+		if !hasID(glines, 4, 0) && gid != 0 {
 			glines = append([]string{"root:x:0:"}, glines...)
 		}
 		glines = append(glines, freeName(glines, g)+":x:"+g+":")
@@ -76,25 +76,43 @@ func joinLines(lines []string) []byte {
 	return []byte(strings.Join(lines, "\n") + "\n")
 }
 
-// hasID reports whether an entry with fields fields has id as its third.
-func hasID(lines []string, fields int, id string) bool {
+// hasID reports whether lines hold an entry, of fields fields, for id.
+func hasID(lines []string, fields, id int) bool {
 	for _, l := range lines {
-		if f := strings.Split(l, ":"); len(f) == fields && f[2] == id {
+		if isEntry(strings.Split(l, ":"), fields, id) {
 			return true
 		}
 	}
 	return false
 }
 
-// freeName returns runUserName, or runUserName-id if an entry has that
-// name already.
+// isEntry reports whether f is an entry for id, as libc reads it: comments
+// and NIS directives (+, -) are none, and the id is a decimal number however
+// it is spelled (01000 is 1000).
+func isEntry(f []string, fields, id int) bool {
+	if len(f) != fields || f[0] == "" || strings.ContainsAny(f[0][:1], "#+-") {
+		return false
+	}
+	n, err := strconv.Atoi(f[2])
+	return err == nil && n == id
+}
+
+// freeName returns runUserName, or the first of runUserName-id,
+// runUserName-id-2, ... that no entry has.
 func freeName(lines []string, id string) string {
+	taken := map[string]bool{}
 	for _, l := range lines {
-		if n, _, _ := strings.Cut(l, ":"); n == runUserName {
-			return runUserName + "-" + id
+		n, _, _ := strings.Cut(l, ":")
+		taken[n] = true
+	}
+	name := runUserName
+	for i := 1; taken[name]; i++ {
+		name = runUserName + "-" + id
+		if i > 1 {
+			name += "-" + strconv.Itoa(i)
 		}
 	}
-	return runUserName
+	return name
 }
 
 // imageIDRe matches what `docker image inspect --format '{{.Id}}'` prints.
@@ -166,14 +184,22 @@ func (s *Session) readImageFiles(ctx context.Context, d dockerRunner, image stri
 			s.containers.Delete(name)
 		}
 	}()
-	if out, err := runShell(ctx, d.cmd("create --pull never --network none --name "+shq(name)+" --entrypoint /bin/sh "+shq(image))); err != nil {
+	// Like giveBackFiles: a docker client left behind by a helper that died
+	// can't create the container after the next holder's sweep.
+	child := func(script string) *exec.Cmd {
+		cmd := shellCmd(ctx, d.cmd(script))
+		cmd.SysProcAttr = childSysProcAttr()
+		cmd.Env = append(os.Environ(), "SPOTEXEC_WORKSPACE="+s.workspace)
+		return cmd
+	}
+	if out, err := child("create --pull never --network none --name " + shq(name) + " --entrypoint /bin/sh " + shq(image)).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("docker create: %v: %s", err, firstLines(strings.TrimSpace(string(out)), 3))
 	}
 	files := make([][]byte, len(paths))
 	for i, p := range paths {
 		var stdout limitedBuffer
 		var stderr bytes.Buffer
-		cmd := shellCmd(ctx, d.cmd("cp -L "+shq(name+":"+p)+" -"))
+		cmd := child("cp -L " + shq(name+":"+p) + " -")
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if err := cmd.Run(); err != nil {
 			msg := stderr.String()
@@ -186,7 +212,7 @@ func (s *Session) readImageFiles(ctx context.Context, d dockerRunner, image stri
 			}
 			return nil, fmt.Errorf("docker cp %s: %v: %s", p, err, firstLines(strings.TrimSpace(msg), 3))
 		}
-		b, err := tarFile(stdout.Bytes())
+		b, err := tarFile(stdout.buf.Bytes())
 		if err != nil {
 			return nil, fmt.Errorf("%s: %v", p, err)
 		}
@@ -206,20 +232,48 @@ func tarFile(b []byte) ([]byte, error) {
 	if h.Typeflag != tar.TypeReg {
 		return nil, errors.New("not a regular file")
 	}
-	return io.ReadAll(io.LimitReader(tr, maxAccountFile))
+	if h.Size > maxAccountFile {
+		return nil, fmt.Errorf("larger than %d bytes", maxAccountFile)
+	}
+	return io.ReadAll(tr)
 }
 
-// limitedBuffer keeps at most maxAccountFile bytes and fails the write
-// past that, so a huge file can't use up memory.
+// limitedBuffer keeps at most maxAccountFile bytes (plus the archive's
+// headers and padding) and fails the write past that, so a huge file can't
+// use up memory. Only Write is promoted: io.Copy would bypass it through a
+// bytes.Buffer's ReadFrom.
 type limitedBuffer struct {
-	bytes.Buffer
+	buf  bytes.Buffer
 	full bool
 }
 
 func (l *limitedBuffer) Write(p []byte) (int, error) {
-	if l.Len()+len(p) > maxAccountFile+64<<10 { // the archive's headers and padding
+	if l.buf.Len()+len(p) > maxAccountFile+64<<10 {
 		l.full = true
 		return 0, errors.New("too large")
 	}
-	return l.Buffer.Write(p)
+	return l.buf.Write(p)
+}
+
+// mountsAt reports whether container options mount something at path, as
+// -v/--volume src:dst[:mode] or --mount ...,target=dst (also dst=,
+// destination=), in any spelling of the flag.
+func mountsAt(opts []string, path string) bool {
+	for _, o := range opts {
+		if strings.HasPrefix(o, "-") {
+			if _, v, ok := strings.Cut(o, "="); ok {
+				o = v // --volume=..., --mount=...
+			}
+		}
+		if f := strings.Split(o, ":"); len(f) >= 2 && f[1] == path {
+			return true
+		}
+		for _, kv := range strings.Split(o, ",") {
+			k, v, _ := strings.Cut(kv, "=")
+			if (k == "target" || k == "dst" || k == "destination") && v == path {
+				return true
+			}
+		}
+	}
+	return false
 }

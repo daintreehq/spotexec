@@ -662,10 +662,12 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 			return "", nil, nil, perr(protocol.CodeImageFailed, "%v", err)
 		}
 		// --mount, not -v: a missing source fails the run instead of
-		// becoming an empty directory.
-		users = []string{
-			"--mount", "type=bind,source=" + passwd + ",target=/etc/passwd,readonly",
-			"--mount", "type=bind,source=" + group + ",target=/etc/group,readonly",
+		// becoming an empty directory. A file container.options already
+		// mounts there is left to it (Docker refuses two mounts at one path).
+		for src, dst := range map[string]string{passwd: "/etc/passwd", group: "/etc/group"} {
+			if !mountsAt(run.Options, dst) {
+				users = append(users, "--mount", "type=bind,source="+src+",target="+dst+",readonly")
+			}
 		}
 	}
 	runDir := filepath.Join(s.slotDir, "run")
@@ -1075,7 +1077,8 @@ func (s *Session) removeContainers(prefixOnly bool) string {
 // returns those that still exist.
 func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) string {
 	filter := "--filter " + shq("name=^"+s.containerPrefix())
-	_, _ = runShell(ctx, d.cmd("ps -aq "+filter+" | xargs -r docker rm -f")+" >/dev/null 2>&1")
+	// -v: anonymous volumes too (an image's VOLUME makes them at create).
+	_, _ = runShell(ctx, d.cmd("ps -aq "+filter+" | xargs -r docker rm -fv")+" >/dev/null 2>&1")
 	out, err := runShell(ctx, d.cmd("ps -a --format '{{.Names}}' "+filter))
 	if err != nil {
 		return "(docker ps failed: " + strings.TrimSpace(string(out)) + ")"
