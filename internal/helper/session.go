@@ -55,6 +55,8 @@ type Session struct {
 	lifecycle *flock
 	tokens    []*flock
 	tokenIdx  int
+	run       *flock // the run permit, while the command runs (see takeRun)
+	runIdx    int
 	slotLock  *flock
 	slotDir   string
 	workspace string
@@ -577,6 +579,8 @@ func (s *Session) releaseLocks(teardown bool) {
 	if held {
 		touchActivity(s.layout.Root)
 	}
+	s.run.Unlock()
+	s.run, s.runIdx = nil, 0
 	s.gate.Unlock()
 	s.slotLock.Unlock()
 	s.lifecycle.Unlock()

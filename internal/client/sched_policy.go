@@ -33,6 +33,7 @@ type vmView struct {
 	in       provider.Instance
 	v        *vmSched
 	units    int
+	admits   int  // ordinary jobs it may hold at once (schedState.admits)
 	firm     int  // slots taken by live attempts
 	unc      int  // slots taken by uncertain attempts
 	eligible bool // running, reachable, matching, not draining
@@ -62,7 +63,7 @@ func (p *Pool) views(st *poolState, now time.Time) []vmView {
 		}
 		f, u := s.held(p.R, in.ID)
 		out = append(out, vmView{
-			in: in, v: v, units: s.units(p.R, in.ID), firm: f, unc: u,
+			in: in, v: v, units: s.units(p.R, in.ID), admits: s.admits(p.R, in.ID), firm: f, unc: u,
 			eligible: !n.closed() && (v.Role == roleRetained || v.Role == roleStandby) && (n == nil || !now.Before(n.SuspectUntil)),
 			ready:    n != nil && n.Ready,
 		})
@@ -316,7 +317,7 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			ready bool // this machine installed the helper there (no upload first)
 		}
 		var keep, latency []ranked
-		var standby []vmView
+		var standby, over []vmView
 		for _, w := range p.views(st, now) {
 			n := st.Notes[w.in.ID]
 			if excluded(exclude, w.in) {
@@ -338,6 +339,12 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 				// capacity stops counting as launch capacity in Plan).
 				if w.firm >= w.units && n != nil && n.Ready && !n.SawFull {
 					n.SawFull = true
+				}
+				// Its helper admits jobs to prepare beside those: tried
+				// once no VM has a free slot (the helper refuses it if
+				// they're running commands rather than preparing).
+				if !c.Exclusive && w.v.Role == roleRetained && w.firm+1 <= w.admits {
+					over = append(over, w)
 				}
 				continue
 			}
@@ -447,6 +454,12 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			cl := base
 			cl.Promote = true
 			add(*w, cl, "retained VMs full: bringing back a standby VM")
+		}
+		sort.SliceStable(over, func(i, j int) bool { return over[i].firm < over[j].firm })
+		for _, w := range over {
+			cl := base
+			cl.Overflow = true
+			add(w, cl, "slots taken: preparing beside them until one is free")
 		}
 		return nil
 	})

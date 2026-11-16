@@ -403,7 +403,22 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 			if n == 0 {
 				n = min(max(h.CPUs/4, 1), protocol.MaxSlots)
 			}
-			slots = fmt.Sprintf("%d/%d", len(h.Holders), n)
+			// Jobs running commands fill the slots; the helper admits more
+			// to prepare (sync, image, dependencies) or write back meanwhile.
+			running := protocol.RunningJobs(h.Holders)
+			if exclusiveHeld(h.Holders) {
+				running = n // one job, the whole VM
+			}
+			slots = fmt.Sprintf("%d/%d", running, n)
+			more := 0
+			for _, x := range h.Holders {
+				if !x.Running() {
+					more++
+				}
+			}
+			if more > 0 {
+				slots += fmt.Sprintf(" (+%d)", more)
+			}
 			if h.CPUs > 0 && h.Load1 > 0 {
 				load = fmt.Sprintf("%.1f/%d", h.Load1, h.CPUs)
 			}
@@ -460,13 +475,33 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		}
 		for _, h := range s.Helper.Holders {
 			age := time.Since(time.UnixMilli(h.StartedAt)).Round(time.Second)
-			fmt.Fprintf(w, "  %s slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Token, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
+			doing := ""
+			switch {
+			case !h.Running():
+				doing = " [preparing or writing back]"
+			case h.Phase == protocol.PhaseRunWait:
+				doing = " [waiting for a free slot to run]"
+			}
+			fmt.Fprintf(w, "  %s slot %d: %s%s  (%s, %s pid %d, %s)\n", s.Name, h.Token, h.Client.Command, doing, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
 		}
 		for _, h := range s.Helper.Waiters {
 			age := time.Since(time.UnixMilli(h.StartedAt)).Round(time.Second)
 			fmt.Fprintf(w, "  %s waiting for workspace slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Slot, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
 		}
 	}
+}
+
+// exclusiveHeld reports whether one run holds several tokens: an
+// exclusive run, which takes the whole VM.
+func exclusiveHeld(hs []protocol.Holder) bool {
+	seen := map[int]bool{}
+	for _, h := range hs {
+		if h.HelperPID != 0 && seen[h.HelperPID] {
+			return true
+		}
+		seen[h.HelperPID] = true
+	}
+	return false
 }
 
 func cmdStatus() *cobra.Command {

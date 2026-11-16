@@ -120,6 +120,10 @@ type vmSched struct {
 	Hold time.Time `json:"hold,omitempty"`
 	// Slots: the helper-reported slot count (0 until a job reaches it).
 	Slots int `json:"slots,omitempty"`
+	// Admit: how many jobs its helper admits at once (Acquired.Admit):
+	// jobs still preparing leave room for more, and the helper refuses
+	// work once Slots of them run commands. 0: Slots (an older helper).
+	Admit int `json:"admit,omitempty"`
 	// LastStart/LastEnd: the latest job acquired/released here by this
 	// machine (useful work, unlike keepalive activity).
 	LastStart time.Time `json:"last_start,omitempty"`
@@ -292,6 +296,16 @@ func (s *schedState) units(r *config.Runner, id string) int {
 		return v.Slots
 	}
 	return slotsOf(r)
+}
+
+// admits is how many ordinary jobs an instance may hold at once: its
+// helper's admission limit once a job has reached it, otherwise units.
+// Within it the helper decides (it is full once units jobs run commands).
+func (s *schedState) admits(r *config.Runner, id string) int {
+	if v := s.VMs[id]; v != nil && v.Slots > 0 && v.Admit > v.Slots {
+		return v.Admit
+	}
+	return s.units(r, id)
 }
 
 // held is the capacity live attempts take on a VM: firm (attempts of live
@@ -534,6 +548,10 @@ type claim struct {
 	// Force: reserve whatever the ledger says (legacy placement, exact
 	// slots): the helper decides.
 	Force bool
+	// Overflow: the VM's slots are taken but its helper admits more jobs
+	// to prepare beside them (schedState.admits); the acquire asks for
+	// that (protocol.Acquire.Overflow).
+	Overflow bool
 }
 
 // errNoRoom: the ledger shows the VM full, or it may no longer take
@@ -588,11 +606,13 @@ func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 				s.promote(in.ID, now, why)
 			}
 			firm, _ := s.held(p.R, in.ID)
-			need := 1
+			need, room := 1, s.units(p.R, in.ID)
 			if c.Exclusive {
-				need = s.units(p.R, in.ID)
+				need = room
+			} else if c.Overflow {
+				room = s.admits(p.R, in.ID)
 			}
-			if firm+need > s.units(p.R, in.ID) {
+			if firm+need > room {
 				return errNoRoom
 			}
 		}
@@ -665,7 +685,7 @@ func (p *Pool) commitAttempt(id string, acq protocol.Acquired, expect time.Time)
 		}
 		v := s.vm(a.VM, now)
 		if acq.MaxSlots > 0 {
-			v.Slots = acq.MaxSlots
+			v.Slots, v.Admit = acq.MaxSlots, acq.Admit
 			if a.Exclusive {
 				a.Units = acq.MaxSlots
 			}

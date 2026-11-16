@@ -217,3 +217,55 @@ func TestFleetRoles(t *testing.T) {
 		t.Fatalf("waited %s for the pool lock", d)
 	}
 }
+
+// The slots column counts the jobs running commands; jobs a helper
+// admitted to prepare or write back meanwhile are shown beside it, and
+// each holder line says what its job is doing.
+func TestStatusSlotsCountRunningJobs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := []protocol.Holder{
+		{Token: 1, Phased: true, Phase: protocol.PhaseRun, Run: 1, Client: protocol.ClientInfo{Command: "sx test a"}},
+		{Token: 2, Phased: true, Client: protocol.ClientInfo{Command: "sx test b"}},
+		{Token: 3, Phased: true, Phase: protocol.PhaseRunWait, Client: protocol.ClientInfo{Command: "sx test c"}},
+		{Token: 4, Phased: true, Client: protocol.ClientInfo{Command: "sx test d"}},
+	}
+	printStatus(f, []runnerStatus{{Name: "spot/i-1", Type: "aws-spot", r: &config.Runner{MaxSlots: 2},
+		Info:   provider.Info{State: provider.StateRunning, InstanceID: "i-1"},
+		Helper: &helper.Status{Holders: hs, IdleS: -1}}}, nil)
+	f.Close()
+	b, _ := os.ReadFile(path)
+	out := string(b)
+	if !strings.Contains(out, "2/2 (+2)") {
+		t.Fatalf("slots column:\n%s", out)
+	}
+	for _, want := range []string{"slot 1: sx test a  (", "slot 2: sx test b [preparing or writing back]", "slot 3: sx test c [waiting for a free slot to run]"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no %q in:\n%s", want, out)
+		}
+	}
+}
+
+// An exclusive run holds several tokens: one job, taking the whole VM.
+func TestStatusCountsExclusiveRunOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hs []protocol.Holder
+	for i := 1; i <= 4; i++ {
+		hs = append(hs, protocol.Holder{Token: i, HelperPID: 77, Client: protocol.ClientInfo{Command: "sx --exclusive build"}})
+	}
+	printStatus(f, []runnerStatus{{Name: "spot/i-1", Type: "aws-spot", r: &config.Runner{MaxSlots: 2},
+		Info:   provider.Info{State: provider.StateRunning, InstanceID: "i-1"},
+		Helper: &helper.Status{Holders: hs, IdleS: -1}}}, nil)
+	f.Close()
+	b, _ := os.ReadFile(path)
+	if out := string(b); !strings.Contains(out, " 2/2 ") || strings.Contains(out, "(+") || strings.Contains(out, "4/2") {
+		t.Fatalf("slots column:\n%s", out)
+	}
+}

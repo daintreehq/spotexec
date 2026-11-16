@@ -92,7 +92,9 @@ check "exactly one instance" "[ \$(count) = 1 ]"
 echo "== scale out (6 jobs, 2 slots per instance, max 3 instances)"
 for i in 1 2 3 4 5 6; do "$SX" --json "sleep 6; echo job$i" >"$WORK/s$i.out" 2>"$WORK/s$i.err" & done; wait
 check "all six jobs succeed" "[ \$(cat $WORK/s*.out | grep -c '^job') = 6 ]"
-check "fleet grew to 3 instances" "[ \$(count) = 3 ]"
+# Jobs still preparing on a VM leave room for more there (#227), so the
+# burst may need one instance fewer.
+check "fleet grew to 2-3 instances" "[ \$(count) -ge 2 ] && [ \$(count) -le 3 ]"
 
 echo "== capacity cap (8 jobs on 6 slots)"
 for i in 1 2 3 4 5 6 7 8; do "$SX" --json "sleep 4; echo cap$i" >"$WORK/k$i.out" 2>"$WORK/k$i.err" & done; wait

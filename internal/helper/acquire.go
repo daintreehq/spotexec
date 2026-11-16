@@ -85,12 +85,17 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	}
 	own = min(own, protocol.MaxSlots)
 	max := own // the slot count the VM's runs agree on, once capacity is taken
+	// Up to max jobs run their commands at once (run permits, see takeRun),
+	// but more may be admitted, each with its own token and workspace, to
+	// sync and prepare meanwhile.
+	admit := protocol.AdmitLimit(max)
 	// exec, pull and --same-slot need one exact workspace.
 	only := a.OnlySlot && a.PreferSlot >= 1
 	start := time.Now()
 	deadline := start.Add(time.Duration(a.QueueMS) * time.Millisecond)
 	lastNotice := time.Time{}
-	holder := protocol.Holder{RepoID: a.RepoID, Client: a.Client, StartedAt: time.Now().UnixMilli(), HelperPID: os.Getpid()}
+	// An exclusive run holds every token, so it takes no run permit.
+	holder := protocol.Holder{RepoID: a.RepoID, Client: a.Client, StartedAt: time.Now().UnixMilli(), HelperPID: os.Getpid(), Phased: !a.Exclusive}
 	waiter := &slotWaiter{}
 	defer waiter.done()
 
@@ -107,12 +112,12 @@ capacity:
 				return err
 			}
 		}
-		n, got, err := s.reserveCapacity(a, own, only)
+		n, got, err := s.reserveCapacity(a, own, only, holder)
 		if err != nil {
 			return err
 		}
 		if got {
-			max = n
+			max, admit = n, protocol.AdmitLimit(n)
 			if ok, err := s.takeOnlySlot(a, only, &holder); err != nil || ok {
 				if err != nil {
 					return err
@@ -160,8 +165,14 @@ capacity:
 		score int
 		used  int64
 	}
+	// A job admitted past max_slots (overflow) may need a workspace past
+	// them too; others keep to 1..max_slots, which stay warm.
+	wsTop := max
+	if a.Overflow && !a.Exclusive {
+		wsTop = admit
+	}
 	var cands []cand
-	for i := 1; i <= max; i++ {
+	for i := 1; i <= wsTop; i++ {
 		st := loadSlotState(s.layout.Slot(a.RepoID, i))
 		c := cand{n: i, used: st.LastUsed}
 		switch {
@@ -185,9 +196,14 @@ capacity:
 		}
 		return cands[i].used < cands[j].used // LRU first
 	})
-	order := make([]int, 0, len(cands))
+	order := make([]int, 0, admit)
 	for _, c := range cands {
 		order = append(order, c.n)
+	}
+	// Last resort: overflow jobs admitted meanwhile may hold every one of
+	// those workspaces.
+	for i := wsTop + 1; i <= admit; i++ {
+		order = append(order, i)
 	}
 	slotDeadline := time.Now().Add(30 * time.Second)
 	for s.slotLock == nil {
@@ -279,7 +295,7 @@ capacity:
 	s.owned.Store(&root)
 	return s.c.Send(protocol.TypeAcquired, protocol.Acquired{
 		Token: holder.Token, Slot: holder.Slot, Workspace: s.workspace,
-		FingerprintMatch: match, WaitedMS: time.Since(start).Milliseconds(), MaxSlots: max, PrevWorktreeKey: prevKey,
+		FingerprintMatch: match, WaitedMS: time.Since(start).Milliseconds(), MaxSlots: max, Admit: admit, PrevWorktreeKey: prevKey,
 		Pending: s.state.Pending,
 	})
 }
@@ -311,7 +327,8 @@ func (s *Session) rollbackAcquire() {
 }
 
 // tryAll locks every token, 1..max. The exclusive gate keeps out every
-// other session, so no token above the VM's slot count needs taking.
+// other session, overflow jobs on tokens above max included, so no token
+// above the VM's slot count needs taking.
 func (s *Session) tryAll(max int) bool {
 	var got []*flock
 	for i := 1; i <= max; i++ {
@@ -342,6 +359,31 @@ func (s *Session) setChildPGID(pgid int) {
 	_ = readJSON(filepath.Join(s.slotDir, "holder.json"), &h)
 	h.ChildPGID = pgid
 	s.writeHolder(h)
+}
+
+// running counts the jobs taking command capacity on this runner: those
+// running (or waiting to run) their command, and those holding their
+// slot's capacity for their whole lease (older helpers, exclusive runs).
+// recorded drops tokens held without a record: another acquire or a
+// status probe testing them for an instant, or one being taken.
+func recorded(hs []protocol.Holder) []protocol.Holder {
+	out := hs[:0]
+	for _, h := range hs {
+		if h.HelperPID != 0 {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+func running(hs []protocol.Holder) int {
+	n := 0
+	for _, h := range hs {
+		if h.Running() {
+			n++
+		}
+	}
+	return n
 }
 
 // waitForSlot waits, holding nothing, until the exact workspace slot an
@@ -386,16 +428,18 @@ func (s *Session) waitForSlot(a protocol.Acquire, w *slotWaiter, h protocol.Hold
 // on (see slots.go), which it returns as n.
 //
 // The exact workspace an exec, pull or --same-slot names may lie above n:
-// a run took it while the VM agreed on more slots. Tokens bound capacity,
-// not workspace numbers, so it is still reached, under n. Only a slot above
-// both counts that holds no run's files (never used, or pruned) is gone.
-func (s *Session) reserveCapacity(a protocol.Acquire, own int, only bool) (n int, got bool, err error) {
+// a run took it while the VM agreed on more slots, or a job admitted past
+// them (overflow) did. Tokens bound capacity, not workspace numbers, so it
+// is still reached, under n. Only a slot above both counts that holds no
+// run's files (never used, or pruned) is gone.
+func (s *Session) reserveCapacity(a protocol.Acquire, own int, only bool, holder protocol.Holder) (n int, got bool, err error) {
 	mu, ok, err := lockSlots(s.layout)
 	if err != nil || !ok {
 		return 0, false, err
 	}
 	defer mu.Unlock()
 	n = agreedSlots(s.layout, own)
+	admit := protocol.AdmitLimit(n)
 	if only && a.PreferSlot > max(n, own) && loadSlotState(s.layout.Slot(a.RepoID, a.PreferSlot)).LastUsed == 0 {
 		return 0, false, perr(protocol.CodeBadRequest, "workspace slot %d no longer exists: this runner now has %d slots (max_slots)", a.PreferSlot, n)
 	}
@@ -422,7 +466,19 @@ func (s *Session) reserveCapacity(a protocol.Acquire, own int, only bool) (n int
 			if pass > 0 {
 				time.Sleep(25 * time.Millisecond)
 			}
-			for i := 1; i <= n; i++ {
+			// The runner is full once it holds n jobs, or, for an
+			// overflow request, once n of them run (or wait to run)
+			// their commands: jobs still preparing leave room. A plain
+			// request also takes only tokens 1..n, as before.
+			hs := recorded(readHolders(s.layout))
+			if len(hs) >= n && (!a.Overflow || running(hs) >= n) {
+				continue
+			}
+			top := n
+			if a.Overflow {
+				top = admit
+			}
+			for i := 1; i <= top; i++ {
 				l, ok, err := tryLock(s.layout.TokenLock(i))
 				if err != nil {
 					gate.Unlock()
@@ -430,6 +486,11 @@ func (s *Session) reserveCapacity(a protocol.Acquire, own int, only bool) (n int
 				}
 				if ok {
 					s.own(func() { s.tokens, s.tokenIdx = []*flock{l}, i })
+					// Recorded at once: a token without its record
+					// counts as running a command (see running).
+					h := holder
+					h.Token = i
+					_ = writeJSON(s.layout.TokenHolder(i), h)
 					break
 				}
 			}
