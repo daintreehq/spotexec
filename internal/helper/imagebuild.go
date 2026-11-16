@@ -42,14 +42,27 @@ var (
 	// the legacy builder (and its older "COPY failed: stat …: no such file").
 	missingSourceRe = regexp.MustCompile(`failed to calculate checksum of ref [^ ]+ "[^"]*": not found|failed to compute cache key: "[^"]*" not found|(?:COPY|ADD) failed: (?:file not found in build context|stat [^:]*: no such file or directory)`)
 	// A line a BuildKit step printed ("#5 0.214 …"), as it ran or repeated
-	// in the failure's summary ("0.214 …"), or a line of the Dockerfile the
-	// summary quotes ("   2 | >>> RUN …"): the step's words, not Docker's.
-	stepLineRe = regexp.MustCompile(`^(?:#\d+ )?\d+\.\d+ |^\s*\d+ \| `)
+	// in the failure's summary ("0.214 …"): the step's words, not Docker's.
+	stepLineRe = regexp.MustCompile(`^(?:#\d+ )?\d+\.\d+ `)
+	// A line quoting the Dockerfile: a step's heading ("#5 [2/2] RUN …",
+	// " > [2/2] RUN …:", the legacy "Step 2/2 : RUN …") or the summary's
+	// excerpt ("   2 | >>> RUN …"). It's no evidence of anything.
+	dockerfileLineRe = regexp.MustCompile(`^(?:#\d+ \[|\s*> \[|Step \d+/\d+ : |\s*\d+ \| )`)
+	// The RUN command Docker quotes in its diagnostics, which is the
+	// Dockerfile's text and no evidence either ("RUN grep ECONNRESET log").
+	quotedCommands = []struct {
+		re   *regexp.Regexp
+		repl string
+	}{
+		{regexp.MustCompile(`process ".*" did not complete`), `process "…" did not complete`},
+		{regexp.MustCompile(`executor failed running \[.*\]`), `executor failed running […]`},
+		{regexp.MustCompile(`The command '.*' returned`), `The command '…' returned`},
+	}
 	// Evidence of Docker, the network or the machine failing, anywhere in
 	// the output, which wins over the above: a RUN step that fails because
 	// DNS is down, or a server answered 503, is not the Dockerfile's fault.
 	buildInfraRe = regexp.MustCompile(`(?i)cannot connect to the docker daemon|error during connect|rpc error: code = unavailable|no space left on device|input/output error|` +
-		`temporary failure in name resolution|could not resolve host|unable to resolve host address|no such host|network is unreachable|` +
+		`temporary failure in name resolution|temporary failure resolving|could not resolve host|could not resolve '|could not connect to|unable to resolve host address|no such host|network is unreachable|` +
 		`i/o timeout|tls handshake timeout|connection reset by peer|connection refused|connection timed out|operation timed out|read timed out|` +
 		`failed to connect to|max retries exceeded|curl: \((?:5|6|7|28|35|52|56)\)|returned error: (?:429|5\d\d)\b|` +
 		`\b(?:429 too many requests|502 bad gateway|503 service unavailable|504 gateway time-?out)\b|toomanyrequests|` +
@@ -102,14 +115,22 @@ func (b *buildLog) write(i int, p []byte) {
 // it.
 func (b *buildLog) line(l string, long bool) {
 	l = strings.TrimRight(l, "\r")
-	if buildInfraRe.MatchString(l) {
-		b.infra = true
+	// Where the line came from is decided on all of it: a progress bar's
+	// rewrites (\r) could otherwise hide that a step printed it.
+	if !dockerfileLineRe.MatchString(l) {
+		bare := l
+		for _, q := range quotedCommands {
+			bare = q.re.ReplaceAllLiteralString(bare, q.repl)
+		}
+		if buildInfraRe.MatchString(bare) {
+			b.infra = true
+		}
+		if b.project == "" && !long && !stepLineRe.MatchString(l) {
+			b.project = projectCause(bare)
+		}
 	}
 	if j := strings.LastIndexByte(l, '\r'); j >= 0 {
 		l = l[j+1:] // a progress bar's last state
-	}
-	if b.project == "" && !long && !stepLineRe.MatchString(l) {
-		b.project = projectCause(l)
 	}
 	if len(l) > buildLineMax {
 		l = l[len(l)-buildLineMax:]
