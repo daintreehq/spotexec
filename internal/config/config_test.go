@@ -1364,6 +1364,9 @@ func TestSchedulingSettings(t *testing.T) {
 	if a := g.Runners["a"]; a.SchedPolicy() != PolicyLegacy || a.ResultRetention() != 2*time.Minute {
 		t.Fatalf("a: policy %s retention %s", a.SchedPolicy(), a.ResultRetention())
 	}
+	if b := g.Runners["b"]; b.SchedPolicy() != PolicyShadow {
+		t.Fatalf("b: policy %s", b.SchedPolicy())
+	}
 	// Retention never outlasts idle_timeout (the watchdog ends the VM
 	// then anyway), and early_drain = false opts out.
 	g, err = loadGlobalText(t, "[runners.a]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nidle_timeout = \"90s\"\n[runners.b]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nidle_timeout = \"5m\"\nscheduling = { early_drain = false, result_retention = \"20m\" }\n")
@@ -1375,9 +1378,6 @@ func TestSchedulingSettings(t *testing.T) {
 	}
 	if b := g.Runners["b"]; b.ResultRetention() != 5*time.Minute || b.EarlyDrain() {
 		t.Fatalf("b: retention %s early drain %v", b.ResultRetention(), b.EarlyDrain())
-	}
-	if b := g.Runners["b"]; b.SchedPolicy() != PolicyShadow {
-		t.Fatalf("b: policy %s", b.SchedPolicy())
 	}
 	for _, bad := range []string{"policy = \"newest\"", "mode = \"fast\"", "spare_slots = -1", "result_retention = \"-1m\""} {
 		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n[runners.aws.scheduling]\n"+bad+"\n"); err == nil || !strings.Contains(err.Error(), "scheduling.") {
