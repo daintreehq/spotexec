@@ -223,8 +223,11 @@ sleep 1; echo "local edit 4" > src/a.txt; wait
 check "a failed command that conflicted keeps its own exit code" "[ \$(cat $WORK/conf4.code) = 3 ] && grep -qx 'local edit 4' src/a.txt && grep '\"event\":\"result\"' $WORK/conf4.err | grep -q '\"conflict_count\":1'"
 
 echo "== concurrency (max_slots=3, 4 jobs)"
-for i in 1 2 3 4; do "$SX" --json "sleep 1.5; echo slot=\$SPOTEXEC_SLOT" >"$WORK/p$i.out" 2>"$WORK/p$i.err" & done; wait
-check "three run at once, the fourth queues" "cat $WORK/p*.err | grep -c '\"event\":\"queued\"' | grep -qx 1"
+for i in 1 2 3 4; do "$SX" --json "echo start=\$(date +%s%N); sleep 1.5; echo end=\$(date +%s%N); echo slot=\$SPOTEXEC_SLOT" >"$WORK/p$i.out" 2>"$WORK/p$i.err" & done; wait
+# The fourth either queues (every slot running a command) or, admitted to
+# prepare beside jobs still preparing, waits there for a free slot.
+check "three run at once, the fourth waits" "grep -lE '\"event\":\"(queued|run_wait)\"' $WORK/p*.err | wc -l | tr -d ' ' | grep -qx 1"
+check "never more than three commands at once" "cat $WORK/p*.out | sed -n 's/^start=/1 /p; s/^end=/-1 /p' | awk '{print \$2, \$1}' | sort -n | awk '{n+=\$2; if (n>m) m=n} END {exit !(m<=3)}'"
 check "all four succeed" "[ \$(cat $WORK/p*.out | grep -c slot=) = 4 ]"
 
 echo "== deps cache"

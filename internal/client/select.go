@@ -293,6 +293,10 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			}
 		}
 		if mayProbe {
+			// Runners whose slots are all taken but some by jobs only
+			// preparing: tried again, asking to prepare beside them
+			// (protocol.Acquire.Overflow), once no runner has a free slot.
+			overflow := map[*member][]candidate{}
 			for _, m := range members {
 				if m.fatal != nil {
 					continue
@@ -324,14 +328,23 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					}
 					reachable++
 					lastHolders = holders
+					if !req.Base.Exclusive && protocol.Overflowable(holders, slotsOf(m.r)) {
+						overflow[m] = nil
+					}
 					continue
 				}
 				for _, c := range fleetCands[m] {
+					if c.claim.Overflow {
+						overflow[m] = append(overflow[m], c)
+						continue
+					}
 					in := c.Instance
 					lease, holders, out := m.probeInstance(ctx, req, c, deadline)
 					if out == OutUnreachable && ctx.Err() != nil {
 						out = outSkipped // a cancelled probe proves nothing about the VM
 					}
+					// One whose jobs only prepare is asked again below.
+					over := out == OutBusy && !req.Base.Exclusive && protocol.Overflowable(holders, slotsOf(m.r))
 					if !(out == OutBusy && req.Base.Exclusive) {
 						m.pool.Observe(in.ID, out, in.LaunchedAt)
 					} else {
@@ -357,6 +370,10 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					}
 					if out == OutBusy {
 						lastHolders = holders
+						if over {
+							c.claim.Overflow = true
+							overflow[m] = append(overflow[m], c)
+						}
 					}
 					// Root and user bootstrap each get boot_timeout.
 					if out == OutBooting && !in.LaunchedAt.IsZero() && time.Since(in.LaunchedAt) > 2*m.r.BootTimeout.Duration+2*time.Minute {
@@ -372,6 +389,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 						cancel()
 					}
 				}
+			}
+			if lease := probeOverflow(ctx, req, members, overflow, deadline); lease != nil {
+				return lease, nil
 			}
 		} else {
 			for _, m := range members {
@@ -557,6 +577,44 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		case <-time.After(sleep):
 		}
 	}
+}
+
+// probeOverflow tries, once no runner had a free slot, the runners whose
+// slots are taken but some by jobs only preparing: asking to prepare
+// beside them (protocol.Acquire.Overflow) and wait there for a free slot
+// to run the command, which beats queueing or launching a VM. Static
+// runners are listed with no candidates.
+func probeOverflow(ctx context.Context, req AcquireRequest, members []*member, over map[*member][]candidate, deadline time.Time) *Lease {
+	if len(over) == 0 || req.Base.Exclusive {
+		return nil
+	}
+	req.Base.Overflow = true
+	for _, m := range members {
+		cands, ok := over[m]
+		if !ok || m.fatal != nil {
+			continue
+		}
+		if m.pool == nil {
+			if lease, _, _ := m.probeStatic(ctx, req); lease != nil {
+				return lease
+			}
+			continue
+		}
+		for _, c := range cands {
+			lease, _, out := m.probeInstance(ctx, req, c, deadline)
+			if out == OutUnreachable && ctx.Err() != nil {
+				out = outSkipped // a cancelled probe proves nothing about the VM
+			}
+			m.pool.Observe(c.Instance.ID, out, c.Instance.LaunchedAt)
+			if lease != nil {
+				return lease
+			}
+			if m.fatal != nil {
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // fatalErr is why m can't serve, with how to fix it.
@@ -1039,6 +1097,9 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 	req := AcquireRequest{
 		Base: protocol.Acquire{RepoID: ws.RepoID, WorktreeKey: ws.WorktreeKey, Fingerprint: fingerprint, Exclusive: exclusive, KeepOwner: !syncing,
 			ReadOnly: display == PullDisplay, // still allowed on a VM near max_lifetime
+			// Only this VM will do: prepare beside jobs still preparing
+			// there rather than wait for one to finish.
+			Overflow: !exclusive,
 			Client:   protocol.ClientInfo{Host: host, PID: os.Getpid(), Worktree: ws.Root, Command: display}},
 		QueueTimeout: queue, PreferSlot: lr.Slot, OnlySlot: true, Rep: rep,
 	}

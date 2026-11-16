@@ -533,7 +533,9 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 		switch o {
 		case OutAcquired:
 			st.markReady(id, now)
-			n.LastUsed, n.SuspectUntil, n.Failures, n.Reached = now, time.Time{}, 0, now
+			// It just took a job: a busy hint from before (one an overflow
+			// request then got past) no longer holds.
+			n.LastUsed, n.SuspectUntil, n.Failures, n.Reached, n.BusyUntil = now, time.Time{}, 0, now, time.Time{}
 		case OutBusy:
 			st.markReady(id, now)
 			n.SawFull = true
@@ -1115,31 +1117,49 @@ func (w *Waiter) Done() {
 // to end within the lead hold now. A job whose end is unknown, or already
 // overdue, frees nothing here: the prediction has no say then. A
 // whole-VM (exclusive) waiter needs a VM to empty, which freeing slots
-// don't show, so it never waits here.
+// don't show, so it never waits here. Jobs a VM's helper admitted
+// beyond its slots (overflow, preparing beside them) take the first slots
+// that free there: those releases free nothing for this demand.
 func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendingVM map[string]bool, now time.Time) bool {
 	need := d.Demand - d.Capacity
 	if need <= 0 || wholeVM || p.since.IsZero() || d.Waited >= d.Lead {
 		return false
 	}
 	s := st.sched()
-	eligible := map[string]bool{}
+	queued := map[string]int{} // eligible VMs: units held beyond their slots
 	for _, in := range st.Instances {
 		n := st.Notes[in.ID]
 		if n == nil || !n.Ready || n.closed() || now.Before(n.SuspectUntil) || pendingVM[in.ID] || s.Fences[in.ID] != nil {
 			continue
 		}
-		eligible[in.ID] = true
+		firm, _ := s.held(p.R, in.ID)
+		queued[in.ID] = max(firm-s.units(p.R, in.ID), 0)
 	}
 	type release struct {
 		at    time.Time
 		units int
 	}
-	var rs []release
+	byVM := map[string][]release{}
 	for _, a := range s.Attempts {
-		if a.State != attAcquired || !eligible[a.VM] || !a.Expect.After(now) || !a.Expect.Before(now.Add(d.Lead)) {
+		if _, ok := queued[a.VM]; !ok || a.State != attAcquired || !a.Expect.After(now) || !a.Expect.Before(now.Add(d.Lead)) {
 			continue
 		}
-		rs = append(rs, release{a.Expect, max(a.Units, 1)})
+		byVM[a.VM] = append(byVM[a.VM], release{a.Expect, max(a.Units, 1)})
+	}
+	var rs []release
+	for vm, vrs := range byVM {
+		sort.Slice(vrs, func(i, j int) bool { return vrs[i].at.Before(vrs[j].at) })
+		skip := queued[vm]
+		for _, r := range vrs {
+			if skip > 0 {
+				taken := min(skip, r.units)
+				skip -= taken
+				if r.units -= taken; r.units == 0 {
+					continue
+				}
+			}
+			rs = append(rs, r)
+		}
 	}
 	sort.Slice(rs, func(i, j int) bool { return rs[i].at.Before(rs[j].at) })
 	freed := 0

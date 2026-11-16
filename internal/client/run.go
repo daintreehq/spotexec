@@ -194,6 +194,8 @@ type progress struct {
 	since time.Time                // when the current phase began
 	spent map[string]time.Duration // by phaseKind
 	now   func() time.Time         // nil: time.Now
+	// waited: the start phase a run-permit wait (phaseRunWait) returns to.
+	waited string
 }
 
 func newProgress(phase string) *progress {
@@ -260,6 +262,9 @@ func (p *progress) dispatch(setup bool) {
 func (p *progress) started() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.at.phase == phaseRunWait { // run_slot not seen
+		p.enter(p.waited)
+	}
 	switch p.at.phase {
 	case phaseStartSetup:
 		p.enter(phaseSetup)
@@ -267,6 +272,27 @@ func (p *progress) started() {
 	case phaseStartCommand:
 		p.enter(phaseCommand)
 		p.at.started = true
+	}
+}
+
+// runWait records the helper waiting for a free slot to run the
+// dispatched [setup] run or command (all max_slots are running commands).
+func (p *progress) runWait() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.at.phase == phaseStartSetup || p.at.phase == phaseStartCommand {
+		p.waited = p.at.phase
+		p.enter(phaseRunWait)
+	}
+}
+
+// runSlot records the helper getting its slot after runWait: the process
+// is being started.
+func (p *progress) runSlot() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.at.phase == phaseRunWait {
+		p.enter(p.waited)
 	}
 }
 
@@ -490,6 +516,7 @@ const (
 	phaseImage        = "preparing the container image"
 	phaseDepsCheck    = "checking the dependency cache"
 	phaseDeps         = "installing dependencies"
+	phaseRunWait      = "waiting for a free slot to run the command"
 	phaseStartSetup   = "starting [setup] run"
 	phaseSetup        = "running [setup] run"
 	phaseStartCommand = "starting the command"
@@ -515,6 +542,7 @@ var phaseKind = map[string]string{
 	phaseSync: PhaseSync, phaseGitSeed: PhaseSync,
 	phaseImage:     PhaseImage,
 	phaseDepsCheck: PhaseDeps, phaseDeps: PhaseDeps,
+	phaseRunWait:    PhaseQueued,
 	phaseStartSetup: PhaseSetup, phaseSetup: PhaseSetup,
 	phaseStartCommand: PhaseCommand, phaseCommand: PhaseCommand,
 	phaseWriteback: PhaseWriteback,
@@ -870,13 +898,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		Snapshot: true, Skip: skip, SpotWatch: r.Type == config.TypeAWSSpot,
 		Container: crun,
 	}
+	running := fmt.Sprintf("%s · running %s", label, o.Display)
 	if run, timeout := SetupFor(p, o); run != "" {
 		ex.SetupRun, ex.SetupTimeoutMS = run, timeout.Milliseconds()
-		o.Rep.Status("%s · running setup ([setup] run)", label)
+		running = fmt.Sprintf("%s · running setup ([setup] run)", label)
 		o.Rep.Event("setup", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": run})
-	} else {
-		o.Rep.Status("%s · running %s", label, o.Display)
 	}
+	o.Rep.Status("%s", running)
 	o.Rep.Event("exec", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": o.Display, "cwd": ws.Cwd})
 	stopWatch.Do(func() { close(execStarted) })
 	if ctx.Err() != nil {
@@ -932,10 +960,24 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		prog.setupDone()
 		o.Rep.Status("%s · running %s", label, o.Display)
 	}
-	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup, prog.started)
+	// Every slot on the VM is running a command: the helper holds this one
+	// back, its files prepared, until one finishes.
+	onRunWait := func(waiting bool, msg string) {
+		if waiting {
+			prog.runWait()
+			o.Rep.Status("%s · %s", label, msg)
+			return
+		}
+		prog.runSlot()
+		o.Rep.Status("%s", running)
+	}
+	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup, prog.started, onRunWait)
 	outW.Flush()
 	errW.Flush()
 	if err != nil {
+		if re := (*transport.RemoteError)(nil); errors.As(err, &re) && re.Code == protocol.CodeQueueTimeout {
+			return res, infra(fmt.Errorf("%s: %w", label, err)), ""
+		}
 		return res, infra(fmt.Errorf("lost runner %s during execution: %w", r.Name, err)), lostRunner(lease, err)
 	}
 	res.ExitCode, res.TimedOut = result.ExitCode, result.TimedOut
@@ -1795,7 +1837,7 @@ func setupFailure(p *config.Project, o Options, r protocol.Result) (int, string)
 }
 
 // pumpExec streams output until the result arrives, forwarding interrupts.
-func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot, afterSetup, onStarted func()) (protocol.Result, error) {
+func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot, afterSetup, onStarted func(), onRunWait func(waiting bool, msg string)) (protocol.Result, error) {
 	var res protocol.Result
 	type fr struct {
 		f   protocol.Frame
@@ -1864,6 +1906,9 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot,
 				o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
 				if ev.Name == "setup_done" && afterSetup != nil {
 					afterSetup()
+				}
+				if (ev.Name == "run_wait" || ev.Name == "run_slot") && onRunWait != nil {
+					onRunWait(ev.Name == "run_wait", ev.Message)
 				}
 				if ev.Name == "spot_interruption" {
 					o.Rep.Warn("SPOT_INTERRUPTION", "%s; warming a replacement", ev.Message)

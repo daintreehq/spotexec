@@ -56,9 +56,47 @@ func TestProgressTimesEachPhase(t *testing.T) {
 }
 
 func TestEveryAttemptPhaseHasAKind(t *testing.T) {
-	for _, ph := range []string{phaseSync, phaseGitSeed, phaseImage, phaseDepsCheck, phaseDeps, phaseStartSetup, phaseSetup, phaseStartCommand, phaseCommand, phaseWriteback} {
+	for _, ph := range []string{phaseSync, phaseGitSeed, phaseImage, phaseDepsCheck, phaseDeps, phaseRunWait, phaseStartSetup, phaseSetup, phaseStartCommand, phaseCommand, phaseWriteback} {
 		if phaseKind[ph] == "" {
 			t.Errorf("%q counts as no kind of time", ph)
 		}
+	}
+}
+
+// Time the helper holds a dispatched run back for a free slot counts as
+// queued, and the attempt is still one whose process hasn't started.
+func TestProgressRunWaitIsQueued(t *testing.T) {
+	now := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	at := func(s int) { now = time.Date(2026, 11, 16, 10, 0, s, 0, time.UTC) }
+	p := &progress{at: stage{phase: phaseDeps}, spent: map[string]time.Duration{}, now: func() time.Time { return now }}
+	p.since = now
+	p.dispatch(true)
+	at(1)
+	p.runWait()
+	if s := p.get(); s.phase != phaseRunWait || !s.dispatched || s.started {
+		t.Fatalf("waiting: stage %+v", s)
+	}
+	at(9)
+	p.runSlot()
+	at(10)
+	p.started()
+	if s := p.get(); s.phase != phaseSetup || !s.started {
+		t.Fatalf("after the wait: stage %+v", s)
+	}
+	at(12)
+	got := p.timings()
+	if got[PhaseQueued] != 8*time.Second || got[PhaseSetup] != 4*time.Second {
+		t.Fatalf("timings %v", got)
+	}
+
+	// Started without run_slot (an event lost or reordered) still lands in
+	// the right phase.
+	q := &progress{at: stage{phase: phaseDeps}, spent: map[string]time.Duration{}, now: func() time.Time { return now }}
+	q.since = now
+	q.dispatch(false)
+	q.runWait()
+	q.started()
+	if s := q.get(); s.phase != phaseCommand || !s.started {
+		t.Fatalf("started from the wait: stage %+v", s)
 	}
 }

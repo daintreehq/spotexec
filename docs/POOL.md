@@ -59,7 +59,16 @@ takes part in scheduling, and every VM shuts itself down.
      hour). A never-reached VM in a held region stops covering waiting
      jobs at once, so their launch goes elsewhere. `spotexec status` and
      `spotexec prices` say which regions are held and why.
-3. **Queue and scale out.** If every slot is busy, the job takes a ticket in
+3. **Prepare beside preparing jobs.** A job holds its slot's command
+   capacity only while its `[setup] run` and command run; syncing, the
+   image, the dependency install and the write-back take only its own
+   token and workspace. So when every slot is taken but some by jobs still
+   preparing (or writing back), the job asks those VMs to admit it beside
+   them (`Acquire.Overflow`, up to twice `max_slots` jobs per VM): it
+   prepares there and waits for a free slot to run its command. A VM
+   whose slots all run commands (or whose admitted jobs wait to) refuses.
+   Plain requests (older clients) still see a VM full at `max_slots` jobs.
+4. **Queue and scale out.** If every slot is busy, the job takes a ticket in
    a fair local queue (priority, then arrival; `queue.go`) and registers as
    demand on each fleet (a waiter file under `waiters/`). Under `pool.lock`,
    `Plan` launches only while waiting demand exceeds the capacity already
@@ -78,7 +87,9 @@ takes part in scheduling, and every VM shuts itself down.
      round launches, and a job that has waited longer than the lead is
      sustained demand, and launches as before. A job whose end is unknown
      frees nothing here either, nor does a VM that is draining, outdated,
-     suspect, fenced or still starting. While an exclusive job waits (it
+     suspect, fenced or still starting. The first slots to free on a VM
+     whose helper admitted jobs beyond its slots (step 3) are theirs, so
+     those releases free nothing for jobs still waiting to be admitted. While an exclusive job waits (it
      needs a whole VM to empty, which freeing slots don't show), the fleet
      doesn't hold at all. Held demand counts as covered, so lower-priority
      fleets don't launch for it either. The hold is a `scale_held` event
@@ -112,7 +123,7 @@ takes part in scheduling, and every VM shuts itself down.
      launches for the jobs already waiting the same way, and with no VM
      running the job fails at once, naming the cap and the cheapest
      current price. A job that starts later checks the prices again.
-4. **Wait.** Tickets near the head of the queue probe instances about every
+5. **Wait.** Tickets near the head of the queue probe instances about every
    0.5-2.5s (the head most often) until a slot frees or `queue_timeout`
    expires.
 

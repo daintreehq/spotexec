@@ -364,6 +364,21 @@ func (s *Session) exec(e protocol.Exec) error {
 	if s.slotLock == nil {
 		return perr(protocol.CodeBadRequest, "acquire required before exec")
 	}
+	// Before anything marks the slot dirty: a job that never gets to run
+	// leaves its workspace as it was.
+	if canceled, err := s.takeRun(); err != nil {
+		return err
+	} else if canceled {
+		return s.c.Send(protocol.TypeResult, protocol.Result{ExitCode: 130, Canceled: true})
+	}
+	// A command whose processes or container couldn't be cleaned up keeps
+	// its permit until the session ends: it may still be running.
+	stuck := false
+	defer func() {
+		if !stuck {
+			s.releaseRun()
+		}
+	}()
 	s.loadStored()
 	dir := s.workspace
 	if e.Cwd != "" && e.Cwd != "." {
@@ -460,6 +475,7 @@ func (s *Session) exec(e protocol.Exec) error {
 		t := time.Now()
 		pr, shutdown, oom, err = runPhase(e.SetupRun, s.workspace, time.Duration(e.SetupTimeoutMS)*time.Millisecond, out)
 		if err != nil {
+			stuck = true
 			return err
 		}
 		setupMS = time.Since(t).Milliseconds()
@@ -485,9 +501,13 @@ func (s *Session) exec(e protocol.Exec) error {
 	if !setupFailed {
 		pr, shutdown, oom, err = runPhase(e.Shell, dir, timeout, nil)
 		if err != nil {
+			stuck = true
 			return err
 		}
 	}
+	// The command and its container are gone: collecting and writing back
+	// its results needs no command capacity.
+	s.releaseRun()
 	res := protocol.Result{
 		ExitCode: pr.code, Signal: pr.signal, TimedOut: pr.timedOut, Canceled: pr.canceled,
 		Interrupted: pr.spotIntr || s.interrupted.Load(), DurationMS: time.Since(start).Milliseconds(),

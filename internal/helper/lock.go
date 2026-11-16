@@ -115,6 +115,16 @@ func (l Layout) TokenLock(i int) string {
 func (l Layout) TokenHolder(i int) string {
 	return filepath.Join(l.Root, "tokens", fmt.Sprintf("token-%02d.json", i))
 }
+
+// RunLock is run permit i: held while a job's [setup] run and command
+// run, so at most max_slots commands run at once however many jobs the
+// runner has admitted.
+func (l Layout) RunLock(i int) string {
+	return filepath.Join(l.Root, "tokens", fmt.Sprintf("run-%02d.lock", i))
+}
+
+// RunGate serializes counting and taking run permits, held for an instant.
+func (l Layout) RunGate() string       { return filepath.Join(l.Root, "tokens", "run-gate.lock") }
 func (l Layout) Repo(id string) string { return filepath.Join(l.Root, "repos", id) }
 func (l Layout) Slot(id string, n int) string {
 	return filepath.Join(l.Repo(id), "slots", fmt.Sprintf("slot-%02d", n))

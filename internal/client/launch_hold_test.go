@@ -86,6 +86,28 @@ func TestShortBurstWaitsForSlotsAboutToFree(t *testing.T) {
 	}
 }
 
+// Jobs a helper admitted beyond its slots (#227 overflow, preparing
+// beside them) take the first slots that free there: those releases don't
+// hold a launch for jobs still waiting to be admitted.
+func TestHoldSkipsSlotsOverflowJobsTake(t *testing.T) {
+	now := time.Now()
+	ctx := context.Background()
+	soon, later := now.Add(10*time.Second), now.Add(20*time.Second)
+
+	// Two running jobs end soon, but two overflow jobs wait for their
+	// slots; the overflow jobs end only later.
+	p := fullFleet(t, 1, time.Second, soon, soon, time.Time{}, time.Time{})
+	if d, _ := p.Plan(ctx, 0); !d.Launch || d.Held {
+		t.Fatalf("slots go to overflow jobs: %+v, want a launch", d)
+	}
+	// One overflow job: the second slot to free is the waiting job's.
+	p = fullFleet(t, 1, time.Second, soon, later, time.Time{})
+	d, _ := p.Plan(ctx, 0)
+	if d.Launch || !d.Held || d.Deferred != 1 || d.FreeIn <= 10*time.Second {
+		t.Fatalf("one overflow job: %+v, want held until the second slot frees", d)
+	}
+}
+
 // Demand still waiting after a launch's lead is sustained: it launches as
 // before, whatever is predicted to free.
 func TestSustainedWaitLaunches(t *testing.T) {
