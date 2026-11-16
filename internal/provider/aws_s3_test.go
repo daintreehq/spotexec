@@ -123,8 +123,8 @@ func TestAccountIDSlashProfile(t *testing.T) {
 
 // The S3 canonical query sorts by encoded name and keeps repeated values.
 func TestS3CanonicalQuery(t *testing.T) {
-	q := url.Values{"a-b": {"1"}, "a": {"2", "1"}, "delete": {""}, "t": {"x~y z"}}
-	if got, want := s3CanonicalQuery(q), "a=1&a=2&a-b=1&delete=&t=x~y%20z"; got != want {
+	q := url.Values{"a-b": {"1"}, "a": {"2", "1"}, "a/b": {"1"}, "delete": nil, "t": {"x~y z+"}}
+	if got, want := s3CanonicalQuery(q), "a=1&a=2&a%2Fb=1&a-b=1&delete=&t=x~y%20z%2B"; got != want {
 		t.Fatalf("s3CanonicalQuery = %q, want %q", got, want)
 	}
 }

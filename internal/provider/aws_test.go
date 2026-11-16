@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -29,13 +30,14 @@ func TestSigV4Suite(t *testing.T) {
 	creds := awsCreds{AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"}
 	now := time.Date(2015, 8, 30, 12, 36, 0, 0, time.UTC)
 	cases := []struct {
-		name, method, ctype, body, signed, sig string
+		name, method, query, ctype, body, signed, sig string
 	}{
-		{"get-vanilla", "GET", "", "", "host;x-amz-date", "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"},
-		{"post-x-www-form-urlencoded", "POST", "application/x-www-form-urlencoded", "Param1=value1", "content-type;host;x-amz-date", "ff11897932ad3f4e8b18135d722051e5ac45fc38421b1da7b9d196a0fe09473a"},
+		{"get-vanilla", "GET", "", "", "", "host;x-amz-date", "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"},
+		{"get-vanilla-query-order-key-case", "GET", "?Param2=value2&Param1=value1", "", "", "host;x-amz-date", "b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500"},
+		{"post-x-www-form-urlencoded", "POST", "", "application/x-www-form-urlencoded", "Param1=value1", "content-type;host;x-amz-date", "ff11897932ad3f4e8b18135d722051e5ac45fc38421b1da7b9d196a0fe09473a"},
 	}
 	for _, c := range cases {
-		req, _ := http.NewRequest(c.method, "https://example.amazonaws.com/", strings.NewReader(c.body))
+		req, _ := http.NewRequest(c.method, "https://example.amazonaws.com/"+c.query, strings.NewReader(c.body))
 		if c.ctype != "" {
 			req.Header.Set("Content-Type", c.ctype)
 		}
@@ -316,6 +318,10 @@ func TestCanonicalQuery(t *testing.T) {
 		{"lifecycle", "lifecycle="},
 		{"t=a%7Eb&s=x%20y", "s=x%20y&t=a~b"},
 		{"t=a~b%2Fc", "t=a~b%2Fc"},
+		{"t=a+b", "t=a%2Bb"},               // a literal plus, not a space
+		{"t=%ZZ", "t=%ZZ"},                 // malformed: left as it is
+		{"t=%7e%2f", "t=~%2F"},             // lowercase escapes normalised
+		{"a-b=1&a%2Fb=1", "a%2Fb=1&a-b=1"}, // sorted after encoding ('%' < '-' < '/')
 	} {
 		if got := canonicalQuery(c.raw); got != c.want {
 			t.Errorf("canonicalQuery(%q) = %q, want %q", c.raw, got, c.want)
@@ -327,13 +333,23 @@ func TestCanonicalQuery(t *testing.T) {
 // the region's: launch must not cool regions down for it.
 func TestSSMExpiredCredsIsCredentialError(t *testing.T) {
 	var n atomic.Int32
+	var mu sync.Mutex
+	var keys []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n.Add(1)
+		mu.Lock()
+		keys = append(keys, strings.SplitN(strings.TrimPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 Credential="), "/", 2)[0])
+		mu.Unlock()
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, `{"__type":"com.amazon.coral.service#ExpiredTokenException","message":"The security token included in the request is expired"}`)
 	}))
 	t.Cleanup(srv.Close)
-	c := &awsClient{region: "us-east-2", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AK", SecretAccessKey: "s"}},
+	// Cached credentials that have expired server-side; the refresh finds
+	// new ones in the environment.
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKNEW")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "s")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	c := &awsClient{region: "us-east-2", creds: &awsCredResolver{envOnly: true, cached: &awsCreds{AccessKeyID: "AKOLD", SecretAccessKey: "s"}},
 		http: srv.Client(), endpoints: map[string]string{"ssm": srv.URL + "/"}}
 	ctx := context.Background()
 	_, err := c.ssmGetParameter(ctx, "/aws/service/x")
@@ -341,11 +357,15 @@ func TestSSMExpiredCredsIsCredentialError(t *testing.T) {
 	if !errors.As(err, &ce) || awsCode(err) != "ExpiredTokenException" {
 		t.Fatalf("err = %T %v, want a CredentialError", err, err)
 	}
-	if n.Load() != 2 {
-		t.Fatalf("%d attempts, want 2 (one after refreshing)", n.Load())
+	if n.Load() != 2 || strings.Join(keys, ",") != "AKOLD,AKNEW" {
+		t.Fatalf("%d attempts with keys %v, want AKOLD then AKNEW after refreshing", n.Load(), keys)
+	}
+	wrapped := fmt.Errorf("resolve AMI: %w", err)
+	if got := asRegionError(ctx, wrapped); got != wrapped {
+		t.Fatalf("asRegionError = %v, want the credential error unchanged", got)
 	}
 	var re *regionError
-	if errors.As(asRegionError(ctx, fmt.Errorf("resolve AMI: %w", err)), &re) {
-		t.Fatal("expired credentials became a region error")
+	if !errors.As(asRegionError(ctx, errors.New("resolve AMI: throttled")), &re) {
+		t.Fatal("an ordinary error is no longer a region error")
 	}
 }

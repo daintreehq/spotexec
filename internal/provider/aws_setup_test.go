@@ -834,3 +834,31 @@ func TestAWSUserSetupAdminFromEnv(t *testing.T) {
 		t.Fatalf("%+v %v, calls %v", res, err, f.calls)
 	}
 }
+
+// Setup writes the key where ~ and $VAR in the AWS file variables point,
+// never to a literal ./~/ path under the working directory.
+func TestAWSUserSetupExpandsFilePaths(t *testing.T) {
+	f := &fakeIAM{}
+	s, creds, cfg := newSetupEnv(t, f)
+	home := filepath.Dir(creds)
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("SPOTEXEC_TEST_AWS", filepath.Dir(cfg))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", "~/credentials")
+	t.Setenv("AWS_CONFIG_FILE", "${SPOTEXEC_TEST_AWS}/config")
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	s.Confirm = func(AWSSetupPlan) bool { return true }
+	if _, err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(creds); !strings.Contains(string(b), "aws_secret_access_key = secret-AKNEW1") {
+		t.Fatalf("credentials file:\n%s", b)
+	}
+	if b, _ := os.ReadFile(cfg); !strings.Contains(string(b), "[profile spotexec]\nregion = us-east-2") {
+		t.Fatalf("config file:\n%s", b)
+	}
+	if ents, _ := os.ReadDir(cwd); len(ents) != 0 {
+		t.Fatalf("working directory holds %v", ents)
+	}
+}
