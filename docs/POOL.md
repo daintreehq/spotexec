@@ -15,7 +15,7 @@ takes part in scheduling, and every VM shuts itself down.
                                                                   ▼
    ┌─ i-a  [slot1 ●][slot2 ●]   retained, busy       ◀── pack: retained VMs, the
    ├─ i-b  [slot1 ●][slot2 ○]   retained, busy           worktree's own or a busy one first
-   ├─ i-c  [slot1 ○][slot2 ○]   standby, idle 3m ── watchdog ─▶ terminates at idle_timeout (10m)
+   ├─ i-c  [slot1 ○][slot2 ○]   standby, idle 3m ── watchdog ─▶ terminates (early drain: 2m idle)
    └─ (launching)               claimed by agent 3
 ```
 
@@ -102,10 +102,12 @@ more every 10 seconds while the surplus lasts:
 - nothing shrinks while jobs are queued, or an exclusive job waits.
 
 A standby VM's running jobs finish, new jobs go elsewhere, and nothing renews
-its idle clock, so its watchdog ends it after `idle_timeout`. Standby is
-reversible: when the retained VMs are full, the standby VM that left most
-recently comes back before anything launches (and stays for at least a
-minute). New VMs join the retained set.
+its idle clock. Once this machine has nothing left on it, it is handed an
+[early drain](#early-drain) and ends after `result_retention` (2m) idle;
+otherwise its watchdog ends it after `idle_timeout`. Until that drain is
+handed over, standby is reversible: when the retained VMs are full, the
+standby VM that left most recently comes back before anything launches (and
+stays for at least a minute). New VMs join the retained set.
 
 **Where does this job go?** Among retained VMs with room: the one holding
 this worktree's files (recently synced there), else this repository's
@@ -168,42 +170,68 @@ while its last run is under 10 minutes old.
 
 ## Early drain
 
-By default a standby VM ends at its watchdog's `idle_timeout`, like any idle
-VM. With `scheduling.early_drain = true` and the [pool manager](scaling.md#pool-manager-optional)
-running, a standby VM can end sooner: once it has been idle for
-`scheduling.result_retention` (default `idle_timeout`, so set it lower, such
-as `"2m"`, for this to change anything). Until then `exec`, `pull` and
-`--same-slot` can still reach its workspaces.
+A standby VM ends once it has been idle for `scheduling.result_retention`
+(default `2m`, never longer than `idle_timeout`), rather than at
+`idle_timeout`. Retained VMs keep the full `idle_timeout`. This is on by
+default and needs no [pool manager](scaling.md#pool-manager-optional): each
+`sx` hands out the drains due as its job ends, and each VM carries its own
+out.
 
-Each pass, for a standby VM that has been standby for 30 seconds, isn't
-warm, holds nothing of this machine's (no job, reservation, uncertain
-attempt or exclusive fence), with no job queued and the retained VMs
-covering recent demand without it, the manager:
+What it costs:
+
+- **Results.** Once a drained VM ends, `exec`, `pull` and `--same-slot` can
+  no longer reach its workspaces. `result_retention` is how long after its
+  last job they still can.
+- **Relaunches.** A VM is never placed on again once its drain is handed
+  over, even while it is still up keeping its results. If demand comes back,
+  new jobs wait for room on the retained VMs or for a new VM to boot.
+
+To keep surplus VMs until `idle_timeout` instead:
+
+```toml
+[runners.aws.scheduling]
+early_drain = false
+```
+
+For a standby VM that has been standby for 30 seconds, isn't warm, holds
+nothing of this machine's (no job, reservation, uncertain attempt or
+exclusive fence), with no job queued and the retained VMs covering recent
+demand without it, `sx` (as a job's lease ends) or the pool manager (each
+probe pass):
 
 1. records the drain in the ledger (`drain_requested`). From then on the VM
    is never placed on again, even if the request below times out, so a
    delayed request can't drain a VM that just took new work;
-2. asks the VM (`spotexec-helper try-drain`, over the helper this machine
-   already installed: installing one would touch its idle clock). The
-   helper takes its lifecycle lock exclusively without waiting, and only
-   with no session holding it, no run waiting for a workspace slot, and its
-   activity at least `result_retention` old (by the VM's own clock) writes
-   its drain marker. Every acquire takes that lock shared and checks the
-   marker once it holds it, so nothing can start after;
-3. records the answer: drained (the watchdog powers the VM off at its next
-   pass, within a minute), or busy / still keeping results, asked again
-   30 seconds later with the same operation ID (a retry whose earlier
-   answer was lost reads as drained).
+2. hands it to the VM (`spotexec-helper schedule-drain`, over the helper
+   this machine already installed: installing one would touch its idle
+   clock). The helper writes `drain_after` beside the watchdog's other
+   files, and from then on the watchdog ends the VM once it has been idle
+   for `result_retention` with no session holding its lifecycle lock, as it
+   would at `idle_timeout`: it writes the drain marker first, so nothing can
+   start after. Nothing on this machine has to keep running for it;
+3. records the answer (`drain_scheduled`), and the VM isn't asked again.
 
-`sx` processes don't drain VMs early; without the pool manager, standby VMs
-end at `idle_timeout`. A Spot interruption or `max_lifetime` still ends a VM
-whatever its role.
+A VM booted by an older spotexec has a watchdog that doesn't read
+`drain_after`. It is asked to drain now instead (`try-drain`): the helper
+takes its lifecycle lock exclusively without waiting, and only with no
+session holding it, no run waiting for a workspace slot, and its activity
+at least `result_retention` old (by the VM's own clock) writes its drain
+marker. Busy or still keeping results, it is asked again 30 seconds later,
+by the next `sx` to finish a job or the next pool manager pass, with the
+same operation ID; with neither, it ends at `idle_timeout`.
+
+Only VMs the placement policy has marked standby are drained: after the
+last `sx` exits nothing re-sorts the retained set, so VMs still retained
+then end at `idle_timeout`. A Spot interruption or `max_lifetime` still
+ends a VM whatever its role.
 
 ## Scale in
 
 Each VM's watchdog (a systemd timer installed by cloud-init) powers it off
-after `idle_timeout` (default 10m) without activity. Standby VMs get no new
-work, so this is how the surplus the controller found ends. It only does so when no
+after `idle_timeout` (default 10m) without activity, or a standby VM after
+`result_retention` (default 2m) once it has an [early drain](#early-drain).
+Standby VMs get no new work, so this is how the surplus the controller found
+ends. It only does so when no
 session holds the lifecycle lock. Because instances launch with
 `InstanceInitiatedShutdownBehavior=terminate`, powering off terminates the
 instance.
