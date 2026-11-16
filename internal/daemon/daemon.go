@@ -47,8 +47,8 @@ var (
 	// before client.LifetimeDrainAhead drains whatever is left, one at a
 	// time, so their replacements are warm by then.
 	retireAhead = 10 * time.Minute
-	// A config file changed this recently may be mid-save: wait for it to
-	// settle before applying it.
+	// A changed config file may be mid-save: its new contents are applied
+	// only once they stay the same this long.
 	reloadSettle = time.Second
 	// How long the circuit breaker remembers an instance it counted (or a
 	// VM this daemon launched) after it stops being listed: longer than a
@@ -278,15 +278,15 @@ func (d *Daemon) reload() {
 	if d.cfgPath == "" {
 		return
 	}
-	raw, mod, err := readConfig(d.cfgPath)
+	raw, err := os.ReadFile(d.cfgPath)
 	if err == nil && d.cfgRaw != nil && bytes.Equal(raw, d.cfgRaw) {
 		return
 	}
-	if age := time.Since(mod); err == nil && age < reloadSettle {
-		// Just written, maybe not finished: a valid prefix of the new file
-		// (or an empty one) must not be applied. Changed meanwhile: next pass.
-		time.Sleep(min(reloadSettle, reloadSettle-age))
-		again, _, err2 := readConfig(d.cfgPath)
+	if err == nil && reloadSettle > 0 {
+		// Maybe mid-save: a valid prefix of the new file (or an empty one)
+		// must not be applied. Changed meanwhile: try again next pass.
+		time.Sleep(reloadSettle)
+		again, err2 := os.ReadFile(d.cfgPath)
 		if err2 != nil || !bytes.Equal(raw, again) {
 			return
 		}
@@ -305,15 +305,6 @@ func (d *Daemon) reload() {
 		return
 	}
 	d.cfgRaw, d.cfgErr = raw, ""
-}
-
-func readConfig(path string) ([]byte, time.Time, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return nil, time.Time{}, err
-	}
-	raw, err := os.ReadFile(path)
-	return raw, fi.ModTime(), err
 }
 
 // apply switches the daemon to cfg's fleet runners. A fleet whose runner is
@@ -410,10 +401,12 @@ func (d *Daemon) action(format string, args ...any) {
 }
 
 // healthSettings is r without the settings that only size or schedule the
-// fleet: changing those can't fix instances that never became healthy.
+// fleet, or shape its jobs: changing those can't fix instances that never
+// became healthy.
 func healthSettings(r *config.Runner) config.Runner {
 	c := *r
 	c.Priority, c.MinInstances, c.MaxInstances, c.MaxSlots, c.HourlyCost = 0, 0, 0, 0, 0
+	c.RemotePathSetup = ""
 	c.IdleTimeout, c.MaxLifetime = config.Duration{}, config.Duration{}
 	c.LaunchOrder, c.MaxPrice, c.WaitCost = "", "", config.Dollars{}
 	return c

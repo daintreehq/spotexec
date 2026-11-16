@@ -692,7 +692,8 @@ func TestBreakerAccounting(t *testing.T) {
 }
 
 // A config edit that may fix the fleet (a new bootstrap_script) lifts a
-// pause and launches resume; one that only schedules (priority) doesn't.
+// pause and launches resume; one that only schedules or shapes jobs
+// (priority, remote_path_setup) doesn't.
 func TestConfigChangeResetsBreaker(t *testing.T) {
 	c, cfgPath := setup(t)
 	writeConfig(t, cfgPath, runnerConfig("a.large", 1))
@@ -707,13 +708,13 @@ func TestConfigChangeResetsBreaker(t *testing.T) {
 	if fl.paused.IsZero() || len(c.launches()) != 0 {
 		t.Fatal("not paused")
 	}
-	writeConfig(t, cfgPath, runnerConfig("a.large", 1, "priority = 3"))
+	writeConfig(t, cfgPath, runnerConfig("a.large", 1, "priority = 3", `remote_path_setup = "export PATH=/opt/bin:$PATH"`))
 	d.pass(ctx)
 	settle(t, d)
-	if fl.r.Priority != 3 || fl.paused.IsZero() || len(c.launches()) != 0 {
-		t.Fatal("a priority change lifted the pause")
+	if fl.r.Priority != 3 || fl.r.RemotePathSetup == "" || fl.paused.IsZero() || len(c.launches()) != 0 {
+		t.Fatal("a priority or remote_path_setup change lifted the pause")
 	}
-	writeConfig(t, cfgPath, runnerConfig("a.large", 1, "priority = 3", `bootstrap_script = "echo fixed"`))
+	writeConfig(t, cfgPath, runnerConfig("a.large", 1, "priority = 3", `remote_path_setup = "export PATH=/opt/bin:$PATH"`, `bootstrap_script = "echo fixed"`))
 	d.pass(ctx)
 	settle(t, d)
 	if !fl.paused.IsZero() || recent(d, fl) != 0 || len(c.launches()) != 1 {
