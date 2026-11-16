@@ -147,15 +147,17 @@ func (n *note) reaping(now time.Time) bool {
 // the mark), and if so commits to it: from then on no claim reserves it.
 func (p *Pool) commitReap(id string) bool {
 	ok := false
-	_ = p.with(func(st *poolState) error {
+	err := p.with(func(st *poolState) error {
 		n := st.Notes[id]
-		ok = n.reaping(time.Now()) && !st.sched().protected(id)
+		now := time.Now()
+		ok = n.reaping(now) && !st.sched().protected(id)
 		if ok {
-			n.ReapCommitted = true
+			// From now: the exclusion covers the termination request.
+			n.Reaping, n.ReapCommitted = now, true
 		}
 		return nil
 	})
-	return ok
+	return ok && err == nil // unsaved, other processes don't see the commitment
 }
 
 // Reached records that a VM answered this client outside a job's probe

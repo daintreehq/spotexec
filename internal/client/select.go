@@ -628,7 +628,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	// Recorded in the fleet's ledger before any contact, so concurrent sx
 	// processes see the slot as taken while this acquire is in flight.
 	aid, rerr := m.pool.reserveOn(in, c.claim)
-	if errors.Is(rerr, errNoRoom) {
+	if errors.Is(rerr, errNoRoom) || errors.Is(rerr, errReaping) {
 		return nil, nil, outSkipped
 	}
 	sent := false
