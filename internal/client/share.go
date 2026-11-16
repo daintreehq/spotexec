@@ -36,7 +36,7 @@ var sharePoll = 250 * time.Millisecond
 
 // shareDone is the verdict a leader leaves when it finished: the artifact
 // is published, or the build failed in a way that would fail again (the
-// install itself failed). Either way the runs waiting go on at once, each
+// install or image build itself failed: buildFailed). Either way the runs waiting go on at once, each
 // fetching it or building it for itself. A leader that was lost or
 // cancelled leaves none: the next waiting run builds instead.
 const shareDone = "done"
@@ -232,12 +232,25 @@ func (s sharer) run(ctx context.Context) (shareOutcome, error) {
 			}
 		}
 		verdict = shareDone
-	case errors.As(err, &re) && ctx.Err() == nil:
-		// The runner reported the failure: the others needn't wait in
-		// line to fail the same way.
+	case errors.As(err, &re) && ctx.Err() == nil && buildFailed(re):
+		// The runner reported the build itself failing: the others needn't
+		// wait in line to fail the same way.
 		verdict = shareDone
 	}
 	return out, err
+}
+
+// buildFailed reports whether the runner's error is the build failing (the
+// install or the image build exited non-zero), which would fail again,
+// rather than the runner being lost under it (a Spot reclaim shutting the
+// VM down, a drain, a helper fault): then the next waiting run builds,
+// instead of every waiting run at once (#162).
+func buildFailed(re *transport.RemoteError) bool {
+	switch re.Code {
+	case protocol.CodeDepsFailed, protocol.CodeImageFailed:
+		return true
+	}
+	return false
 }
 
 // take waits for the lock, giving up with the session's error if the

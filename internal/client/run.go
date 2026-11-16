@@ -758,13 +758,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		// Count the doomed instance as draining right away so the pool may
 		// launch its replacement even at max_instances.
 		NewPool(r, f).Observe(lease.InstanceID, OutDraining, time.Time{})
-		spare := req
-		spare.Exclude = map[string]bool{lease.InstanceID: true}
-		for k := range att.exclude {
-			spare.Exclude[k] = true
-		}
-		spare.Base.Fingerprint = ""
-		spare.Base.Exclusive = false
+		spare := spareRequest(req, lease.InstanceID, att.exclude)
 		var sctx context.Context
 		sctx, stopWarm = context.WithTimeout(context.WithoutCancel(ctx), r.BootTimeout.Duration+2*time.Minute)
 		go func() { defer close(warmDone); EnsureSpare(sctx, spare) }()
@@ -1059,6 +1053,21 @@ func classifyExec(r protocol.Result) execOutcome {
 		return execCanceled
 	}
 	return execCompleted
+}
+
+// spareRequest is what warming capacity for a replay of req asks for, when
+// the VM it runs on (doomed) announced its reclamation: room anywhere but
+// that VM and those lost before, for the same kind of run. An --exclusive
+// run needs a whole VM, so its spare must too: one free slot on a busy VM
+// would satisfy a shared spare and launch nothing (#162).
+func spareRequest(req AcquireRequest, doomed string, lost map[string]bool) AcquireRequest {
+	spare := req
+	spare.Exclude = map[string]bool{doomed: true}
+	for k := range lost {
+		spare.Exclude[k] = true
+	}
+	spare.Base.Fingerprint = ""
+	return spare
 }
 
 // shutdownRunner is what to exclude from a replay when the VM shut down
