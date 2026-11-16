@@ -321,6 +321,31 @@ func (s *Session) image(m protocol.Image) error {
 				}
 			}
 		}
+		if m.Source != nil {
+			// Another region holds the image: copy it rather than build it
+			// again, so every region runs the same image (#192).
+			copied, err := s.copyImage(ctx, d, m.Source, m.Tag, local)
+			if err != nil {
+				_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_registry_error", Message: err.Error()})
+			}
+			if copied {
+				res.Pulled, res.Copied = true, true
+				if m.Registry != nil && cfgDir != "" {
+					remote := m.Registry.Repo + ":" + m.Tag
+					if m.WaitPush {
+						_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_push", Message: remote})
+						if out, err := runShell(ctx, d.cmd("tag "+shq(local)+" "+shq(remote))+" && "+d.cmd("--config "+shq(cfgDir)+" push -q "+shq(remote))); err != nil {
+							return perr(protocol.CodeImageFailed, "copied %s from %s but could not push it to %s: %v: %s", m.Dockerfile, m.Source.Server, remote, err, firstLines(string(out), 3))
+						}
+						res.Pushed = true
+					} else if t, err := startImagePush(s.layout.Root, d, local, remote, cfgDir); err == nil {
+						s.track(protocol.ShareImage, t)
+						res.Pushing = true
+					}
+				}
+				break
+			}
+		}
 		if m.Probe {
 			// The client decides who builds (one run for every runner
 			// waiting on this tag), and asks again.
@@ -380,6 +405,29 @@ func firstLines(s string, n int) string {
 		lines = lines[:n]
 	}
 	return strings.Join(lines, " | ")
+}
+
+// copyImage pulls tag from another region's registry src and tags it
+// local, keeping its image ID. A tag src doesn't hold (it expired meanwhile)
+// is no copy and no error.
+func (s *Session) copyImage(ctx context.Context, d dockerRunner, src *protocol.RegistryAuth, tag, local string) (bool, error) {
+	cfgDir, err := dockerLogin(ctx, d, src)
+	if err != nil {
+		return false, fmt.Errorf("source registry %s: %v", src.Server, err)
+	}
+	defer os.RemoveAll(cfgDir)
+	remote := src.Repo + ":" + tag
+	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_copy", Message: remote})
+	out, err := runShell(ctx, d.cmd("--config "+shq(cfgDir)+" pull -q "+shq(remote))+" && "+d.cmd("tag "+shq(remote)+" "+shq(local)))
+	if err != nil {
+		if msg := string(out); !strings.Contains(msg, "not found") && !strings.Contains(msg, "manifest unknown") {
+			return false, fmt.Errorf("copying %s: %s", remote, firstLines(msg, 3))
+		}
+		return false, nil
+	}
+	// The source's name for it isn't needed on this VM.
+	_, _ = runShell(ctx, d.cmd("rmi "+shq(remote))+" >/dev/null 2>&1")
+	return true, nil
 }
 
 // stageContext builds the docker build context from exactly the synced

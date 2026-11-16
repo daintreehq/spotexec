@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -75,6 +76,21 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 		_ = os.MkdirAll(a.dir, 0o700)
 		_ = os.WriteFile(marker, []byte(uri+"\n"), 0o600)
 	}
+	auth, err := a.ecrLogin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(uri, auth.Server+"/") {
+		_ = os.Remove(marker) // stale record (other account/region): re-describe next time
+		return nil, fmt.Errorf("ECR repository %s is not in registry %s", uri, auth.Server)
+	}
+	auth.Repo = uri
+	return auth, nil
+}
+
+// ecrLogin returns a short-lived login for the region's registry, without
+// a repository.
+func (a *AWSSpot) ecrLogin(ctx context.Context) (*protocol.RegistryAuth, error) {
 	var tok struct {
 		Data []struct {
 			Token    string `json:"authorizationToken"`
@@ -96,11 +112,10 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 		return nil, fmt.Errorf("ECR login: malformed token")
 	}
 	server := strings.TrimPrefix(tok.Data[0].Endpoint, "https://")
-	if !strings.HasPrefix(uri, server+"/") {
-		_ = os.Remove(marker) // stale record (other account/region): re-describe next time
-		return nil, fmt.Errorf("ECR repository %s is not in registry %s", uri, server)
+	if server == "" {
+		return nil, fmt.Errorf("ECR login: no registry endpoint")
 	}
-	return &protocol.RegistryAuth{Server: server, Repo: uri, User: user, Password: pass}, nil
+	return &protocol.RegistryAuth{Server: server, User: user, Password: pass}, nil
 }
 
 // ecr calls an ECR JSON 1.1 action.
@@ -192,4 +207,88 @@ func (a *AWSSpot) projectImage(ctx context.Context, repoID, tag string) (string,
 		return "", fmt.Errorf("ECR: unreadable manifest for %s (%s)", tag, img.MediaType)
 	}
 	return m.Config.Digest, nil
+}
+
+// ImageSource is implemented by providers whose instances live in several
+// regions, each with its own registry: an image one region holds is copied
+// to another, never built there again (#192).
+type ImageSource interface {
+	// ImageSource returns a pull login for the repository of repoID in
+	// another of the runner's regions that holds tag, for the region of
+	// instanceID to copy it from; nil when no other region holds it.
+	ImageSource(ctx context.Context, instanceID, repoID, tag string) (*protocol.RegistryAuth, error)
+}
+
+// ImageSource looks for tag in the project's repository in every region
+// the runner may use or has used, other than instanceID's own. Of the
+// regions holding it, the first in the runner's order wins: the regions
+// it lists, then the rest by name.
+func (g *AWSGlobal) ImageSource(ctx context.Context, instanceID, repoID, tag string) (*protocol.RegistryAuth, error) {
+	home, err := g.regionOf(ctx, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	regions, merr := g.managedRegions(ctx)
+	if len(regions) == 0 {
+		return nil, merr
+	}
+	var others []string
+	for _, rg := range regions {
+		if rg != home {
+			others = append(others, rg)
+		}
+	}
+	others = imageSourceOrder(g.r.Regions, others)
+	var mu sync.Mutex
+	holds := map[string]bool{}
+	errs := eachRegion(ctx, others, func(ctx context.Context, rg string) error {
+		id, err := g.Regional(rg).projectImage(ctx, repoID, tag)
+		if err == nil && id != "" {
+			mu.Lock()
+			holds[rg] = true
+			mu.Unlock()
+		}
+		return err
+	})
+	for _, rg := range others {
+		if !holds[rg] {
+			continue
+		}
+		a := g.Regional(rg)
+		auth, err := a.ecrLogin(ctx)
+		if err != nil {
+			errs[rg] = err
+			continue
+		}
+		auth.Repo = auth.Server + "/spotexec/" + ecrName(repoID)
+		return auth, nil
+	}
+	if len(errs) > 0 && len(holds) == 0 {
+		return nil, joinRegionErrors(errs)
+	}
+	return nil, nil
+}
+
+// imageSourceOrder orders regions: those listed (in their order), then
+// the rest by name.
+func imageSourceOrder(listed, regions []string) []string {
+	in := map[string]bool{}
+	for _, rg := range regions {
+		in[rg] = true
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, rg := range listed {
+		if in[rg] && !seen[rg] {
+			seen[rg] = true
+			out = append(out, rg)
+		}
+	}
+	for _, rg := range regions {
+		if !seen[rg] {
+			seen[rg] = true
+			out = append(out, rg)
+		}
+	}
+	return out
 }

@@ -234,6 +234,10 @@ type Image struct {
 	// Probe uses an image already on the runner or in Registry, but never
 	// builds one: a miss is reported as ImageResult.Missing.
 	Probe bool `json:"probe,omitempty"`
+	// Source is another region's registry holding Tag: when Registry lacks
+	// it, the image is pulled from Source (keeping its ID) and pushed to
+	// Registry, instead of being built again (#192).
+	Source *RegistryAuth `json:"source,omitempty"`
 }
 
 // ImageResult reports the local image reference to run.
@@ -245,6 +249,7 @@ type ImageResult struct {
 	Pushing         bool   `json:"pushing"`
 	Pushed          bool   `json:"pushed,omitempty"`
 	Missing         bool   `json:"missing,omitempty"` // Probe: neither on the runner nor in the registry
+	Copied          bool   `json:"copied,omitempty"`  // pulled from Image.Source (another region)
 	InstalledDocker bool   `json:"installed_docker"`
 	MS              int64  `json:"ms"`
 }
