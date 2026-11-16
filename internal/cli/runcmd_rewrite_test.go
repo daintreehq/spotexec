@@ -25,6 +25,8 @@ func TestRewriteRoot(t *testing.T) {
 		{"ls \\\n/Users/me/repo/x", "ls \\\n\"${SPOTEXEC_WORKSPACE:?}\"/x"},
 		{"ls x\\\n/Users/me/repo/x", "ls x\\\n/Users/me/repo/x"},
 		{`ls prefix/Users/me/repo/x`, `ls prefix/Users/me/repo/x`},
+		{"cat <<EOF\n/Users/me/repo/x\nEOF", "cat <<EOF\n${SPOTEXEC_WORKSPACE:?}/x\nEOF"},
+		{"cat <<< /Users/me/repo/x", `cat <<< "${SPOTEXEC_WORKSPACE:?}"/x`},
 	}
 	for _, c := range cases {
 		if got := rewriteRoot(c.in, root); got != c.want {
@@ -130,6 +132,7 @@ func TestSnippetWorkspaceDoesNotWordSplit(t *testing.T) {
 		{"/Users/me/it's repo", `ls /Users/me/it\'s repo`},
 		{"/Users/me/it's", `ls /Users/me/it's'`},
 		{"/tmp/repo[1]", `ls /tmp/repo[1]/x`},
+		{"/tmp/repo*", `ls /tmp/repo*/x`},
 	} {
 		if got := rewriteRoot(c.in, c.root); got != c.in {
 			t.Errorf("rewriteRoot(%q) = %q, want it unchanged", c.in, got)

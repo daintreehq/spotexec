@@ -194,6 +194,14 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 		{`printf "<%s>" $'it\'s #x' # c`, "<it's #x><a><two words>"},
 		{"printf \"<%s>\" x\r#y", "<x\r#y><a><two words>"},
 		{"cat <<'EOF'\n<%s>\nEOF\n# note", "<%s>\n"},
+		{`printf "<%s>" \&;`, "<&><a><two words>"},
+		{`printf "<%s>" "$(printf '%s' " #")"`, "< #><a><two words>"},
+		{`printf "<%s>" "$(date +"%%")" # c`, "<%><a><two words>"},
+		{`printf "<%s>" \$'x\' ' #y'`, `<$x\>< #y><a><two words>`},
+		{"(true)# '\nprintf \"<%s>\" ' #x'", "< #x><a><two words>"},
+		{`printf "<%s>" x # << note`, "<x><a><two words>"},
+		{"printf \"<%s>\" `echo '#'` # c", "<#><a><two words>"},
+		{`printf "<%s>" $((1+2)) <<< x # c`, "<3><a><two words>"},
 	}
 	for _, c := range cases {
 		line := taskCommand(c.tmpl, []string{"a", "two words"})

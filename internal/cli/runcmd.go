@@ -347,7 +347,7 @@ func envAssignment(s string) (name, value string, ok bool) {
 // around it, and ${...:?} aborts rather than expanding to "" if unset.
 func rewriteRoot(s, root string) string {
 	var b strings.Builder
-	inSingle, inDouble := false, false
+	inSingle, inDouble, heredoc := false, false, false
 	atBoundary := true // where a path may start: not mid-word, as after My\ x
 	for i := 0; i < len(s); {
 		c := s[i]
@@ -357,7 +357,10 @@ func rewriteRoot(s, root string) string {
 				// Close the quotes, splice the variable in double quotes,
 				// reopen ('a/x' -> ''"$W"'/x').
 				b.WriteString(`'"${SPOTEXEC_WORKSPACE:?}"'`)
-			case inDouble:
+			case inDouble, heredoc:
+				// Quotes in a here-document's body would be literal; the
+				// tracker can't tell its body from the rest, so after <<
+				// unquoted paths keep the bare form.
 				b.WriteString("${SPOTEXEC_WORKSPACE:?}")
 			default:
 				b.WriteString(`"${SPOTEXEC_WORKSPACE:?}"`)
@@ -380,6 +383,8 @@ func rewriteRoot(s, root string) string {
 			inSingle = !inSingle
 		case c == '"' && !inSingle:
 			inDouble = !inDouble
+		case c == '<' && !inSingle && !inDouble && strings.HasPrefix(s[i:], "<<") && !strings.HasPrefix(s[i:], "<<<") && (i == 0 || s[i-1] != '<'):
+			heredoc = true
 		}
 		b.WriteByte(c)
 		i++
@@ -414,8 +419,8 @@ func matchRoot(s string, i int, root string, unquoted bool) int {
 }
 
 // shellSyntax is the bytes that mean something to the shell outside quotes:
-// quoting, expansion, word splitting, operators, globs and braces.
-const shellSyntax = " \t\n\\'\"$`;&|<>()*?[{}"
+// quoting, expansion, word splitting, operators and globs.
+const shellSyntax = " \t\n\\'\"$`;&|<>()*?["
 
 // pathStarts is the bytes a whole path may follow.
 const pathStarts = " \t\n'\"=:(;&|"
@@ -706,42 +711,32 @@ func taskCommand(run string, args []string) string {
 		// "$@" too, or the arguments would be word-split or not expanded.
 		body = strings.NewReplacer(`"{args}"`, `"$@"`, `'{args}'`, `"$@"`, "{args}", `"$@"`).Replace(run)
 	} else {
-		// Before any trailing comment, which would swallow them. A
-		// here-document's lines are data, so it keeps plain appending.
-		end := len(run)
-		if !strings.Contains(run, "<<") {
-			end = endOfCode(run)
-		}
+		// Before any trailing comment, which would swallow them.
+		end := endOfCode(run)
 		body = run[:end] + ` "$@"` + run[end:]
 	}
 	return "set -- " + strings.Join(q, " ") + "\n" + body
 }
 
 // endOfCode returns where run's last command ends: after its last byte that
-// is not whitespace, a closing ';' or '&', or part of a comment (a '#'
-// outside quotes that begins a word, to the end of its line). A run that is
-// only comments ends at its end, so its arguments land in the comment and
-// still run nothing.
+// is not whitespace, a closing ';' or '&', or part of a comment (a '#' that
+// begins a word outside quotes, to the end of its line). Quoted strings,
+// $(...) and `...` are skipped whole. A run that is only comments, or has a
+// here-document (whose lines are data), ends at its end: arguments are
+// appended as they always were.
 func endOfCode(run string) int {
 	end, beforeTerm := 0, -1 // beforeTerm: end before a closing ; or &
-	inSingle, ansi, inDouble, wordStart := false, false, false, true
+	wordStart, prevOp, prevDollar := true, false, false
 	for i := 0; i < len(run); i++ {
 		c := run[i]
+		op, dollar := false, false
 		switch {
-		case inSingle:
-			if ansi && c == '\\' { // $'...' takes escapes, \' included
-				i++
-			} else {
-				inSingle = c != '\''
-			}
 		case c == '\\' && i+1 < len(run):
 			i++
 			if run[i] == '\n' {
 				continue // a line continuation vanishes
 			}
-			wordStart = false // escaped, inside double quotes too (\")
-		case inDouble:
-			inDouble = c != '"'
+			wordStart = false
 		case c == '#' && wordStart:
 			nl := strings.IndexByte(run[i:], '\n')
 			if nl < 0 {
@@ -749,23 +744,35 @@ func endOfCode(run string) int {
 			} else {
 				i += nl // the loop steps past the newline
 			}
+			prevOp, prevDollar = false, false
+			continue
+		case c == ' ' || c == '\t' || c == '\n':
+			wordStart, prevOp, prevDollar = true, false, false
 			continue
 		case c == '\'':
-			inSingle, ansi, wordStart = true, i > 0 && run[i-1] == '$', false
+			i, wordStart = closeSingle(run, i, prevDollar), false
 		case c == '"':
-			inDouble, wordStart = true, false
-		case c == ' ' || c == '\t' || c == '\n':
-			wordStart = true
-			continue
-		case (c == ';' || c == '&') && strings.IndexByte(";&|<>", prevByte(run, i)) < 0 && strings.IndexByte(";&|>", nextByte(run, i)) < 0:
+			i, wordStart = closeDouble(run, i), false
+		case c == '`':
+			i, wordStart = closeBacktick(run, i), false
+		case c == '$' && i+1 < len(run) && run[i+1] == '(':
+			i, wordStart = closeParen(run, i+1), false
+		case c == '<' && strings.HasPrefix(run[i:], "<<<"):
+			i, wordStart, op = i+2, true, true
+		case c == '<' && strings.HasPrefix(run[i:], "<<"):
+			return len(run)
+		case (c == ';' || c == '&') && !prevOp && strings.IndexByte(";&|>", nextByte(run, i)) < 0:
 			// A list terminator: arguments go before it ("make &" ->
 			// make "$@" &). Part of an operator (&&, 2>&1, ;;) it is code.
-			beforeTerm, end, wordStart = end, i+1, true
+			beforeTerm, end = end, i+1
+			wordStart, prevOp, prevDollar = true, true, false
 			continue
 		default:
-			// ')' ends a word only as an operator, and $(...)#x is one word.
-			wordStart = strings.IndexByte(";&|(", c) >= 0
+			wordStart = strings.IndexByte(";&|()", c) >= 0
+			op = strings.IndexByte(";&|<>", c) >= 0
+			dollar = c == '$'
 		}
+		prevOp, prevDollar = op, dollar
 		end, beforeTerm = i+1, -1
 	}
 	switch {
@@ -777,11 +784,75 @@ func endOfCode(run string) int {
 	return end
 }
 
-func prevByte(s string, i int) byte {
-	if i == 0 {
-		return 0
+// closeSingle returns the index of the quote closing the '...' that opens at
+// run[i], or the last index; in $'...' a backslash escapes.
+func closeSingle(run string, i int, ansi bool) int {
+	for j := i + 1; j < len(run); j++ {
+		switch {
+		case ansi && run[j] == '\\':
+			j++
+		case run[j] == '\'':
+			return j
+		}
 	}
-	return s[i-1]
+	return len(run) - 1
+}
+
+// closeDouble returns the index of the quote closing the "..." that opens at
+// run[i], or the last index.
+func closeDouble(run string, i int) int {
+	for j := i + 1; j < len(run); j++ {
+		switch {
+		case run[j] == '\\':
+			j++
+		case run[j] == '"':
+			return j
+		case run[j] == '`':
+			j = closeBacktick(run, j)
+		case run[j] == '$' && j+1 < len(run) && run[j+1] == '(':
+			j = closeParen(run, j+1)
+		}
+	}
+	return len(run) - 1
+}
+
+// closeParen returns the index of the ')' matching the '(' at run[i], or the
+// last index.
+func closeParen(run string, i int) int {
+	depth := 0
+	for j := i; j < len(run); j++ {
+		switch c := run[j]; {
+		case c == '\\':
+			j++
+		case c == '\'':
+			j = closeSingle(run, j, run[j-1] == '$')
+		case c == '"':
+			j = closeDouble(run, j)
+		case c == '`':
+			j = closeBacktick(run, j)
+		case c == '(':
+			depth++
+		case c == ')':
+			if depth--; depth == 0 {
+				return j
+			}
+		}
+	}
+	return len(run) - 1
+}
+
+// closeBacktick returns the index of the '`' closing the one at run[i], or
+// the last index.
+func closeBacktick(run string, i int) int {
+	for j := i + 1; j < len(run); j++ {
+		switch run[j] {
+		case '\\':
+			j++
+		case '`':
+			return j
+		}
+	}
+	return len(run) - 1
 }
 
 func nextByte(s string, i int) byte {
