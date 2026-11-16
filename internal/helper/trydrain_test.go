@@ -119,6 +119,9 @@ func TestScheduleDrain(t *testing.T) {
 	if r := scheduleDrain(root, "op1", time.Second, true); r.Result != DrainScheduled {
 		t.Fatalf("retry without features: %+v", r)
 	}
+	if r := scheduleDrain(root, "op1", time.Second, false); r.Result != DrainScheduled {
+		t.Fatalf("retry with the lifecycle check failing: %+v", r)
+	}
 	// Once the watchdog has drained it, the operation reads as done.
 	if err := os.WriteFile(filepath.Join(root, "draining"), nil, 0o644); err != nil {
 		t.Fatal(err)

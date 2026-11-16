@@ -192,13 +192,9 @@ func ScheduleDrain(w io.Writer, root, op string, minIdle time.Duration) error {
 
 func scheduleDrain(root, op string, minIdle time.Duration, ephemeral bool) TryDrainResult {
 	res := TryDrainResult{Op: op, IdleS: -1}
-	if !ephemeral {
-		res.Result = DrainUnsupported
-		return res
-	}
 	// What is already in place first: "unsupported" must never be the
 	// answer for a VM that has a drain scheduled (the client would put it
-	// back into service).
+	// back into service), even if a check below fails on a retry.
 	if draining(root) {
 		if b, err := os.ReadFile(drainOpFile(root)); err == nil && op != "" && strings.TrimSpace(string(b)) == op {
 			res.Result = DrainDone
@@ -214,6 +210,10 @@ func scheduleDrain(root, op string, minIdle time.Duration, ephemeral bool) TryDr
 		return res
 	} else if !errors.Is(err, os.ErrNotExist) {
 		res.Result, res.Detail = DrainBusy, "reading the drain schedule: "+err.Error()
+		return res
+	}
+	if !ephemeral {
+		res.Result = DrainUnsupported
 		return res
 	}
 	if ok, err := watchdogReadsDrainAfter(root); err != nil {
