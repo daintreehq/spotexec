@@ -20,7 +20,7 @@ import (
 const defaultDockerfile = ".spotexec/Dockerfile"
 
 func cmdContainer() *cobra.Command {
-	c := &cobra.Command{Use: "container", Short: "Project container image: scaffold a Dockerfile and build it on a runner"}
+	c := &cobra.Command{Use: "container", Short: "Project container image: scaffold a Dockerfile, build it on a runner, and see which regions hold it"}
 
 	var force, yes bool
 	var dfPath string
@@ -62,7 +62,7 @@ func cmdContainer() *cobra.Command {
 		},
 	}
 	f.register(build.Flags())
-	c.AddCommand(initC, build)
+	c.AddCommand(initC, build, cmdContainerRegions())
 	return c
 }
 
