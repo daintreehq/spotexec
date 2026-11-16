@@ -11,8 +11,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -90,7 +92,9 @@ func hasID(lines []string, fields, id int) bool {
 // and NIS directives (+, -) are none, and the id is a decimal number however
 // it is spelled (01000 is 1000).
 func isEntry(f []string, fields, id int) bool {
-	if len(f) != fields || f[0] == "" || strings.ContainsAny(f[0][:1], "#+-") {
+	// libc skips leading blanks before looking for a comment.
+	name := strings.TrimLeft(f[0], " \t")
+	if len(f) != fields || name == "" || strings.ContainsAny(name[:1], "#+-") {
 		return false
 	}
 	n, err := strconv.Atoi(f[2])
@@ -255,25 +259,65 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 	return l.buf.Write(p)
 }
 
-// mountsAt reports whether container options mount something at path, as
-// -v/--volume src:dst[:mode] or --mount ...,target=dst (also dst=,
-// destination=), in any spelling of the flag.
-func mountsAt(opts []string, path string) bool {
-	for _, o := range opts {
-		if strings.HasPrefix(o, "-") {
-			if _, v, ok := strings.Cut(o, "="); ok {
-				o = v // --volume=..., --mount=...
-			}
+// mountsAt reports whether container options mount something at path,
+// with -v/--volume [src:]dst[:mode] or --mount ...,target=dst (also dst=,
+// destination=), as Docker reads them: only those flags' values count, and
+// destinations are compared cleaned (/etc/./passwd is /etc/passwd).
+func mountsAt(opts []string, dst string) bool {
+	for _, v := range dockerFlagValues(opts, "-v", "--volume") {
+		f := strings.Split(v, ":")
+		d := f[0] // an anonymous volume
+		if len(f) >= 2 {
+			d = f[1]
 		}
-		if f := strings.Split(o, ":"); len(f) >= 2 && f[1] == path {
+		if path.Clean(d) == dst {
 			return true
 		}
-		for _, kv := range strings.Split(o, ",") {
-			k, v, _ := strings.Cut(kv, "=")
-			if (k == "target" || k == "dst" || k == "destination") && v == path {
+	}
+	for _, v := range dockerFlagValues(opts, "--mount") {
+		for _, kv := range strings.Split(v, ",") {
+			k, d, _ := strings.Cut(kv, "=")
+			if k = strings.ToLower(strings.TrimSpace(k)); (k == "target" || k == "dst" || k == "destination") && path.Clean(d) == dst {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// dockerFlagValues returns the values the named flags are given in a
+// docker run argument list, read by dockerFlags' rules.
+func dockerFlagValues(opts []string, names ...string) []string {
+	var vals []string
+	for i := 0; i < len(opts); i++ {
+		o := opts[i]
+		switch {
+		case strings.HasPrefix(o, "--") && len(o) > 2:
+			name, v, hasValue := strings.Cut(o, "=")
+			if !hasValue && !slices.Contains(dockerBoolFlags, name) && i+1 < len(opts) {
+				i++
+				v, hasValue = opts[i], true
+			}
+			if hasValue && slices.Contains(names, name) {
+				vals = append(vals, v)
+			}
+		case len(o) > 1 && o[0] == '-':
+			for j := 1; j < len(o); j++ {
+				f := "-" + o[j:j+1]
+				if slices.Contains(dockerBoolFlags, f) {
+					continue
+				}
+				v, hasValue := strings.TrimPrefix(o[j+1:], "="), j < len(o)-1
+				if !hasValue && i+1 < len(opts) {
+					i++
+					v, hasValue = opts[i], true
+				}
+				if hasValue && slices.Contains(names, f) {
+					vals = append(vals, v)
+				}
+				break
+			}
+		}
+	}
+	return vals
 }

@@ -77,6 +77,13 @@ func TestWithRunUser(t *testing.T) {
 			wantGroup:  debianGroup + "#node:x:1000:\n-node:x:1000:\nspotexec:x:1000:\n",
 		},
 		{
+			// ...indented too.
+			name: "indented comment", passwd: debianPasswd + "  #node:x:1000:1000::/home/node:/bin/sh\n",
+			group: debianGroup + "\t#node:x:1000:\n", uid: 1000, gid: 1000,
+			wantPasswd: debianPasswd + "  #node:x:1000:1000::/home/node:/bin/sh\nspotexec:x:1000:1000:spotexec:/home/spotexec:/bin/sh\n",
+			wantGroup:  debianGroup + "\t#node:x:1000:\nspotexec:x:1000:\n",
+		},
+		{
 			// No files at all (an image built from scratch).
 			name: "empty", uid: 1000, gid: 1000,
 			wantPasswd: "root:x:0:0:root:/root:/bin/sh\nspotexec:x:1000:1000:spotexec:/home/spotexec:/bin/sh\n",
@@ -259,7 +266,16 @@ func TestMountsAt(t *testing.T) {
 		{[]string{"-v", "/etc/passwd:/host/passwd:ro"}, false},
 		{[]string{"--mount", "type=bind,source=/etc/passwd,target=/x"}, false},
 		{[]string{"-v", "/x:/etc/passwd.d"}, false},
+		{[]string{"-v", "/x:/etc/./passwd:ro"}, true},
+		{[]string{"--mount", "Type=bind,Source=/x,Target=/etc/passwd/"}, true},
+		{[]string{"-itv", "/x:/etc/passwd"}, true},
+		{[]string{"-v=/x:/etc/passwd"}, true},
+		{[]string{"-v", "/etc/passwd"}, true}, // an anonymous volume there
 		{[]string{"-e", "A=/etc/passwd"}, false},
+		// Only the mount flags' values count.
+		{[]string{"-e", "LOOKUP=/tmp:/etc/passwd"}, false},
+		{[]string{"--label", "target=/etc/passwd"}, false},
+		{[]string{"--label", "-v", "-e", "x:/etc/passwd"}, false},
 	} {
 		if got := mountsAt(c.opts, "/etc/passwd"); got != c.want {
 			t.Errorf("%q: got %v", c.opts, got)

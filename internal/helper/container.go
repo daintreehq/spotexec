@@ -664,9 +664,9 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		// --mount, not -v: a missing source fails the run instead of
 		// becoming an empty directory. A file container.options already
 		// mounts there is left to it (Docker refuses two mounts at one path).
-		for src, dst := range map[string]string{passwd: "/etc/passwd", group: "/etc/group"} {
-			if !mountsAt(run.Options, dst) {
-				users = append(users, "--mount", "type=bind,source="+src+",target="+dst+",readonly")
+		for _, m := range [][2]string{{passwd, "/etc/passwd"}, {group, "/etc/group"}} {
+			if !mountsAt(run.Options, m[1]) {
+				users = append(users, "--mount", "type=bind,source="+m[0]+",target="+m[1]+",readonly")
 			}
 		}
 	}
