@@ -41,21 +41,23 @@ var DefaultPatterns = []string{
 	`^(gradle|\./gradlew)( -[\w.=-]+)* (clean )?(test|check|build|compileJava|compileKotlin|lint|spotlessCheck)\b`,
 }
 
-// DefaultExclude keeps watch modes, dev servers and anything already wrapped
-// local.
+// DefaultExclude keeps watch flags local, and honours the agent's explicit
+// opt-out for one command. Like user excludes, they match the whole line.
 //
-// Words are matched as whole command words, not inside paths: a test file
-// under ~/dev/ or src/watch.test.ts is not a dev server.
+// Watch modes, dev servers and spotexec itself are recognised by the
+// command's own words instead (see localCommand), not by its arguments:
+// `pytest -k watch`, `cargo test --features dev` and `go test ./cmd/spotexec`
+// are ordinary test runs.
 var DefaultExclude = []string{
-	`--watch\b`, `(^|\s|:)(watch|serve)(\s|:|$)`, `(^|\s)(dev|start)(\s|:|$)`, `--ui\b`, `(^|\s)sx(\s|$)`, `(^|[\s/])spotexec(\s|$)`,
-	// The agent's explicit opt-out for one command.
+	`--watch\b`, `--ui\b`,
 	`(^|\s)SPOTEXEC_LOCAL=1(\s|$)`,
 }
 
 var (
 	trailingMerge = regexp.MustCompile(`\s+2>&1$`)
 	cdSeg         = regexp.MustCompile(`^cd\s+\S+$`)
-	envSeg        = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+`)
+	assignName    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+	commandWord   = regexp.MustCompile(`^[A-Za-z0-9_][\w.:@+-]*$`)
 )
 
 // Decider decides which commands to offload.
@@ -230,20 +232,27 @@ func hasUnquoted(s, chars string) bool {
 }
 
 func (d *Decider) shouldOffload(command string) bool {
+	c := strings.TrimSpace(command)
 	// A trailing 2>&1 (agents add it to nearly everything) only merges the
-	// streams: harmless, and it stays part of the offloaded command.
-	c := strings.TrimSpace(trailingMerge.ReplaceAllString(strings.TrimSpace(command), ""))
-	if c == "" || strings.ContainsAny(c, "|<>`$(){}\n&") && !onlyAndAnd(c) {
+	// streams: harmless, and it stays part of the offloaded command. User
+	// excludes see the line without it, as they always have.
+	line := strings.TrimSpace(trailingMerge.ReplaceAllString(c, ""))
+	if line == "" {
 		return false
 	}
 	for _, re := range d.exclude {
-		if re.MatchString(c) {
+		if re.MatchString(line) {
 			return false
 		}
 	}
+	segs, _ := splitList(c)
 	heavy := false
-	for _, seg := range splitSegments(c) {
-		seg = strings.TrimSpace(envSeg.ReplaceAllString(strings.TrimSpace(seg), ""))
+	for _, seg := range segs {
+		seg = strings.TrimSpace(trailingMerge.ReplaceAllString(seg, ""))
+		if shellSyntax(seg) {
+			return false
+		}
+		seg = strings.TrimSpace(seg[len(envPrefix(seg)):])
 		if seg == "" {
 			continue
 		}
@@ -254,6 +263,9 @@ func (d *Decider) shouldOffload(command string) bool {
 				return false
 			}
 			continue
+		}
+		if localCommand(seg) {
+			return false
 		}
 		matched := false
 		for _, re := range d.include {
@@ -270,18 +282,115 @@ func (d *Decider) shouldOffload(command string) bool {
 	return heavy
 }
 
-// onlyAndAnd allows '&' only as part of "&&" (and no other metacharacters).
-func onlyAndAnd(c string) bool {
-	if strings.ContainsAny(c, "|<>`$(){}\n") {
-		return false
+// shellSyntax reports syntax in one list segment that the decider doesn't
+// model: a pipe, redirect, background job, subshell, brace group or
+// expansion outside quotes, or an expansion inside double quotes (which
+// would run locally, or with remote values). Single-quoted text is data, so
+// `go test -run 'TestA|TestB'` and `pytest -k 'a or (b and c)'` are fine.
+func shellSyntax(seg string) bool {
+	var q byte
+	for i := 0; i < len(seg); i++ {
+		ch := seg[i]
+		switch {
+		case ch == '\n':
+			return true
+		case q == '\'':
+			if ch == '\'' {
+				q = 0
+			}
+		case q == '"':
+			switch ch {
+			case '\\':
+				i++
+			case '"':
+				q = 0
+			case '$', '`':
+				return true
+			}
+		case ch == '\'' || ch == '"':
+			q = ch
+		case strings.IndexByte("\\|<>`$(){}&;", ch) >= 0:
+			return true
+		}
 	}
-	return !strings.Contains(strings.ReplaceAll(c, "&&", ""), "&")
+	return q != 0
 }
 
-func splitSegments(c string) []string {
-	c = strings.ReplaceAll(c, "&&", "\x00")
-	c = strings.ReplaceAll(c, ";", "\x00")
-	return strings.Split(c, "\x00")
+// envPrefix is the leading `NAME=value` assignments of a list segment, with
+// the whitespace after them. A value may be quoted and hold spaces or
+// operators: `X='a; pytest' git commit` assigns X and runs git.
+func envPrefix(seg string) string {
+	i := 0
+	for {
+		m := assignName.FindStringIndex(seg[i:])
+		if m == nil {
+			return seg[:i]
+		}
+		_, rest, _, ok := shellWord(seg[i+m[1]:])
+		if !ok || rest == "" || rest[0] != ' ' && rest[0] != '\t' {
+			// No command follows, or the value ends at an operator.
+			return seg[:i]
+		}
+		i = len(seg) - len(strings.TrimLeft(rest, " \t"))
+	}
+}
+
+// bareSeg is a list segment without its leading assignments and a trailing
+// 2>&1, for recognising a `cd`.
+func bareSeg(seg string) string {
+	seg = strings.TrimSpace(trailingMerge.ReplaceAllString(strings.TrimSpace(seg), ""))
+	return strings.TrimSpace(seg[len(envPrefix(seg)):])
+}
+
+// localCommand reports a command that stays local whatever the patterns
+// say: spotexec itself, or a watch mode or dev server named by the command's
+// own words (`vitest watch`, `pnpm dev`, `npm run test:watch`), never by an
+// argument (`pytest -k watch`, `go test ./cmd/spotexec`, `cargo test -p sx`).
+func localCommand(seg string) bool {
+	exe, _, _, ok := shellWord(seg)
+	if !ok || exe == "" {
+		return true
+	}
+	exe = filepath.Base(exe)
+	if exe == "spotexec" || exe == "sx" {
+		return true
+	}
+	// The command words: the executable and the plain words after it, up
+	// to the first option, path or quoted word.
+	words := []string{exe}
+	for _, w := range strings.Fields(seg)[1:] {
+		if !commandWord.MatchString(w) {
+			break
+		}
+		words = append(words, w)
+	}
+	// Past a package runner, the script or tool it runs.
+	switch {
+	case words[0] == "npx" || words[0] == "bunx":
+		words = words[1:]
+	case len(words) > 1 && (words[0] == "bun" && words[1] == "x" || words[0] == "npm" && words[1] == "exec" ||
+		words[0] == "pnpm" && (words[1] == "exec" || words[1] == "dlx")):
+		words = words[2:]
+	case words[0] == "npm" || words[0] == "pnpm" || words[0] == "yarn" || words[0] == "bun":
+		words = words[1:]
+		if len(words) > 0 && words[0] == "run" {
+			words = words[1:]
+		}
+	}
+	// The script or tool's name and its subcommand: `test:watch`,
+	// `vitest watch`, `ng serve`, `dev:server`.
+	for _, w := range words[:min(2, len(words))] {
+		parts := strings.Split(w, ":")
+		if parts[0] == "dev" || parts[0] == "start" {
+			return true
+		}
+		for _, p := range parts {
+			if p == "watch" || p == "serve" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Wrap returns the offloaded form of command, meaning the same as the
@@ -326,7 +435,7 @@ func WrapRTK(bin, command string, rtk bool) string {
 }
 
 func isCd(seg string) bool {
-	return cdSeg.MatchString(strings.TrimSpace(envSeg.ReplaceAllString(seg, "")))
+	return cdSeg.MatchString(bareSeg(seg))
 }
 
 // splitList splits a command list at unquoted "&&" and ";" (the only list
@@ -643,8 +752,9 @@ func cdsInside(command, dir string) bool {
 	if r, err := filepath.EvalSymlinks(cur); err == nil {
 		cur = r
 	}
-	for _, seg := range splitSegments(command) {
-		seg = strings.TrimSpace(envSeg.ReplaceAllString(strings.TrimSpace(seg), ""))
+	segs, _ := splitList(command)
+	for _, seg := range segs {
+		seg = bareSeg(seg)
 		if !cdSeg.MatchString(seg) {
 			continue
 		}
@@ -689,7 +799,7 @@ func wrapDir(command, dir string) string {
 	segs, _ := splitList(head)
 	cur := dir
 	for i := 0; i < len(segs)-1 && isCd(segs[i]); i++ {
-		t, ok := cdTarget(strings.TrimSpace(envSeg.ReplaceAllString(segs[i], "")), cur)
+		t, ok := cdTarget(bareSeg(segs[i]), cur)
 		if !ok {
 			return dir
 		}
@@ -787,23 +897,6 @@ func hookForm(cmd string) int {
 	return hookNone
 }
 
-// claudeHooks returns the hook objects of every PreToolUse entry.
-func claudeHooks(settings map[string]any) []map[string]any {
-	hooks, _ := settings["hooks"].(map[string]any)
-	pre, _ := hooks["PreToolUse"].([]any)
-	var out []map[string]any
-	for _, e := range pre {
-		em, _ := e.(map[string]any)
-		hs, _ := em["hooks"].([]any)
-		for _, h := range hs {
-			if hm, ok := h.(map[string]any); ok {
-				out = append(out, hm)
-			}
-		}
-	}
-	return out
-}
-
 func readSettings(settingsPath string) (map[string]any, bool) {
 	b, err := os.ReadFile(settingsPath)
 	if err != nil {
@@ -821,22 +914,46 @@ func hasForm(settingsPath string, form int) bool {
 	if !ok {
 		return false
 	}
-	for _, hm := range claudeHooks(settings) {
-		if c, _ := hm["command"].(string); hookForm(c) == form {
-			return true
+	for _, e := range preEntries(settings) {
+		if !matchesBash(e.matcher) {
+			continue // it never sees a Bash command
+		}
+		for _, hm := range e.hooks {
+			if c, _ := hm["command"].(string); hookForm(c) == form {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// HasClaude reports whether a Claude Code settings file has the hook, in
-// either form (a legacy `sx hook claude` entry still works).
+// refreshHook is an installed spotexec hook command calling spotexec the
+// way hookCmd does: after a switch of install method (a release binary for
+// Homebrew, say), the old path may be gone. A chain keeps its next hook.
+func refreshHook(cmd, hookCmd string) string {
+	if hookForm(cmd) != hookCurrent {
+		return cmd
+	}
+	have, _, ok := hookExe(cmd)
+	want, _, ok2 := hookExe(hookCmd)
+	if !ok || !ok2 || have == want {
+		return cmd
+	}
+	if then, ok := thenOf(cmd); ok {
+		return chainCmd(hookCmd, then)
+	}
+	return hookCmd
+}
+
+// HasClaude reports whether a Claude Code settings file has the hook for
+// Bash commands, in either form (a legacy `sx hook claude` entry still
+// works).
 func HasClaude(settingsPath string) bool {
 	return hasForm(settingsPath, hookCurrent) || hasForm(settingsPath, hookLegacy)
 }
 
-// HasLegacyClaude reports whether a Claude Code settings file has a hook
-// that calls `sx hook claude`, which InstallClaude rewrites to spotexec.
+// HasLegacyClaude reports whether a Claude Code settings file has a Bash
+// hook that calls `sx hook claude`, which InstallClaude rewrites to spotexec.
 func HasLegacyClaude(settingsPath string) bool { return hasForm(settingsPath, hookLegacy) }
 
 // InstallClaude adds the PreToolUse hook to a Claude Code settings file,
@@ -844,7 +961,10 @@ func HasLegacyClaude(settingsPath string) bool { return hasForm(settingsPath, ho
 // entry is rewritten in place to hookCmd (or dropped, when a spotexec entry
 // is already there). RTK's hook (`rtk hook claude`) is chained in place
 // behind spotexec's, which then needs no entry of its own: one hook decides
-// what happens to each command. It reports whether the file changed.
+// what happens to each command. Only an entry whose matcher covers Bash
+// counts as installed, and an installed hook that calls spotexec by another
+// path than hookCmd is updated to hookCmd's. It reports whether the file
+// changed.
 func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 	settings := map[string]any{}
 	if b, err := os.ReadFile(settingsPath); err == nil && len(strings.TrimSpace(string(b))) > 0 {
@@ -898,6 +1018,10 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 	var keep []any
 	for _, e := range pre {
 		em, _ := e.(map[string]any)
+		m, _ := em["matcher"].(string)
+		// A hook under another matcher (Edit, say) never sees a Bash
+		// command, so it doesn't stand in for spotexec's Bash entry.
+		bash := matchesBash(m)
 		hs, _ := em["hooks"].([]any)
 		// Each legacy command is rewritten in place, keeping its matcher and
 		// options, unless its own entry already calls spotexec.
@@ -905,7 +1029,8 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 		for _, h := range hs {
 			hm, _ := h.(map[string]any)
 			if c, _ := hm["command"].(string); hookForm(c) == hookCurrent {
-				has, current = true, true
+				has = true
+				current = current || bash
 			}
 		}
 		var keepHooks []any
@@ -915,19 +1040,22 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 			if c == "" && hm["type"] == "command" {
 				continue // an RTK hook the chain already runs
 			}
-			if _, isChain := thenOf(c); chained && !isChain && hookForm(c) != hookNone {
+			if _, isChain := thenOf(c); chained && bash && !isChain && hookForm(c) != hookNone {
 				// The chained entry runs spotexec's hook: another one would
 				// rewrite the same commands without RTK in mind.
 				changed = true
 				continue
 			}
 			if hookForm(c) == hookLegacy {
-				changed, current = true, true
+				changed = true
+				current = current || bash
 				if has {
 					continue
 				}
 				hm["command"] = hookCmd
 				has = true
+			} else if r := refreshHook(c, hookCmd); r != c {
+				hm["command"], changed = r, true
 			}
 			keepHooks = append(keepHooks, h)
 		}

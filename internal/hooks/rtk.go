@@ -313,7 +313,7 @@ func UnwrapRTK(command string) (line string, found, raw bool) {
 		if seg == "" {
 			return command, false, false // bash refuses `a;; b`
 		}
-		env := envSeg.FindString(seg)
+		env := envPrefix(seg)
 		rest := seg[len(env):]
 		if m := rtkTool.FindStringSubmatchIndex(rest); m != nil {
 			rest, found = rest[m[2]:], true
@@ -344,9 +344,12 @@ var rtkFilters = []struct {
 	filter string
 	flag   string // inserted after the match unless already there
 	has    *regexp.Regexp
+	// The filter reads stdout as JSON: a trailing 2>&1 would mix compiler
+	// errors into it, so it is dropped and stderr reaches the agent as is.
+	stdoutOnly bool
 }{
-	{regexp.MustCompile(`^cargo test(\s|$)`), "cargo-test", "", nil},
-	{regexp.MustCompile(`^go test(\s|$)`), "go-test", "-json", regexp.MustCompile(`(^|\s)--?json(=true)?(\s|$)`)},
+	{regexp.MustCompile(`^cargo test(\s|$)`), "cargo-test", "", nil, false},
+	{regexp.MustCompile(`^go test(\s|$)`), "go-test", "-json", regexp.MustCompile(`(^|\s)--?json(=true)?(\s|$)`), true},
 }
 
 // rtkNoFilter is a line that asks for other output than the filter reads.
@@ -355,7 +358,7 @@ var rtkNoFilter = regexp.MustCompile(`(^|\s)--?json=(false|0|f|F|FALSE|False)(\s
 // rtkFilterFor returns the RTK pipe filter for a single command segment and
 // the segment as it must run to feed it.
 func rtkFilterFor(seg string) (filter, run string, ok bool) {
-	env := envSeg.FindString(seg)
+	env := envPrefix(seg)
 	rest := seg[len(env):]
 	if rtkNoFilter.MatchString(rest) {
 		return "", "", false
@@ -364,6 +367,9 @@ func rtkFilterFor(seg string) (filter, run string, ok bool) {
 		loc := f.match.FindStringSubmatchIndex(rest)
 		if loc == nil {
 			continue
+		}
+		if f.stdoutOnly {
+			rest = trailingMerge.ReplaceAllString(rest, "")
 		}
 		if f.flag != "" && !f.has.MatchString(rest) {
 			at := loc[2] // right after the subcommand, before its separator

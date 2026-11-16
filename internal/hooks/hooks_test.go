@@ -495,3 +495,150 @@ func TestFirstNoticeOncePerSessionConcurrently(t *testing.T) {
 		t.Fatalf("notice given %d times", n.Load())
 	}
 }
+
+// Operators and exclude words inside quotes or arguments are data, not
+// shell syntax or commands (#160).
+func TestShouldOffloadQuotedAndArguments(t *testing.T) {
+	d, err := NewDecider(config.Hook{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	yes := []string{
+		"go test -run 'TestFoo|TestBar' ./...", "vitest run -t 'login|signup'",
+		"pytest -k 'a or (b and c)'", `pytest -k "a or (b and c)" | tail`, "pytest -k 'a;b' | tail",
+		"pytest -k 'x && y'", "go test ./cmd/spotexec", "cargo test -p sx", "pytest -k watch",
+		"cargo test --features dev", "pytest tests/start", "go test ./internal/serve/...",
+		"pnpm test 2>&1 && pnpm lint 2>&1",
+	}
+	no := []string{
+		"X='1 pytest; pytest' git commit -m wip", `X="pytest && pytest" git push`,
+		"X='a;b' pytest; git push", "pytest 'unterminated",
+		"sx pnpm test", "spotexec run -- pnpm test", "/usr/local/bin/spotexec run -- pnpm test",
+		"CI=1 sx pnpm test", "cd pkg && sx go test", "npm start", "pnpm start", "yarn dev",
+		"npx vitest watch", "pnpm vitest watch", "vitest dev", "pnpm run test:watch",
+		"pnpm test 2>&1 > out.txt", "pnpm test 2>&1 &",
+	}
+	for _, c := range yes {
+		if !d.ShouldOffload(c) {
+			t.Errorf("expected offload: %q", c)
+		}
+	}
+	for _, c := range no {
+		if d.ShouldOffload(c) {
+			t.Errorf("expected local: %q", c)
+		}
+	}
+}
+
+func TestWrapQuotedAndMerged(t *testing.T) {
+	for in, want := range map[string]string{
+		"go test -run 'TestA|TestB' ./... 2>&1 | tail": `sx run -- 'go test -run '\''TestA|TestB'\'' ./... 2>&1' | tail`,
+		"pnpm test 2>&1 && pnpm lint 2>&1":             "sx run -- 'pnpm test 2>&1 && pnpm lint 2>&1'",
+		"cd pkg 2>&1 && go test ./...":                 "cd pkg 2>&1 && sx run -- 'go test ./...'",
+		"X='a; b' pytest -x":                           `sx run -- 'X='\''a; b'\'' pytest -x'`,
+	} {
+		if got := Wrap("sx", in); got != want {
+			t.Errorf("Wrap(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestEnvPrefix(t *testing.T) {
+	for in, want := range map[string]string{
+		"pytest":                        "",
+		"CI=1 pytest":                   "CI=1 ",
+		"A=1 B=2  pytest":               "A=1 B=2  ",
+		"X='1 pytest; pytest' git push": "X='1 pytest; pytest' ",
+		`X="a && b" Y= go test`:         `X="a && b" Y= `,
+		"X=1":                           "",
+		"X=1;pytest":                    "",
+		"'X'=1 pytest":                  "",
+		"X='open pytest":                "",
+	} {
+		if got := envPrefix(in); got != want {
+			t.Errorf("envPrefix(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestCdsInsideQuotedAndMerged(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "pkg"), 0o755)
+	for cmd, want := range map[string]bool{
+		"cd pkg 2>&1 && go test ./...":      true,
+		"cd .. 2>&1 && go test ./...":       false,
+		"X='a; cd /tmp' pytest":             true,
+		"cd pkg && pytest -k 'x; cd /tmp'":  true,
+		"cd pkg && pytest | grep 'a; cd /'": true,
+	} {
+		if got := cdsInside(cmd, root); got != want {
+			t.Errorf("cdsInside(%q) = %v, want %v", cmd, got, want)
+		}
+	}
+}
+
+// Only an entry that sees Bash commands counts as installed (#160).
+func TestInstallAddsBashBesideOtherMatcher(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "settings.json")
+	os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[
+	  {"matcher":"Edit|Write","hooks":[{"type":"command","command":"spotexec hook claude"}]}
+	]}}`), 0o644)
+	if HasClaude(p) {
+		t.Fatal("an Edit|Write entry never sees Bash")
+	}
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	b, _ := os.ReadFile(p)
+	if !HasClaude(p) || !strings.Contains(string(b), `"Edit|Write"`) || strings.Count(string(b), "spotexec hook claude") != 2 {
+		t.Fatalf("want a Bash entry beside the Edit|Write one:\n%s", b)
+	}
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || ok {
+		t.Fatal("second install should be a no-op", ok, err)
+	}
+	// A wildcard matcher covers Bash.
+	os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"spotexec hook claude"}]}]}}`), 0o644)
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || ok || !HasClaude(p) {
+		t.Fatal("a * entry is installed already", ok, err)
+	}
+}
+
+// After a switch of install method, re-installing points the hook at the
+// spotexec now in use, keeping a chain and the entry's options (#160).
+func TestInstallRefreshesStalePath(t *testing.T) {
+	want := "/opt/homebrew/bin/spotexec hook claude"
+	for name, c := range map[string]struct{ have, keep string }{
+		"plain": {
+			`{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/spotexec hook claude","timeout":7}]}`,
+			`"command": "` + want + `",` + "\n" + `            "timeout": 7`,
+		},
+		"chained": {
+			`{"matcher":"Bash","hooks":[{"type":"command","command":"'/old dir/spotexec' hook claude --then 'rtk hook claude'"}]}`,
+			`"command": "` + want + ` --then 'rtk hook claude'"`,
+		},
+	} {
+		p := filepath.Join(t.TempDir(), "settings.json")
+		// The user's own compound command is never ours to rewrite.
+		os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[`+c.have+`,
+		  {"matcher":"Bash","hooks":[{"type":"command","command":"audit; /usr/local/bin/spotexec hook claude"}]}
+		]}}`), 0o644)
+		if ok, err := InstallClaude(p, want); err != nil || !ok {
+			t.Fatal(name, ok, err)
+		}
+		b, _ := os.ReadFile(p)
+		got := string(b)
+		if !strings.Contains(got, c.keep) || strings.Contains(got, "old dir") ||
+			!strings.Contains(got, `"audit; /usr/local/bin/spotexec hook claude"`) || strings.Count(got, `"matcher"`) != 2 {
+			t.Errorf("%s: want %s, the user's own hook kept:\n%s", name, c.keep, got)
+		}
+		if ok, err := InstallClaude(p, want); err != nil || ok {
+			t.Fatal(name, "second install should be a no-op", ok, err)
+		}
+	}
+	// The same executable, quoted differently, is left as it is.
+	p := filepath.Join(t.TempDir(), "settings.json")
+	os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'/opt/homebrew/bin/spotexec' hook claude"}]}]}}`), 0o644)
+	if ok, err := InstallClaude(p, want); err != nil || ok {
+		t.Fatal("same executable rewritten", ok, err)
+	}
+}
