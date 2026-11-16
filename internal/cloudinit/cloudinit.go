@@ -57,7 +57,15 @@ D=/var/tmp/spotexec
 # can't write to, and so does everything below: anything else is removed
 # (a link itself, never its target). Once root owns the entry, /var/tmp's
 # sticky bit keeps everyone else from replacing it.
-sx_rootdir() { [ ! -L "$D" ] && [ -d "$D" ] && [ "$(stat -c %u "$D")" = 0 ] && [ -z "$(find "$D" -maxdepth 0 -perm -0002)" ]; }
+# Owner and mode come from one stat, and anything it can't read fails.
+sx_rootdir() {
+  [ ! -L "$D" ] && [ -d "$D" ] || return 1
+  case "$(stat -c %u:%A "$D" 2>/dev/null)" in
+    0:d???????w?) return 1 ;; # others can write
+    0:d*) return 0 ;;
+  esac
+  return 1
+}
 for _ in 1 2 3; do
   if [ -e "$D" ] || [ -L "$D" ]; then sx_rootdir || timeout 60 rm -rf "$D"; fi
   mkdir -p "$D" 2>/dev/null

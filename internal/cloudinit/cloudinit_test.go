@@ -122,7 +122,7 @@ func TestRenderClaimsStateDirForRoot(t *testing.T) {
 	block := s[start:end]
 	uid := strconv.Itoa(os.Getuid())
 	run := func(t *testing.T, d, owner string) (string, error) {
-		script := strings.NewReplacer("/var/tmp/spotexec", d, `"$D")" = 0 ]`, `"$D")" = `+owner+` ]`, "sleep 120; poweroff -f", ":").Replace(block)
+		script := strings.NewReplacer("/var/tmp/spotexec", d, "0:d", owner+":d", "sleep 120; poweroff -f", ":").Replace(block)
 		out, err := exec.Command("bash", "-c", "set -u\n"+script).CombinedOutput()
 		return string(out), err
 	}
@@ -186,6 +186,20 @@ func TestRenderClaimsStateDirForRoot(t *testing.T) {
 		}
 		if b, _ := os.ReadFile(target); string(b) != "keep" {
 			t.Fatalf("the link's target changed: %q", b)
+		}
+	})
+	t.Run("unreadable mode fails closed", func(t *testing.T) {
+		// A stat that answers nothing proves nothing: the boot stops.
+		d := filepath.Join(t.TempDir(), "spotexec")
+		os.Mkdir(d, 0o755)
+		bin := t.TempDir()
+		os.WriteFile(filepath.Join(bin, "stat"), []byte("#!/bin/sh\nexit 1\n"), 0o755)
+		script := strings.NewReplacer("/var/tmp/spotexec", d, "0:d", uid+":d", "sleep 120; poweroff -f", ":").Replace(block)
+		cmd := exec.Command("bash", "-c", "set -u\n"+script)
+		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+		out, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "DESTROYED") {
+			t.Fatalf("boot went on without knowing who owns the directory: %v: %s", err, out)
 		}
 	})
 	t.Run("root's directory is kept", func(t *testing.T) {
