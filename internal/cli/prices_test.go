@@ -137,6 +137,16 @@ func TestPricesShowFailureHistory(t *testing.T) {
 	if got := strings.Join(strings.Fields(row(strings.Split(b.String(), "\n"), "eu-north-1b")), " "); got != want {
 		t.Fatalf("row:\n%s\nwant:\n%s", got, want)
 	}
+	// Too little to show in USD (wait_cost 0, a cheap pool): still said.
+	failed.Failures, failed.FailedHere = 0.0004, &provider.FailureHistory{Capacity: 1}
+	v.k.Cost[optionKey(coldOpt)] = failed
+	b.Reset()
+	v.writeText(&b, 20)
+	if got := row(strings.Split(b.String(), "\n"), "eu-north-1b"); !strings.Contains(got, "failed here lately: 1.0 capacity refusals") {
+		t.Fatalf("small penalty row: %s", got)
+	}
+	failed.Failures, failed.FailedHere = 0.1074, &provider.FailureHistory{Capacity: 1.83, Reclaims: 0.5, LastCapacity: last, LastReclaim: last}
+	v.k.Cost[optionKey(coldOpt)] = failed
 	b.Reset()
 	if err := v.writeJSON(&b); err != nil {
 		t.Fatal(err)
