@@ -698,8 +698,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	for k, v := range o.Env {
 		env[k] = v
 	}
-	skip := append([]string{}, manifest.HeavyDirs...)
-	skip = append(skip, p.Deps.CacheDirs...)
+	skip := manifest.SnapshotSkip(p.Deps.CacheDirs)
 	ex := protocol.Exec{
 		Shell: o.Command, Cwd: ws.Cwd, Env: env, Setup: r.RemotePathSetup,
 		TimeoutMS: o.Timeout.Milliseconds(), GraceMS: o.Grace.Milliseconds(),
@@ -815,7 +814,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// the rest stay pending until written back or removed by the next sync.
 	var ignoredCreated map[string]bool
 	if m != nil && len(result.Created) > 0 {
-		ignoredCreated = settleCreated(post, sess, m, result.Created)
+		ignoredCreated = settleCreated(post, sess, ws, m, result.Created)
 	}
 	if m != nil && len(result.Unverified) > 0 {
 		o.Rep.Warn("UNVERIFIED", "%d file(s) could not be read on the runner after the run and were not written back: %s", len(result.Unverified), strings.Join(firstN(result.Unverified, 5), ", "))
@@ -1178,8 +1177,10 @@ func underSyncedFile(m *manifest.Manifest, p string) bool {
 
 // settleCreated tells the helper which files the run created are ignored
 // here, and returns that set (nil if it couldn't be determined: write-back
-// then checks again and reports the error).
-func settleCreated(ctx context.Context, s *transport.Session, m *manifest.Manifest, created []protocol.Entry) map[string]bool {
+// then checks again and reports the error). A reserved path (spotexec's own
+// state in a non-Git .spotexec/) is ignored but never settled: write-back
+// refuses it, and it stays pending so the next sync removes it.
+func settleCreated(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, created []protocol.Entry) map[string]bool {
 	paths := make([]string, 0, len(created))
 	for _, c := range created {
 		if _, err := fsid.CleanRel(c.Path); err == nil {
@@ -1192,7 +1193,7 @@ func settleCreated(ctx context.Context, s *transport.Session, m *manifest.Manife
 	}
 	var keep []string
 	for _, p := range paths {
-		if ign[p] {
+		if ign[p] && !reservedPath(p, ws.Git) {
 			keep = append(keep, p)
 		}
 	}
