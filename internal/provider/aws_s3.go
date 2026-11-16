@@ -65,91 +65,153 @@ func (a *AWSSpot) CacheURLs(ctx context.Context, repoID, key string) (string, st
 }
 
 // accountID returns (and caches) the AWS account of these credentials.
+// The account is the same in every region, so when this region's STS can't
+// be reached it is asked in the partition's home region instead (#228).
 func (a *AWSSpot) accountID(ctx context.Context) (string, error) {
 	// Keyed by the access key too: switching credentials (a different
 	// account under the same profile name, or none) must not reuse it.
-	keyID := ""
-	if c, err := a.api.creds.get(ctx); err == nil {
-		h := sha256.Sum256([]byte(c.AccessKeyID))
-		keyID = hex.EncodeToString(h[:])[:12]
-	}
-	p := filepath.Join(a.dir, "account-id-"+fileSafe(a.r.Profile)+"-"+keyID)
-	if b, err := os.ReadFile(p); err == nil && len(strings.TrimSpace(string(b))) == 12 {
-		return strings.TrimSpace(string(b)), nil
-	}
-	b, err := a.api.query(ctx, "sts", stsAPIVersion, "GetCallerIdentity", nil)
+	c, err := a.api.creds.get(ctx)
 	if err != nil {
 		return "", err
 	}
-	acct := xmlFirst(b, "GetCallerIdentityResult>Account")
-	if len(acct) != 12 {
-		return "", fmt.Errorf("could not determine AWS account id")
+	h := sha256.Sum256([]byte(c.AccessKeyID))
+	p := filepath.Join(a.dir, "account-id-"+fileSafe(a.r.Profile)+"-"+hex.EncodeToString(h[:])[:12])
+	if b, err := os.ReadFile(p); err == nil && len(strings.TrimSpace(string(b))) == 12 {
+		return strings.TrimSpace(string(b)), nil
+	}
+	ask := func(ctx context.Context, api *awsClient) (string, error) {
+		b, err := api.query(ctx, "sts", stsAPIVersion, "GetCallerIdentity", nil)
+		if err != nil {
+			return "", err
+		}
+		acct := xmlFirst(b, "GetCallerIdentityResult>Account")
+		if len(acct) != 12 {
+			return "", fmt.Errorf("could not determine AWS account id")
+		}
+		return acct, nil
+	}
+	acct, err := "", error(nil)
+	if home := accountRegion(a.r.Region); home != a.r.Region {
+		// This region first (the home region may be denied by policy), but
+		// bounded, so the home region still gets its turn.
+		rctx, cancel := context.WithTimeout(ctx, accountLookupTimeout)
+		acct, err = ask(rctx, a.api)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			hc := *a.api
+			hc.region = home
+			if acct, err = ask(ctx, &hc); err != nil {
+				err = fmt.Errorf("finding the AWS account through STS in %s and %s: %w", a.r.Region, home, err)
+			}
+		}
+	} else {
+		acct, err = ask(ctx, a.api)
+	}
+	if err != nil {
+		return "", err
 	}
 	_ = os.MkdirAll(a.dir, 0o700)
 	_ = os.WriteFile(p, []byte(acct+"\n"), 0o600)
 	return acct, nil
 }
 
+// accountLookupTimeout bounds asking the runner's own region for the
+// account before asking the partition's home region.
+var accountLookupTimeout = 8 * time.Second
+
+// cacheRuleTimeout bounds setting the cache bucket's expiry rule: it is
+// best effort, and mustn't use up the signing's budget.
+var cacheRuleTimeout = 10 * time.Second
+
 // ensureBucket returns the cache bucket (and owning account), creating it
 // (private, 14-day expiry) when it is the auto-named one. Setup is
 // remembered per (account, region, bucket), and every check asserts
 // ownership.
+//
+// Only a definite answer fails it (#228): when S3 can't be reached from
+// here (or answers 5xx) the bucket is returned unchecked, since the URLs
+// signed for it are bound to the account (x-amz-expected-bucket-owner) and
+// used from the VM, in the bucket's region. A bucket that turns out not to
+// exist is then a cache miss, which is what failing here would cause. The
+// expiry rule is best effort: a bucket known to exist is remembered without
+// it, and the rule is applied again on the next lookup.
 func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 	bucket, acct, auto, err := a.cacheBucket(ctx)
 	if err != nil || bucket == "" {
 		return "", "", err
 	}
 	owner := map[string]string{"x-amz-expected-bucket-owner": acct}
-	marker := filepath.Join(a.dir, "cache-bucket-"+acct+"-"+a.r.Region+"-"+bucket)
+	id := acct + "-" + a.r.Region + "-" + bucket
+	marker := filepath.Join(a.dir, "cache-bucket-"+id)        // exists, with its expiry rule
+	exists := filepath.Join(a.dir, "cache-bucket-exists-"+id) // exists, rule not set yet
 	if _, err := os.Stat(marker); err == nil {
 		return bucket, acct, nil
 	}
-	status, _, err := a.s3(ctx, http.MethodHead, bucket, "", nil, owner)
-	if err != nil {
-		return "", "", err
-	}
-	switch {
-	case status == 200:
-	case status == 404 && auto:
-		var body []byte
-		if a.r.Region != "us-east-1" {
-			body = []byte(`<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>` + a.r.Region + `</LocationConstraint></CreateBucketConfiguration>`)
+	if _, err := os.Stat(exists); err != nil {
+		status, _, err := a.s3(ctx, http.MethodHead, bucket, "", nil, owner)
+		if err != nil || status/100 == 5 {
+			return bucket, acct, nil // unchecked: S3 can't be reached from here
 		}
-		st, b, err := a.s3Settled(ctx, http.MethodPut, bucket, "", body, nil)
-		if err != nil {
-			return "", "", err
+		switch {
+		case status == 200:
+		case status == 404 && auto:
+			var body []byte
+			if a.r.Region != "us-east-1" {
+				body = []byte(`<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>` + a.r.Region + `</LocationConstraint></CreateBucketConfiguration>`)
+			}
+			st, b, err := a.s3Settled(ctx, http.MethodPut, bucket, "", body, nil)
+			if err != nil {
+				return "", "", err
+			}
+			if st/100 != 2 && !bytes.Contains(b, []byte("BucketAlreadyOwnedByYou")) {
+				return "", "", fmt.Errorf("creating cache bucket %s: HTTP %d: %s", bucket, st, firstLineOf(b))
+			}
+		case status == 404:
+			return "", "", fmt.Errorf("cache bucket %s does not exist (create it, or use cache_bucket = \"auto\")", bucket)
+		case status == 403 && auto:
+			return "", "", fmt.Errorf("cache bucket %s: access denied: either the key lacks the S3 statement of spotexec's policy (re-run `spotexec setup` to refresh it), or another account owns a bucket by this name (name one of your own with cache_bucket, granting it as docs/aws.md shows); or set cache_bucket = \"off\"", bucket)
+		case status == 403:
+			// S3 says 403 both for a bucket another account owns and for one
+			// this key may not read; spotexec's policy only covers its own
+			// spotexec-cache-* buckets, so a named one needs its own grant.
+			return "", "", fmt.Errorf("cache bucket %s: access denied: either it isn't owned by account %s, or the key has no access to it. spotexec's policy only covers spotexec-cache-* buckets, so a bucket you name needs its own grant of s3:ListBucket on the bucket and s3:GetObject and s3:PutObject on its objects (see docs/aws.md); or use cache_bucket = \"auto\" or \"off\"", bucket, acct)
+		default:
+			return "", "", fmt.Errorf("checking cache bucket %s: HTTP %d", bucket, status)
 		}
-		if st/100 != 2 && !bytes.Contains(b, []byte("BucketAlreadyOwnedByYou")) {
-			return "", "", fmt.Errorf("creating cache bucket %s: HTTP %d: %s", bucket, st, firstLineOf(b))
+		_ = os.MkdirAll(a.dir, 0o700)
+		if auto {
+			_ = os.WriteFile(exists, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o600)
 		}
-	case status == 404:
-		return "", "", fmt.Errorf("cache bucket %s does not exist (create it, or use cache_bucket = \"auto\")", bucket)
-	case status == 403 && auto:
-		return "", "", fmt.Errorf("cache bucket %s: access denied: either the key lacks the S3 statement of spotexec's policy (re-run `spotexec setup` to refresh it), or another account owns a bucket by this name (name one of your own with cache_bucket, granting it as docs/aws.md shows); or set cache_bucket = \"off\"", bucket)
-	case status == 403:
-		// S3 says 403 both for a bucket another account owns and for one
-		// this key may not read; spotexec's policy only covers its own
-		// spotexec-cache-* buckets, so a named one needs its own grant.
-		return "", "", fmt.Errorf("cache bucket %s: access denied: either it isn't owned by account %s, or the key has no access to it. spotexec's policy only covers spotexec-cache-* buckets, so a bucket you name needs its own grant of s3:ListBucket on the bucket and s3:GetObject and s3:PutObject on its objects (see docs/aws.md); or use cache_bucket = \"auto\" or \"off\"", bucket, acct)
-	default:
-		return "", "", fmt.Errorf("checking cache bucket %s: HTTP %d", bucket, status)
 	}
 	if auto {
-		// (Re)apply the expiry rule until it has succeeded once.
-		lifecycle := []byte(`<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>spotexec-expire</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>14</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>`)
-		sum := md5.Sum(lifecycle)
-		hdr := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:]), "x-amz-expected-bucket-owner": acct}
-		st, b, err := a.s3Settled(ctx, http.MethodPut, bucket, "?lifecycle", lifecycle, hdr)
-		if err != nil {
-			return "", "", err
-		}
-		if st/100 != 2 {
-			return "", "", fmt.Errorf("setting cache expiry on %s: HTTP %d: %s", bucket, st, firstLineOf(b))
+		if st := a.setCacheRule(ctx, bucket, acct); st/100 != 2 {
+			if st == http.StatusNotFound {
+				// The bucket is gone since: check (and create) it again.
+				_ = os.Remove(exists)
+			}
+			return bucket, acct, nil // the rule is tried again next time
 		}
 	}
 	_ = os.MkdirAll(a.dir, 0o700)
 	_ = os.WriteFile(marker, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o600)
+	_ = os.Remove(exists)
 	return bucket, acct, nil
+}
+
+// setCacheRule applies the cache bucket's 14-day expiry rule, returning
+// S3's status (0: no answer). It gets its own timeout, so a region that is
+// slow to reach doesn't spend the signing's budget on it.
+func (a *AWSSpot) setCacheRule(ctx context.Context, bucket, acct string) int {
+	ctx, cancel := context.WithTimeout(ctx, cacheRuleTimeout)
+	defer cancel()
+	lifecycle := []byte(`<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>spotexec-expire</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>14</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>`)
+	sum := md5.Sum(lifecycle)
+	hdr := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:]), "x-amz-expected-bucket-owner": acct}
+	st, _, err := a.s3Settled(ctx, http.MethodPut, bucket, "?lifecycle", lifecycle, hdr)
+	if err != nil {
+		return 0
+	}
+	return st
 }
 
 // cacheBucket names the region's cache bucket and the account that must

@@ -1518,14 +1518,16 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 		image = crun.Image
 	}
 	// Shared cache: sign URLs for the key the runner will compute. Any
-	// failure just means installing without the cache.
+	// failure just means installing without the cache, and says why.
 	// The cache lives in the instance's own region (multi-region fleets).
 	var resign func(context.Context) (string, string, error)
-	if dc, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.DepsCache); ok {
+	if dc := depsCacheFor(ctx, o, r, lease.Provider, lease.InstanceID); dc != nil {
 		key, err := depskey.Key(ws.Root, depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Image: image, Toolchain: req.Toolchain, OS: s.Hello.OS, Arch: s.Hello.Arch})
-		if err == nil {
+		if err != nil {
+			o.Rep.Warn("DEPS_CACHE", "shared dependency cache unavailable: computing its key: %v", err)
+		} else {
 			sign := func(ctx context.Context) (string, string, error) {
-				cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				cctx, cancel := context.WithTimeout(ctx, depsCacheTimeout)
 				defer cancel()
 				return dc.CacheURLs(cctx, ws.RepoID, key)
 			}
@@ -1538,7 +1540,9 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 			}
 		}
 	}
+	cacheErr := depsCacheErrors(o)
 	onEvent := func(ev protocol.Event) {
+		cacheErr(ev)
 		if s.OnEvent != nil {
 			s.OnEvent(ev) // records interruption notices for the pre-exec check
 		} else {
@@ -1588,6 +1592,51 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	return dr, nil
 }
 
+// depsCacheTimeout bounds finding the VM's region and signing the shared
+// dependency cache's URLs.
+const depsCacheTimeout = 20 * time.Second
+
+// depsCacheFor is the shared dependency cache in the instance's own region
+// (nil: none, or turned off with cache_bucket). A multi-region fleet that
+// can't tell the instance's region offers none, and the run says why
+// (#228) instead of installing without the cache unannounced.
+func depsCacheFor(ctx context.Context, o Options, r *config.Runner, p provider.Provider, instanceID string) provider.DepsCache {
+	switch r.CacheBucket {
+	case "off", "none", "false":
+		return nil
+	}
+	if pl, ok := p.(provider.Placed); ok && instanceID != "" {
+		cctx, cancel := context.WithTimeout(ctx, depsCacheTimeout)
+		q, err := pl.For(cctx, instanceID)
+		cancel()
+		if err != nil || q == nil {
+			if err == nil {
+				err = errors.New("no provider serves it")
+			}
+			o.Rep.Warn("DEPS_CACHE", "shared dependency cache unavailable: finding the region of %s: %v", instanceID, err)
+			return nil
+		}
+		p = q
+	}
+	dc, _ := p.(provider.DepsCache)
+	return dc
+}
+
+// depsCacheErrors turns the first deps_cache_error the helper reports (the
+// VM couldn't download or upload the shared cache's archive) into a
+// DEPS_CACHE warning, which the run's record keeps (#217): the event alone
+// is only shown.
+func depsCacheErrors(o Options) func(protocol.Event) {
+	warned := false
+	return func(ev protocol.Event) {
+		if ev.Name != "deps_cache_error" || warned {
+			return
+		}
+		warned = true
+		o.Rep.Warn("DEPS_CACHE", "the VM couldn't use the shared dependency cache: %s", ev.Message)
+	}
+}
+
 // fetchDeps sends the deps request. With a shared cache, which may lack
 // this key, of the runs on this machine needing it now (the parts of a
 // task, concurrent commands) one installs it and uploads it, and the rest
@@ -1624,7 +1673,13 @@ func fetchDeps(ctx context.Context, c rpc, onEvent func(protocol.Event), o Optio
 		},
 		build: func(ctx context.Context) error {
 			if resign != nil && time.Since(signed) > resignAfter {
-				if get, put, err := resign(ctx); err == nil && get != "" {
+				get, put, err := resign(ctx)
+				switch {
+				case err != nil:
+					// The URLs signed before may have expired: a restore then
+					// misses, and an upload fails.
+					o.Rep.Warn("DEPS_CACHE", "signing fresh shared dependency cache URLs failed (using those signed %s ago): %v", ui.Dur(time.Since(signed)), err)
+				case get != "":
 					req.CacheGet, req.CachePut = get, put
 				}
 			}
