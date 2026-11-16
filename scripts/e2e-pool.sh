@@ -55,6 +55,14 @@ bootstrap_script = """
 echo boot-step-one; sleep 6
 echo boot-step-two; sleep 6
 """
+[runners.${RUNNER}r]
+type = "sim"
+max_instances = 4
+max_slots = 1
+idle_timeout = "3m"
+boot_timeout = "15s"
+boot_delay = "1s"
+priority = 60
 EOF
 
 count() { docker ps -q --filter "label=spotexec-runner=$RUNNER" | wc -l | tr -d ' '; }
@@ -62,7 +70,7 @@ countb() { docker ps -q --filter "label=spotexec-runner=${RUNNER}b" | wc -l | tr
 countx() { docker ps -q --filter "label=spotexec-runner=${RUNNER}x" | wc -l | tr -d ' '; }
 cleanup() {
   # One filter per command: Docker ANDs repeated label filters.
-  for r in "$RUNNER" "${RUNNER}b" "${RUNNER}x" "${RUNNER}l" "${RUNNER}s"; do
+  for r in "$RUNNER" "${RUNNER}b" "${RUNNER}x" "${RUNNER}l" "${RUNNER}s" "${RUNNER}r"; do
     docker ps -q --filter "label=spotexec-runner=$r" | xargs -r docker rm -f >/dev/null 2>&1
   done
   return 0
@@ -327,6 +335,31 @@ check "the other machine, with no VM, fails at once (exit 125)" "[ $code = 125 ]
 check "and says who holds the quota" "grep -q '4 of 4 vCPUs in use: 4 by owner ' $WORK/mb.err"
 wait $P
 check "the first machine's run was unaffected" "grep -q a-done $WORK/ma.out"
+
+echo "== a region the client can't reach: launches move elsewhere, and come back once it answers (#225)"
+export SPOTEXEC_SIM_REGIONS=sim-a,sim-b
+RR=${RUNNER}r
+region() { docker inspect -f '{{index .Config.Labels "spotexec-region"}}' "$1" 2>/dev/null; }
+regions() { docker ps --filter "label=spotexec-runner=$RR" --format '{{.Label "spotexec-region"}}' | sort | tr '\n' ' '; }
+"$SX" sim network "$RR" sim-a down >/dev/null
+SPOTEXEC_POOL=$RR "$SX" --json 'echo served' >"$WORK/u1.out" 2>"$WORK/u1.err"; code=$?
+U1=$(placed "$WORK/u1.err")
+check "the job ran, on a VM in sim-b (${U1:-none})" "[ $code = 0 ] && grep -q served $WORK/u1.out && [ \"\$(region \"$U1\")\" = sim-b ]"
+check "its first launch, into sim-a, is still running but was never used (regions: $(regions))" "[ \"\$(regions)\" = 'sim-a sim-b ' ]"
+"$SX" status "$RR" >"$WORK/u-status.out" 2>&1
+check "status says sim-a takes no launches, and why" "grep -q \"$RR: no launches into sim-a: unreachable from this client\" $WORK/u-status.out && grep -q 'never answered SSH' $WORK/u-status.out"
+for i in 1 2; do SPOTEXEC_POOL=$RR "$SX" --json "sleep 4; echo busy$i" >"$WORK/u2$i.out" 2>"$WORK/u2$i.err" & done; wait
+check "with sim-a still held, the next launch goes to sim-b too (regions: $(regions))" "[ \$(cat $WORK/u2*.out | grep -c '^busy') = 2 ] && [ \"\$(regions)\" = 'sim-a sim-b sim-b ' ]"
+"$SX" sim network "$RR" sim-a up >/dev/null
+sleep 32 # the sim-a VM's 30s suspect window: probed again from here
+SPOTEXEC_POOL=$RR "$SX" --json 'echo back' >"$WORK/u3.out" 2>"$WORK/u3.err"
+U3=$(placed "$WORK/u3.err")
+check "sim-a answers again: a job runs there (${U3:-none})" "grep -q back $WORK/u3.out && [ \"\$(region \"$U3\")\" = sim-a ]"
+"$SX" status "$RR" >"$WORK/u-status2.out" 2>&1
+check "and its hold is gone" "! grep -q 'no launches into sim-a' $WORK/u-status2.out"
+for i in 1 2 3 4; do SPOTEXEC_POOL=$RR "$SX" --json "sleep 6; echo again$i" >"$WORK/u4$i.out" 2>"$WORK/u4$i.err" & done; wait
+check "with every VM busy, a new launch goes to sim-a again (regions: $(regions))" "[ \$(cat $WORK/u4*.out | grep -c '^again') = 4 ] && [ \"\$(regions)\" = 'sim-a sim-a sim-b sim-b ' ]"
+unset SPOTEXEC_SIM_REGIONS
 
 echo
 echo "passed: $PASS  failed: $FAIL"

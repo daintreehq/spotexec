@@ -574,6 +574,11 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 					// not capacity a waiting agent can count on.
 					continue
 				}
+				if listed[l.InstanceID] && p.lostVM(st, l.InstanceID, time.Now()) {
+					// Never reached, in a region this client can't reach: it
+					// won't serve, so another launch (elsewhere) may.
+					continue
+				}
 			}
 			if l.InstanceID == "" || !listed[l.InstanceID] {
 				usable++

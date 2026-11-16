@@ -135,6 +135,21 @@ func (p *Pool) silentRegion(st *poolState, region string, now time.Time) string 
 // served, which notes from before Reached existed only say this way).
 func (n *note) reached() bool { return n != nil && (n.Ready || !n.Reached.IsZero()) }
 
+// lostVM reports whether a listed VM has never answered this client, past
+// boot_timeout, in a region held as unreachable.
+func (p *Pool) lostVM(st *poolState, id string, now time.Time) bool {
+	for _, in := range st.Instances {
+		if in.ID != id {
+			continue
+		}
+		n := st.Notes[id]
+		at, held := st.Held[in.Region]
+		return in.Region != "" && held && now.Sub(at) <= reapAfter && n != nil && !n.reached() && n.Failures >= 2 &&
+			now.Sub(in.LaunchedAt) >= p.R.BootTimeout.Duration
+	}
+	return false
+}
+
 // reapable returns a VM to end, and its region, so a fleet at
 // max_instances can launch for waiting jobs: a VM past boot_timeout, in a
 // region this client holds as unreachable, that failed its last probes
