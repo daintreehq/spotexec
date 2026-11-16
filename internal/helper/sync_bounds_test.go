@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"io"
 	"path/filepath"
 	"reflect"
@@ -116,5 +117,90 @@ func TestAddTarSkipsAVanishedFile(t *testing.T) {
 	}
 	if _, err := tar.NewReader(&buf).Next(); err != io.EOF {
 		t.Fatalf("an entry for a vanished file (%v)", err)
+	}
+}
+
+// hookWriter runs onHeader once, after the tar header has been written.
+type hookWriter struct {
+	w        io.Writer
+	onHeader func()
+}
+
+func (h *hookWriter) Write(p []byte) (int, error) {
+	n, err := h.w.Write(p)
+	if h.onHeader != nil {
+		h.onHeader()
+		h.onHeader = nil
+	}
+	return n, err
+}
+
+// addTar sends what the header says: a file that grows meanwhile is cut
+// there, one that shrinks fails the stream.
+func TestAddTarSendsWhatTheHeaderSays(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "f")
+	writeFile(t, filepath.Dir(p), "f", "original")
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&hookWriter{w: &buf, onHeader: func() { writeFile(t, filepath.Dir(p), "f", "original and more") }})
+	if err := addTar(tw, p, "f"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(&buf)
+	if _, err := tr.Next(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := io.ReadAll(tr); string(b) != "original" {
+		t.Fatalf("sent %q", b)
+	}
+	tw = tar.NewWriter(&hookWriter{w: io.Discard, onHeader: func() { writeFile(t, filepath.Dir(p), "f", "o") }})
+	if err := addTar(tw, p, "f"); err == nil || !strings.Contains(err.Error(), "shrank") {
+		t.Fatalf("shrunk file: got %v", err)
+	}
+}
+
+// extract checks the gzip trailer, and refuses data after the archive
+// rather than decompressing it.
+func TestExtractChecksTheWholeStream(t *testing.T) {
+	archive := func(tail []byte) []byte {
+		var raw bytes.Buffer
+		tw := tar.NewWriter(&raw)
+		if err := tw.WriteHeader(&tar.Header{Name: "a", Typeflag: tar.TypeReg, Size: 1, Mode: 0o644}); err != nil {
+			t.Fatal(err)
+		}
+		tw.Write([]byte("x"))
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		raw.Write(tail)
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		zw.Write(raw.Bytes())
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	run := func(b []byte) error {
+		s := testSession(t, t.TempDir())
+		if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+			t.Fatal(err)
+		}
+		s.loadStored()
+		_, _, _, err := s.extract(bytes.NewReader(b), map[string]bool{"a": true}, nil)
+		return err
+	}
+	if err := run(archive(nil)); err != nil {
+		t.Fatalf("intact: %v", err)
+	}
+	bad := archive(nil)
+	bad[len(bad)-8] ^= 0xff
+	if err := run(bad); !errors.Is(err, gzip.ErrChecksum) {
+		t.Fatalf("bad CRC: got %v", err)
+	}
+	if err := run(archive(make([]byte, 1<<20))); err == nil || !strings.Contains(err.Error(), "after the end") {
+		t.Fatalf("trailing data: got %v", err)
 	}
 }

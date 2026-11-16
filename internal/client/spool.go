@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
@@ -18,13 +19,17 @@ import (
 // spool keeps fetched files on disk, not in memory, until they are applied:
 // a write-back or pull can be far larger than the memory this process has.
 type spool struct {
-	dir string
-	n   int
+	dir  string
+	lock *os.File // held while the spool is in use: pruneSpools passes it by
+	n    int
 }
 
-// spoolMaxAge is how old a spool left behind by a killed process must be
-// before a later one removes it (no transfer runs that long).
-const spoolMaxAge = 24 * time.Hour
+// spoolLock is the file in each spool its owner holds locked.
+const spoolLock = "lock"
+
+// spoolMinAge is how old an unlocked spool must be before another process
+// removes it: one just made may not hold its lock yet.
+const spoolMinAge = time.Hour
 
 // newSpool makes a private spool in ws's spotexec state, next to the
 // worktree rather than in a system temp directory that may be memory-backed.
@@ -39,13 +44,37 @@ func newSpool(ws *Workspace) (*spool, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &spool{dir: dir}, nil
+	lock, ok := lockSpool(dir)
+	if !ok {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("can't lock the spool in %s", dir)
+	}
+	return &spool{dir: dir, lock: lock}, nil
 }
 
 // Close removes the spool and everything in it.
-func (s *spool) Close() error { return os.RemoveAll(s.dir) }
+func (s *spool) Close() error {
+	err := os.RemoveAll(s.dir)
+	s.lock.Close()
+	return err
+}
 
-// pruneSpools removes spools a killed process left behind.
+// lockSpool takes dir's spool lock without waiting; ok is false when another
+// process holds it.
+func lockSpool(dir string) (*os.File, bool) {
+	f, err := os.OpenFile(filepath.Join(dir, spoolLock), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, false
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, false
+	}
+	return f, true
+}
+
+// pruneSpools removes spools a killed process left behind: old, and no
+// longer locked by their owner, however long its transfer has run.
 func pruneSpools(base string, now time.Time) {
 	ents, err := os.ReadDir(base)
 	if err != nil {
@@ -55,8 +84,13 @@ func pruneSpools(base string, now time.Time) {
 		if !strings.HasPrefix(e.Name(), "fetch-") {
 			continue
 		}
-		if fi, err := e.Info(); err == nil && now.Sub(fi.ModTime()) > spoolMaxAge {
-			_ = os.RemoveAll(filepath.Join(base, e.Name()))
+		if fi, err := e.Info(); err != nil || now.Sub(fi.ModTime()) < spoolMinAge {
+			continue
+		}
+		dir := filepath.Join(base, e.Name())
+		if f, ok := lockSpool(dir); ok {
+			_ = os.RemoveAll(dir)
+			f.Close()
 		}
 	}
 }

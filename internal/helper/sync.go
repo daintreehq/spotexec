@@ -260,6 +260,7 @@ func (s *Session) extract(r io.Reader, needSet map[string]bool, want map[string]
 		return 0, 0, nil, err
 	}
 	defer zr.Close()
+	zr.Multistream(false) // the client writes one gzip member
 	tr := tar.NewReader(zr)
 	written := 0
 	var bytes int64
@@ -299,9 +300,13 @@ func (s *Session) extract(r io.Reader, needSet map[string]bool, want map[string]
 		bytes += h.Size
 	}
 	// The tar ends before the gzip trailer is read: reading on to the end
-	// is what checks the stream's CRC and length.
-	if _, err := io.Copy(io.Discard, zr); err != nil {
+	// is what checks the stream's CRC and length. More than a little
+	// padding after the archive is refused rather than decompressed.
+	const maxTrailing = 64 << 10
+	if n, err := io.Copy(io.Discard, io.LimitReader(zr, maxTrailing+1)); err != nil {
 		return written, bytes, corrected, err
+	} else if n > maxTrailing {
+		return written, bytes, corrected, errors.New("unexpected data after the end of the archive")
 	}
 	return written, bytes, corrected, zr.Close()
 }

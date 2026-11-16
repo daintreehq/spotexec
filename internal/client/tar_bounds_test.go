@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/manifest"
@@ -114,7 +115,38 @@ func TestReadTarReportsTheSendersError(t *testing.T) {
 	}
 }
 
+// A complete gzip stream holding half a tar, then the helper's error: the
+// tar reader's unexpected EOF gives way to the helper's message.
+func TestReadTarPrefersTheSendersErrorToATruncatedTar(t *testing.T) {
+	whole := rawTar(t, []tarEntry{{"a", strings.Repeat("x", 4096)}})
+	half := gz(t, whole[:1024]) // the header and part of the body
+	_, err := readAll(t, blobOf(t, half, errors.New("read slot/a: input/output error")), 0)
+	if err == nil || !strings.Contains(err.Error(), "input/output error") {
+		t.Fatalf("got %v, want the helper's error", err)
+	}
+	// Without a sender error, the truncation itself is the error.
+	if _, err := readAll(t, blobOf(t, half, nil), 0); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("got %v, want unexpected EOF", err)
+	}
+}
+
+// tripwire counts reads that reach it.
+type tripwire struct{ reads int }
+
+func (w *tripwire) Read([]byte) (int, error) { w.reads++; return 0, io.EOF }
+
 func TestReadTarRefusesMoreThanItsLimit(t *testing.T) {
+	// Over the cap, nothing more is read from the sender: a live one could
+	// keep sending forever.
+	bomb := gz(t, rawTar(t, []tarEntry{{"zeros", string(make([]byte, 64<<20))}}))
+	trip := &tripwire{}
+	if err := readTar(io.MultiReader(bytes.NewReader(bomb), trip), 1<<20, func(*tar.Header, io.Reader) error { return nil }); !errors.Is(err, errArchiveTooLarge) {
+		t.Fatalf("got %v, want errArchiveTooLarge", err)
+	}
+	if trip.reads != 0 {
+		t.Fatal("read on past the cap")
+	}
+
 	big := gz(t, rawTar(t, []tarEntry{{name: "skipped", data: strings.Repeat("0", 4<<20)}}))
 	calls := 0
 	err := readTar(bytes.NewReader(big), 1<<20, func(*tar.Header, io.Reader) error {
@@ -131,23 +163,76 @@ func TestReadTarRefusesMoreThanItsLimit(t *testing.T) {
 	}
 }
 
-// A runner that reports a 1-byte file and sends a big one fails the
-// write-back before reading the file, and leaves no spool behind.
+// A runner that reports a 1-byte file and sends a bigger one fails the
+// write-back on that file (well inside the archive's cap), before reading it,
+// and leaves no spool behind.
 func TestWritebackRefusesAFileLargerThanReported(t *testing.T) {
 	dir := gitRepo(t, map[string]string{"src/a.go": "package a\n"})
 	ws := &Workspace{Root: dir, Git: true, GitDir: filepath.Join(dir, ".git")}
 	m := manifestOf(t, dir)
-	big := strings.Repeat("A", 8<<20)
 	r := protocol.Result{Created: []protocol.Entry{{Path: "bomb.bin", ID: fsid.Bytes([]byte("x")), Mode: fsid.ModeFile, Size: 1}}}
-	fetch := func(protocol.Fetch) (io.Reader, error) { return tarOf(t, map[string]string{"bomb.bin": big}), nil }
+	fetch := func(protocol.Fetch) (io.Reader, error) {
+		return tarOf(t, map[string]string{"bomb.bin": strings.Repeat("A", 100<<10)}), nil
+	}
 	_, err := writeback(context.Background(), fetch, ws, m, r, "run1", map[string]bool{}, nil, WritebackLimits{}, &recordingReporter{})
-	if err == nil || !strings.Contains(err.Error(), "larger than the") {
-		t.Fatalf("got %v, want a size refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "larger than the 1 B it reported") || errors.Is(err, errArchiveTooLarge) {
+		t.Fatalf("got %v, want the per-file size refusal", err)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, "bomb.bin")); !os.IsNotExist(err) {
 		t.Fatalf("bomb.bin was written (%v)", err)
 	}
 	assertNoSpools(t, ws)
+}
+
+// A write-back archive that sends one path twice fails and applies nothing.
+func TestWritebackRefusesARepeatedPath(t *testing.T) {
+	dir := gitRepo(t, map[string]string{"src/a.go": "package a\n"})
+	ws := &Workspace{Root: dir, Git: true, GitDir: filepath.Join(dir, ".git")}
+	m := manifestOf(t, dir)
+	r := protocol.Result{Created: []protocol.Entry{entry("gen/a", "one"), entry("gen/b", "two")}}
+	fetch := func(protocol.Fetch) (io.Reader, error) {
+		return bytes.NewReader(gz(t, rawTar(t, []tarEntry{{"gen/a", "one"}, {"gen/a", "two"}}))), nil
+	}
+	wb, err := writeback(context.Background(), fetch, ws, m, r, "run1", map[string]bool{}, nil, WritebackLimits{}, &recordingReporter{})
+	if err == nil || !strings.Contains(err.Error(), "twice") {
+		t.Fatalf("got %v, want a repeated-path refusal", err)
+	}
+	if len(wb.Applied) != 0 {
+		t.Fatalf("applied %v", wb.Applied)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "gen")); !os.IsNotExist(err) {
+		t.Fatalf("gen/ was written (%v)", err)
+	}
+	assertNoSpools(t, ws)
+}
+
+// A spool still locked by its owner is never pruned, however old; one whose
+// owner is gone is, once old.
+func TestPruneSpoolsKeepsALiveSpool(t *testing.T) {
+	ws := &Workspace{Root: t.TempDir(), GitDir: t.TempDir()}
+	live, err := newSpool(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	dead, err := newSpool(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead.lock.Close() // its process was killed
+	old := time.Now().Add(-48 * time.Hour)
+	for _, d := range []string{live.dir, dead.dir} {
+		if err := os.Chtimes(d, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneSpools(filepath.Dir(live.dir), time.Now())
+	if _, err := os.Stat(live.dir); err != nil {
+		t.Fatalf("live spool pruned: %v", err)
+	}
+	if _, err := os.Stat(dead.dir); !os.IsNotExist(err) {
+		t.Fatalf("abandoned spool kept (%v)", err)
+	}
 }
 
 // A write-back that fetches files spools them on disk, applies them, and
@@ -210,6 +295,48 @@ func TestPullAppliesOnlyAVerifiedArchive(t *testing.T) {
 		t.Errorf("out/a = %q, want the first copy", b)
 	}
 	assertNoSpools(t, ws)
+}
+
+// hookWriter runs onHeader once, after the tar header has been written.
+type hookWriter struct {
+	w        io.Writer
+	onHeader func()
+}
+
+func (h *hookWriter) Write(p []byte) (int, error) {
+	n, err := h.w.Write(p)
+	if h.onHeader != nil {
+		h.onHeader()
+		h.onHeader = nil
+	}
+	return n, err
+}
+
+// A file that grows after its header is sent is cut at the header's size
+// (and hashed as sent); one that shrinks fails, as a re-run.
+func TestAddLocalTarSendsWhatTheHeaderSays(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "f")
+	if err := os.WriteFile(p, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&hookWriter{w: &buf, onHeader: func() {
+		f, _ := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
+		f.WriteString(" and more")
+		f.Close()
+	}})
+	e, err := addLocalTar(tw, p, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.ID != fsid.Bytes([]byte("original")) || e.Size != 8 {
+		t.Fatalf("entry %+v, want the 8 bytes sent", e)
+	}
+	tw = tar.NewWriter(&hookWriter{w: io.Discard, onHeader: func() { os.Truncate(p, 3) }})
+	if _, err := addLocalTar(tw, p, "f"); err == nil || !strings.Contains(err.Error(), "re-run") {
+		t.Fatalf("shrunk file: got %v", err)
+	}
 }
 
 // addLocalTar streams a file and returns the entry for exactly the bytes in

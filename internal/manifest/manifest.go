@@ -47,7 +47,7 @@ var BuiltinExcludes = []string{
 // project's .spotexec/ (write-back lock, stashed conflicts, backups), a
 // nested project's included. It is matched case-insensitively, as macOS and
 // Windows filesystems resolve it.
-var NeverSync = append(append([]string{}, config.CredentialDirs...), "**/.spotexec/conflicts/", "**/.spotexec/backup/", "**/.spotexec/writeback.lock")
+var NeverSync = append(append([]string{}, config.CredentialDirs...), "**/.spotexec/conflicts/", "**/.spotexec/backup/", "**/.spotexec/spool/", "**/.spotexec/writeback.lock")
 
 var textAttr = regexp.MustCompile(`(^|\s)-?(text|crlf)(=|\s|$)`)
 

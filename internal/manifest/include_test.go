@@ -88,7 +88,7 @@ func TestSpotexecDirSyncsExceptState(t *testing.T) {
 	files := []string{
 		"src/a.txt", ".spotexec/prep.sh", ".spotexec/lib/helper.sh",
 		".spotexec/conflicts/run1/src/a.txt", ".spotexec/backup/run1/src/a.txt", ".spotexec/writeback.lock",
-		".SpotExec/Backup/run2/b.txt",
+		".SpotExec/Backup/run2/b.txt", ".spotexec/spool/fetch-1/1", "sub/.spotexec/spool/fetch-2/lock",
 		"sub/.spotexec/prep.sh", "sub/.spotexec/backup/run1/x", "sub/.spotexec/conflicts/run1/x", "sub/.spotexec/writeback.lock",
 	}
 	want := ".spotexec/lib/helper.sh .spotexec/prep.sh src/a.txt sub/.spotexec/prep.sh"

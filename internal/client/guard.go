@@ -33,7 +33,7 @@ func reservedPath(p string, git bool) bool {
 	if git || !strings.EqualFold(segs[0], ".spotexec") {
 		return false
 	}
-	return len(segs) == 1 || strings.EqualFold(segs[1], "conflicts") || strings.EqualFold(segs[1], "backup") || strings.EqualFold(segs[1], "writeback.lock")
+	return len(segs) == 1 || strings.EqualFold(segs[1], "conflicts") || strings.EqualFold(segs[1], "backup") || strings.EqualFold(segs[1], "spool") || strings.EqualFold(segs[1], "writeback.lock")
 }
 
 // spotexecConfigPath reports whether p is spotexec's own configuration, at
