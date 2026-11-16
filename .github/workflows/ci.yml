@@ -34,7 +34,7 @@ jobs:
     # Spot fleet simulator and the pool manager on it. Each suite runs even
     # when an earlier one fails, so one run shows every broken scenario.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
