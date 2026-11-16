@@ -185,7 +185,7 @@ func browserLibs(deps []browserDep) (body, note string) {
 	}
 	var tools, manifests []string
 	declared := map[string][]string{}
-	electron := false
+	electron, puppeteer := false, false
 	for _, d := range deps {
 		tools = append(tools, d.tool)
 		if declared[d.manifest] == nil {
@@ -201,6 +201,7 @@ func browserLibs(deps []browserDep) (body, note string) {
 		case "Playwright":
 			add(playwrightPkgs)
 		case "Puppeteer":
+			puppeteer = true
 			add(chromePkgs)
 		}
 	}
@@ -240,10 +241,19 @@ func browserLibs(deps []browserDep) (body, note string) {
 		line += " " + p
 	}
 	b.WriteString(line + " \\\n && rm -rf /var/lib/apt/lists/*\n")
+	if electron {
+		b.WriteString("\n# Chromium's sandbox needs user namespaces, which Docker doesn't give a\n# container, so an Electron window aborts without this (the container\n# isolates the run instead).\nENV ELECTRON_DISABLE_SANDBOX=1\n")
+	}
+	if puppeteer {
+		b.WriteString("\n# For the same reason, launch Puppeteer's Chrome with --no-sandbox:\n# puppeteer.launch({ args: ['--no-sandbox'] }).\n")
+	}
 
 	note = "added the system libraries " + need + " (" + strings.Join(why, "; ") + ")"
 	if electron {
-		note += "; run Electron tests that open a window under `xvfb-run -a`"
+		note += "; run Electron tests that open a window under `xvfb-run -a` (the image sets ELECTRON_DISABLE_SANDBOX=1)"
+	}
+	if puppeteer {
+		note += "; launch Puppeteer's Chrome with --no-sandbox"
 	}
 	return b.String(), note
 }

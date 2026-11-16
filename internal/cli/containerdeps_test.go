@@ -105,7 +105,8 @@ func TestBrowserLibs(t *testing.T) {
 			t.Errorf("Puppeteer: no %s in\n%s", want, body)
 		}
 	}
-	if p["xvfb"] || p["libgtk-4-1"] || note != "added the system libraries Puppeteer needs (package.json declares puppeteer)" {
+	if p["xvfb"] || p["libgtk-4-1"] || strings.Contains(body, "ELECTRON_DISABLE_SANDBOX") || !strings.Contains(body, "--no-sandbox") ||
+		note != "added the system libraries Puppeteer needs (package.json declares puppeteer); launch Puppeteer's Chrome with --no-sandbox" {
 		t.Errorf("Puppeteer: %q\n%s", note, body)
 	}
 
@@ -115,6 +116,9 @@ func TestBrowserLibs(t *testing.T) {
 		if !p[want] {
 			t.Errorf("Electron+Playwright: no %s in\n%s", want, body)
 		}
+	}
+	if !strings.Contains(body, "\nENV ELECTRON_DISABLE_SANDBOX=1\n") || strings.Contains(body, "--no-sandbox") {
+		t.Errorf("Electron+Playwright sandbox lines:\n%s", body)
 	}
 	if !strings.Contains(note, "Electron and Playwright need (apps/desktop/package.json declares electron and @playwright/test)") || !strings.Contains(note, "xvfb-run -a") {
 		t.Errorf("note: %q", note)
