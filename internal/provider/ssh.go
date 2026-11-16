@@ -75,9 +75,19 @@ func (s *SSH) Doctor(ctx context.Context) []Check {
 	return out
 }
 
-// pick returns the cached host, or settles on one. The dial runs unlocked so
-// a slow happyEyeballs doesn't hold up callers with their own contexts.
-func (s *SSH) pick(ctx context.Context) (Target, error) {
+func (s *SSH) pick(ctx context.Context) (Target, error) { return s.pickWith(ctx, s.selectHost) }
+
+// selectHost returns the index of the host to use.
+func (s *SSH) selectHost(ctx context.Context) (int, error) {
+	if len(s.r.Hosts) == 1 {
+		return 0, nil
+	}
+	return happyEyeballs(ctx, s.r.Hosts, s.r.SSHOptions, 500*time.Millisecond, 5*time.Second)
+}
+
+// pickWith returns the cached host, or settles on one with sel. sel runs
+// unlocked so a slow dial doesn't hold up callers with their own contexts.
+func (s *SSH) pickWith(ctx context.Context, sel func(context.Context) (int, error)) (Target, error) {
 	s.mu.Lock()
 	if s.chosen != nil {
 		t := *s.chosen
@@ -87,13 +97,9 @@ func (s *SSH) pick(ctx context.Context) (Target, error) {
 	gen := s.gen
 	s.mu.Unlock()
 
-	idx := 0
-	if len(s.r.Hosts) != 1 {
-		var err error
-		idx, err = happyEyeballs(ctx, s.r.Hosts, s.r.SSHOptions, 500*time.Millisecond, 5*time.Second)
-		if err != nil {
-			return Target{}, err
-		}
+	idx, err := sel(ctx)
+	if err != nil {
+		return Target{}, err
 	}
 	t := s.target(s.r.Hosts[idx])
 

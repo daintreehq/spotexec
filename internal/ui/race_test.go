@@ -29,10 +29,15 @@ func TestPrettyReporterEventsFileConcurrent(t *testing.T) {
 	if len(lines) != 2*n {
 		t.Fatalf("got %d event lines, want %d", len(lines), 2*n)
 	}
+	count := map[string]int{}
 	for _, l := range lines {
 		var m map[string]any
 		if err := json.Unmarshal([]byte(l), &m); err != nil {
 			t.Fatalf("bad event line %q: %v", l, err)
 		}
+		count[m["event"].(string)]++
+	}
+	if count["tick"] != n || count["warning"] != n {
+		t.Fatalf("event counts = %v, want %d of each", count, n)
 	}
 }
