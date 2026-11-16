@@ -136,11 +136,12 @@ func (s *Sim) List(ctx context.Context) ([]Instance, error) {
 		return nil, err
 	}
 	out, err := docker(ctx, "ps", "--filter", "label=spotexec-runner="+s.r.Name, "--filter", "label=spotexec-owner="+owner,
-		"--format", "{{.Names}}\t{{.Ports}}\t{{.Label \"spotexec-launched\"}}")
+		"--format", "{{.Names}}\t{{.Ports}}\t{{.Label \"spotexec-launched\"}}\t{{.Label \"spotexec-region\"}}")
 	if err != nil {
 		return nil, err
 	}
 	var res []Instance
+	cut := s.cutOff()
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		f := strings.Split(sc.Text(), "\t")
@@ -148,10 +149,16 @@ func (s *Sim) List(ctx context.Context) ([]Instance, error) {
 			continue
 		}
 		in := Instance{ID: f[0], State: StatePending, Type: "sim", Spot: true}
+		if len(f) > 3 {
+			in.Region = f[3]
+		}
 		if ms, err := strconv.ParseInt(f[2], 10, 64); err == nil {
 			in.LaunchedAt = time.UnixMilli(ms)
 		}
 		if port := mappedPort(f[1]); port > 0 {
+			if in.Region != "" && cut[in.Region] {
+				port = unreachableTarget // running, but this client can't reach it
+			}
 			in.State, in.Target = StateRunning, s.target(port)
 		}
 		res = append(res, in)
@@ -265,11 +272,25 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 	if err != nil {
 		return Instance{}, err
 	}
+	// Simulated regions: the first one this client hasn't been held out of.
+	region := ""
+	if regions := simRegions(); len(regions) > 0 {
+		var perr error
+		if err := s.withHolds(func(m map[string]cooldown) {
+			region, perr = simPickRegion(m, regions, time.Now(), trialFor(s.r.BootTimeout.Duration))
+		}); err != nil {
+			return Instance{}, err
+		}
+		if perr != nil {
+			return Instance{}, perr
+		}
+	}
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	name := "sx-" + s.r.Name + "-" + hex.EncodeToString(b[:])
 	_, err = docker(ctx, "run", "-d", "--rm", "--name", name,
 		"--label", "spotexec-runner="+s.r.Name, "--label", "spotexec-owner="+owner, "--label", "spotexec-sim-account="+simAccount(),
+		"--label", "spotexec-region="+region,
 		"--label", "spotexec-launched="+strconv.FormatInt(time.Now().UnixMilli(), 10),
 		"-e", "BOOT_DELAY="+strconv.FormatFloat(s.r.BootDelay.Seconds(), 'f', 1, 64),
 		"-e", "USER_DATA_B64="+base64.StdEncoding.EncodeToString([]byte(ud)),
@@ -279,9 +300,13 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 		return Instance{}, err
 	}
 	if log != nil {
-		log("launched simulated instance %s", name)
+		if region != "" {
+			log("launched simulated instance %s in %s", name, region)
+		} else {
+			log("launched simulated instance %s", name)
+		}
 	}
-	return Instance{ID: name, State: StatePending, Type: "sim", LaunchedAt: time.Now(), Spot: true}, nil
+	return Instance{ID: name, State: StatePending, Type: "sim", LaunchedAt: time.Now(), Spot: true, Region: region}, nil
 }
 
 // WaitRunning waits for the container's SSH port mapping.

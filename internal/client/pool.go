@@ -62,6 +62,9 @@ type note struct {
 	// never placed on again, and not capacity, though the VM itself may
 	// not have agreed to drain yet.
 	Retiring bool `json:"retiring,omitempty"`
+	// Reached: when the VM last answered this client (any reply, even
+	// booting or draining). Ready says it once served.
+	Reached time.Time `json:"reached,omitempty"`
 }
 
 // closed reports whether an instance takes no new runs and isn't capacity:
@@ -97,6 +100,9 @@ type poolState struct {
 	// The requirements (provider.MatchKey) the notes' Mismatch reasons
 	// were judged against.
 	MatchKey string `json:"match_key,omitempty"`
+	// Held: regions this client found it can't reach, and when it last
+	// asked the fleet to hold launches out of them (reach.go).
+	Held map[string]time.Time `json:"held,omitempty"`
 	// Sched: the reservation ledger and placement policy (sched.go). Kept
 	// in its own file, sched.json, under the same lock: a binary from
 	// before it would otherwise drop it whenever it rewrote pool.json.
@@ -470,31 +476,36 @@ const (
 	outSkipped
 )
 
-// Observe records a probe result.
+// Observe records a probe result, and holds launches out of the VM's
+// region when it shows the client can't reach the region (or ends that
+// hold when the VM answered).
 func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 	if o == outSkipped {
 		return
 	}
+	var reach regionReach
 	_ = p.with(func(st *poolState) error {
 		n := st.note(id)
 		now := time.Now()
 		switch o {
 		case OutAcquired:
 			n.markReady(now)
-			n.LastUsed, n.SuspectUntil, n.Failures = now, time.Time{}, 0
+			n.LastUsed, n.SuspectUntil, n.Failures, n.Reached = now, time.Time{}, 0, now
 		case OutBusy:
 			n.markReady(now)
 			n.SawFull = true
-			n.BusyUntil, n.SuspectUntil, n.Failures = now.Add(busyHintFor), time.Time{}, 0
+			n.BusyUntil, n.SuspectUntil, n.Failures, n.Reached = now.Add(busyHintFor), time.Time{}, 0, now
 		case OutDraining:
 			n.Draining = true
 		case OutBootFailed:
 			n.Draining, n.BootFailed = true, true
+			n.Failures, n.Reached = 0, now
 			if n.BootFailedAt.IsZero() {
 				n.BootFailedAt = now
 			}
 		case OutBooting:
 			n.BusyUntil = now.Add(2 * time.Second)
+			n.Failures, n.Reached = 0, now
 		case OutUnreachable:
 			// A young instance is probably still booting sshd; an older one is
 			// suspect (but still counts toward capacity: unreachable is not
@@ -506,8 +517,10 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 				n.SuspectUntil = now.Add(suspectFor)
 			}
 		}
+		reach = p.judgeRegion(st, id, o, now)
 		return nil
 	})
+	p.applyReach(reach)
 }
 
 // LaunchDecision is returned by Plan.
@@ -523,6 +536,9 @@ type LaunchDecision struct {
 	// every Spot price) blocks launches: the fleet can only serve from the
 	// VMs it already has.
 	QuotaErr string
+	// Reap: VMs to terminate before a launch can make room under
+	// max_instances: they are in a region this client can't reach.
+	Reap []string
 }
 
 // Plan decides, under the pool lock, whether this process should launch one
@@ -598,6 +614,10 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = "waiting for instances being launched"
 		case !p.R.BelowMax(usable):
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
+			if id, region := p.reapable(st, time.Now()); id != "" {
+				d.Reap = []string{id}
+				d.Reason += fmt.Sprintf("; ending %s, in %s, which this client can't reach, to make room", id, region)
+			}
 		case p.R.Capped() && total >= 2*p.R.MaxInstances:
 			d.Reason = liveCapReason(st, p.R.MaxInstances)
 		case d.QuotaErr != "":

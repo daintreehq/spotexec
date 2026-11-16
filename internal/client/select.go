@@ -326,6 +326,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				for _, c := range fleetCands[m] {
 					in := c.Instance
 					lease, holders, out := m.probeInstance(ctx, req, c, deadline)
+					if out == OutUnreachable && ctx.Err() != nil {
+						out = outSkipped // a cancelled probe proves nothing about the VM
+					}
 					if !(out == OutBusy && req.Base.Exclusive) {
 						// An exclusive probe finding a partly busy instance must
 						// not hide its free slots from everyone else.
@@ -448,6 +451,18 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			if err != nil {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
+			}
+			for _, id := range d.Reap {
+				// At max_instances with VMs this client can't reach: end one,
+				// so the next round launches where it can. Marked draining
+				// only once the request succeeded, so a failed attempt is
+				// retried by the next round.
+				req.Rep.Warn("VM_UNREACHABLE", "%s: %s", m.r.Name, d.Reason)
+				tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				if err := m.pool.Fleet.Terminate(tctx, id); err == nil {
+					m.pool.Observe(id, OutDraining, time.Time{})
+				}
+				cancel()
 			}
 			if d.Live == 0 && d.Pending == 0 {
 				// No VM to wait for, and none will be launched.

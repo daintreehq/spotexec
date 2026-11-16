@@ -83,7 +83,10 @@ type runnerStatus struct {
 	// and why.
 	Role       string `json:"role,omitempty"`
 	RoleReason string `json:"role_reason,omitempty"`
-	r          *config.Runner
+	// LaunchHolds: the regions a fleet launches nothing into for now, and
+	// why (on the fleet's first row).
+	LaunchHolds map[string]provider.RegionHold `json:"launch_holds,omitempty"`
+	r           *config.Runner
 	// reclaimed records a Spot interruption notice the VM reports.
 	reclaimed func()
 }
@@ -218,6 +221,7 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, Error: err.Error(), r: r, Info: provider.Info{State: provider.StateUnknown}})
 				continue
 			}
+			first := len(rows)
 			if len(insts) == 0 {
 				detail := "0 instances; scales on demand"
 				if r.Capped() {
@@ -240,6 +244,11 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 					st.reclaimed = func() { rc.Reclaimed(in) }
 				}
 				rows = append(rows, st)
+			}
+			if rh, ok := f.(provider.RegionHolder); ok && len(rows) > first {
+				if holds, _ := rh.RegionHolds(); len(holds) > 0 {
+					rows[first].LaunchHolds = holds
+				}
 			}
 			continue
 		}
@@ -353,6 +362,14 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 	}
 	tw.Flush()
 	for _, s := range sts {
+		var held []string
+		for rg := range s.LaunchHolds {
+			held = append(held, rg)
+		}
+		sort.Strings(held)
+		for _, rg := range held {
+			fmt.Fprintf(w, "  %s: no launches into %s: %s\n", s.Fleet, rg, s.LaunchHolds[rg].Why)
+		}
 		if s.Error != "" {
 			fmt.Fprintf(w, "  %s: %s\n", s.Name, s.Error)
 		}

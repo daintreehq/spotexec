@@ -111,6 +111,27 @@ func cmdSim() *cobra.Command {
 			return sim.EnsureImage(cmd.Context())
 		},
 	}
-	c.AddCommand(interrupt, rebalance, build)
+	network := &cobra.Command{
+		Use:   "network <runner> <region> up|down",
+		Args:  cobra.ExactArgs(3),
+		Short: "Cut this client off from a simulated region's VMs (down), or restore it (up); the VMs keep running (needs SPOTEXEC_SIM_REGIONS)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sim, _, err := pick(args[:1])
+			if err != nil {
+				return err
+			}
+			switch args[2] {
+			case "up", "down":
+			default:
+				return fmt.Errorf("want up or down, not %q", args[2])
+			}
+			if err := sim.SetReachable(args[1], args[2] == "up"); err != nil {
+				return err
+			}
+			fmt.Printf("%s: %s is %s\n", sim.Runner().Name, args[1], map[bool]string{true: "reachable", false: "cut off"}[args[2] == "up"])
+			return nil
+		},
+	}
+	c.AddCommand(interrupt, rebalance, build, network)
 	return c
 }
