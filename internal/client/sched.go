@@ -104,6 +104,9 @@ type schedState struct {
 	Model map[string]*durStat `json:"model,omitempty"`
 	// PricesAt: when the VMs' prices were last looked up.
 	PricesAt time.Time `json:"prices_at,omitempty"`
+	// Leads: how long recent launches took to serve (sched_model.go), so
+	// Plan can tell a slot freeing soon from one a new VM would beat.
+	Leads []leadSample `json:"launch_leads,omitempty"`
 }
 
 // vmSched is what scheduling knows about one VM.
