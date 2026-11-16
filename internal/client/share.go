@@ -249,7 +249,7 @@ func (s sharer) run(ctx context.Context) (shareOutcome, error) {
 // instead of every waiting run at once (#162).
 func buildFailed(re *transport.RemoteError) bool {
 	switch re.Code {
-	case protocol.CodeDepsFailed, protocol.CodeImageFailed:
+	case protocol.CodeDepsFailed, protocol.CodeImageFailed, protocol.CodeImageBuildFailed:
 		return true
 	}
 	return false

@@ -149,6 +149,8 @@ func TestErrorCode(t *testing.T) {
 		// The helper's reason beats whatever wraps it.
 		{fmt.Errorf("QUEUE_TIMEOUT: %w", remote(protocol.CodeDraining)), "RUNNER_DRAINING"},
 		{errors.New("unknown runner \"gone\""), "SPOTEXEC_ERROR"},
+		{&client.ImageBuildError{Err: fmt.Errorf("container image: %w", remote(protocol.CodeImageBuildFailed))}, "IMAGE_BUILD_FAILED"},
+		{&client.InfraError{Err: fmt.Errorf("container image: %w", remote(protocol.CodeImageFailed))}, "IMAGE_FAILED"},
 	} {
 		if got := errorCode(c.err); got != c.want {
 			t.Errorf("errorCode(%q) = %s, want %s", c.err, got, c.want)
