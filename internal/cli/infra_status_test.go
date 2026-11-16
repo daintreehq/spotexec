@@ -6,8 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
+	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/helper"
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -101,38 +104,52 @@ func (f regionListerFleet) ListReachable(context.Context) ([]provider.Instance, 
 // One region that can't be listed shows as its own unknown row, with why,
 // beside the instances of the regions that could be.
 func TestStatusShowsReachableRegions(t *testing.T) {
-	r := &config.Runner{Name: "spot", Type: config.TypeAWSSpot, Region: "us-east-2", Regions: []string{"us-east-2", "ap-south-1"}}
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	r := &config.Runner{Name: "spot", Type: config.TypeAWSSpot, Region: "us-east-2", Regions: []string{"us-east-2", "ap-south-1", "eu-north-1"}}
 	f := regionListerFleet{
-		insts:    []provider.Instance{{ID: "i-ok", State: provider.StateRunning, Region: "us-east-2"}},
-		unlisted: map[string]error{"ap-south-1": errors.New("no answer within 15s")},
+		insts: []provider.Instance{{ID: "i-ok", State: provider.StatePending, Region: "us-east-2"}},
+		unlisted: map[string]error{"ap-south-1": errors.New("no answer within 15s"),
+			"eu-north-1": errors.New("UnauthorizedOperation")},
 	}
-	insts, unlisted, err := listFleet(context.Background(), f)
-	if err != nil || len(insts) != 1 || len(unlisted) != 1 {
-		t.Fatalf("listFleet = %v, %v, %v", insts, unlisted, err)
+	defer func(n func(*config.Runner) (provider.Provider, error)) { newProvider = n }(newProvider)
+	newProvider = func(*config.Runner) (provider.Provider, error) { return f, nil }
+	rows := gatherStatus(context.Background(), []*config.Runner{r}, nil)
+	var names []string
+	for _, row := range rows {
+		names = append(names, row.Name+"="+string(row.Info.State))
 	}
-	rows := unlistedRows(r, unlisted)
-	if len(rows) != 1 || rows[0].Info.State != provider.StateUnknown || rows[0].Info.Region != "ap-south-1" {
-		t.Fatalf("rows %+v", rows)
+	if got := strings.Join(names, " "); got != "spot/ap-south-1=unknown spot/eu-north-1=unknown spot/i-ok=pending" {
+		t.Fatalf("rows %s", got)
+	}
+	if rows[0].Info.Region != "ap-south-1" || rows[0].Info.InstanceID != "" {
+		t.Fatalf("region row %+v", rows[0])
 	}
 	path := filepath.Join(t.TempDir(), "out")
 	out, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	printStatus(out, append(rows, runnerStatus{Name: "spot/i-ok", Type: r.Type, r: r, Fleet: "spot",
-		Info: provider.Info{State: provider.StateRunning, InstanceID: "i-ok", Region: "us-east-2"}}), nil)
+	printStatus(out, rows, nil)
 	out.Close()
 	b, _ := os.ReadFile(path)
 	text := string(b)
 	lines := strings.Split(text, "\n")
-	if !strings.Contains(lines[1], "ap-south-1") || !strings.Contains(lines[1], "unknown") || !strings.Contains(lines[1], "instances not listed") {
+	if !strings.Contains(lines[1], "aws-spot ap-south-1") || !strings.Contains(lines[1], "unknown") || !strings.Contains(lines[1], "instances not listed") {
 		t.Fatalf("region row:\n%s", text)
 	}
-	if !strings.Contains(lines[2], "spot/i-ok") || !strings.Contains(lines[2], "running") {
+	if !strings.Contains(lines[3], "spot/i-ok") {
 		t.Fatalf("instance row:\n%s", text)
 	}
-	if !strings.Contains(text, "spot: couldn't list ap-south-1: no answer within 15s") {
+	if !strings.Contains(text, "spot/ap-south-1: couldn't list ap-south-1: no answer within 15s") {
 		t.Fatalf("no reason:\n%s", text)
+	}
+	// Nothing listed and a region missing: not "0 instances".
+	f.insts = nil
+	newProvider = func(*config.Runner) (provider.Provider, error) { return f, nil }
+	for _, row := range gatherStatus(context.Background(), []*config.Runner{r}, nil) {
+		if row.Info.State == provider.StateAbsent {
+			t.Fatalf("claimed an empty fleet while regions were unlisted: %+v", row)
+		}
 	}
 }
 
@@ -150,3 +167,31 @@ type listOnlyFleet struct {
 }
 
 func (f listOnlyFleet) List(context.Context) ([]provider.Instance, error) { return nil, f.err }
+
+// Status reads a consolidating fleet's roles without waiting out a pool
+// manager that holds the pool's lock through a slow listing.
+func TestFleetRolesDontWaitForBusyPool(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	r := &config.Runner{Name: "spot", Type: config.TypeAWSSpot} // consolidate by default
+	dir := provider.RunnerStateDir(r.Name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "pool.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer func(d time.Duration) { rolesTimeout = d }(rolesTimeout)
+	rolesTimeout = 100 * time.Millisecond
+	start := time.Now()
+	if got := fleetRoles(context.Background(), r, client.NewPool(r, regionListerFleet{})); len(got) != 0 {
+		t.Fatalf("roles %v", got)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("waited %s for the pool lock", d)
+	}
+}

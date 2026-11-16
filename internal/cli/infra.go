@@ -230,12 +230,30 @@ func unlistedRows(r *config.Runner, unlisted map[string]error) []runnerStatus {
 	sort.Strings(regions)
 	var rows []runnerStatus
 	for _, rg := range regions {
-		rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, r: r, Fleet: r.Name,
+		rows = append(rows, runnerStatus{Name: r.Name + "/" + rg, Type: r.Type, r: r, Fleet: r.Name,
 			Error: fmt.Sprintf("couldn't list %s: %v", rg, unlisted[rg]),
 			Info:  provider.Info{State: provider.StateUnknown, Region: rg, Detail: "instances not listed"}})
 	}
 	return rows
 }
+
+// rolesTimeout bounds the wait for the pool's lock when status reads VM
+// roles: the pool manager holds it while its own listing runs.
+var rolesTimeout = 5 * time.Second
+
+// fleetRoles are a consolidating fleet's VM roles (none for other
+// policies, whose roles are hypothetical, or when the pool is busy).
+func fleetRoles(ctx context.Context, r *config.Runner, pool *client.Pool) map[string]client.Role {
+	if r.SchedPolicy() != config.PolicyConsolidate {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, rolesTimeout)
+	defer cancel()
+	return pool.Roles(ctx)
+}
+
+// newProvider builds a runner's provider for status (tests replace it).
+var newProvider = provider.New
 
 func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []runnerStatus {
 	var rows []runnerStatus
@@ -248,7 +266,7 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 	}
 	var holders []holder
 	for _, r := range rs {
-		p, err := provider.New(r)
+		p, err := newProvider(r)
 		if err != nil {
 			rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, Error: err.Error(), r: r})
 			continue
@@ -272,13 +290,13 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			fleets = append(fleets, fleetInstances{r, insts})
 			mismatch := fleetMismatches(ctx, f, insts)
 			pool := client.NewPool(r, f)
-			roles := pool.Roles()
+			roles := fleetRoles(ctx, r, pool)
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
 				st := runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
 					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}}
-				if r.SchedPolicy() == config.PolicyConsolidate { // shadow roles are hypothetical
-					st.Role, st.RoleReason = roles[in.ID].Role, roles[in.ID].Reason
+				if ro, ok := roles[in.ID]; ok {
+					st.Role, st.RoleReason = ro.Role, ro.Reason
 				}
 				if rc, ok := f.(provider.Reclaimer); ok {
 					st.reclaimed = func() { rc.Reclaimed(in) }

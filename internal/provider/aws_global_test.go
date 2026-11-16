@@ -748,13 +748,13 @@ func TestGlobalListReachableSkipsStalledRegion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d := time.Since(start); d > 5*time.Second {
+	if d := time.Since(start); d > 2*time.Second {
 		t.Fatalf("waited %s on the stalled region", d)
 	}
 	if len(ins) != 1 || ins[0].ID != "i-a" {
 		t.Fatalf("listed %v", ins)
 	}
-	if len(unlisted) != 1 || unlisted["r-two-1"] == nil || !strings.Contains(unlisted["r-two-1"].Error(), "no answer within 200ms") {
+	if len(unlisted) != 1 || unlisted["r-two-1"] == nil || !strings.Contains(unlisted["r-two-1"].Error(), "no answer within 200ms") || !errors.Is(unlisted["r-two-1"], context.DeadlineExceeded) {
 		t.Fatalf("unlisted %v", unlisted)
 	}
 	if got := active(t, g); got != "r-one-1,r-two-1" {
@@ -783,6 +783,27 @@ func TestGlobalListReachableReportsRegionError(t *testing.T) {
 	}
 	if e := unlisted["r-two-1"]; e == nil || !strings.Contains(e.Error(), "UnauthorizedOperation") {
 		t.Fatalf("unlisted %v", unlisted)
+	}
+}
+
+// The first listing only counts as discovery once every region answered:
+// a region that couldn't be listed is looked at again next time.
+func TestGlobalListReachableKeepsDiscoveringFailedRegion(t *testing.T) {
+	f := &fakeRegionsEC2{
+		instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}, "r-two-1": {"i-b": "c7a.2xlarge"}},
+		listErr:   map[string]string{"r-two-1": "RequestLimitExceeded"},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	ins, unlisted, err := g.ListReachable(context.Background())
+	if err != nil || len(ins) != 1 || unlisted["r-two-1"] == nil {
+		t.Fatalf("list = %v, %v, %v", ins, unlisted, err)
+	}
+	f.mu.Lock()
+	delete(f.listErr, "r-two-1")
+	f.mu.Unlock()
+	ins, unlisted, err = g.ListReachable(context.Background())
+	if err != nil || len(ins) != 2 || len(unlisted) != 0 {
+		t.Fatalf("list = %v, %v, %v", ins, unlisted, err)
 	}
 }
 

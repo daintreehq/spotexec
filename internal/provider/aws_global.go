@@ -1125,7 +1125,7 @@ func (g *AWSGlobal) list(ctx context.Context, each time.Duration) ([]Instance, m
 	}
 	slow := func(ctx context.Context, err error) error {
 		if each > 0 && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			return fmt.Errorf("no answer within %s", each)
+			return fmt.Errorf("no answer within %s: %w", each, err)
 		}
 		return err
 	}
@@ -1144,9 +1144,11 @@ func (g *AWSGlobal) list(ctx context.Context, each time.Duration) ([]Instance, m
 	}
 	if !discovered {
 		// No record yet of where instances may be: look everywhere once.
-		all, err := g.managedRegions(ctx)
+		dctx, cancel := bound(ctx)
+		all, err := g.managedRegions(dctx)
+		cancel()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, slow(ctx, err)
 		}
 		regions = union(regions, all)
 	}
