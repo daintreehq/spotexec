@@ -13,10 +13,15 @@ func TestSnapshotSkipAnchorsRootDirs(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("SnapshotSkip = %v, want %v", got, want)
 	}
+	hasRootTarget := false
 	for _, k := range got {
-		if k == "target" || k == ".spotexec" {
-			t.Fatalf("%q skipped at any depth: %v", k, got)
+		if k == "target" || k == ".spotexec" || k == "/.spotexec" {
+			t.Fatalf("%q skipped: %v", k, got)
 		}
+		hasRootTarget = hasRootTarget || k == "/target"
+	}
+	if !hasRootTarget {
+		t.Fatalf("/target not skipped: %v", got)
 	}
 	if len(HeavyDirs) == 0 || &got[0] == &HeavyDirs[0] {
 		t.Fatal("SnapshotSkip must copy HeavyDirs, not append to it")

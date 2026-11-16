@@ -74,7 +74,7 @@ func (s *Session) takeSnapshot(skip []string) snapshot {
 				return filepath.SkipDir
 			}
 			for _, sp := range skipPaths {
-				if ok, _ := filepath.Match(sp, rel); ok || sp == rel {
+				if ok, _ := path.Match(sp, rel); ok || sp == rel {
 					return filepath.SkipDir
 				}
 			}
