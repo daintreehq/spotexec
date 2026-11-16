@@ -284,6 +284,7 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 							mu.Unlock()
 						} else {
 							t.Errorf("%s %s has no deadline", r.Method, r.URL)
+							return nil, errors.New("no deadline")
 						}
 						<-r.Context().Done()
 						return nil, r.Context().Err()
