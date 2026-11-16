@@ -48,6 +48,7 @@ type fakeIAM struct {
 	stsDown     map[string]string            // key -> error code GetCallerIdentity fails with (not a key rejection)
 	selfGetUser string                       // a user's key may GetUser itself (the current policy): "ok", or an error code
 	sgs         map[string]map[string]string // security group id -> tags; "name"/"desc" override spotexec's
+	sgFailFrom  int                          // DescribeSecurityGroups fails from this page on (0: never)
 	policy      string                       // the last PutUserPolicy document
 	signedIn    map[string]string            // action -> the region its last call was signed for
 }
@@ -142,6 +143,10 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 			sort.Strings(ids)
 			page, next := 0, ""
 			fmt.Sscanf(v.Get("NextToken"), "page-%d", &page)
+			if f.sgFailFrom > 0 && page >= f.sgFailFrom {
+				iamErr(403, "UnauthorizedOperation")
+				return
+			}
 			if page+1 < len(ids) {
 				next = fmt.Sprintf("<nextToken>page-%d</nextToken>", page+1)
 			}
@@ -803,6 +808,27 @@ func TestAWSUserSetupTagsOldSecurityGroups(t *testing.T) {
 	}
 }
 
+// A listing that fails part-way still tags the groups already read, and
+// says so; the rest wait for the next setup.
+func TestAWSUserSetupTagsOldSecurityGroupsPartly(t *testing.T) {
+	f := &fakeIAM{sgFailFrom: 1, sgs: map[string]map[string]string{
+		"sg-a": {"Name": "spotexec-ssh"},
+		"sg-b": {"Name": "spotexec-ssh"},
+	}}
+	s, _, _ := newSetupEnv(t, f)
+	var logged []string
+	s.Log = func(format string, a ...any) { logged = append(logged, fmt.Sprintf(format, a...)) }
+	if _, err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.sgs["sg-a"][tagOwner] != testMachine || f.sgs["sg-b"][tagOwner] != "" {
+		t.Fatalf("groups %v", f.sgs)
+	}
+	if !strings.Contains(strings.Join(logged, "\n"), "couldn't list all of spotexec's security groups in us-east-2") {
+		t.Fatalf("no warning: %v", logged)
+	}
+}
+
 // In GovCloud, setup signs in to that partition's IAM and STS, and the
 // policy it attaches names GovCloud ARNs.
 func TestAWSUserSetupGovCloud(t *testing.T) {
@@ -812,7 +838,7 @@ func TestAWSUserSetupGovCloud(t *testing.T) {
 	if _, err := s.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(f.policy, `"arn:aws-us-gov:ec2:*:*:instance/*"`) || strings.Contains(f.policy, `"arn:aws:`) {
+	if f.policy != compactJSON(PolicyFor("us-gov-east-1")) || strings.Contains(f.policy, `"arn:aws:`) {
 		t.Fatalf("policy %s", f.policy)
 	}
 	for _, a := range []string{"CreateUser", "PutUserPolicy", "CreateAccessKey"} {
@@ -830,9 +856,14 @@ func TestAWSUserSetupGovCloud(t *testing.T) {
 func TestAWSUserSetupMixedPartitions(t *testing.T) {
 	f := &fakeIAM{}
 	s, _, _ := newSetupEnv(t, f)
-	s.VPCRegions = []string{"us-gov-west-1"}
-	if _, err := s.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "different AWS partitions") || len(f.calls) != 0 {
-		t.Fatalf("err %v, calls %v", err, f.calls)
+	for _, set := range []func(){
+		func() { s.VPCRegions, s.QuotaRegions = []string{"us-gov-west-1"}, nil },
+		func() { s.VPCRegions, s.QuotaRegions = nil, []string{"us-east-2", "us-gov-east-1"} },
+	} {
+		set()
+		if _, err := s.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "different AWS partitions") || len(f.calls) != 0 {
+			t.Fatalf("err %v, calls %v", err, f.calls)
+		}
 	}
 }
 

@@ -160,11 +160,19 @@ func TestRegistryForSlashProfile(t *testing.T) {
 // covers only its own spotexec-cache-* buckets, so a named bucket needs a
 // grant of its own.
 func TestEnsureBucketForbidden(t *testing.T) {
-	for _, tc := range []struct{ bucket, host, want string }{
-		{"auto", "spotexec-cache-123456789012-us-east-2.s3.us-east-2.amazonaws.com", "S3 statement of spotexec's policy"},
-		{"my-team-cache", "my-team-cache.s3.us-east-2.amazonaws.com", "policy only covers spotexec-cache-* buckets"},
+	auto := []string{"S3 statement of spotexec's policy", "another account owns", "spotexec-cache-123456789012-us-east-2"}
+	named := []string{"policy only covers spotexec-cache-* buckets", "isn't owned by account 123456789012", "s3:ListBucket", "s3:GetObject", "s3:PutObject"}
+	for _, tc := range []struct {
+		bucket, host string
+		want         []string
+	}{
+		{"", "spotexec-cache-123456789012-us-east-2.s3.us-east-2.amazonaws.com", auto},
+		{"auto", "spotexec-cache-123456789012-us-east-2.s3.us-east-2.amazonaws.com", auto},
+		{"my-team-cache", "my-team-cache.s3.us-east-2.amazonaws.com", named},
+		// Named by hand, however spotexec-like: the setting decides.
+		{"spotexec-cache-123456789012-us-east-2", "spotexec-cache-123456789012-us-east-2.s3.us-east-2.amazonaws.com", named},
 	} {
-		t.Run(tc.bucket, func(t *testing.T) {
+		t.Run("bucket="+tc.bucket, func(t *testing.T) {
 			rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				st, body := 500, ""
 				switch {
@@ -183,8 +191,14 @@ func TestEnsureBucketForbidden(t *testing.T) {
 					http: &http.Client{Transport: rt}},
 				dir: t.TempDir(),
 			}
-			if _, _, err := a.ensureBucket(context.Background()); err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "access denied") {
+			_, _, err := a.ensureBucket(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "access denied") {
 				t.Fatalf("ensureBucket error = %v", err)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error lacks %q: %v", w, err)
+				}
 			}
 		})
 	}

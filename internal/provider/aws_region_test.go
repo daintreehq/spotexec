@@ -1,8 +1,12 @@
 package provider
 
 import (
+	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -148,6 +152,7 @@ func TestAccountRegion(t *testing.T) {
 		{"gov", nil, "us-gov-west-1"},
 		{"work", nil, "us-east-1"},
 		{"missing", nil, "us-east-1"},
+		{"gov", []string{"eu-west-1"}, "us-east-1"}, // the regions in play win over the profile
 	} {
 		if got, err := AccountRegion(c.profile, c.regions); err != nil || got != c.want {
 			t.Errorf("AccountRegion(%q, %v) = %q, %v; want %q", c.profile, c.regions, got, err, c.want)
@@ -180,5 +185,33 @@ func TestIAMEndpointAndSigningRegion(t *testing.T) {
 	}
 	if got := (&AWSUserSetup{}).client("us-gov-west-1", nil).endpoint("iam"); got != "https://iam.us-gov.amazonaws.com/" {
 		t.Errorf("setup's IAM endpoint %s", got)
+	}
+}
+
+// The wiring, not just the helpers: an IAM request from a client in any
+// region goes to its partition's IAM host signed for the partition's home,
+// and STS stays in the client's region.
+func TestIAMRequestsSignedForPartitionHome(t *testing.T) {
+	for _, c := range []struct{ region, iamHost, iamScope string }{
+		{"eu-west-1", "iam.amazonaws.com", "us-east-1"},
+		{"us-gov-east-1", "iam.us-gov.amazonaws.com", "us-gov-west-1"},
+	} {
+		var hosts, scopes []string
+		rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			hosts = append(hosts, r.URL.Host)
+			scopes = append(scopes, regexp.MustCompile(`Credential=[^/]+/[^/]+/([^/]+)/`).FindStringSubmatch(r.Header.Get("Authorization"))[1])
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("<ok/>")), Request: r}, nil
+		})
+		cl := &awsClient{region: c.region, creds: staticResolver(awsCreds{AccessKeyID: "AK", SecretAccessKey: "s"}), http: &http.Client{Transport: rt}}
+		if _, err := cl.query(context.Background(), "iam", iamAPIVersion, "ListUsers", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cl.query(context.Background(), "sts", "2011-06-15", "GetCallerIdentity", nil); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{c.iamHost, "sts." + c.region + ".amazonaws.com"}
+		if strings.Join(hosts, ",") != strings.Join(want, ",") || strings.Join(scopes, ",") != c.iamScope+","+c.region {
+			t.Errorf("%s: hosts %v, signed for %v", c.region, hosts, scopes)
+		}
 	}
 }

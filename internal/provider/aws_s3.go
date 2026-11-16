@@ -125,7 +125,7 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 	case status == 404:
 		return "", "", fmt.Errorf("cache bucket %s does not exist (create it, or use cache_bucket = \"auto\")", bucket)
 	case status == 403 && auto:
-		return "", "", fmt.Errorf("cache bucket %s: access denied: the key needs the S3 statement of spotexec's policy (re-run `spotexec setup` to refresh it), or set cache_bucket = \"off\"", bucket)
+		return "", "", fmt.Errorf("cache bucket %s: access denied: either the key lacks the S3 statement of spotexec's policy (re-run `spotexec setup` to refresh it), or another account owns a bucket by this name (name one of your own with cache_bucket, granting it as docs/aws.md shows); or set cache_bucket = \"off\"", bucket)
 	case status == 403:
 		// S3 says 403 both for a bucket another account owns and for one
 		// this key may not read; spotexec's policy only covers its own

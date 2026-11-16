@@ -364,8 +364,9 @@ func TestRosterMatchUntaggedUser(t *testing.T) {
 
 // --print-policy prints the policy for the partition the runners (else
 // the admin profile) are in.
-func TestPolicyRegion(t *testing.T) {
+func TestPrintPolicyPartition(t *testing.T) {
 	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "aws-config"), []byte("[profile gov]\nregion = us-gov-east-1\n\n[profile work]\nregion = eu-west-1\n"), 0o600)
 	t.Setenv("AWS_CONFIG_FILE", filepath.Join(dir, "aws-config"))
 	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(dir, "credentials"))
 	for _, k := range []string{"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"} {
@@ -373,16 +374,29 @@ func TestPolicyRegion(t *testing.T) {
 	}
 	cfg := filepath.Join(dir, "config.toml")
 	t.Setenv("SPOTEXEC_CONFIG", cfg)
-	if rg := policyRegion(""); rg != "" || provider.PolicyFor(rg) != provider.SpotexecPolicy {
-		t.Fatalf("no config: %q", rg)
+	printed := func(args ...string) string {
+		return captureStdout(t, func() {
+			c := cmdSetup()
+			c.SetArgs(append([]string{"--print-policy"}, args...))
+			if err := c.Execute(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
+	commercial, gov := provider.SpotexecPolicy+"\n", provider.PolicyFor("us-gov-west-1")+"\n"
+	if got := printed(); got != commercial {
+		t.Fatalf("no config, no profile region:\n%s", got)
+	}
+	if got := printed("--admin-profile", "gov"); got != gov {
+		t.Fatalf("GovCloud admin profile:\n%s", got)
+	}
+	// The runners' partition wins over the admin profile's.
 	os.WriteFile(cfg, []byte("version = 1\n\n[runners.gov]\ntype = \"aws-spot\"\nregion = \"us-gov-west-1\"\n"), 0o600)
-	if rg := policyRegion(""); rg != "us-gov-west-1" || !strings.Contains(provider.PolicyFor(rg), `"arn:aws-us-gov:ssm:`) {
-		t.Fatalf("GovCloud runner: %q", rg)
+	if got := printed("--admin-profile", "work"); got != gov {
+		t.Fatalf("GovCloud runner:\n%s", got)
 	}
-	os.WriteFile(cfg, nil, 0o600)
-	t.Setenv("AWS_REGION", "us-gov-east-1")
-	if rg := policyRegion(""); rg != "us-gov-east-1" {
-		t.Fatalf("GovCloud admin profile: %q", rg)
+	os.WriteFile(cfg, []byte("version = 1\n\n[runners.aws]\ntype = \"aws-spot\"\nregion = \"eu-west-1\"\n"), 0o600)
+	if got := printed("--admin-profile", "gov"); got != commercial {
+		t.Fatalf("commercial runner:\n%s", got)
 	}
 }

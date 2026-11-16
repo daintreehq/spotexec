@@ -720,7 +720,7 @@ func TestSetupHostsSpotexecUserSession(t *testing.T) {
 	f.localInstalled("0.3.0")
 	withLatest(t, "v0.3.0")
 	old := adminSession
-	adminSession = func(context.Context, string) ([]string, string, error) {
+	adminSession = func(context.Context, string, []string) ([]string, string, error) {
 		return []string{"AKIASPOTEXEC", "s", ""}, "arn:aws:iam::1:user/spotexec/spotexec-here", nil
 	}
 	t.Cleanup(func() { adminSession = old })

@@ -238,6 +238,11 @@ func (f *fakeAccount) install(t *testing.T) {
 	})
 	dir := t.TempDir()
 	t.Setenv("SPOTEXEC_CONFIG_DIR", dir)
+	// No ambient AWS region or profile picks the partition.
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(dir, "aws-config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(dir, "aws-credentials"))
 	os.WriteFile(filepath.Join(dir, "owner-id"), []byte("me-1\n"), 0o600)
 }
 
@@ -472,6 +477,34 @@ func TestRevokeMachineGovCloud(t *testing.T) {
 		keys:  map[string][2]string{"AKMAC": {"spotexec-mac", "Active"}},
 	}
 	f.install(t)
+	iamHomes := func() []string {
+		var out []string
+		for _, s := range f.signed {
+			out = append(out, s[strings.LastIndex(s, " ")+1:])
+		}
+		f.signed = nil
+		return out
+	}
+	// Setup on another machine checks the admin session in the runners'
+	// partition, or the profile's when there are no runners.
+	env, arn, err := AdminSession(context.Background(), "admin", []string{"us-gov-east-1"})
+	if err != nil || env[0] != "AK-admin" || arn == "" || strings.Join(iamHomes(), ",") != "us-gov-west-1" {
+		t.Fatalf("AdminSession: %v %q %v", env, arn, err)
+	}
+	t.Setenv("AWS_REGION", "us-gov-east-1")
+	if _, _, err := AdminSession(context.Background(), "admin", nil); err != nil || strings.Join(iamHomes(), ",") != "us-gov-west-1" {
+		t.Fatalf("AdminSession from the profile's region: %v", err)
+	}
+	t.Setenv("AWS_REGION", "")
+	ms, err := ListMachines(context.Background(), "admin", []string{"us-gov-east-1"})
+	if err != nil || len(ms) != 1 || ms[0].VMs != 1 {
+		t.Fatalf("ListMachines %+v %v", ms, err)
+	}
+	for _, s := range f.signed {
+		if strings.HasPrefix(s, "iam ") && !strings.HasSuffix(s, " us-gov-west-1") {
+			t.Fatalf("ListMachines: IAM call outside GovCloud's home: %v", f.signed)
+		}
+	}
 	if err := RevokeMachine(context.Background(), "admin", "spotexec-mac", []string{"us-gov-east-1"}, t.Logf); err != nil {
 		t.Fatal(err)
 	}
@@ -485,5 +518,31 @@ func TestRevokeMachineGovCloud(t *testing.T) {
 	}
 	if _, err := ListMachines(context.Background(), "admin", []string{"us-gov-east-1", "us-east-1"}); err == nil || !strings.Contains(err.Error(), "different AWS partitions") {
 		t.Fatalf("mixed partitions: %v", err)
+	}
+}
+
+// A listing IAM says is truncated but gives no marker for is an error, not
+// a complete list; what was read is kept (teardown reports the failure and
+// still lists those users).
+func TestListSpotexecUsersIncomplete(t *testing.T) {
+	pages := []string{
+		`<ListUsersResponse><ListUsersResult><Users><member><UserName>spotexec-a</UserName><Path>/spotexec/</Path></member></Users><IsTruncated>true</IsTruncated><Marker>m1</Marker></ListUsersResult></ListUsersResponse>`,
+		`<ListUsersResponse><ListUsersResult><Users><member><UserName>spotexec-b</UserName><Path>/spotexec/</Path></member></Users><IsTruncated>true</IsTruncated></ListUsersResult></ListUsersResponse>`,
+	}
+	var markers []string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(r.Body)
+		v, _ := url.ParseQuery(string(b))
+		markers = append(markers, v.Get("Marker"))
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(pages[len(markers)-1])), Request: r}, nil
+	})
+	cl := &awsClient{region: "us-east-1", creds: staticResolver(awsCreds{AccessKeyID: "AK", SecretAccessKey: "s"}), http: &http.Client{Transport: rt}}
+	p := &TeardownPlan{}
+	err := p.listUsers(context.Background(), cl)
+	if err == nil || !strings.Contains(err.Error(), "without a marker") || strings.Join(markers, ",") != ",m1" {
+		t.Fatalf("err %v, markers %v", err, markers)
+	}
+	if len(p.Items) != 2 || p.Items[0].ID != "spotexec-a" || p.Items[1].ID != "spotexec-b" {
+		t.Fatalf("items %+v", p.Items)
 	}
 }

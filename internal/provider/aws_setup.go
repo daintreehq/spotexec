@@ -882,16 +882,19 @@ func upsertINISection(path, section string, set [][2]string, drop []string) erro
 
 // AdminSession returns the current AWS sign-in for profile ("" = the
 // default chain) and who it is, so setup can run on another machine with
-// it. The credentials are usually short-lived session credentials.
-func AdminSession(ctx context.Context, profile string) (env []string, arn string, err error) {
-	r := &awsCredResolver{profile: profile}
-	c, err := r.get(ctx)
+// it. The credentials are usually short-lived session credentials. regions
+// are the runners' regions: they say which partition to sign in to (else
+// the profile's region does).
+func AdminSession(ctx context.Context, profile string, regions []string) (env []string, arn string, err error) {
+	home, err := AccountRegion(profile, regions)
 	if err != nil {
 		return nil, "", err
 	}
-	home, _ := AccountRegion(profile, nil)
-	cl := (&AWSUserSetup{}).client(home, staticResolver(c))
-	if _, arn, err = callerIdentity(ctx, cl); err != nil {
+	c, err := accountResolver(profile).get(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, arn, err = callerIdentity(ctx, accountClient(home, staticResolver(c))); err != nil {
 		return nil, "", err
 	}
 	return []string{c.AccessKeyID, c.SecretAccessKey, c.SessionToken}, arn, nil
