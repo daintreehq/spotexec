@@ -3,6 +3,8 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -54,15 +56,25 @@ func browserDeps(root, pm string, pkg map[string]any) (deps []browserDep, notes 
 
 	var pats []string
 	if pm == "pnpm" {
-		pats, _ = pnpmWorkspacePackages(readSmall(root, "pnpm-workspace.yaml"))
+		var ok bool
+		if pats, ok = pnpmWorkspacePackages(readSmall(root, "pnpm-workspace.yaml")); !ok {
+			notes = append(notes, "pnpm-workspace.yaml's packages list wasn't readable, so workspaces weren't checked for Electron, Playwright or Puppeteer; add the system libraries they need to the Dockerfile by hand")
+		}
 	} else {
 		pats = packageJSONWorkspaces(pkg)
 	}
-	var excl []string
-	for _, p := range pats {
-		if p, ok := strings.CutPrefix(strings.TrimSpace(p), "!"); ok {
-			excl = append(excl, strings.TrimRight(strings.TrimPrefix(p, "./"), "/"))
+	var excl, unapplied []string
+	for _, raw := range pats {
+		p, ok := strings.CutPrefix(strings.TrimSpace(raw), "!")
+		if !ok {
+			continue
 		}
+		p = strings.TrimRight(strings.TrimPrefix(p, "./"), "/")
+		if _, err := path.Match(p, ""); err != nil || strings.Contains(p, "**") || strings.ContainsAny(p, "{}") {
+			unapplied = append(unapplied, fmt.Sprintf("%q", raw))
+			continue
+		}
+		excl = append(excl, p)
 	}
 	nm, skipped := workspaceNodeModules(pats)
 	realRoot, err := filepath.EvalSymlinks(root)
@@ -73,16 +85,16 @@ func browserDeps(root, pm string, pkg map[string]any) (deps []browserDep, notes 
 	seen := map[string]bool{}
 scan:
 	for _, d := range nm[1:] {
-		matches, _ := filepath.Glob(filepath.Join(root, filepath.FromSlash(strings.TrimSuffix(d, "/node_modules")), "package.json"))
+		// Relative to root, so glob characters in the checkout's own path
+		// don't count.
+		matches, _ := fs.Glob(os.DirFS(root), strings.TrimSuffix(d, "node_modules")+"package.json")
 		sort.Strings(matches)
-		for _, m := range matches {
-			rel, err := filepath.Rel(root, m)
-			if err != nil || seen[rel] {
+		for _, rel := range matches {
+			if seen[rel] {
 				continue
 			}
 			seen[rel] = true
-			rel = filepath.ToSlash(rel)
-			if excluded(path.Dir(rel), excl) || !inside(realRoot, m) {
+			if excluded(path.Dir(rel), excl) || !inside(realRoot, filepath.Join(root, filepath.FromSlash(rel))) {
 				continue
 			}
 			if read == maxWorkspaceManifests {
@@ -95,6 +107,9 @@ scan:
 				look(rel, wp)
 			}
 		}
+	}
+	if len(unapplied) > 0 {
+		notes = append(notes, fmt.Sprintf("couldn't apply workspace exclusion(s) %s (no ** or {a,b}), so the workspaces they exclude were checked for Electron, Playwright and Puppeteer too", strings.Join(unapplied, ", ")))
 	}
 	if len(skipped) > 0 {
 		notes = append(notes, fmt.Sprintf("didn't look for Electron, Playwright or Puppeteer in workspace pattern(s) %s (no ** or {a,b}); add the system libraries they need to the Dockerfile by hand", strings.Join(skipped, ", ")))

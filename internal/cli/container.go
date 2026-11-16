@@ -530,7 +530,8 @@ func scaffoldDockerfile(root string) (body, stack string, missing, notes []strin
 		from = "oven/bun:" + v
 		// The Bun image's Debian release depends on its version, and the
 		// library packages are named differently in each: name them only.
-		if deps, n := browserDeps(root, pm, pkg); len(deps) > 0 {
+		deps, n := browserDeps(root, pm, pkg)
+		if len(deps) > 0 {
 			var tools []string
 			for _, d := range deps {
 				tools = append(tools, d.tool)
@@ -541,8 +542,9 @@ func scaffoldDockerfile(root string) (body, stack string, missing, notes []strin
 			}
 			msg := joinAnd(tools) + need + " system libraries the Bun image doesn't have: add them to the apt-get install (`npx playwright install-deps --dry-run chromium` lists Chromium's)"
 			body += "\n# " + msg + ".\n"
-			notes = append(append(notes, msg), n...)
+			notes = append(notes, msg)
 		}
+		notes = append(notes, n...)
 	case pm != "" || pkg != nil:
 		node := nodeVersion(root, pkg)
 		stack, primary = "Node.js "+node, "js"

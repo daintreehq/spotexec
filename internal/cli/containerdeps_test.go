@@ -49,6 +49,15 @@ func TestBrowserDeps(t *testing.T) {
 			"pnpm-workspace.yaml":     "packages:\n  - 'tools/*'\n  - 'web/**'\n",
 			"tools/shot/package.json": `{"dependencies":{"puppeteer":"^24","playwright":"^1"}}`,
 		}, []browserDep{{"Playwright", "playwright", "package.json"}, {"Puppeteer", "puppeteer", "tools/shot/package.json"}}, `pattern(s) "web/**"`},
+		{"pnpm workspaces unreadable", map[string]string{
+			"package.json":              `{"packageManager":"pnpm@9.15.0"}`,
+			"pnpm-workspace.yaml":       "packages: &pkgs\n  - 'packages/*'\n",
+			"packages/e2e/package.json": `{"devDependencies":{"@playwright/test":"^1"}}`,
+		}, nil, "pnpm-workspace.yaml's packages list wasn't readable"},
+		{"unsupported exclusion", map[string]string{
+			"package.json":                    `{"workspaces":["apps/*/*","!**/fixtures"]}`,
+			"apps/team/fixtures/package.json": `{"devDependencies":{"electron":"^38"}}`,
+		}, []browserDep{{"Electron", "electron", "apps/team/fixtures/package.json"}}, `couldn't apply workspace exclusion(s) "!**/fixtures"`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -64,6 +73,29 @@ func TestBrowserDeps(t *testing.T) {
 				t.Errorf("notes %q, want %q", notes, c.note)
 			}
 		})
+	}
+}
+
+// Glob characters in the checkout's own path don't stop workspace matching.
+func TestBrowserDepsGlobCharsInRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "project[201]")
+	writeTree(t, root, map[string]string{
+		"package.json":              `{"workspaces":["packages/*"]}`,
+		"packages/app/package.json": `{"devDependencies":{"electron":"^38"}}`,
+	})
+	got, _ := browserDeps(root, "npm", readPackageJSON(root))
+	if want := []browserDep{{"Electron", "electron", "packages/app/package.json"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("deps %v, want %v", got, want)
+	}
+}
+
+// A Bun project keeps the scan's notes even when nothing was found.
+func TestScaffoldBunKeepsScanNotes(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{"package.json": `{"workspaces":["packages/**"]}`, "bun.lock": ""})
+	_, stack, _, notes := scaffoldDockerfile(root)
+	if stack != "Bun 1" || !strings.Contains(strings.Join(notes, "\n"), `workspace pattern(s) "packages/**"`) {
+		t.Fatalf("stack %q, notes %q", stack, notes)
 	}
 }
 
@@ -84,6 +116,14 @@ func TestBrowserDepsSymlinkOutside(t *testing.T) {
 func TestBrowserLibs(t *testing.T) {
 	pkgs := func(body string) map[string]bool {
 		set := map[string]bool{}
+		// Every line of the RUN but its last continues onto the next.
+		_, block, _ := strings.Cut(body, "\nRUN apt-get update")
+		block, _, _ = strings.Cut(block, "&& rm -rf /var/lib/apt/lists/*\n")
+		for _, l := range strings.Split(block, "\n") {
+			if strings.TrimSpace(l) != "" && !strings.HasSuffix(l, " \\") {
+				t.Errorf("RUN line doesn't continue: %q", l)
+			}
+		}
 		_, run, _ := strings.Cut(body, "apt-get install -y --no-install-recommends")
 		run, _, _ = strings.Cut(run, "&& rm -rf")
 		for _, f := range strings.Fields(strings.ReplaceAll(run, "\\", "")) {
@@ -98,8 +138,20 @@ func TestBrowserLibs(t *testing.T) {
 		t.Fatalf("libraries for no dependencies: %q %q", body, note)
 	}
 
-	body, note := browserLibs([]browserDep{{"Puppeteer", "puppeteer", "package.json"}})
+	body, note := browserLibs([]browserDep{{"Electron", "electron", "package.json"}})
 	p := pkgs(body)
+	for _, want := range []string{"libnss3", "libasound2", "libgbm1", "libgtk-3-0", "libx11-xcb1", "libxss1", "libxtst6", "libsecret-1-0", "libxshmfence1", "xvfb", "xauth"} {
+		if !p[want] {
+			t.Errorf("Electron: no %s in\n%s", want, body)
+		}
+	}
+	if p["libgtk-4-1"] || !strings.Contains(body, "\nENV ELECTRON_DISABLE_SANDBOX=1\n") ||
+		note != "added the system libraries Electron needs (package.json declares electron); run Electron tests that open a window under `xvfb-run -a` (the image sets ELECTRON_DISABLE_SANDBOX=1)" {
+		t.Errorf("Electron: %q\n%s", note, body)
+	}
+
+	body, note = browserLibs([]browserDep{{"Puppeteer", "puppeteer", "package.json"}})
+	p = pkgs(body)
 	for _, want := range []string{"libnss3", "libgbm1", "libgtk-3-0", "libasound2", "fonts-liberation"} {
 		if !p[want] {
 			t.Errorf("Puppeteer: no %s in\n%s", want, body)
