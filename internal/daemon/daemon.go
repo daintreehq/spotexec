@@ -134,6 +134,9 @@ type fleet struct {
 	counted    map[string]time.Time         // already counted by the circuit breaker (when)
 	killing    map[string]string            // terminations to retry until gone (id -> reason)
 	retire     map[string]provider.Instance // warm VMs to drain remotely, until confirmed
+	roles      map[string]string            // placement role of each VM (client.Pool.WarmSet)
+	warmPlan   []string                     // the last warm set WarmSet chose (nil: legacy)
+	unprobed   map[string]bool              // skipped by the last probe round on purpose
 	// Circuit breaker: replacements of instances that never became healthy.
 	failures []time.Time
 	paused   time.Time
@@ -501,6 +504,47 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		}
 		return running[i].ID < running[j].ID
 	})
+	// The placement policy picks the warm VMs (from the VMs it keeps
+	// placing work on), so the manager keeps alive what sx uses: warm ones
+	// first, then the rest of the retained set, then standby VMs (which
+	// are left to idle out). The legacy policy packs onto the oldest VMs,
+	// so then the oldest are warm.
+	warmIDs, roles, err := fl.pool.WarmSet(ctx)
+	if err == nil {
+		fl.roles, fl.warmPlan = roles, warmIDs
+	} else {
+		// Keep the last plan (and its roles) rather than fall back to the
+		// oldest VMs, which may be standby ones left to idle out.
+		warmIDs, roles = fl.warmPlan, fl.roles
+		st.LastError = "placement policy: " + err.Error()
+	}
+	inPlan := map[string]bool{}
+	for _, id := range warmIDs {
+		inPlan[id] = true
+	}
+	if warmIDs != nil {
+		order := map[string]int{}
+		for i, id := range warmIDs {
+			order[id] = i
+		}
+		rank := func(in provider.Instance) (int, int) {
+			if i, ok := order[in.ID]; ok {
+				return 0, i
+			}
+			if roles[in.ID] == "retained" {
+				return 1, 0
+			}
+			return 2, 0
+		}
+		sort.SliceStable(running, func(i, j int) bool {
+			ai, aj := rank(running[i])
+			bi, bj := rank(running[j])
+			if ai != bi {
+				return ai < bi
+			}
+			return aj < bj
+		})
+	}
 
 	// 2. Retire a warm instance shortly before max_lifetime, while its jobs
 	// can still finish, so the VM's hard stop never kills one and the
@@ -526,7 +570,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			i++
 			// One at a time: warm VMs launched together would otherwise all
 			// retire in the same pass and leave no warm capacity.
-			if i <= r.MinInstances && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > retireAt {
+			if i <= r.MinInstances && (warmIDs == nil || inPlan[in.ID]) && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > retireAt {
 				// Drained locally now (so the warm pool replaces it); the
 				// VM itself is told below, retried until it confirms.
 				d.action("%s: retiring warm instance %s ahead of max_lifetime", r.Name, in.ID)
@@ -544,9 +588,11 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			delete(fl.retire, id)
 		}
 	}
+	// With the placement policy's plan, exactly its warm VMs; otherwise
+	// (legacy) the oldest matching ones.
 	warm := map[string]bool{}
 	for _, in := range running {
-		if len(warm) < r.MinInstances && view.Mismatch[in.ID] == "" {
+		if len(warm) < r.MinInstances && view.Mismatch[in.ID] == "" && (warmIDs == nil || inPlan[in.ID]) {
 			warm[in.ID] = true
 		}
 	}
@@ -571,6 +617,14 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	if ctx.Err() != nil {
 		return st // stopping: a cancelled probe proves nothing
 	}
+	if probed {
+		fl.pool.RefreshPrices(ctx) // for the placement cost model (at most every 15m)
+	}
+	if probed && r.Scheduling.EarlyDrain {
+		for _, id := range d.earlyDrain(ctx, fl, running) {
+			view.Draining[id] = true
+		}
+	}
 
 	// 4. Replace instances that stopped answering, judged only right after
 	// a probe round. When no instance answered that round it may be our own
@@ -587,6 +641,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			since := fl.seen[in.ID]
 			if last, ok := fl.lastOK[in.ID]; ok {
 				since = last
+			}
+			if fl.unprobed[in.ID] {
+				continue // left unprobed on purpose (a standby VM without our helper): silence proves nothing
 			}
 			stale := time.Since(since) > unhealthyAfter && age > r.BootTimeout.Duration
 			stuck := (fl.booting[in.ID] && age > 2*r.BootTimeout.Duration+2*time.Minute) || fl.bootFailed[in.ID]
@@ -749,6 +806,59 @@ func drainRemote(ctx context.Context, r *config.Runner, in provider.Instance) bo
 	return err == nil && json.Unmarshal(out, &hs) == nil && hs.Draining
 }
 
+// earlyDrain asks idle standby VMs to drain (scheduling.early_drain), so a
+// surplus VM ends once its results have been kept result_retention rather
+// than at idle_timeout. Each drain is committed locally first (BeginDrain),
+// and the VM decides under its lifecycle lock (spotexec-helper try-drain),
+// so a job that reached it meanwhile keeps it. Only VMs this machine
+// already installed the helper on are asked: installing one would touch
+// its idle clock. It returns the VMs drained.
+func (d *Daemon) earlyDrain(ctx context.Context, fl *fleet, running []provider.Instance) []string {
+	r := fl.r
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var drained []string
+	for _, in := range running {
+		if role := fl.roles[in.ID]; role != "standby" && role != "drain_requested" {
+			continue
+		}
+		c := transport.New(in.Target, r.WorkRoot)
+		if !c.HelperInstalled() {
+			continue
+		}
+		op, ok, err := fl.pool.BeginDrain(ctx, in.ID)
+		if err != nil || !ok {
+			continue
+		}
+		wg.Add(1)
+		go func(in provider.Instance) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+			defer cancel()
+			if err := c.EnsureMaster(pctx); err != nil {
+				return // asked again later, with the same operation
+			}
+			out, err := c.HelperCmdInstalled(pctx, "try-drain", "--op", op, "--min-idle", r.ResultRetention().String(), "--reason", "surplus capacity")
+			if err != nil {
+				return
+			}
+			var res helper.TryDrainResult
+			if json.Unmarshal(out, &res) != nil || res.Op != op {
+				return
+			}
+			fl.pool.FinishDrain(in.ID, op, res.Result, res.Detail)
+			if res.Result == helper.DrainDone || res.Result == helper.DrainAlready {
+				d.action("%s: %s is surplus and was idle %s: drained early", r.Name, in.ID, time.Duration(res.IdleS)*time.Second)
+				mu.Lock()
+				drained = append(drained, in.ID)
+				mu.Unlock()
+			}
+		}(in)
+	}
+	wg.Wait()
+	return drained
+}
+
 // provision launches in the background; the daemon outlives it, so the
 // launch always completes and is recorded. batch is the pass that sent it.
 func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int) {
@@ -808,6 +918,7 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int)
 func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instance, warm map[string]bool) (notified []string, answered int) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	fl.unprobed = map[string]bool{}
 	wasBooting := map[string]bool{} // read-only copy for the goroutines
 	for id, b := range fl.booting {
 		wasBooting[id] = b
@@ -826,6 +937,14 @@ func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instan
 			defer wg.Done()
 			c := transport.New(in.Target, fl.r.WorkRoot)
 			if _, done := d.installed.Load(in.ID); !done && !c.HelperInstalled() {
+				if fl.roles[in.ID] == "standby" {
+					// Installing touches its idle clock: a surplus VM is left
+					// to idle out instead.
+					mu.Lock()
+					fl.unprobed[in.ID] = true
+					mu.Unlock()
+					return
+				}
 				// A first contact uploads the helper, which over a slow link
 				// can outlast this round: install it in the background (once
 				// per VM) and probe once it's there, so a slow upload neither

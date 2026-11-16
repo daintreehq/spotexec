@@ -207,10 +207,78 @@ type Runner struct {
 	// fleets (aws-spot, sim)
 	MaxInstances int `toml:"max_instances"` // fleet ceiling; 0 (the default): none, the Spot quota is the only limit
 	MinInstances int `toml:"min_instances"` // kept warm by `spotexec daemon` (default 0)
+	// Scheduling: how jobs are placed on the fleet's running VMs, and how
+	// surplus VMs are let go ([runners.<name>.scheduling]).
+	Scheduling Scheduling `toml:"scheduling"`
 
 	// sim
 	Image     string   `toml:"image"`
 	BootDelay Duration `toml:"boot_delay"`
+}
+
+// Scheduling policies (Scheduling.Policy).
+const (
+	// PolicyConsolidate keeps a retained set of VMs sized to recent demand,
+	// places jobs inside it, and lets the surplus idle out (the default).
+	PolicyConsolidate = "consolidate"
+	// PolicyShadow places like PolicyLegacy, but works out (and reports as
+	// placement_shadow events) what PolicyConsolidate would have done.
+	PolicyShadow = "shadow"
+	// PolicyLegacy is the placement before 0.10: the oldest VM with a free
+	// slot first, or the worktree's VM from the last 10 minutes.
+	PolicyLegacy = "legacy"
+)
+
+// Scheduling modes (Scheduling.Mode).
+const (
+	// ModeBalanced never reopens a surplus VM just because a worktree last
+	// ran there (the default).
+	ModeBalanced = "balanced"
+	// ModeLatency lets a worktree's surplus VM take it back when the files
+	// and caches there are its own, at the cost of keeping more VMs.
+	ModeLatency = "latency"
+)
+
+// Scheduling is [runners.<name>.scheduling] (fleets only).
+type Scheduling struct {
+	Policy string `toml:"policy"` // consolidate (default) | shadow | legacy
+	Mode   string `toml:"mode"`   // balanced (default) | latency
+	// SpareSlots: warm headroom kept on top of recent demand, in slots.
+	SpareSlots int `toml:"spare_slots"`
+	// EarlyDrain lets the pool manager shut a surplus VM down as soon as it
+	// is idle and its results have been kept for ResultRetention, instead
+	// of waiting out idle_timeout.
+	EarlyDrain bool `toml:"early_drain"`
+	// ResultRetention: how long a VM's workspaces stay reachable (exec,
+	// pull, --same-slot) after its last job before an early drain may end
+	// it. Default: idle_timeout (so early drain only ever ends VMs that the
+	// watchdog was about to end anyway).
+	ResultRetention Duration `toml:"result_retention"`
+}
+
+// SchedPolicy is the runner's scheduling policy, defaulted.
+func (r *Runner) SchedPolicy() string {
+	if r.Scheduling.Policy == "" {
+		return PolicyConsolidate
+	}
+	return r.Scheduling.Policy
+}
+
+// SchedMode is the runner's scheduling mode, defaulted.
+func (r *Runner) SchedMode() string {
+	if r.Scheduling.Mode == "" {
+		return ModeBalanced
+	}
+	return r.Scheduling.Mode
+}
+
+// ResultRetention is how long an early drain leaves an idle VM's results
+// reachable: result_retention, or idle_timeout.
+func (r *Runner) ResultRetention() time.Duration {
+	if d := r.Scheduling.ResultRetention.Duration; d > 0 {
+		return d
+	}
+	return r.IdleTimeout.Duration
 }
 
 // AllRegions is the regions value meaning every enabled region.
@@ -696,6 +764,22 @@ func (r *Runner) applyDefaults() error {
 	return r.validate()
 }
 
+func (s Scheduling) validate() error {
+	if s.Policy != "" && !oneOf(s.Policy, PolicyConsolidate, PolicyShadow, PolicyLegacy) {
+		return fmt.Errorf("scheduling.policy must be %s, %s or %s (got %q)", PolicyConsolidate, PolicyShadow, PolicyLegacy, s.Policy)
+	}
+	if s.Mode != "" && !oneOf(s.Mode, ModeBalanced, ModeLatency) {
+		return fmt.Errorf("scheduling.mode must be %s or %s (got %q)", ModeBalanced, ModeLatency, s.Mode)
+	}
+	if s.SpareSlots < 0 || s.SpareSlots > 1000 {
+		return fmt.Errorf("scheduling.spare_slots must be between 0 and 1000 (got %d)", s.SpareSlots)
+	}
+	if s.ResultRetention.Duration < 0 {
+		return fmt.Errorf("scheduling.result_retention must not be negative")
+	}
+	return nil
+}
+
 // validate rejects values that would pass silently and break later.
 func (r *Runner) validate() error {
 	if r.Name != "" && !runnerNameRe.MatchString(r.Name) {
@@ -706,6 +790,9 @@ func (r *Runner) validate() error {
 		if h == "" || strings.HasPrefix(h, "-") || strings.ContainsAny(h, " \t\r\n\x00") {
 			return fmt.Errorf("invalid host %q", h)
 		}
+	}
+	if err := r.Scheduling.validate(); err != nil {
+		return err
 	}
 	if r.MaxSlots < 0 || r.MaxSlots > protocol.MaxSlots {
 		return fmt.Errorf("max_slots must be between 1 and %d (got %d)", protocol.MaxSlots, r.MaxSlots)

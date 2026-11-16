@@ -103,6 +103,9 @@ type ClientInfo struct {
 	Worktree string `json:"worktree"`
 	Command  string `json:"command"`
 	RunID    string `json:"run_id"`
+	// Attempt: the client's reservation for this acquire (its pool
+	// ledger), echoed in holders so the client can match them.
+	Attempt string `json:"attempt,omitempty"`
 }
 
 // Acquire asks for a concurrency token and a workspace slot.

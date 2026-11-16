@@ -13,9 +13,9 @@ takes part in scheduling, and every VM shuts itself down.
                                                                   │
    EC2 API ◀── List / Launch / Terminate (tags: runner + owner)   │
                                                                   ▼
-   ┌─ i-a  [slot1 ●][slot2 ●]   busy                 ◀── pack: the oldest instance
-   ├─ i-b  [slot1 ●][slot2 ○]   busy                     with a free slot first
-   ├─ i-c  [slot1 ○][slot2 ○]   idle 3m ── watchdog ─▶ terminates at idle_timeout (10m)
+   ┌─ i-a  [slot1 ●][slot2 ●]   retained, busy       ◀── pack: retained VMs, the
+   ├─ i-b  [slot1 ●][slot2 ○]   retained, busy           worktree's own or a busy one first
+   ├─ i-c  [slot1 ○][slot2 ○]   standby, idle 3m ── watchdog ─▶ terminates at idle_timeout (10m)
    └─ (launching)               claimed by agent 3
 ```
 
@@ -26,16 +26,12 @@ takes part in scheduling, and every VM shuts itself down.
    through its known instances.
 2. **Known instances.** The fleet's instance list is read from the local cache
    (`pool.json`). It is refreshed from the cloud API when older than 8s, and
-   after any launch, successful or not. Running instances are tried oldest
-   first (ties broken by instance ID) with a non-blocking acquire.
-   - Packing work onto the oldest instances lets the newest go idle and
-     terminate: the pool scales in without any coordinator.
-   - While the worktree's last-run record (the slot `--same-slot` returns
-     to) is less than 10 minutes old, the instance it names is tried first
-     instead, since its slot still holds the worktree's files and build
-     caches. A run is recorded once its files are synced and its container
-     image is ready; a parallel or sharded task, once it finishes; a `--sync none` run,
-     never. After that, work goes back to the oldest instances.
+   after any launch, successful or not. Running instances are tried in the
+   order the [placement policy](#placement-the-retained-set) gives, with a
+   non-blocking acquire. Before contacting a VM, the job reserves a slot
+   there in the fleet's ledger (`sched.json`), so other `sx` processes see
+   it as taken at once; a VM whose slots this machine's jobs already fill is
+   skipped without an SSH round trip. The VM's helper still decides.
    - An instance that refuses with `RUNNER_DRAINING` is marked draining and
      skipped.
    - An instance that no longer satisfies the runner's current requirements
@@ -83,10 +79,131 @@ takes part in scheduling, and every VM shuts itself down.
    0.5-2.5s (the head most often) until a slot frees or `queue_timeout`
    expires.
 
+## Placement: the retained set
+
+With `scheduling.policy = "consolidate"` (the default), placement answers two
+questions separately.
+
+**Which VMs are worth keeping?** Every `sx` process (and the pool manager)
+runs a small controller under `pool.lock`, at most every 10 seconds. It
+tracks how many slots this machine's jobs hold or have reserved, and keeps
+a *retained set* big enough for the 90th percentile of that over the last
+minute (time-weighted, so a burst of short jobs counts for its duration, not
+its job count), plus `spare_slots`. When the retained VMs have had spare
+capacity for 60 seconds, it moves one of them to *standby*, then at most one
+more every 10 seconds while the surplus lasts:
+
+- an empty VM goes before a busy one, then one whose worktrees' files other
+  retained VMs also hold, a dearer one (when prices are known), one nearer
+  `max_lifetime`, and the one used least recently;
+- never a VM that joined in the last minute, one with an acquire in flight,
+  an `exec`/`pull`/`--same-slot` in progress or an exclusive job's fence,
+  nor one of the `min_instances` warm VMs;
+- nothing shrinks while jobs are queued, or an exclusive job waits.
+
+A standby VM's running jobs finish, new jobs go elsewhere, and nothing renews
+its idle clock, so its watchdog ends it after `idle_timeout`. Standby is
+reversible: when the retained VMs are full, the standby VM that left most
+recently comes back before anything launches (and stays for at least a
+minute). New VMs join the retained set.
+
+**Where does this job go?** Among retained VMs with room: the one holding
+this worktree's files (recently synced there), else this repository's
+caches; then a busy VM before an idle one, the tightest fit, the most
+recently used, and the longest-standing member. Then standby VMs, as above.
+A worktree's last VM is a preference *inside* the retained set: it no longer
+keeps a surplus VM alive by itself, so six worktrees whose jobs fit on three
+VMs end up on three, not six.
+
+`scheduling.mode = "latency"` lets a worktree go back to its own standby VM
+before a retained VM without its files (keeping more VMs, for fewer cold
+syncs).
+
+**Cost-aware placement.** Once there is enough history, the retained VMs
+with room are compared by what the job would cost on each, rather than by
+the fixed order above alone:
+
+    extra VM time it causes × the VM's price  +  its expected lease × wait_cost
+
+The *extra VM time* is how much later the VM can idle out because of this
+job. Reviving a VM that has sat idle for 9 of its 10 minutes costs the
+job's whole lease plus those 9 minutes (its idle time already run down);
+a busy VM whose jobs outlast this one costs nothing; a busy VM whose job
+ends in a second costs nearly the whole lease. The *lease* (acquire to
+release, sync and write-back included) is learned per task (repository and
+command, hashed) and per how warm the VM is for it, so a cold sync shows up
+as a longer lease: the last 16 leases each, for the 96 most recent tasks,
+in `sched.json`. Prices are the VMs' current Spot prices, looked up at most
+every 15 minutes for the whole machine (by `sx` in the background, and by
+the pool manager), or the runner's `hourly_cost`. VMs within about a
+second's worth of cost of the cheapest keep the fixed order between them,
+and a VM whose `max_lifetime` would cut the job's slower leases short goes
+last. Until every candidate is priced and the task (and the jobs already on
+those VMs) has at least 3 leases, the fixed order stands: an unknown figure
+is never taken as zero. The `placed` event's `score_mode` says which
+(`measured` or `heuristic`), and `reason` why that VM.
+
+**Exclusive jobs.** An exclusive job at the head of the queue that finds no
+empty VM *fences* the retained VM with the fewest jobs: new shared jobs go
+elsewhere, so it empties. Launches go on meanwhile, so it doesn't wait
+behind a long job when a new VM would be ready sooner. The fence ends when
+the job gets a VM, gives up, or its process dies.
+
+**The ledger.** `sched.json`, beside `pool.json` in the runner's state
+directory, records every job's claim from reservation to release: *reserved*
+(nothing sent yet), *sent* (just before the acquire goes out), *acquired*,
+or *uncertain*. Each `sx` process holds a lock on its own file under
+`owners/`, so a dead process is told from a live one. A dead process's
+reservation that was never sent is dropped; one that may have reached the VM
+counts as uncertain until the VM's holder list shows it gone or six minutes
+pass (the helper drops a silent client within that). Uncertain slots never
+stop a job from asking the VM; they only keep the VM from being let go.
+`exec`, `pull` and `--same-slot` are recorded too, but always go to their
+exact slot, standby or not.
+
+`policy = "shadow"` places as before but reports what the retained-set policy
+would have chosen (`placement_shadow` events); `policy = "legacy"` is the
+pre-0.10 placement: the oldest VM with a free slot, or the worktree's VM
+while its last run is under 10 minutes old.
+
+## Early drain
+
+By default a standby VM ends at its watchdog's `idle_timeout`, like any idle
+VM. With `scheduling.early_drain = true` and the [pool manager](scaling.md#pool-manager-optional)
+running, a standby VM can end sooner: once it has been idle for
+`scheduling.result_retention` (default `idle_timeout`, so set it lower, such
+as `"2m"`, for this to change anything). Until then `exec`, `pull` and
+`--same-slot` can still reach its workspaces.
+
+Each pass, for a standby VM that has been standby for 30 seconds, isn't
+warm, holds nothing of this machine's (no job, reservation, uncertain
+attempt or exclusive fence), with no job queued and the retained VMs
+covering recent demand without it, the manager:
+
+1. records the drain in the ledger (`drain_requested`). From then on the VM
+   is never placed on again, even if the request below times out, so a
+   delayed request can't drain a VM that just took new work;
+2. asks the VM (`spotexec-helper try-drain`, over the helper this machine
+   already installed: installing one would touch its idle clock). The
+   helper takes its lifecycle lock exclusively without waiting, and only
+   with no session holding it, no run waiting for a workspace slot, and its
+   activity at least `result_retention` old (by the VM's own clock) writes
+   its drain marker. Every acquire takes that lock shared and checks the
+   marker once it holds it, so nothing can start after;
+3. records the answer: drained (the watchdog powers the VM off at its next
+   pass, within a minute), or busy / still keeping results, asked again
+   30 seconds later with the same operation ID (a retry whose earlier
+   answer was lost reads as drained).
+
+`sx` processes don't drain VMs early; without the pool manager, standby VMs
+end at `idle_timeout`. A Spot interruption or `max_lifetime` still ends a VM
+whatever its role.
+
 ## Scale in
 
 Each VM's watchdog (a systemd timer installed by cloud-init) powers it off
-after `idle_timeout` (default 10m) without activity. It only does so when no
+after `idle_timeout` (default 10m) without activity. Standby VMs get no new
+work, so this is how the surplus the controller found ends. It only does so when no
 session holds the lifecycle lock. Because instances launch with
 `InstanceInitiatedShutdownBehavior=terminate`, powering off terminates the
 instance.

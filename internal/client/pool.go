@@ -58,12 +58,17 @@ type note struct {
 	// when it does). Unlike Draining it is recomputed, so reverting the
 	// config puts the VM back in service.
 	Mismatch string `json:"mismatch,omitempty"`
+	// Retiring: an early drain was committed (sched.go drain_requested):
+	// never placed on again, and not capacity, though the VM itself may
+	// not have agreed to drain yet.
+	Retiring bool `json:"retiring,omitempty"`
 }
 
 // closed reports whether an instance takes no new runs and isn't capacity:
-// it is draining, or no longer matches the runner's requirements (it then
-// idles out, and replacements launch for waiting demand).
-func (n *note) closed() bool { return n != nil && (n.Draining || n.Mismatch != "") }
+// it is draining (or retiring), or no longer matches the runner's
+// requirements (it then idles out, and replacements launch for waiting
+// demand).
+func (n *note) closed() bool { return n != nil && (n.Draining || n.Retiring || n.Mismatch != "") }
 
 type launchRec struct {
 	ID         string    `json:"id"`
@@ -92,6 +97,10 @@ type poolState struct {
 	// The requirements (provider.MatchKey) the notes' Mismatch reasons
 	// were judged against.
 	MatchKey string `json:"match_key,omitempty"`
+	// Sched: the reservation ledger and placement policy (sched.go). Kept
+	// in its own file, sched.json, under the same lock: a binary from
+	// before it would otherwise drop it whenever it rewrote pool.json.
+	Sched *schedState `json:"-"`
 }
 
 // quotaBlocked reports the quota (or max_price) refusal that still holds
@@ -179,18 +188,42 @@ func (p *Pool) withCtx(ctx context.Context, fn func(st *poolState) error) error 
 			st.Notes = map[string]*note{}
 		}
 	}
+	origSched, _ := os.ReadFile(filepath.Join(p.dir, "sched.json"))
+	if len(origSched) > 0 {
+		var s schedState
+		if json.Unmarshal(origSched, &s) == nil {
+			st.Sched = &s
+		}
+	}
+	applied := p.applyPending(st)
 	if err := fn(st); err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(st, "", "  ")
-	if bytes.Equal(b, orig) {
-		return nil // unchanged: skip the write (lots of read-only callers)
+	// The ledger first: if pool.json then fails, the launch records it
+	// holds were never saved (so no launch is counted that nobody makes).
+	if st.Sched != nil {
+		b, _ := json.MarshalIndent(st.Sched, "", "  ")
+		if err := writeIfChanged(p.dir, "sched.json", b, origSched); err != nil {
+			return err
+		}
+		p.pendingDone(applied)
 	}
-	tmp := filepath.Join(p.dir, "pool.json.tmp"+strconv.Itoa(os.Getpid()))
+	b, _ := json.MarshalIndent(st, "", "  ")
+	return writeIfChanged(p.dir, "pool.json", b, orig)
+}
+
+// writeIfChanged atomically replaces dir/name with b, unless it already
+// holds exactly that (lots of read-only callers).
+func writeIfChanged(dir, name string, b, orig []byte) error {
+	if bytes.Equal(b, orig) {
+		return nil
+	}
+	tmp := filepath.Join(dir, name+".tmp"+strconv.Itoa(os.Getpid()))
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(p.dir, "pool.json"))
+	return os.Rename(tmp, filepath.Join(dir, name))
 }
 
 // readyGrace: how long after an instance is first seen ready its launch
@@ -376,6 +409,7 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 		}
 	}
 	st.Launches = keep
+	st.sched().forgetGone(live)
 	return nil
 }
 
@@ -431,10 +465,16 @@ const (
 	OutDraining
 	OutUnreachable
 	OutBootFailed // its bootstrap_script failed: draining, and a fleet problem
+	// outSkipped: not contacted, the ledger shows no room (or the policy no
+	// longer places work there).
+	outSkipped
 )
 
 // Observe records a probe result.
 func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
+	if o == outSkipped {
+		return
+	}
 	_ = p.with(func(st *poolState) error {
 		n := st.note(id)
 		now := time.Now()
@@ -707,7 +747,7 @@ func (p *Pool) Cancel(id string) {
 // Reset forgets all local pool state (after `spotexec down`).
 func (p *Pool) Reset() {
 	_ = p.with(func(st *poolState) error {
-		*st = poolState{Notes: map[string]*note{}}
+		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}}
 		return nil
 	})
 }

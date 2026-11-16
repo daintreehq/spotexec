@@ -90,7 +90,7 @@ for i in 1 2 3 4 5 6 7 8; do "$SX" --json "sleep 4; echo cap$i" >"$WORK/k$i.out"
 check "all eight jobs succeed (two queued)" "[ \$(cat $WORK/k*.out | grep -c '^cap') = 8 ]"
 check "never more than max_instances" "[ \$(count) -le 3 ]"
 
-echo "== bin-packing (sequential jobs reuse the most recently used instance)"
+echo "== bin-packing (sequential jobs from one worktree reuse one instance)"
 for i in 1 2 3 4; do "$SX" --json "echo seq$i" >/dev/null 2>"$WORK/b$i.err"; done
 check "sequential jobs land on one instance" "[ \$(cat $WORK/b*.err | grep '\"placed\"' | sed 's/.*instance_id\":\"\\([^\"]*\\)\".*/\\1/' | sort -u | wc -l | tr -d ' ') = 1 ]"
 
