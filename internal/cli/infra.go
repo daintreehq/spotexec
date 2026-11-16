@@ -215,8 +215,12 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				continue
 			}
 			if len(insts) == 0 {
+				detail := "0 instances; scales on demand"
+				if r.Capped() {
+					detail = fmt.Sprintf("0 of max %d instances; scales on demand", r.MaxInstances)
+				}
 				rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, r: r, Fleet: r.Name,
-					Info: provider.Info{State: provider.StateAbsent, Detail: fmt.Sprintf("0 of max %d instances; scales on demand", r.MaxInstances)}})
+					Info: provider.Info{State: provider.StateAbsent, Detail: detail}})
 			}
 			fleets = append(fleets, fleetInstances{r, insts})
 			mismatch := fleetMismatches(ctx, f, insts)
@@ -545,7 +549,8 @@ func cmdUp() *cobra.Command {
 				count = 1
 			}
 			// Prewarming goes through the pool ledger, so it respects
-			// max_instances and concurrent sx processes see the launches.
+			// max_instances (when set) and concurrent sx processes see the
+			// launches.
 			pool := client.NewPool(r, f)
 			ids, err := pool.Reserve(ctx, count)
 			if err != nil {

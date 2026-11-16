@@ -278,7 +278,7 @@ The constants are assumptions, not measurements of your project, and `spotexec p
 
 Spot capacity is limited by a per-region vCPU quota, *All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests* (`L-34B43A08`). New accounts often start very low, sometimes 5 vCPUs: enough for one 4-vCPU VM, but not one 8-vCPU VM. `spotexec setup` sizes the starter fleet to it (4-vCPU VMs when an 8-vCPU one doesn't fit) and offers to request an increase when not even one VM fits.
 
-You need at least `max_instances × vCPUs per instance`, summed over every fleet in the region. For example, the starter fleet of 4 × `c7a.2xlarge` (8 vCPUs each) needs 32 vCPUs, or 16 once setup has switched it to 4-vCPU VMs. `spotexec doctor` shows the current value and what the runner may use; it fails only when not even one VM fits, and prints the increase command whenever the quota limits the fleet. To check or raise it:
+A fleet with `max_instances` needs at least `max_instances × vCPUs per instance`, summed over every fleet in the region; for example, 4 × `c7a.2xlarge` (8 vCPUs each) needs 32 vCPUs. A fleet without `max_instances` (the default, as in the starter config) has no ceiling of its own, so the quota is what limits how many of its VMs run at once. `spotexec doctor` shows the current value and what the runner may use; it fails only when not even one VM fits, and prints the increase command whenever the quota holds a fleet below its `max_instances`. To check or raise it:
 
 ```sh
 aws service-quotas get-service-quota --profile spotexec --region us-east-2 \

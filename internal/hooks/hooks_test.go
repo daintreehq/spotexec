@@ -27,10 +27,11 @@ func TestShouldOffload(t *testing.T) {
 		"pnpm test | tee out.txt", "pnpm test 2>&1 | tail -50", "cargo test 2>&1 | grep -E 'FAIL|panicked' | head -20",
 		"go test ./... | grep -v '^ok'", "pytest -q 2>&1 | tail -n 30",
 		"cd packages/api && pnpm test | tee test.log", "pytest -k 'a#b' | tail", "pytest issue#3",
+		"pnpm test || echo failed",
 	}
 	no := []string{
 		"git status", "ls -la", "rg foo", "pnpm dev", "pnpm vitest --watch", "pnpm test | xargs echo",
-		"git log | head", "pnpm test | tail -5 > out.txt", "pnpm test || echo failed", "pnpm test | sh",
+		"git log | head", "pnpm test | tail -5 > out.txt", "pnpm test || git push", "pnpm test | sh",
 		"pnpm test | grep 'unterminated", "pnpm test |", "pnpm test | tail -$N",
 		"pnpm test > out.txt", "pnpm test && git commit -m x", "sx pnpm test", "echo $(pnpm test)",
 		"pnpm install", "pnpm test &", "",
@@ -84,8 +85,9 @@ func TestWrapPreservesShellSemantics(t *testing.T) {
 	for _, c := range []string{
 		// Offloaded, the second cd would only happen remotely.
 		"pnpm build && cd pkg && pnpm test", "go vet ./... && cd sub && go test | tail",
-		// Only lint is filtered; as two runs, lint could miss build's output.
-		"pnpm test && pnpm lint | tail -50", "pnpm build; pnpm test | tail",
+		// Only test is filtered: the filter would run on the runner, and
+		// tee writes a file there.
+		"pnpm build && pnpm test | tee out.log", "pnpm build; pnpm test | sed -i x",
 		// A comment can hide an operator; escapes aren't modelled.
 		// Hoisted, the cd would also gate lint.
 		"cd missing && pnpm test; pnpm lint",
@@ -148,6 +150,11 @@ func isolate(t *testing.T, runner bool) {
 	// Not this machine's Claude Code settings (RTK's hook, say).
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(d, "claude"))
 	t.Setenv("CLAUDE_PROJECT_DIR", "")
+	// Nor this machine's managed settings.
+	prev, prevMDM := managedSettings, mdmPolicies
+	managedSettings = func() string { return filepath.Join(d, "managed-settings.json") }
+	mdmPolicies = func() []string { return []string{filepath.Join(d, "mdm.plist")} }
+	t.Cleanup(func() { managedSettings, mdmPolicies = prev, prevMDM })
 	if runner {
 		if err := os.WriteFile(filepath.Join(d, "config.toml"), []byte("version = 1\n[runners.box]\ntype = \"ssh\"\nhost = \"me@box\"\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -158,10 +165,11 @@ func isolate(t *testing.T, runner bool) {
 type hookOut struct {
 	System string `json:"systemMessage"`
 	H      struct {
-		Event   string         `json:"hookEventName"`
-		Updated map[string]any `json:"updatedInput"`
-		Context string         `json:"additionalContext"`
-		Reason  string         `json:"permissionDecisionReason"`
+		Event    string         `json:"hookEventName"`
+		Updated  map[string]any `json:"updatedInput"`
+		Context  string         `json:"additionalContext"`
+		Reason   string         `json:"permissionDecisionReason"`
+		Decision string         `json:"permissionDecision"`
 	} `json:"hookSpecificOutput"`
 }
 

@@ -684,7 +684,7 @@ func setupClaudeHookFrom(yes, want, skip, interactive bool, in io.Reader) (opted
 	} else {
 		fmt.Printf("✓ installed the Claude Code hook in %s\n", p)
 	}
-	fmt.Println("  Permission rules now see `spotexec run -- <cmd>`: allow `Bash(spotexec run:*)` if you pre-approve test commands.")
+	fmt.Println("  Your permission rules still apply to the commands as the agent writes them: the hook passes them on.")
 	return true, false
 }
 

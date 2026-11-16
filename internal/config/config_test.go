@@ -1077,10 +1077,11 @@ func TestConfigVersion(t *testing.T) {
 	}
 }
 
-// A repository may tune a fleet, never loosen what the user's own runner
-// allows: its image, its price, or how long and how many VMs bill (#152).
-func TestProjectRunnerCannotLoosenBase(t *testing.T) {
-	g, err := loadGlobalText(t, `[runners.sim]
+// A repository can't change the image or on-demand fallback its runners
+// boot with (#152), but its fleet size, idle and lifetime limits and Spot
+// price cap replace the base runner's, higher or lower (#191).
+func TestProjectRunnerOverridesBaseLimits(t *testing.T) {
+	const global = `[runners.sim]
 type = "sim"
 max_instances = 2
 [runners.aws]
@@ -1093,9 +1094,17 @@ max_lifetime = "6h"
 [runners.open]
 type = "aws-spot"
 region = "us-east-1"
-`)
-	if err != nil {
-		t.Fatal(err)
+`
+	// Each merge gets its own global: a same-name override replaces the
+	// runner in the global map it is merged into.
+	merge := func(body string) (*Global, *Config, error) {
+		t.Helper()
+		g, err := loadGlobalText(t, global)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := mergeProject(t, g, body)
+		return g, c, err
 	}
 	for body, want := range map[string]string{
 		"[runners.big]\nextends = \"aws\"\nami = \"ami-0123456789abcdef0\"\n": `"ami" can only be set in the global config`,
@@ -1104,18 +1113,8 @@ region = "us-east-1"
 		"[runners.big]\nextends = \"aws\"\nOn_Demand_Fallback = true\n":       `"on_demand_fallback" can only be set in the global config`,
 		"[runners.big]\nextends = \"aws\"\nPROFILE = \"x\"\n":                 `"profile" can only be set in the global config`,
 		"[runners.big]\nextends = \"aws\"\nmax_price = \"\"\n":                `"runners.big.max_price"): invalid amount ""`,
-		"[runners.big]\nextends = \"aws\"\nmax_price = \"0.41\"\n":            `max_price = "0.41" is more than your runner "aws" allows (0.4 an hour)`,
 		"[runners.big]\nextends = \"aws\"\nmax_price = \"lots\"\n":            `"runners.big.max_price"): invalid amount "lots"`,
-		"[runners.big]\nextends = \"aws\"\nmax_instances = 5\n":               `max_instances = 5 is more than your runner "aws" allows (4)`,
-		"[runners.big]\nextends = \"aws\"\nidle_timeout = \"11m\"\n":          `idle_timeout = 11m0s is longer than your runner "aws" allows (10m0s)`,
-		"[runners.big]\nextends = \"aws\"\nmax_lifetime = \"7h\"\n":           `max_lifetime = 7h0m0s is longer than your runner "aws" allows (6h0m0s)`,
-		"[runners.big]\nextends = \"open\"\nmax_lifetime = \"13h\"\n":         `max_lifetime = 13h0m0s is longer than your runner "open" allows (12h0m0s)`,
 		"[runners.aws]\nmax_price = \"\"\n":                                   `"runners.aws.max_price"): invalid amount ""`,
-		"[runners.aws]\nmax_price = \"0.5\"\n":                                `is more than your runner "aws" allows`,
-		"[runners.aws]\nidle_timeout = \"1h\"\n":                              `idle_timeout = 1h0m0s is longer`,
-		"[runners.aws]\nmax_lifetime = \"24h\"\n":                             `max_lifetime = 24h0m0s is longer`,
-		"[runners.sim]\nidle_timeout = \"11m\"\n":                             `idle_timeout = 11m0s is longer than your runner "sim" allows (10m0s)`,
-		"[runners.big]\nextends_type = \"sim\"\nmax_lifetime = \"3h\"\n":      `max_lifetime = 3h0m0s is longer than your runner "sim" allows (2h0m0s)`,
 		"[runners.big]\nextends = \"aws\"\nvolume_gb = 16385\n":               `volume_gb must be between 8 and 16384`,
 		"[runners.big]\nextends = \"aws\"\nmax_price = \"NaN\"\n":             `max_price must be a positive number`,
 		"[runners.big]\nextends = \"aws\"\nmax_price = \"0\"\n":               `max_price must be a positive number`,
@@ -1123,60 +1122,66 @@ region = "us-east-1"
 		"[runners.big]\nextends = \"open\"\nmax_price = \"Inf\"\n":            `max_price must be a positive number`,
 		"[runners.big]\nextends = \"open\"\nmax_price = \"cheap\"\n":          `"runners.big.max_price"): invalid amount "cheap"`,
 		"[runners.big]\nextends_type = \"sim\"\nmax_price = \"x\"\n":          `"runners.big.max_price"): invalid amount "x"`,
-		"[runners.sim]\nmax_instances = 3\n":                                  `max_instances = 3 is more than your runner "sim" allows (2)`,
-		"[runners.aws]\nmax_instances = 40\n":                                 `max_instances`,
+		"[runners.big]\nextends = \"aws\"\nmax_instances = -1\n":              `max_instances must be at least 1 (leave it unset for no ceiling)`,
 	} {
-		if _, err := mergeProject(t, g, body); err == nil || !strings.Contains(err.Error(), want) {
+		if _, _, err := merge(body); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: want %q, got %v", body, want, err)
 		}
 	}
-	// Tightening, or matching the base, is fine.
-	c, err := mergeProject(t, g, `[runners.big]
-extends = "aws"
-max_price = "0.25"
-max_instances = 2
-idle_timeout = "5m"
-max_lifetime = "2h"
-volume_gb = 200
-[runners.same]
-extends = "aws"
-max_price = "0.4"
-max_instances = 4
-idle_timeout = "10m"
-max_lifetime = "6h"
-volume_gb = 16384
-[runners.capped]
-extends = "open"
-max_price = "1.00"
-`)
-	if err != nil {
-		t.Fatal(err)
+
+	type limits struct {
+		instances  int
+		idle, life time.Duration
+		price      float64
 	}
-	if r := c.Global.Runners["big"]; r.MaxPriceUSD() != 0.25 || r.MaxInstances != 2 || r.IdleTimeout.Duration != 5*time.Minute || r.MaxLifetime.Duration != 2*time.Hour || r.VolumeGB != 200 {
-		t.Fatalf("big: %+v", r)
+	got := func(r *Runner) limits {
+		return limits{r.MaxInstances, r.IdleTimeout.Duration, r.MaxLifetime.Duration, r.MaxPriceUSD()}
 	}
-	if r := c.Global.Runners["capped"]; r.MaxPriceUSD() != 1.00 {
-		t.Fatalf("capped: %+v", r)
+	for _, tc := range []struct {
+		name, body string
+		want       limits
+	}{
+		{"raise", "[runners.big]\nextends = \"aws\"\nmax_instances = 12\nidle_timeout = \"1h\"\nmax_lifetime = \"24h\"\nmax_price = \"0.90\"\n",
+			limits{12, time.Hour, 24 * time.Hour, 0.90}},
+		{"lower", "[runners.big]\nextends = \"aws\"\nmax_instances = 2\nidle_timeout = \"5m\"\nmax_lifetime = \"2h\"\nmax_price = \"0.25\"\n",
+			limits{2, 5 * time.Minute, 2 * time.Hour, 0.25}},
+		{"same-name raise", "[runners.aws]\nmax_instances = 40\nidle_timeout = \"1h\"\nmax_lifetime = \"24h\"\nmax_price = \"0.5\"\n",
+			limits{40, time.Hour, 24 * time.Hour, 0.5}},
+		{"same-name lower", "[runners.aws]\nmax_instances = 1\nidle_timeout = \"5m\"\nmax_lifetime = \"1h\"\nmax_price = \"0.3\"\n",
+			limits{1, 5 * time.Minute, time.Hour, 0.3}},
+		// What the project leaves unset comes from the base.
+		{"inherit", "[runners.aws]\nmax_instances = 12\n",
+			limits{12, 10 * time.Minute, 6 * time.Hour, 0.40}},
+		{"inherit ceiling", "[runners.big]\nextends = \"aws\"\nidle_timeout = \"1h\"\n",
+			limits{4, time.Hour, 6 * time.Hour, 0.40}},
+		// An explicit 0 removes the base's ceiling.
+		{"uncap", "[runners.big]\nextends = \"aws\"\nmax_instances = 0\n",
+			limits{0, 10 * time.Minute, 6 * time.Hour, 0.40}},
+		// The open base has no ceiling, so neither does the project fleet.
+		{"inherit defaults", "[runners.big]\nextends = \"open\"\nmax_lifetime = \"13h\"\nmax_price = \"1.00\"\n",
+			limits{0, 10 * time.Minute, 13 * time.Hour, 1.00}},
+		{"sim", "[runners.big]\nextends_type = \"sim\"\nmax_instances = 3\nidle_timeout = \"11m\"\nmax_lifetime = \"3h\"\n",
+			limits{3, 11 * time.Minute, 3 * time.Hour, 0}},
+	} {
+		g, c, err := merge(tc.body)
+		if err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		name := "big"
+		if c.Global.Runners[name] == nil {
+			name = "aws"
+		}
+		if l := got(c.Global.Runners[name]); l != tc.want {
+			t.Errorf("%s: got %+v, want %+v", tc.name, l, tc.want)
+		}
+		if name == "big" {
+			if b := got(g.Runners["aws"]); b != (limits{4, 10 * time.Minute, 6 * time.Hour, 0.40}) {
+				t.Errorf("%s: base runner must not be modified: %+v", tc.name, b)
+			}
+		}
 	}
-	if r := c.Global.Runners["same"]; r.MaxPriceUSD() != 0.4 || r.MaxInstances != 4 {
-		t.Fatalf("same: %+v", r)
-	}
-	if r := c.Global.Runners["same"]; r.VolumeGB != 16384 || r.IdleTimeout.Duration != 10*time.Minute || r.MaxLifetime.Duration != 6*time.Hour {
-		t.Fatalf("same: %+v", r)
-	}
-	if b := g.Runners["aws"]; b.MaxPriceUSD() != 0.40 || b.MaxInstances != 4 || b.MaxLifetime.Duration != 6*time.Hour {
-		t.Fatalf("base runner must not be modified: %+v", b)
-	}
-	if b := g.Runners["open"]; b.MaxLifetime.Duration != 12*time.Hour {
-		t.Fatalf("the open fixture relies on the 12h default lifetime: %s", b.MaxLifetime.Duration)
-	}
-	// A same-name override may tighten too, and an SSH base has no fleet
-	// limits to keep.
-	if c, err := mergeProject(t, g, "[runners.aws]\nmax_price = \"0.3\"\nidle_timeout = \"5m\"\nmax_lifetime = \"1h\"\nmax_instances = 1\n"); err != nil {
-		t.Errorf("same-name tightening: %v", err)
-	} else if r := c.Global.Runners["aws"]; r.MaxPriceUSD() != 0.3 || r.IdleTimeout.Duration != 5*time.Minute || r.MaxLifetime.Duration != time.Hour || r.MaxInstances != 1 {
-		t.Errorf("same-name tightening: %+v", r)
-	}
+
 	gs, err := loadGlobalText(t, "[runners.box]\ntype = \"ssh\"\nhost = \"box\"\n")
 	if err != nil {
 		t.Fatal(err)
@@ -1317,5 +1322,23 @@ func TestProjectDurationsAndTaskPools(t *testing.T) {
 	// A task pool naming a fleet this user can't back loads, like a project pool.
 	if _, err := mergeProject(t, g, "[runners.big]\nextends = \"aws\"\n[tasks.a]\nrun = \"x\"\npool = [\"big\"]\n"); err != nil {
 		t.Errorf("unavailable fleet in a task pool: %v", err)
+	}
+}
+
+// A fleet has no ceiling unless max_instances sets one: it grows with
+// demand, up to the account's Spot quota.
+func TestMaxInstancesUnsetMeansNoCeiling(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nmin_instances = 3\n[runners.capped]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nmax_instances = 2\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := g.Runners["aws"]; r.Capped() || r.MaxInstances != 0 || !r.BelowMax(1000) {
+		t.Fatalf("unset max_instances must mean no ceiling: %+v", r)
+	}
+	if r := g.Runners["capped"]; !r.Capped() || !r.BelowMax(1) || r.BelowMax(2) {
+		t.Fatalf("max_instances = 2: %+v", r)
+	}
+	if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nmax_instances = 2\nmin_instances = 3\n"); err == nil || !strings.Contains(err.Error(), "min_instances must be between 0 and max_instances") {
+		t.Errorf("min above a ceiling: %v", err)
 	}
 }

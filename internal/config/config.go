@@ -205,7 +205,7 @@ type Runner struct {
 	WaitCost             Dollars  `toml:"wait_cost"`    // USD an hour of waiting is worth against the Spot bill (run_cost); default DefaultWaitCost
 
 	// fleets (aws-spot, sim)
-	MaxInstances int `toml:"max_instances"`
+	MaxInstances int `toml:"max_instances"` // fleet ceiling; 0 (the default): none, the Spot quota is the only limit
 	MinInstances int `toml:"min_instances"` // kept warm by `spotexec daemon` (default 0)
 
 	// sim
@@ -294,6 +294,14 @@ func MatchType(pattern, t string) bool {
 
 // Ephemeral reports whether the runner is provisioned on demand.
 func (r *Runner) Ephemeral() bool { return r.Type == TypeAWSSpot || r.Type == TypeSim }
+
+// Capped reports whether the fleet has a max_instances ceiling. Without
+// one it grows with demand, limited only by the account's Spot quota.
+func (r *Runner) Capped() bool { return r.MaxInstances > 0 }
+
+// BelowMax reports whether a fleet of n VMs may launch another: always,
+// without a ceiling.
+func (r *Runner) BelowMax(n int) bool { return !r.Capped() || n < r.MaxInstances }
 
 // Global is ~/.config/spotexec/config.toml.
 type Global struct {
@@ -408,6 +416,9 @@ type Hook struct {
 	WhenLoadAbove float64  `toml:"when_load_above"` // only offload when local load/CPU exceeds this
 	Mode          string   `toml:"mode"`            // rewrite (default) | block
 	Disabled      bool     `toml:"disabled"`
+	// TransparentPrefixes are wrapper commands the hook looks past to judge
+	// the command they run (`direnv exec .`); they run on the runner too.
+	TransparentPrefixes []string `toml:"transparent_prefixes"`
 }
 
 // Project is .spotexec.toml.
@@ -672,13 +683,10 @@ func (r *Runner) applyDefaults() error {
 		return fmt.Errorf("unsupported type %q (supported: ssh, aws-spot, sim)", r.Type)
 	}
 	if r.Ephemeral() {
-		if r.MaxInstances == 0 {
-			r.MaxInstances = 4
-		}
 		if r.MaxInstances < 0 {
-			return errors.New("max_instances must be >= 1")
+			return errors.New("max_instances must be at least 1 (leave it unset for no ceiling)")
 		}
-		if r.MinInstances < 0 || r.MinInstances > r.MaxInstances {
+		if r.MinInstances < 0 || (r.Capped() && r.MinInstances > r.MaxInstances) {
 			return errors.New("min_instances must be between 0 and max_instances")
 		}
 	}
@@ -1264,9 +1272,6 @@ func (c *Config) MergeProjectRunners() error {
 		if err := base.applyDefaults(); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
 		}
-		if err := base.withinBase(g); err != nil {
-			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
-		}
 		c.Global.Runners[name] = &base
 	}
 	if und := p.md.Undecoded(); len(und) > 0 {
@@ -1311,41 +1316,6 @@ func allPatterns(types []string) bool {
 		}
 	}
 	return len(types) > 0
-}
-
-// withinBase rejects a project runner that would spend more than the
-// user's runner it builds on allows: a repository can lower the fleet
-// ceiling, the idle and lifetime limits and the Spot price cap, never
-// raise or remove them.
-func (r *Runner) withinBase(g *Runner) error {
-	if !g.Ephemeral() {
-		return nil
-	}
-	yours := fmt.Sprintf("your runner %q", g.Name)
-	if r.MaxInstances > g.MaxInstances {
-		return fmt.Errorf("max_instances = %d is more than %s allows (%d); a project can lower it, not raise it", r.MaxInstances, yours, g.MaxInstances)
-	}
-	for _, d := range []struct {
-		key       string
-		got, base time.Duration
-	}{
-		{"idle_timeout", r.IdleTimeout.Duration, g.IdleTimeout.Duration},
-		{"max_lifetime", r.MaxLifetime.Duration, g.MaxLifetime.Duration},
-	} {
-		if d.got > d.base {
-			return fmt.Errorf("%s = %s is longer than %s allows (%s); a project can shorten it, not lengthen it", d.key, d.got, yours, d.base)
-		}
-	}
-	if !g.MaxPrice.Set {
-		return nil
-	}
-	if !r.MaxPrice.Set {
-		return fmt.Errorf("max_price can't be removed: %s caps the Spot price at %s an hour", yours, g.MaxPrice)
-	}
-	if r.MaxPrice.V > g.MaxPrice.V {
-		return fmt.Errorf("max_price = %q is more than %s allows (%s an hour); a project can lower it, not raise it", r.MaxPrice.String(), yours, g.MaxPrice)
-	}
-	return nil
 }
 
 // projectBase picks the global runner a project runner builds on: the one

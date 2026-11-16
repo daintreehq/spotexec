@@ -85,7 +85,7 @@ func Dir() string { return filepath.Join(config.StateDir(), "daemon") }
 type FleetStatus struct {
 	Runner    string           `json:"runner"`
 	Min       int              `json:"min_instances"`
-	Max       int              `json:"max_instances"`
+	Max       int              `json:"max_instances"` // 0: no ceiling
 	Instances []InstanceStatus `json:"instances"`
 	Demand    int              `json:"demand"`
 	Launching int              `json:"launching"`
