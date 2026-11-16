@@ -1,4 +1,70 @@
 # Scaling and the pool manager
+
+## A few warm VMs
+
+spotexec exists to take heavy commands off one developer's machine. It isn't built to run as many things at once as possible. The setup that usually costs least, and is often the fastest, is a few VMs that stay warm and that every command shares.
+
+### What each extra VM costs
+
+A VM is cheap to keep busy and costly to start:
+
+- **The cold start.** Before its first command, a new VM boots, pulls the project image, restores dependencies, takes a full sync of the worktree and runs the project's setup step. On [Daintree](case-study-daintree.md#one-vm-per-part-the-lesson) that came to about 3 minutes per VM, more than twice as long as the 74 to 84 seconds of tests it was launched for.
+- **The idle tail.** After its last job, a VM keeps running, and billing, for `idle_timeout` (10 minutes by default) in case more work arrives.
+
+A warm VM pays neither. The next command sends only the files that changed and starts within seconds.
+
+### Queueing is the normal path
+
+`max_instances` is a ceiling, not a target. When every slot is busy, a run registers demand and the fleet launches VMs for it, up to `max_instances`. Past that, runs wait in a fair queue and take the next slot that frees up. With a few VMs shared by several agents, that is expected, not a sign that the pool is too small.
+
+Set `max_instances` to the most VMs you're willing to pay for at once, not to the most parts you might run at once. Size `queue_timeout` (10 minutes by default) for the longest task a run might wait behind: a run that waits longer fails with `QUEUE_TIMEOUT`.
+
+### The recommended shape
+
+One pool of one VM type serves every command:
+
+```toml
+# ~/.config/spotexec/config.toml
+[runners.aws]
+type = "aws-spot"
+vcpus = 8
+max_slots = 2           # two shared jobs per VM, 4 CPUs each
+max_instances = 8       # a ceiling: past it, runs queue
+idle_timeout = "10m"
+```
+
+```toml
+# .spotexec.toml
+queue_timeout = "30m"   # long enough to wait behind the longest task
+
+[tasks.test]            # a few test files: shares a VM
+run = "npx vitest run {args}"
+
+[tasks.test-all]        # the whole suite, unsharded, on a whole VM
+run = "npx vitest run {args}"
+exclusive = true
+
+[tasks.typecheck]
+run = "npm run typecheck"
+exclusive = true
+```
+
+A task that needs a whole VM's CPUs or memory is `exclusive`. Everything else shares a VM, two slots at a time. spotexec places each run as it comes, packing work onto the oldest VMs so the newest go idle and power off. There is no separate fleet per task: a [project-defined fleet](configuration.md#project-defined-fleets) launches VMs of its own, which pay their own cold starts and idle tails even while the shared pool has room.
+
+The starter config from `spotexec setup` gives 8-vCPU VMs 4 slots each. At 2, which is where Daintree settled, each shared job gets 4 CPUs and twice the memory.
+
+### When sharding pays
+
+A [sharded task](configuration.md#tasks) splits a suite into parts that run at once, each in its own slot. On an `exclusive` VM, an unsharded run already uses every CPU, because the test runner spreads its workers across them. Sharding usually adds VMs, and each part on a new VM pays the cold start before it runs a test, then leaves that VM idling until its timeout.
+
+Sharding is worth it when:
+
+- the suite runs many times longer than a cold start on a whole VM, and you need the result sooner;
+- the parts land on VMs that are already warm, with the image and dependencies in place, such as a [warm pool](#pool-manager-optional);
+- you run the suite rarely, so the VMs it adds aren't multiplied by every agent that runs it.
+
+It rarely pays for a suite that runs in a few minutes on one VM, or one that several agents run at once: their shards compete for the same `max_instances` and queue anyway. On Daintree, the suite sharded over 9 fresh single-slot VMs ran 74 to 84 seconds of tests per part, yet each part took 3m48s to 4m45s end to end, and all 9 VMs then billed their idle timeout. [The case study](case-study-daintree.md#one-vm-per-part-the-lesson) has the numbers.
+
 ## Scaling, queueing and CPU sizing
 
 Every `sx` process schedules for itself, against shared local state:
@@ -17,7 +83,7 @@ Every `sx` process schedules for itself, against shared local state:
   pytest -n $SPOTEXEC_CPUS
   go test -p $SPOTEXEC_CPUS ./...
   ```
-- **Sharding.** A suite too big for one slot can run as a [sharded task](configuration.md#tasks): `shards = 8` queues eight parts at once, so the fleet scales out for them like any other demand, and each part runs its `--shard={shard}/{shards}` slice.
+- **Sharding.** A [sharded task](configuration.md#tasks) with `shards = 8` queues eight parts at once, so the fleet launches VMs for them like any other demand, up to `max_instances`, and each part runs its `--shard={shard}/{shards}` slice. Read [when sharding pays](#when-sharding-pays) before reaching for it.
 
 ### Several machines, one Spot quota
 
@@ -29,7 +95,7 @@ The Spot vCPU quota belongs to the AWS account and region, so every machine usin
 
 When a launch doesn't fit, the machine behaves as for any [quota refusal](aws.md#5-check-your-spot-vcpu-quota): its runs queue for the VMs it already has, or, with none, fail at once with exit 125. The error shows who is using the quota, for example `16 of 16 vCPUs in use: 8 by this machine, 8 by studio-01`, and the command to raise it. `spotexec status -A` prints the same breakdown for every region your runners use. If the quota can't be read, spotexec launches anyway and lets EC2 decide. The check is a snapshot, so EC2 stays the final judge: two machines launching at the same moment can both pass it, and open Spot requests from other tools that have no instance yet aren't counted. EC2 then refuses the launch, which is handled the same way.
 
-To mix machine sizes, define two fleets: a 2-vCPU fleet for light jobs and a 4-vCPU fleet for heavy ones. Route tasks to them with `pool`, or let overflow spill from one to the other by priority. [docs/POOL.md](POOL.md) has the full scheduling design.
+One VM type usually covers every command, with `exclusive` for the jobs that need a whole VM (see [the recommended shape](#the-recommended-shape)). If some jobs really need a different size, define a second fleet and route those tasks to it with `pool`, or let overflow spill from one to the other by priority. Each fleet pays its own cold starts and idle tails. [docs/POOL.md](POOL.md) has the full scheduling design.
 
 ### One fleet, several instance types
 
