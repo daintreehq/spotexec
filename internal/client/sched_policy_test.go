@@ -475,3 +475,39 @@ func (r *placeRep) saw(name, field string) bool {
 	}
 	return false
 }
+
+// A VM launched moments ago counts as launch capacity until it is seen
+// serving at capacity. The ledger skips probing a VM its own jobs fill, so
+// Rank must record that it is full, or Plan keeps counting its slots as
+// still to come and launches too few VMs for waiting jobs.
+func TestRankMarksLedgerFullVMSeenFull(t *testing.T) {
+	p, _ := schedPool(t, 1, 2)
+	now := time.Now()
+	p.loaded(t, func(st *poolState) {
+		s := st.sched()
+		p.views(st, now)
+		s.EpochAt = now
+		st.Launches = []launchRec{{ID: "l1", InstanceID: "i-0", Started: now.Add(-10 * time.Second), PID: os.Getpid()}}
+		st.note("i-0").markReady(now.Add(-5 * time.Second)) // within readyGrace
+		hold(s, "i-0", "a", now)
+		hold(s, "i-0", "b", now)
+	})
+	w, err := p.Register(4) // four jobs waiting
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Done()
+	d, err := p.Plan(context.Background(), 0)
+	if err != nil || d.Capacity != 4 || !d.Launch {
+		t.Fatalf("before Rank: %+v %v, want the young VM's 2 pending slots plus this launch's 2", d, err)
+	}
+	if cands, _, _, _ := p.Rank(context.Background(), nil, claim{}); len(cands) != 0 {
+		t.Fatalf("candidates %+v on a full VM", cands)
+	}
+	d, err = p.Plan(context.Background(), 0)
+	// Pending now: only the launch planned above (2 slots), so 4 waiting
+	// jobs call for another. Counting the full VM too (4 slots) would not.
+	if err != nil || !d.Launch || d.Capacity != 4 {
+		t.Fatalf("after Rank: %+v %v, want a second launch with the full VM no longer pending", d, err)
+	}
+}

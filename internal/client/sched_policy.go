@@ -332,7 +332,13 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 				continue // held for an exclusive job
 			}
 			if w.firm+need(w) > w.units {
-				continue // full, by this machine's own reservations
+				// Full, by this machine's own reservations: not probed, so
+				// record what a busy probe would have (a VM serving at
+				// capacity stops counting as launch capacity in Plan).
+				if w.firm >= w.units && n != nil && n.Ready && !n.SawFull {
+					n.SawFull = true
+				}
+				continue
 			}
 			r := ranked{vmView: w, ready: helperInstalled(w.in.Target, p.R.WorkRoot)}
 			switch {
