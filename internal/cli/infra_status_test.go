@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,3 +87,66 @@ func TestStatusSlotsShowVMCount(t *testing.T) {
 		}
 	}
 }
+
+type regionListerFleet struct {
+	provider.Fleet
+	insts    []provider.Instance
+	unlisted map[string]error
+}
+
+func (f regionListerFleet) ListReachable(context.Context) ([]provider.Instance, map[string]error, error) {
+	return f.insts, f.unlisted, nil
+}
+
+// One region that can't be listed shows as its own unknown row, with why,
+// beside the instances of the regions that could be.
+func TestStatusShowsReachableRegions(t *testing.T) {
+	r := &config.Runner{Name: "spot", Type: config.TypeAWSSpot, Region: "us-east-2", Regions: []string{"us-east-2", "ap-south-1"}}
+	f := regionListerFleet{
+		insts:    []provider.Instance{{ID: "i-ok", State: provider.StateRunning, Region: "us-east-2"}},
+		unlisted: map[string]error{"ap-south-1": errors.New("no answer within 15s")},
+	}
+	insts, unlisted, err := listFleet(context.Background(), f)
+	if err != nil || len(insts) != 1 || len(unlisted) != 1 {
+		t.Fatalf("listFleet = %v, %v, %v", insts, unlisted, err)
+	}
+	rows := unlistedRows(r, unlisted)
+	if len(rows) != 1 || rows[0].Info.State != provider.StateUnknown || rows[0].Info.Region != "ap-south-1" {
+		t.Fatalf("rows %+v", rows)
+	}
+	path := filepath.Join(t.TempDir(), "out")
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	printStatus(out, append(rows, runnerStatus{Name: "spot/i-ok", Type: r.Type, r: r, Fleet: "spot",
+		Info: provider.Info{State: provider.StateRunning, InstanceID: "i-ok", Region: "us-east-2"}}), nil)
+	out.Close()
+	b, _ := os.ReadFile(path)
+	text := string(b)
+	lines := strings.Split(text, "\n")
+	if !strings.Contains(lines[1], "ap-south-1") || !strings.Contains(lines[1], "unknown") || !strings.Contains(lines[1], "instances not listed") {
+		t.Fatalf("region row:\n%s", text)
+	}
+	if !strings.Contains(lines[2], "spot/i-ok") || !strings.Contains(lines[2], "running") {
+		t.Fatalf("instance row:\n%s", text)
+	}
+	if !strings.Contains(text, "spot: couldn't list ap-south-1: no answer within 15s") {
+		t.Fatalf("no reason:\n%s", text)
+	}
+}
+
+// A fleet in one region keeps its strict listing.
+func TestListFleetPlain(t *testing.T) {
+	_, unlisted, err := listFleet(context.Background(), listOnlyFleet{err: errors.New("boom")})
+	if err == nil || unlisted != nil {
+		t.Fatalf("%v %v", unlisted, err)
+	}
+}
+
+type listOnlyFleet struct {
+	provider.Fleet
+	err error
+}
+
+func (f listOnlyFleet) List(context.Context) ([]provider.Instance, error) { return nil, f.err }

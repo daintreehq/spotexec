@@ -108,6 +108,18 @@ type Fleet interface {
 	Terminate(ctx context.Context, instanceID string) error
 }
 
+// RegionLister is implemented by fleets spread over regions that can list
+// the regions they reach even when another can't be listed. It is for
+// showing the fleet (`spotexec status`); the pool uses List, which fails
+// as a whole so that it never believes an unlisted region's VMs gone.
+type RegionLister interface {
+	// ListReachable returns the live instances of every region it could
+	// list and, for each region it couldn't, why. It waits on no region
+	// longer than a short timeout. err is for failures that leave nothing
+	// listed at all.
+	ListReachable(ctx context.Context) (insts []Instance, unlisted map[string]error, err error)
+}
+
 // Matcher is implemented by fleets whose VMs can stop satisfying the
 // runner's requirements when its config changes (a raised min_memory_gib,
 // a type dropped from instance_types): such a VM should take no new runs

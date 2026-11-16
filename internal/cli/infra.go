@@ -208,6 +208,35 @@ func fleetMismatches(ctx context.Context, f provider.Fleet, insts []provider.Ins
 	return m.Mismatches(ctx, insts)
 }
 
+// listFleet lists a fleet's instances for showing them: a fleet spread
+// over regions lists the ones it reaches and names the others, so one
+// region's stalled API doesn't hide the rest.
+func listFleet(ctx context.Context, f provider.Fleet) ([]provider.Instance, map[string]error, error) {
+	if rl, ok := f.(provider.RegionLister); ok {
+		return rl.ListReachable(ctx)
+	}
+	insts, err := f.List(ctx)
+	return insts, nil, err
+}
+
+// unlistedRows are one unknown row per region a fleet couldn't list, in
+// region order. They carry the fleet's name, so its launch holds still
+// show when no instance was listed.
+func unlistedRows(r *config.Runner, unlisted map[string]error) []runnerStatus {
+	regions := make([]string, 0, len(unlisted))
+	for rg := range unlisted {
+		regions = append(regions, rg)
+	}
+	sort.Strings(regions)
+	var rows []runnerStatus
+	for _, rg := range regions {
+		rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, r: r, Fleet: r.Name,
+			Error: fmt.Sprintf("couldn't list %s: %v", rg, unlisted[rg]),
+			Info:  provider.Info{State: provider.StateUnknown, Region: rg, Detail: "instances not listed"}})
+	}
+	return rows
+}
+
 func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []runnerStatus {
 	var rows []runnerStatus
 	var fleets []fleetInstances
@@ -225,13 +254,14 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			continue
 		}
 		if f, ok := p.(provider.Fleet); ok {
-			insts, err := f.List(ctx)
+			insts, unlisted, err := listFleet(ctx, f)
 			if err != nil {
 				rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, Error: err.Error(), r: r, Info: provider.Info{State: provider.StateUnknown}})
 				continue
 			}
 			first := len(rows)
-			if len(insts) == 0 {
+			rows = append(rows, unlistedRows(r, unlisted)...)
+			if len(insts) == 0 && len(unlisted) == 0 {
 				detail := "0 instances; scales on demand"
 				if r.Capped() {
 					detail = fmt.Sprintf("0 of max %d instances; scales on demand", r.MaxInstances)

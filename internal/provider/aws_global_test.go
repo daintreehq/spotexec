@@ -729,6 +729,63 @@ func TestGlobalListFailsIfARegionFails(t *testing.T) {
 	}
 }
 
+// Status lists what it can reach: a stalled region is reported by name
+// after a short wait, the others' instances still show, and the stalled
+// region is neither forgotten nor allowed to make List itself lenient.
+func TestGlobalListReachableSkipsStalledRegion(t *testing.T) {
+	f := &fakeRegionsEC2{
+		instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}, "r-two-1": {"i-b": "c7a.2xlarge"}},
+		dead:      map[string]bool{"r-two-1": true},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	discovered(t, g)
+	g.markActive("r-one-1", time.Now().Add(time.Hour))
+	g.markActive("r-two-1", time.Now().Add(-time.Minute)) // due to be dropped once seen empty
+	defer func(d time.Duration) { regionListTimeout = d }(regionListTimeout)
+	regionListTimeout = 200 * time.Millisecond
+	start := time.Now()
+	ins, unlisted, err := g.ListReachable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("waited %s on the stalled region", d)
+	}
+	if len(ins) != 1 || ins[0].ID != "i-a" {
+		t.Fatalf("listed %v", ins)
+	}
+	if len(unlisted) != 1 || unlisted["r-two-1"] == nil || !strings.Contains(unlisted["r-two-1"].Error(), "no answer within 200ms") {
+		t.Fatalf("unlisted %v", unlisted)
+	}
+	if got := active(t, g); got != "r-one-1,r-two-1" {
+		t.Fatalf("a region that couldn't be listed was forgotten: %q", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := g.List(ctx); err == nil {
+		t.Fatal("List must still fail when a region can't be listed")
+	}
+}
+
+// A region that answers with an error is reported the same way, at once.
+func TestGlobalListReachableReportsRegionError(t *testing.T) {
+	f := &fakeRegionsEC2{
+		instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}, "r-two-1": {"i-b": "c7a.2xlarge"}},
+		listErr:   map[string]string{"r-two-1": "UnauthorizedOperation"},
+	}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	discovered(t, g)
+	g.markActive("r-one-1", time.Now().Add(time.Hour))
+	g.markActive("r-two-1", time.Now().Add(time.Hour))
+	ins, unlisted, err := g.ListReachable(context.Background())
+	if err != nil || len(ins) != 1 || ins[0].ID != "i-a" {
+		t.Fatalf("list = %v, %v", ins, err)
+	}
+	if e := unlisted["r-two-1"]; e == nil || !strings.Contains(e.Error(), "UnauthorizedOperation") {
+		t.Fatalf("unlisted %v", unlisted)
+	}
+}
+
 func TestGlobalListOnlyQueriesActiveRegions(t *testing.T) {
 	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-two-1": {"i-b": "c7a.2xlarge"}}}
 	g := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")

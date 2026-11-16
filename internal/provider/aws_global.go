@@ -1091,6 +1091,44 @@ func zoneWide(code string) bool {
 // such region can't be listed the whole listing fails, so the pool keeps
 // its last view instead of believing those instances gone.
 func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
+	out, unlisted, err := g.list(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(unlisted) > 0 {
+		return nil, joinRegionErrors(unlisted)
+	}
+	return out, nil
+}
+
+// regionListTimeout bounds how long ListReachable waits on one region.
+var regionListTimeout = 15 * time.Second
+
+// ListReachable lists every region List would, giving each at most
+// regionListTimeout, and returns what it found with the regions it
+// couldn't list. A region that failed is never forgotten: while any did,
+// the listing only records the instances it saw.
+func (g *AWSGlobal) ListReachable(ctx context.Context) ([]Instance, map[string]error, error) {
+	return g.list(ctx, regionListTimeout)
+}
+
+// list lists the regions that may hold instances. With each zero, it stops
+// at the first sign of a region it couldn't list and returns those
+// regions' errors with nothing else. With each set, it bounds every
+// region's queries by it and goes on with the regions it listed.
+func (g *AWSGlobal) list(ctx context.Context, each time.Duration) ([]Instance, map[string]error, error) {
+	bound := func(ctx context.Context) (context.Context, context.CancelFunc) {
+		if each <= 0 {
+			return ctx, func() {}
+		}
+		return context.WithTimeout(ctx, each)
+	}
+	slow := func(ctx context.Context, err error) error {
+		if each > 0 && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return fmt.Errorf("no answer within %s", each)
+		}
+		return err
+	}
 	var regions []string
 	discovered := false
 	if err := g.withState(func(st *placementState) {
@@ -1099,7 +1137,7 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 			regions = append(regions, r)
 		}
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if g.legacy {
 		regions = union(regions, []string{g.r.Region})
@@ -1108,17 +1146,19 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 		// No record yet of where instances may be: look everywhere once.
 		all, err := g.managedRegions(ctx)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		regions = union(regions, all)
 	}
 	var mu sync.Mutex
 	var out []Instance
 	empty := map[string]bool{}
-	errs := eachRegion(ctx, regions, func(ctx context.Context, rg string) error {
+	unlisted := eachRegion(ctx, regions, func(pctx context.Context, rg string) error {
+		ctx, cancel := bound(pctx)
+		defer cancel()
 		ins, err := g.Regional(rg).List(ctx)
 		if err != nil {
-			return err
+			return slow(pctx, err)
 		}
 		mu.Lock()
 		out = append(out, ins...)
@@ -1128,11 +1168,16 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 		mu.Unlock()
 		return nil
 	})
-	if len(errs) > 0 {
-		return nil, joinRegionErrors(errs)
+	if len(unlisted) > 0 && each <= 0 {
+		return nil, unlisted, nil
 	}
 	if err := g.remember(out); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if len(unlisted) > 0 {
+		// Forgetting or discovering regions needs every region's answer.
+		sortInstances(out)
+		return out, unlisted, nil
 	}
 	// The listing above has only schedulable VMs. Before forgetting a
 	// region (or, while discovering, passing over one), make sure it holds
@@ -1147,12 +1192,14 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 			}
 		}
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// A region that holds something, or that couldn't be checked, stays
 	// listed until it's clear.
 	held := map[string]bool{}
 	for rg := range eachRegion(ctx, check, func(ctx context.Context, rg string) error {
+		ctx, cancel := bound(ctx)
+		defer cancel()
 		if n, err := g.Regional(rg).leftovers(ctx); err != nil {
 			return err
 		} else if n > 0 {
@@ -1178,8 +1225,14 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 			}
 		}
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	sortInstances(out)
+	return out, nil, nil
+}
+
+// sortInstances orders a listing by state, then newest first.
+func sortInstances(out []Instance) {
 	sort.SliceStable(out, func(i, j int) bool {
 		ri, rj := stateRank(string(out[i].State)), stateRank(string(out[j].State))
 		if ri != rj {
@@ -1187,7 +1240,6 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 		}
 		return out[i].LaunchedAt.After(out[j].LaunchedAt)
 	})
-	return out, nil
 }
 
 // Launch starts one instance at the first option in launch order (see Rank)
