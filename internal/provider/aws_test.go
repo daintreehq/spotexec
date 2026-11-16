@@ -305,3 +305,47 @@ func TestQuerySlowCredentialsNotCutShort(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The canonical query sorts by parameter name, then value, and encodes
+// each the RFC 3986 way whatever escaping the URL used.
+func TestCanonicalQuery(t *testing.T) {
+	for _, c := range []struct{ raw, want string }{
+		{"", ""},
+		{"a-b=1&a=1", "a=1&a-b=1"},
+		{"a=2&a=1", "a=1&a=2"},
+		{"lifecycle", "lifecycle="},
+		{"t=a%7Eb&s=x%20y", "s=x%20y&t=a~b"},
+		{"t=a~b%2Fc", "t=a~b%2Fc"},
+	} {
+		if got := canonicalQuery(c.raw); got != c.want {
+			t.Errorf("canonicalQuery(%q) = %q, want %q", c.raw, got, c.want)
+		}
+	}
+}
+
+// SSM still rejecting refreshed credentials is a credential failure, not
+// the region's: launch must not cool regions down for it.
+func TestSSMExpiredCredsIsCredentialError(t *testing.T) {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"__type":"com.amazon.coral.service#ExpiredTokenException","message":"The security token included in the request is expired"}`)
+	}))
+	t.Cleanup(srv.Close)
+	c := &awsClient{region: "us-east-2", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AK", SecretAccessKey: "s"}},
+		http: srv.Client(), endpoints: map[string]string{"ssm": srv.URL + "/"}}
+	ctx := context.Background()
+	_, err := c.ssmGetParameter(ctx, "/aws/service/x")
+	var ce *CredentialError
+	if !errors.As(err, &ce) || awsCode(err) != "ExpiredTokenException" {
+		t.Fatalf("err = %T %v, want a CredentialError", err, err)
+	}
+	if n.Load() != 2 {
+		t.Fatalf("%d attempts, want 2 (one after refreshing)", n.Load())
+	}
+	var re *regionError
+	if errors.As(asRegionError(ctx, fmt.Errorf("resolve AMI: %w", err)), &re) {
+		t.Fatal("expired credentials became a region error")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -97,17 +98,40 @@ func trimAll(v []string) []string {
 	return out
 }
 
-// canonicalQuery sorts an already-encoded query string by key then value.
+// canonicalQuery turns a request's query string into SigV4 canonical form:
+// each name and value RFC 3986-encoded, sorted by name, then by value.
 func canonicalQuery(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	parts := strings.Split(raw, "&")
-	for i, p := range parts {
-		if !strings.Contains(p, "=") {
-			parts[i] = p + "=" // valueless subresources (?lifecycle) sign as "lifecycle="
+	type pair struct{ k, v string }
+	var pairs []pair
+	for _, p := range strings.Split(raw, "&") {
+		if p == "" {
+			continue
 		}
+		k, v, _ := strings.Cut(p, "=") // valueless subresources (?lifecycle) sign as "lifecycle="
+		pairs = append(pairs, pair{reencodeQuery(k), reencodeQuery(v)})
 	}
-	sort.Strings(parts)
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].k != pairs[j].k {
+			return pairs[i].k < pairs[j].k
+		}
+		return pairs[i].v < pairs[j].v
+	})
+	parts := make([]string, len(pairs))
+	for i, p := range pairs {
+		parts[i] = p.k + "=" + p.v
+	}
 	return strings.Join(parts, "&")
+}
+
+// reencodeQuery re-encodes one query component the way AWS does
+// (uriEncode), whatever escaping the URL used ("%7E" and "~" alike).
+func reencodeQuery(s string) string {
+	d, err := url.PathUnescape(s)
+	if err != nil {
+		return s
+	}
+	return uriEncode(d)
 }

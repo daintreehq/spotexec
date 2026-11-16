@@ -89,3 +89,39 @@ output = json
 		t.Errorf("unreadable config: %q %q", r, from)
 	}
 }
+
+// AWS_SHARED_CREDENTIALS_FILE and AWS_CONFIG_FILE expand ~ and $VARS
+// wherever they are read or written, as the AWS CLI does: setup must not
+// write a key to a literal ./~/.aws/credentials.
+func TestAWSFileEnvExpanded(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("SPOTEXEC_TEST_AWS", filepath.Join(home, "elsewhere"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", "~/.aws/credentials")
+	t.Setenv("AWS_CONFIG_FILE", "$SPOTEXEC_TEST_AWS/config")
+	wantCreds := filepath.Join(home, ".aws", "credentials")
+	wantCfg := filepath.Join(home, "elsewhere", "config")
+	if got := sharedCredentialsPath(); got != wantCreds {
+		t.Errorf("sharedCredentialsPath = %q, want %q", got, wantCreds)
+	}
+	if got := awsCredentialsFile(); got != wantCreds {
+		t.Errorf("awsCredentialsFile = %q, want %q", got, wantCreds)
+	}
+	if got, err := awsConfigPath(); err != nil || got != wantCfg {
+		t.Errorf("awsConfigPath = %q, %v; want %q", got, err, wantCfg)
+	}
+	if got := awsConfigFile(); got != wantCfg {
+		t.Errorf("awsConfigFile = %q, want %q", got, wantCfg)
+	}
+	os.MkdirAll(filepath.Dir(wantCreds), 0o700)
+	os.WriteFile(wantCreds, []byte("[work]\naws_access_key_id = AK\naws_secret_access_key = s\nregion = eu-west-3\n"), 0o600)
+	if c, err := readSharedCredentials("work"); err != nil || c.AccessKeyID != "AK" {
+		t.Errorf("readSharedCredentials = %+v, %v", c, err)
+	}
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	if r, _ := ProfileRegion("work"); r != "eu-west-3" {
+		t.Errorf("ProfileRegion = %q", r)
+	}
+}

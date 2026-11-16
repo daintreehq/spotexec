@@ -387,11 +387,12 @@ func TestTeardownNeedsAdmin(t *testing.T) {
 }
 
 func TestS3URL(t *testing.T) {
-	q := url.Values{"list-type": {"2"}, "continuation-token": {"a+b/c="}}
+	// RFC 3986, as SigV4 signs it: "~" bare, a space as %20.
+	q := url.Values{"list-type": {"2"}, "continuation-token": {"a+b/c=~d e"}}
 	for _, c := range []struct{ endpoint, region, bucket, want string }{
 		{"", "us-east-1", "", "https://s3.us-east-1.amazonaws.com/"},
-		{"", "eu-west-1", "spotexec-cache-1-eu-west-1", "https://spotexec-cache-1-eu-west-1.s3.eu-west-1.amazonaws.com/?continuation-token=a%2Bb%2Fc%3D&list-type=2"},
-		{"http://127.0.0.1:9/", "eu-west-1", "b", "http://127.0.0.1:9/b/?continuation-token=a%2Bb%2Fc%3D&list-type=2"},
+		{"", "eu-west-1", "spotexec-cache-1-eu-west-1", "https://spotexec-cache-1-eu-west-1.s3.eu-west-1.amazonaws.com/?continuation-token=a%2Bb%2Fc%3D~d%20e&list-type=2"},
+		{"http://127.0.0.1:9/", "eu-west-1", "b", "http://127.0.0.1:9/b/?continuation-token=a%2Bb%2Fc%3D~d%20e&list-type=2"},
 	} {
 		qq := q
 		if c.bucket == "" {

@@ -25,7 +25,7 @@ type ImageRegistry interface {
 // in its default docker config.
 func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.RegistryAuth, error) {
 	name := "spotexec/" + ecrName(repoID)
-	marker := filepath.Join(a.dir, "ecr-"+a.r.Region+"-"+a.r.Profile+"-"+strings.ReplaceAll(name, "/", "_"))
+	marker := filepath.Join(a.dir, "ecr-"+fileSafe(a.r.Region)+"-"+fileSafe(a.r.Profile)+"-"+strings.ReplaceAll(name, "/", "_"))
 	uri := ""
 	// The cached URI saves two API calls per image, but expires: a deleted
 	// repository must be recreated, or every push would fail.

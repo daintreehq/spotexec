@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -94,5 +95,27 @@ func TestEnsureBucketGivesUp(t *testing.T) {
 				t.Fatalf("lifecycle PUTs = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// A profile name is one file name component: "corp/dev" neither needs a
+// directory nor shares a file with "corp_dev"; ordinary names keep theirs.
+func TestFileSafe(t *testing.T) {
+	for in, want := range map[string]string{"work": "work", "corp/dev": "corp%2Fdev", "a\\b": "a%5Cb", "..": "..", "x%y": "x%25y", "us-east-2": "us-east-2"} {
+		if got := fileSafe(in); got != want {
+			t.Errorf("fileSafe(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestAccountIDSlashProfile(t *testing.T) {
+	a, _ := fakeCacheBucketAWS(t, func(int) (int, string) { return 200, "" })
+	a.r.Profile = "corp/../dev"
+	if acct, err := a.accountID(context.Background()); err != nil || acct != "123456789012" {
+		t.Fatalf("accountID = %q, %v", acct, err)
+	}
+	ents, _ := os.ReadDir(a.dir)
+	if len(ents) != 1 || ents[0].IsDir() || !strings.HasPrefix(ents[0].Name(), "account-id-corp%2F..%2Fdev-") {
+		t.Fatalf("state dir holds %v", ents)
 	}
 }

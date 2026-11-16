@@ -190,7 +190,7 @@ func parseProcessCredentials(b []byte) (awsCreds, error) {
 
 func sharedCredentialsPath() string {
 	if p := os.Getenv("AWS_SHARED_CREDENTIALS_FILE"); p != "" {
-		return p
+		return expandAWSPath(p)
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".aws", "credentials")
