@@ -10,7 +10,7 @@
 | `release/<version>` | Optional release stabilisation, branched from `develop` and merged into `main`, then back into `develop`. |
 | `hotfix/<name>` | Urgent fixes, branched from `main` and merged into `main`, then back into `develop`. |
 
-CI (build, vet, race tests on Linux and macOS) runs on every push to `main` and `develop`, and on every pull request into either.
+CI (build, vet, race tests on Linux and macOS, plus the Docker end-to-end suites on Linux) runs on every push to `main` and `develop`, and on every pull request into `main`, `develop` or a `release/*` branch.
 
 ## Development
 
@@ -36,9 +36,9 @@ git push origin v0.2.0
 git checkout develop && git merge main && git push origin develop   # keep develop in step
 ```
 
-CI also builds a snapshot of the release on every push and pull request and smoke-tests what users install (the archive, `sx`, completions and the Linux packages). To do the same locally: `goreleaser release --snapshot --clean --skip=publish && ./scripts/smoke-release.sh`.
+CI also builds a snapshot of the release on every push and pull request and smoke-tests what users install (the archive, `sx`, completions and the Linux packages). To do the same locally: `goreleaser release --snapshot --clean --skip=publish && ./scripts/smoke-release.sh`. CI and the Release workflow pin GoReleaser to one version (in both workflow files) so an upgrade can't change a release unannounced; bump it in both places together.
 
-The tag starts the [Release workflow](.github/workflows/release.yml). It refuses a tag that isn't on `main`, runs the tests, and then runs [GoReleaser](.goreleaser.yaml), which:
+The tag starts the [Release workflow](.github/workflows/release.yml). It refuses a tag that isn't on `main`, builds the embedded helpers, runs vet and the race tests, and then runs [GoReleaser](.goreleaser.yaml), which:
 - builds `spotexec` for macOS and Linux (amd64, arm64) with the remote helpers embedded;
 - publishes a GitHub release with tarballs, `.deb`/`.rpm`/`.apk` packages, checksums and a changelog;
 - updates the formula in [daintreehq/homebrew-tap](https://github.com/daintreehq/homebrew-tap), so `brew upgrade spotexec` picks the release up.
@@ -48,4 +48,4 @@ The tap is written with a deploy key that can only write to that repository. Its
 2. Add the public key as a write-enabled deploy key on `homebrew-tap`.
 3. Replace the secret, then delete the old key.
 
-Versions follow [semantic versioning](https://semver.org). Commit subjects use conventional prefixes (`feat:`, `fix:`, `docs:`, `build:`, `refactor:`, `test:`). `docs:`, `test:` and `chore:` commits are left out of release notes.
+Versions follow [semantic versioning](https://semver.org). Commit subjects use conventional prefixes (`feat:`, `fix:`, `docs:`, `build:`, `refactor:`, `test:`). Release notes leave out `docs`, `test`, `chore`, `style`, `ci`, `build` and `release` commits, scoped or not (`test(transport): ...`), and merge commits.

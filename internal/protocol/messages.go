@@ -310,7 +310,7 @@ type Exec struct {
 	TimeoutMS int64             `json:"timeout_ms"`
 	GraceMS   int64             `json:"grace_ms"`
 	Snapshot  bool              `json:"snapshot"` // compute mutations (and track created files)
-	Skip      []string          `json:"skip"`     // dir names/paths skipped by the post-run walk
+	Skip      []string          `json:"skip"`     // dirs the post-run walk skips: a bare name at any depth, "/name" or a path/glob from the root
 	SpotWatch bool              `json:"spot_watch"`
 	Container *ContainerRun     `json:"container,omitempty"`
 	// SetupRun ([setup] run) runs as its own process, from the workspace

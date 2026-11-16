@@ -28,7 +28,7 @@ func ProfileRegion(profile string) (region, from string) {
 	}
 	// As in the AWS CLI, a profile's settings in the credentials file win
 	// over those in the config file.
-	if r, src := iniRegion(expandAWSPath(sharedCredentialsPath()), []string{profile, `"` + profile + `"`}, profile); r != "" {
+	if r, src := iniRegion(sharedCredentialsPath(), []string{profile, `"` + profile + `"`}, profile); r != "" {
 		return r, src
 	}
 	cfg, err := awsConfigPath()
@@ -39,7 +39,7 @@ func ProfileRegion(profile string) (region, from string) {
 	if profile == "default" {
 		sections = append(sections, "profile default") // common spelling
 	}
-	return iniRegion(expandAWSPath(cfg), sections, profile)
+	return iniRegion(cfg, sections, profile)
 }
 
 // iniRegion reads region from the first of sections found in path.
@@ -74,4 +74,56 @@ func expandAWSPath(p string) string {
 		}
 	}
 	return p
+}
+
+// AWS partitions spotexec supports: the commercial one and GovCloud (US).
+// Each is a separate set of accounts with its own IAM, so account-wide
+// calls (IAM, STS, S3 ListBuckets) go to the partition's own home region.
+const (
+	partitionAWS    = "aws"
+	partitionGovUS  = "aws-us-gov"
+	homeAWS         = "us-east-1"
+	homeGovUS       = "us-gov-west-1"
+	iamEndpointAWS  = "https://iam.amazonaws.com/"
+	iamEndpointGov  = "https://iam.us-gov.amazonaws.com/"
+	partitionPrefix = `"arn:aws:`
+)
+
+// partitionOf is the partition region belongs to.
+func partitionOf(region string) string {
+	if strings.HasPrefix(region, "us-gov-") {
+		return partitionGovUS
+	}
+	return partitionAWS
+}
+
+// accountRegion is the region account-wide calls use for region's
+// partition: where its IAM is signed and STS and S3 are asked.
+func accountRegion(region string) string {
+	if partitionOf(region) == partitionGovUS {
+		return homeGovUS
+	}
+	return homeAWS
+}
+
+// AccountRegion picks the account-wide region for an admin session that
+// works in regions (any one partition), else in profile's region, else in
+// the commercial partition. Regions from two partitions are an error: one
+// session can't reach both.
+func AccountRegion(profile string, regions []string) (string, error) {
+	for _, rg := range regions {
+		if partitionOf(rg) != partitionOf(regions[0]) {
+			return "", fmt.Errorf("regions %s and %s are in different AWS partitions (GovCloud and commercial), which need separate accounts and admin sessions: work with one partition at a time", regions[0], rg)
+		}
+	}
+	if len(regions) > 0 {
+		return accountRegion(regions[0]), nil
+	}
+	rg, _ := ProfileRegion(profile)
+	return accountRegion(rg), nil
+}
+
+// PolicyFor is SpotexecPolicy with its ARNs in region's partition.
+func PolicyFor(region string) string {
+	return strings.ReplaceAll(SpotexecPolicy, partitionPrefix, `"arn:`+partitionOf(region)+`:`)
 }

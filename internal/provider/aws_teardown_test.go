@@ -37,6 +37,7 @@ type fakeCloud struct {
 	busySG    map[string]int             // DependencyViolation this many times
 	deleted   []string                   // "kind id", in order
 	s3owner   []string                   // x-amz-expected-bucket-owner seen
+	listedIn  []string                   // the region each ListBuckets call was signed for
 }
 
 func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, service string, body []byte) bool {
@@ -53,6 +54,7 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 		}
 		switch {
 		case bucket == "" && r.Method == http.MethodGet:
+			c.listedIn = append(c.listedIn, region)
 			// Two buckets per page, to exercise paging.
 			names := make([]string, 0, len(c.buckets))
 			for b := range c.buckets {
@@ -137,7 +139,7 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 	tagged := func(tags map[string]string) bool { return tags[tagOwner] != "" }
 	switch v.Get("Action") {
 	case "DescribeRegions":
-		fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo><item><regionName>us-west-2</regionName></item><item><regionName>us-east-2</regionName></item></regionInfo></DescribeRegionsResponse>`)
+		fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo><item><regionName>us-west-2</regionName></item><item><regionName>us-east-2</regionName><optInStatus>opt-in-not-required</optInStatus></item><item><regionName>ap-east-1</regionName><optInStatus>not-opted-in</optInStatus></item></regionInfo></DescribeRegionsResponse>`)
 	case "DescribeImages":
 		if v.Get("Owner.1") != "self" || v.Get("Filter.1.Value.1") != tagOwner {
 			fail(400, "BadFilter")
@@ -347,6 +349,51 @@ func TestTeardown(t *testing.T) {
 	}
 }
 
+// A GovCloud teardown signs in to that partition: the admin check, IAM and
+// the bucket listing go to us-gov-west-1, never the commercial us-east-1.
+func TestTeardownGovCloud(t *testing.T) {
+	c := newFakeCloud(t)
+	c.instances["AK-admin"] = map[string][]fakeAcctInstance{"us-gov-east-1": c.instances["AK-admin"]["us-east-2"]}
+	c.buckets["spotexec-cache-111111111111-us-gov-east-1"] = map[string]bool{}
+	p, err := PlanTeardown(context.Background(), "admin", []string{"us-gov-east-1"})
+	if err != nil || p.Err() != nil {
+		t.Fatalf("%v %v", err, p.Err())
+	}
+	var got []string
+	for _, it := range p.Items {
+		if it.Kind == KindInstance || it.Kind == KindBucket {
+			got = append(got, it.ID)
+		}
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "i-bake,i-run,spotexec-cache-111111111111-us-gov-east-1" {
+		t.Fatalf("plan %v", got)
+	}
+	if err := p.Apply(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	// IAM is GovCloud's one endpoint; STS may also be asked regionally.
+	for _, s := range c.signed {
+		if !strings.Contains(s, " us-gov-") || strings.HasPrefix(s, "iam ") && !strings.HasSuffix(s, " us-gov-west-1") {
+			t.Fatalf("call outside GovCloud's IAM home: %v", c.signed)
+		}
+	}
+	if c.signed[0] != "sts GetCallerIdentity us-gov-west-1" {
+		t.Fatalf("the admin session was checked in %v", c.signed[0])
+	}
+	if len(c.listedIn) == 0 || len(c.signed) == 0 {
+		t.Fatalf("ListBuckets %v, IAM/STS %v", c.listedIn, c.signed)
+	}
+	for _, rg := range c.listedIn {
+		if rg != "us-gov-west-1" {
+			t.Fatalf("ListBuckets signed in %v", c.listedIn)
+		}
+	}
+	if _, err := PlanTeardown(context.Background(), "admin", []string{"us-gov-east-1", "us-east-2"}); err == nil {
+		t.Fatal("mixed partitions accepted")
+	}
+}
+
 // What can't be deleted is reported, the rest still goes, and a re-run
 // finishes the job.
 func TestTeardownFailures(t *testing.T) {
@@ -387,11 +434,13 @@ func TestTeardownNeedsAdmin(t *testing.T) {
 }
 
 func TestS3URL(t *testing.T) {
-	q := url.Values{"list-type": {"2"}, "continuation-token": {"a+b/c="}}
+	// RFC 3986, as SigV4 signs it: "~" bare, a space as %20.
+	q := url.Values{"list-type": {"2"}, "continuation-token": {"a+b/c=~d e"}}
 	for _, c := range []struct{ endpoint, region, bucket, want string }{
 		{"", "us-east-1", "", "https://s3.us-east-1.amazonaws.com/"},
-		{"", "eu-west-1", "spotexec-cache-1-eu-west-1", "https://spotexec-cache-1-eu-west-1.s3.eu-west-1.amazonaws.com/?continuation-token=a%2Bb%2Fc%3D&list-type=2"},
-		{"http://127.0.0.1:9/", "eu-west-1", "b", "http://127.0.0.1:9/b/?continuation-token=a%2Bb%2Fc%3D&list-type=2"},
+		{"", "us-gov-west-1", "", "https://s3.us-gov-west-1.amazonaws.com/"},
+		{"", "eu-west-1", "spotexec-cache-1-eu-west-1", "https://spotexec-cache-1-eu-west-1.s3.eu-west-1.amazonaws.com/?continuation-token=a%2Bb%2Fc%3D~d%20e&list-type=2"},
+		{"http://127.0.0.1:9/", "eu-west-1", "b", "http://127.0.0.1:9/b/?continuation-token=a%2Bb%2Fc%3D~d%20e&list-type=2"},
 	} {
 		qq := q
 		if c.bucket == "" {

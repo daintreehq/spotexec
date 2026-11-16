@@ -310,7 +310,7 @@ func TestShareWaitEndsWhenTheClientIsGone(t *testing.T) {
 	shareTick = 10 * time.Millisecond
 	t.Cleanup(func() { shareTick = old })
 	s, _ := shareSession(t)
-	s.lastSeen.Store(time.Now().Add(-time.Hour).UnixNano())
+	s.lastSeen.Store(s.now() - int64(time.Hour))
 	tr, _ := pending()
 	s.track(protocol.ShareDeps, tr)
 	err := s.shareWait(protocol.ShareWait{Kind: protocol.ShareDeps, TimeoutMS: 60000})
@@ -389,5 +389,77 @@ func TestImageProbe(t *testing.T) {
 				t.Fatalf("probe built the image: %v", err)
 			}
 		})
+	}
+}
+
+// A slot whose venvs an older helper relocated (text files only) has its
+// symlinks into the cache's origin workspace relocated on its next run.
+func TestDepsRelocatesVenvLinksOfOlderSlots(t *testing.T) {
+	s, out := depsSession(t)
+	d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p .venv && touch .venv/pyvenv.cfg", CacheDirs: []string{".venv"}}
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	var res protocol.DepsResult
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if !res.Built || s.state.VenvRelocation != venvRelocation {
+		t.Fatalf("first run: %+v, state %+v", res, s.state)
+	}
+	// As hydrated from a cache built in /old/ws by a helper that left links.
+	if err := os.WriteFile(filepath.Join(s.layout.Deps(s.repoID), res.Key, originFile), []byte("/old/ws\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(s.workspace, ".venv", "tool")
+	if err := os.Symlink("/old/ws/bin/tool", link); err != nil {
+		t.Fatal(err)
+	}
+	s.state.VenvRelocation = 0
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	ws, _ := filepath.EvalSymlinks(s.workspace)
+	if got, _ := os.Readlink(link); got != ws+"/bin/tool" {
+		t.Fatalf("link -> %s", got)
+	}
+	if st := loadSlotState(s.slotDir); st.VenvRelocation != venvRelocation || st.DepsKey != res.Key {
+		t.Fatalf("saved state %+v", st)
+	}
+}
+
+// A slot an older helper relocated from a cache that doesn't record its
+// origin can't say where its venv's links point any more: it is hydrated
+// afresh from the cache rather than marked relocated as it is.
+func TestDepsRehydratesOlderSlotsOfUnknownOrigin(t *testing.T) {
+	s, out := depsSession(t)
+	d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p .venv && touch .venv/pyvenv.cfg", CacheDirs: []string{".venv"}}
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	var res protocol.DepsResult
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if err := os.Remove(filepath.Join(s.layout.Deps(s.repoID), res.Key, originFile)); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(s.workspace, ".venv", "tool")
+	if err := os.Symlink("/old/ws/bin/tool", stale); err != nil {
+		t.Fatal(err)
+	}
+	s.state.VenvsRelocated, s.state.VenvRelocation = true, 0
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if !res.Hydrated {
+		t.Fatalf("not hydrated afresh: %+v", res)
+	}
+	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
+		t.Fatalf("the old copy's link survived: %v", err)
+	}
+	if st := loadSlotState(s.slotDir); st.VenvRelocation != venvRelocation || st.DepsKey != res.Key {
+		t.Fatalf("saved state %+v", st)
 	}
 }

@@ -698,8 +698,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	for k, v := range o.Env {
 		env[k] = v
 	}
-	skip := append([]string{}, manifest.HeavyDirs...)
-	skip = append(skip, p.Deps.CacheDirs...)
+	skip := manifest.SnapshotSkip(p.Deps.CacheDirs)
 	ex := protocol.Exec{
 		Shell: o.Command, Cwd: ws.Cwd, Env: env, Setup: r.RemotePathSetup,
 		TimeoutMS: o.Timeout.Milliseconds(), GraceMS: o.Grace.Milliseconds(),
@@ -759,13 +758,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		// Count the doomed instance as draining right away so the pool may
 		// launch its replacement even at max_instances.
 		NewPool(r, f).Observe(lease.InstanceID, OutDraining, time.Time{})
-		spare := req
-		spare.Exclude = map[string]bool{lease.InstanceID: true}
-		for k := range att.exclude {
-			spare.Exclude[k] = true
-		}
-		spare.Base.Fingerprint = ""
-		spare.Base.Exclusive = false
+		spare := spareRequest(req, lease.InstanceID, att.exclude)
 		var sctx context.Context
 		sctx, stopWarm = context.WithTimeout(context.WithoutCancel(ctx), r.BootTimeout.Duration+2*time.Minute)
 		go func() { defer close(warmDone); EnsureSpare(sctx, spare) }()
@@ -815,7 +808,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// the rest stay pending until written back or removed by the next sync.
 	var ignoredCreated map[string]bool
 	if m != nil && len(result.Created) > 0 {
-		ignoredCreated = settleCreated(post, sess, m, result.Created)
+		ignoredCreated = settleCreated(post, sess, ws, m, result.Created)
 	}
 	if m != nil && len(result.Unverified) > 0 {
 		o.Rep.Warn("UNVERIFIED", "%d file(s) could not be read on the runner after the run and were not written back: %s", len(result.Unverified), strings.Join(firstN(result.Unverified, 5), ", "))
@@ -955,6 +948,10 @@ func reportConflicts(rep ui.Reporter, stashed []Conflict, runID string) {
 			ev["reason"] = c.Reason
 		}
 		switch {
+		case c.Reason == ReasonSpotexecConfig && c.Deleted:
+			rep.Warn("WRITEBACK_CONFIG", "the remote command deleted %s, spotexec's own config; kept it here, since a runner may not change spotexec's configuration (delete it yourself if that was intended)", printable(c.Path))
+		case c.Reason == ReasonSpotexecConfig:
+			rep.Warn("WRITEBACK_CONFIG", "the remote command wrote %s, spotexec's own config; not applied, since a runner may not change spotexec's configuration (the next run would load it). Review its version, and copy it over yourself if you want it: %s", printable(c.Path), diff)
 		case c.With != "":
 			// Two remote names, one local file: say which landed, and spell
 			// out names that only differ in Unicode normalisation.
@@ -1060,6 +1057,21 @@ func classifyExec(r protocol.Result) execOutcome {
 		return execCanceled
 	}
 	return execCompleted
+}
+
+// spareRequest is what warming capacity for a replay of req asks for, when
+// the VM it runs on (doomed) announced its reclamation: room anywhere but
+// that VM and those lost before, for the same kind of run. An --exclusive
+// run needs a whole VM, so its spare must too: one free slot on a busy VM
+// would satisfy a shared spare and launch nothing (#162).
+func spareRequest(req AcquireRequest, doomed string, lost map[string]bool) AcquireRequest {
+	spare := req
+	spare.Exclude = map[string]bool{doomed: true}
+	for k := range lost {
+		spare.Exclude[k] = true
+	}
+	spare.Base.Fingerprint = ""
+	return spare
 }
 
 // shutdownRunner is what to exclude from a replay when the VM shut down
@@ -1178,8 +1190,10 @@ func underSyncedFile(m *manifest.Manifest, p string) bool {
 
 // settleCreated tells the helper which files the run created are ignored
 // here, and returns that set (nil if it couldn't be determined: write-back
-// then checks again and reports the error).
-func settleCreated(ctx context.Context, s *transport.Session, m *manifest.Manifest, created []protocol.Entry) map[string]bool {
+// then checks again and reports the error). A reserved path (spotexec's own
+// state in a non-Git .spotexec/) is ignored but never settled: write-back
+// refuses it, and it stays pending so the next sync removes it.
+func settleCreated(ctx context.Context, s *transport.Session, ws *Workspace, m *manifest.Manifest, created []protocol.Entry) map[string]bool {
 	paths := make([]string, 0, len(created))
 	for _, c := range created {
 		if _, err := fsid.CleanRel(c.Path); err == nil {
@@ -1192,7 +1206,7 @@ func settleCreated(ctx context.Context, s *transport.Session, m *manifest.Manife
 	}
 	var keep []string
 	for _, p := range paths {
-		if ign[p] {
+		if ign[p] && !reservedPath(p, ws.Git) {
 			keep = append(keep, p)
 		}
 	}
@@ -1316,19 +1330,34 @@ func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 	if !fi.Mode().IsRegular() {
 		return protocol.Entry{}, fmt.Errorf("%s is no longer a regular file; re-run", name)
 	}
-	b, err := os.ReadFile(full)
+	// Streamed, never read whole, and hashed as it goes: the entry is for
+	// exactly the bytes in the tar.
+	f, err := os.Open(full)
 	if err != nil {
 		return protocol.Entry{}, err
+	}
+	defer f.Close()
+	if fi, err = f.Stat(); err != nil {
+		return protocol.Entry{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		return protocol.Entry{}, fmt.Errorf("%s is no longer a regular file; re-run", name)
 	}
 	mode, emode := int64(0o644), fsid.ModeFile
 	if fi.Mode()&0o111 != 0 {
 		mode, emode = 0o755, fsid.ModeExec
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Size: int64(len(b)), Mode: mode, ModTime: fi.ModTime()}); err != nil {
+	size := fi.Size()
+	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Size: size, Mode: mode, ModTime: fi.ModTime()}); err != nil {
 		return protocol.Entry{}, err
 	}
-	_, err = tw.Write(b)
-	return protocol.Entry{Path: name, ID: fsid.Bytes(b), Mode: emode, Size: int64(len(b))}, err
+	// A file that grows meanwhile is cut at the header's size (the hash
+	// covers what was sent); one that shrinks can't fill the entry.
+	id, err := fsid.Reader(io.TeeReader(io.LimitReader(f, size), tw), size)
+	if err != nil {
+		return protocol.Entry{}, fmt.Errorf("sending %s: %w; re-run", name, err)
+	}
+	return protocol.Entry{Path: name, ID: id, Mode: emode, Size: size}, nil
 }
 
 func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string, m *manifest.Manifest) (protocol.DepsResult, error) {

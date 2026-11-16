@@ -204,3 +204,90 @@ func TestRelocateVenvLinks(t *testing.T) {
 		}
 	}
 }
+
+// Symlinks into the workspace the venv was built in (an interpreter or a
+// package that lives in the project) follow it to the new workspace;
+// relative links and links elsewhere stay as they are.
+func TestRelocateVenvSymlinkTargets(t *testing.T) {
+	root := t.TempDir()
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
+	}
+	wsA, wsB := filepath.Join(root, "a"), filepath.Join(root, "b")
+	v := filepath.Join(wsB, ".venv")
+	sp := filepath.Join(v, "lib", "python3.12", "site-packages")
+	for _, d := range []string{filepath.Join(v, "bin"), sp, filepath.Join(wsB, "src", "pkg")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(v, "pyvenv.cfg"), []byte("home = "+wsA+"/.python/bin\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The project's .pth, in the new workspace, says where it came from:
+	// it is the project's file, not the venv's to rewrite.
+	pth := filepath.Join(wsB, "src", "proj.pth")
+	if err := os.WriteFile(pth, []byte(wsA+"/src\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The workspace links to a uv cache outside it.
+	if err := os.MkdirAll(filepath.Join(root, "uv-cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "uv-cache", "ext.pth"), []byte(wsA+"/src\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "uv-cache"), filepath.Join(wsB, "cache")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(wsB, "cache", "ext.pth"), filepath.Join(sp, "ext.pth")); err != nil {
+		t.Fatal(err)
+	}
+	links := map[string]struct{ target, want string }{
+		"bin/python":                            {wsA + "/.python/bin/python3", wsB + "/.python/bin/python3"},
+		"bin/python3":                           {"/usr/bin/python3", "/usr/bin/python3"},
+		"bin/py":                                {"python", "python"},
+		"bin/tool":                              {wsA + "2/bin/tool", wsA + "2/bin/tool"}, // not under wsA
+		"bin/ws":                                {wsA, wsB},
+		"lib/python3.12/site-packages/pkg":      {wsA + "/src/pkg", wsB + "/src/pkg"},
+		"lib/python3.12/site-packages/proj.pth": {wsA + "/src/proj.pth", wsB + "/src/proj.pth"},
+	}
+	for rel, l := range links {
+		if err := os.Symlink(l.target, filepath.Join(v, rel)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := relocateVenvs(v, ".venv", []string{wsA}, wsB); err != nil {
+		t.Fatal(err)
+	}
+	for rel, l := range links {
+		got, err := os.Readlink(filepath.Join(v, rel))
+		if err != nil {
+			t.Fatalf("%s: %v", rel, err)
+		}
+		if got != l.want {
+			t.Errorf("%s -> %s, want %s", rel, got, l.want)
+		}
+	}
+	if b, _ := os.ReadFile(pth); string(b) != wsA+"/src\n" {
+		t.Errorf("wrote through a relocated link into the project: %q", b)
+	}
+	// Into the workspace only on paper (through a link to elsewhere): it
+	// is rewritten as a file of its own, never written through.
+	if b, _ := os.ReadFile(filepath.Join(sp, "ext.pth")); string(b) != wsB+"/src\n" {
+		t.Errorf("ext.pth = %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "uv-cache", "ext.pth")); string(b) != wsA+"/src\n" {
+		t.Errorf("wrote through into the uv cache: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(v, "pyvenv.cfg")); string(b) != "home = "+wsB+"/.python/bin\n" {
+		t.Errorf("pyvenv.cfg = %q", b)
+	}
+	// Again (a retried relocation): nothing moves twice.
+	if err := relocateVenvs(v, ".venv", []string{wsA}, wsB); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.Readlink(filepath.Join(v, "bin/python")); got != wsB+"/.python/bin/python3" {
+		t.Errorf("relocated again: %s", got)
+	}
+}

@@ -47,15 +47,30 @@ var BuiltinExcludes = []string{
 // project's .spotexec/ (write-back lock, stashed conflicts, backups), a
 // nested project's included. It is matched case-insensitively, as macOS and
 // Windows filesystems resolve it.
-var NeverSync = append(append([]string{}, config.CredentialDirs...), "**/.spotexec/conflicts/", "**/.spotexec/backup/", "**/.spotexec/writeback.lock")
+var NeverSync = append(append([]string{}, config.CredentialDirs...), "**/.spotexec/conflicts/", "**/.spotexec/backup/", "**/.spotexec/spool/", "**/.spotexec/writeback.lock")
 
 var textAttr = regexp.MustCompile(`(^|\s)-?(text|crlf)(=|\s|$)`)
 
 // HeavyDirs are skipped by the remote post-run walk (they are build outputs
-// or dependency trees, never source).
+// or dependency trees, never source). A bare name is skipped at any depth;
+// "/target" only at the root, as BuiltinExcludes anchors it. .spotexec/ is
+// walked: project files in it sync, so a run's new ones come back too.
 var HeavyDirs = []string{
-	".git", "node_modules", ".venv", "venv", "__pycache__", ".next", ".turbo", "target",
-	".cache", ".pytest_cache", ".mypy_cache", ".gradle", ".spotexec",
+	".git", "node_modules", ".venv", "venv", "__pycache__", ".next", ".turbo", "/target",
+	".cache", ".pytest_cache", ".mypy_cache", ".gradle",
+}
+
+// SnapshotSkip is what the remote post-run walk skips: HeavyDirs, plus each
+// deps.cache_dirs entry anchored at the root, as Build anchors Protect (so
+// "build" or "./build" skips build/ but not cmd/build/).
+func SnapshotSkip(cacheDirs []string) []string {
+	skip := append([]string{}, HeavyDirs...)
+	for _, p := range cacheDirs {
+		if p = strings.Trim(strings.TrimPrefix(p, "./"), "/"); p != "" {
+			skip = append(skip, "/"+p)
+		}
+	}
+	return skip
 }
 
 // Options controls enumeration.
@@ -64,12 +79,14 @@ type Options struct {
 	Exclude []string // [sync].exclude patterns
 	Source  string   // "", "git" or "directory"
 	Protect []string // cache dirs never synced (deps.cache_dirs)
-	// Include lists repo-relative files and directories synced even where
-	// a built-in exclude covers them, Git or not: the container's
-	// Dockerfile, its .dockerignore and its build context (.spotexec/ by
-	// default). Below a directory listed here only the built-in excludes
-	// that match inside it apply. [sync].exclude still applies, and
-	// NeverSync always does.
+	// Include lists the container's build inputs: repo-relative files
+	// (the Dockerfile, its .dockerignore files) synced even where Git
+	// ignores them or a built-in exclude covers them, and directories (its
+	// build context, .spotexec/ by default). Every file in a directory
+	// under .spotexec/ syncs, Git or not; any other directory follows the
+	// usual rules, .gitignore included. Below a directory listed here only
+	// the built-in excludes that match inside it apply. [sync].exclude
+	// still applies, and NeverSync always does.
 	Include []string
 }
 
@@ -203,10 +220,14 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 			return nil, err
 		}
 	}
-	// The container's build inputs: the Dockerfile and .dockerignore, and
-	// every file in the build context, are needed to build the image. Sync
-	// them even when Git ignores them (git status doesn't list them) or
-	// they sit in a built-in excluded directory.
+	// The container's build inputs: the Dockerfile and its .dockerignore
+	// files sync even when Git ignores them (git status doesn't list them)
+	// or they sit in a built-in excluded directory, and so does every file
+	// in a build directory under .spotexec/, spotexec's own place for
+	// container support files. Any other directory (a Dockerfile or
+	// context in services/api) holds ordinary project source: the usual
+	// rules apply there, so what Git ignores (secrets, build outputs)
+	// stays local.
 	listed := make(map[string]bool, len(cands))
 	for _, c := range cands {
 		listed[c.path] = true
@@ -227,7 +248,7 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		case err != nil:
 		case fi.Mode().IsRegular() || fi.Mode()&fs.ModeSymlink != 0:
 			add(r)
-		case fi.IsDir():
+		case fi.IsDir() && inSpotexecDir(r):
 			err := filepath.WalkDir(full, func(p string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
@@ -411,7 +432,9 @@ func statusDirty(ctx context.Context, root string) (map[string]bool, []string, e
 
 // hasWorktreeFilters reports whether any .gitattributes declares content
 // transformations (filters, eol, encodings), in which case index blob IDs do
-// not describe worktree bytes and everything must be hashed from disk.
+// not describe worktree bytes and everything must be hashed from disk. Git
+// reads .gitattributes from the worktree whether it is tracked, untracked or
+// ignored, so every directory above an indexed file is looked at.
 func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 	check := func(p string) bool {
 		b, err := os.ReadFile(p)
@@ -425,11 +448,36 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 			strings.Contains(s, "working-tree-encoding") || strings.Contains(s, "ident") ||
 			textAttr.MatchString(s)
 	}
+	dirs := map[string]bool{".": true}
 	for p := range staged {
-		if p == ".gitattributes" || strings.HasSuffix(p, "/.gitattributes") {
-			if check(filepath.Join(root, filepath.FromSlash(p))) {
-				return true
-			}
+		// Each directory's ancestors were added with it.
+		for d := path.Dir(p); !dirs[d]; d = path.Dir(d) {
+			dirs[d] = true
+		}
+	}
+	for d := range dirs {
+		if check(filepath.Join(root, filepath.FromSlash(d), ".gitattributes")) {
+			return true
+		}
+	}
+	// The global attributes file (core.attributesFile, by default
+	// $XDG_CONFIG_HOME/git/attributes) applies to every repository. Git
+	// reads a relative core.attributesFile from the worktree root.
+	if out, err := exec.Command("git", "-C", root, "config", "--path", "--get", "core.attributesFile").Output(); err == nil {
+		f := strings.TrimSpace(string(out))
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(root, f)
+		}
+		if check(f) {
+			return true
+		}
+	} else if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		if check(filepath.Join(x, "git", "attributes")) {
+			return true
+		}
+	} else if h := gitHome(); h != "" {
+		if check(filepath.Join(h, ".config", "git", "attributes")) {
+			return true
 		}
 	}
 	if gd, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output(); err == nil {
@@ -442,6 +490,16 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 		}
 	}
 	return false
+}
+
+// gitHome is the home directory Git uses: $HOME when set (Git for Windows
+// too), else the OS's own.
+func gitHome() string {
+	if h := os.Getenv("HOME"); h != "" {
+		return h
+	}
+	h, _ := os.UserHomeDir()
+	return h
 }
 
 func isGitWorktree(ctx context.Context, root string) bool {
@@ -610,6 +668,14 @@ func (x *spotExcluder) Match(p string, isDir bool) bool {
 		return x.builtin.MatchBelow(p, isDir, strings.Count(best, "/")+1)
 	}
 	return x.builtin.Match(p, isDir)
+}
+
+// inSpotexecDir reports whether the cleaned relative path r is the
+// project's .spotexec directory or inside it (any case, as macOS and Windows
+// filesystems resolve it).
+func inSpotexecDir(r string) bool {
+	first, _, _ := strings.Cut(r, "/")
+	return strings.EqualFold(first, ".spotexec")
 }
 
 // isNestedRepo reports whether dir is another repository's worktree (a

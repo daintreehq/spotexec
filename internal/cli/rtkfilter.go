@@ -22,9 +22,10 @@ var rtkMaxSpool int64 = 256 << 20
 
 // rtkOutput holds a command's stdout for RTK to compact (`rtk pipe -f NAME`)
 // once the command is done: RTK's filters summarize a whole run, so nothing
-// is lost by not streaming it. The raw output is kept in a file, shown in
+// is lost by not streaming it. The raw stdout is kept in a file, shown in
 // full if RTK fails, and named after the compacted output when the command
-// failed, as `rtk <cmd>` itself does. Output that can't be held (too large,
+// failed, as `rtk <cmd>` itself does; stderr is never held, and reaches the
+// agent as it comes. Output that can't be held (too large,
 // or the disk is full) is printed as it comes instead, unfiltered.
 type rtkOutput struct {
 	filter string
@@ -126,7 +127,8 @@ func (r *rtkOutput) finish(failed bool) {
 		r.out.Write(out.Bytes())
 		if failed {
 			keep = true
-			fmt.Fprintf(r.out, "\n[full output: %s]\n", path)
+			// Only stdout went through RTK: stderr was printed as it came.
+			fmt.Fprintf(r.out, "\n[full stdout: %s]\n", path)
 		}
 		return
 	}

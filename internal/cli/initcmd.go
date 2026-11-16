@@ -47,7 +47,7 @@ priority = 20
 idle_timeout = "10m"           # the VM terminates itself after this much idle time (15m suits long agent pauses)
 max_lifetime = "12h"           # hard cap regardless of activity
 # hourly_cost = 0.12           # burn estimate for VMs without a Spot price (status and monitor use each VM's own Spot price)
-# max_price = "0.40"           # USD/hour cap (default: the on-demand price)
+# max_price = "0.40"           # USD/hour Spot bid cap, above 0 (default: the on-demand price)
 # on_demand_fallback = true
 # cache_bucket = "auto"        # shared dependency cache in S3: auto | <bucket> | off
 bootstrap_script = """
@@ -76,6 +76,7 @@ func cmdInit() *cobra.Command {
 	var global, force, yes, noContainer bool
 	c := &cobra.Command{
 		Use:   "init",
+		Args:  noArgs,
 		Short: "Generate .spotexec.toml for this repo, and a container for its toolchain (or --global runner config)",
 		Long: `Generate .spotexec.toml for this repository: dependency caching and tasks
 detected from its lockfiles and scripts.
@@ -570,6 +571,7 @@ func cmdHook() *cobra.Command {
 	var claude, codex, globalScope, shared, uninstall bool
 	install := &cobra.Command{
 		Use:   "install [--claude] [--codex]",
+		Args:  noArgs,
 		Short: "Install the Claude Code PreToolUse hook and/or an AGENTS.md snippet",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !claude && !codex {
@@ -598,7 +600,7 @@ func cmdHook() *cobra.Command {
 					fmt.Printf("%s: %s\n", p, map[bool]string{true: "removed spotexec hook", false: "no spotexec hook found"}[ok])
 				} else {
 					hookCmd := transportQuote(hookBinary()) + " hook claude"
-					legacy, rtk := hooks.HasLegacyClaude(p), hooks.HasRTK(p)
+					legacy, rtk, had := hooks.HasLegacyClaude(p), hooks.HasRTK(p), hooks.HasClaude(p)
 					ok, err := hooks.InstallClaude(p, hookCmd)
 					if err != nil {
 						return err
@@ -607,6 +609,8 @@ func cmdHook() *cobra.Command {
 						fmt.Printf("chained RTK's PreToolUse hook behind spotexec's in %s: spotexec decides first and hands every other command to RTK\n", p)
 					} else if ok && legacy {
 						fmt.Printf("updated the PreToolUse hook in %s to call spotexec (sx only runs commands)\n", p)
+					} else if ok && had {
+						fmt.Printf("updated the PreToolUse hook in %s to call %s\n", p, hookCmd)
 					} else if ok {
 						fmt.Printf("installed PreToolUse hook in %s\n", p)
 					} else {
@@ -662,6 +666,9 @@ func cmdHook() *cobra.Command {
 		Use:    "claude",
 		Short:  "PreToolUse hook handler (reads the event JSON on stdin)",
 		Hidden: true,
+		// A hook line in someone's settings must never start failing: the
+		// handler reads stdin and has always ignored any words after it.
+		Args: cobra.ArbitraryArgs,
 		Run: func(*cobra.Command, []string) {
 			if code := claudeHook(then); code != 0 {
 				os.Exit(code)

@@ -1,7 +1,11 @@
 package helper
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -32,5 +36,68 @@ func TestNetworkArgs(t *testing.T) {
 		if !slices.Equal(got, c.want) {
 			t.Errorf("network %q, options %q: got %q, want %q", c.network, c.options, got, c.want)
 		}
+	}
+}
+
+// Only the flags container.options sets count, not the values they take.
+func TestForbiddenOption(t *testing.T) {
+	for _, c := range []struct {
+		options []string
+		want    string
+	}{
+		{nil, ""},
+		{[]string{"-e", "NODE_OPTIONS=-d"}, ""},
+		{[]string{"--label", "-u"}, ""},
+		{[]string{"-e", "--"}, ""},
+		{[]string{"--label", "--name"}, ""},
+		{[]string{"-e", "--user=0", "--shm-size", "1g"}, ""},
+		{[]string{"--init", "-it", "--cap-add", "SYS_PTRACE"}, ""},
+		{[]string{"--"}, "--"},
+		{[]string{"--init", "--", "x"}, "--"},
+		{[]string{"--name", "x"}, "--name"},
+		{[]string{"--name=x"}, "--name"},
+		{[]string{"--detach"}, "--detach"},
+		{[]string{"--entrypoint", "sh"}, "--entrypoint"},
+		{[]string{"-e", "A=1", "--user", "0"}, "--user"},
+		{[]string{"--rm"}, "--rm"},
+		{[]string{"--workdir=/x"}, "--workdir"},
+		{[]string{"-d"}, "-d"},
+		{[]string{"-itd"}, "-d"},
+		{[]string{"-iu", "0"}, "-u"},
+		{[]string{"-w/src"}, "-w"},
+		{[]string{"--label", "x", "-Pqu0"}, "-u"},
+		// A shorthand that takes a value ends the cluster: the rest is its value.
+		{[]string{"-ed"}, ""},
+	} {
+		if got := forbiddenOption(c.options); got != c.want {
+			t.Errorf("forbiddenOption(%q) = %q, want %q", c.options, got, c.want)
+		}
+	}
+}
+
+// containerScript refuses a forbidden option before writing anything, and
+// takes a value that only looks like one.
+func TestContainerScriptChecksOptions(t *testing.T) {
+	bin, _ := statefulDocker(t, false, "", "", "")
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	slot := t.TempDir()
+	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Options: []string{"-e", "A=1", "-iu", "0"}}, "true", s.workspace, map[string]string{})
+	var pe *protoError
+	if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed || !strings.Contains(err.Error(), "container.options may not set -u") {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(slot, "run")); !os.IsNotExist(err) {
+		t.Fatal("files written for a refused run")
+	}
+	_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Options: []string{"--label", "--name", "-e", "NODE_OPTIONS=-d"}}, "true", s.workspace, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -74,7 +73,7 @@ func (a *AWSSpot) accountID(ctx context.Context) (string, error) {
 		h := sha256.Sum256([]byte(c.AccessKeyID))
 		keyID = hex.EncodeToString(h[:])[:12]
 	}
-	p := filepath.Join(a.dir, "account-id-"+a.r.Profile+"-"+keyID)
+	p := filepath.Join(a.dir, "account-id-"+fileSafe(a.r.Profile)+"-"+keyID)
 	if b, err := os.ReadFile(p); err == nil && len(strings.TrimSpace(string(b))) == 12 {
 		return strings.TrimSpace(string(b)), nil
 	}
@@ -125,8 +124,13 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 		}
 	case status == 404:
 		return "", "", fmt.Errorf("cache bucket %s does not exist (create it, or use cache_bucket = \"auto\")", bucket)
+	case status == 403 && auto:
+		return "", "", fmt.Errorf("cache bucket %s: access denied: either the key lacks the S3 statement of spotexec's policy (re-run `spotexec setup` to refresh it), or another account owns a bucket by this name (name one of your own with cache_bucket, granting it as docs/aws.md shows); or set cache_bucket = \"off\"", bucket)
 	case status == 403:
-		return "", "", fmt.Errorf("cache bucket %s is not owned by account %s or not accessible (set cache_bucket to another name, or \"off\")", bucket, acct)
+		// S3 says 403 both for a bucket another account owns and for one
+		// this key may not read; spotexec's policy only covers its own
+		// spotexec-cache-* buckets, so a named one needs its own grant.
+		return "", "", fmt.Errorf("cache bucket %s: access denied: either it isn't owned by account %s, or the key has no access to it. spotexec's policy only covers spotexec-cache-* buckets, so a bucket you name needs its own grant of s3:ListBucket on the bucket and s3:GetObject and s3:PutObject on its objects (see docs/aws.md); or use cache_bucket = \"auto\" or \"off\"", bucket, acct)
 	default:
 		return "", "", fmt.Errorf("checking cache bucket %s: HTTP %d", bucket, status)
 	}
@@ -295,16 +299,34 @@ func s3EscapePath(p string) string {
 }
 
 func s3CanonicalQuery(q url.Values) string {
-	keys := make([]string, 0, len(q))
-	for k := range q {
-		keys = append(keys, k)
+	var pairs [][2]string
+	for k, vs := range q {
+		if len(vs) == 0 {
+			vs = []string{""}
+		}
+		for _, v := range vs {
+			pairs = append(pairs, [2]string{uriEncode(k), uriEncode(v)})
+		}
 	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, uriEncode(k)+"="+uriEncode(q.Get(k)))
+	return joinQueryPairs(pairs)
+}
+
+// fileSafe makes s (a profile name such as "corp/dev") usable inside one
+// local file name: bytes outside a portable set become %XX, so a name can
+// neither add a directory nor collide with another; ordinary names are kept.
+// "." and ".." survive, which is safe only with a prefix around them, as
+// every caller has.
+func fileSafe(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.IndexByte("-_.@+=,", c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
 	}
-	return strings.Join(parts, "&")
+	return b.String()
 }
 
 func uriEncode(s string) string {

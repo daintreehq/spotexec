@@ -110,7 +110,7 @@ func (f wbFixture) apply(t *testing.T, dels []string, writes map[string]string) 
 		remote[p] = version{}
 	}
 	for p, b := range writes {
-		rf := remoteFile{data: []byte(b), id: fsid.Bytes([]byte(b)), mode: fsid.ModeFile}
+		rf := spooled(t, b, fsid.ModeFile)
 		remote[p] = version{true, rf.id, rf.mode}
 		files[p] = rf
 	}
@@ -240,24 +240,22 @@ func TestWritebackBacksUpSymlinks(t *testing.T) {
 	gone(t, f.ws.Root, "link")
 }
 
-func TestWritebackHoldsBackProjectConfigDeletion(t *testing.T) {
+func TestWritebackHoldsBackGitignoreDeletion(t *testing.T) {
 	f := newWBFixture(t, true, map[string]string{
-		".spotexec.toml": "[sync]\n", ".gitignore": "x\n", "sub/.gitignore": "y\n",
+		".gitignore": "x\n", "sub/.gitignore": "y\n",
 		"a": "a", "b": "b", "c": "c", "d": "d", "e": "e", "f": "f",
 	}, nil)
-	wb := f.apply(t, []string{".spotexec.toml", ".gitignore", "sub/.gitignore", "a"}, nil)
-	if got := strings.Join(wb.Held, ","); got != ".gitignore,.spotexec.toml" {
+	wb := f.apply(t, []string{".gitignore", "sub/.gitignore", "a"}, nil)
+	if got := strings.Join(wb.Held, ","); got != ".gitignore" {
 		t.Fatalf("held %q", got)
 	}
 	if got := strings.Join(wb.Deleted, ","); got != "sub/.gitignore,a" {
 		t.Errorf("deleted %q", got)
 	}
-	for _, p := range []string{".spotexec.toml", ".gitignore"} {
-		if _, err := os.Lstat(filepath.Join(f.ws.Root, p)); err != nil {
-			t.Errorf("%s was deleted: %v", p, err)
-		}
+	if _, err := os.Lstat(filepath.Join(f.ws.Root, ".gitignore")); err != nil {
+		t.Errorf(".gitignore was deleted: %v", err)
 	}
-	if !strings.Contains(wb.HeldWhy, ".spotexec.toml") {
+	if !strings.Contains(wb.HeldWhy, ".gitignore") {
 		t.Errorf("reason %q", wb.HeldWhy)
 	}
 }

@@ -68,11 +68,11 @@ func TestRTKOutput(t *testing.T) {
 		t.Fatalf("raw output of a passing run kept: %v", kept())
 	}
 	got := run("good", true, "a\nb\n", "c\n")
-	i := strings.Index(got, "[full output: ")
+	i := strings.Index(got, "[full stdout: ")
 	if !strings.HasPrefix(got, "compact: 3 lines\n") || i < 0 {
 		t.Fatalf("failed: %q", got)
 	}
-	path := strings.TrimSuffix(strings.TrimSpace(got[i+len("[full output: "):]), "]")
+	path := strings.TrimSuffix(strings.TrimSpace(got[i+len("[full stdout: "):]), "]")
 	if b, err := os.ReadFile(path); err != nil || string(b) != "a\nb\nc\n" {
 		t.Fatalf("raw output %q: %q %v", path, b, err)
 	}

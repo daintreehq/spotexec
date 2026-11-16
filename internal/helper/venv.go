@@ -2,6 +2,7 @@ package helper
 
 import (
 	"bytes"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,6 +25,11 @@ const originFile = ".origin"
 
 // maxVenvText caps the files relocateVenvs reads (scripts are small).
 const maxVenvText = 1 << 20
+
+// venvRelocation versions what relocateVenvs fixes, so slots relocated by
+// an older helper are relocated again (SlotState.VenvRelocation): 1 was
+// text files only, 2 adds symlink targets.
+const venvRelocation = 2
 
 var activateVenv = regexp.MustCompile(`(?m)^\s*(?:export\s+)?VIRTUAL_ENV=['"]?([^'"\n]+?)['"]?\s*$`)
 
@@ -60,18 +66,7 @@ func relocateVenvs(dir, rel string, origins []string, ws string) error {
 	if r, err := filepath.EvalSymlinks(ws); err == nil {
 		ws = r
 	}
-	venvs := []string{dir}
-	if ents, err := os.ReadDir(dir); err == nil {
-		for _, e := range ents {
-			if e.IsDir() {
-				venvs = append(venvs, filepath.Join(dir, e.Name()))
-			}
-		}
-	}
-	for _, v := range venvs {
-		if fi, err := os.Lstat(filepath.Join(v, "pyvenv.cfg")); err != nil || !fi.Mode().IsRegular() {
-			continue
-		}
+	for _, v := range venvsAt(dir) {
 		var olds []string
 		for _, o := range append(origins, venvOrigin(v, dir, rel)) {
 			if filepath.IsAbs(o) && o != ws {
@@ -86,6 +81,26 @@ func relocateVenvs(dir, rel string, origins []string, ws string) error {
 		}
 	}
 	return nil
+}
+
+// venvsAt lists the virtualenvs at dir and in its immediate
+// subdirectories.
+func venvsAt(dir string) []string {
+	cands := []string{dir}
+	if ents, err := os.ReadDir(dir); err == nil {
+		for _, e := range ents {
+			if e.IsDir() {
+				cands = append(cands, filepath.Join(dir, e.Name()))
+			}
+		}
+	}
+	var venvs []string
+	for _, v := range cands {
+		if fi, err := os.Lstat(filepath.Join(v, "pyvenv.cfg")); err == nil && fi.Mode().IsRegular() {
+			venvs = append(venvs, v)
+		}
+	}
+	return venvs
 }
 
 // venvOrigin infers the workspace a venv was built in from its activate
@@ -110,9 +125,12 @@ func venvOrigin(v, dir, rel string) string {
 	return ws
 }
 
-// relocateVenv rewrites the old workspace paths to ws in the venv's text
-// files that record them.
+// relocateVenv rewrites the old workspace paths to ws in the venv's
+// symlinks and in the text files that record them.
 func relocateVenv(v string, olds []string, ws string) error {
+	if err := relocateVenvLinks(v, olds, ws); err != nil {
+		return err
+	}
 	var files []string
 	if ents, err := os.ReadDir(filepath.Join(v, "bin")); err == nil {
 		for _, e := range ents {
@@ -161,6 +179,60 @@ func relocateVenv(v string, olds []string, ws string) error {
 	return nil
 }
 
+// relocateVenvLinks points the venv's symlinks into an old workspace (an
+// interpreter or a package that lives in the project) at the same path in
+// ws. Relative links, and links anywhere else, are left as they are; a
+// link to a directory is relinked, never descended into.
+func relocateVenvLinks(v string, olds []string, ws string) error {
+	return filepath.WalkDir(v, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.Type()&fs.ModeSymlink == 0 {
+			return nil // unreadable (left as it is), or not a link
+		}
+		target, err := os.Readlink(p)
+		if err != nil || !filepath.IsAbs(target) {
+			return nil
+		}
+		moved, ok := relocatePath(target, olds, ws)
+		if !ok {
+			return nil
+		}
+		// Replaced whole: rename swaps the link itself, never what it
+		// points at.
+		tmp := p + ".spotexec-relocate"
+		if fi, err := os.Lstat(tmp); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			_ = os.Remove(tmp) // left by an interrupted relocation; anything else stays
+		}
+		if err := os.Symlink(moved, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, p); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+		return nil
+	})
+}
+
+// relocatePath returns p moved from the longest of olds it lies in (or is)
+// to repl.
+func relocatePath(p string, olds []string, repl string) (string, bool) {
+	best := ""
+	for _, o := range olds {
+		if len(o) > len(best) && pathWithin(p, o) {
+			best = o
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return repl + p[len(best):], true
+}
+
+// pathWithin: p is dir, or below it.
+func pathWithin(p, dir string) bool {
+	return p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, "/")+"/")
+}
+
 func readSmallFile(p string) ([]byte, error) {
 	fi, err := os.Lstat(p)
 	if err != nil {
@@ -176,8 +248,15 @@ func readSmallFile(p string) ([]byte, error) {
 // replacing the file rather than writing into it: a hardlink-hydrated copy
 // shares its inode with the cache. A symlink to a file holding an old path
 // (uv's link-mode = "symlink") is replaced by a rewritten regular file; its
-// target is left alone.
+// target is left alone. A symlink that really resolves into the workspace
+// repl (relocated by relocateVenvLinks, or relative) stays: what it points
+// at is the workspace's own file.
 func rewritePaths(p string, olds []string, repl string) error {
+	if li, err := os.Lstat(p); err == nil && li.Mode()&fs.ModeSymlink != 0 {
+		if r, err := filepath.EvalSymlinks(p); err == nil && pathWithin(r, repl) {
+			return nil
+		}
+	}
 	fi, err := os.Stat(p)
 	if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxVenvText {
 		return nil // missing, not a regular file, or too large

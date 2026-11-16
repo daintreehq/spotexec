@@ -60,8 +60,8 @@ type = "aws-spot"
 region = "us-east-2"
 profile = "dev"
 instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]
-max_slots = 4
-max_instances = 4
+max_slots = 2                     # shared jobs per VM; an exclusive task takes both
+max_instances = 4                 # a ceiling: past it, runs queue for a free slot
 min_instances = 0                 # kept warm only while `spotexec daemon` runs
 priority = 20
 idle_timeout = "10m"
@@ -86,7 +86,7 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | `work_root` | `~/.cache/spotexec` | Where slots, caches and the helper live on the runner. |
 | `remote_path_setup` | (none) | Shell run before each command, after the login profile (for example `PATH` for mise or nvm). Not used inside a [project container](environments.md#project-containers). |
 | `ssh_options` | (none) | Extra `-o` options for `ssh`, for example `["Port=2222", "ProxyJump=bastion"]`. They override spotexec's defaults (`ConnectTimeout=10`, `ServerAliveInterval=10`, `ServerAliveCountMax=3`, `LogLevel=ERROR`), and runners whose options differ never share a connection. |
-| `hourly_cost` | (none) | Price per machine-hour, for the burn estimates in `spotexec status` and `spotexec monitor`. `aws-spot` VMs are priced at the current Spot price of their own instance type in their zone, so for them this is only the fallback when that price is unknown (an on-demand VM, or prices that can't be read). |
+| `hourly_cost` | (none) | Price per machine-hour, for the burn estimates in `spotexec status` and `spotexec monitor`. `aws-spot` VMs are priced at the current Spot price of their own instance type in their zone, so for them this is only the fallback when that price is unknown (an on-demand VM, or prices that can't be read). A non-negative number. |
 
 ### `ssh` runners
 
@@ -114,16 +114,16 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `launch_order` | `run_cost` | How launches rank the options. `run_cost`: by the expected cost of an hour of work, the Spot price plus the waiting (at `wait_cost`) that a slower generation (`vcpus` runners), a cold region or a farther region (several regions) adds; a runner in one region with a fixed list ranks by price, as with `cheapest`. `cheapest`: the Spot price alone. `listed`: `instance_types` in the listed order, each in its cheapest zone first. See [Rank by the cost of the run](aws.md#rank-by-the-cost-of-the-run). |
 | `wait_cost` | `1` | With `launch_order = "run_cost"`: what an hour of waiting for results is worth, in USD, against the Spot bill. `0` counts only the bill; higher values favor warm regions and faster types more. A number or a string (`"1.50"`). |
 | `arch` | from the first instance type that isn't a pattern, else `amd64` | `amd64` or `arm64` (Graviton). |
-| `max_instances` | `4` | Fleet ceiling. |
+| `max_instances` | `4` | Fleet ceiling, not a target: past it, runs queue for a free slot instead of launching more VMs. Every VM pays a cold start and then its `idle_timeout`, so set it to the most VMs you're willing to pay for at once. See [A few warm VMs](scaling.md#a-few-warm-vms). |
 | `min_instances` | `0` | Warm floor, kept only while the [pool manager](scaling.md#pool-manager-optional) runs. |
-| `idle_timeout` | `10m` | The VM powers off after this long with no work. |
+| `idle_timeout` | `10m` | The VM powers off after this long with no work, and bills until then. |
 | `max_lifetime` | `12h` | Hard cap, regardless of activity. Must exceed `boot_timeout`. New runs stop going to a VM 15 minutes before it (a quarter of a shorter lifetime). |
 | `boot_timeout` | `15m` | Longest wait for first-boot setup; a VM that takes longer is terminated. |
 | `bootstrap_script` | (none) | Runs as root on first boot, after the watchdog is armed. Bounded by `boot_timeout`. |
 | `user_bootstrap_script` | (none) | Then runs as the login user, in a login shell. |
-| `max_price` | the on-demand price | Spot bid cap in USD per hour, as a string (`"0.40"`). |
-| `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available, trying the types in their Spot-price order. |
-| `volume_gb` | `64` | Root gp3 volume (at least 8). |
+| `max_price` | the on-demand price | Spot bid cap in USD per hour: a positive number or string (`0.40`, `"0.40"`, `"$0.40"`), at most 10000. Options priced above it are skipped, and so is their on-demand fallback. |
+| `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available, trying the types in their Spot-price order. With `max_price`, only the types whose Spot price is at or under it. |
+| `volume_gb` | `64` | Root gp3 volume, from 8 to 16384. |
 | `ami` | `auto` | `auto` uses the newest matching bake, else Ubuntu 24.04. `base` ignores bakes. An `ami-…` ID pins one image. |
 | `user` | `ubuntu` | Login user of the AMI. |
 | `subnet_id`, `security_group_ids` | default VPC, a managed `spotexec-ssh` group | Network placement. |
@@ -132,13 +132,13 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 
 ## Project config: `.spotexec.toml`
 
-Every key is optional. `spotexec init` writes a starting point for npm, pnpm, yarn, bun, Go, Rust and Python projects.
+Every key is optional. `spotexec init` writes a starting point for npm, pnpm, yarn, bun, Go, Rust and Python projects. Durations (`timeout`, `grace_period`, `queue_timeout`, and the `timeout` of `[deps]`, `[setup]`, `[container]` and each task) must be positive: zero or a negative value is an error when the file loads.
 
 ```toml
 version = 1
 timeout = "5m"                 # wall-clock cap per command (exit 124 when exceeded)
 grace_period = "5s"            # SIGTERM → SIGKILL delay on timeout or Ctrl-C
-queue_timeout = "10m"          # how long to wait for a free slot
+queue_timeout = "10m"          # how long to wait for a free slot; size it for the longest task a run may queue behind
 env_allow = ["NODE_OPTIONS"]   # local env vars forwarded (nothing else is)
 env = { TZ = "UTC" }           # set on the runner for every command
 pool = ["aws"]                 # overrides default_pool for this repo
@@ -219,14 +219,14 @@ Ignored outputs from earlier runs stay in a slot, so a setup that builds into `d
 | --- | --- |
 | `run` | Shell command. `{args}` (as its own word, or `"{args}"`) becomes the arguments after the task name, passed as `"$@"`; without it they are appended. |
 | `parallel` | Names of other (non-parallel) tasks to run at once, each in its own slot. A sharded task named here fans out into its shards. Extra arguments are not forwarded. |
-| `shards` | Run a `run` task as this many parts at once (1 to 64), each in its own slot, like a parallel task's parts. In the command, `{shard}` becomes the part's number (from 1) and `{shards}` the count; each part also gets `SPOTEXEC_SHARD` and `SPOTEXEC_SHARDS`. Extra arguments go to every shard. |
+| `shards` | Run a `run` task as this many parts at once (1 to 64), each in its own slot, like a parallel task's parts. In the command, `{shard}` becomes the part's number (from 1) and `{shards}` the count; each part also gets `SPOTEXEC_SHARD` and `SPOTEXEC_SHARDS`. Extra arguments go to every shard. Parts beyond the free slots launch VMs, each with its own cold start; see [when sharding pays](scaling.md#when-sharding-pays). |
 | `fail_fast` | Stop the remaining parts of a parallel or sharded task when one fails. In a parallel task, its own setting covers every part, shards included. |
 | `group` | `true` holds each part's output and prints it as one block, still prefixed, when the part finishes, instead of interleaving every part's lines as they come; `false` keeps the live output. Unset, it follows `--group`, which is on by default for agents (`SPOTEXEC_AGENT=1` with stdout not a terminal). In a parallel task, its own setting covers every part. |
 | `timeout`, `sync`, `exclusive` | Per-task overrides of the run flags. |
 | `pool`, `priority` | Send this task to a different fleet, or move it ahead in the queue. |
 | `setup` | `false` skips the project's [`[setup]`](#setup) for this task (on a parallel task, for each of its parts). |
 
-A sharded task splits one command across the fleet, for test runners that take a shard option:
+A sharded task splits one command into parts, for test runners that take a shard option. Each part needs a slot, and parts beyond the free slots launch VMs, up to `max_instances`, each paying a cold start and then its idle timeout. For most suites, one `exclusive` run on a warm VM costs less; shard a suite when it is long enough to be worth it (see [when sharding pays](scaling.md#when-sharding-pays)):
 
 ```toml
 [tasks.test-all]
@@ -260,7 +260,9 @@ run = "npm run typecheck"
 pool = ["ci-big"]              # only this task needs the big fleet
 ```
 
-A project runner builds on one of your global runners. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts. It picks its base this way:
+Most projects don't need one. An `exclusive` task gets a whole VM from your shared pool, while a project fleet starts its own VMs, with their own cold starts and idle timeouts, even when the pool has room. Keep project fleets for jobs that need a different machine, such as more memory per job.
+
+A project runner builds on one of your global runners. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts. It can't spend more than your runner allows: `max_instances`, `idle_timeout` and `max_lifetime` may go down but not up, and when your runner sets `max_price`, the project may lower it but not raise or remove it. Instance types that are all patterns (`["m*", "r*"]`) keep your runner's `arch`; a concrete type or `arch` sets it. It picks its base this way:
 
 - `extends = "name"` uses your runner of that name. With neither key, a project runner of the same name as one of yours overrides it.
 - `extends_type = "ssh" | "aws-spot" | "sim"` uses your runner of that type when `extends` names none you have (or one of another type). With several of that type, the first one in your `default_pool` wins.
@@ -280,4 +282,4 @@ max_slots = 2
 
 Setting `vcpus` (or another requirement key) without `instance_types` drops the inherited `instance_types`, and setting `instance_types` alone drops inherited requirements: the project's way of choosing types replaces yours. Set both to narrow the requirements with patterns.
 
-How you connect and which account and network are used stay in your global config. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `regions`, `exclude_regions`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, or open a port. See [Security model](architecture.md#security-model).
+How you connect and which account and network are used stay in your global config. So do the AMI your AWS VMs boot and whether they may fall back to on-demand prices. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `regions`, `exclude_regions`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`, `ami`, `on_demand_fallback`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, open a port, or boot an image without the watchdog that powers idle VMs off. See [Security model](architecture.md#security-model).

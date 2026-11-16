@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +23,18 @@ import (
 // The test binary stands in for spotexec-helper when startDockerProxy runs
 // os.Executable() docker-proxy.
 func TestMain(m *testing.M) {
+	// The test binary stands in for the helper's detached subcommands.
+	if len(os.Args) > 1 && os.Args[1] == "cache-put" {
+		fs := flag.NewFlagSet("cache-put", flag.ExitOnError)
+		root, src, lock := fs.String("work-root", "", ""), fs.String("src", "", ""), fs.String("lock", "", "")
+		fd := fs.Int("lifecycle-fd", 0, "")
+		_ = fs.Parse(os.Args[2:])
+		if err := CachePut(*root, *src, *lock, *fd); err != nil {
+			fmt.Fprintln(os.Stderr, "spotexec-helper:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "docker-proxy" {
 		if err := DockerProxy(); err != nil {
 			fmt.Fprintln(os.Stderr, "spotexec-helper:", err)
@@ -153,6 +168,12 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		}
 		create(w, r)
 	})
+	prune := func(w http.ResponseWriter, r *http.Request) {
+		f.created <- "PRUNE " + r.URL.Path + " " + r.URL.Query().Get("filters")
+		io.WriteString(w, `{}`)
+	}
+	mux.HandleFunc("POST /{kind}/prune", prune)
+	mux.HandleFunc("POST /v1.45/{kind}/prune", prune)
 	mux.HandleFunc("DELETE /containers/{id}", func(w http.ResponseWriter, r *http.Request) {
 		f.created <- "DELETE " + r.URL.Path + "?" + r.URL.RawQuery
 		w.WriteHeader(204)
@@ -265,6 +286,125 @@ func TestDockerProxyLabelsCreates(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 400 || !strings.Contains(string(b), `"message"`) {
 		t.Fatalf("status %d: %s", resp.StatusCode, b)
+	}
+}
+
+// A path that isn't written canonically is checked, and forwarded, as the
+// canonical path it stands for, so it can't slip past the labelling.
+func TestDockerProxyCanonicalPaths(t *testing.T) {
+	f := newFakeDaemon(t)
+	sock := serveProxy(t, f.sock)
+	for _, p := range []string{"//v1.45/containers/create", "/v1.45//containers/create", "/v1.45/containers/./create", "/v1.45/x/../containers/create", "/v1.45/containers/create/", "/v1.45/containers%2Fcreate"} {
+		if code := rawRequest(t, sock, "POST", p+"?name=pg", `{"Image":"postgres","HostConfig":{"Binds":["/var/run/docker.sock:/var/run/docker.sock"]}}`); code != 201 {
+			t.Fatalf("%s: status %d", p, code)
+		}
+		got := f.next(t)
+		if !strings.HasPrefix(got, "/v1.45/containers/create?name=pg ") || !strings.Contains(got, `"io.spotexec.run":"sx-repo-1-abc"`) || strings.Contains(got, `"/var/run/docker.sock:`) {
+			t.Fatalf("%s: daemon got %s", p, got)
+		}
+	}
+	if code := rawRequest(t, sock, "DELETE", "//containers/pg?force=1", ""); code != 204 {
+		t.Fatalf("delete: status %d", code)
+	}
+	if got := f.next(t); got != "DELETE /containers/pg?force=1&v=1" {
+		t.Fatalf("daemon got %s", got)
+	}
+}
+
+// next is what the daemon got next.
+func (f *fakeDaemon) next(t *testing.T) string {
+	t.Helper()
+	select {
+	case got := <-f.created:
+		return got
+	case <-time.After(10 * time.Second):
+		t.Fatal("the daemon got nothing")
+		return ""
+	}
+}
+
+// rawRequest sends target as the request line has it: Go's client would
+// rewrite a path starting with // to an absolute URL.
+func rawRequest(t *testing.T, sock, method, target, body string) int {
+	t.Helper()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: docker\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", method, target, len(body), body)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// Pruning removes only what this run created: the caller's filters are
+// kept, and the run's labels are added to them.
+func TestDockerProxyScopesPrune(t *testing.T) {
+	f := newFakeDaemon(t)
+	sock := serveProxy(t, f.sock)
+	for _, q := range []struct{ path, filters, want string }{
+		{"/v1.45/networks/prune", "", `{"label":["io.spotexec.run=sx-repo-1-abc","io.spotexec.slot=sx-repo-1-"]}`},
+		{"/containers/prune", `{"until":["24h"]}`, `{"label":["io.spotexec.run=sx-repo-1-abc","io.spotexec.slot=sx-repo-1-"],"until":["24h"]}`},
+		// The legacy form, with a label of the caller's own.
+		{"/volumes/prune", `{"label":{"keep=no":true},"all":{"true":true}}`, `{"all":["true"],"label":["io.spotexec.run=sx-repo-1-abc","io.spotexec.slot=sx-repo-1-","keep=no"]}`},
+		{"//v1.45/volumes//prune", "", `{"label":["io.spotexec.run=sx-repo-1-abc","io.spotexec.slot=sx-repo-1-"]}`},
+		// Repeats, and a label the proxy adds anyway, count once.
+		{"/networks/prune", `{"label":["a=1","a=1","io.spotexec.run=sx-repo-1-abc"],"label!":["b"]}`, `{"label":["a=1","io.spotexec.run=sx-repo-1-abc","io.spotexec.slot=sx-repo-1-"],"label!":["b"]}`},
+	} {
+		u := q.path
+		if q.filters != "" {
+			u += "?filters=" + url.QueryEscape(q.filters)
+		}
+		if code := rawRequest(t, sock, "POST", u, ""); code != 200 {
+			t.Fatalf("%s: status %d", q.path, code)
+		}
+		got := f.next(t)
+		_, filters, _ := strings.Cut(strings.TrimPrefix(got, "PRUNE "), " ")
+		if filters != q.want {
+			t.Fatalf("%s %s: daemon got %s", q.path, q.filters, got)
+		}
+	}
+	// Filters the proxy can't read, or can't be sure are the ones the
+	// daemon reads, can't be scoped: refused, and never forwarded.
+	for _, target := range []string{
+		"/networks/prune?filters=" + url.QueryEscape(`{"label":`),
+		"/networks/prune?filters=" + url.QueryEscape(`{"label":42}`),
+		"/networks/prune?filters=%7B%7D&filters=%7B%7D",
+		"/networks/prune?filters=%zz",
+	} {
+		if code := rawRequest(t, sock, "POST", target, ""); code != 400 {
+			t.Fatalf("%s: status %d", target, code)
+		}
+	}
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	form := "filters=%7B%7D"
+	fmt.Fprintf(conn, "POST /networks/prune HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(form), form)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("form body: status %d", resp.StatusCode)
+	}
+	select {
+	case got := <-f.created:
+		t.Fatalf("a refused prune reached the daemon: %s", got)
+	default:
+	}
+	// Without labels to scope it to, nothing is pruned.
+	if err := scopePrune(url.Values{}, nil); err == nil {
+		t.Fatal("prune scoped to no labels")
 	}
 }
 
@@ -385,7 +525,8 @@ func statefulDocker(t *testing.T, stuck bool, ps, network, volume string) (bin, 
 			t.Fatal(err)
 		}
 	}
-	rm := `: > "$d/$1"`
+	// Removal takes exactly the IDs the listing printed.
+	rm := `[ "$*" = "$(cat "$d/$k")" ] && : > "$d/$k"`
 	if stuck {
 		rm = "true"
 	}
@@ -394,9 +535,10 @@ d=` + shq(bin) + `
 echo "$*" >> "$d/calls"
 case "$1 $2" in
 "ps "*) case "$*" in *label=*) cat "$d/ps" ;; esac ;;
-"rm -fv") set -- ps; ` + rm + ` ;;
+"rm -fv") k=ps; shift 2; ` + rm + ` ;;
 "network ls"|"volume ls") cat "$d/$1" ;;
-"network rm"|"volume rm") ` + rm + ` ;;
+"network rm") k=network; shift 2; ` + rm + ` ;;
+"volume rm") k=volume; shift 3; ` + rm + ` ;;
 esac
 exit 0
 `
@@ -497,10 +639,14 @@ func TestContainerScriptDocker(t *testing.T) {
 			t.Fatalf("no %q:\n%s", rm, callsWith(t, calls))
 		}
 	}
-	for _, list := range []string{"ps -a --format", "network ls", "volume ls"} {
+	for _, list := range []string{"ps -aq --no-trunc", "network ls -q --no-trunc", "volume ls -q"} {
 		if len(callsWith(t, calls, list, "label="+labelRun+"="+name)) == 0 {
 			t.Fatalf("%s not filtered by the run's label", list)
 		}
+	}
+	// Listed by ID, never by name: a network name can hold spaces and quotes.
+	if got := callsWith(t, calls, "label=", "--format"); len(got) > 0 {
+		t.Fatalf("labelled objects listed by name: %v", got)
 	}
 	for _, m := range []string{rootRunMarker, dockerRunMarker} {
 		if _, err := os.Stat(filepath.Join(slot, m)); !os.IsNotExist(err) {
@@ -540,8 +686,8 @@ func TestContainerScriptDockerCleanupFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := s.lastContainer.name
-	os.WriteFile(filepath.Join(bin, "network"), []byte("net\n"), 0o644)
-	if err := cleanup(); err == nil || !strings.Contains(err.Error(), "net") {
+	os.WriteFile(filepath.Join(bin, "network"), []byte("0123abcd\n"), 0o644)
+	if err := cleanup(); err == nil || !strings.Contains(err.Error(), "network 0123abcd") {
 		t.Fatalf("got %v", err)
 	}
 	if _, ok := s.nested.Load(name); !ok {
@@ -551,6 +697,46 @@ func TestContainerScriptDockerCleanupFails(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(slot, m)); err != nil {
 			t.Fatalf("%s dropped: %v", m, err)
 		}
+	}
+}
+
+// Files a root run's container left that can't be given back fail that
+// run, not the slot's next one: its cleanup reports them, and the marker
+// stays so the next holder tries again.
+func TestContainerScriptGiveBackFails(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root can read anything")
+	}
+	bin, _ := statefulDocker(t, false, "", "", "")
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	slot := t.TempDir()
+	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	locked := filepath.Join(s.workspace, "out")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Root: true}, "true", s.workspace, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	err = cleanup()
+	if !errors.Is(err, errFilesNotGivenBack) || !strings.Contains(err.Error(), locked) {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(slot, rootRunMarker)); err != nil {
+		t.Fatalf("marker dropped although the files are still not ours: %v", err)
+	}
+	// Once they are ours again, the next holder clears it.
+	os.Chmod(locked, 0o755)
+	if err := s.reclaimFiles(1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(slot, rootRunMarker)); !os.IsNotExist(err) {
+		t.Fatal("marker kept after the files checked out")
 	}
 }
 
@@ -595,7 +781,7 @@ func TestSweepSlotContainersDockerRun(t *testing.T) {
 	if left := s.sweepSlotContainers(context.Background(), dockerRunner{}); left != "" {
 		t.Fatal(left)
 	}
-	for _, list := range []string{"ps -a --format", "network ls", "volume ls"} {
+	for _, list := range []string{"ps -aq --no-trunc", "network ls -q --no-trunc", "volume ls -q"} {
 		if len(callsWith(t, calls, list, "label="+labelSlot+"="+s.containerPrefix())) == 0 {
 			t.Fatalf("%s not swept by the slot's label", list)
 		}

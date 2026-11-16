@@ -70,14 +70,14 @@ The policy is scoped to what spotexec creates:
 - Reads (`ec2:Describe*`) are unconditional.
 - Every EC2 call that changes an existing resource (terminating or stopping an instance, imaging it, deregistering an AMI, deleting a snapshot, adding a rule to a security group) only works on resources tagged `spotexec-owner`.
 - Tags can only be applied while spotexec creates the resource (`ec2:CreateAction`), so the key can't tag an unrelated instance to get around the conditions. `RunInstances` is allowed only when the new instance and its volumes are requested with the `spotexec-owner` tag; the image, subnet and security groups it launches with needn't be spotexec's.
-- S3 and ECR access is limited to `spotexec-cache-*` buckets and `spotexec/*` repositories.
+- S3 and ECR access is limited to `spotexec-cache-*` buckets (and their objects) and `spotexec/*` repositories. A bucket you name with `cache_bucket` isn't covered: grant `s3:ListBucket` on it and `s3:GetObject` and `s3:PutObject` on its objects in a policy of your own, or spotexec reports access denied on its first `[deps]` run.
 - `iam:GetUser` only covers the key's own user under `/spotexec/`, so setup can check which machine it belongs to.
 
 So a leaked key can launch tagged VMs and manage spotexec's own resources, but can't terminate, image or open up anything else in the account.
 
 The S3 statement (the [dependency cache](environments.md#dependency-cache); without it, set `cache_bucket = "off"` on the runner), the ECR statements (Dockerfile-built [containers](environments.md#project-containers)) and `servicequotas:GetServiceQuota` (`doctor`'s quota check and the pre-launch quota check) are optional. Everything else is needed to launch and clean up VMs and to [bake images](environments.md#baked-images).
 
-The policy is attached inline, and an IAM user's inline policies are limited to 2,048 characters, which is why some statements group several actions. Re-running `spotexec setup` replaces the policy with the current version's. It also tags any `spotexec-ssh*` security group an older spotexec made without the tag. Until then, a VM can still launch into such a group if it already allows SSH from `ssh_cidr`, but spotexec can't add a rule to it.
+The policy is attached inline, and an IAM user's inline policies are limited to 2,048 characters, which is why some statements group several actions. Its ARNs are in the commercial partition (`arn:aws:`). In GovCloud (US), setup attaches it with `arn:aws-us-gov:` instead, as `--print-policy` prints it when your runners (or your admin profile's region) are in `us-gov-*`. Re-running `spotexec setup` replaces the policy with the current version's. It also tags any `spotexec-ssh*` security group an older spotexec made without the tag. Until then, a VM can still launch into such a group if it already allows SSH from `ssh_cidr`, but spotexec can't add a rule to it.
 
 ```json
 {
@@ -108,7 +108,7 @@ The policy is attached inline, and an IAM user's inline policies are limited to 
     { "Effect": "Allow", "Action": [
         "s3:CreateBucket", "s3:PutLifecycleConfiguration", "s3:ListBucket",
         "s3:GetObject", "s3:PutObject"
-      ], "Resource": ["arn:aws:s3:::spotexec-cache-*", "arn:aws:s3:::spotexec-cache-*/*"] },
+      ], "Resource": "arn:aws:s3:::spotexec-cache-*" },
     { "Effect": "Allow", "Action": [
         "ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy",
         "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
@@ -121,9 +121,8 @@ The policy is attached inline, and an IAM user's inline policies are limited to 
 For an IAM user (option C), run this with an admin identity:
 
 ```sh
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-aws iam create-policy --policy-name spotexec --policy-document file://spotexec-policy.json
-aws iam attach-user-policy --user-name spotexec --policy-arn "arn:aws:iam::$ACCOUNT:policy/spotexec"
+ARN=$(aws iam create-policy --policy-name spotexec --policy-document file://spotexec-policy.json --query Policy.Arn --output text)
+aws iam attach-user-policy --user-name spotexec --policy-arn "$ARN"
 ```
 
 For IAM Identity Center, add the JSON as an inline policy on the permission set you sign in with. For a role, attach it to the role.
@@ -176,7 +175,7 @@ Each time the fleet needs a new VM, spotexec compares the current Linux Spot pri
 
 Equal prices go to the type listed first in `instance_types`. To keep the listed order as a preference instead (say, a faster type first and a cheaper one only as a fallback), set `launch_order = "listed"`: each type is then tried in its cheapest zone first, before the next type. If prices can't be read (an older IAM policy without `ec2:Describe*`), a single-region runner with a fixed `instance_types` list tries them in the listed order as it used to (with `regions`, or `vcpus`, the launch fails instead); re-run `spotexec setup` to update the policy.
 
-With `on_demand_fallback`, on-demand is the last resort, after every Spot option. spotexec doesn't look up on-demand prices (that needs the AWS Pricing API, another permission and endpoint), so it tries the types in their Spot-price order, a fair stand-in: within one size, on-demand and Spot prices tend to rank the same way.
+With `on_demand_fallback`, on-demand is the last resort, after every Spot option. spotexec doesn't look up on-demand prices (that needs the AWS Pricing API, another permission and endpoint), so it tries the types in their Spot-price order, a fair stand-in: within one size, on-demand and Spot prices tend to rank the same way. With `max_price`, a type whose Spot price is above it is never launched on-demand either (a Spot price is never above the on-demand price, so its on-demand price is above the cap too), and types without a Spot price are left out: when every Spot option is above `max_price`, the launch fails with the cap rather than falling back. `max_price` caps only the Spot bid, so an on-demand VM of a type priced under it on Spot can still cost more than `max_price`.
 
 #### Describe the VM instead of naming types
 
@@ -397,7 +396,7 @@ If `up` fails, the error says why: a credential problem names the login command 
 | ECR repositories `spotexec/<repo-id>` | First Dockerfile build | Keeps the newest 10 images; `spotexec teardown` deletes the repositories. |
 | AMIs and snapshots | `spotexec image bake` | `spotexec image clear`, or `spotexec teardown`. |
 
-To remove all of it at once, run `spotexec teardown` while signed in as an administrator. It searches every region enabled in the account (or those you pass with `--region`) and lists every instance, AMI, snapshot, security group, ECR repository, cache bucket and IAM user spotexec created, from any machine. It asks before deleting them (`--dry-run` only lists them; `--yes` skips the question). It then deactivates every machine's key, so nothing new is launched, terminates the VMs (including any launched in the meantime) and waits until they're gone before removing the rest. It reports anything it couldn't list or delete with a non-zero exit, so you can re-run it. It only touches resources with spotexec's tags or exact names: a `cache_bucket` you named yourself, a security group you made, an untagged snapshot or an IAM user outside `/spotexec/` is left alone. So are the default VPC and the Spot service-linked role. Delete `~/.config/spotexec` and the `[spotexec]` profile yourself.
+To remove all of it at once, run `spotexec teardown` while signed in as an administrator. It searches every region enabled in the account (or those you pass with `--region`; for a GovCloud account, pass a `us-gov-*` region or give the admin profile one, so it signs in to that partition) and lists every instance, AMI, snapshot, security group, ECR repository, cache bucket and IAM user spotexec created, from any machine. It asks before deleting them (`--dry-run` only lists them; `--yes` skips the question). It then deactivates every machine's key, so nothing new is launched, terminates the VMs (including any launched in the meantime) and waits until they're gone before removing the rest. It reports anything it couldn't list or delete with a non-zero exit, so you can re-run it. It only touches resources with spotexec's tags or exact names: a `cache_bucket` you named yourself, a security group you made, an untagged snapshot or an IAM user outside `/spotexec/` is left alone. So are the default VPC and the Spot service-linked role. Delete `~/.config/spotexec` and the `[spotexec]` profile yourself.
 
 The SSH key is generated locally at `~/.config/spotexec/keys/id_ed25519` and injected through user-data, so no EC2 key pair is involved. Each instance gets its own `known_hosts` file, filled on first connect.
 

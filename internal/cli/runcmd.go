@@ -79,7 +79,7 @@ func (f *runFlags) register(fs *pflag.FlagSet) {
 	fs.BoolVar(&f.noRetry, "no-retry", false, "do not replay the run if its runner is lost (spot reclaim)")
 	fs.IntVar(&f.priority, "priority", 0, "queue priority when every slot is busy (higher runs first)")
 	fs.BoolVarP(&f.sameSlot, "same-slot", "s", false, "run in the slot (same VM) this worktree last used, waiting if it's busy; with --sync none, skip the sync")
-	fs.StringVar(&f.rtkFilter, "rtk-filter", "", "compact stdout with RTK once the command ends (rtk pipe -f `NAME`): cargo-test for cargo test, go-test for go test -json; the full output is kept when it fails")
+	fs.StringVar(&f.rtkFilter, "rtk-filter", "", "compact stdout with RTK once the command ends (rtk pipe -f `NAME`): cargo-test for cargo test, go-test for go test -json; the full stdout is kept when it fails")
 	fs.BoolVar(&f.failConflict, "fail-on-conflict", false, fmt.Sprintf("exit %d when the command succeeded but write-back kept a local edit over one of its changes (SYNC_CONFLICT)", client.ExitWritebackConflict))
 	fs.BoolVar(&f.group, "group", false, "parallel and sharded tasks: print each part's output as one block when it finishes (default with SPOTEXEC_AGENT=1 when stdout isn't a terminal)")
 }
@@ -265,38 +265,38 @@ func load(dir string) (*loaded, error) {
 // buildCommand turns argv into a remote shell line. A single argument is
 // taken as a shell snippet (so `sx 'pnpm build && pnpm test'` works); several
 // are quoted individually. Absolute local paths inside the worktree are
-// mapped to the remote workspace: in a snippet to "$SPOTEXEC_WORKSPACE" (so
-// they stay right after a `cd`), or, where the shell won't expand that
-// (single quotes, separate arguments), to a path relative to the mirrored
-// working directory.
+// mapped to the remote workspace's absolute path, "$SPOTEXEC_WORKSPACE", so
+// they still name the same file after the command changes directory
+// (`make -C sub OUT=/repo/build`) and stay absolute for tools that check.
 func buildCommand(ws *client.Workspace, args []string) string {
-	toRoot := "."
-	if ws.Cwd != "." {
-		toRoot = strings.TrimSuffix(strings.Repeat("../", strings.Count(ws.Cwd, "/")+1), "/")
-	}
 	if len(args) == 1 {
-		return rewriteRoot(args[0], ws.Root, toRoot, true)
+		return rewriteRoot(args[0], ws.Root)
 	}
 	q := make([]string, len(args))
 	assigning := true
 	for i, a := range args {
 		// Leading NAME=value words stay environment assignments: quoting
 		// them whole would make bash run "NAME=value" as a command. The
-		// value is quoted on its own, and since the shell expands it, a
-		// worktree path in it can become the absolute remote one.
+		// value is quoted on its own.
 		if name, value, ok := envAssignment(a); ok && assigning {
-			q[i] = name + "=" + quoteValue(value, ws.Root)
+			q[i] = name + "=" + quoteArg(value, ws.Root)
 			continue
 		}
+		q[i] = quoteArg(a, ws.Root)
+		// The command word must not read as an assignment once spliced
+		// (A+=/repo/x -> A+="$W"/x would be one): start it quoted.
+		if assigning && looksAssigning(q[i]) {
+			q[i] = "''" + q[i]
+		}
 		assigning = false
-		q[i] = transport.ShellQuote(rewriteRoot(a, ws.Root, toRoot, false))
 	}
 	return strings.Join(q, " ")
 }
 
-// quoteValue shell-quotes an assignment's value, with each worktree path in
-// it (matched before quoting) turned into the remote workspace's.
-func quoteValue(v, root string) string {
+// quoteArg shell-quotes one word, with each worktree path in it (matched
+// before quoting) turned into the remote workspace's, double-quoted so a
+// workspace path with spaces stays one word.
+func quoteArg(v, root string) string {
 	var b strings.Builder
 	last := 0
 	for i := 0; i+len(root) <= len(v); i++ {
@@ -315,6 +315,16 @@ func quoteValue(v, root string) string {
 	return b.String()
 }
 
+// looksAssigning reports whether bash could read the shell word w as an
+// assignment: NAME=, NAME+= or NAME[...] at its start, unquoted.
+func looksAssigning(w string) bool {
+	n := 0
+	for n < len(w) && (w[n] == '_' || w[n] >= 'A' && w[n] <= 'Z' || w[n] >= 'a' && w[n] <= 'z' || n > 0 && w[n] >= '0' && w[n] <= '9') {
+		n++
+	}
+	return n > 0 && (strings.HasPrefix(w[n:], "=") || strings.HasPrefix(w[n:], "+=") || strings.HasPrefix(w[n:], "["))
+}
+
 // envAssignment splits a NAME=value word whose name is a valid shell
 // variable name.
 func envAssignment(s string) (name, value string, ok bool) {
@@ -330,50 +340,124 @@ func envAssignment(s string) (name, value string, ok bool) {
 	return name, value, true
 }
 
-// rewriteRoot replaces root where it appears as a whole path (followed by
-// '/', the end, or a shell delimiter, and not as part of a longer name such
-// as /repo-other).
-func rewriteRoot(s, root, toRoot string, snippet bool) string {
+// rewriteRoot replaces root in a shell snippet with the remote workspace
+// where it appears as a whole path (followed by '/', the end, or a shell
+// delimiter, and not as part of a longer name such as /repo-other). The
+// variable is spliced so it expands to one word whatever the quoting
+// around it, and ${...:?} aborts rather than expanding to "" if unset.
+func rewriteRoot(s, root string) string {
 	var b strings.Builder
-	inSingle, inDouble := false, false
+	// The quoting context: 0 at the top, '"' in double quotes, '(' in
+	// $(...) or a subshell and '`' in `...`, where quoting starts afresh.
+	// Single quotes nest in neither. saved holds each $(...)'s outer braces.
+	ctx, saved := []byte{0}, []int{}
+	inSingle, heredoc, braces := false, false, 0 // braces: open ${...}
+	atBoundary := true                           // where a path may start: not mid-word, as after My\ x
 	for i := 0; i < len(s); {
 		c := s[i]
-		if strings.HasPrefix(s[i:], root) && boundaryBefore(s, i) && boundaryAfter(s, i+len(root)) {
+		inDouble := ctx[len(ctx)-1] == '"'
+		if end := matchRoot(s, i, root, !inSingle && !inDouble); end >= 0 && atBoundary && boundaryAfter(s, end) {
 			switch {
-			case snippet && !inSingle:
-				b.WriteString("${SPOTEXEC_WORKSPACE:?}") // aborts rather than expanding to "" if unset
-			case snippet:
-				// Inside single quotes: close them, splice the variable in
-				// double quotes, reopen ('a/x' -> ''"$W"'/x').
+			case inSingle:
+				// Close the quotes, splice the variable in double quotes,
+				// reopen ('a/x' -> ''"$W"'/x').
 				b.WriteString(`'"${SPOTEXEC_WORKSPACE:?}"'`)
+			case inDouble, heredoc:
+				// Quotes in a here-document's body would be literal; the
+				// tracker can't tell its body from the rest, so after <<
+				// unquoted paths keep the bare form.
+				b.WriteString("${SPOTEXEC_WORKSPACE:?}")
 			default:
-				b.WriteString(toRoot)
+				b.WriteString(`"${SPOTEXEC_WORKSPACE:?}"`)
 			}
-			i += len(root)
+			i = end
+			atBoundary = false
 			continue
 		}
 		switch {
-		case c == '\\' && !inSingle && i+1 < len(s):
+		case inSingle:
+			inSingle = c != '\''
+		case c == '\\' && i+1 < len(s):
 			b.WriteByte(c)
 			b.WriteByte(s[i+1])
 			i += 2
+			// A line continuation vanishes, leaving the boundary as it was.
+			if s[i-1] != '\n' {
+				atBoundary = false
+			}
 			continue
-		case c == '\'' && !inDouble:
-			inSingle = !inSingle
-		case c == '"' && !inSingle:
-			inDouble = !inDouble
+		case c == '"' && inDouble:
+			ctx = ctx[:len(ctx)-1]
+		case c == '"':
+			ctx = append(ctx, '"')
+		case c == '`' && ctx[len(ctx)-1] == '`':
+			ctx = ctx[:len(ctx)-1]
+		case c == '`':
+			ctx = append(ctx, '`')
+		case c == '$' && i+1 < len(s) && s[i+1] == '(':
+			ctx, saved, braces = append(ctx, '$'), append(saved, braces), 0
+			b.WriteString("$(")
+			i += 2
+			atBoundary = true
+			continue
+		case c == '$' && i+1 < len(s) && s[i+1] == '{':
+			braces++
+		case c == '}' && braces > 0:
+			braces--
+		case inDouble:
+		case c == '\'':
+			inSingle = true
+		case braces > 0: // ${x//(/} is a pattern, not a subshell
+		case c == '(':
+			ctx = append(ctx, '(')
+		case c == ')' && ctx[len(ctx)-1] == '$':
+			ctx, braces, saved = ctx[:len(ctx)-1], saved[len(saved)-1], saved[:len(saved)-1]
+		case c == ')' && ctx[len(ctx)-1] == '(':
+			ctx = ctx[:len(ctx)-1]
+		case c == '<' && strings.HasPrefix(s[i:], "<<") && !strings.HasPrefix(s[i:], "<<<") && (i == 0 || s[i-1] != '<'):
+			heredoc = true
 		}
 		b.WriteByte(c)
 		i++
+		atBoundary = strings.IndexByte(pathStarts, c) >= 0
 	}
 	return b.String()
 }
 
-func boundaryBefore(s string, i int) bool {
-	if i == 0 {
-		return true
+// matchRoot returns where root ends if it is written at s[i:], or -1.
+// Outside quotes (unquoted) each of its bytes may be backslash-escaped, as
+// in /Users/me/My\ Projects/repo, and one the shell would read as syntax
+// (a quote, '$', whitespace, an operator) must be.
+func matchRoot(s string, i int, root string, unquoted bool) int {
+	if !unquoted {
+		if strings.HasPrefix(s[i:], root) {
+			return i + len(root)
+		}
+		return -1
 	}
-	return strings.ContainsRune(" \t\n'\"=:(;&|", rune(s[i-1]))
+	j := i
+	for k := 0; k < len(root); k++ {
+		switch {
+		case j+1 < len(s) && s[j] == '\\' && s[j+1] == root[k] && root[k] != '\n': // \<newline> is a continuation
+			j += 2
+		case j < len(s) && s[j] == root[k] && !strings.ContainsRune(shellSyntax, rune(root[k])):
+			j++
+		default:
+			return -1
+		}
+	}
+	return j
+}
+
+// shellSyntax is the bytes that mean something to the shell outside quotes:
+// quoting, expansion, word splitting, operators and globs.
+const shellSyntax = " \t\n\\'\"$`;&|<>()*?["
+
+// pathStarts is the bytes a whole path may follow.
+const pathStarts = " \t\n'\"=:(;&|"
+
+func boundaryBefore(s string, i int) bool {
+	return i == 0 || strings.IndexByte(pathStarts, s[i-1]) >= 0
 }
 
 func boundaryAfter(s string, i int) bool {
@@ -658,9 +742,215 @@ func taskCommand(run string, args []string) string {
 		// "$@" too, or the arguments would be word-split or not expanded.
 		body = strings.NewReplacer(`"{args}"`, `"$@"`, `'{args}'`, `"$@"`, "{args}", `"$@"`).Replace(run)
 	} else {
-		body = run + ` "$@"`
+		// Before any trailing comment, which would swallow them.
+		end := endOfCode(run)
+		body = run[:end] + ` "$@"` + run[end:]
 	}
 	return "set -- " + strings.Join(q, " ") + "\n" + body
+}
+
+// endOfCode returns where run's last command ends: after its last byte that
+// is not whitespace, a closing ';' or '&', or part of a comment (a '#' that
+// begins a word outside quotes, to the end of its line). Quoted strings,
+// $(...), ${...} and `...` are skipped whole. A run that is only comments, or has a
+// here-document (whose lines are data), ends at its end: arguments are
+// appended as they always were.
+func endOfCode(run string) int {
+	end, beforeTerm := 0, -1 // beforeTerm: end before a closing ; or &
+	wordStart, prevOp, prevDollar := true, false, false
+	for i := 0; i < len(run); i++ {
+		c := run[i]
+		op, dollar := false, false
+		switch {
+		case c == '\\' && i+1 < len(run):
+			i++
+			if run[i] == '\n' {
+				continue // a line continuation vanishes
+			}
+			wordStart = false
+		case c == '#' && wordStart:
+			nl := strings.IndexByte(run[i:], '\n')
+			if nl < 0 {
+				i = len(run)
+			} else {
+				i += nl // the loop steps past the newline
+			}
+			prevOp, prevDollar = false, false
+			continue
+		case c == ' ' || c == '\t' || c == '\n':
+			wordStart, prevOp, prevDollar = true, false, false
+			continue
+		case c == '\'':
+			i, wordStart = closeSingle(run, i, prevDollar), false
+		case c == '"':
+			i, wordStart = closeDouble(run, i), false
+		case c == '`':
+			i, wordStart = closeBacktick(run, i), false
+		case c == '$' && i+1 < len(run) && run[i+1] == '(':
+			i, wordStart = closeParen(run, i+1), false
+		case c == '$' && i+1 < len(run) && run[i+1] == '{':
+			i, wordStart = closeBrace(run, i+1), false
+		case c == '<' && strings.HasPrefix(run[i:], "<<<"):
+			i, wordStart, op = i+2, true, true
+		case c == '<' && strings.HasPrefix(run[i:], "<<"):
+			return len(run)
+		case (c == ';' || c == '&') && !prevOp && strings.IndexByte(";&|>", nextByte(run, i)) < 0:
+			// A list terminator: arguments go before it ("make &" ->
+			// make "$@" &). Part of an operator (&&, 2>&1, ;;) it is code.
+			beforeTerm, end = end, i+1
+			wordStart, prevOp, prevDollar = true, true, false
+			continue
+		default:
+			wordStart = strings.IndexByte(";&|()", c) >= 0
+			op = strings.IndexByte(";&|<>", c) >= 0
+			dollar = c == '$'
+		}
+		prevOp, prevDollar = op, dollar
+		end, beforeTerm = i+1, -1
+	}
+	switch {
+	case end == 0:
+		return len(run)
+	case beforeTerm > 0:
+		return beforeTerm
+	}
+	return end
+}
+
+// closeSingle returns the index of the quote closing the '...' that opens at
+// run[i], or the last index; in $'...' a backslash escapes.
+func closeSingle(run string, i int, ansi bool) int {
+	for j := i + 1; j < len(run); j++ {
+		switch {
+		case ansi && run[j] == '\\':
+			j++
+		case run[j] == '\'':
+			return j
+		}
+	}
+	return len(run) - 1
+}
+
+// closeDouble returns the index of the quote closing the "..." that opens at
+// run[i], or the last index.
+func closeDouble(run string, i int) int {
+	for j := i + 1; j < len(run); j++ {
+		switch {
+		case run[j] == '\\':
+			j++
+		case run[j] == '"':
+			return j
+		case run[j] == '`':
+			j = closeBacktick(run, j)
+		case run[j] == '$' && j+1 < len(run) && run[j+1] == '(':
+			j = closeParen(run, j+1)
+		case run[j] == '$' && j+1 < len(run) && run[j+1] == '{':
+			j = closeBrace(run, j+1)
+		}
+	}
+	return len(run) - 1
+}
+
+// closeParen returns the index of the ')' matching the '(' at run[i], or the
+// last index. Inside case ... esac a pattern's ')' doesn't close it.
+func closeParen(run string, i int) int {
+	depth, cases := 0, 0
+	for j := i; j < len(run); j++ {
+		c := run[j]
+		if j > i && strings.IndexByte(" \t\n;&|(", run[j-1]) >= 0 && commandPos(run, i, j) {
+			switch {
+			case keywordAt(run, j, "case"):
+				cases, j = cases+1, j+3
+				continue
+			case keywordAt(run, j, "esac") && cases > 0:
+				cases, j = cases-1, j+3
+				continue
+			}
+		}
+		switch {
+		case c == '\\':
+			j++
+		case c == '\'':
+			j = closeSingle(run, j, run[j-1] == '$')
+		case c == '"':
+			j = closeDouble(run, j)
+		case c == '`':
+			j = closeBacktick(run, j)
+		case c == '$' && j+1 < len(run) && run[j+1] == '{':
+			j = closeBrace(run, j+1)
+		case c == '$' && j+1 < len(run) && run[j+1] == '(':
+			j = closeParen(run, j+1)
+		case cases > 0:
+		case c == '(':
+			depth++
+		case c == ')':
+			if depth--; depth <= 0 {
+				return j
+			}
+		}
+	}
+	return len(run) - 1
+}
+
+// commandPos reports whether a word at run[j] (inside the parenthesis at
+// run[i]) is where a command starts: first, or after ( ; & | or a newline.
+func commandPos(run string, i, j int) bool {
+	k := j - 1
+	for k > i && (run[k] == ' ' || run[k] == '\t') {
+		k--
+	}
+	return k == i || strings.IndexByte("(;&|\n", run[k]) >= 0
+}
+
+// keywordAt reports whether the word at run[j:] is kw.
+func keywordAt(run string, j int, kw string) bool {
+	k := j + len(kw)
+	return strings.HasPrefix(run[j:], kw) && (k == len(run) || strings.IndexByte(" \t\n;&|)", run[k]) >= 0)
+}
+
+// closeBrace returns the index of the '}' closing the ${ whose '{' is at
+// run[i], or the last index. A bare '{' inside (${x//{/}) is text.
+func closeBrace(run string, i int) int {
+	for j := i + 1; j < len(run); j++ {
+		switch c := run[j]; {
+		case c == '\\':
+			j++
+		case c == '\'':
+			j = closeSingle(run, j, run[j-1] == '$')
+		case c == '"':
+			j = closeDouble(run, j)
+		case c == '`':
+			j = closeBacktick(run, j)
+		case c == '$' && j+1 < len(run) && run[j+1] == '(':
+			j = closeParen(run, j+1)
+		case c == '$' && j+1 < len(run) && run[j+1] == '{':
+			j = closeBrace(run, j+1)
+		case c == '}':
+			return j
+		}
+	}
+	return len(run) - 1
+}
+
+// closeBacktick returns the index of the '`' closing the one at run[i], or
+// the last index.
+func closeBacktick(run string, i int) int {
+	for j := i + 1; j < len(run); j++ {
+		switch run[j] {
+		case '\\':
+			j++
+		case '`':
+			return j
+		}
+	}
+	return len(run) - 1
+}
+
+func nextByte(s string, i int) byte {
+	if i+1 >= len(s) {
+		return 0
+	}
+	return s[i+1]
 }
 
 // taskPart is one run of a task's fan-out: a task of a parallel task, or

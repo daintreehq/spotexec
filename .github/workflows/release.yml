@@ -24,12 +24,18 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      # Embed the helpers first, as `make build` does in CI, so the tests see
+      # the same internal/helperbin/dist the release binaries ship with.
+      - name: Build embedded helpers
+        run: make helpers
+      - name: Vet
+        run: go vet ./...
       - name: Test
-        run: go test ./...
+        run: go test -race ./...
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: "v2.20.2"   # pinned; bump in ci.yml and release.yml together
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

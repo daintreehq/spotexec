@@ -138,7 +138,10 @@ type SlotState struct {
 	SweepSkip []string `json:"sweep_skip,omitempty"`
 	// VenvsRelocated: the cache dirs' virtualenvs point at this slot
 	// (see relocateVenvs); false for slots hydrated by older helpers.
+	// VenvRelocation is the venvRelocation they were relocated by (0 for
+	// helpers before symlinks were).
 	VenvsRelocated bool `json:"venvs_relocated,omitempty"`
+	VenvRelocation int  `json:"venv_relocation,omitempty"`
 	// GitOwned: the workspace holds a .git spotexec seeded ([sync]
 	// git_seed), complete or not. GitSeed is the key of the complete seed
 	// ("" while it is being built), GitIndex its index's signature and
@@ -208,14 +211,12 @@ func readHolders(l Layout) []protocol.Holder {
 func touchActivity(root string) {
 	now := time.Now()
 	for _, p := range []string{filepath.Join(root, "activity"), ActivityFile} {
-		if p == ActivityFile {
-			if _, err := os.Stat(LifecycleDir); err != nil {
-				continue
-			}
+		if p == ActivityFile && !onSpotexecVM() {
+			continue
 		}
 		// Rewriting the content (rather than utimes with explicit times) only
-		// needs write permission, so it works on the root-owned 0666 file that
-		// cloud-init creates.
+		// needs write permission, so it works on the root-owned file that
+		// cloud-init opens to the runner user's group.
 		_ = os.WriteFile(p, []byte(strconv.FormatInt(now.Unix(), 10)+"\n"), 0o666)
 	}
 }
@@ -223,6 +224,9 @@ func touchActivity(root string) {
 // draining reports whether the runner refuses new work.
 func draining(root string) bool {
 	for _, p := range []string{DrainingFile, filepath.Join(root, "draining")} {
+		if p == DrainingFile && !onSpotexecVM() {
+			continue
+		}
 		if _, err := os.Stat(p); err == nil {
 			return true
 		}

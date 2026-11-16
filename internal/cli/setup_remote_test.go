@@ -720,11 +720,16 @@ func TestSetupHostsSpotexecUserSession(t *testing.T) {
 	f.localInstalled("0.3.0")
 	withLatest(t, "v0.3.0")
 	old := adminSession
-	adminSession = func(context.Context, string) ([]string, string, error) {
+	var gotProfile string
+	var gotRegions []string
+	adminSession = func(_ context.Context, profile string, regions []string) ([]string, string, error) {
+		gotProfile, gotRegions = profile, regions
 		return []string{"AKIASPOTEXEC", "s", ""}, "arn:aws:iam::1:user/spotexec/spotexec-here", nil
 	}
 	t.Cleanup(func() { adminSession = old })
 	f.write("local-config/owner-id", "aaaa-1111\n", 0o644)
+	// The runners' regions pick the partition the session is checked in.
+	f.write("local-config.toml", "version = 1\n\n[runners.gov]\ntype = \"aws-spot\"\nregion = \"us-gov-west-1\"\n\n[runners.gov2]\ntype = \"aws-spot\"\nregion = \"us-gov-east-1\"\n", 0o644)
 	out := captureStdout(t, func() {
 		if err := setupHosts(context.Background(), []string{"box"}, remoteSetup{install: "auto", profile: "spotexec", aws: true}); err != nil {
 			t.Error(err)
@@ -732,6 +737,9 @@ func TestSetupHostsSpotexecUserSession(t *testing.T) {
 	})
 	if !strings.Contains(out, "can't manage IAM users") || !strings.Contains(out, "admin key: none") {
 		t.Fatalf("output:\n%s", out)
+	}
+	if gotProfile != "" || strings.Join(gotRegions, ",") != "us-gov-east-1,us-gov-west-1" && strings.Join(gotRegions, ",") != "us-gov-west-1,us-gov-east-1" {
+		t.Fatalf("admin session checked for %q in %v", gotProfile, gotRegions)
 	}
 }
 
@@ -893,6 +901,22 @@ func TestSetupClaudeHookOptIn(t *testing.T) {
 	})
 	if !hooks.HasClaude(settings) || !strings.Contains(out, "✓ Claude Code hook in") {
 		t.Fatalf("output:\n%s", out)
+	}
+	// A hook left calling spotexec where an old install put it is updated
+	// to call this one.
+	stale := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/gone/bin/spotexec hook claude","timeout":10}]}]}}`
+	if err := os.WriteFile(settings, []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() {
+		// A refresh is no opt-in to pass on.
+		if in, declined := setupClaudeHook(true, false, false); in || declined {
+			t.Errorf("refresh: %v, %v", in, declined)
+		}
+	})
+	want := `"command": "` + transportQuote(hookBinary()) + ` hook claude"`
+	if got := readFile(settings); !strings.Contains(got, want) || !strings.Contains(out, "✓ updated the Claude Code hook") {
+		t.Fatalf("want %s:\n%s\n%s", want, got, out)
 	}
 }
 

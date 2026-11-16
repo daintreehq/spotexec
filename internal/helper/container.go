@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -598,7 +599,7 @@ func ImagePush(root string) error {
 	d := dockerRunner{viaSG: lines[0] == "sg"}
 	local, remote, cfgDir, ready := lines[1], lines[2], lines[3], lines[4]
 	defer os.RemoveAll(cfgDir)
-	if _, err := os.Stat(LifecycleLock); err == nil {
+	if hasLifecycleLock() {
 		l, err := lockShared(LifecycleLock, 10*time.Second)
 		if err != nil {
 			return fmt.Errorf("image-push: VM is shutting down: %w", err)
@@ -637,12 +638,10 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		return "", nil, nil, fmt.Errorf("invalid image reference %q", run.Image)
 	}
 	// Checked before anything (env-file with secrets) is written.
-	for _, o := range run.Options {
-		if bad := forbiddenOption(o); bad != "" {
-			// These would change what spotexec relies on to stop, find and
-			// clean up the container, or who it runs as (use container.user).
-			return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
-		}
+	if bad := forbiddenOption(run.Options); bad != "" {
+		// These would change what spotexec relies on to stop, find and
+		// clean up the container, or who it runs as (use container.user).
+		return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
 	}
 	// Before procMu: these may send an event.
 	limits := append(s.cpusetArgs(run, d), s.memoryArgs(run, d)...)
@@ -817,7 +816,11 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 				os.Remove(marker)
 			case errors.Is(err, errRepairRunning):
 				return err
-			} // otherwise the slot's next holder tries again (reclaimFiles)
+			default:
+				// Reported on this run, which made them; the marker stays,
+				// so the slot's next holder tries again (reclaimFiles).
+				return fmt.Errorf("%w to %s (%v); fix their owner on the runner (sudo chown -R) or remove %s", errFilesNotGivenBack, currentUser(), err, s.workspace)
+			}
 		}
 		return nil
 	}
@@ -876,6 +879,10 @@ func appendLine(path, line string) error {
 // errRepairRunning: a timed-out ownership repair's container couldn't be
 // removed, so it may still be changing files.
 var errRepairRunning = errors.New("the ownership fix-up container is still running")
+
+// errFilesNotGivenBack: the run's container is gone, but files it left in
+// the workspace are still not the runner user's.
+var errFilesNotGivenBack = errors.New("files the container run left in the workspace couldn't be given back")
 
 // giveBackFiles gives files a root container run created in the workspace
 // back to the runner user: root-owned files would block later cleanup,
@@ -1078,22 +1085,20 @@ func shq(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// forbiddenOption returns the docker run flag in o that container.options
-// may not set ("" if none). Clustered short flags count: in "-itd" the d
-// detaches, in "-iu" the u sets the user.
-func forbiddenOption(o string) string {
-	if o == "--" {
-		return "--"
-	}
-	for _, long := range []string{"--name", "--detach", "--entrypoint", "--user", "--rm", "--workdir"} {
-		if o == long || strings.HasPrefix(o, long+"=") {
-			return long
-		}
-	}
-	if len(o) > 1 && o[0] == '-' && o[1] != '-' {
-		rest := strings.TrimLeft(o[1:], "itPq") // boolean shorthands
-		if rest != "" && strings.ContainsRune("duw", rune(rest[0])) {
-			return "-" + rest[:1]
+// forbiddenOptions are the docker run flags container.options may not set.
+// A lone "--" would end the options, making spotexec's own arguments the
+// command's.
+var forbiddenOptions = []string{"--", "--name", "--detach", "--entrypoint", "--user", "--rm", "--workdir", "-d", "-u", "-w"}
+
+// forbiddenOption returns the first docker run flag opts sets that
+// container.options may not set ("" if none). Flags are read as docker reads
+// them (dockerFlags): clustered shorthands count (in "-itd" the d detaches,
+// in "-iu" the u sets the user), and the values flags take don't
+// (`-e NODE_OPTIONS=-d`, `--label -u`).
+func forbiddenOption(opts []string) string {
+	for _, f := range dockerFlags(opts) {
+		if slices.Contains(forbiddenOptions, f) {
+			return f
 		}
 	}
 	return ""

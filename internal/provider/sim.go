@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,8 +29,10 @@ import (
 // watchdog self-destructs, exactly where a real VM would terminate. Spot
 // interruptions and rebalance notices are injected with Interrupt/Rebalance.
 type Sim struct {
-	r     *config.Runner
-	owner string
+	r *config.Runner
+	// ownerMu guards owner, filled lazily by concurrent callers.
+	ownerMu sync.Mutex
+	owner   string
 }
 
 // NewSim constructs the simulator provider. The default image is tagged
@@ -65,7 +68,7 @@ for b in systemctl systemd-run; do printf '#!/bin/sh\nexit 0\n' > /tmp/fakebin/$
 printf '%s' "$USER_DATA_B64" | base64 -d > /tmp/user-data.sh
 # Like cloud-init, user-data runs while the watchdog timer is already ticking.
 PATH=/tmp/fakebin:$PATH bash /tmp/user-data.sh >/var/log/spotexec-userdata.log 2>&1 &
-mkdir -p /var/tmp/spotexec/sim && chmod 1777 /var/tmp/spotexec/sim  # marks the simulator (no IMDS)
+mkdir -p /var/tmp/spotexec/sim  # marks the simulator (no IMDS); root-owned, or the helper ignores it
 chmod 1777 /simcache 2>/dev/null || true  # shared "S3" for the dependency cache
 while true; do
   sleep 2 & wait $!
@@ -76,6 +79,8 @@ done
 func (s *Sim) Runner() *config.Runner { return s.r }
 
 func (s *Sim) ownerTag() (string, error) {
+	s.ownerMu.Lock()
+	defer s.ownerMu.Unlock()
 	if s.owner == "" {
 		o, err := ownerID()
 		if err != nil {

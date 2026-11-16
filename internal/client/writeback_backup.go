@@ -23,13 +23,14 @@ import (
 // Mass-deletion guard: a write-back that would delete at least
 // massDeleteMin files and at least half of the synced files, counting only
 // files neither committed nor moved (their content written back under
-// another path), holds those deletions back. Deleting the project's own root .spotexec.toml or
-// .gitignore is always held back.
+// another path), holds those deletions back. Deleting the project's own root
+// .gitignore is always held back (spotexec's own config is never deleted at
+// all: see spotexecConfigPath).
 const massDeleteMin = 5
 
 // protectedPath reports whether deleting p is always held back.
 func protectedPath(p string) bool {
-	return strings.EqualFold(p, ".spotexec.toml") || strings.EqualFold(p, ".gitignore")
+	return strings.EqualFold(p, ".gitignore")
 }
 
 // massDeletion reports whether deleting n of total synced files is enough

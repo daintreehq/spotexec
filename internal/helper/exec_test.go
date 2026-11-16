@@ -196,7 +196,7 @@ func TestCancelQueued(t *testing.T) {
 		t.Fatal("closed input not seen")
 	}
 	s.frames = make(chan protocol.Frame)
-	s.lastSeen.Store(time.Now().Add(-2 * ClientTimeout).UnixNano())
+	s.lastSeen.Store(s.now() - int64(2*ClientTimeout))
 	if !s.cancelQueued() {
 		t.Fatal("silent client not seen")
 	}

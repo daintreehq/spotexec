@@ -54,7 +54,7 @@ func TestWriteLocalKeepsLocalPermissions(t *testing.T) {
 		if err := os.Chmod(full, c.before); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeLocal(dir, filepath.ToSlash(name), remoteFile{data: []byte("new\n"), mode: c.remote}, nil); err != nil {
+		if err := writeLocal(dir, filepath.ToSlash(name), spooled(t, "new\n", c.remote), nil); err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
 		if b, _ := os.ReadFile(full); string(b) != "new\n" {
@@ -70,10 +70,10 @@ func TestWriteLocalNewFilesRespectUmask(t *testing.T) {
 	old := syscall.Umask(0o077)
 	defer syscall.Umask(old)
 	dir := t.TempDir()
-	if err := writeLocal(dir, "new.txt", remoteFile{data: []byte("x"), mode: fsid.ModeFile}, nil); err != nil {
+	if err := writeLocal(dir, "new.txt", spooled(t, "x", fsid.ModeFile), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeLocal(dir, "new.sh", remoteFile{data: []byte("x"), mode: fsid.ModeExec}, nil); err != nil {
+	if err := writeLocal(dir, "new.sh", spooled(t, "x", fsid.ModeExec), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := perm(t, filepath.Join(dir, "new.txt")); got != 0o600 {
@@ -104,7 +104,7 @@ func TestWriteLocalHonoursAChmodDuringStaging(t *testing.T) {
 		_ = os.Chmod(full, 0o600)
 	}
 	defer func() { stagedHook = nil }()
-	if err := writeLocal(dir, ".npmrc", remoteFile{data: []byte("new\n"), mode: fsid.ModeFile}, nil); err != nil {
+	if err := writeLocal(dir, ".npmrc", spooled(t, "new\n", fsid.ModeFile), nil); err != nil {
 		t.Fatal(err)
 	}
 	if staged != 0o600 {
@@ -166,8 +166,8 @@ func TestConflictStashIsDiffable(t *testing.T) {
 		t.Fatal(err)
 	}
 	wb := &WritebackResult{ConflictDir: stash}
-	rf := remoteFile{data: []byte("remote\n"), mode: fsid.ModeFile}
-	if err := wb.conflict(root, "src/a b.txt", version{true, fsid.Bytes(rf.data), rf.mode}, rf, ""); err != nil {
+	rf := spooled(t, "remote\n", fsid.ModeFile)
+	if err := wb.conflict(root, "src/a b.txt", version{true, rf.id, rf.mode}, rf, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := wb.conflict(root, "src/gone.txt", version{}, remoteFile{}, ""); err != nil {
@@ -284,7 +284,7 @@ func TestWriteLocalBackslashName(t *testing.T) {
 		t.Skip(`\ separates paths here`)
 	}
 	dir := t.TempDir()
-	if err := writeLocal(dir, `src/back\slash.txt`, remoteFile{data: []byte("w"), mode: fsid.ModeFile}, nil); err != nil {
+	if err := writeLocal(dir, `src/back\slash.txt`, spooled(t, "w", fsid.ModeFile), nil); err != nil {
 		t.Fatal(err)
 	}
 	if b, err := os.ReadFile(filepath.Join(dir, "src", `back\slash.txt`)); err != nil || string(b) != "w" {
@@ -317,8 +317,8 @@ func TestSymlinkParentConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	wb := &WritebackResult{ConflictDir: filepath.Join(t.TempDir(), "conflicts", "run-1")}
-	rf := remoteFile{data: []byte("remote\n"), mode: fsid.ModeFile}
-	want := version{true, fsid.Bytes(rf.data), rf.mode}
+	rf := spooled(t, "remote\n", fsid.ModeFile)
+	want := version{true, rf.id, rf.mode}
 	for _, p := range []string{"nested/docs/evil.txt", "nested/docs/old.txt", "src/a.txt", "gen/x.txt"} {
 		w, f := want, rf
 		if p == "nested/docs/old.txt" {
@@ -627,7 +627,7 @@ func TestWritebackReportsLinksBeforeAFailure(t *testing.T) {
 	t.Cleanup(func() { os.Chmod(ro, 0o755) })
 	m := &manifest.Manifest{ByPath: map[string]protocol.Entry{}}
 	link := remoteFile{link: "/etc/passwd", mode: fsid.ModeSymlink, id: fsid.Bytes([]byte("/etc/passwd"))}
-	file := remoteFile{data: []byte("x"), mode: fsid.ModeFile, id: fsid.Bytes([]byte("x"))}
+	file := spooled(t, "x", fsid.ModeFile)
 	remote := map[string]version{"a_link": {true, link.id, link.mode}, "ro/new.txt": {true, file.id, file.mode}}
 	files := map[string]remoteFile{"a_link": link, "ro/new.txt": file}
 	wb := WritebackResult{}

@@ -499,8 +499,10 @@ func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Durati
 		// An upload is activity (at its start and end): an ephemeral VM's
 		// idle watchdog must not stop a VM still being readied over a slow
 		// link. The upload is bounded by the probe's HelperUploadBudget,
-		// well under any idle_timeout.
-		script := fmt.Sprintf(`set -e; a=/var/tmp/spotexec/activity; [ -w "$a" ] && touch "$a" || true; mkdir -p %[1]s; t=%[1]s/.upload.$$; gzip -dc > "$t"; chmod 755 "$t"; mv -f "$t" %[2]s; [ -w "$a" ] && touch "$a" || true; find %[1]s -maxdepth 1 -name 'spotexec-helper-*' ! -name %[3]s -mmin +1440 -exec rm -f {} + 2>/dev/null || true`, dir, path, ShellQuote(filepath.Base(path)))
+		// well under any idle_timeout. Only a root-owned state directory is
+		// a spotexec VM's (see helper.onSpotexecVM): on a shared runner,
+		// anyone can create that path.
+		script := fmt.Sprintf(`set -e; a=; [ -n "$(find /var/tmp/spotexec -maxdepth 0 -type d -user 0 ! -perm -0002 2>/dev/null)" ] && a=/var/tmp/spotexec/activity || true; [ -n "$a" ] && [ -w "$a" ] && touch "$a" || true; mkdir -p %[1]s; t=%[1]s/.upload.$$; gzip -dc > "$t"; chmod 755 "$t"; mv -f "$t" %[2]s; [ -n "$a" ] && [ -w "$a" ] && touch "$a" || true; find %[1]s -maxdepth 1 -name 'spotexec-helper-*' ! -name %[3]s -mmin +1440 -exec rm -f {} + 2>/dev/null || true`, dir, path, ShellQuote(filepath.Base(path)))
 		if _, err := c.runWithin(ctx, uploadTimeout, script, bytes.NewReader(gz)); err != nil {
 			return "", fmt.Errorf("uploading helper: %w", err)
 		}

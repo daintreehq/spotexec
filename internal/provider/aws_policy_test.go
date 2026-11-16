@@ -106,17 +106,26 @@ func allowedIAMSelf(t *testing.T, stmts []policyStatement, arn string, ctx map[s
 
 // The machine key may only change EC2 resources spotexec created and
 // tagged, and may only tag resources while creating them.
+// It holds in every partition: GovCloud's ARNs start arn:aws-us-gov:, which
+// a commercial NotResource wouldn't exclude.
 func TestPolicyScopesMutationsToSpotexecResources(t *testing.T) {
+	for _, region := range []string{"us-east-2", "us-gov-east-1"} {
+		t.Run(region, func(t *testing.T) { checkPolicyScopes(t, region) })
+	}
+}
+
+func checkPolicyScopes(t *testing.T, region string) {
 	var p struct{ Statement []policyStatement }
-	if err := json.Unmarshal([]byte(SpotexecPolicy), &p); err != nil {
+	if err := json.Unmarshal([]byte(PolicyFor(region)), &p); err != nil {
 		t.Fatal(err)
 	}
 	const acct = "111122223333"
+	pre := "arn:" + partitionOf(region) + ":"
 	arn := func(kind string) string {
 		if kind == "image" || kind == "snapshot" {
-			return "arn:aws:ec2:us-east-2::" + kind + "/x-1"
+			return pre + "ec2:" + region + "::" + kind + "/x-1"
 		}
-		return "arn:aws:ec2:us-east-2:" + acct + ":" + kind + "/x-1"
+		return pre + "ec2:" + region + ":" + acct + ":" + kind + "/x-1"
 	}
 	tagged := map[string]string{"aws:ResourceTag/spotexec-owner": "u-1"}
 	untagged := map[string]string{"aws:ResourceTag/Name": "prod-db"}
@@ -178,8 +187,32 @@ func TestPolicyScopesMutationsToSpotexecResources(t *testing.T) {
 	}
 	// Every action the code calls with the machine key is granted somewhere.
 	self := map[string]string{"aws:username": "spotexec-mac"}
-	if !allowedIAMSelf(t, p.Statement, "arn:aws:iam::111122223333:user/spotexec/spotexec-mac", self) || allowedIAMSelf(t, p.Statement, "arn:aws:iam::111122223333:user/spotexec/spotexec-other", self) {
+	if !allowedIAMSelf(t, p.Statement, pre+"iam::111122223333:user/spotexec/spotexec-mac", self) || allowedIAMSelf(t, p.Statement, pre+"iam::111122223333:user/spotexec/spotexec-other", self) {
 		t.Error("iam:GetUser must cover exactly the key's own user")
+	}
+	// The cache buckets and their objects, the base images' parameters and
+	// spotexec's repositories, in this partition; nothing else.
+	bucket := pre + "s3:::spotexec-cache-" + acct + "-" + region
+	for _, c := range []struct {
+		action, arn string
+		want        bool
+	}{
+		{"s3:CreateBucket", bucket, true},
+		{"s3:ListBucket", bucket, true},
+		{"s3:PutLifecycleConfiguration", bucket, true},
+		{"s3:GetObject", bucket + "/repo/key.tar", true},
+		{"s3:PutObject", bucket + "/repo/key.tar", true},
+		{"s3:GetObject", pre + "s3:::my-team-cache/repo/key.tar", false},
+		{"s3:ListBucket", pre + "s3:::my-team-cache", false},
+		{"s3:DeleteObject", bucket + "/repo/key.tar", false},
+		{"ssm:GetParameter", pre + "ssm:" + region + "::parameter/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id", true},
+		{"ssm:GetParameter", pre + "ssm:" + region + ":" + acct + ":parameter/secret", false},
+		{"ecr:PutImage", pre + "ecr:" + region + ":" + acct + ":repository/spotexec/app", true},
+		{"ecr:PutImage", pre + "ecr:" + region + ":" + acct + ":repository/team/app", false},
+	} {
+		if got := allowed(t, p.Statement, c.action, c.arn, nil); got != c.want {
+			t.Errorf("%s on %s: allowed = %v, want %v", c.action, c.arn, got, c.want)
+		}
 	}
 	for _, a := range []string{"ec2:DescribeVpcs", "ec2:DescribeSubnets", "ssm:GetParameter", "ecr:GetAuthorizationToken", "servicequotas:GetServiceQuota"} {
 		found := false
@@ -196,10 +229,28 @@ func TestPolicyScopesMutationsToSpotexecResources(t *testing.T) {
 
 // IAM caps a user's inline policies at 2,048 characters, not counting
 // whitespace; PutUserPolicy rejects anything longer.
+// GovCloud's longer ARNs must fit too.
 func TestPolicyFitsInline(t *testing.T) {
-	n := len(strings.Join(strings.Fields(compactJSON(SpotexecPolicy)), ""))
-	if n > 2048 {
-		t.Fatalf("SpotexecPolicy is %d characters; an inline user policy may have 2048", n)
+	for _, region := range []string{"us-east-2", "us-gov-west-1"} {
+		n := len(strings.Join(strings.Fields(compactJSON(PolicyFor(region))), ""))
+		if n > 2048 {
+			t.Fatalf("the policy for %s is %d characters; an inline user policy may have 2048", region, n)
+		}
+	}
+}
+
+// PolicyFor rewrites every ARN for the region's partition, and only them.
+func TestPolicyFor(t *testing.T) {
+	if PolicyFor("eu-west-1") != SpotexecPolicy {
+		t.Fatal("the commercial policy changed")
+	}
+	gov := PolicyFor("us-gov-west-1")
+	if strings.Contains(gov, "arn:aws:") || strings.Count(gov, `"arn:aws-us-gov:`) != strings.Count(SpotexecPolicy, `"arn:`) ||
+		strings.Count(SpotexecPolicy, "arn:") != strings.Count(SpotexecPolicy, `"arn:aws:`) {
+		t.Fatalf("GovCloud policy:\n%s", gov)
+	}
+	if strings.ReplaceAll(gov, "arn:aws-us-gov:", "arn:aws:") != SpotexecPolicy {
+		t.Fatal("PolicyFor changed more than the ARNs' partition")
 	}
 }
 

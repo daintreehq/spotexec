@@ -1,6 +1,6 @@
 # Case study: Daintree
 
-[Daintree](https://github.com/daintreehq/daintree) is an Electron IDE for running coding agents in parallel git worktrees. It was the first real project to run its full checks on spotexec, in November 2026. That trial shaped spotexec 0.4.
+[Daintree](https://github.com/daintreehq/daintree) is an Electron IDE for running coding agents in parallel git worktrees. It was the first real project to run its full checks on spotexec, in November 2026. That trial shaped spotexec 0.4, and using it every day since has settled how it is laid out: a few warm VMs that every command shares, not a fleet that grows for each task.
 
 ## The project
 
@@ -35,9 +35,9 @@ The rest was project configuration, covered in [Tuning a real project](tuning.md
 - **Workspace builds.** A workspace package build before every task.
 - **Whole VMs for the heavy jobs.** Typecheck, lint and the guards each run `exclusive`, with typecheck's projects run one at a time.
 
-## Results
+## Results from the 0.4 trial
 
-On spotexec 0.4, with the configuration below:
+On spotexec 0.4, with the starter fleet's 4-slot VMs:
 
 | Check | Result |
 | :--- | :--- |
@@ -57,13 +57,40 @@ What a job sees on a 4-slot, 8-vCPU VM:
 | `localhost` | `127.0.0.1` | `::1` and `127.0.0.1` |
 | Git | No repository | HEAD, branch and status match the local worktree (with `git_seed`) |
 
+## One VM per part: the lesson
+
+After the trial, Daintree gave `test-all` a fleet of its own: single-slot 8-vCPU VMs, up to 18 of them so that two runs could overlap, with the suite split into 8 shards plus the perf test, each part on its own VM. With all 9 VMs warm, the suite took about 3.6 minutes.
+
+In everyday use on spotexec 0.7, it went differently. Each shard's Vitest run took 74 to 84 seconds, but each part took 3m48s to 4m45s end to end: about 3 minutes of every part went on starting its VM (boot, image, dependency restore, sync and the workspace build). Each of the 9 VMs then billed its idle timeout. With a 10-minute timeout, that is about 2 VM-hours for one run of the suite, or roughly 30 to 70 cents at the Spot prices in [What it costs](when-to-use.md#what-it-costs), estimated rather than measured from a bill. A developer running several agents, each checking its work with the whole suite, multiplies that.
+
+So Daintree moved to one shared pool:
+
+- **One VM type for every command.** 8-vCPU VMs with `max_slots = 2`, so each shared job gets 4 CPUs.
+- **`max_instances = 8`, as a ceiling.** Past it, commands queue instead of launching more VMs, with `queue_timeout = "30m"` to wait behind the longest task.
+- **`test-all` as one run, unsharded and `exclusive`.** It takes a whole VM, often one already warm from another command, and Vitest spreads across its 8 CPUs.
+- **`idle_timeout = "10m"`.** The pool's idle tail is shared by every command, not paid per task.
+
+One run on one VM gives up some wall time against 9 warm VMs, but it pays one cold start at most, and the pool stays small enough to stay warm. [When sharding pays](scaling.md#when-sharding-pays) covers the trade-off in general.
+
 ## Configuration
 
-Daintree's `.spotexec.toml`, shortened: every task starts with the workspace build, written here as `PREP`.
+The runner in Daintree's `~/.config/spotexec/config.toml`:
+
+```toml
+[runners.aws]
+type = "aws-spot"
+vcpus = 8
+max_slots = 2
+max_instances = 8
+idle_timeout = "10m"
+```
+
+Its `.spotexec.toml`, shortened: `[setup]` builds the workspace packages before every task, skipping the build while the slot's last one still matches the sources.
 
 ```toml
 version = 1
 timeout = "15m"
+queue_timeout = "30m"
 
 [sync]
 git_seed = true
@@ -81,35 +108,34 @@ timeout = "20m"
 [container]
 dockerfile = ".spotexec/Dockerfile"
 
-[tasks.test]
-run = "PREP; npx vitest run {args}"
+[setup]
+run = "npm run prepare --workspaces --if-present"   # shortened: skipped while the last build still matches
 
-[tasks.unit]
-run = "PREP; npx vitest run --shard={shard}/{shards} --exclude scripts/perf/__tests__/scenarioLiveness.test.ts {args}"
-shards = 8
+[tasks.test]               # a few files: shares a VM
+run = "npx vitest run {args}"
+
+[tasks.test-all]           # the whole suite: one run on a whole VM
+run = "npx vitest run {args}"
+exclusive = true
 timeout = "30m"
-
-[tasks.perf-liveness]
-run = "PREP; npx vitest run scripts/perf/__tests__/scenarioLiveness.test.ts"
-timeout = "30m"
-
-[tasks.test-all]
-parallel = ["unit", "perf-liveness"]
 
 [tasks.typecheck]          # the projects one at a time: three at once outgrew 16 GB
-run = "PREP; for p in $PROJECTS; do node scripts/typecheck.mjs --only \"$p\"; done"
+run = "for p in $PROJECTS; do node scripts/typecheck.mjs --only \"$p\"; done"
 exclusive = true
 
 [tasks.lint]
-run = "PREP; ESLINT_CONCURRENCY=2 npm run lint:ratchet"
+run = "ESLINT_CONCURRENCY=4 npm run lint:ratchet"
 exclusive = true
 
 [tasks.guards]
-run = "PREP; npm run check:guards && npm run format:check"
+run = "npm run check:guards"
 exclusive = true
 
+[tasks.format]
+run = "npm run format:check"
+
 [tasks.check]              # the project's `npm run check`, split as its CI splits it
-parallel = ["typecheck", "lint", "guards"]
+parallel = ["typecheck", "lint", "guards", "format"]
 ```
 
 The Dockerfile starts from `node:22.23.2-bookworm` (matching `.nvmrc`), adds the libraries Electron's binary links (`libgtk-3-0`, `libnss3`, `libgbm1`, `libasound2` and ten more) and the `locales` package, and generates `en_US.UTF-8`.

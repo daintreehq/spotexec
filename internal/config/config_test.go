@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -452,6 +453,17 @@ func TestInstanceRequirements(t *testing.T) {
 		"huge wait_cost":            "wait_cost = 10001\n",
 		"wordy wait_cost":           "wait_cost = \"a lot\"\n",
 		"boolean wait_cost":         "wait_cost = true\n",
+		"zero max_price":            "max_price = \"0\"\n",
+		"unquoted zero max_price":   "max_price = 0\n",
+		"negative max_price":        "max_price = -0.4\n",
+		"nan max_price":             "max_price = nan\n",
+		"infinite max_price":        "max_price = inf\n",
+		"huge max_price":            "max_price = 10001\n",
+		"wordy max_price":           "max_price = \"cheap\"\n",
+		"empty max_price":           "max_price = \"\"\n",
+		"negative hourly_cost":      "hourly_cost = -0.1\n",
+		"nan hourly_cost":           "hourly_cost = nan\n",
+		"infinite hourly_cost":      "hourly_cost = inf\n",
 	} {
 		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\n"+body); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -540,6 +552,69 @@ func TestWaitCost(t *testing.T) {
 	}
 	if g.Runners["aws"].WaitCostPerHour() != 5 {
 		t.Fatal("base runner must not be modified")
+	}
+}
+
+// max_price is written like wait_cost: a number or a dollar string, kept
+// as the plain decimal EC2 takes. A project runner may override it, and an
+// ssh runner's hourly_cost is checked too.
+func TestMaxPrice(t *testing.T) {
+	for body, want := range map[string]string{
+		"":                         "",
+		"max_price = \"0.40\"\n":   "0.4",
+		"max_price = \"$0.40\"\n":  "0.4",
+		"max_price = \" 0.40 \"\n": "0.4",
+		"max_price = 0.4\n":        "0.4",
+		"max_price = 2\n":          "2",
+		"max_price = 10000\n":      "10000",
+	} {
+		g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n"+body)
+		if err != nil {
+			t.Fatalf("%q: %v", body, err)
+		}
+		r := g.Runners["aws"]
+		if b, _ := r.MaxPrice.MarshalText(); string(b) != want || r.MaxPrice.Set != (want != "") {
+			t.Errorf("%q: max_price %+v encodes as %q, want %q", body, r.MaxPrice, b, want)
+		}
+		if want == "" && r.MaxPriceUSD() != 0 {
+			t.Errorf("unset max_price is %g", r.MaxPriceUSD())
+		}
+	}
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nmax_price = \"0.40\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+	os.WriteFile(pp, []byte("version = 1\n[runners.same]\nextends = \"aws\"\n[runners.lower]\nextends = \"aws\"\nmax_price = \"$0.25\"\n"), 0o644)
+	p, err := LoadProject(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Global: g, Project: p}
+	if err := c.MergeProjectRunners(); err != nil {
+		t.Fatal(err)
+	}
+	if r := c.Global.Runners["same"]; r.MaxPriceUSD() != 0.4 {
+		t.Fatalf("same: %+v", r.MaxPrice)
+	}
+	if r := c.Global.Runners["lower"]; r.MaxPriceUSD() != 0.25 {
+		t.Fatalf("lower: %+v", r.MaxPrice)
+	}
+	os.WriteFile(pp, []byte("version = 1\n[runners.free]\nextends = \"aws\"\nmax_price = \"0\"\n"), 0o644)
+	if p, err = LoadProject(pp); err == nil {
+		err = (&Config{Global: g, Project: p}).MergeProjectRunners()
+	}
+	if err == nil || !strings.Contains(err.Error(), "max_price") {
+		t.Fatalf("project max_price = \"0\": %v", err)
+	}
+	if _, err := loadGlobalText(t, "[runners.box]\ntype = \"ssh\"\nhost = \"box\"\nhourly_cost = -1\n"); err == nil {
+		t.Fatal("ssh runner with a negative hourly_cost accepted")
+	}
+	for _, c := range []float64{0, 0.25} {
+		g, err := loadGlobalText(t, fmt.Sprintf("[runners.box]\ntype = \"ssh\"\nhost = \"box\"\nhourly_cost = %g\n[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nhourly_cost = %g\n", c, c))
+		if err != nil || g.Runners["box"].HourlyCost != c || g.Runners["aws"].HourlyCost != c {
+			t.Fatalf("hourly_cost = %g: %v", c, err)
+		}
 	}
 }
 
@@ -727,6 +802,10 @@ func TestUnavailableProjectRunnerStillValidated(t *testing.T) {
 		"pool = [\"nope\"]\n[runners.big]\nextends = \"aws\"\n":                "pool references unknown runner \"nope\"",
 		"[runners.big]\nextends = \"aws\"\nmax_slots = -1\n":                   "max_slots must be between",
 		"[runners.big]\nextends_type = \"aws-spot\"\nidle_timeout = \"-1m\"\n": "idle_timeout must not be negative",
+		"[runners.big]\nextends = \"aws\"\nmax_price = 0\n":                    "max_price must be",
+		"[runners.big]\nextends = \"aws\"\nmax_price = nan\n":                  "max_price must be",
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"$10001\"\n":           "max_price must be",
+		"[runners.big]\nextends = \"aws\"\nhourly_cost = -1\n":                 "hourly_cost must be",
 	} {
 		if _, err := mergeProject(t, g, body); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: want %q, got %v", body, want, err)
@@ -995,5 +1074,248 @@ func TestConfigVersion(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A repository may tune a fleet, never loosen what the user's own runner
+// allows: its image, its price, or how long and how many VMs bill (#152).
+func TestProjectRunnerCannotLoosenBase(t *testing.T) {
+	g, err := loadGlobalText(t, `[runners.sim]
+type = "sim"
+max_instances = 2
+[runners.aws]
+type = "aws-spot"
+region = "us-east-1"
+max_price = "0.40"
+max_instances = 4
+idle_timeout = "10m"
+max_lifetime = "6h"
+[runners.open]
+type = "aws-spot"
+region = "us-east-1"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for body, want := range map[string]string{
+		"[runners.big]\nextends = \"aws\"\nami = \"ami-0123456789abcdef0\"\n": `"ami" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\non_demand_fallback = true\n":       `"on_demand_fallback" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\nAMI = \"ami-0123456789abcdef0\"\n": `"ami" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\nOn_Demand_Fallback = true\n":       `"on_demand_fallback" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\nPROFILE = \"x\"\n":                 `"profile" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"\"\n":                `"runners.big.max_price"): invalid amount ""`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"0.41\"\n":            `max_price = "0.41" is more than your runner "aws" allows (0.4 an hour)`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"lots\"\n":            `"runners.big.max_price"): invalid amount "lots"`,
+		"[runners.big]\nextends = \"aws\"\nmax_instances = 5\n":               `max_instances = 5 is more than your runner "aws" allows (4)`,
+		"[runners.big]\nextends = \"aws\"\nidle_timeout = \"11m\"\n":          `idle_timeout = 11m0s is longer than your runner "aws" allows (10m0s)`,
+		"[runners.big]\nextends = \"aws\"\nmax_lifetime = \"7h\"\n":           `max_lifetime = 7h0m0s is longer than your runner "aws" allows (6h0m0s)`,
+		"[runners.big]\nextends = \"open\"\nmax_lifetime = \"13h\"\n":         `max_lifetime = 13h0m0s is longer than your runner "open" allows (12h0m0s)`,
+		"[runners.aws]\nmax_price = \"\"\n":                                   `"runners.aws.max_price"): invalid amount ""`,
+		"[runners.aws]\nmax_price = \"0.5\"\n":                                `is more than your runner "aws" allows`,
+		"[runners.aws]\nidle_timeout = \"1h\"\n":                              `idle_timeout = 1h0m0s is longer`,
+		"[runners.aws]\nmax_lifetime = \"24h\"\n":                             `max_lifetime = 24h0m0s is longer`,
+		"[runners.sim]\nidle_timeout = \"11m\"\n":                             `idle_timeout = 11m0s is longer than your runner "sim" allows (10m0s)`,
+		"[runners.big]\nextends_type = \"sim\"\nmax_lifetime = \"3h\"\n":      `max_lifetime = 3h0m0s is longer than your runner "sim" allows (2h0m0s)`,
+		"[runners.big]\nextends = \"aws\"\nvolume_gb = 16385\n":               `volume_gb must be between 8 and 16384`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"NaN\"\n":             `max_price must be a positive number`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"0\"\n":               `max_price must be a positive number`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"-1\"\n":              `max_price must be a positive number`,
+		"[runners.big]\nextends = \"open\"\nmax_price = \"Inf\"\n":            `max_price must be a positive number`,
+		"[runners.big]\nextends = \"open\"\nmax_price = \"cheap\"\n":          `"runners.big.max_price"): invalid amount "cheap"`,
+		"[runners.big]\nextends_type = \"sim\"\nmax_price = \"x\"\n":          `"runners.big.max_price"): invalid amount "x"`,
+		"[runners.sim]\nmax_instances = 3\n":                                  `max_instances = 3 is more than your runner "sim" allows (2)`,
+		"[runners.aws]\nmax_instances = 40\n":                                 `max_instances`,
+	} {
+		if _, err := mergeProject(t, g, body); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want %q, got %v", body, want, err)
+		}
+	}
+	// Tightening, or matching the base, is fine.
+	c, err := mergeProject(t, g, `[runners.big]
+extends = "aws"
+max_price = "0.25"
+max_instances = 2
+idle_timeout = "5m"
+max_lifetime = "2h"
+volume_gb = 200
+[runners.same]
+extends = "aws"
+max_price = "0.4"
+max_instances = 4
+idle_timeout = "10m"
+max_lifetime = "6h"
+volume_gb = 16384
+[runners.capped]
+extends = "open"
+max_price = "1.00"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := c.Global.Runners["big"]; r.MaxPriceUSD() != 0.25 || r.MaxInstances != 2 || r.IdleTimeout.Duration != 5*time.Minute || r.MaxLifetime.Duration != 2*time.Hour || r.VolumeGB != 200 {
+		t.Fatalf("big: %+v", r)
+	}
+	if r := c.Global.Runners["capped"]; r.MaxPriceUSD() != 1.00 {
+		t.Fatalf("capped: %+v", r)
+	}
+	if r := c.Global.Runners["same"]; r.MaxPriceUSD() != 0.4 || r.MaxInstances != 4 {
+		t.Fatalf("same: %+v", r)
+	}
+	if r := c.Global.Runners["same"]; r.VolumeGB != 16384 || r.IdleTimeout.Duration != 10*time.Minute || r.MaxLifetime.Duration != 6*time.Hour {
+		t.Fatalf("same: %+v", r)
+	}
+	if b := g.Runners["aws"]; b.MaxPriceUSD() != 0.40 || b.MaxInstances != 4 || b.MaxLifetime.Duration != 6*time.Hour {
+		t.Fatalf("base runner must not be modified: %+v", b)
+	}
+	if b := g.Runners["open"]; b.MaxLifetime.Duration != 12*time.Hour {
+		t.Fatalf("the open fixture relies on the 12h default lifetime: %s", b.MaxLifetime.Duration)
+	}
+	// A same-name override may tighten too, and an SSH base has no fleet
+	// limits to keep.
+	if c, err := mergeProject(t, g, "[runners.aws]\nmax_price = \"0.3\"\nidle_timeout = \"5m\"\nmax_lifetime = \"1h\"\nmax_instances = 1\n"); err != nil {
+		t.Errorf("same-name tightening: %v", err)
+	} else if r := c.Global.Runners["aws"]; r.MaxPriceUSD() != 0.3 || r.IdleTimeout.Duration != 5*time.Minute || r.MaxLifetime.Duration != time.Hour || r.MaxInstances != 1 {
+		t.Errorf("same-name tightening: %+v", r)
+	}
+	gs, err := loadGlobalText(t, "[runners.box]\ntype = \"ssh\"\nhost = \"box\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mergeProject(t, gs, "[runners.box]\nmax_instances = 9\nidle_timeout = \"1h\"\n"); err != nil {
+		t.Errorf("ssh override: %v", err)
+	}
+	if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nmax_price = \"$0\"\n"); err == nil || !strings.Contains(err.Error(), "max_price must be a positive number") {
+		t.Errorf("global max_price: %v", err)
+	}
+}
+
+// Wildcard instance_types narrow the base's types; they say nothing about
+// the architecture, so the base's arch stays (#152).
+func TestProjectTypePatternsKeepBaseArch(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.arm]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\narch = \"arm64\"\nvcpus = 8\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := mergeProject(t, g, `[runners.mem]
+extends = "arm"
+vcpus = 8
+instance_types = ["m*", "r*"]
+[runners.concrete]
+extends = "arm"
+instance_types = ["c7a.2xlarge"]
+[runners.graviton]
+extends = "arm"
+vcpus = 8
+instance_types = ["m*g*"]
+[runners.mixed]
+extends = "arm"
+vcpus = 8
+instance_types = ["m*", "c7a.2xlarge"]
+[runners.mixed2]
+extends = "arm"
+vcpus = 8
+instance_types = ["c7a.2xlarge", "m*"]
+[runners.empty]
+extends = "arm"
+instance_types = []
+[runners.untouched]
+extends = "arm"
+max_slots = 2
+[runners.explicit]
+extends = "arm"
+vcpus = 8
+instance_types = ["c*"]
+arch = "amd64"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"mem": "arm64", "graviton": "arm64", "mixed": "amd64", "mixed2": "amd64", "empty": "amd64", "concrete": "amd64", "explicit": "amd64", "untouched": "arm64"} {
+		if got := c.Global.Runners[name].Arch; got != want {
+			t.Errorf("%s: arch %q, want %q", name, got, want)
+		}
+	}
+	// instance_types alone drop the inherited vcpus, so patterns need their own.
+	if _, err := mergeProject(t, g, "[runners.x]\nextends = \"arm\"\ninstance_types = [\"m*\"]\n"); err == nil || !strings.Contains(err.Error(), "is a pattern, which needs vcpus") {
+		t.Errorf("patterns without vcpus: %v", err)
+	}
+}
+
+// Every duration in .spotexec.toml must be positive, and a task's pool must
+// name runners, like the project's (#152).
+func TestProjectDurationsAndTaskPools(t *testing.T) {
+	load := func(body string) (*Project, error) {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		if err := os.WriteFile(pp, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return LoadProject(pp)
+	}
+	for body, want := range map[string]string{
+		"timeout = \"0s\"\n":                                    "timeout must be positive (got 0s)",
+		"timeout = \"-1m\"\n":                                   "timeout must be positive (got -1m0s)",
+		"Timeout = \"0s\"\n":                                    "timeout must be positive (got 0s)",
+		"grace_period = \"0s\"\n":                               "grace_period must be positive",
+		"grace_period = \"-1s\"\n":                              "grace_period must be positive",
+		"queue_timeout = \"0s\"\n":                              "queue_timeout must be positive",
+		"queue_timeout = \"-5m\"\n":                             "queue_timeout must be positive",
+		"[deps]\ntimeout = \"0s\"\n":                            "deps.timeout must be positive",
+		"[deps]\ntimeout = \"-1m\"\n":                           "deps.timeout must be positive",
+		"[container]\nimage = \"node:22\"\ntimeout = \"0s\"\n":  "container.timeout must be positive",
+		"[container]\nimage = \"node:22\"\ntimeout = \"-1m\"\n": "container.timeout must be positive",
+		"[tasks.a]\nrun = \"x\"\ntimeout = \"0s\"\n":            "tasks.a.timeout must be positive",
+		"[tasks.a]\nrun = \"x\"\ntimeout = \"-1m\"\n":           "tasks.a.timeout must be positive",
+		"[tasks.a]\nrun = \"x\"\nTIMEOUT = \"0s\"\n":            "tasks.a.timeout must be positive",
+		"deps.timeout = \"0s\"\n":                               "deps.timeout must be positive",
+		"setup.timeout = \"1m\"\n":                              "setup.run must be set",
+		"[deps]\nTimeout = \"0s\"\n":                            "deps.timeout must be positive",
+	} {
+		if _, err := load(body); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want %q, got %v", body, want, err)
+		}
+	}
+	// A runner table spelled in capitals decodes like any other.
+	g0, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, err := mergeProject(t, g0, "[RUNNERS.big]\nEXTENDS = \"aws\"\nMAX_SLOTS = 1\n"); err != nil || c.Global.Runners["big"] == nil || c.Global.Runners["big"].MaxSlots != 1 {
+		t.Errorf("capitalised runner table: %v", err)
+	}
+	// Unset durations get their defaults (a task's inherits the command's).
+	for _, body := range []string{"", "[deps]\nhydrate = \"copy\"\n[container]\nimage = \"node:22\"\n[tasks.a]\nrun = \"x\"\n"} {
+		p, err := load(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Timeout.Duration != 5*time.Minute || p.Grace.Duration != 5*time.Second || p.QueueTimeout.Duration != 10*time.Minute || p.Deps.Timeout.Duration != 20*time.Minute || p.Container.Timeout.Duration != 20*time.Minute {
+			t.Errorf("%q: defaults %+v", body, p)
+		}
+		if a := p.Tasks["a"]; body != "" && (a == nil || a.Timeout.Duration != 0) {
+			t.Errorf("unset task timeout: %+v", a)
+		}
+	}
+	p, err := load("timeout = \"30m\"\ngrace_period = \"2s\"\nqueue_timeout = \"1h\"\n[deps]\ntimeout = \"3m\"\n[container]\nimage = \"node:22\"\ntimeout = \"4m\"\n[tasks.a]\nrun = \"x\"\ntimeout = \"7m\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Timeout.Duration != 30*time.Minute || p.Grace.Duration != 2*time.Second || p.QueueTimeout.Duration != time.Hour || p.Deps.Timeout.Duration != 3*time.Minute || p.Container.Timeout.Duration != 4*time.Minute || p.Tasks["a"].Timeout.Duration != 7*time.Minute {
+		t.Errorf("positive durations: %+v", p)
+	}
+
+	g, err := loadGlobalText(t, "[runners.homelab]\ntype = \"ssh\"\nhost = \"box\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tasks are checked in name order, each pool in its own order.
+	if _, err := mergeProject(t, g, "[tasks.b]\nrun = \"x\"\npool = [\"zz\"]\n[tasks.a]\nrun = \"x\"\npool = [\"homelab\", \"nope\", \"also\"]\n"); err == nil || !strings.Contains(err.Error(), `task "a": pool references unknown runner "nope"`) {
+		t.Errorf("task pool: %v", err)
+	}
+	if _, err := mergeProject(t, g, "[tasks.a]\nrun = \"x\"\npool = [\"homelab\"]\n"); err != nil {
+		t.Errorf("valid task pool: %v", err)
+	}
+	// A task pool naming a fleet this user can't back loads, like a project pool.
+	if _, err := mergeProject(t, g, "[runners.big]\nextends = \"aws\"\n[tasks.a]\nrun = \"x\"\npool = [\"big\"]\n"); err != nil {
+		t.Errorf("unavailable fleet in a task pool: %v", err)
 	}
 }

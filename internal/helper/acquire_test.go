@@ -3,6 +3,7 @@ package helper
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -24,8 +25,8 @@ func (w *syncBuf) Write(p []byte) (int, error) {
 
 func testSession(t *testing.T, root string) *Session {
 	t.Helper()
-	s := &Session{c: protocol.NewConn(strings.NewReader(""), &syncBuf{}), layout: Layout{Root: root}, frames: make(chan protocol.Frame, 1)}
-	s.lastSeen.Store(time.Now().UnixNano())
+	s := &Session{c: protocol.NewConn(strings.NewReader(""), &syncBuf{}), layout: Layout{Root: root}, frames: make(chan protocol.Frame, 1), born: time.Now()}
+	s.lastSeen.Store(s.now())
 	t.Cleanup(s.release)
 	return s
 }
@@ -145,5 +146,38 @@ func TestAutoSlotsKeepPortsValid(t *testing.T) {
 	}
 	if port := 20000 + protocol.MaxSlots*1000 + 999; port > 65535 {
 		t.Fatalf("slot %d's port range ends at %d", protocol.MaxSlots, port)
+	}
+}
+
+// Once teardown (a signal, or lastResort) has begun, the dispatch goroutine
+// gives nothing up: a release there would free the slot for another run
+// while teardown still cleans it.
+func TestReleaseWaitsOutTeardown(t *testing.T) {
+	s := testSession(t, t.TempDir())
+	if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.stopping.Store(false) }) // before testSession's release
+	s.stopping.Store(true)
+	released := make(chan struct{})
+	go func() {
+		s.release()
+		close(released)
+	}()
+	select {
+	case <-released:
+		t.Fatal("released under a teardown")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if l, ok, _ := tryLock(filepath.Join(s.slotDir, ".lock")); ok {
+		l.Unlock()
+		t.Fatal("the slot was given up under a teardown")
+	}
+	// Teardown's own release goes ahead.
+	s.releaseLocks(true)
+	if l, ok, _ := tryLock(filepath.Join(s.slotDir, ".lock")); !ok {
+		t.Fatal("teardown kept the slot")
+	} else {
+		l.Unlock()
 	}
 }

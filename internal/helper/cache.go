@@ -155,14 +155,48 @@ func bodyHas(r io.Reader, s string) bool {
 // so the job doesn't wait and the upload outlives this session. The URL is
 // passed on stdin, never in argv (visible to every process on the VM).
 func startCacheUpload(root, src, lockPath, url string) (*transfer, error) {
+	lifecycle := ""
+	if hasLifecycleLock() {
+		lifecycle = LifecycleLock
+	}
+	return startCacheUploadWith(lifecycle, root, src, lockPath, url)
+}
+
+// startCacheUploadWith is startCacheUpload with the lifecycle lock at
+// lifecycle ("" when there is none to hold).
+func startCacheUploadWith(lifecycle, root, src, lockPath, url string) (*transfer, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
+	args := []string{"cache-put", "--work-root", root, "--src", src, "--lock", lockPath}
+	// The upload holds the lifecycle lock from the moment it exists: it
+	// inherits a shared lock taken here, while this session still holds its
+	// own, so the idle watchdog can't take it exclusively in between (a
+	// quick run releases its slot right after) and power the VM off
+	// mid-upload.
+	var held *os.File
+	if lifecycle != "" {
+		l, err := lockShared(lifecycle, 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		// Closed, never unlocked: the child's copy shares the lock, which
+		// lasts until the last copy is closed.
+		held = l.f
+		defer held.Close()
+		args = append(args, "--lifecycle-fd", "3")
+	}
 	logf, _ := os.OpenFile(filepath.Join(root, "cache-upload.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	cmd := exec.Command(self, "cache-put", "--work-root", root, "--src", src, "--lock", lockPath)
+	if logf != nil {
+		defer logf.Close()
+	}
+	cmd := exec.Command(self, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdout, cmd.Stderr = logf, logf
+	if held != nil {
+		cmd.ExtraFiles = []*os.File{held} // fd 3
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -172,18 +206,16 @@ func startCacheUpload(root, src, lockPath, url string) (*transfer, error) {
 	}
 	_, _ = io.WriteString(stdin, url+"\n")
 	stdin.Close()
-	if logf != nil {
-		logf.Close()
-	}
 	return watch(cmd), nil
 }
 
 // CachePut is the detached upload (spotexec-helper cache-put; URL on
 // stdin). It is bounded in time, holds the lifecycle lock shared so the
-// idle watchdog keeps the VM up meanwhile, holds the dependency key's lock
+// idle watchdog keeps the VM up meanwhile (inherited already held as
+// descriptor lifecycleFD when above 0), holds the dependency key's lock
 // shared so prune cannot delete the source mid-archive, and gives up if
 // the VM starts draining.
-func CachePut(root, src, lockPath string) error {
+func CachePut(root, src, lockPath string, lifecycleFD int) error {
 	resetOwnOOMScore() // started by a protected helper: don't keep its score
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil && line == "" {
@@ -201,10 +233,23 @@ func CachePut(root, src, lockPath string) error {
 			time.Sleep(2 * time.Second)
 		}
 	}()
-	if _, err := os.Stat(LifecycleLock); err == nil {
-		if l, err := lockShared(LifecycleLock, 10*time.Second); err == nil {
-			defer l.Unlock()
+	if lifecycleFD > 0 {
+		f := os.NewFile(uintptr(lifecycleFD), "lifecycle.lock")
+		if f == nil {
+			return fmt.Errorf("cache-put: no lifecycle lock descriptor %d", lifecycleFD)
 		}
+		defer f.Close()
+		syscall.CloseOnExec(lifecycleFD) // tar and its compressor don't hold it
+		// The lock is already this descriptor's: this only confirms it.
+		if err := syscall.Flock(lifecycleFD, syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+			return fmt.Errorf("cache-put: inherited lifecycle lock: %w", err)
+		}
+	} else if hasLifecycleLock() {
+		l, err := lockShared(LifecycleLock, 10*time.Second)
+		if err != nil {
+			return fmt.Errorf("cache-put: VM is shutting down: %w", err)
+		}
+		defer l.Unlock()
 	}
 	if lockPath != "" {
 		if f, err := openLockFile(lockPath); err == nil {

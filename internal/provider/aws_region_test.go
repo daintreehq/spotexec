@@ -1,8 +1,12 @@
 package provider
 
 import (
+	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -87,5 +91,127 @@ output = json
 	t.Setenv("AWS_CONFIG_FILE", dir)
 	if r, from := ProfileRegion("work"); r != "" || !strings.Contains(from, "cannot read") {
 		t.Errorf("unreadable config: %q %q", r, from)
+	}
+}
+
+// AWS_SHARED_CREDENTIALS_FILE and AWS_CONFIG_FILE expand ~ and $VARS
+// wherever they are read or written, as the AWS CLI does: setup must not
+// write a key to a literal ./~/.aws/credentials.
+func TestAWSFileEnvExpanded(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("SPOTEXEC_TEST_AWS", filepath.Join(home, "elsewhere"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", "~/.aws/credentials")
+	t.Setenv("AWS_CONFIG_FILE", "$SPOTEXEC_TEST_AWS/config")
+	wantCreds := filepath.Join(home, ".aws", "credentials")
+	wantCfg := filepath.Join(home, "elsewhere", "config")
+	if got := sharedCredentialsPath(); got != wantCreds {
+		t.Errorf("sharedCredentialsPath = %q, want %q", got, wantCreds)
+	}
+	if got := awsCredentialsFile(); got != wantCreds {
+		t.Errorf("awsCredentialsFile = %q, want %q", got, wantCreds)
+	}
+	if got, err := awsConfigPath(); err != nil || got != wantCfg {
+		t.Errorf("awsConfigPath = %q, %v; want %q", got, err, wantCfg)
+	}
+	if got := awsConfigFile(); got != wantCfg {
+		t.Errorf("awsConfigFile = %q, want %q", got, wantCfg)
+	}
+	os.MkdirAll(filepath.Dir(wantCreds), 0o700)
+	os.WriteFile(wantCreds, []byte("[work]\naws_access_key_id = AK\naws_secret_access_key = s\nregion = eu-west-3\n"), 0o600)
+	if c, err := readSharedCredentials("work"); err != nil || c.AccessKeyID != "AK" {
+		t.Errorf("readSharedCredentials = %+v, %v", c, err)
+	}
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	if r, _ := ProfileRegion("work"); r != "eu-west-3" {
+		t.Errorf("ProfileRegion = %q", r)
+	}
+}
+
+// Account-wide calls go to the partition's home: the regions' partition,
+// else the admin profile's, else the commercial one.
+func TestAccountRegion(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config")
+	os.WriteFile(cfg, []byte("[profile gov]\nregion = us-gov-east-1\n\n[profile work]\nregion = eu-west-1\n"), 0o600)
+	t.Setenv("AWS_CONFIG_FILE", cfg)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(dir, "credentials"))
+	for _, k := range []string{"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"} {
+		t.Setenv(k, "")
+	}
+	for _, c := range []struct {
+		profile string
+		regions []string
+		want    string
+	}{
+		{"work", []string{"eu-west-1", "us-east-2"}, "us-east-1"},
+		{"work", []string{"us-gov-east-1"}, "us-gov-west-1"},
+		{"gov", []string{"us-gov-west-1", "us-gov-east-1"}, "us-gov-west-1"},
+		{"gov", nil, "us-gov-west-1"},
+		{"work", nil, "us-east-1"},
+		{"missing", nil, "us-east-1"},
+		{"gov", []string{"eu-west-1"}, "us-east-1"}, // the regions in play win over the profile
+	} {
+		if got, err := AccountRegion(c.profile, c.regions); err != nil || got != c.want {
+			t.Errorf("AccountRegion(%q, %v) = %q, %v; want %q", c.profile, c.regions, got, err, c.want)
+		}
+	}
+	if _, err := AccountRegion("work", []string{"us-east-2", "us-gov-west-1"}); err == nil || !strings.Contains(err.Error(), "different AWS partitions") {
+		t.Errorf("mixed partitions: %v", err)
+	}
+}
+
+// IAM has one endpoint per partition, signed for the partition's home
+// region whichever region the client is for; other services stay regional.
+func TestIAMEndpointAndSigningRegion(t *testing.T) {
+	for _, c := range []struct{ region, iam, signed string }{
+		{"us-east-1", "https://iam.amazonaws.com/", "us-east-1"},
+		{"eu-west-1", "https://iam.amazonaws.com/", "us-east-1"},
+		{"us-gov-east-1", "https://iam.us-gov.amazonaws.com/", "us-gov-west-1"},
+		{"us-gov-west-1", "https://iam.us-gov.amazonaws.com/", "us-gov-west-1"},
+	} {
+		cl := accountClient(c.region, nil)
+		if got := cl.endpoint("iam"); got != c.iam {
+			t.Errorf("%s: IAM endpoint %s, want %s", c.region, got, c.iam)
+		}
+		if got := cl.signingRegion("iam"); got != c.signed {
+			t.Errorf("%s: IAM signed for %s, want %s", c.region, got, c.signed)
+		}
+		if got := cl.endpoint("sts"); got != "https://sts."+c.region+".amazonaws.com/" || cl.signingRegion("sts") != c.region {
+			t.Errorf("%s: STS %s signed for %s", c.region, got, cl.signingRegion("sts"))
+		}
+	}
+	if got := (&AWSUserSetup{}).client("us-gov-west-1", nil).endpoint("iam"); got != "https://iam.us-gov.amazonaws.com/" {
+		t.Errorf("setup's IAM endpoint %s", got)
+	}
+}
+
+// The wiring, not just the helpers: an IAM request from a client in any
+// region goes to its partition's IAM host signed for the partition's home,
+// and STS stays in the client's region.
+func TestIAMRequestsSignedForPartitionHome(t *testing.T) {
+	for _, c := range []struct{ region, iamHost, iamScope string }{
+		{"eu-west-1", "iam.amazonaws.com", "us-east-1"},
+		{"us-gov-east-1", "iam.us-gov.amazonaws.com", "us-gov-west-1"},
+	} {
+		var hosts, scopes []string
+		rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			hosts = append(hosts, r.URL.Host)
+			scopes = append(scopes, regexp.MustCompile(`Credential=[^/]+/[^/]+/([^/]+)/`).FindStringSubmatch(r.Header.Get("Authorization"))[1])
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("<ok/>")), Request: r}, nil
+		})
+		cl := &awsClient{region: c.region, creds: staticResolver(awsCreds{AccessKeyID: "AK", SecretAccessKey: "s"}), http: &http.Client{Transport: rt}}
+		if _, err := cl.query(context.Background(), "iam", iamAPIVersion, "ListUsers", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cl.query(context.Background(), "sts", "2011-06-15", "GetCallerIdentity", nil); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{c.iamHost, "sts." + c.region + ".amazonaws.com"}
+		if strings.Join(hosts, ",") != strings.Join(want, ",") || strings.Join(scopes, ",") != c.iamScope+","+c.region {
+			t.Errorf("%s: hosts %v, signed for %v", c.region, hosts, scopes)
+		}
 	}
 }

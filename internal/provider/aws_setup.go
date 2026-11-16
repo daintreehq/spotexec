@@ -31,7 +31,10 @@ const iamAPIVersion = "2010-05-08"
 // RunInstances and CreateImage are authorised per resource type: the new
 // instance and volumes must be requested with the tag, the source instance
 // of an image must already carry it. Inline user policies are capped at
-// 2,048 characters (TestPolicyFitsInline).
+// 2,048 characters, in every partition (TestPolicyFitsInline): the ARNs
+// are written for the commercial partition, and PolicyFor rewrites them
+// for GovCloud's longer "arn:aws-us-gov:" (IAM allows no wildcard
+// partition). "spotexec-cache-*" covers the buckets' objects too.
 const SpotexecPolicy = `{
   "Version": "2012-10-17",
   "Statement": [
@@ -60,7 +63,7 @@ const SpotexecPolicy = `{
     { "Effect": "Allow", "Action": [
         "s3:CreateBucket", "s3:PutLifecycleConfiguration", "s3:ListBucket",
         "s3:GetObject", "s3:PutObject"
-      ], "Resource": ["arn:aws:s3:::spotexec-cache-*", "arn:aws:s3:::spotexec-cache-*/*"] },
+      ], "Resource": "arn:aws:s3:::spotexec-cache-*" },
     { "Effect": "Allow", "Action": [
         "ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy",
         "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
@@ -130,7 +133,7 @@ func (s *AWSUserSetup) logf(format string, args ...any) {
 }
 
 func (s *AWSUserSetup) client(region string, creds *awsCredResolver) *awsClient {
-	ep := map[string]string{"iam": "https://iam.amazonaws.com/"}
+	ep := map[string]string{}
 	for k, v := range s.endpoints {
 		ep[k] = v
 	}
@@ -148,6 +151,11 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		if n != "" && !validIAMName.MatchString(n) {
 			return nil, fmt.Errorf("%q is not a valid IAM user name (letters, digits and +=,.@_- only, at most 64)", n)
 		}
+	}
+	// One user, one policy and one key serve one partition.
+	home, err := AccountRegion("", append(append([]string{s.Region}, s.VPCRegions...), s.QuotaRegions...))
+	if err != nil {
+		return nil, err
 	}
 	machine := s.MachineID
 	if machine == "" {
@@ -215,7 +223,7 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		name = s.DefaultName
 	}
 
-	admin := s.client("us-east-1", &awsCredResolver{profile: s.AdminProfile, envOnly: s.AdminFromEnv})
+	admin := s.client(home, &awsCredResolver{profile: s.AdminProfile, envOnly: s.AdminFromEnv})
 	acct, adminARN, adminErr := callerIdentity(ctx, admin)
 	if adminErr == nil && profAcct != "" && profAcct != acct {
 		// Changing anything here would set up a user in one account and
@@ -234,7 +242,7 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 		// are read with the admin session, else with the key itself.
 		reader := admin
 		if !isAdmin {
-			reader = s.client("us-east-1", staticResolver(*existing))
+			reader = s.client(home, staticResolver(*existing))
 		}
 		if u, err := getUser(ctx, reader, name); err == nil {
 			if tag := u.Tags[tagMachine]; tag != "" && tag != machine {
@@ -370,7 +378,7 @@ func (s *AWSUserSetup) Run(ctx context.Context) (*AWSUserSetupResult, error) {
 
 	// 2. Its policy (inline, so re-running replaces it with this version's).
 	if _, err := admin.query(ctx, "iam", iamAPIVersion, "PutUserPolicy", url.Values{
-		"UserName": {name}, "PolicyName": {"spotexec"}, "PolicyDocument": {compactJSON(SpotexecPolicy)},
+		"UserName": {name}, "PolicyName": {"spotexec"}, "PolicyDocument": {compactJSON(PolicyFor(home))},
 	}); err != nil {
 		return nil, iamHint(fmt.Errorf("attaching the spotexec policy: %w", err))
 	}
@@ -496,14 +504,23 @@ func (s *AWSUserSetup) tagOldSecurityGroups(ctx context.Context, creds *awsCredR
 		}
 		seen[region] = true
 		c := s.client(region, creds)
-		b, err := c.ec2(ctx, "DescribeSecurityGroups", spotexecSGFilter())
+		var groups []ec2SecurityGroup
+		err := paginate(func(token string) (string, error) {
+			q := spotexecSGFilter()
+			if token != "" {
+				q.Set("NextToken", token)
+			}
+			b, err := c.ec2(ctx, "DescribeSecurityGroups", q)
+			if err != nil {
+				return "", err
+			}
+			page, next, err := parseSecurityGroups(b)
+			groups = append(groups, page...)
+			return next, err
+		})
 		if err != nil {
-			s.logf("warning: couldn't list spotexec's security groups in %s: %v", region, err)
-			continue
-		}
-		groups, _, err := parseSecurityGroups(b)
-		if err != nil {
-			continue
+			// Tag what was listed; the rest waits for the next setup.
+			s.logf("warning: couldn't list all of spotexec's security groups in %s: %v", region, err)
 		}
 		for _, g := range groups {
 			if g.tag(tagOwner) != "" || !g.madeBySpotexec() {
@@ -667,7 +684,7 @@ func compactJSON(s string) string {
 
 func awsConfigFile() string {
 	if p := os.Getenv("AWS_CONFIG_FILE"); p != "" {
-		return p
+		return expandAWSPath(p)
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".aws", "config")
@@ -865,15 +882,19 @@ func upsertINISection(path, section string, set [][2]string, drop []string) erro
 
 // AdminSession returns the current AWS sign-in for profile ("" = the
 // default chain) and who it is, so setup can run on another machine with
-// it. The credentials are usually short-lived session credentials.
-func AdminSession(ctx context.Context, profile string) (env []string, arn string, err error) {
-	r := &awsCredResolver{profile: profile}
-	c, err := r.get(ctx)
+// it. The credentials are usually short-lived session credentials. regions
+// are the runners' regions: they say which partition to sign in to (else
+// the profile's region does).
+func AdminSession(ctx context.Context, profile string, regions []string) (env []string, arn string, err error) {
+	home, err := AccountRegion(profile, regions)
 	if err != nil {
 		return nil, "", err
 	}
-	cl := (&AWSUserSetup{}).client("us-east-1", staticResolver(c))
-	if _, arn, err = callerIdentity(ctx, cl); err != nil {
+	c, err := accountResolver(profile).get(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, arn, err = callerIdentity(ctx, accountClient(home, staticResolver(c))); err != nil {
 		return nil, "", err
 	}
 	return []string{c.AccessKeyID, c.SecretAccessKey, c.SessionToken}, arn, nil
@@ -949,19 +970,14 @@ type MachineKey struct {
 // ListMachines lists the IAM users under /spotexec/ with their keys and the
 // spotexec VMs each machine has running in regions.
 func ListMachines(ctx context.Context, adminProfile string, regions []string) ([]Machine, error) {
-	admin := accountClient("us-east-1", accountResolver(adminProfile))
-	b, err := admin.query(ctx, "iam", iamAPIVersion, "ListUsers", url.Values{"PathPrefix": {iamUserPath}, "MaxItems": {"1000"}})
+	home, err := AccountRegion(adminProfile, regions)
 	if err != nil {
-		return nil, iamHint(fmt.Errorf("listing spotexec's IAM users: %w", err))
-	}
-	var v struct {
-		Users []struct {
-			Name    string `xml:"UserName"`
-			Created string `xml:"CreateDate"`
-		} `xml:"ListUsersResult>Users>member"`
-	}
-	if err := xml.Unmarshal(b, &v); err != nil {
 		return nil, err
+	}
+	admin := accountClient(home, accountResolver(adminProfile))
+	users, err := listSpotexecUsers(ctx, admin)
+	if err != nil {
+		return nil, fmt.Errorf("listing spotexec's IAM users: %w", err)
 	}
 	me, _ := ownerID()
 	vms := map[string]int{}
@@ -969,7 +985,7 @@ func ListMachines(ctx context.Context, adminProfile string, regions []string) ([
 		vms[in.Owner]++
 	}
 	var out []Machine
-	for _, u := range v.Users {
+	for _, u := range users {
 		m := Machine{User: u.Name, Created: u.Created}
 		if gu, err := getUser(ctx, admin, u.Name); err == nil {
 			m.Host, m.MachineID = gu.Tags["spotexec-host"], gu.Tags[tagMachine]
@@ -992,6 +1008,50 @@ func ListMachines(ctx context.Context, adminProfile string, regions []string) ([
 	return out, nil
 }
 
+// listedUser is one IAM user from ListUsers.
+type listedUser struct {
+	Name    string `xml:"UserName"`
+	Path    string `xml:"Path"`
+	Created string `xml:"CreateDate"`
+}
+
+// listSpotexecUsers lists every IAM user setup creates: exactly under
+// /spotexec/ (PathPrefix also matches /spotexec/anything/), every page.
+func listSpotexecUsers(ctx context.Context, admin *awsClient) ([]listedUser, error) {
+	var out []listedUser
+	err := paginate(func(marker string) (string, error) {
+		q := url.Values{"PathPrefix": {iamUserPath}, "MaxItems": {"1000"}}
+		if marker != "" {
+			q.Set("Marker", marker)
+		}
+		b, err := admin.query(ctx, "iam", iamAPIVersion, "ListUsers", q)
+		if err != nil {
+			return "", iamHint(err)
+		}
+		var v struct {
+			Users     []listedUser `xml:"ListUsersResult>Users>member"`
+			Truncated bool         `xml:"ListUsersResult>IsTruncated"`
+			Marker    string       `xml:"ListUsersResult>Marker"`
+		}
+		if err := xml.Unmarshal(b, &v); err != nil {
+			return "", err
+		}
+		for _, u := range v.Users {
+			if u.Path == iamUserPath {
+				out = append(out, u)
+			}
+		}
+		if !v.Truncated {
+			return "", nil
+		}
+		if v.Marker == "" {
+			return "", errors.New("ListUsers: truncated without a marker")
+		}
+		return v.Marker, nil
+	})
+	return out, err
+}
+
 // adminScopes searches regions with the admin profile.
 func adminScopes(profile string, regions []string) []AccountScope {
 	var out []AccountScope
@@ -1012,7 +1072,11 @@ func adminScopes(profile string, regions []string) []AccountScope {
 // owner ID) is kept, so running it again finishes the job. user is the IAM
 // user name.
 func RevokeMachine(ctx context.Context, adminProfile, user string, regions []string, log func(string, ...any)) error {
-	admin := accountClient("us-east-1", accountResolver(adminProfile))
+	home, err := AccountRegion(adminProfile, regions)
+	if err != nil {
+		return err
+	}
+	admin := accountClient(home, accountResolver(adminProfile))
 	u, err := getUser(ctx, admin, user)
 	if err != nil {
 		return iamHint(fmt.Errorf("IAM user %s: %w", user, err))

@@ -68,6 +68,7 @@ func cmdSim() *cobra.Command {
 	var after time.Duration
 	interrupt := &cobra.Command{
 		Use:   "interrupt [runner] [instance]",
+		Args:  cobra.MaximumNArgs(2),
 		Short: "Send a spot interruption notice, then terminate the instance after --after",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sim, id, err := pick(args)
@@ -84,6 +85,7 @@ func cmdSim() *cobra.Command {
 	interrupt.Flags().DurationVar(&after, "after", 10*time.Second, "time between the notice and termination (AWS: 2m)")
 	rebalance := &cobra.Command{
 		Use:   "rebalance [runner] [instance]",
+		Args:  cobra.MaximumNArgs(2),
 		Short: "Send a rebalance recommendation (advisory: reported, the instance keeps working)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sim, id, err := pick(args)
@@ -99,6 +101,7 @@ func cmdSim() *cobra.Command {
 	}
 	build := &cobra.Command{
 		Use:   "build [runner]",
+		Args:  cobra.MaximumNArgs(1),
 		Short: "Build the simulator image",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sim, _, err := pick(args)

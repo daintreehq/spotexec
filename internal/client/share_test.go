@@ -229,6 +229,12 @@ func TestShareLostLeaderHandsOver(t *testing.T) {
 		cancel bool
 	}{
 		{"runner lost", errors.New("runner stopped responding"), false},
+		// #162: the runner reporting that it is going away (a Spot reclaim
+		// shutting the VM down, a drain, a helper fault) is losing it, not
+		// the build failing: one waiting part takes over, not all at once.
+		{"vm shutting down", fmt.Errorf("deps: %w", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeShutdown, Message: "the VM began shutting down"}}), false},
+		{"draining", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeDraining}}, false},
+		{"helper fault", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeInternal}}, false},
 		// A failure the runner reports as the run is cancelled (fail_fast)
 		// is the cancel's, not the install's.
 		{"cancelled", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeDepsFailed, Message: "install command exited 143"}}, true},
@@ -261,21 +267,25 @@ func TestShareLostLeaderHandsOver(t *testing.T) {
 // the waiting parts go on at once, each on its own, instead of retrying it
 // one after another. prepareImage wraps the runner's error.
 func TestShareFailedInstallReleasesTheWaiters(t *testing.T) {
-	ctx := fastShare(t)
-	bad := fmt.Errorf("container image: %w", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "docker build: exit 1"}})
-	f := &fakeStore{hold: make(chan struct{}), fail: []error{bad, bad, bad, bad}, together: 3}
-	runs := runParts(ctx, t, 4, f)
-	l := leader(t, runs)
-	for i, r := range runs {
-		if r.err == nil {
-			t.Errorf("part %d succeeded: %+v", i, r.out)
-		}
-		if i != l && len(r.waiting) != 1 {
-			t.Errorf("part %d didn't wait: %+v", i, r)
-		}
-	}
-	if builds, _, _ := f.counts(); builds != 4 || f.serial {
-		t.Fatalf("builds %d, one after another %v; want 4 at once", builds, f.serial)
+	for _, code := range []string{protocol.CodeImageFailed, protocol.CodeDepsFailed} {
+		t.Run(code, func(t *testing.T) {
+			ctx := fastShare(t)
+			bad := fmt.Errorf("prepare: %w", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: code, Message: "exit 1"}})
+			f := &fakeStore{hold: make(chan struct{}), fail: []error{bad, bad, bad, bad}, together: 3}
+			runs := runParts(ctx, t, 4, f)
+			l := leader(t, runs)
+			for i, r := range runs {
+				if r.err == nil {
+					t.Errorf("part %d succeeded: %+v", i, r.out)
+				}
+				if i != l && len(r.waiting) != 1 {
+					t.Errorf("part %d didn't wait: %+v", i, r)
+				}
+			}
+			if builds, _, _ := f.counts(); builds != 4 || f.serial {
+				t.Fatalf("builds %d, one after another %v; want 4 at once", builds, f.serial)
+			}
+		})
 	}
 }
 
