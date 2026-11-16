@@ -115,15 +115,21 @@ func choose(idx int) func(context.Context) (int, error) {
 	return func(context.Context) (int, error) { return idx, nil }
 }
 
-// Forget drops the cached host, so the next pick selects afresh; a pick
-// that was dialing when Forget ran returns its host but doesn't cache it,
-// since Forget means the old answer may be stale. Twice, so every Forget
-// invalidates, not just the first.
+// A cached host is reused without selecting; Forget drops it, so the next
+// pick selects afresh; a pick that was dialing when Forget ran returns its
+// host but doesn't cache it, since Forget means the old answer may be stale.
+// The rounds overlap one and then two Forgets, so every Forget invalidates.
 func TestSSHForget(t *testing.T) {
 	ctx := context.Background()
 	s := &SSH{r: &config.Runner{Name: "r", Hosts: []string{"a", "b"}}}
 	if tg, err := s.pickWith(ctx, choose(0)); err != nil || tg.Host != "a" || cached(s) != "a" {
 		t.Fatalf("first pick = %+v, %v; cached %q", tg, err, cached(s))
+	}
+	if tg, err := s.pickWith(ctx, func(context.Context) (int, error) {
+		t.Fatal("selector ran with a host cached")
+		return 0, nil
+	}); err != nil || tg.Host != "a" {
+		t.Fatalf("cached pick = %+v, %v", tg, err)
 	}
 	s.Forget()
 	if tg, err := s.pickWith(ctx, choose(1)); err != nil || tg.Host != "b" || cached(s) != "b" {
@@ -132,7 +138,9 @@ func TestSSHForget(t *testing.T) {
 	for round := range 2 {
 		s.Forget()
 		release, done := blockedPick(t, s, 0)
-		s.Forget()
+		for range round + 1 {
+			s.Forget()
+		}
 		release()
 		if tg := <-done; tg.Host != "a" {
 			t.Fatalf("round %d: overtaken pick returned %q, want a", round, tg.Host)
