@@ -8,6 +8,8 @@ EMBED_DIR := internal/helperbin/dist
 # Where `make install` puts spotexec and sx: GOBIN, else the first GOPATH
 # entry's bin, as `go install` would. BINDIR=... overrides both.
 BINDIR ?= $(shell b=$$(go env GOBIN); [ -n "$$b" ] || b="$$(go env GOPATH | cut -d: -f1)/bin"; printf '%s' "$$b")
+# A path as one shell word, whatever quotes it holds.
+shq = '$(subst ','\'',$(1))'
 
 .PHONY: build helpers completions install test vet e2e clean
 
@@ -41,9 +43,9 @@ completions:
 	@rm -f completions/.gen
 
 install: build
-	install -d '$(BINDIR)'
-	install -m 0755 bin/spotexec '$(BINDIR)/spotexec'
-	ln -sf spotexec '$(BINDIR)/sx'
+	install -d $(call shq,$(BINDIR))
+	install -m 0755 bin/spotexec $(call shq,$(BINDIR)/spotexec)
+	ln -sf spotexec $(call shq,$(BINDIR)/sx)
 
 test:
 	go test ./...
