@@ -28,18 +28,26 @@ const ClientTimeout = 45 * time.Second
 
 // Session is one RPC connection.
 type Session struct {
-	c        *protocol.Conn
-	layout   Layout
-	frames   chan protocol.Frame
-	readErr  atomic.Value // error
+	c       *protocol.Conn
+	layout  Layout
+	frames  chan protocol.Frame
+	readErr atomic.Value // error
+	// born anchors the session's monotonic clock (see now): lastSeen,
+	// stalledAt and stallTick are offsets from it, so a wall clock stepped
+	// by NTP on a just-booted or resumed VM can't make the client look
+	// silent, or alive.
+	born     time.Time
 	lastSeen atomic.Int64
 	// stalledAt is when the helper last found itself unscheduled for
-	// seconds (see watchStalls).
+	// seconds (see watchStalls); 0 (never) until then.
 	stalledAt atomic.Int64
-	stallTick atomic.Int64 // the stall sampler's latest run
+	stallTick atomic.Int64 // the stall sampler's latest run; 0 before its first
 	// owned is the work root while this session holds a slot (read by the
 	// heartbeat goroutine, so not s.tokens / s.layout directly).
-	owned    atomic.Pointer[string]
+	owned atomic.Pointer[string]
+	// relMu guards what the session owns (its locks and the slot's paths)
+	// against Shutdown and lastResort, which tear it down from another
+	// goroutine: acquire publishes them under it (see own).
 	relMu    sync.Mutex
 	procMu   sync.Mutex  // held while a process or container is being started
 	stopping atomic.Bool // Shutdown/lastResort own cleanup and exit
@@ -90,32 +98,66 @@ var current atomic.Pointer[Session]
 // when a blocked read of stdin can't be interrupted.
 func Shutdown(code int) {
 	if s := current.Load(); s != nil {
-		s.stopping.Store(true)
-		s.procMu.Lock() // wait out a start in progress; none begins after this
-		s.procMu.Unlock()
-		if pg := int(s.child.Load()); pg > 0 {
-			killGroup(pg, 2*time.Second)
-		}
-		if s.workspace != "" {
-			reapWorkspace(s.workspace, 2*time.Second)
-		}
-		s.removeContainers(false)
-		if s.slotDir != "" {
-			_ = os.RemoveAll(filepath.Join(s.slotDir, "run"))
-		}
-		s.release()
+		s.teardown()
 	}
 	os.Exit(code)
 }
 
+// teardown cleans up what the session owns (its command's process group,
+// containers, slot locks) before the process exits. Acquire may be running
+// meanwhile: the slot's paths are read under relMu, and stopping makes it
+// stop instead of taking more.
+func (s *Session) teardown() {
+	s.stopping.Store(true)
+	s.procMu.Lock() // wait out a start in progress; none begins after this
+	s.procMu.Unlock()
+	if pg := int(s.child.Load()); pg > 0 {
+		killGroup(pg, 2*time.Second)
+	}
+	s.relMu.Lock()
+	workspace, slotDir := s.workspace, s.slotDir
+	s.relMu.Unlock()
+	if workspace != "" {
+		reapWorkspace(workspace, 2*time.Second)
+	}
+	s.removeContainers(false)
+	if slotDir != "" {
+		_ = os.RemoveAll(filepath.Join(slotDir, "run"))
+	}
+	s.release()
+}
+
+// own publishes what acquire just took (locks, the slot's paths) under
+// relMu, so a concurrent teardown sees all of it or none.
+func (s *Session) own(f func()) {
+	s.relMu.Lock()
+	defer s.relMu.Unlock()
+	f()
+}
+
+// newSession starts a session's monotonic clock, with the client just
+// heard from.
+func newSession() *Session {
+	s := &Session{frames: make(chan protocol.Frame, 64), born: time.Now()}
+	s.heard()
+	return s
+}
+
+// now is the session's monotonic clock: time since it began, never 0 (a
+// timestamp's "never"). Every liveness and stall timestamp is one of its
+// readings.
+func (s *Session) now() int64 { return max(int64(time.Since(s.born)), 1) }
+
+// heard notes that the client just sent something.
+func (s *Session) heard() { s.lastSeen.Store(s.now()) }
+
 func Serve(in io.Reader, out io.Writer) error {
 	startProtection()
-	s := &Session{frames: make(chan protocol.Frame, 64)}
+	s := newSession()
 	// Liveness counts bytes arriving, so a large manifest still streaming
 	// over a slow link is not mistaken for a silent client.
-	s.c = protocol.NewConn(protocol.ProgressReader{R: in, OnRead: func() { s.lastSeen.Store(time.Now().UnixNano()) }}, out)
+	s.c = protocol.NewConn(protocol.ProgressReader{R: in, OnRead: s.heard}, out)
 	current.Store(s)
-	s.lastSeen.Store(time.Now().UnixNano())
 	go s.readLoop()
 	defer s.release()
 	// Registered after release, so it runs first: while Shutdown/lastResort
@@ -126,9 +168,9 @@ func Serve(in io.Reader, out io.Writer) error {
 			select {}
 		}
 	}()
-	go s.lastResort()
 	done := make(chan struct{})
 	defer close(done)
+	go s.lastResort(done)
 	go s.watchStalls(done)
 	go func() {
 		// A heartbeat every 20s carries the runner's memory. Memory is
@@ -229,7 +271,7 @@ func (s *Session) readLoop() {
 			close(s.frames)
 			return
 		}
-		s.lastSeen.Store(time.Now().UnixNano())
+		s.heard()
 		if f.Kind == protocol.KindMsg {
 			if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeHeartbeat {
 				continue
@@ -265,24 +307,17 @@ func (s *Session) next() (protocol.Frame, error) {
 // heartbeat timeout. Normal paths notice earlier; this covers a helper wedged
 // in a blocking write to a client that stopped reading (laptop asleep) so the
 // kernel releases every flock and the idle watchdog can proceed.
-func (s *Session) lastResort() {
+func (s *Session) lastResort(done <-chan struct{}) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
 	for {
-		time.Sleep(5 * time.Second)
+		select {
+		case <-done:
+			return
+		case <-t.C:
+		}
 		if s.silentFor(ClientTimeout + 30*time.Second) {
-			s.stopping.Store(true)
-			s.procMu.Lock()
-			s.procMu.Unlock()
-			if pg := int(s.child.Load()); pg > 0 {
-				killGroup(pg, 2*time.Second)
-			}
-			if s.workspace != "" {
-				reapWorkspace(s.workspace, 2*time.Second)
-			}
-			s.removeContainers(false)
-			if s.slotDir != "" {
-				_ = os.RemoveAll(filepath.Join(s.slotDir, "run"))
-			}
-			s.release()
+			s.teardown()
 			os.Exit(4)
 		}
 	}
@@ -307,40 +342,47 @@ const (
 // silentFor: nothing from the client for longer than limit, and not
 // because the helper itself was just stalled.
 func (s *Session) silentFor(limit time.Duration) bool {
-	silent := time.Since(time.Unix(0, s.lastSeen.Load()))
+	return s.silentForAt(s.now(), limit)
+}
+
+// silentForAt is silentFor at the session clock's reading now.
+func (s *Session) silentForAt(now int64, limit time.Duration) bool {
+	silent := time.Duration(now - s.lastSeen.Load())
 	if silent <= limit {
 		return false
 	}
-	return silent > limit+stallCap || !s.recentlyStalled()
+	return silent > limit+stallCap || !s.recentlyStalledAt(now)
 }
 
 // recentlyStalled: the helper was unscheduled for seconds within the last
 // stallGrace, or is only now running again (its stall sampler is overdue:
 // whichever goroutine wakes first after a stall must not act on it).
-func (s *Session) recentlyStalled() bool {
-	now := time.Now()
-	if t := s.stallTick.Load(); t != 0 && now.Sub(time.Unix(0, t)) > 3*time.Second {
+func (s *Session) recentlyStalled() bool { return s.recentlyStalledAt(s.now()) }
+
+func (s *Session) recentlyStalledAt(now int64) bool {
+	if t := s.stallTick.Load(); t != 0 && time.Duration(now-t) > 3*time.Second {
 		return true
 	}
-	return now.Sub(time.Unix(0, s.stalledAt.Load())) < stallGrace
+	t := s.stalledAt.Load()
+	return t != 0 && time.Duration(now-t) < stallGrace
 }
 
 // watchStalls samples the helper's own scheduling every second, recording
 // when it last went unscheduled for several seconds.
 func (s *Session) watchStalls(done <-chan struct{}) {
-	last := time.Now()
-	s.stallTick.Store(last.UnixNano())
+	last := s.now()
+	s.stallTick.Store(last)
 	for {
 		select {
 		case <-done:
 			return
 		case <-time.After(time.Second):
 		}
-		now := time.Now()
-		if now.Sub(last) > 3*time.Second {
-			s.stalledAt.Store(now.UnixNano())
+		now := s.now()
+		if time.Duration(now-last) > 3*time.Second {
+			s.stalledAt.Store(now)
 		}
-		s.stallTick.Store(now.UnixNano())
+		s.stallTick.Store(now)
 		last = now
 	}
 }

@@ -310,7 +310,7 @@ func TestShareWaitEndsWhenTheClientIsGone(t *testing.T) {
 	shareTick = 10 * time.Millisecond
 	t.Cleanup(func() { shareTick = old })
 	s, _ := shareSession(t)
-	s.lastSeen.Store(time.Now().Add(-time.Hour).UnixNano())
+	s.lastSeen.Store(s.now() - int64(time.Hour))
 	tr, _ := pending()
 	s.track(protocol.ShareDeps, tr)
 	err := s.shareWait(protocol.ShareWait{Kind: protocol.ShareDeps, TimeoutMS: 60000})

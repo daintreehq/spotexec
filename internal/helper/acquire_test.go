@@ -24,8 +24,8 @@ func (w *syncBuf) Write(p []byte) (int, error) {
 
 func testSession(t *testing.T, root string) *Session {
 	t.Helper()
-	s := &Session{c: protocol.NewConn(strings.NewReader(""), &syncBuf{}), layout: Layout{Root: root}, frames: make(chan protocol.Frame, 1)}
-	s.lastSeen.Store(time.Now().UnixNano())
+	s := &Session{c: protocol.NewConn(strings.NewReader(""), &syncBuf{}), layout: Layout{Root: root}, frames: make(chan protocol.Frame, 1), born: time.Now()}
+	s.lastSeen.Store(s.now())
 	t.Cleanup(s.release)
 	return s
 }
