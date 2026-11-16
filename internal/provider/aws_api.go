@@ -257,6 +257,10 @@ func (c *awsClient) ssmGetParameter(ctx context.Context, name string) (string, e
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
+		var ce *CredentialError
+		if errors.As(err, &ce) {
+			return "", err // retrying can't fix credentials
+		}
 		if code := awsCode(err); isExpiredCreds(code) {
 			if attempt == 0 {
 				c.creds.invalidate()
@@ -267,10 +271,6 @@ func (c *awsClient) ssmGetParameter(ctx context.Context, name string) (string, e
 			return "", &CredentialError{err}
 		}
 		if awsCode(err) != "" && classifyAWSError(err) != errRetryable {
-			return "", err
-		}
-		var ce *CredentialError
-		if errors.As(err, &ce) {
 			return "", err
 		}
 	}

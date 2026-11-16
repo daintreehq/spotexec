@@ -104,30 +104,37 @@ func canonicalQuery(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	type pair struct{ k, v string }
-	var pairs []pair
+	var pairs [][2]string
 	for _, p := range strings.Split(raw, "&") {
 		if p == "" {
 			continue
 		}
 		k, v, _ := strings.Cut(p, "=") // valueless subresources (?lifecycle) sign as "lifecycle="
-		pairs = append(pairs, pair{reencodeQuery(k), reencodeQuery(v)})
+		pairs = append(pairs, [2]string{reencodeQuery(k), reencodeQuery(v)})
 	}
+	return joinQueryPairs(pairs)
+}
+
+// joinQueryPairs sorts encoded name/value pairs by name, then value (as
+// SigV4 requires: "a=1" before "a-b=1"), and joins them.
+func joinQueryPairs(pairs [][2]string) string {
 	sort.Slice(pairs, func(i, j int) bool {
-		if pairs[i].k != pairs[j].k {
-			return pairs[i].k < pairs[j].k
+		if pairs[i][0] != pairs[j][0] {
+			return pairs[i][0] < pairs[j][0]
 		}
-		return pairs[i].v < pairs[j].v
+		return pairs[i][1] < pairs[j][1]
 	})
 	parts := make([]string, len(pairs))
 	for i, p := range pairs {
-		parts[i] = p.k + "=" + p.v
+		parts[i] = p[0] + "=" + p[1]
 	}
 	return strings.Join(parts, "&")
 }
 
 // reencodeQuery re-encodes one query component the way AWS does
-// (uriEncode), whatever escaping the URL used ("%7E" and "~" alike).
+// (uriEncode), whatever escaping the URL used ("%7E" and "~" alike). A
+// literal "+" is a plus, not a space: signed URLs here encode a space as
+// %20. A malformed escape is left as it is.
 func reencodeQuery(s string) string {
 	d, err := url.PathUnescape(s)
 	if err != nil {

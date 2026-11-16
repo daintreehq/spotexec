@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -295,21 +294,23 @@ func s3EscapePath(p string) string {
 }
 
 func s3CanonicalQuery(q url.Values) string {
-	keys := make([]string, 0, len(q))
-	for k := range q {
-		keys = append(keys, k)
+	var pairs [][2]string
+	for k, vs := range q {
+		if len(vs) == 0 {
+			vs = []string{""}
+		}
+		for _, v := range vs {
+			pairs = append(pairs, [2]string{uriEncode(k), uriEncode(v)})
+		}
 	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, uriEncode(k)+"="+uriEncode(q.Get(k)))
-	}
-	return strings.Join(parts, "&")
+	return joinQueryPairs(pairs)
 }
 
 // fileSafe makes s (a profile name such as "corp/dev") usable inside one
 // local file name: bytes outside a portable set become %XX, so a name can
 // neither add a directory nor collide with another; ordinary names are kept.
+// "." and ".." survive, which is safe only with a prefix around them, as
+// every caller has.
 func fileSafe(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {

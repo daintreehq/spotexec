@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -116,6 +117,41 @@ func TestAccountIDSlashProfile(t *testing.T) {
 	}
 	ents, _ := os.ReadDir(a.dir)
 	if len(ents) != 1 || ents[0].IsDir() || !strings.HasPrefix(ents[0].Name(), "account-id-corp%2F..%2Fdev-") {
+		t.Fatalf("state dir holds %v", ents)
+	}
+}
+
+// The S3 canonical query sorts by encoded name and keeps repeated values.
+func TestS3CanonicalQuery(t *testing.T) {
+	q := url.Values{"a-b": {"1"}, "a": {"2", "1"}, "delete": {""}, "t": {"x~y z"}}
+	if got, want := s3CanonicalQuery(q), "a=1&a=2&a-b=1&delete=&t=x~y%20z"; got != want {
+		t.Fatalf("s3CanonicalQuery = %q, want %q", got, want)
+	}
+}
+
+// The ECR marker for a slash profile is one file in the state directory.
+func TestRegistryForSlashProfile(t *testing.T) {
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := "{}"
+		switch strings.TrimPrefix(r.Header.Get("X-Amz-Target"), "AmazonEC2ContainerRegistry_V20150921.") {
+		case "DescribeRepositories":
+			body = `{"repositories":[{"repositoryUri":"1.dkr.ecr.us-east-2.amazonaws.com/spotexec/x"}]}`
+		case "GetAuthorizationToken":
+			body = `{"authorizationData":[{"authorizationToken":"QVdTOnB3","proxyEndpoint":"https://1.dkr.ecr.us-east-2.amazonaws.com"}]}`
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})
+	a := &AWSSpot{
+		r: &config.Runner{Name: "aws", Region: "us-east-2", Profile: "corp/dev"},
+		api: &awsClient{region: "us-east-2", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "s"}},
+			http: &http.Client{Transport: rt}},
+		dir: t.TempDir(),
+	}
+	if auth, err := a.RegistryFor(context.Background(), "x"); err != nil || auth.User != "AWS" {
+		t.Fatalf("RegistryFor = %+v, %v", auth, err)
+	}
+	ents, _ := os.ReadDir(a.dir)
+	if len(ents) != 1 || ents[0].IsDir() || !strings.HasPrefix(ents[0].Name(), "ecr-us-east-2-corp%2Fdev-") {
 		t.Fatalf("state dir holds %v", ents)
 	}
 }
