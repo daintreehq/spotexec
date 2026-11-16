@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -183,14 +184,47 @@ func (sr *seedRepo) indexDigest(ctx context.Context) (string, error) {
 	}
 	h.Write(out)
 	if len(sr.req.IntentToAdd) > 0 {
-		out, err := sr.run(ctx, nil, append([]string{"diff-files", "--name-only", "-z", "--"}, sr.req.IntentToAdd...)...)
-		if err != nil {
-			return "", err
+		var names []string
+		for _, batch := range pathBatches(sr.req.IntentToAdd) {
+			out, err := sr.run(ctx, nil, append([]string{"diff-files", "--name-only", "-z", "--"}, batch...)...)
+			if err != nil {
+				return "", err
+			}
+			for _, n := range bytes.Split(out, []byte{0}) {
+				if len(n) > 0 {
+					names = append(names, string(n))
+				}
+			}
 		}
+		// As one command lists them: in index order (bytewise), once each.
+		slices.Sort(names)
 		h.Write([]byte{0, 1})
-		h.Write(out)
+		for _, n := range slices.Compact(names) {
+			h.Write([]byte(n))
+			h.Write([]byte{0})
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// argBatch bounds the paths one git command line carries, by count and by
+// bytes, well inside ARG_MAX (1 MiB on macOS, 2 MiB on Linux, environment
+// included).
+var argBatch = struct{ paths, bytes int }{500, 64 << 10}
+
+// pathBatches splits paths into batches that each fit one command line.
+func pathBatches(paths []string) [][]string {
+	var out [][]string
+	for len(paths) > 0 {
+		n, size := 0, 0
+		for n < len(paths) && n < argBatch.paths && (n == 0 || size+len(paths[n])+1 <= argBatch.bytes) {
+			size += len(paths[n]) + 1
+			n++
+		}
+		out = append(out, paths[:n])
+		paths = paths[n:]
+	}
+	return out
 }
 
 // prepare leaves only the objects the seed wants in .git, and the index
@@ -467,12 +501,10 @@ func (sr *seedRepo) build(ctx context.Context) (*statSig, string, error) {
 			}
 		}
 	}
-	for len(ita) > 0 {
-		n := min(len(ita), 500)
-		if _, err := sr.run(ctx, nil, append([]string{"add", "-N", "-f", "--"}, ita[:n]...)...); err != nil {
+	for _, batch := range pathBatches(ita) {
+		if _, err := sr.run(ctx, nil, append([]string{"add", "-N", "-f", "--"}, batch...)...); err != nil {
 			return nil, "", err
 		}
-		ita = ita[n:]
 	}
 	if sr.req.Head != "" {
 		// Exit 1 only means some file differs from HEAD.
