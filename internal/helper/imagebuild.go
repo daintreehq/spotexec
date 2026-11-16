@@ -14,28 +14,46 @@ import (
 // enough for BuildKit's closing summary of the failing step.
 const buildTailLines = 40
 
-// buildLineMax caps a line held for classification or the tail.
+// buildLineMax caps a line held for the tail, and an unfinished line held
+// while more of it comes.
 const buildLineMax = 4 << 10
+
+// buildOverlap is how much of an endless line's end, once classified, is
+// classified again with what follows, so no diagnostic straddles a cut.
+const buildOverlap = 512
 
 // Evidence that the project's Dockerfile itself is broken (#193). Docker's
 // build output is not a typed API, so only these well-known diagnostics
 // count; anything else stays a failure of spotexec's own (exit 125).
+// They count only on Docker's own lines, never on a line a step printed.
 var (
-	// BuildKit: a RUN step that exited non-zero.
-	buildRunExitRe = regexp.MustCompile(`did not complete successfully: exit code: (\d+)`)
+	// BuildKit: a RUN step that exited non-zero ("process "/bin/sh -c …"
+	// did not complete successfully: exit code: 2"; before BuildKit 0.11,
+	// "executor failed running [/bin/sh -c …]: exit code: 2").
+	buildRunExitRe = regexp.MustCompile(`(?:did not complete successfully|executor failed running \[.*\]): exit code: (\d+)`)
 	// The legacy builder's form of the same.
 	legacyRunExitRe = regexp.MustCompile(`returned a non-zero code: (\d+)`)
 	// A Dockerfile that doesn't parse ("dockerfile parse error on line 3:
 	// unknown instruction: RUNN"; the legacy builder's "Dockerfile parse
 	// error line 3: …").
 	parseErrorRe = regexp.MustCompile(`(?i)dockerfile parse error`)
-	// COPY or ADD of a file that isn't in the build context (BuildKit, then
-	// the legacy builder).
-	missingSourceRe = regexp.MustCompile(`failed to calculate checksum of ref [^ ]+ "[^"]*": not found|COPY failed: file not found in build context`)
-	// Evidence of Docker, the network or the machine failing, which wins
-	// over the above: a RUN step that fails because DNS is down is not the
-	// Dockerfile's fault.
-	buildInfraRe = regexp.MustCompile(`(?i)cannot connect to the docker daemon|error during connect|no space left on device|temporary failure in name resolution|could not resolve host|no such host|network is unreachable|i/o timeout|tls handshake timeout|connection reset by peer|toomanyrequests|input/output error`)
+	// COPY or ADD of a file that isn't in the build context: BuildKit (and
+	// before 0.11, its "failed to compute cache key: "/x" not found"), then
+	// the legacy builder (and its older "COPY failed: stat …: no such file").
+	missingSourceRe = regexp.MustCompile(`failed to calculate checksum of ref [^ ]+ "[^"]*": not found|failed to compute cache key: "[^"]*" not found|(?:COPY|ADD) failed: (?:file not found in build context|stat [^:]*: no such file or directory)`)
+	// A line a BuildKit step printed ("#5 0.214 …"), as it ran or repeated
+	// in the failure's summary ("0.214 …"), or a line of the Dockerfile the
+	// summary quotes ("   2 | >>> RUN …"): the step's words, not Docker's.
+	stepLineRe = regexp.MustCompile(`^(?:#\d+ )?\d+\.\d+ |^\s*\d+ \| `)
+	// Evidence of Docker, the network or the machine failing, anywhere in
+	// the output, which wins over the above: a RUN step that fails because
+	// DNS is down, or a server answered 503, is not the Dockerfile's fault.
+	buildInfraRe = regexp.MustCompile(`(?i)cannot connect to the docker daemon|error during connect|rpc error: code = unavailable|no space left on device|input/output error|` +
+		`temporary failure in name resolution|could not resolve host|unable to resolve host address|no such host|network is unreachable|` +
+		`i/o timeout|tls handshake timeout|connection reset by peer|connection refused|connection timed out|operation timed out|read timed out|` +
+		`failed to connect to|max retries exceeded|curl: \((?:5|6|7|28|35|52|56)\)|returned error: (?:429|5\d\d)\b|` +
+		`\b(?:429 too many requests|502 bad gateway|503 service unavailable|504 gateway time-?out)\b|toomanyrequests|` +
+		`\b(?:EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND)\b`)
 )
 
 // buildLog watches a docker build's output as it streams to the client:
@@ -45,6 +63,7 @@ var (
 type buildLog struct {
 	mu      sync.Mutex
 	partial [2][]byte // per stream, a line not yet ended
+	long    [2]bool   // that line outgrew buildLineMax: only its end is held
 	tail    []string
 	project string // why the Dockerfile is at fault, if it is
 	infra   bool   // the output shows Docker, the network or the VM failing
@@ -60,30 +79,40 @@ func (b *buildLog) write(i int, p []byte) {
 		if n < 0 {
 			break
 		}
-		b.line(string(buf[:n]))
+		b.line(string(buf[:n]), b.long[i])
+		b.long[i] = false
 		buf = buf[n+1:]
 	}
 	if len(buf) > buildLineMax {
-		// An endless line (a progress bar): keep its end only.
-		buf = buf[len(buf)-buildLineMax:]
+		// An endless line (a progress bar): keep its end only, once what
+		// is dropped has been looked at for a failure around the build.
+		cut := len(buf) - buildLineMax
+		if buildInfraRe.Match(buf[:cut+buildOverlap]) {
+			b.infra = true
+		}
+		buf = buf[cut:]
+		b.long[i] = true
 	}
 	b.partial[i] = append([]byte(nil), buf...)
 }
 
-// line classifies one line and adds it to the tail.
-func (b *buildLog) line(l string) {
+// line classifies one line and adds it to the tail. A long line (whose
+// start was dropped) can still show a failure around the build, but can't
+// show the Dockerfile at fault: its start would say whether a step printed
+// it.
+func (b *buildLog) line(l string, long bool) {
 	l = strings.TrimRight(l, "\r")
-	if j := strings.LastIndexByte(l, '\r'); j >= 0 {
-		l = l[j+1:]
-	}
-	if len(l) > buildLineMax {
-		l = l[len(l)-buildLineMax:]
-	}
 	if buildInfraRe.MatchString(l) {
 		b.infra = true
 	}
-	if b.project == "" {
+	if j := strings.LastIndexByte(l, '\r'); j >= 0 {
+		l = l[j+1:] // a progress bar's last state
+	}
+	if b.project == "" && !long && !stepLineRe.MatchString(l) {
 		b.project = projectCause(l)
+	}
+	if len(l) > buildLineMax {
+		l = l[len(l)-buildLineMax:]
 	}
 	b.tail = append(b.tail, l)
 	if len(b.tail) > buildTailLines {
@@ -119,8 +148,8 @@ func (b *buildLog) flush() {
 	defer b.mu.Unlock()
 	for i := range b.partial {
 		if len(b.partial[i]) > 0 {
-			b.line(string(b.partial[i]))
-			b.partial[i] = nil
+			b.line(string(b.partial[i]), b.long[i])
+			b.partial[i], b.long[i] = nil, false
 		}
 	}
 }
