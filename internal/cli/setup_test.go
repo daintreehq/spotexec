@@ -361,3 +361,28 @@ func TestRosterMatchUntaggedUser(t *testing.T) {
 		}
 	}
 }
+
+// --print-policy prints the policy for the partition the runners (else
+// the admin profile) are in.
+func TestPolicyRegion(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(dir, "aws-config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(dir, "credentials"))
+	for _, k := range []string{"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"} {
+		t.Setenv(k, "")
+	}
+	cfg := filepath.Join(dir, "config.toml")
+	t.Setenv("SPOTEXEC_CONFIG", cfg)
+	if rg := policyRegion(""); rg != "" || provider.PolicyFor(rg) != provider.SpotexecPolicy {
+		t.Fatalf("no config: %q", rg)
+	}
+	os.WriteFile(cfg, []byte("version = 1\n\n[runners.gov]\ntype = \"aws-spot\"\nregion = \"us-gov-west-1\"\n"), 0o600)
+	if rg := policyRegion(""); rg != "us-gov-west-1" || !strings.Contains(provider.PolicyFor(rg), `"arn:aws-us-gov:ssm:`) {
+		t.Fatalf("GovCloud runner: %q", rg)
+	}
+	os.WriteFile(cfg, nil, 0o600)
+	t.Setenv("AWS_REGION", "us-gov-east-1")
+	if rg := policyRegion(""); rg != "us-gov-east-1" {
+		t.Fatalf("GovCloud admin profile: %q", rg)
+	}
+}

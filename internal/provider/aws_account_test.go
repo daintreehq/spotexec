@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -41,6 +42,7 @@ type fakeAccount struct {
 	listings     map[string]int                           // key+region -> DescribeInstances listings so far
 	stuck        bool                                     // terminating instances never finish
 	filters      url.Values
+	signed       []string // "service Action region" of every IAM and STS call
 	// extra serves anything else first (S3, ECR, more EC2); true = handled.
 	extra func(w http.ResponseWriter, r *http.Request, key, region, service string, body []byte) bool
 }
@@ -56,6 +58,9 @@ func (f *fakeAccount) install(t *testing.T) {
 			return
 		}
 		v, _ := url.ParseQuery(string(body))
+		if m[3] == "iam" || m[3] == "sts" {
+			f.signed = append(f.signed, m[3]+" "+v.Get("Action")+" "+region)
+		}
 		fail := func(code string) {
 			w.WriteHeader(400)
 			fmt.Fprintf(w, `<Response><Errors><Error><Code>%s</Code><Message>%s</Message></Error></Errors></Response>`, code, code)
@@ -111,15 +116,36 @@ func (f *fakeAccount) install(t *testing.T) {
 			f.log = append(f.log, "DeleteUserPolicy "+iamUser)
 			fmt.Fprint(w, `<DeleteUserPolicyResponse/>`)
 		case "ListUsers":
-			var b strings.Builder
+			// One user per page, to exercise paging. PathPrefix matches
+			// nested paths too, as IAM's does.
+			var names []string
 			for name := range f.users {
 				path := "/spotexec/"
 				if pp := f.userPaths[name]; pp != "" {
 					path = pp
 				}
-				fmt.Fprintf(&b, `<member><UserName>%s</UserName><Path>%s</Path></member>`, name, path)
+				if strings.HasPrefix(path, v.Get("PathPrefix")) {
+					names = append(names, name)
+				}
 			}
-			fmt.Fprintf(w, `<ListUsersResponse><ListUsersResult><Users>%s</Users><IsTruncated>false</IsTruncated></ListUsersResult></ListUsersResponse>`, b.String())
+			sort.Strings(names)
+			page := 0
+			fmt.Sscanf(v.Get("Marker"), "user-%d", &page)
+			var b strings.Builder
+			if page < len(names) {
+				path := "/spotexec/"
+				if pp := f.userPaths[names[page]]; pp != "" {
+					path = pp
+				}
+				fmt.Fprintf(&b, `<member><UserName>%s</UserName><Path>%s</Path><CreateDate>2026-01-0%dT00:00:00Z</CreateDate></member>`, names[page], path, page+1)
+			}
+			more := "<IsTruncated>false</IsTruncated>"
+			if page+1 < len(names) {
+				more = fmt.Sprintf("<IsTruncated>true</IsTruncated><Marker>user-%d</Marker>", page+1)
+			}
+			fmt.Fprintf(w, `<ListUsersResponse><ListUsersResult><Users>%s</Users>%s</ListUsersResult></ListUsersResponse>`, b.String(), more)
+		case "GetAccessKeyLastUsed":
+			fmt.Fprint(w, `<GetAccessKeyLastUsedResponse><GetAccessKeyLastUsedResult><AccessKeyLastUsed/></GetAccessKeyLastUsedResult></GetAccessKeyLastUsedResponse>`)
 		case "DeleteUser":
 			delete(f.users, iamUser)
 			f.log = append(f.log, "DeleteUser "+iamUser)
@@ -402,5 +428,62 @@ func TestRevokeMachineUnlabelled(t *testing.T) {
 	f.users["spotexec-old"][tagMachine] = "m-9"
 	if err := RevokeMachine(context.Background(), "admin", "spotexec-old", nil, t.Logf); err == nil || f.users["spotexec-old"] == nil {
 		t.Fatalf("no regions: err %v", err)
+	}
+}
+
+// ListMachines reads every page of IAM users, and only those exactly
+// under /spotexec/ (PathPrefix also matches /spotexec/nested/).
+func TestListMachinesPagesAndFiltersPath(t *testing.T) {
+	f := &fakeAccount{
+		accounts: map[string]string{"AK-admin": "111111111111"},
+		users: map[string]map[string]string{
+			"spotexec-a": {tagMachine: "m-1"}, "spotexec-b": {tagMachine: "m-2"},
+			"spotexec-c": {tagMachine: "m-3"}, "nested": {},
+		},
+		userPaths: map[string]string{"nested": "/spotexec/nested/"},
+		keys:      map[string][2]string{"AKA": {"spotexec-a", "Active"}},
+	}
+	f.install(t)
+	ms, err := ListMachines(context.Background(), "admin", []string{"us-east-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, m := range ms {
+		got = append(got, m.User+"="+m.MachineID)
+	}
+	if strings.Join(got, ",") != "spotexec-a=m-1,spotexec-b=m-2,spotexec-c=m-3" {
+		t.Fatalf("machines %v", got)
+	}
+	if n := strings.Count(strings.Join(f.signed, ";"), "ListUsers"); n != 4 {
+		t.Fatalf("ListUsers called %d times, want a call per page: %v", n, f.signed)
+	}
+}
+
+// For GovCloud regions, IAM and STS are signed for us-gov-west-1, the
+// partition's home, whichever GovCloud region the VMs are in.
+func TestRevokeMachineGovCloud(t *testing.T) {
+	f := &fakeAccount{
+		accounts: map[string]string{"AK-admin": "111111111111"},
+		instances: map[string]map[string][]fakeAcctInstance{"AK-admin": {
+			"us-gov-east-1": {{"i-run", "running", map[string]string{tagRunner: "aws", tagOwner: "m-1"}}},
+		}},
+		users: map[string]map[string]string{"spotexec-mac": {tagMachine: "m-1"}},
+		keys:  map[string][2]string{"AKMAC": {"spotexec-mac", "Active"}},
+	}
+	f.install(t)
+	if err := RevokeMachine(context.Background(), "admin", "spotexec-mac", []string{"us-gov-east-1"}, t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(f.log, ";"), "TerminateInstances i-run") || f.users["spotexec-mac"] != nil {
+		t.Fatalf("log %v, users %v", f.log, f.users)
+	}
+	for _, s := range f.signed {
+		if strings.HasPrefix(s, "iam ") && !strings.HasSuffix(s, " us-gov-west-1") {
+			t.Fatalf("IAM call outside GovCloud's home: %v", f.signed)
+		}
+	}
+	if _, err := ListMachines(context.Background(), "admin", []string{"us-gov-east-1", "us-east-1"}); err == nil || !strings.Contains(err.Error(), "different AWS partitions") {
+		t.Fatalf("mixed partitions: %v", err)
 	}
 }

@@ -125,3 +125,60 @@ func TestAWSFileEnvExpanded(t *testing.T) {
 		t.Errorf("ProfileRegion = %q", r)
 	}
 }
+
+// Account-wide calls go to the partition's home: the regions' partition,
+// else the admin profile's, else the commercial one.
+func TestAccountRegion(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config")
+	os.WriteFile(cfg, []byte("[profile gov]\nregion = us-gov-east-1\n\n[profile work]\nregion = eu-west-1\n"), 0o600)
+	t.Setenv("AWS_CONFIG_FILE", cfg)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(dir, "credentials"))
+	for _, k := range []string{"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"} {
+		t.Setenv(k, "")
+	}
+	for _, c := range []struct {
+		profile string
+		regions []string
+		want    string
+	}{
+		{"work", []string{"eu-west-1", "us-east-2"}, "us-east-1"},
+		{"work", []string{"us-gov-east-1"}, "us-gov-west-1"},
+		{"gov", []string{"us-gov-west-1", "us-gov-east-1"}, "us-gov-west-1"},
+		{"gov", nil, "us-gov-west-1"},
+		{"work", nil, "us-east-1"},
+		{"missing", nil, "us-east-1"},
+	} {
+		if got, err := AccountRegion(c.profile, c.regions); err != nil || got != c.want {
+			t.Errorf("AccountRegion(%q, %v) = %q, %v; want %q", c.profile, c.regions, got, err, c.want)
+		}
+	}
+	if _, err := AccountRegion("work", []string{"us-east-2", "us-gov-west-1"}); err == nil || !strings.Contains(err.Error(), "different AWS partitions") {
+		t.Errorf("mixed partitions: %v", err)
+	}
+}
+
+// IAM has one endpoint per partition, signed for the partition's home
+// region whichever region the client is for; other services stay regional.
+func TestIAMEndpointAndSigningRegion(t *testing.T) {
+	for _, c := range []struct{ region, iam, signed string }{
+		{"us-east-1", "https://iam.amazonaws.com/", "us-east-1"},
+		{"eu-west-1", "https://iam.amazonaws.com/", "us-east-1"},
+		{"us-gov-east-1", "https://iam.us-gov.amazonaws.com/", "us-gov-west-1"},
+		{"us-gov-west-1", "https://iam.us-gov.amazonaws.com/", "us-gov-west-1"},
+	} {
+		cl := accountClient(c.region, nil)
+		if got := cl.endpoint("iam"); got != c.iam {
+			t.Errorf("%s: IAM endpoint %s, want %s", c.region, got, c.iam)
+		}
+		if got := cl.signingRegion("iam"); got != c.signed {
+			t.Errorf("%s: IAM signed for %s, want %s", c.region, got, c.signed)
+		}
+		if got := cl.endpoint("sts"); got != "https://sts."+c.region+".amazonaws.com/" || cl.signingRegion("sts") != c.region {
+			t.Errorf("%s: STS %s signed for %s", c.region, got, cl.signingRegion("sts"))
+		}
+	}
+	if got := (&AWSUserSetup{}).client("us-gov-west-1", nil).endpoint("iam"); got != "https://iam.us-gov.amazonaws.com/" {
+		t.Errorf("setup's IAM endpoint %s", got)
+	}
+}

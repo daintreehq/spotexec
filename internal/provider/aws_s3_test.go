@@ -155,3 +155,37 @@ func TestRegistryForSlashProfile(t *testing.T) {
 		t.Fatalf("state dir holds %v", ents)
 	}
 }
+
+// A 403 on the cache bucket says why it may be refused: spotexec's policy
+// covers only its own spotexec-cache-* buckets, so a named bucket needs a
+// grant of its own.
+func TestEnsureBucketForbidden(t *testing.T) {
+	for _, tc := range []struct{ bucket, host, want string }{
+		{"auto", "spotexec-cache-123456789012-us-east-2.s3.us-east-2.amazonaws.com", "S3 statement of spotexec's policy"},
+		{"my-team-cache", "my-team-cache.s3.us-east-2.amazonaws.com", "policy only covers spotexec-cache-* buckets"},
+	} {
+		t.Run(tc.bucket, func(t *testing.T) {
+			rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				st, body := 500, ""
+				switch {
+				case strings.HasPrefix(r.URL.Host, "sts."):
+					st, body = 200, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`
+				case r.URL.Host == tc.host && r.Method == http.MethodHead:
+					st = http.StatusForbidden
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL)
+				}
+				return &http.Response{StatusCode: st, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+			})
+			a := &AWSSpot{
+				r: &config.Runner{Name: "aws", Region: "us-east-2", Profile: "p", CacheBucket: tc.bucket},
+				api: &awsClient{region: "us-east-2", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "s"}},
+					http: &http.Client{Transport: rt}},
+				dir: t.TempDir(),
+			}
+			if _, _, err := a.ensureBucket(context.Background()); err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "access denied") {
+				t.Fatalf("ensureBucket error = %v", err)
+			}
+		})
+	}
+}

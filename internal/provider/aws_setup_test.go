@@ -48,6 +48,8 @@ type fakeIAM struct {
 	stsDown     map[string]string            // key -> error code GetCallerIdentity fails with (not a key rejection)
 	selfGetUser string                       // a user's key may GetUser itself (the current policy): "ok", or an error code
 	sgs         map[string]map[string]string // security group id -> tags; "name"/"desc" override spotexec's
+	policy      string                       // the last PutUserPolicy document
+	signedIn    map[string]string            // action -> the region its last call was signed for
 }
 
 func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
@@ -55,7 +57,8 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		body, _ := io.ReadAll(r.Body)
-		key := regexp.MustCompile(`Credential=([^/]+)/`).FindStringSubmatch(r.Header.Get("Authorization"))[1]
+		cred := regexp.MustCompile(`Credential=([^/]+)/[^/]+/([^/]+)/`).FindStringSubmatch(r.Header.Get("Authorization"))
+		key := cred[1]
 		if tgt := r.Header.Get("X-Amz-Target"); tgt != "" {
 			f.calls = append(f.calls, tgt)
 			fmt.Fprint(w, `{"Quota":{"Value":16}}`)
@@ -64,6 +67,10 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 		v, _ := url.ParseQuery(string(body))
 		action := v.Get("Action")
 		f.calls = append(f.calls, action)
+		if f.signedIn == nil {
+			f.signedIn = map[string]string{}
+		}
+		f.signedIn[action] = cred[2]
 		iamErr := func(status int, code string) {
 			w.WriteHeader(status)
 			fmt.Fprintf(w, `<ErrorResponse><Error><Code>%s</Code><Message>%s</Message></Error></ErrorResponse>`, code, code)
@@ -127,8 +134,25 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 			if v.Get("Filter.1.Name") != "group-name" || v.Get("Filter.1.Value.1") != "spotexec-ssh" || v.Get("Filter.1.Value.2") != "spotexec-ssh-*" {
 				t.Errorf("DescribeSecurityGroups filter %v", v)
 			}
+			// One group per page, to exercise paging.
+			ids := make([]string, 0, len(f.sgs))
+			for id := range f.sgs {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			page, next := 0, ""
+			fmt.Sscanf(v.Get("NextToken"), "page-%d", &page)
+			if page+1 < len(ids) {
+				next = fmt.Sprintf("<nextToken>page-%d</nextToken>", page+1)
+			}
+			if page < len(ids) {
+				ids = ids[page : page+1]
+			} else {
+				ids = nil
+			}
 			var b strings.Builder
-			for id, tags := range f.sgs {
+			for _, id := range ids {
+				tags := f.sgs[id]
 				name, desc := "spotexec-ssh", "spotexec runners: SSH ingress"
 				if tags["name"] != "" {
 					name, desc = tags["name"], tags["desc"]
@@ -142,7 +166,7 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 				}
 				b.WriteString(`</tagSet></item>`)
 			}
-			fmt.Fprintf(w, `<DescribeSecurityGroupsResponse><securityGroupInfo>%s</securityGroupInfo></DescribeSecurityGroupsResponse>`, b.String())
+			fmt.Fprintf(w, `<DescribeSecurityGroupsResponse><securityGroupInfo>%s</securityGroupInfo>%s</DescribeSecurityGroupsResponse>`, b.String(), next)
 		case "CreateTags":
 			tags := f.sgs[v.Get("ResourceId.1")]
 			if tags == nil || v.Get("ResourceId.2") != "" {
@@ -188,6 +212,7 @@ func (f *fakeIAM) handler(t *testing.T) http.HandlerFunc {
 			if err := json.Unmarshal([]byte(v.Get("PolicyDocument")), &doc); err != nil || v.Get("PolicyName") != "spotexec" {
 				t.Errorf("PutUserPolicy: %v %v", v.Get("PolicyName"), err)
 			}
+			f.policy = v.Get("PolicyDocument")
 			fmt.Fprint(w, `<PutUserPolicyResponse/>`)
 		case "CreateServiceLinkedRole":
 			iamErr(400, "InvalidInput") // message lacks "has been taken": logged as a warning
@@ -775,6 +800,39 @@ func TestAWSUserSetupTagsOldSecurityGroups(t *testing.T) {
 	if f.sgs["sg-old"][tagOwner] != testMachine || f.sgs["sg-old"]["Name"] != "spotexec-ssh" || f.sgs["sg-cidr"][tagOwner] != testMachine ||
 		f.sgs["sg-new"][tagOwner] != "someone-else" || f.sgs["sg-prod"][tagOwner] != "" || f.sgs["sg-other"][tagOwner] != "" || f.count("CreateTags") != 2 {
 		t.Fatalf("groups %v, calls %v", f.sgs, f.calls)
+	}
+}
+
+// In GovCloud, setup signs in to that partition's IAM and STS, and the
+// policy it attaches names GovCloud ARNs.
+func TestAWSUserSetupGovCloud(t *testing.T) {
+	f := &fakeIAM{}
+	s, _, _ := newSetupEnv(t, f)
+	s.Region, s.QuotaRegions = "us-gov-east-1", []string{"us-gov-east-1"}
+	if _, err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.policy, `"arn:aws-us-gov:ec2:*:*:instance/*"`) || strings.Contains(f.policy, `"arn:aws:`) {
+		t.Fatalf("policy %s", f.policy)
+	}
+	for _, a := range []string{"CreateUser", "PutUserPolicy", "CreateAccessKey"} {
+		if f.signedIn[a] != "us-gov-west-1" {
+			t.Fatalf("%s signed for %q, want us-gov-west-1 (%v)", a, f.signedIn[a], f.signedIn)
+		}
+	}
+	if f.signedIn["DescribeSecurityGroups"] != "us-gov-east-1" {
+		t.Fatalf("regional calls moved: %v", f.signedIn)
+	}
+}
+
+// One setup serves one partition: regions from two are refused before
+// anything is called.
+func TestAWSUserSetupMixedPartitions(t *testing.T) {
+	f := &fakeIAM{}
+	s, _, _ := newSetupEnv(t, f)
+	s.VPCRegions = []string{"us-gov-west-1"}
+	if _, err := s.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "different AWS partitions") || len(f.calls) != 0 {
+		t.Fatalf("err %v, calls %v", err, f.calls)
 	}
 }
 
