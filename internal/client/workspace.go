@@ -179,9 +179,11 @@ func saveLastRun(w *Workspace, lr LastRun) {
 }
 
 // ManifestOptions are the manifest.Build options for project p rooted at
-// root. A container's Dockerfile, its companion .dockerignore and its build
-// context sync even inside built-in excludes or Git-ignored paths, Git or
-// not: the runner builds the image from the synced copy.
+// root. A container's Dockerfile and the .dockerignore files that can apply
+// to it sync even inside built-in excludes or Git-ignored paths, Git or
+// not: the runner builds the image from the synced copy. Its directory and
+// build context sync whole under .spotexec/, and by the usual rules
+// (.gitignore included) anywhere else.
 func ManifestOptions(root string, p *config.Project) manifest.Options {
 	o := manifest.Options{Root: root, Exclude: p.Sync.Exclude, Source: p.Sync.Source, Protect: p.Deps.CacheDirs}
 	if df := p.Container.Dockerfile; df != "" && p.Container.Image == "" {
@@ -191,7 +193,7 @@ func ManifestOptions(root string, p *config.Project) manifest.Options {
 		}
 		// The Dockerfile's own directory too: with context = "." its
 		// support files (.spotexec/setup.sh) are still build inputs.
-		o.Include = []string{df, df + ".dockerignore", path.Dir(df), ctx}
+		o.Include = []string{df, df + ".dockerignore", path.Join(ctx, ".dockerignore"), path.Dir(df), ctx}
 	}
 	return o
 }

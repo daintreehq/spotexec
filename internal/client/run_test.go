@@ -278,6 +278,71 @@ func TestImageTagNonGitProject(t *testing.T) {
 	}
 }
 
+// A Dockerfile in a project subdirectory: the build context there follows
+// the usual rules, so what Git ignores (a secret, dist/) stays local, while
+// the Dockerfile and the context's .dockerignore sync even when ignored, and
+// the image tag reads the synced rules.
+func TestSubdirDockerfileSyncsOnlyBuildInputs(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	for f, body := range map[string]string{
+		"services/api/Dockerfile":    "FROM scratch\nCOPY main.go /\n",
+		"services/api/.dockerignore": "*.md\n",
+		"services/api/main.go":       "package main\n",
+		"services/api/README.md":     "# api\n",
+		"services/api/secrets.json":  "{}\n",
+		"services/api/dist/app.js":   "1\n",
+		".gitignore":                 "Dockerfile\n.dockerignore\nsecrets.json\ndist/\n",
+	} {
+		p := filepath.Join(root, filepath.FromSlash(f))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := &config.Project{Container: config.Container{Dockerfile: "services/api/Dockerfile"}}
+	read := func(rel string) ([]byte, error) { return os.ReadFile(filepath.Join(root, filepath.FromSlash(rel))) }
+	tag := func() string {
+		t.Helper()
+		m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, e := range m.Entries {
+			got = append(got, e.Path)
+		}
+		// README.md is project source: it syncs though .dockerignore
+		// keeps it out of the build.
+		if want := ".gitignore services/api/.dockerignore services/api/Dockerfile services/api/README.md services/api/main.go"; strings.Join(got, " ") != want {
+			t.Fatalf("synced %q, want %q", strings.Join(got, " "), want)
+		}
+		tag, err := imageTag(m, "services/api/Dockerfile", "", "linux/amd64", read)
+		if err != nil {
+			t.Fatalf("imageTag: %v", err)
+		}
+		return tag
+	}
+	write := func(f, body string) {
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(f)), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := tag()
+	write("services/api/README.md", "# api, edited\n")
+	if got := tag(); got != first {
+		t.Fatal("editing a dockerignored file changed the image tag: the synced .dockerignore wasn't applied")
+	}
+	write("services/api/main.go", "package main // edited\n")
+	if tag() == first {
+		t.Fatal("editing a build input left the image tag unchanged")
+	}
+}
+
 // A Dockerfile a run can't build from fails the run before it acquires a
 // runner (an acquire would have booted a VM only to exit 125), and
 // Preflight, which spotexec supported uses, finds the same.
