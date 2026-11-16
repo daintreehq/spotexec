@@ -622,6 +622,9 @@ func TestRunLocalWorkspaceWithSpaces(t *testing.T) {
 	} {
 		var out lockedBuf
 		o := client.Options{Command: buildCommand(l.ws, args), Stdout: &out, Stderr: &out}
+		if !strings.Contains(o.Command, "SPOTEXEC_WORKSPACE") {
+			t.Errorf("%q: path not rewritten in %q", args, o.Command)
+		}
 		if code := runLocal(context.Background(), nil, l, o, rep, 0, 1); code != 0 || out.String() != "ok\n" {
 			t.Errorf("%q ran %q: exit %d, output %q", args, o.Command, code, out.String())
 		}

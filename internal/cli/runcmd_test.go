@@ -189,6 +189,11 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 		{`printf "<%s>" 2>&1 ;`, "<a><two words>"},
 		{"printf \"<%s>\" &", "<a><two words>"},
 		{"printf \"<%s>\" # it's \"unbalanced\n# more", "<a><two words>"},
+		{"printf \"<%s>\"\n\\\n # continued", "<a><two words>"},
+		{`printf "<%s>" $(printf x)#y # c`, "<x#y><a><two words>"},
+		{`printf "<%s>" $'it\'s #x' # c`, "<it's #x><a><two words>"},
+		{"printf \"<%s>\" x\r#y", "<x\r#y><a><two words>"},
+		{"cat <<'EOF'\n<%s>\nEOF\n# note", "<%s>\n"},
 	}
 	for _, c := range cases {
 		line := taskCommand(c.tmpl, []string{"a", "two words"})
@@ -200,9 +205,19 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 			t.Errorf("template %q: line %q printed %q, want %q", c.tmpl, line, out, c.want)
 		}
 	}
-	// A run that is only a comment must not run its arguments.
-	line := taskCommand("# nothing yet", []string{"touch", "x"})
-	if out, err := exec.Command("sh", "-c", line+"\necho done").Output(); err != nil || string(out) != "done\n" {
-		t.Errorf("comment-only run %q: %q %v", line, out, err)
+	// A run that is only a comment must not run its arguments, and an
+	// operator at the end still takes them as its right-hand side.
+	for _, c := range []struct{ tmpl, want string }{
+		{"# nothing yet", "done\n"},
+		{"true &&", "UNEXPECTED\ndone\n"},
+		{"echo x 2>&", "x\ndone\n"},
+	} {
+		line := taskCommand(c.tmpl, []string{"printf", `UNEXPECTED\n`})
+		if c.tmpl == "echo x 2>&" {
+			line = taskCommand(c.tmpl, []string{"1"})
+		}
+		if out, err := exec.Command("sh", "-c", line+"\necho done").Output(); err != nil || string(out) != c.want {
+			t.Errorf("template %q: line %q printed %q %v, want %q", c.tmpl, line, out, err, c.want)
+		}
 	}
 }

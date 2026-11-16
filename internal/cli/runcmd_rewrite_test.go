@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/client"
@@ -20,6 +21,10 @@ func TestRewriteRoot(t *testing.T) {
 		{`ls /Users/me/re\po/x`, `ls "${SPOTEXEC_WORKSPACE:?}"/x`},
 		{`ls '/Users/me/re\po'`, `ls '/Users/me/re\po'`},
 		{`ls x\ /Users/me/repo`, `ls x\ /Users/me/repo`},
+		{`ls x\ y /Users/me/repo/x`, `ls x\ y "${SPOTEXEC_WORKSPACE:?}"/x`},
+		{"ls \\\n/Users/me/repo/x", "ls \\\n\"${SPOTEXEC_WORKSPACE:?}\"/x"},
+		{"ls x\\\n/Users/me/repo/x", "ls x\\\n/Users/me/repo/x"},
+		{`ls prefix/Users/me/repo/x`, `ls prefix/Users/me/repo/x`},
 	}
 	for _, c := range cases {
 		if got := rewriteRoot(c.in, root); got != c.want {
@@ -94,6 +99,13 @@ func TestBuildCommandArgsGetAbsoluteRemotePaths(t *testing.T) {
 	if got, want := runWith(t, line), "<OUT=/remote ws/build></remote ws><--cfg=/remote ws/a b></Users/me/repo-other/x>"; got != want {
 		t.Errorf("line %q printed %q, want %q", line, got, want)
 	}
+	// A command word that is not NAME=value stays a command once spliced.
+	line = buildCommand(ws, []string{"A+=/Users/me/repo/x", "y"})
+	cmd := exec.Command("bash", "-c", line+" 2>&1; echo $?")
+	cmd.Env = append(os.Environ(), "SPOTEXEC_WORKSPACE=/remote ws")
+	if out, _ := cmd.Output(); !strings.Contains(string(out), "A+=/remote ws/x") || !strings.HasSuffix(string(out), "127\n") {
+		t.Errorf("line %q ran as %q, want the command A+=/remote ws/x not found", line, out)
+	}
 }
 
 func TestSnippetWorkspaceDoesNotWordSplit(t *testing.T) {
@@ -112,13 +124,18 @@ func TestSnippetWorkspaceDoesNotWordSplit(t *testing.T) {
 	if got, want := runWith(t, line), "</remote ws/x></remote ws/y></Users/me/My Projects/repo-other>"; got != want {
 		t.Errorf("line %q printed %q, want %q", line, got, want)
 	}
-	// Unescaped, the space and the quote are syntax, not part of the path.
-	root := "/Users/me/it's repo"
-	for _, in := range []string{`ls /Users/me/it's repo'`, `ls /Users/me/it\'s repo`} {
-		if got := rewriteRoot(in, root); got != in {
-			t.Errorf("rewriteRoot(%q) = %q, want it unchanged", in, got)
+	// Unescaped, a space, a quote or a glob is syntax, not part of the path.
+	for _, c := range []struct{ root, in string }{
+		{"/Users/me/it's repo", `ls /Users/me/it's repo'`},
+		{"/Users/me/it's repo", `ls /Users/me/it\'s repo`},
+		{"/Users/me/it's", `ls /Users/me/it's'`},
+		{"/tmp/repo[1]", `ls /tmp/repo[1]/x`},
+	} {
+		if got := rewriteRoot(c.in, c.root); got != c.in {
+			t.Errorf("rewriteRoot(%q) = %q, want it unchanged", c.in, got)
 		}
 	}
+	root := "/Users/me/it's repo"
 	if got, want := rewriteRoot(`ls /Users/me/it\'s\ repo/a`, root), `ls "${SPOTEXEC_WORKSPACE:?}"/a`; got != want {
 		t.Errorf("got %q want %q", got, want)
 	}

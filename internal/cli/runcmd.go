@@ -282,8 +282,13 @@ func buildCommand(ws *client.Workspace, args []string) string {
 			q[i] = name + "=" + quoteArg(value, ws.Root)
 			continue
 		}
-		assigning = false
 		q[i] = quoteArg(a, ws.Root)
+		// The command word must not read as an assignment once spliced
+		// (A+=/repo/x -> A+="$W"/x would be one): start it quoted.
+		if assigning && looksAssigning(q[i]) {
+			q[i] = "''" + q[i]
+		}
+		assigning = false
 	}
 	return strings.Join(q, " ")
 }
@@ -310,6 +315,16 @@ func quoteArg(v, root string) string {
 	return b.String()
 }
 
+// looksAssigning reports whether bash could read the shell word w as an
+// assignment: NAME=, NAME+= or NAME[...] at its start, unquoted.
+func looksAssigning(w string) bool {
+	n := 0
+	for n < len(w) && (w[n] == '_' || w[n] >= 'A' && w[n] <= 'Z' || w[n] >= 'a' && w[n] <= 'z' || n > 0 && w[n] >= '0' && w[n] <= '9') {
+		n++
+	}
+	return n > 0 && (strings.HasPrefix(w[n:], "=") || strings.HasPrefix(w[n:], "+=") || strings.HasPrefix(w[n:], "["))
+}
+
 // envAssignment splits a NAME=value word whose name is a valid shell
 // variable name.
 func envAssignment(s string) (name, value string, ok bool) {
@@ -332,11 +347,11 @@ func envAssignment(s string) (name, value string, ok bool) {
 // around it, and ${...:?} aborts rather than expanding to "" if unset.
 func rewriteRoot(s, root string) string {
 	var b strings.Builder
-	inSingle, inDouble, escaped := false, false, false
+	inSingle, inDouble := false, false
+	atBoundary := true // where a path may start: not mid-word, as after My\ x
 	for i := 0; i < len(s); {
 		c := s[i]
-		// After an escaped byte (as in My\ repo) the path is mid-word.
-		if end := matchRoot(s, i, root, !inSingle && !inDouble); end >= 0 && !escaped && boundaryBefore(s, i) && boundaryAfter(s, end) {
+		if end := matchRoot(s, i, root, !inSingle && !inDouble); end >= 0 && atBoundary && boundaryAfter(s, end) {
 			switch {
 			case inSingle:
 				// Close the quotes, splice the variable in double quotes,
@@ -348,15 +363,18 @@ func rewriteRoot(s, root string) string {
 				b.WriteString(`"${SPOTEXEC_WORKSPACE:?}"`)
 			}
 			i = end
+			atBoundary = false
 			continue
 		}
-		escaped = false
 		switch {
 		case c == '\\' && !inSingle && i+1 < len(s):
 			b.WriteByte(c)
 			b.WriteByte(s[i+1])
 			i += 2
-			escaped = true
+			// A line continuation vanishes, leaving the boundary as it was.
+			if s[i-1] != '\n' {
+				atBoundary = false
+			}
 			continue
 		case c == '\'' && !inDouble:
 			inSingle = !inSingle
@@ -365,6 +383,7 @@ func rewriteRoot(s, root string) string {
 		}
 		b.WriteByte(c)
 		i++
+		atBoundary = strings.IndexByte(pathStarts, c) >= 0
 	}
 	return b.String()
 }
@@ -383,7 +402,7 @@ func matchRoot(s string, i int, root string, unquoted bool) int {
 	j := i
 	for k := 0; k < len(root); k++ {
 		switch {
-		case j+1 < len(s) && s[j] == '\\' && s[j+1] == root[k]:
+		case j+1 < len(s) && s[j] == '\\' && s[j+1] == root[k] && root[k] != '\n': // \<newline> is a continuation
 			j += 2
 		case j < len(s) && s[j] == root[k] && !strings.ContainsRune(shellSyntax, rune(root[k])):
 			j++
@@ -394,14 +413,15 @@ func matchRoot(s string, i int, root string, unquoted bool) int {
 	return j
 }
 
-// shellSyntax is the bytes that mean something to the shell outside quotes.
-const shellSyntax = " \t\n\\'\"$`;&|<>()"
+// shellSyntax is the bytes that mean something to the shell outside quotes:
+// quoting, expansion, word splitting, operators, globs and braces.
+const shellSyntax = " \t\n\\'\"$`;&|<>()*?[{}"
+
+// pathStarts is the bytes a whole path may follow.
+const pathStarts = " \t\n'\"=:(;&|"
 
 func boundaryBefore(s string, i int) bool {
-	if i == 0 {
-		return true
-	}
-	return strings.ContainsRune(" \t\n'\"=:(;&|", rune(s[i-1]))
+	return i == 0 || strings.IndexByte(pathStarts, s[i-1]) >= 0
 }
 
 func boundaryAfter(s string, i int) bool {
@@ -686,28 +706,40 @@ func taskCommand(run string, args []string) string {
 		// "$@" too, or the arguments would be word-split or not expanded.
 		body = strings.NewReplacer(`"{args}"`, `"$@"`, `'{args}'`, `"$@"`, "{args}", `"$@"`).Replace(run)
 	} else {
-		// Before any trailing comment, which would swallow them.
-		end := endOfCode(run)
+		// Before any trailing comment, which would swallow them. A
+		// here-document's lines are data, so it keeps plain appending.
+		end := len(run)
+		if !strings.Contains(run, "<<") {
+			end = endOfCode(run)
+		}
 		body = run[:end] + ` "$@"` + run[end:]
 	}
 	return "set -- " + strings.Join(q, " ") + "\n" + body
 }
 
 // endOfCode returns where run's last command ends: after its last byte that
-// is not whitespace, a terminator (';', '&'), or part of a comment (a '#'
-// outside quotes that begins a word, to the end of its line). A run that is only comments ends
-// at its end, so its arguments land in the comment and still run nothing.
+// is not whitespace, a closing ';' or '&', or part of a comment (a '#'
+// outside quotes that begins a word, to the end of its line). A run that is
+// only comments ends at its end, so its arguments land in the comment and
+// still run nothing.
 func endOfCode(run string) int {
-	end := 0
-	inSingle, inDouble, wordStart := false, false, true
+	end, beforeTerm := 0, -1 // beforeTerm: end before a closing ; or &
+	inSingle, ansi, inDouble, wordStart := false, false, false, true
 	for i := 0; i < len(run); i++ {
 		c := run[i]
 		switch {
 		case inSingle:
-			inSingle = c != '\''
+			if ansi && c == '\\' { // $'...' takes escapes, \' included
+				i++
+			} else {
+				inSingle = c != '\''
+			}
 		case c == '\\' && i+1 < len(run):
-			i++ // escaped, inside double quotes too (\")
-			wordStart = false
+			i++
+			if run[i] == '\n' {
+				continue // a line continuation vanishes
+			}
+			wordStart = false // escaped, inside double quotes too (\")
 		case inDouble:
 			inDouble = c != '"'
 		case c == '#' && wordStart:
@@ -719,22 +751,44 @@ func endOfCode(run string) int {
 			}
 			continue
 		case c == '\'':
-			inSingle, wordStart = true, false
+			inSingle, ansi, wordStart = true, i > 0 && run[i-1] == '$', false
 		case c == '"':
 			inDouble, wordStart = true, false
+		case c == ' ' || c == '\t' || c == '\n':
+			wordStart = true
+			continue
+		case (c == ';' || c == '&') && strings.IndexByte(";&|<>", prevByte(run, i)) < 0 && strings.IndexByte(";&|>", nextByte(run, i)) < 0:
+			// A list terminator: arguments go before it ("make &" ->
+			// make "$@" &). Part of an operator (&&, 2>&1, ;;) it is code.
+			beforeTerm, end, wordStart = end, i+1, true
+			continue
 		default:
-			wordStart = strings.IndexByte(" \t\r\n;&|()", c) >= 0
-			// Arguments go before a terminator: "make &" -> make "$\" &.
-			if strings.IndexByte(" \t\r\n;&", c) >= 0 {
-				continue
-			}
+			// ')' ends a word only as an operator, and $(...)#x is one word.
+			wordStart = strings.IndexByte(";&|(", c) >= 0
 		}
-		end = i + 1
+		end, beforeTerm = i+1, -1
 	}
-	if end == 0 {
+	switch {
+	case end == 0:
 		return len(run)
+	case beforeTerm > 0:
+		return beforeTerm
 	}
 	return end
+}
+
+func prevByte(s string, i int) byte {
+	if i == 0 {
+		return 0
+	}
+	return s[i-1]
+}
+
+func nextByte(s string, i int) byte {
+	if i+1 >= len(s) {
+		return 0
+	}
+	return s[i+1]
 }
 
 // taskPart is one run of a task's fan-out: a task of a parallel task, or
