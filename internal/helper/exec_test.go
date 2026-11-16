@@ -144,9 +144,13 @@ func TestExecSetupFailureStopsTheCommand(t *testing.T) {
 	}
 }
 
+// A setup past its timeout is killed, its output so far reaches the client,
+// and the command never starts. The timeout runs from the shell's start,
+// before its login profiles: 2s leaves a loaded -race runner time to reach
+// the echo, still far short of the sleep.
 func TestExecSetupTimeout(t *testing.T) {
 	start := time.Now()
-	o, ws := runExec(t, protocol.Exec{SetupRun: `echo slow; sleep 30`, SetupTimeoutMS: 300, GraceMS: 300, Shell: `touch ran`}, "")
+	o, ws := runExec(t, protocol.Exec{SetupRun: `echo slow; sleep 30`, SetupTimeoutMS: 2000, GraceMS: 300, Shell: `touch ran`}, "")
 	if !o.res.SetupFailed || !o.res.TimedOut || o.res.ExitCode != 124 || time.Since(start) > 10*time.Second {
 		t.Fatalf("result %+v after %s", o.res, time.Since(start))
 	}
