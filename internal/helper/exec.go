@@ -422,6 +422,11 @@ func (s *Session) exec(e protocol.Exec) error {
 				// dockerd went away with the VM: the run was cut short, not failed.
 				return pr, true, false, perr(protocol.CodeShutdown, "the runner is shutting down: %v", err)
 			}
+			if errors.Is(err, errFilesNotGivenBack) {
+				// Nothing is still running, but files the sync can't read
+				// would make the results incomplete.
+				return pr, false, false, perr(protocol.CodeImageFailed, "%v; refusing to collect results from the workspace", err)
+			}
 			return pr, false, false, perr(protocol.CodeImageFailed, "%v; refusing to collect results from a workspace it may still be modifying", err)
 		}
 		if e.Container != nil && pr.startErr == nil && pr.code != 0 && !pr.timedOut && !pr.canceled && !shutdown {
