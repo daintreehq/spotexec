@@ -391,3 +391,39 @@ func TestImageProbe(t *testing.T) {
 		})
 	}
 }
+
+// A slot whose venvs an older helper relocated (text files only) has its
+// symlinks into the cache's origin workspace relocated on its next run.
+func TestDepsRelocatesVenvLinksOfOlderSlots(t *testing.T) {
+	s, out := depsSession(t)
+	d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p .venv && touch .venv/pyvenv.cfg", CacheDirs: []string{".venv"}}
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	var res protocol.DepsResult
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if !res.Built || s.state.VenvRelocation != venvRelocation {
+		t.Fatalf("first run: %+v, state %+v", res, s.state)
+	}
+	// As hydrated from a cache built in /old/ws by a helper that left links.
+	if err := os.WriteFile(filepath.Join(s.layout.Deps(s.repoID), res.Key, originFile), []byte("/old/ws\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(s.workspace, ".venv", "tool")
+	if err := os.Symlink("/old/ws/bin/tool", link); err != nil {
+		t.Fatal(err)
+	}
+	s.state.VenvRelocation = 0
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	ws, _ := filepath.EvalSymlinks(s.workspace)
+	if got, _ := os.Readlink(link); got != ws+"/bin/tool" {
+		t.Fatalf("link -> %s", got)
+	}
+	if st := loadSlotState(s.slotDir); st.VenvRelocation != venvRelocation || st.DepsKey != res.Key {
+		t.Fatalf("saved state %+v", st)
+	}
+}

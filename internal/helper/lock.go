@@ -138,7 +138,10 @@ type SlotState struct {
 	SweepSkip []string `json:"sweep_skip,omitempty"`
 	// VenvsRelocated: the cache dirs' virtualenvs point at this slot
 	// (see relocateVenvs); false for slots hydrated by older helpers.
+	// VenvRelocation is the venvRelocation they were relocated by (0 for
+	// helpers before symlinks were).
 	VenvsRelocated bool `json:"venvs_relocated,omitempty"`
+	VenvRelocation int  `json:"venv_relocation,omitempty"`
 	// GitOwned: the workspace holds a .git spotexec seeded ([sync]
 	// git_seed), complete or not. GitSeed is the key of the complete seed
 	// ("" while it is being built), GitIndex its index's signature and

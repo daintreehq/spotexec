@@ -135,8 +135,9 @@ func (s *Session) deps(d protocol.Deps) error {
 	ready := filepath.Join(cacheRoot, ".ready")
 
 	if dirs := expandCacheDirs(s.workspace, d.CacheDirs); s.state.DepsKey == key && len(dirs) > 0 {
-		if !s.state.VenvsRelocated {
-			// Hydrated by an older helper, which copied venvs as they were.
+		if s.state.VenvRelocation < venvRelocation {
+			// Hydrated by an older helper, which copied venvs as they were
+			// or left their symlinks pointing into another slot.
 			// Until this succeeds the slot's copy is suspect: a failure
 			// leaves the key unset, so the next run hydrates afresh.
 			s.state.DepsKey = ""
@@ -152,7 +153,7 @@ func (s *Session) deps(d protocol.Deps) error {
 					return perr(protocol.CodeDepsFailed, "relocating %s: %v", rel, err)
 				}
 			}
-			s.state.DepsKey, s.state.VenvsRelocated = key, true
+			s.state.DepsKey, s.state.VenvsRelocated, s.state.VenvRelocation = key, true, venvRelocation
 			if err := saveSlotState(s.slotDir, s.state); err != nil {
 				return err
 			}
@@ -262,7 +263,7 @@ func (s *Session) deps(d protocol.Deps) error {
 		res.Hydrated, res.Method = true, method
 	}
 	_ = os.Chtimes(ready, time.Now(), time.Now())
-	s.state.DepsKey, s.state.VenvsRelocated = key, true
+	s.state.DepsKey, s.state.VenvsRelocated, s.state.VenvRelocation = key, true, venvRelocation
 	if err := saveSlotState(s.slotDir, s.state); err != nil {
 		return err
 	}
