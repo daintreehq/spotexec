@@ -24,10 +24,12 @@ type cloud struct {
 	mu        sync.Mutex
 	insts     map[string][]provider.Instance // runner -> live instances
 	n         int
-	launchErr error // Launch refuses with this
-	waitErr   error // WaitRunning fails with this (after Launch created the VM)
+	launchErr error         // Launch refuses with this
+	waitErr   error         // WaitRunning fails with this (after Launch created the VM)
+	hold      chan struct{} // WaitRunning blocks until it is closed
 	built     map[string]int
 	launched  []string // "runner:types" of each launch request
+	waited    []string // "runner:types" of the provider each WaitRunning ran on
 }
 
 func newCloud() *cloud {
@@ -40,12 +42,35 @@ func (c *cloud) add(runner string, in provider.Instance) {
 	c.insts[runner] = append(c.insts[runner], in)
 }
 
+// born sets when every instance of runner launched.
+func (c *cloud) born(runner string, at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.insts[runner] {
+		c.insts[runner][i].LaunchedAt = at
+	}
+}
+
+func (c *cloud) launches() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.launched)
+}
+
+func (c *cloud) set(fn func(c *cloud)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fn(c)
+}
+
 // fakeFleet is an in-memory provider.Fleet (and provider.Matcher: a VM
 // matches while its type is one of the runner's instance_types).
 type fakeFleet struct {
 	r *config.Runner
 	c *cloud
 }
+
+func (f *fakeFleet) key() string { return f.r.Name + ":" + strings.Join(f.r.InstanceTypes, ",") }
 
 func (f *fakeFleet) Runner() *config.Runner                        { return f.r }
 func (f *fakeFleet) Status(context.Context) (provider.Info, error) { return provider.Info{}, nil }
@@ -65,7 +90,7 @@ func (f *fakeFleet) List(context.Context) ([]provider.Instance, error) {
 func (f *fakeFleet) Launch(context.Context, provider.Logger) (provider.Instance, error) {
 	f.c.mu.Lock()
 	defer f.c.mu.Unlock()
-	f.c.launched = append(f.c.launched, f.r.Name+":"+strings.Join(f.r.InstanceTypes, ","))
+	f.c.launched = append(f.c.launched, f.key())
 	if f.c.launchErr != nil {
 		return provider.Instance{}, f.c.launchErr
 	}
@@ -80,6 +105,13 @@ func (f *fakeFleet) Launch(context.Context, provider.Logger) (provider.Instance,
 }
 
 func (f *fakeFleet) WaitRunning(_ context.Context, id string, _ provider.Logger) (provider.Instance, error) {
+	f.c.mu.Lock()
+	f.c.waited = append(f.c.waited, f.key())
+	hold := f.c.hold
+	f.c.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
 	f.c.mu.Lock()
 	defer f.c.mu.Unlock()
 	if f.c.waitErr != nil {
@@ -112,18 +144,26 @@ func (f *fakeFleet) Mismatches(_ context.Context, insts []provider.Instance) map
 	return out
 }
 
-// setup isolates config and state in temp dirs and installs the fake
-// cloud, with probes that find every running VM healthy and drains that
-// confirm (unless the test changes them).
+// setup isolates config and state in temp dirs, pins the timings, and
+// installs the fake cloud, with probes that find every running VM healthy
+// and drains that confirm (unless the test changes them).
 func setup(t *testing.T) (*cloud, string) {
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
 	t.Setenv("SPOTEXEC_CONFIG", cfgPath)
 	t.Setenv("SPOTEXEC_STATE_DIR", filepath.Join(dir, "state"))
+	if err := os.MkdirAll(Dir(), 0o700); err != nil { // Lock makes it in production
+		t.Fatal(err)
+	}
 	c := newCloud()
 	oldFleet, oldProbe, oldDrain := newFleet, probeFleet, drainVM
-	t.Cleanup(func() { newFleet, probeFleet, drainVM = oldFleet, oldProbe, oldDrain })
+	oldSettle, oldRetire, oldProbeEvery := reloadSettle, retireAhead, probeEvery
+	t.Cleanup(func() {
+		newFleet, probeFleet, drainVM = oldFleet, oldProbe, oldDrain
+		reloadSettle, retireAhead, probeEvery = oldSettle, oldRetire, oldProbeEvery
+	})
+	reloadSettle, retireAhead, probeEvery = 0, 10*time.Minute, 30*time.Second
 	newFleet = func(r *config.Runner) (provider.Fleet, error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -147,34 +187,59 @@ func writeConfig(t *testing.T, path, body string) {
 	}
 }
 
-func start(t *testing.T) (*Daemon, *[]string) {
+type logs struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logs) matching(sub string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, s := range l.lines {
+		if strings.Contains(s, sub) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (l *logs) count(sub string) int { return len(l.matching(sub)) }
+
+func (l *logs) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return fmt.Sprintf("%q", l.lines)
+}
+
+func start(t *testing.T) (*Daemon, *logs) {
 	t.Helper()
 	g, err := config.LoadGlobal()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var mu sync.Mutex
-	logs := &[]string{}
+	l := &logs{}
 	d, err := New(&config.Config{Global: g}, func(f string, a ...any) {
-		mu.Lock()
-		*logs = append(*logs, fmt.Sprintf(f, a...))
-		mu.Unlock()
+		l.mu.Lock()
+		l.lines = append(l.lines, fmt.Sprintf(f, a...))
+		l.mu.Unlock()
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { settle(t, d) })
-	return d, logs
+	return d, l
 }
 
-// settle waits for the daemon's background launches to finish.
-func settle(t *testing.T, d *Daemon) {
+// settle waits for the daemon's background launches (also those of the
+// given fleets, which may no longer be managed) to finish.
+func settle(t *testing.T, d *Daemon, extra ...*fleet) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		busy := 0
 		d.mu.Lock()
-		for _, fl := range d.fleets {
+		for _, fl := range append(slices.Clone(d.fleets), extra...) {
 			busy += len(fl.busy)
 		}
 		d.mu.Unlock()
@@ -197,12 +262,10 @@ func fleetNamed(d *Daemon, name string) *fleet {
 	return nil
 }
 
-func count(logs []string, sub string) int {
-	n := 0
-	for _, l := range logs {
-		if strings.Contains(l, sub) {
-			n++
-		}
+func names(d *Daemon) []string {
+	var n []string
+	for _, fl := range d.fleets {
+		n = append(n, fl.r.Name)
 	}
 	return n
 }
@@ -214,22 +277,30 @@ min_instances = %d
 max_instances = 4
 `
 
+func runnerConfig(typ string, min int, extra ...string) string {
+	return fmt.Sprintf(simRunner, typ, min) + strings.Join(extra, "\n") + "\n"
+}
+
 // The daemon follows edits to config.toml: once sx has re-judged the pool
 // under the new requirements, the daemon's passes keep them instead of
 // writing the startup ones back.
 func TestReloadFollowsConfigEdits(t *testing.T) {
 	c, cfgPath := setup(t)
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "old.large", 0))
+	writeConfig(t, cfgPath, runnerConfig("old.large", 0))
 	c.add("pool", provider.Instance{ID: "i-old", Type: "old.large", State: provider.StateRunning, LaunchedAt: time.Now(), Target: provider.Target{Host: "192.0.2.1"}})
-	d, logs := start(t)
+	d, l := start(t)
 	ctx := context.Background()
 	d.pass(ctx)
 	fl := fleetNamed(d, "pool")
 	if c.built["pool"] != 1 {
 		t.Fatalf("an unchanged config rebuilt the fleet: built %d times", c.built["pool"])
 	}
+	seen := fl.seen["i-old"]
+	if seen.IsZero() || fl.lastOK["i-old"].IsZero() {
+		t.Fatal("the first pass didn't see the instance")
+	}
 
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "new.large", 1))
+	writeConfig(t, cfgPath, runnerConfig("new.large", 1))
 	g, err := config.LoadGlobal()
 	if err != nil {
 		t.Fatal(err)
@@ -245,7 +316,10 @@ func TestReloadFollowsConfigEdits(t *testing.T) {
 		settle(t, d)
 	}
 	if fleetNamed(d, "pool") != fl {
-		t.Error("a changed runner lost its fleet's state")
+		t.Error("a changed runner lost its fleet")
+	}
+	if !fl.seen["i-old"].Equal(seen) {
+		t.Error("a config change forgot when the daemon first saw its instances")
 	}
 	if fl.r.MinInstances != 1 || fl.r.InstanceTypes[0] != "new.large" {
 		t.Errorf("daemon still runs the old runner: %+v", fl.r)
@@ -265,54 +339,97 @@ func TestReloadFollowsConfigEdits(t *testing.T) {
 	if saved.MatchKey != provider.MatchKey(r) || saved.Notes["i-old"].Mismatch == "" {
 		t.Errorf("the daemon rewrote pool.json under the old config: key %q, notes %+v", saved.MatchKey, saved.Notes)
 	}
-	v, err := sx.Snapshot(ctx, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.Mismatch["i-old"] == "" {
-		t.Error("the daemon cleared the outdated VM's mismatch")
-	}
-	for id, why := range v.Mismatch {
-		if id != "i-old" && why != "" {
-			t.Errorf("the daemon marked new VM %s mismatched: %s", id, why)
+	for id, n := range saved.Notes {
+		if id != "i-old" && n.Mismatch != "" {
+			t.Errorf("the daemon marked new VM %s mismatched: %s", id, n.Mismatch)
 		}
 	}
-	c.mu.Lock()
-	launched := slices.Clone(c.launched)
-	c.mu.Unlock()
-	if len(launched) != 1 || launched[0] != "pool:new.large" {
-		t.Errorf("warm launches = %v, want one under the new config", launched)
+	if got := c.launches(); len(got) != 1 || got[0] != "pool:new.large" {
+		t.Errorf("warm launches = %v, want one under the new config", got)
 	}
-	if count(*logs, "config changed") != 1 {
-		t.Errorf("logs = %q", *logs)
+	if l.count("config changed") != 1 {
+		t.Errorf("logs = %s", l)
 	}
 }
 
-// A config that doesn't load (half-saved, invalid) leaves the daemon on the
-// last good one, reported once; fixing it applies it.
+// A launch in flight when the config changes finishes on the provider and
+// pool it started with, and is recorded; later launches use the new config.
+func TestReloadDuringLaunch(t *testing.T) {
+	c, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 1))
+	d, _ := start(t)
+	ctx := context.Background()
+	hold := make(chan struct{})
+	c.set(func(c *cloud) { c.hold = hold })
+	d.pass(ctx) // launches i-1 under a.large, which then waits on hold
+	for len(c.launches()) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	writeConfig(t, cfgPath, runnerConfig("b.large", 1))
+	d.pass(ctx) // reloads while i-1's launch is still waiting
+	fl := fleetNamed(d, "pool")
+	if fl.r.InstanceTypes[0] != "b.large" {
+		t.Fatal("not reloaded")
+	}
+	c.set(func(c *cloud) { c.hold = nil })
+	close(hold)
+	settle(t, d)
+	for i := 0; i < 2; i++ {
+		d.pass(ctx)
+		settle(t, d)
+	}
+
+	c.mu.Lock()
+	waited := slices.Clone(c.waited)
+	c.mu.Unlock()
+	if len(waited) == 0 || waited[0] != "pool:a.large" {
+		t.Errorf("the in-flight launch waited on %v, want its original provider", waited)
+	}
+	if got := c.launches(); !slices.Equal(got, []string{"pool:a.large", "pool:b.large"}) {
+		t.Errorf("launches = %v, want the old one then one under the new config", got)
+	}
+	v, err := fl.pool.Snapshot(ctx, true)
+	if err != nil || v.Launching != 0 {
+		t.Errorf("launches left unrecorded: %d (%v)", v.Launching, err)
+	}
+}
+
+// A config that doesn't load (half-saved, invalid, missing) leaves the
+// daemon on the last good one, each distinct error reported once; fixing it
+// applies it.
 func TestReloadKeepsLastGoodConfig(t *testing.T) {
 	c, cfgPath := setup(t)
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "a.large", 0))
-	d, logs := start(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 0))
+	d, l := start(t)
 	ctx := context.Background()
 	d.pass(ctx)
+	const failed = "config reload failed"
 
 	writeConfig(t, cfgPath, "[runners.pool\ntype = ")
 	d.pass(ctx)
 	d.pass(ctx)
-	if n := count(*logs, "config reload failed"); n != 1 {
-		t.Errorf("reported the bad config %d times, want once: %q", n, *logs)
+	if n := l.count(failed); n != 1 {
+		t.Errorf("reported the bad config %d times, want once: %s", n, l)
 	}
-	writeConfig(t, cfgPath, "[runners.pool]\ntype = \"sim\"\nbogus = 1\n")
+	bogus := "[runners.pool]\ntype = \"sim\"\nbogus = 1\n"
+	writeConfig(t, cfgPath, bogus)
 	d.pass(ctx)
-	if n := count(*logs, "config reload failed"); n != 2 {
-		t.Errorf("a different error wasn't reported: %q", *logs)
+	if n := l.count(failed); n != 2 {
+		t.Errorf("a different error wasn't reported: %s", l)
+	}
+	if err := os.Remove(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	d.pass(ctx)
+	if n := l.count(failed); n != 3 {
+		t.Errorf("a missing config wasn't reported: %s", l)
 	}
 	if fl := fleetNamed(d, "pool"); fl == nil || fl.r.InstanceTypes[0] != "a.large" {
-		t.Fatal("a bad config replaced the running one")
+		t.Fatal("a bad or missing config replaced the running one")
 	}
 
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "b.large", 0))
+	writeConfig(t, cfgPath, runnerConfig("b.large", 0))
 	d.pass(ctx)
 	if fl := fleetNamed(d, "pool"); fl == nil || fl.r.InstanceTypes[0] != "b.large" {
 		t.Fatal("the fixed config wasn't applied")
@@ -320,45 +437,83 @@ func TestReloadKeepsLastGoodConfig(t *testing.T) {
 	if c.built["pool"] != 2 {
 		t.Errorf("fleet built %d times, want 2", c.built["pool"])
 	}
+	// After a good config, the same bad one is news again.
+	writeConfig(t, cfgPath, bogus)
+	d.pass(ctx)
+	if n := l.count(failed); n != 4 {
+		t.Errorf("a recurring error wasn't reported after recovery: %s", l)
+	}
+}
+
+// A config whose save is still settling isn't applied until it is.
+func TestReloadWaitsForSave(t *testing.T) {
+	_, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 0))
+	d, _ := start(t)
+	ctx := context.Background()
+	d.pass(ctx)
+	reloadSettle = 300 * time.Millisecond
+	writeConfig(t, cfgPath, runnerConfig("b.large", 0))
+	done := make(chan error)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		done <- os.WriteFile(cfgPath, []byte(runnerConfig("c.large", 0)), 0o600)
+	}()
+	d.pass(ctx)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := fleetNamed(d, "pool").r.InstanceTypes[0]; got != "a.large" {
+		t.Fatalf("applied %s while the file was still changing", got)
+	}
+	d.pass(ctx)
+	if got := fleetNamed(d, "pool").r.InstanceTypes[0]; got != "c.large" {
+		t.Fatalf("applied %s, want the settled c.large", got)
+	}
 }
 
 // Runners added to or removed from the config are picked up, in priority
 // order; a fleet that fails to build leaves the whole config unapplied.
 func TestReloadAddsAndRemovesRunners(t *testing.T) {
 	c, cfgPath := setup(t)
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "a.large", 0))
-	d, logs := start(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 0))
+	d, l := start(t)
 	ctx := context.Background()
 	d.pass(ctx)
 	first := fleetNamed(d, "pool")
+	firstFleet, firstPool := first.f, first.pool
 
-	two := fmt.Sprintf(simRunner, "a.large", 0) + "\n[runners.fast]\ntype = \"sim\"\npriority = -1\n"
+	// "zfast" sorts after "pool" by name but before it by priority.
+	const zfast = "\n[runners.zfast]\ntype = \"sim\"\npriority = -1\n"
 	build := newFleet
 	newFleet = func(r *config.Runner) (provider.Fleet, error) {
-		if r.Name == "fast" {
+		if r.Name == "zfast" {
 			return nil, errors.New("no credentials")
 		}
 		return build(r)
 	}
-	writeConfig(t, cfgPath, two)
+	writeConfig(t, cfgPath, runnerConfig("b.large", 0)+zfast)
 	d.pass(ctx)
-	if len(d.fleets) != 1 || count(*logs, "no credentials") != 1 {
-		t.Fatalf("a failed build applied part of the config: %d fleets, logs %q", len(d.fleets), *logs)
+	if len(d.fleets) != 1 || l.count("no credentials") != 1 {
+		t.Fatalf("a failed build applied part of the config: %v, logs %s", names(d), l)
+	}
+	if first.r.InstanceTypes[0] != "a.large" || first.f != firstFleet || first.pool != firstPool {
+		t.Fatal("a failed build still changed the other runner")
 	}
 
 	newFleet = build
 	d.pass(ctx)
-	if len(d.fleets) != 2 || d.fleets[0].r.Name != "fast" || d.fleets[1] != first {
-		t.Fatalf("fleets after adding: %v", names(d))
+	if got := names(d); !slices.Equal(got, []string{"zfast", "pool"}) || d.fleets[1] != first || first.r.InstanceTypes[0] != "b.large" {
+		t.Fatalf("fleets after adding: %v", got)
 	}
 
-	writeConfig(t, cfgPath, "[runners.fast]\ntype = \"sim\"\n")
+	writeConfig(t, cfgPath, zfast)
 	d.pass(ctx)
-	if got := names(d); len(got) != 1 || got[0] != "fast" {
+	if got := names(d); !slices.Equal(got, []string{"zfast"}) {
 		t.Fatalf("fleets after removing: %v", got)
 	}
-	if c.built["pool"] != 1 {
-		t.Errorf("unchanged runner rebuilt %d times", c.built["pool"])
+	if c.built["pool"] != 2 || c.built["zfast"] != 1 {
+		t.Errorf("builds = %v", c.built)
 	}
 
 	writeConfig(t, cfgPath, "")
@@ -368,58 +523,10 @@ func TestReloadAddsAndRemovesRunners(t *testing.T) {
 	}
 }
 
-func names(d *Daemon) []string {
-	var n []string
-	for _, fl := range d.fleets {
-		n = append(n, fl.r.Name)
-	}
-	return n
-}
-
 func recent(d *Daemon, fl *fleet) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return len(fl.failures)
-}
-
-// Warm launches refused together (a network blip, an expired SSO session,
-// no capacity) created no VM, so they never count toward the circuit
-// breaker; VMs launched together that then fail together count once.
-func TestBreakerIgnoresBurstFailures(t *testing.T) {
-	c, cfgPath := setup(t)
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "a.large", 3))
-	d, _ := start(t)
-	ctx := context.Background()
-	fl := fleetNamed(d, "pool")
-
-	c.mu.Lock()
-	c.launchErr = errors.New("ExpiredToken: the SSO session has expired")
-	c.mu.Unlock()
-	d.pass(ctx)
-	settle(t, d)
-	if n := len(c.launched); n != 3 {
-		t.Fatalf("launch requests = %d, want 3", n)
-	}
-	if n := recent(d, fl); n != 0 {
-		t.Errorf("refused launches counted %d failures", n)
-	}
-
-	c.mu.Lock()
-	c.launchErr, c.waitErr = nil, errors.New("instance reclaimed while booting")
-	c.mu.Unlock()
-	clearBackoff(t, fl)
-	d.pass(ctx)
-	settle(t, d)
-	if n := len(c.launched); n != 6 {
-		t.Fatalf("launch requests = %d, want 6", n)
-	}
-	if n := recent(d, fl); n != 1 {
-		t.Errorf("3 VMs failing together counted %d failures, want 1", n)
-	}
-	st := d.manage(ctx, fl)
-	if !fl.paused.IsZero() || st.LastError != "" {
-		t.Errorf("one burst paused warm launches: %q", st.LastError)
-	}
 }
 
 // clearBackoff ends the pool's backoff after a failed launch, as time would.
@@ -443,151 +550,286 @@ func clearBackoff(t *testing.T, fl *fleet) {
 	}
 }
 
-// Distinct instances failing to become healthy still trip the breaker; the
-// same instance seen failing twice counts once; a later launch batch counts
-// again but an earlier one doesn't.
+// age moves the breaker's clock back by dt.
+func age(d *Daemon, fl *fleet, dt time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := range fl.failures {
+		fl.failures[i] = fl.failures[i].Add(-dt)
+	}
+	fl.paused = fl.paused.Add(-dt)
+}
+
+// Warm launches refused together (a network blip, an expired SSO session,
+// no capacity) created no VM, so they never count toward the circuit
+// breaker; VMs launched together that then fail together count once per
+// pass, so it takes three such passes to pause, and the pause holds for an
+// hour.
+func TestBreakerIgnoresBurstFailures(t *testing.T) {
+	c, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 3))
+	d, l := start(t)
+	ctx := context.Background()
+	fl := fleetNamed(d, "pool")
+	pass := func() FleetStatus {
+		t.Helper()
+		clearBackoff(t, fl)
+		d.pass(ctx)
+		settle(t, d)
+		st, err := ReadStatus()
+		if err != nil || len(st.Fleets) != 1 {
+			t.Fatalf("status: %v", err)
+		}
+		return st.Fleets[0]
+	}
+
+	c.set(func(c *cloud) { c.launchErr = errors.New("ExpiredToken: the SSO session has expired") })
+	d.pass(ctx)
+	settle(t, d)
+	if n := len(c.launches()); n != 3 {
+		t.Fatalf("launch requests = %d, want 3", n)
+	}
+	if n := recent(d, fl); n != 0 {
+		t.Errorf("refused launches counted %d failures", n)
+	}
+
+	c.set(func(c *cloud) { c.launchErr, c.waitErr = nil, errors.New("instance reclaimed while booting") })
+	for want := 1; want <= 2; want++ {
+		if st := pass(); st.LastError != "" {
+			t.Fatalf("paused after %d failed passes: %q", want, st.LastError)
+		}
+		if n := recent(d, fl); n != want {
+			t.Fatalf("after %d passes of 3 VMs failing together: %d failures", want, n)
+		}
+	}
+	if n := len(c.launches()); n != 9 {
+		t.Fatalf("launch requests = %d, want 9", n)
+	}
+	pass()
+	if st := pass(); !strings.Contains(st.LastError, "paused") || l.count("pausing warm launches") != 1 {
+		t.Fatalf("3 failed passes didn't pause: %q", st.LastError)
+	}
+	if n := len(c.launches()); n != 12 {
+		t.Fatalf("launched while paused: %d requests, want 12", n)
+	}
+
+	c.set(func(c *cloud) { c.waitErr = nil })
+	age(d, fl, 59*time.Minute)
+	if st := pass(); !strings.Contains(st.LastError, "paused") || len(c.launches()) != 12 {
+		t.Fatalf("pause ended early: %q, %d launches", st.LastError, len(c.launches()))
+	}
+	age(d, fl, 2*time.Minute)
+	if st := pass(); st.LastError != "" || len(c.launches()) != 15 || recent(d, fl) != 0 {
+		t.Fatalf("pause didn't end after an hour: %q, %d launches, %d failures", st.LastError, len(c.launches()), recent(d, fl))
+	}
+}
+
+// Each instance counts once whichever path reports it; launch batches count
+// once each, older ones not at all; instances and launches from before the
+// breaker restarted don't count.
 func TestBreakerAccounting(t *testing.T) {
 	_, cfgPath := setup(t)
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "a.large", 1))
-	d, logs := start(t)
-	ctx := context.Background()
+	writeConfig(t, cfgPath, runnerConfig("a.large", 0))
+	d, _ := start(t)
 	fl := fleetNamed(d, "pool")
+	now := time.Now()
+	for id, pass := range map[string]int{"i-1": 5, "i-2": 5, "i-3": 4, "i-4": 6} {
+		fl.batchOf[id] = launchBatch{pass: pass, at: now}
+	}
+	steps := []struct {
+		id   string
+		want int
+	}{
+		{"i-1", 1}, // pass 5
+		{"i-2", 1}, // pass 5 again
+		{"i-3", 1}, // an older pass
+		{"i-1", 1}, // reported twice
+		{"i-4", 2}, // pass 6
+		{"i-5", 3}, // not a launch of this daemon
+		{"i-5", 3},
+	}
+	for _, s := range steps {
+		d.countFailure(fl, s.id, time.Time{})
+		if n := recent(d, fl); n != s.want {
+			t.Fatalf("after %s: %d failures, want %d", s.id, n, s.want)
+		}
+	}
+	// Reported by a health check first, then by its launch.
+	d.countFailure(fl, "i-6", time.Time{})
+	fl.batchOf["i-6"] = launchBatch{pass: 9, at: now}
+	d.countFailure(fl, "i-6", time.Time{})
+	if n := recent(d, fl); n != 4 {
+		t.Fatalf("i-6 counted twice: %d", n)
+	}
 
-	d.countLaunchFailure(fl, "i-1", 5)
-	d.countLaunchFailure(fl, "i-2", 5)
-	d.countLaunchFailure(fl, "i-3", 4)
-	d.countFailure(fl, "i-1")
+	// A restarted breaker ignores what came before it.
+	fl.failures, fl.epoch, fl.since = nil, 1, now
+	fl.batchOf["i-7"] = launchBatch{pass: 20, epoch: 0, at: now}
+	d.countFailure(fl, "i-7", time.Time{})
+	d.countFailure(fl, "i-8", now.Add(-time.Minute))
+	if n := recent(d, fl); n != 0 {
+		t.Fatalf("pre-restart failures counted: %d", n)
+	}
+	d.countFailure(fl, "i-9", now.Add(time.Minute))
 	if n := recent(d, fl); n != 1 {
-		t.Fatalf("failures = %d, want 1", n)
+		t.Fatalf("post-restart failure not counted: %d", n)
 	}
-	d.countLaunchFailure(fl, "i-4", 6)
-	d.countFailure(fl, "i-5")
-	d.countFailure(fl, "i-5")
-	if n := recent(d, fl); n != 3 {
-		t.Fatalf("failures = %d, want 3", n)
-	}
-	st := d.manage(ctx, fl)
-	if fl.paused.IsZero() || !strings.Contains(st.LastError, "paused") || count(*logs, "pausing warm launches") != 1 {
-		t.Fatalf("3 unhealthy instances didn't pause: %q", st.LastError)
-	}
-	settle(t, d)
 
-	// An hour on, old failures expire and launches resume.
-	d.mu.Lock()
-	for i := range fl.failures {
-		fl.failures[i] = fl.failures[i].Add(-2 * time.Hour)
+	// Long-unlisted entries are forgotten; recent ones are kept.
+	fl.counted["i-old"] = now.Add(-2 * forgetAfter)
+	fl.batchOf["i-old"] = launchBatch{at: now.Add(-2 * forgetAfter)}
+	fl.lastPrb = time.Now()
+	d.manage(context.Background(), fl)
+	if _, ok := fl.counted["i-old"]; ok {
+		t.Error("an old unlisted counted entry was kept")
 	}
-	d.mu.Unlock()
-	fl.paused = fl.paused.Add(-2 * time.Hour)
-	if st := d.manage(ctx, fl); st.LastError != "" || recent(d, fl) != 0 {
-		t.Errorf("breaker didn't reset: %q, %d failures", st.LastError, recent(d, fl))
+	if _, ok := fl.batchOf["i-old"]; ok {
+		t.Error("an old unlisted launch batch was kept")
+	}
+	if _, ok := fl.counted["i-9"]; !ok {
+		t.Error("a recent counted entry was dropped")
 	}
 }
 
-// Editing the config (say, to fix bootstrap_script) lifts a pause.
+// A config edit that may fix the fleet (a new bootstrap_script) lifts a
+// pause and launches resume; one that only schedules (priority) doesn't.
 func TestConfigChangeResetsBreaker(t *testing.T) {
-	_, cfgPath := setup(t)
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "a.large", 0))
+	c, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 1))
 	d, _ := start(t)
 	ctx := context.Background()
-	d.pass(ctx)
 	fl := fleetNamed(d, "pool")
 	for _, id := range []string{"i-1", "i-2", "i-3"} {
-		d.countFailure(fl, id)
+		d.countFailure(fl, id, time.Time{})
 	}
 	d.pass(ctx)
-	if fl.paused.IsZero() {
+	settle(t, d)
+	if fl.paused.IsZero() || len(c.launches()) != 0 {
 		t.Fatal("not paused")
 	}
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "a.large", 0)+"bootstrap_script = \"echo fixed\"\n")
+	writeConfig(t, cfgPath, runnerConfig("a.large", 1, "priority = 3"))
 	d.pass(ctx)
-	if !fl.paused.IsZero() || recent(d, fl) != 0 {
-		t.Error("a config change kept the pause")
+	settle(t, d)
+	if fl.r.Priority != 3 || fl.paused.IsZero() || len(c.launches()) != 0 {
+		t.Fatal("a priority change lifted the pause")
+	}
+	writeConfig(t, cfgPath, runnerConfig("a.large", 1, "priority = 3", `bootstrap_script = "echo fixed"`))
+	d.pass(ctx)
+	settle(t, d)
+	if !fl.paused.IsZero() || recent(d, fl) != 0 || len(c.launches()) != 1 {
+		t.Errorf("a bootstrap_script change kept the pause: %d launches", len(c.launches()))
 	}
 }
 
-// Warm VMs launched together retire one at a time ahead of max_lifetime:
-// the second only once the first's replacement answers, so warm capacity
-// never drops below min_instances.
-func TestStaggeredRetirement(t *testing.T) {
+// retirementFleet is a fleet of two co-born warm VMs (min_instances = 2,
+// max_lifetime = 2h) launched ago; booting reports whether a replacement
+// VM is still in first boot. pass runs one management round with a probe.
+func retirementFleet(t *testing.T, ago time.Duration, booting func() bool) (c *cloud, l *logs, pass func()) {
 	c, cfgPath := setup(t)
-	writeConfig(t, cfgPath, fmt.Sprintf(simRunner, "a.large", 2)+"max_lifetime = \"2h\"\n")
-	d, logs := start(t)
-	ctx := context.Background()
-	fl := fleetNamed(d, "pool")
-	// Past the retirement point (2h - drain-ahead - 10m), short of the
-	// pool's own drain-ahead.
-	born := time.Now().Add(-(2*time.Hour - client.LifetimeDrainAhead(fl.r) - 5*time.Minute))
+	writeConfig(t, cfgPath, runnerConfig("a.large", 2, `max_lifetime = "2h"`))
 	for _, id := range []string{"i-a", "i-b"} {
-		c.add("pool", provider.Instance{ID: id, Type: "a.large", State: provider.StateRunning, LaunchedAt: born, Target: provider.Target{Host: "192.0.2.1"}})
+		c.add("pool", provider.Instance{ID: id, Type: "a.large", State: provider.StateRunning, LaunchedAt: time.Now().Add(-ago), Target: provider.Target{Host: "192.0.2.1"}})
 	}
-	var confirm sync.Mutex
-	confirmed := false
-	drainVM = func(context.Context, *config.Runner, provider.Instance) bool {
-		confirm.Lock()
-		defer confirm.Unlock()
-		return confirmed
-	}
-	// Hold the replacement in first boot until the test lets it finish.
-	booting := true
 	probeFleet = func(d *Daemon, _ context.Context, fl *fleet, running []provider.Instance, _ map[string]bool) ([]string, int) {
 		for _, in := range running {
 			fl.lastOK[in.ID] = time.Now()
-			fl.booting[in.ID] = booting && in.ID != "i-a" && in.ID != "i-b"
+			fl.booting[in.ID] = in.ID != "i-a" && in.ID != "i-b" && booting()
 		}
 		return nil, len(running)
 	}
-
-	retiring := func() []string {
-		var ids []string
-		for _, l := range *logs {
-			if strings.Contains(l, "retiring warm instance") {
-				ids = append(ids, l[strings.LastIndex(l, " i-")+1:strings.Index(l, " ahead")])
-			}
-		}
-		return ids
-	}
-	pass := func() {
-		fl.lastPrb = time.Time{} // probe every pass
-		d.pass(ctx)
+	d, l := start(t)
+	pass = func() {
+		fleetNamed(d, "pool").lastPrb = time.Time{} // probe every pass
+		d.pass(context.Background())
 		settle(t, d)
 	}
+	return c, l, pass
+}
 
-	// First pass: nothing answered yet, so nothing counts as ready.
-	pass()
-	if got := retiring(); len(got) != 0 {
-		t.Fatalf("retired before any VM answered: %v", got)
+// retireWindow is an age past the retirement point of a 2h max_lifetime
+// (2h - drain-ahead - retireAhead) but short of the pool's own drain-ahead.
+func retireWindow() time.Duration {
+	r := &config.Runner{MaxLifetime: config.Duration{Duration: 2 * time.Hour}}
+	return 2*time.Hour - client.LifetimeDrainAhead(r) - retireAhead/2
+}
+
+// Warm VMs retire ahead of max_lifetime only once in the window, and one at
+// a time: the second waits for the first's drain to be confirmed, even
+// with its replacement ready.
+func TestRetirementWaitsForDrainConfirmation(t *testing.T) {
+	c, l, pass := retirementFleet(t, time.Hour, func() bool { return false })
+	var mu sync.Mutex
+	confirmed := false
+	drainVM = func(context.Context, *config.Runner, provider.Instance) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return confirmed
 	}
-	// Second: both ready, exactly one retires; the VM hasn't confirmed.
 	pass()
-	if got := retiring(); len(got) != 1 {
+	pass()
+	if got := l.matching("retiring warm instance"); len(got) != 0 {
+		t.Fatalf("retired young VMs: %v", got)
+	}
+	c.born("pool", time.Now().Add(-retireWindow()))
+	pass()
+	if got := l.matching("retiring warm instance"); len(got) != 1 {
 		t.Fatalf("retired %v, want exactly one", got)
 	}
-	// Unconfirmed drain: no second retirement meanwhile.
+	// Its replacement launches and answers; the drain stays unconfirmed.
 	pass()
-	if got := retiring(); len(got) != 1 {
+	pass()
+	pass()
+	if got := l.matching("retiring warm instance"); len(got) != 1 {
 		t.Fatalf("retired %v while the first drain was unconfirmed", got)
 	}
-	// Confirmed, but the replacement is still booting.
-	confirm.Lock()
+	if n := len(c.launches()); n != 1 {
+		t.Fatalf("replacements launched = %d, want 1", n)
+	}
+	mu.Lock()
 	confirmed = true
-	confirm.Unlock()
+	mu.Unlock()
 	pass()
 	pass()
-	if got := retiring(); len(got) != 1 {
+	if got := l.matching("retiring warm instance"); len(got) != 2 || got[0] == got[1] {
+		t.Fatalf("retired %v, want both, one after the other", got)
+	}
+}
+
+// With drains confirmed, the second co-born VM still waits until the first
+// one's replacement is ready, so warm capacity never drops below
+// min_instances.
+func TestRetirementWaitsForReplacement(t *testing.T) {
+	var mu sync.Mutex
+	booting := true
+	c, l, pass := retirementFleet(t, retireWindow(), func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return booting
+	})
+	// First pass: nothing answered yet, so nothing counts as ready.
+	pass()
+	if got := l.matching("retiring warm instance"); len(got) != 0 {
+		t.Fatalf("retired before any VM answered: %v", got)
+	}
+	pass()
+	if got := l.matching("retiring warm instance"); len(got) != 1 {
+		t.Fatalf("retired %v, want exactly one", got)
+	}
+	pass()
+	pass()
+	pass()
+	if got := l.matching("retiring warm instance"); len(got) != 1 {
 		t.Fatalf("retired %v before the replacement was ready", got)
 	}
-	c.mu.Lock()
-	launches := len(c.launched)
-	c.mu.Unlock()
-	if launches == 0 {
-		t.Fatal("no replacement launched")
+	if n := len(c.launches()); n != 1 {
+		t.Fatalf("replacements launched = %d, want 1", n)
 	}
-	// Replacement ready: now the second retires.
+	mu.Lock()
 	booting = false
+	mu.Unlock()
 	pass()
 	pass()
-	if got := retiring(); len(got) != 2 || got[0] == got[1] {
+	if got := l.matching("retiring warm instance"); len(got) != 2 || got[0] == got[1] {
 		t.Fatalf("retired %v, want both, one after the other", got)
 	}
 }

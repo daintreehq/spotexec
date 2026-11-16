@@ -47,6 +47,13 @@ var (
 	// before client.LifetimeDrainAhead drains whatever is left, one at a
 	// time, so their replacements are warm by then.
 	retireAhead = 10 * time.Minute
+	// A config file changed this recently may be mid-save: wait for it to
+	// settle before applying it.
+	reloadSettle = time.Second
+	// How long the circuit breaker remembers an instance it counted (or a
+	// VM this daemon launched) after it stops being listed: longer than a
+	// launch can take to show up in listings.
+	forgetAfter = 10 * time.Minute
 )
 
 func init() {
@@ -123,19 +130,31 @@ type fleet struct {
 	seen       map[string]time.Time         // when this daemon first saw each instance
 	booting    map[string]bool              // answered, but first-boot setup unfinished
 	bootFailed map[string]bool              // its bootstrap_script failed
-	counted    map[string]bool              // already counted by the circuit breaker
+	counted    map[string]time.Time         // already counted by the circuit breaker (when)
 	killing    map[string]string            // terminations to retry until gone (id -> reason)
 	retire     map[string]provider.Instance // warm VMs to drain remotely, until confirmed
 	// Circuit breaker: replacements of instances that never became healthy.
 	failures []time.Time
 	paused   time.Time
-	// The latest pass whose warm launches already counted a failure:
-	// launches sent together that fail together count once.
+	// VMs this daemon launched that haven't answered yet, by the pass that
+	// sent them, and the latest such pass that already counted a failure:
+	// VMs launched together that fail together count once.
+	batchOf     map[string]launchBatch
 	failedBatch int
+	// The breaker restarts when the runner's config changes in a way that
+	// may fix it: instances launched before then (since), and launches from
+	// an earlier epoch, no longer count.
+	epoch int
+	since time.Time
+}
+
+type launchBatch struct {
+	pass, epoch int
+	at          time.Time
 }
 
 func newFleetState(r *config.Runner, f provider.Fleet) *fleet {
-	return &fleet{r: r, f: f, pool: client.NewPool(r, f), lastOK: map[string]time.Time{}, busy: map[string]bool{}, noticed: map[string]bool{}, seen: map[string]time.Time{}, booting: map[string]bool{}, bootFailed: map[string]bool{}, counted: map[string]bool{}, killing: map[string]string{}, retire: map[string]provider.Instance{}}
+	return &fleet{r: r, f: f, pool: client.NewPool(r, f), lastOK: map[string]time.Time{}, busy: map[string]bool{}, noticed: map[string]bool{}, seen: map[string]time.Time{}, booting: map[string]bool{}, bootFailed: map[string]bool{}, counted: map[string]time.Time{}, batchOf: map[string]launchBatch{}, killing: map[string]string{}, retire: map[string]provider.Instance{}}
 }
 
 // Daemon manages every fleet runner in the global config.
@@ -259,9 +278,18 @@ func (d *Daemon) reload() {
 	if d.cfgPath == "" {
 		return
 	}
-	raw, err := os.ReadFile(d.cfgPath)
+	raw, mod, err := readConfig(d.cfgPath)
 	if err == nil && d.cfgRaw != nil && bytes.Equal(raw, d.cfgRaw) {
 		return
+	}
+	if age := time.Since(mod); err == nil && age < reloadSettle {
+		// Just written, maybe not finished: a valid prefix of the new file
+		// (or an empty one) must not be applied. Changed meanwhile: next pass.
+		time.Sleep(min(reloadSettle, reloadSettle-age))
+		again, _, err2 := readConfig(d.cfgPath)
+		if err2 != nil || !bytes.Equal(raw, again) {
+			return
+		}
 	}
 	if err == nil {
 		var g *config.Global
@@ -277,6 +305,15 @@ func (d *Daemon) reload() {
 		return
 	}
 	d.cfgRaw, d.cfgErr = raw, ""
+}
+
+func readConfig(path string) ([]byte, time.Time, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	raw, err := os.ReadFile(path)
+	return raw, fi.ModTime(), err
 }
 
 // apply switches the daemon to cfg's fleet runners. A fleet whose runner is
@@ -322,8 +359,13 @@ func (d *Daemon) apply(cfg *config.Config) error {
 	for _, c := range changes {
 		d.action("%s: config changed; applying it", c.r.Name)
 		d.mu.Lock()
+		if !reflect.DeepEqual(healthSettings(c.fl.r), healthSettings(c.r)) {
+			// The edit may be the fix (a new image, bootstrap_script or
+			// instance types): give it a fresh circuit breaker.
+			c.fl.failures, c.fl.paused = nil, time.Time{}
+			c.fl.epoch, c.fl.since = c.fl.epoch+1, time.Now()
+		}
 		c.fl.r, c.fl.f, c.fl.pool = c.r, c.f, client.NewPool(c.r, c.f)
-		c.fl.failures, c.fl.paused = nil, time.Time{}
 		d.mu.Unlock()
 	}
 	for name := range old {
@@ -365,6 +407,16 @@ func (d *Daemon) action(format string, args ...any) {
 	if d.log != nil {
 		d.log(format, args...) // the logger adds its own timestamp
 	}
+}
+
+// healthSettings is r without the settings that only size or schedule the
+// fleet: changing those can't fix instances that never became healthy.
+func healthSettings(r *config.Runner) config.Runner {
+	c := *r
+	c.Priority, c.MinInstances, c.MaxInstances, c.MaxSlots, c.HourlyCost = 0, 0, 0, 0, 0
+	c.IdleTimeout, c.MaxLifetime = config.Duration{}, config.Duration{}
+	c.LaunchOrder, c.MaxPrice, c.WaitCost = "", "", config.Dollars{}
+	return c
 }
 
 // pass is one management round over every fleet.
@@ -410,6 +462,20 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			}
 		}
 	}
+	// Launched or counted but never listed (a VM that ended before any
+	// listing showed it): forgotten once listings would show it.
+	d.mu.Lock()
+	for id, t := range fl.counted {
+		if !listed[id] && !view.BootFailed[id] && time.Since(t) > forgetAfter {
+			delete(fl.counted, id)
+		}
+	}
+	for id, b := range fl.batchOf {
+		if !listed[id] && time.Since(b.at) > forgetAfter {
+			delete(fl.batchOf, id)
+		}
+	}
+	d.mu.Unlock()
 
 	// 1. Retry terminations that haven't taken effect yet.
 	for id, why := range fl.killing {
@@ -495,6 +561,11 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		var notified []string
 		notified, answered = probeFleet(d, ctx, fl, running, warm)
 		probed = true
+		d.mu.Lock()
+		for id := range fl.lastOK {
+			delete(fl.batchOf, id) // it answered: no longer a failed launch
+		}
+		d.mu.Unlock()
 		for _, id := range notified {
 			view.Draining[id] = true
 		}
@@ -556,7 +627,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			// The circuit breaker counts instances that never became
 			// healthy; one that served and later hung is not a setup problem.
 			if _, ok := fl.lastOK[in.ID]; !ok || fl.booting[in.ID] {
-				d.countFailure(fl, in.ID)
+				d.countFailure(fl, in.ID, in.LaunchedAt)
 			}
 			// Not retried if the request fails: the next probe re-judges it
 			// (it may answer again once the network is back).
@@ -568,8 +639,12 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 
 	// A bootstrap failure an sx client found (it drained the VM): count it
 	// and end the VM now rather than letting it idle out.
+	launchedAt := map[string]time.Time{}
+	for _, in := range view.Instances {
+		launchedAt[in.ID] = in.LaunchedAt
+	}
 	for id := range view.BootFailed {
-		d.countFailure(fl, id) // once per instance (counted)
+		d.countFailure(fl, id, launchedAt[id]) // once per instance (counted)
 		if listed[id] && fl.killing[id] == "" {
 			d.terminate(ctx, fl, id, "bootstrap_script failed", false)
 		}
@@ -580,7 +655,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	for _, in := range view.Instances {
 		if fl.killing[in.ID] == "" && !in.LaunchedAt.IsZero() && time.Since(in.LaunchedAt) > r.BootTimeout.Duration+time.Minute &&
 			(in.State != provider.StateRunning || in.Target.Host == "") {
-			d.countFailure(fl, in.ID)
+			d.countFailure(fl, in.ID, in.LaunchedAt)
 			d.terminate(ctx, fl, in.ID, "never became reachable (no address, or stuck pending)", false)
 		}
 	}
@@ -688,7 +763,7 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int)
 	d.mu.Unlock()
 	// The fleet's runner and pool as of this launch: a config reload may
 	// replace them while it runs.
-	r, pool := fl.r, fl.pool
+	r, pool, epoch := fl.r, fl.pool, fl.epoch
 	if ctx.Err() != nil {
 		pool.Cancel(id) // stopping: never sent, so free the reservation
 		d.mu.Lock()
@@ -709,7 +784,12 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int)
 		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.BootTimeout.Duration+2*time.Minute)
 		defer cancel()
 		created := ""
-		in, err := pool.ProvisionHeldThen(pctx, id, nil, func(in provider.Instance) { created = in.ID })
+		in, err := pool.ProvisionHeldThen(pctx, id, nil, func(in provider.Instance) {
+			created = in.ID
+			d.mu.Lock()
+			fl.batchOf[in.ID] = launchBatch{pass: batch, epoch: epoch, at: time.Now()}
+			d.mu.Unlock()
+		})
 		if err != nil {
 			d.action("%s: launch failed: %v", r.Name, err)
 			// A refused launch request (network, credentials, capacity,
@@ -717,7 +797,7 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int)
 			// fleet's health; the pool already backs further launches off.
 			// Only a VM that was created and then never became usable counts.
 			if created != "" {
-				d.countLaunchFailure(fl, created, batch)
+				d.countFailure(fl, created, time.Time{})
 			}
 			return
 		}
@@ -833,35 +913,28 @@ func ReadStatus() (*Status, error) {
 	return &s, json.Unmarshal(b, &s)
 }
 
-// countFailure records one instance (or launch) that never became healthy,
-// once, for the warm-launch circuit breaker.
-func (d *Daemon) countFailure(fl *fleet, id string) {
+// countFailure records, once, an instance that never became healthy (it was
+// launched at launched, zero if unknown), for the warm-launch circuit
+// breaker. VMs this daemon launched in the same pass that fail together (a
+// Spot capacity reclaim, a network blip while they boot) count once, as
+// does a pass older than one already counted; instances from before the
+// breaker last restarted don't count.
+func (d *Daemon) countFailure(fl *fleet, id string, launched time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if id != "" {
-		if fl.counted[id] {
-			return
-		}
-		fl.counted[id] = true
-	}
-	fl.failures = append(fl.failures, time.Now())
-}
-
-// countLaunchFailure is countFailure for a VM the daemon launched that never
-// became usable: VMs launched in the same pass that fail together (a Spot
-// capacity reclaim, a network blip while they boot) count once, and so does
-// a batch older than one already counted.
-func (d *Daemon) countLaunchFailure(fl *fleet, id string, batch int) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if fl.counted[id] {
+	if _, ok := fl.counted[id]; ok {
 		return
 	}
-	fl.counted[id] = true
-	if batch <= fl.failedBatch {
-		return // its batch (or a later one) was already counted
+	fl.counted[id] = time.Now()
+	if !launched.IsZero() && launched.Before(fl.since) {
+		return
 	}
-	fl.failedBatch = batch
+	if b, ok := fl.batchOf[id]; ok {
+		if b.epoch != fl.epoch || b.pass <= fl.failedBatch {
+			return
+		}
+		fl.failedBatch = b.pass
+	}
 	fl.failures = append(fl.failures, time.Now())
 }
 
