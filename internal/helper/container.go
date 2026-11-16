@@ -652,6 +652,22 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		select {}
 	}
 	defer s.procMu.Unlock()
+	// Under procMu, so teardown waits for the container it creates.
+	var users []string
+	if uid, gid := os.Getuid(), os.Getgid(); !run.Root && uid != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		passwd, group, err := s.runUserFiles(ctx, d, run.Image, uid, gid)
+		cancel()
+		if err != nil {
+			return "", nil, nil, perr(protocol.CodeImageFailed, "%v", err)
+		}
+		// --mount, not -v: a missing source fails the run instead of
+		// becoming an empty directory.
+		users = []string{
+			"--mount", "type=bind,source=" + passwd + ",target=/etc/passwd,readonly",
+			"--mount", "type=bind,source=" + group + ",target=/etc/group,readonly",
+		}
+	}
 	runDir := filepath.Join(s.slotDir, "run")
 	home := filepath.Join(s.slotDir, "home")
 	for _, dd := range []string{runDir, home} {
@@ -755,7 +771,8 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 
 	if !run.Root {
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
-			"-v", home+":/home/spotexec", "-e", "HOME=/home/spotexec")
+			"-v", home+":"+runUserHome, "-e", "HOME="+runUserHome)
+		args = append(args, users...)
 	}
 	args = append(args, limits...)
 	args = append(args, run.Options...)
