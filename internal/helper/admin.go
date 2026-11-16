@@ -55,17 +55,31 @@ type Status struct {
 	DiskFreeMB int64             `json:"disk_free_mb"`
 }
 
+// readCapacity lists the holders and the slot count they agreed on (0
+// without holders), read together under the slot-count mutex so they can't
+// come from either side of an idle VM's change of count.
+func readCapacity(l Layout) ([]protocol.Holder, int) {
+	if _, err := os.Stat(l.SlotsLock()); err == nil {
+		if mu, ok, _ := lockSlots(l); ok {
+			defer mu.Unlock()
+		}
+	}
+	h := readHolders(l)
+	if len(h) == 0 {
+		return h, 0
+	}
+	return h, readSlotCount(l)
+}
+
 // GetStatus inspects the work root without taking any locks.
 func GetStatus(root string) Status {
 	l := Layout{Root: root}
 	st := Status{Version: Version, OS: runtime.GOOS, Arch: runtime.GOARCH, CPUs: runtime.NumCPU(), IdleS: -1}
 	st.Hostname, _ = os.Hostname()
 	st.Draining = draining(root)
-	st.Holders = readHolders(l)
+	st.Holders, st.SlotCount = readCapacity(l)
 	if st.Holders == nil {
 		st.Holders = []protocol.Holder{}
-	} else {
-		st.SlotCount = readSlotCount(l)
 	}
 	st.Waiters = readWaiters(l)
 	vm := onSpotexecVM()

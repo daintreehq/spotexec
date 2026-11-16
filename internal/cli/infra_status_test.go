@@ -74,13 +74,13 @@ func TestStatusSlotsShowVMCount(t *testing.T) {
 	three := []protocol.Holder{{Token: 1}, {Token: 2}, {Token: 3}}
 	printStatus(f, []runnerStatus{
 		{Name: "busy", r: &config.Runner{MaxSlots: 2}, Info: running, Helper: &helper.Status{CPUs: 8, Holders: three, SlotCount: 4}},
-		{Name: "idle", r: &config.Runner{MaxSlots: 2}, Info: running, Helper: &helper.Status{CPUs: 8, Holders: []protocol.Holder{}}},
+		{Name: "idle", r: &config.Runner{MaxSlots: 3}, Info: running, Helper: &helper.Status{CPUs: 8, Holders: []protocol.Holder{}}},
 		{Name: "older", r: &config.Runner{}, Info: running, Helper: &helper.Status{CPUs: 8, Holders: three[:1]}},
 	}, nil)
 	f.Close()
 	b, _ := os.ReadFile(path)
 	lines := strings.Split(string(b), "\n")
-	for i, want := range []string{"3/4", "0/2", "1/2"} {
+	for i, want := range []string{"3/4", "0/3", "1/2"} {
 		if !strings.Contains(lines[i+1], " "+want+" ") {
 			t.Fatalf("row %d: want slots %s:\n%s", i+1, want, b)
 		}

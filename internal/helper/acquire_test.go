@@ -213,6 +213,9 @@ func TestSlotCountAgreedWhileBusy(t *testing.T) {
 
 	a.release()
 	b.release()
+	if st := GetStatus(root); len(st.Holders) != 0 || st.SlotCount != 0 || readSlotCount(Layout{Root: root}) != 2 {
+		t.Fatalf("idle VM: %d holders, status slot count %d (want 0), recorded %d (want 2)", len(st.Holders), st.SlotCount, readSlotCount(Layout{Root: root}))
+	}
 	d := testSession(t, root)
 	if err := d.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 4}); err != nil || d.slotLock == nil {
 		t.Fatalf("run on the idle VM: %v", err)
@@ -252,10 +255,14 @@ func TestSlotCountAgreedUnderRace(t *testing.T) {
 		}()
 	}
 	start.Done()
+	var firstErr error
 	for range runs {
-		if err := <-errs; err != nil {
-			t.Fatal(err)
+		if err := <-errs; err != nil && firstErr == nil {
+			firstErr = err
 		}
+	}
+	if firstErr != nil {
+		t.Fatal(firstErr)
 	}
 	count, tokens := 0, map[int]bool{}
 	for _, s := range sess {
@@ -270,7 +277,7 @@ func TestSlotCountAgreedUnderRace(t *testing.T) {
 		}
 		tokens[s.tokenIdx] = true
 	}
-	if len(tokens) != count {
+	if (count != 2 && count != 4) || len(tokens) != count {
 		t.Fatalf("%d runs got capacity on a VM agreed at %d slots", len(tokens), count)
 	}
 }
@@ -296,39 +303,51 @@ func TestExclusiveTakesAgreedTokens(t *testing.T) {
 	}
 }
 
-// An exact workspace (exec, pull, --same-slot) numbered above the count a
-// busy VM's runs agreed on, but within the run's own max_slots, waits for
-// the VM to go idle rather than failing; one above both fails at once.
-func TestOnlySlotAboveAgreedCountWaits(t *testing.T) {
+// The exact workspace an exec, pull or --same-slot names is reached
+// whatever counts the VM and the checkout use now: a max_slots=2 checkout
+// can be given workspace 3 while the VM agrees on 4 slots, and must get
+// back to it once the VM is idle (agreed on 2) or busy at 2. A slot above
+// both counts that never held a run is gone.
+func TestOnlySlotOutsideAgreedCount(t *testing.T) {
 	root := t.TempDir()
-	a := testSession(t, root)
-	if err := a.acquire(protocol.Acquire{RepoID: "other", MaxSlots: 2}); err != nil || a.slotLock == nil {
-		t.Fatalf("first run: %v", err)
+	var held []*Session
+	for range 2 {
+		s := testSession(t, root)
+		if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 4}); err != nil || s.slotLock == nil {
+			t.Fatalf("run at 4 slots: %v", err)
+		}
+		held = append(held, s)
 	}
+	c := testSession(t, root)
+	if err := c.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 2}); err != nil || c.slotDir != c.layout.Slot("r", 3) {
+		t.Fatalf("max_slots=2 run on a VM at 4: %v, slot %q", err, c.slotDir)
+	}
+	for _, s := range append(held, c) {
+		s.release()
+	}
+
+	exec := func(what string, own int) *Session {
+		t.Helper()
+		e := testSession(t, root)
+		err := e.acquire(protocol.Acquire{RepoID: "r", MaxSlots: own, PreferSlot: 3, OnlySlot: true, Wait: true, QueueMS: 5000})
+		if err != nil || e.slotDir != e.layout.Slot("r", 3) || e.maxSlots != 2 {
+			t.Fatalf("%s: %v, slot %q, %d slots", what, err, e.slotDir, e.maxSlots)
+		}
+		return e
+	}
+	exec("exec into slot 3 on the idle VM", 2).release()
+
+	o := testSession(t, root)
+	if err := o.acquire(protocol.Acquire{RepoID: "other", MaxSlots: 2}); err != nil || o.slotLock == nil {
+		t.Fatalf("run at 2 slots: %v", err)
+	}
+	exec("exec into slot 3 on a VM busy at 2", 4).release()
+
 	bad := testSession(t, root)
 	err := bad.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 4, PreferSlot: 5, OnlySlot: true, Wait: true, QueueMS: 60000})
 	var pe *protoError
 	if !errors.As(err, &pe) || pe.code != protocol.CodeBadRequest || !strings.Contains(pe.msg, "slot 5") {
 		t.Fatalf("want a bad-request error naming slot 5, got %v", err)
-	}
-	b := testSession(t, root)
-	errc := make(chan error, 1)
-	go func() {
-		errc <- b.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 4, PreferSlot: 3, OnlySlot: true, Wait: true, QueueMS: 10000})
-	}()
-	select {
-	case err := <-errc:
-		t.Fatalf("slot 3 on a VM busy at 2 slots: %v, slot %q", err, b.slotDir)
-	case <-time.After(500 * time.Millisecond):
-	}
-	a.release()
-	select {
-	case err := <-errc:
-		if err != nil || b.slotDir != b.layout.Slot("r", 3) || b.maxSlots != 4 {
-			t.Fatalf("slot 3 once the VM was idle: %v, slot %q, %d slots", err, b.slotDir, b.maxSlots)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("slot 3 wasn't granted once the VM was idle")
 	}
 }
 

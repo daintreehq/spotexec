@@ -383,9 +383,12 @@ func (s *Session) waitForSlot(a protocol.Acquire, w *slotWaiter, h protocol.Hold
 
 // reserveCapacity takes the gate and a token (every token for an
 // exclusive run) if they are free, under the slot count the VM's runs agree
-// on (see slots.go), which it returns as n. Nothing is taken (got false)
-// while the VM's runs agree on fewer slots than the exact workspace an
-// exec, pull or --same-slot names: that frees up once the VM is idle.
+// on (see slots.go), which it returns as n.
+//
+// The exact workspace an exec, pull or --same-slot names may lie above n:
+// a run took it while the VM agreed on more slots. Tokens bound capacity,
+// not workspace numbers, so it is still reached, under n. Only a slot above
+// both counts that holds no run's files (never used, or pruned) is gone.
 func (s *Session) reserveCapacity(a protocol.Acquire, own int, only bool) (n int, got bool, err error) {
 	mu, ok, err := lockSlots(s.layout)
 	if err != nil || !ok {
@@ -393,11 +396,8 @@ func (s *Session) reserveCapacity(a protocol.Acquire, own int, only bool) (n int
 	}
 	defer mu.Unlock()
 	n = agreedSlots(s.layout, own)
-	if only && a.PreferSlot > n {
-		if a.PreferSlot > own {
-			return 0, false, perr(protocol.CodeBadRequest, "workspace slot %d no longer exists: this runner now has %d slots (max_slots)", a.PreferSlot, n)
-		}
-		return n, false, nil
+	if only && a.PreferSlot > max(n, own) && loadSlotState(s.layout.Slot(a.RepoID, a.PreferSlot)).LastUsed == 0 {
+		return 0, false, perr(protocol.CodeBadRequest, "workspace slot %d no longer exists: this runner now has %d slots (max_slots)", a.PreferSlot, n)
 	}
 	how := syscall.LOCK_SH
 	if a.Exclusive {
