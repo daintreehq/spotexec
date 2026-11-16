@@ -13,12 +13,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,6 +50,12 @@ var createPathRe = regexp.MustCompile(`^(?:/v[0-9][0-9.]*)?/(containers|networks
 // afterwards (an image's VOLUME, such as postgres's data directory, makes
 // one on every run).
 var deletePathRe = regexp.MustCompile(`^(?:/v[0-9][0-9.]*)?/containers/[^/]+$`)
+
+// prunePathRe matches pruning the kinds of objects the proxy labels. Each
+// is scoped to the run's labels, so a run prunes only what it created
+// itself, never what a concurrent run in another slot has idle. Images and
+// build cache carry no labels of ours and are left as they are.
+var prunePathRe = regexp.MustCompile(`^(?:/v[0-9][0-9.]*)?/(containers|networks|volumes)/prune$`)
 
 // dockerSocketPath is the daemon socket the proxy forwards to.
 func dockerSocketPath() (string, error) {
@@ -83,6 +91,25 @@ func dockerProxyHandler(upstream, sock string, labels map[string]string) http.Ha
 	}
 	sockets := []string{"/var/run/docker.sock", "/run/docker.sock", path.Clean(upstream)}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Matched, and forwarded, as the canonical path: the daemon's
+		// router cleans a path like //containers/create before routing it,
+		// so the raw one would slip past the checks below.
+		if !strings.HasPrefix(r.URL.Path, "/") {
+			dockerError(w, http.StatusBadRequest, "invalid request path "+strconv.Quote(r.URL.Path))
+			return
+		}
+		r.URL.Path, r.URL.RawPath = path.Clean(r.URL.Path), ""
+		if r.Method == http.MethodPost && prunePathRe.MatchString(r.URL.Path) {
+			q, err := url.ParseQuery(r.URL.RawQuery)
+			if err == nil {
+				err = scopePrune(q, labels)
+			}
+			if err != nil {
+				dockerError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			r.URL.RawQuery = q.Encode()
+		}
 		if m := createPathRe.FindStringSubmatch(r.URL.Path); m != nil && r.Method == http.MethodPost {
 			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<20))
 			if err == nil {
@@ -107,6 +134,49 @@ func dockerProxyHandler(upstream, sock string, labels map[string]string) http.Ha
 		}
 		rp.ServeHTTP(w, r)
 	})
+}
+
+// scopePrune adds labels to a prune request's filters (q's filters
+// parameter), keeping the caller's own: the daemon prunes only what carries
+// every label filter, so the caller's filters narrow the run's, never widen
+// them. Both encodings the daemon reads ({"label":["k=v"]} and the legacy
+// {"label":{"k=v":true}}) are taken; the first is sent.
+func scopePrune(q url.Values, labels map[string]string) error {
+	if len(labels) == 0 {
+		return errors.New("prune: no labels to scope it to")
+	}
+	if len(q["filters"]) > 1 {
+		return errors.New("prune: more than one filters parameter")
+	}
+	filters := map[string][]string{}
+	if raw := q.Get("filters"); raw != "" {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+			return fmt.Errorf("invalid filters: %v", err)
+		}
+		for k, v := range obj {
+			var list []string
+			if err := json.Unmarshal(v, &list); err != nil {
+				// The legacy form: its keys are the values, whatever they map to.
+				var set map[string]bool
+				if err := json.Unmarshal(v, &set); err != nil {
+					return fmt.Errorf("invalid filters: %q is neither a list nor a set of strings", k)
+				}
+				list = slices.Collect(maps.Keys(set))
+			}
+			filters[k] = list
+		}
+	}
+	for k, v := range labels {
+		filters["label"] = append(filters["label"], k+"="+v)
+	}
+	for k, v := range filters {
+		slices.Sort(v)
+		filters[k] = slices.Compact(v)
+	}
+	b, _ := json.Marshal(filters)
+	q.Set("filters", string(b))
+	return nil
 }
 
 func dockerError(w http.ResponseWriter, code int, msg string) {
@@ -396,13 +466,15 @@ func (p *dockerProxy) stop() {
 
 // removeLabelled force-removes the containers (with their anonymous
 // volumes), then the networks, then the volumes labelled label (key=value),
-// and returns what is still there ("" if nothing).
+// and returns what is still there ("" if nothing). They are listed and
+// removed by ID (a volume's name is its ID), which xargs can't split or
+// misquote the way it could a network's name.
 func removeLabelled(ctx context.Context, d dockerRunner, label string) string {
 	f := "--filter " + shq("label="+label)
-	lists := []struct{ list, rm string }{
-		{"ps -a --format '{{.Names}}' " + f, "rm -fv"},
-		{"network ls --format '{{.Name}}' " + f, "network rm"},
-		{"volume ls --format '{{.Name}}' " + f, "volume rm -f"},
+	lists := []struct{ kind, list, rm string }{
+		{"container", "ps -aq --no-trunc " + f, "rm -fv"},
+		{"network", "network ls -q --no-trunc " + f, "network rm"},
+		{"volume", "volume ls -q " + f, "volume rm -f"},
 	}
 	var left []string
 	for attempt := 0; attempt < 3; attempt++ {
@@ -416,12 +488,14 @@ func removeLabelled(ctx context.Context, d dockerRunner, label string) string {
 				left = append(left, "(docker "+strings.Fields(l.list)[0]+" failed: "+firstLines(string(out), 2)+")")
 				continue
 			}
-			left = append(left, strings.Fields(string(out))...)
+			for _, id := range strings.Fields(string(out)) {
+				left = append(left, l.kind+" "+id)
+			}
 		}
 		if len(left) == 0 || ctx.Err() != nil {
 			break
 		}
 		time.Sleep(2 * time.Second)
 	}
-	return strings.Join(left, " ")
+	return strings.Join(left, ", ")
 }

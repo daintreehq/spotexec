@@ -34,3 +34,39 @@ func TestNetworkArgs(t *testing.T) {
 		}
 	}
 }
+
+// Only the flags container.options sets count, not the values they take.
+func TestForbiddenOption(t *testing.T) {
+	for _, c := range []struct {
+		options []string
+		want    string
+	}{
+		{nil, ""},
+		{[]string{"-e", "NODE_OPTIONS=-d"}, ""},
+		{[]string{"--label", "-u"}, ""},
+		{[]string{"-e", "--"}, ""},
+		{[]string{"--label", "--name"}, ""},
+		{[]string{"-e", "--user=0", "--shm-size", "1g"}, ""},
+		{[]string{"--init", "-it", "--cap-add", "SYS_PTRACE"}, ""},
+		{[]string{"--"}, "--"},
+		{[]string{"--init", "--", "x"}, "--"},
+		{[]string{"--name", "x"}, "--name"},
+		{[]string{"--name=x"}, "--name"},
+		{[]string{"--detach"}, "--detach"},
+		{[]string{"--entrypoint", "sh"}, "--entrypoint"},
+		{[]string{"-e", "A=1", "--user", "0"}, "--user"},
+		{[]string{"--rm"}, "--rm"},
+		{[]string{"--workdir=/x"}, "--workdir"},
+		{[]string{"-d"}, "-d"},
+		{[]string{"-itd"}, "-d"},
+		{[]string{"-iu", "0"}, "-u"},
+		{[]string{"-w/src"}, "-w"},
+		{[]string{"--label", "x", "-Pqu0"}, "-u"},
+		// A shorthand that takes a value ends the cluster: the rest is its value.
+		{[]string{"-ed"}, ""},
+	} {
+		if got := forbiddenOption(c.options); got != c.want {
+			t.Errorf("forbiddenOption(%q) = %q, want %q", c.options, got, c.want)
+		}
+	}
+}
