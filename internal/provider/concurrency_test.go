@@ -78,60 +78,85 @@ func TestSSHChosenConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// A pick that was dialing when Forget ran returns its host but doesn't cache
-// it: Forget means the old answer may be stale.
-func TestSSHPickOvertakenByForget(t *testing.T) {
-	s := &SSH{r: &config.Runner{Name: "r", Hosts: []string{"a", "b"}}}
-	entered, release := make(chan struct{}), make(chan struct{})
-	done := make(chan Target)
+// blockedPick starts a pick whose selector, once entered, waits for release
+// before choosing hosts[idx]. Cleanup releases it if the test ends early.
+func blockedPick(t *testing.T, s *SSH, idx int) (release func(), done <-chan Target) {
+	t.Helper()
+	entered, rel := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(rel) }) }
+	t.Cleanup(release)
+	out := make(chan Target, 1)
 	go func() {
 		tg, err := s.pickWith(context.Background(), func(context.Context) (int, error) {
 			close(entered)
-			<-release
-			return 1, nil
+			<-rel
+			return idx, nil
 		})
 		if err != nil {
 			t.Error(err)
 		}
-		done <- tg
+		out <- tg
 	}()
 	<-entered
-	s.Forget()
-	close(release)
-	if tg := <-done; tg.Host != "b" {
-		t.Fatalf("pick returned %q, want b", tg.Host)
-	}
+	return release, out
+}
+
+func cached(s *SSH) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.chosen != nil {
-		t.Fatalf("pick begun before Forget was cached: %+v", *s.chosen)
+	if s.chosen == nil {
+		return ""
+	}
+	return s.chosen.Host
+}
+
+func choose(idx int) func(context.Context) (int, error) {
+	return func(context.Context) (int, error) { return idx, nil }
+}
+
+// Forget drops the cached host, so the next pick selects afresh; a pick
+// that was dialing when Forget ran returns its host but doesn't cache it,
+// since Forget means the old answer may be stale. Twice, so every Forget
+// invalidates, not just the first.
+func TestSSHForget(t *testing.T) {
+	ctx := context.Background()
+	s := &SSH{r: &config.Runner{Name: "r", Hosts: []string{"a", "b"}}}
+	if tg, err := s.pickWith(ctx, choose(0)); err != nil || tg.Host != "a" || cached(s) != "a" {
+		t.Fatalf("first pick = %+v, %v; cached %q", tg, err, cached(s))
+	}
+	s.Forget()
+	if tg, err := s.pickWith(ctx, choose(1)); err != nil || tg.Host != "b" || cached(s) != "b" {
+		t.Fatalf("pick after Forget = %+v, %v; cached %q, want b", tg, err, cached(s))
+	}
+	for round := range 2 {
+		s.Forget()
+		release, done := blockedPick(t, s, 0)
+		s.Forget()
+		release()
+		if tg := <-done; tg.Host != "a" {
+			t.Fatalf("round %d: overtaken pick returned %q, want a", round, tg.Host)
+		}
+		if h := cached(s); h != "" {
+			t.Fatalf("round %d: pick begun before Forget was cached: %q", round, h)
+		}
 	}
 }
 
 // Two overlapping picks settle on one host: the later finisher returns the
 // winner's choice rather than replacing it.
 func TestSSHPickKeepsFirstSettled(t *testing.T) {
+	ctx := context.Background()
 	s := &SSH{r: &config.Runner{Name: "r", Hosts: []string{"a", "b"}}}
-	entered, release := make(chan struct{}), make(chan struct{})
-	done := make(chan Target)
-	go func() {
-		tg, _ := s.pickWith(context.Background(), func(context.Context) (int, error) {
-			close(entered)
-			<-release
-			return 1, nil
-		})
-		done <- tg
-	}()
-	<-entered
-	first, err := s.pickWith(context.Background(), func(context.Context) (int, error) { return 0, nil })
-	if err != nil || first.Host != "a" {
+	release, done := blockedPick(t, s, 1)
+	if first, err := s.pickWith(ctx, choose(0)); err != nil || first.Host != "a" {
 		t.Fatalf("first pick = %+v, %v", first, err)
 	}
-	close(release)
+	release()
 	if tg := <-done; tg.Host != "a" {
 		t.Fatalf("overlapping pick returned %q, want the settled a", tg.Host)
 	}
-	if tg, _ := s.pick(context.Background()); tg.Host != "a" {
-		t.Fatalf("cached host = %q, want a", tg.Host)
+	if h := cached(s); h != "a" {
+		t.Fatalf("cached host = %q, want a", h)
 	}
 }
