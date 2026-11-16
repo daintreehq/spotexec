@@ -376,23 +376,19 @@ func localCommand(seg string) bool {
 	if tool == "spotexec" || tool == "sx" {
 		return true
 	}
-	// The command words: the tool and the plain words after it, up to the
-	// first option or path. vitest's watch and dev subcommands may follow
-	// its options (`vitest --no-color watch`), so all its plain words count.
+	// The script or tool's name and its subcommand, the plain word after it
+	// (`test:watch`, `ng serve`, `dev:server`): anything after an option or
+	// path is an argument. vitest's subcommand may follow its options
+	// (`vitest --no-color watch`), so for vitest it is the first plain word.
 	words := []string{tool}
 	for _, w := range toks[1:] {
-		if !commandWord.MatchString(w) {
-			if tool == "vitest" {
-				continue
-			}
+		if commandWord.MatchString(w) {
+			words = append(words, w)
 			break
 		}
-		words = append(words, w)
-	}
-	if tool != "vitest" {
-		// The script or tool's name and its subcommand: `test:watch`,
-		// `ng serve`, `dev:server`.
-		words = words[:min(2, len(words))]
+		if tool != "vitest" {
+			break
+		}
 	}
 	for _, w := range words {
 		parts := strings.Split(w, ":")
@@ -1030,11 +1026,14 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 		for _, h := range hs {
 			hm, _ := h.(map[string]any)
 			c, _ := hm["command"].(string)
-			if isRTKHook(c) && matchesBash(m) && hadChain {
+			// Only under a matcher that surely covers Bash: a chain spotexec
+			// can't count on would leave its own Bash entry running beside
+			// it. An RTK hook left alone still counts as racing.
+			if isRTKHook(c) && coversBash(m) && hadChain {
 				hm["command"], changed = "", true // dropped below
 				continue
 			}
-			if isRTKHook(c) && matchesBash(m) {
+			if isRTKHook(c) && coversBash(m) {
 				hm["command"] = chainCmd(hookCmd, c)
 				c, changed = hm["command"].(string), true
 			}
