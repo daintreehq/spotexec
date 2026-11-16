@@ -348,9 +348,9 @@ func envAssignment(s string) (name, value string, ok bool) {
 func rewriteRoot(s, root string) string {
 	var b strings.Builder
 	// The quoting context: 0 at the top, '"' in double quotes, '(' in
-	// $(...) or a subshell, where quoting starts afresh. Single quotes nest
-	// in neither.
-	ctx := []byte{0}
+	// $(...) or a subshell and '`' in `...`, where quoting starts afresh.
+	// Single quotes nest in neither. saved holds each $(...)'s outer braces.
+	ctx, saved := []byte{0}, []int{}
 	inSingle, heredoc, braces := false, false, 0 // braces: open ${...}
 	atBoundary := true                           // where a path may start: not mid-word, as after My\ x
 	for i := 0; i < len(s); {
@@ -390,8 +390,12 @@ func rewriteRoot(s, root string) string {
 			ctx = ctx[:len(ctx)-1]
 		case c == '"':
 			ctx = append(ctx, '"')
+		case c == '`' && ctx[len(ctx)-1] == '`':
+			ctx = ctx[:len(ctx)-1]
+		case c == '`':
+			ctx = append(ctx, '`')
 		case c == '$' && i+1 < len(s) && s[i+1] == '(':
-			ctx = append(ctx, '(')
+			ctx, saved, braces = append(ctx, '$'), append(saved, braces), 0
 			b.WriteString("$(")
 			i += 2
 			atBoundary = true
@@ -406,7 +410,9 @@ func rewriteRoot(s, root string) string {
 		case braces > 0: // ${x//(/} is a pattern, not a subshell
 		case c == '(':
 			ctx = append(ctx, '(')
-		case c == ')' && len(ctx) > 1:
+		case c == ')' && ctx[len(ctx)-1] == '$':
+			ctx, braces, saved = ctx[:len(ctx)-1], saved[len(saved)-1], saved[:len(saved)-1]
+		case c == ')' && ctx[len(ctx)-1] == '(':
 			ctx = ctx[:len(ctx)-1]
 		case c == '<' && strings.HasPrefix(s[i:], "<<") && !strings.HasPrefix(s[i:], "<<<") && (i == 0 || s[i-1] != '<'):
 			heredoc = true
