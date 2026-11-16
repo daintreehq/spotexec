@@ -142,6 +142,39 @@ would have chosen (`placement_shadow` events); `policy = "legacy"` is the
 pre-0.10 placement: the oldest VM with a free slot, or the worktree's VM
 while its last run is under 10 minutes old.
 
+## Early drain
+
+By default a standby VM ends at its watchdog's `idle_timeout`, like any idle
+VM. With `scheduling.early_drain = true` and the [pool manager](scaling.md#pool-manager-optional)
+running, a standby VM can end sooner: once it has been idle for
+`scheduling.result_retention` (default `idle_timeout`, so set it lower, such
+as `"2m"`, for this to change anything). Until then `exec`, `pull` and
+`--same-slot` can still reach its workspaces.
+
+Each pass, for a standby VM that has been standby for 30 seconds, isn't
+warm, holds nothing of this machine's (no job, reservation, uncertain
+attempt or exclusive fence), with no job queued and the retained VMs
+covering recent demand without it, the manager:
+
+1. records the drain in the ledger (`drain_requested`). From then on the VM
+   is never placed on again, even if the request below times out, so a
+   delayed request can't drain a VM that just took new work;
+2. asks the VM (`spotexec-helper try-drain`, over the helper this machine
+   already installed: installing one would touch its idle clock). The
+   helper takes its lifecycle lock exclusively without waiting, and only
+   with no session holding it, no run waiting for a workspace slot, and its
+   activity at least `result_retention` old (by the VM's own clock) writes
+   its drain marker. Every acquire takes that lock shared and checks the
+   marker once it holds it, so nothing can start after;
+3. records the answer: drained (the watchdog powers the VM off at its next
+   pass, within a minute), or busy / still keeping results, asked again
+   30 seconds later with the same operation ID (a retry whose earlier
+   answer was lost reads as drained).
+
+`sx` processes don't drain VMs early; without the pool manager, standby VMs
+end at `idle_timeout`. A Spot interruption or `max_lifetime` still ends a VM
+whatever its role.
+
 ## Scale in
 
 Each VM's watchdog (a systemd timer installed by cloud-init) powers it off

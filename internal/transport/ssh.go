@@ -549,6 +549,26 @@ func (c *Client) HelperCmd(ctx context.Context, args ...string) ([]byte, error) 
 	return out, err
 }
 
+// ErrHelperNotInstalled: HelperCmdInstalled found no helper this machine
+// installed on the target.
+var ErrHelperNotInstalled = errors.New("helper not installed on this runner")
+
+// HelperCmdInstalled runs a helper subcommand like HelperCmd, but only if
+// this machine already installed this exact helper on the target: it never
+// uploads or reinstalls one, which would touch an ephemeral VM's idle clock.
+func (c *Client) HelperCmdInstalled(ctx context.Context, args ...string) ([]byte, error) {
+	hash, ok := c.installedHash()
+	if !ok {
+		return nil, ErrHelperNotInstalled
+	}
+	q := []string{c.helperPath(hash)}
+	for _, a := range args {
+		q = append(q, ShellQuote(a))
+	}
+	q = append(q, "--work-root", ShellQuote(c.WorkRoot))
+	return c.Run(ctx, strings.Join(q, " "), nil)
+}
+
 func isConn(err error) bool {
 	var ce *ConnError
 	return errors.As(err, &ce)

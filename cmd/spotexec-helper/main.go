@@ -27,6 +27,9 @@ func main() {
 	src := fs.String("src", "", "cache-put: directory to archive")
 	lockPath := fs.String("lock", "", "cache-put: dependency key lock to hold shared")
 	lifecycleFD := fs.Int("lifecycle-fd", 0, "cache-put: inherited descriptor holding the lifecycle lock shared")
+	op := fs.String("op", "", "try-drain: the drain operation's ID")
+	minIdle := fs.Duration("min-idle", 0, "try-drain: least idle time (results kept this long)")
+	reason := fs.String("reason", "surplus capacity", "try-drain: why")
 	_ = fs.Parse(os.Args[2:])
 	root, err := helper.ExpandRoot(*workRoot)
 	if err != nil {
@@ -59,6 +62,10 @@ func main() {
 		fail(helper.Prune(os.Stdout, root, *olderThan, *dryRun))
 	case "drain":
 		fail(helper.Drain(os.Stdout, root, "retired by the spotexec pool manager"))
+	case "try-drain":
+		// `spotexec daemon`'s early drain: drains only an idle VM, decided
+		// under the lifecycle lock.
+		fail(helper.TryDrainIfIdle(os.Stdout, root, *op, "early drain: "+*reason, *minIdle))
 	case "keepalive":
 		// Used by `spotexec daemon` to hold warm-pool instances past their
 		// idle timeout: refreshes the activity the idle watchdog checks.

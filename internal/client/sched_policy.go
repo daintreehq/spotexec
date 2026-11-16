@@ -512,3 +512,91 @@ func (p *Pool) Roles() map[string]Role {
 	})
 	return out
 }
+
+// standbySettle: how long a VM stays standby before an early drain may
+// end it (a burst that comes straight back promotes it instead).
+const standbySettle = 30 * time.Second
+
+// BeginDrain commits an early drain of a standby VM locally, before the VM
+// is asked (scheduling.early_drain): it re-checks, under the lock, that
+// the VM is standby, settled, not warm, holds nothing for this machine
+// (no attempt, uncertain or not, and no fence), that no job is queued, and
+// that the retained VMs cover recent demand without it. From then on the
+// VM is drain_requested and never placed on again, even if the request to
+// it times out. A VM already drain_requested returns its operation, to be
+// retried. ok is false when it may not be drained now.
+func (p *Pool) BeginDrain(ctx context.Context, id string) (op string, ok bool, err error) {
+	if !p.R.Scheduling.EarlyDrain || p.R.SchedPolicy() != config.PolicyConsolidate || !p.R.Ephemeral() {
+		return "", false, nil
+	}
+	err = p.withCtx(ctx, func(st *poolState) error {
+		now := time.Now()
+		s := st.sched()
+		s.reconcileOwners(now)
+		v := s.VMs[id]
+		if v == nil {
+			return nil
+		}
+		if v.Role == roleDrainRequested {
+			op, ok = v.DrainOp, now.Sub(v.DrainAt) >= drainRetry
+			return nil
+		}
+		if v.Role != roleStandby || now.Sub(v.Since) < standbySettle || s.protected(id) || p.waiterDemand() > 0 {
+			return nil
+		}
+		for _, w := range s.Warm {
+			if w == id {
+				return nil
+			}
+		}
+		capacity := 0
+		for _, w := range p.views(st, now) {
+			if w.eligible && w.v.Role == roleRetained {
+				capacity += w.units
+			}
+		}
+		if capacity < max(s.demandNow(p.R), s.demandP90(now))+p.R.Scheduling.SpareSlots {
+			return nil // it may be needed back
+		}
+		op, ok = newAttemptID(), true
+		v.Role, v.Since, v.Reason, v.DrainOp, v.DrainAt = roleDrainRequested, now, "early drain requested", op, now
+		s.Generation++
+		return nil
+	})
+	return op, ok, err
+}
+
+// drainRetry: how often a drain the VM refused (busy, or results still
+// kept) is asked again.
+const drainRetry = 30 * time.Second
+
+// FinishDrain records the VM's answer to an early drain (a helper
+// TryDrain result): drained ends the VM's placement for good (it powers
+// off at its watchdog's next pass); busy or protected is asked again
+// later; the VM stays drain_requested whatever the answer.
+func (p *Pool) FinishDrain(id, op, result, detail string) {
+	_ = p.with(func(st *poolState) error {
+		s := st.sched()
+		v := s.VMs[id]
+		if v == nil || v.DrainOp != op {
+			return nil
+		}
+		now := time.Now()
+		v.DrainAt = now
+		switch result {
+		case "drained", "already_draining":
+			v.Role, v.Since, v.Reason = roleDraining, now, "early drain: idle, its results kept long enough"
+			st.note(id).Draining = true
+			s.Generation++
+		case "unsupported":
+			v.Reason = "early drain unsupported; idles out"
+			v.DrainAt = now.Add(time.Hour) // don't keep asking
+		default:
+			v.Reason = "early drain requested: " + result
+			if detail != "" {
+				v.Reason += " (" + detail + ")"
+			}
+		}
+		return nil
+	})
+}

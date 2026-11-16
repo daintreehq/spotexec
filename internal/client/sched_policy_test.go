@@ -277,3 +277,90 @@ func TestFenceOfDeadProcessDropped(t *testing.T) {
 		t.Fatalf("candidates %+v: a dead process's fence still holds the VM", cands)
 	}
 }
+
+// An early drain is committed locally before the VM is asked, only for a
+// settled, empty standby VM the retained ones can do without, and the VM
+// is never placed on again, whatever the VM answers.
+func TestEarlyDrain(t *testing.T) {
+	p, f := schedPool(t, 3, 2)
+	p.R.Scheduling.EarlyDrain = true
+	now := time.Now()
+	setup := func(fn func(s *schedState)) {
+		p.loaded(t, func(st *poolState) {
+			s := st.sched()
+			p.views(st, now)
+			s.EpochAt = now.Add(time.Hour)
+			fn(s)
+		})
+	}
+	setup(func(s *schedState) {
+		s.VMs["i-0"].Role, s.VMs["i-0"].Since = roleStandby, now.Add(-time.Minute)
+		s.VMs["i-1"].Role, s.VMs["i-1"].Since = roleStandby, now // just retired
+	})
+	ctx := context.Background()
+	if _, ok, _ := p.BeginDrain(ctx, "i-1"); ok {
+		t.Fatal("drained a VM retired a moment ago")
+	}
+	if _, ok, _ := p.BeginDrain(ctx, "i-2"); ok {
+		t.Fatal("drained a retained VM")
+	}
+	p.R.Scheduling.EarlyDrain = false
+	if _, ok, _ := p.BeginDrain(ctx, "i-0"); ok {
+		t.Fatal("drained with early_drain off")
+	}
+	p.R.Scheduling.EarlyDrain = true
+
+	// Something of this machine's on it: not drained.
+	id, err := p.reserveOn(f.insts[0], claim{Exact: true, Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := p.BeginDrain(ctx, "i-0"); ok {
+		t.Fatal("drained a VM an exec is reaching")
+	}
+	p.releaseAttempt(id)
+
+	// Demand the retained VM alone can't cover: not drained.
+	setup(func(s *schedState) { s.Demand = []demandPoint{{now.Add(-time.Minute), 3}} })
+	if _, ok, _ := p.BeginDrain(ctx, "i-0"); ok {
+		t.Fatal("drained a VM recent demand still needs")
+	}
+	setup(func(s *schedState) { s.Demand = nil })
+
+	op, ok, err := p.BeginDrain(ctx, "i-0")
+	if err != nil || !ok || op == "" {
+		t.Fatalf("BeginDrain: %q %v %v", op, ok, err)
+	}
+	if v := p.state(t).VMs["i-0"]; v.Role != roleDrainRequested || v.DrainOp != op {
+		t.Fatalf("after BeginDrain: %+v", v)
+	}
+	// Committed: never placed on again, even with the retained VMs full.
+	setup(func(s *schedState) { hold(s, "i-2", "a", now); hold(s, "i-2", "b", now) })
+	cands, _, _, _ := p.Rank(ctx, nil, claim{})
+	for _, c := range cands {
+		if c.ID == "i-0" {
+			t.Fatalf("a drain-requested VM is a candidate: %+v", cands)
+		}
+	}
+	if _, err := p.reserveOn(f.insts[0], claim{Promote: true}); err != errNoRoom {
+		t.Fatalf("reserving a drain-requested VM: %v", err)
+	}
+	// The VM was busy: asked again only after drainRetry, same operation.
+	p.FinishDrain("i-0", op, "busy", "1 session(s)")
+	if again, ok, _ := p.BeginDrain(ctx, "i-0"); ok || again != op {
+		t.Fatalf("retry too soon: %q %v", again, ok)
+	}
+	if v := p.state(t).VMs["i-0"]; v.Role != roleDrainRequested {
+		t.Fatalf("a busy answer reopened the VM: %+v", v)
+	}
+	p.FinishDrain("i-0", "another-op", "drained", "")
+	if v := p.state(t).VMs["i-0"]; v.Role != roleDrainRequested {
+		t.Fatal("another operation's answer was applied")
+	}
+	p.FinishDrain("i-0", op, "drained", "")
+	var draining bool
+	p.loaded(t, func(st *poolState) { draining = st.Notes["i-0"].closed() })
+	if v := p.state(t).VMs["i-0"]; v.Role != roleDraining || !draining {
+		t.Fatalf("after drained: %+v, note closed %v", v, draining)
+	}
+}
