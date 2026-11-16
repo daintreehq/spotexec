@@ -2070,8 +2070,22 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 	o.Rep.Status("%s · preparing container image", label)
 	t := time.Now()
 	errW := &ui.ClearingWriter{W: o.Stderr, R: o.Rep}
-	r, shared, push, err := fetchImage(ctx, sessionRPC{s}, o, label, errW, req, c.Timeout.Duration+shareSlack)
+	log := newDepsLog(imageLogDir(), label)
+	r, shared, push, err := fetchImage(ctx, sessionRPC{s}, o, label, errW, log, newImageMemo(ws.RepoID), req, c.Timeout.Duration+shareSlack)
+	log.Close()
 	if err != nil {
+		var be *ImageBuildError
+		if errors.As(err, &be) {
+			ev := map[string]any{"code": protocol.CodeImageFailed, "message": be.Message, "tag": be.Tag, "cached": be.Cached,
+				"built_by": be.Who, "failed_at": be.At.UTC().Format(time.RFC3339), "retry_after": be.Until.UTC().Format(time.RFC3339)}
+			if be.Tail != "" {
+				ev["output_tail"], ev["output_truncated"] = be.Tail, be.Truncated
+			}
+			if be.Log != "" {
+				ev["log"] = be.Log
+			}
+			o.Rep.Event("image_failed", ev)
+		}
 		return "", "", err
 	}
 	ev := map[string]any{"image": r.Image, "image_id": r.ImageID, "pulled": r.Pulled, "built": r.Built, "pushing": r.Pushing, "pushed": r.Pushed,
@@ -2088,8 +2102,14 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 
 // fetchImage sends the image request. With a registry, which may lack this
 // image, of the runs on this machine needing it now one builds and pushes
-// it, and the rest wait for it and pull it (#139), as fetchDeps does.
-func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Writer, req protocol.Image, limit time.Duration) (r protocol.ImageResult, shared shareOutcome, push *protocol.ShareDone, err error) {
+// it, and the rest wait for it and pull it (#139), as fetchDeps does. A
+// build that fails is remembered in memo, and a run needing an image whose
+// build failed fails at once instead of building it again (#194), unless
+// the image can be had without building or o.WaitPush forces the build.
+// log keeps the build's output.
+func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Writer, log *depsLog, memo imageMemo, req protocol.Image, limit time.Duration) (r protocol.ImageResult, shared shareOutcome, push *protocol.ShareDone, err error) {
+	building := false // the helper said it is building: its output goes to log too
+	pushing := false  // the helper is pushing the image: it has it
 	ask := func(req protocol.Image) (protocol.ImageResult, error) {
 		if err := c.send(protocol.TypeImage, req); err != nil {
 			return protocol.ImageResult{}, err
@@ -2102,6 +2122,9 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			switch f.Kind {
 			case protocol.KindStdout, protocol.KindStderr:
 				errW.Write(f.Data) // pull/build output goes to stderr
+				if building && log != nil {
+					log.Write(f.Data)
+				}
 				continue
 			}
 			env, err := protocol.Decode(f)
@@ -2113,6 +2136,8 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			case protocol.TypeEvent:
 				var ev protocol.Event
 				_ = env.Unmarshal(&ev)
+				building = building || ev.Name == "image_build"
+				pushing = pushing || ev.Name == "image_push"
 				o.Rep.Status("%s · %s %s", label, strings.ReplaceAll(ev.Name, "_", " "), ev.Message)
 				c.event(ev)
 			case protocol.TypeError:
@@ -2128,14 +2153,60 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			}
 		}
 	}
+	// recall is the failure of an earlier build of this image, if one is
+	// remembered and not to be built again regardless.
+	recall := func() error {
+		if o.WaitPush {
+			return nil
+		}
+		if f := memo.recall(req.Tag); f != nil {
+			return f.cachedError(memo.clock())
+		}
+		return nil
+	}
+	// built settles a build before the runs waiting on it are let go: an
+	// image had forgets an earlier failure (even when pushing it then
+	// failed), and a failure of the build itself is remembered, with its
+	// output.
+	built := func(err error) error {
+		if pushing || err == nil && r.Image != "" {
+			memo.forget(req.Tag)
+		}
+		var re *transport.RemoteError
+		if err == nil || !memo.on(req.Tag) || ctx.Err() != nil || !errors.As(err, &re) || !re.BuildFailed {
+			return err
+		}
+		f := imageFailure{Tag: req.Tag, Message: re.Message, Who: shareWho(o, label), At: memo.clock()}
+		if log != nil {
+			log.Close()
+			f.Tail, f.Truncated = log.Tail(depsTailLines)
+			f.Log = log.Path()
+		}
+		memo.remember(f)
+		f.Repo = memo.repo
+		return &ImageBuildError{Err: err, Until: f.At.Add(imageFailAge), imageFailure: f}
+	}
+	defer func() {
+		if pushing || err == nil && r.Image != "" {
+			memo.forget(req.Tag)
+		}
+	}()
+	probe := req
+	probe.Probe = true
 	if req.Registry == nil || req.Tag == "" {
+		if failed := recall(); failed != nil {
+			// The runner may have the image already: only building it is
+			// ruled out.
+			if r, err = ask(probe); err == nil && r.Missing {
+				return protocol.ImageResult{InstalledDocker: r.InstalledDocker}, shared, nil, failed
+			}
+			return r, shared, nil, err
+		}
 		r, err = ask(req)
-		return r, shared, nil, err
+		return r, shared, nil, built(err)
 	}
 	holder := ""
 	installed := false // a probe installed Docker
-	probe := req
-	probe.Probe = true
 	sh := sharer{
 		lock:  shareLockFor("image", req.Registry.Repo+":"+req.Tag),
 		who:   shareWho(o, label),
@@ -2143,6 +2214,9 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 		probe: func(context.Context) (bool, error) {
 			got, err := ask(probe)
 			installed = got.InstalledDocker
+			if err == nil && got.Missing {
+				err = recall()
+			}
 			if err != nil || got.Missing {
 				return false, err
 			}
@@ -2150,8 +2224,13 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			return true, nil
 		},
 		build: func(context.Context) error {
+			// A run that waited on another's build that failed (or gave up
+			// waiting) doesn't build it again.
+			if failed := recall(); failed != nil {
+				return failed
+			}
 			r, err = ask(req)
-			return err
+			return built(err)
 		},
 		publish: func(ctx context.Context) error {
 			if !r.Built || !r.Pushing {

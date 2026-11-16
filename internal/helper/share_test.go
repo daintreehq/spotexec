@@ -392,6 +392,93 @@ func TestImageProbe(t *testing.T) {
 	}
 }
 
+// #194: only the image build itself failing is marked as a failure to
+// remember: not docker missing under the shell, the login profile giving
+// up, a build killed under its shell, the daemon going away during the
+// build, or a setup failure. The mark reaches the client.
+func TestImageBuildFailureIsMarked(t *testing.T) {
+	const tag = "0123456789abcdef"
+	for _, tc := range []struct {
+		name       string
+		exit       int
+		daemonGone bool // the build takes the daemon down with it
+		synced     bool
+		marked     bool
+	}{
+		{"the build fails", 1, false, true, true},
+		{"the profile gives up", 125, false, true, false},
+		{"docker isn't there", 127, false, true, false},
+		{"the build is killed", 137, false, true, false},
+		{"the daemon goes away", 1, true, true, false},
+		{"the Dockerfile wasn't synced", 1, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			gone := ""
+			if tc.daemonGone {
+				gone = "touch \"$d/gone\"; "
+			}
+			script := fmt.Sprintf("#!/bin/sh\nd=%s\ncase \"$1\" in\ninfo) [ -e \"$d/gone\" ] && exit 1; exit 0 ;;\nimage) exit 1 ;;\nbuild) touch \"$d/built\"; %secho 'RUN false: exit 1' >&2; exit %d ;;\nesac\nexit 0\n", shq(dir), gone, tc.exit)
+			if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// The build runs under a login profile, which may set its own
+			// PATH (macOS's /etc/paths.d puts any installed docker first):
+			// the profile in HOME puts the stub back in front.
+			home := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, ".profile"), []byte("PATH="+shq(dir)+":$PATH\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", home)
+			t.Setenv("PATH", dir+":/usr/bin:/bin")
+			s := testSession(t, t.TempDir())
+			if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(s.workspace, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			s.stored = map[string]storedEntry{}
+			if tc.synced {
+				s.stored["Dockerfile"] = storedEntry{}
+			}
+			s.c = protocol.NewConn(strings.NewReader(""), &syncBuf{})
+			err := s.image(protocol.Image{Dockerfile: "Dockerfile", Tag: tag})
+			var pe *protoError
+			if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed {
+				t.Fatalf("got %v", err)
+			}
+			if _, serr := os.Stat(filepath.Join(dir, "built")); (serr == nil) != tc.synced {
+				t.Fatalf("stub build ran: %v, want %v", serr == nil, tc.synced)
+			}
+			if pe.buildFailed != tc.marked || pe.wire().BuildFailed != tc.marked {
+				t.Fatalf("%v: marked %v (sent %v), want %v", err, pe.buildFailed, pe.wire().BuildFailed, tc.marked)
+			}
+		})
+	}
+}
+
+// Only docker itself running to a failing exit is a failed build.
+func TestStreamExitBuilt(t *testing.T) {
+	for _, tc := range []struct {
+		e    streamExit
+		want bool
+	}{
+		{streamExit{code: 1, ran: true}, true},
+		{streamExit{code: 2, ran: true}, true},
+		{streamExit{code: 1, ran: false}, false}, // canceled
+		{streamExit{code: 125, ran: true}, false},
+		{streamExit{code: 126, ran: true}, false},
+		{streamExit{code: 127, ran: true}, false},
+		{streamExit{code: 124, ran: false}, false}, // timed out
+		{streamExit{code: 143, ran: false}, false}, // killed
+	} {
+		if got := tc.e.built(); got != tc.want {
+			t.Errorf("%+v: built %v, want %v", tc.e, got, tc.want)
+		}
+	}
+}
+
 // A slot whose venvs an older helper relocated (text files only) has its
 // symlinks into the cache's origin workspace relocated on its next run.
 func TestDepsRelocatesVenvLinksOfOlderSlots(t *testing.T) {

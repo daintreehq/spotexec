@@ -178,6 +178,29 @@ func imageName(repoID string) string {
 	return strings.Trim(b.String(), "-")
 }
 
+// streamExit is a streamed docker command exiting non-zero.
+type streamExit struct {
+	code int
+	ran  bool // it ran to its own exit: not timed out, canceled or killed
+}
+
+func (e *streamExit) Error() string { return fmt.Sprintf("exit %d", e.code) }
+
+// built reports whether docker itself ran and failed, rather than what is
+// in front of it or under it: the login profile giving up (125), the shell
+// or sg (126: not executable, 127: not found), or a process killed by a
+// signal and reported by its shell (128+n).
+func (e *streamExit) built() bool { return e.ran && e.code < 125 }
+
+// daemonUp reports whether the Docker daemon answers: a build that failed
+// because it went away (restarted, crashed) is not the build failing.
+func daemonUp(d dockerRunner) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := runShell(ctx, d.cmd("info")+" >/dev/null 2>&1")
+	return err == nil
+}
+
 func (s *Session) image(m protocol.Image) error {
 	if s.slotLock == nil {
 		return perr(protocol.CodeBadRequest, "acquire required before image")
@@ -208,7 +231,7 @@ func (s *Session) image(m protocol.Image) error {
 			return pr.startErr
 		}
 		if pr.code != 0 {
-			return fmt.Errorf("exit %d", pr.code)
+			return &streamExit{code: pr.code, ran: !pr.timedOut && !pr.canceled && !pr.spotIntr && pr.signal == ""}
 		}
 		return nil
 	}
@@ -312,7 +335,10 @@ func (s *Session) image(m protocol.Image) error {
 		defer cleanup()
 		_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_build", Message: m.Dockerfile})
 		if err := stream(d.cmd("build -f " + shq(dockerfile) + " -t " + shq(local) + " " + shq(buildCtx))); err != nil {
-			return perr(protocol.CodeImageFailed, "docker build %s: %v", m.Dockerfile, err)
+			e := &protoError{code: protocol.CodeImageFailed, msg: fmt.Sprintf("docker build %s: %v", m.Dockerfile, err)}
+			var se *streamExit
+			e.buildFailed = errors.As(err, &se) && se.built() && daemonUp(d)
+			return e
 		}
 		res.Built = true
 		if m.Registry != nil && cfgDir != "" {
