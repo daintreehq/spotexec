@@ -25,6 +25,30 @@ func TestReservedPath(t *testing.T) {
 	}
 }
 
+func TestSpotexecConfigPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		".spotexec.toml":         true,
+		".SpotExec.TOML":         true,
+		"sub/dir/.spotexec.toml": true,
+		".spotexecignore":        true,
+		"sub/.SPOTEXECIGNORE":    true,
+		".spotexec":              true,
+		".spotexec/Dockerfile":   true,
+		".SpotExec/setup.sh":     true,
+		"sub/.spotexec/x/y":      true,
+		".spotexec.toml.bak":     false,
+		"spotexec.toml":          false,
+		"spotexec/Dockerfile":    false,
+		"docker/Dockerfile":      false,
+		"a/.spotexec.toml/b":     false,
+		"x.spotexec/y":           false,
+	} {
+		if got := spotexecConfigPath(p); got != want {
+			t.Errorf("spotexecConfigPath(%q) = %v, want %v", p, got, want)
+		}
+	}
+}
+
 func TestPullMatches(t *testing.T) {
 	pats := []string{"coverage", "./dist/", "reports/*.xml"}
 	for p, want := range map[string]bool{

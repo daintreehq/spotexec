@@ -13,8 +13,8 @@ import (
 //
 // .spotexec holds spotexec's own state (the write-back lock, stashed
 // conflicts, backups of what write-back deleted) only outside git (in a git worktree it lives under the git
-// dir). The rest of .spotexec/, such as a container's Dockerfile, is an
-// ordinary directory.
+// dir). The rest of .spotexec/, such as a container's Dockerfile, syncs like
+// any project file, but a runner's edits to it are held (spotexecConfigPath).
 func reservedPath(p string, git bool) bool {
 	segs := strings.Split(p, "/")
 	for _, seg := range segs {
@@ -26,6 +26,24 @@ func reservedPath(p string, git bool) bool {
 		return false
 	}
 	return len(segs) == 1 || strings.EqualFold(segs[1], "conflicts") || strings.EqualFold(segs[1], "backup") || strings.EqualFold(segs[1], "writeback.lock")
+}
+
+// spotexecConfigPath reports whether p is spotexec's own configuration, at
+// any depth: a .spotexec.toml (a nested one is the project config for runs
+// below it), a .spotexecignore, or anything in a .spotexec directory (a
+// container's Dockerfile, [setup] scripts). A runner may not write these
+// into the worktree: the next run would load what it wrote, and a single
+// env_allow line forwards local secrets to whoever controls the runner.
+// Case is folded, as macOS and Windows filesystems fold it.
+func spotexecConfigPath(p string) bool {
+	segs := strings.Split(p, "/")
+	for _, seg := range segs {
+		if strings.EqualFold(seg, ".spotexec") {
+			return true
+		}
+	}
+	base := segs[len(segs)-1]
+	return strings.EqualFold(base, ".spotexec.toml") || strings.EqualFold(base, ".spotexecignore")
 }
 
 // pullMatches reports whether p (workspace-relative) was asked for by one of

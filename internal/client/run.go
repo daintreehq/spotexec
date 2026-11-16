@@ -954,6 +954,10 @@ func reportConflicts(rep ui.Reporter, stashed []Conflict, runID string) {
 			ev["reason"] = c.Reason
 		}
 		switch {
+		case c.Reason == ReasonSpotexecConfig && c.Deleted:
+			rep.Warn("WRITEBACK_CONFIG", "the remote command deleted %s, spotexec's own config; kept it here, since a runner may not change spotexec's configuration (delete it yourself if that was intended)", printable(c.Path))
+		case c.Reason == ReasonSpotexecConfig:
+			rep.Warn("WRITEBACK_CONFIG", "the remote command wrote %s, spotexec's own config; not applied, since a runner may not change spotexec's configuration (the next run would load it). Review its version, and copy it over yourself if you want it: %s", printable(c.Path), diff)
 		case c.With != "":
 			// Two remote names, one local file: say which landed, and spell
 			// out names that only differ in Unicode normalisation.
