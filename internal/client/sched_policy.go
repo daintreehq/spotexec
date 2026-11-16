@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -50,6 +51,9 @@ func (p *Pool) views(st *poolState, now time.Time) []vmView {
 		n := st.Notes[in.ID]
 		if n != nil && n.Draining && v.Role != roleDraining {
 			v.Role, v.Since, v.Reason = roleDraining, now, "draining"
+			s.Generation++
+		} else if n != nil && n.Retiring && v.Role != roleDraining && v.Role != roleDrainRequested {
+			v.Role, v.Since, v.Reason = roleDrainRequested, now, "early drain requested"
 			s.Generation++
 		}
 		f, u := s.held(p.R, in.ID)
@@ -128,19 +132,22 @@ func (p *Pool) control(st *poolState, now time.Time) {
 
 	// Shrink: only with no queued work, no exclusive job wanting a whole
 	// VM, and capacity to spare over recent demand.
+	// An exclusive job waiting for a whole VM (a fence) stops all
+	// shrinking; one already running only keeps its own units counted.
+	// Capacity is what answers: a VM still booting can't stand in for one
+	// that works.
 	exclusive := len(s.Fences) > 0
-	for _, a := range s.Attempts {
-		exclusive = exclusive || (a.live() && a.Exclusive)
-	}
 	demand := max(s.demandNow(p.R), s.demandP90(now)) + p.R.Scheduling.SpareSlots
 	capacity := 0
 	for _, w := range ret {
-		capacity += w.units
+		if w.ready {
+			capacity += w.units
+		}
 	}
 	var victims []*vmView
 	if !exclusive && p.waiterDemand() == 0 {
 		for _, w := range ret {
-			if warm[w.in.ID] || now.Before(w.v.Hold) || s.inflight(w.in.ID) || s.Fences[w.in.ID] != nil || s.exactOn(w.in.ID) {
+			if !w.ready || warm[w.in.ID] || now.Before(w.v.Hold) || s.inflight(w.in.ID) || s.Fences[w.in.ID] != nil || s.exactOn(w.in.ID) {
 				continue
 			}
 			if capacity-w.units >= demand {
@@ -301,17 +308,21 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 		}
 		type ranked struct {
 			vmView
-			cache int // 2: this worktree's files, 1: this repository's caches
+			cache int  // 2: this worktree's files, 1: this repository's caches
+			ready bool // this machine installed the helper there (no upload first)
 		}
 		var keep, latency []ranked
 		var standby []vmView
 		for _, w := range p.views(st, now) {
 			n := st.Notes[w.in.ID]
+			if exclude[w.in.ID] {
+				continue
+			}
 			if !n.closed() && (w.v.Role == roleRetained || w.v.Role == roleStandby) {
 				usable++
 				window += w.units
 			}
-			if exclude[w.in.ID] || !w.eligible || (n != nil && now.Before(n.BusyUntil)) {
+			if !w.eligible || (n != nil && now.Before(n.BusyUntil)) {
 				continue
 			}
 			if f := s.Fences[w.in.ID]; f != nil && f.Owner != owner {
@@ -320,7 +331,7 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			if w.firm+need(w) > w.units {
 				continue // full, by this machine's own reservations
 			}
-			r := ranked{vmView: w}
+			r := ranked{vmView: w, ready: helperInstalled(w.in.Target, p.R.WorkRoot)}
 			switch {
 			case w.v.warmFor(c.Worktree, now):
 				r.cache = 2
@@ -342,6 +353,9 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			if fa, fb := fenced(a.vmView), fenced(b.vmView); fa != fb {
 				return fa // an exclusive job's own fenced VM first
 			}
+			if a.ready != b.ready {
+				return a.ready // a first contact uploads the helper, which can take a while
+			}
 			if a.cache != b.cache {
 				return a.cache > b.cache
 			}
@@ -359,10 +373,34 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			}
 			return a.in.ID < b.in.ID
 		})
+		mode := "heuristic"
+		kv := make([]vmView, len(keep))
+		for i, r := range keep {
+			kv[i] = r.vmView
+		}
+		if measured := p.measure(s, kv, c, now); measured != nil {
+			// Reorder by measured cost; within a tie band of the cheapest,
+			// the order above stands.
+			idx := map[string]int{}
+			for i, r := range keep {
+				idx[r.in.ID] = i
+			}
+			sort.SliceStable(keep, func(i, j int) bool {
+				a, b := measured[keep[i].in.ID], measured[keep[j].in.ID]
+				if a.rank != b.rank {
+					return a.rank < b.rank
+				}
+				if a.rank == 0 {
+					return idx[keep[i].in.ID] < idx[keep[j].in.ID]
+				}
+				return a.cost < b.cost
+			})
+			mode = "measured"
+		}
 		base := c
 		base.Force = false
 		add := func(w vmView, cl claim, why string) {
-			out = append(out, candidate{Instance: w.in, claim: cl, reason: why, mode: "heuristic"})
+			out = append(out, candidate{Instance: w.in, claim: cl, reason: why, mode: mode})
 		}
 		warmFirst := len(keep)
 		for i, r := range keep {
@@ -375,7 +413,7 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			if i == warmFirst {
 				for _, l := range latency {
 					cl := base
-					cl.Promote = true
+					cl.Promote, cl.Latency = true, true
 					add(l.vmView, cl, "latency mode: this worktree's files are on this standby VM")
 				}
 			}
@@ -384,7 +422,7 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 		if warmFirst == len(keep) {
 			for _, l := range latency {
 				cl := base
-				cl.Promote = true
+				cl.Promote, cl.Latency = true, true
 				add(l.vmView, cl, "latency mode: this worktree's files are on this standby VM")
 			}
 		}
@@ -415,7 +453,7 @@ func retainedReason(cache, firm int) string {
 // already has; the VM is a retained one with the fewest slots taken.
 // Launches go on regardless (an exclusive job mustn't wait behind a long
 // job when new capacity could be ready sooner).
-func (p *Pool) Fence(ctx context.Context) string {
+func (p *Pool) Fence(ctx context.Context, exclude map[string]bool) string {
 	owner := processOwner()
 	got := ""
 	if owner == "" {
@@ -426,19 +464,27 @@ func (p *Pool) Fence(ctx context.Context) string {
 			return err
 		}
 		s := st.sched()
-		s.reconcileOwners(time.Now())
+		now := time.Now()
+		s.reconcileOwners(now)
+		vs := p.views(st, now)
+		usable := map[string]bool{}
+		for _, w := range vs {
+			usable[w.in.ID] = w.eligible && w.v.Role == roleRetained && !exclude[w.in.ID]
+		}
 		for vm, f := range s.Fences {
-			if f.Owner == owner {
+			if f.Owner != owner {
+				continue
+			}
+			if usable[vm] {
 				got = vm
 				return nil
 			}
+			delete(s.Fences, vm) // it went draining or standby: fence another
 		}
-		now := time.Now()
 		var best *vmView
-		vs := p.views(st, now)
 		for i := range vs {
 			w := &vs[i]
-			if !w.eligible || w.v.Role != roleRetained || s.Fences[w.in.ID] != nil {
+			if !usable[w.in.ID] || s.Fences[w.in.ID] != nil {
 				continue
 			}
 			if best == nil || w.firm+w.unc < best.firm+best.unc ||
@@ -458,7 +504,10 @@ func (p *Pool) Fence(ctx context.Context) string {
 // Unfence drops this process's fences.
 func (p *Pool) Unfence() {
 	owner := processOwner()
-	_ = p.with(func(st *poolState) error {
+	if owner == "" {
+		return
+	}
+	err := p.with(func(st *poolState) error {
 		s := st.sched()
 		for vm, f := range s.Fences {
 			if f.Owner == owner {
@@ -467,6 +516,9 @@ func (p *Pool) Unfence() {
 		}
 		return nil
 	})
+	if err != nil {
+		p.retryLater("fence:" + owner) // dropped by this process's next transaction
+	}
 }
 
 // WarmSet runs the controller and returns the VMs the pool manager keeps
@@ -560,6 +612,7 @@ func (p *Pool) BeginDrain(ctx context.Context, id string) (op string, ok bool, e
 		}
 		op, ok = newAttemptID(), true
 		v.Role, v.Since, v.Reason, v.DrainOp, v.DrainAt = roleDrainRequested, now, "early drain requested", op, now
+		st.note(id).Retiring = true // no longer capacity: replacements may launch
 		s.Generation++
 		return nil
 	})
@@ -599,4 +652,44 @@ func (p *Pool) FinishDrain(id, op, result, detail string) {
 		}
 		return nil
 	})
+}
+
+// measuredRank is a candidate's place under the cost model: rank 0 within
+// the tie band of the cheapest, 1 above it (ordered by cost), 2 when its
+// lease may outlast the VM's lifetime.
+type measuredRank struct {
+	rank int
+	cost float64
+}
+
+// measure scores every candidate (sched_model.go), or returns nil if any
+// figure is unknown (then the fixed order stands).
+func (p *Pool) measure(s *schedState, vs []vmView, c claim, now time.Time) map[string]measuredRank {
+	if len(vs) < 2 {
+		return nil
+	}
+	out := map[string]measuredRank{}
+	best, band := math.Inf(1), 0.0
+	for _, w := range vs {
+		sc, ok := p.score(s, w, c, now)
+		if !ok {
+			return nil
+		}
+		price, _ := p.hourly(w.v, now)
+		band = max(band, p.tieBand(price))
+		r := measuredRank{rank: 1, cost: sc.cost}
+		if sc.late {
+			r.rank = 2
+		} else if sc.cost < best {
+			best = sc.cost
+		}
+		out[w.in.ID] = r
+	}
+	for id, r := range out {
+		if r.rank == 1 && r.cost <= best+band {
+			r.rank = 0
+			out[id] = r
+		}
+	}
+	return out
 }

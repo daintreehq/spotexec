@@ -27,6 +27,14 @@ func (p *Pool) loaded(t *testing.T, fn func(st *poolState)) {
 	}
 }
 
+// allReady marks every VM as having answered (only those count as
+// capacity the controller can shrink to).
+func allReady(st *poolState, now time.Time) {
+	for _, in := range st.Instances {
+		st.note(in.ID).markReady(now)
+	}
+}
+
 func retainedIDs(st *poolState) []string {
 	var out []string
 	for _, in := range st.Instances {
@@ -53,6 +61,7 @@ func TestControllerConvergesAfterBurst(t *testing.T) {
 	start := time.Now()
 	p.loaded(t, func(st *poolState) {
 		s := st.sched()
+		allReady(st, start)
 		p.views(st, start)
 		for i, in := range st.Instances {
 			s.VMs[in.ID].Hold = time.Time{}
@@ -86,6 +95,7 @@ func TestControllerHysteresis(t *testing.T) {
 	start := time.Now()
 	p.loaded(t, func(st *poolState) {
 		s := st.sched()
+		allReady(st, start)
 		p.views(st, start)
 		for _, v := range s.VMs {
 			v.Hold = time.Time{}
@@ -114,6 +124,7 @@ func TestControllerKeepsWarmFloor(t *testing.T) {
 	start := time.Now()
 	p.loaded(t, func(st *poolState) {
 		s := st.sched()
+		allReady(st, start)
 		p.views(st, start)
 		for _, v := range s.VMs {
 			v.Hold = time.Time{}
@@ -143,7 +154,7 @@ func TestRankPrefersRetainedOverWarmStandby(t *testing.T) {
 	p.loaded(t, func(st *poolState) {
 		s := st.sched()
 		p.views(st, now)
-		s.EpochAt = now.Add(time.Hour) // keep the controller out of it
+		s.EpochAt = now // the controller already ran this epoch
 		s.VMs["i-0"].remember("mine", "repo", now)
 		s.VMs["i-0"].Role = roleStandby
 		hold(s, "i-1", "other", now)
@@ -159,15 +170,26 @@ func TestRankPrefersRetainedOverWarmStandby(t *testing.T) {
 	if len(cands) != 3 || cands[0].ID != "i-1" || cands[2].ID != "i-0" || !cands[2].claim.Promote || cands[0].claim.Promote {
 		t.Fatalf("order %v (%+v), want i-1 (busy, same repo) first and the standby i-0 last, as a promotion", ids, cands)
 	}
-	// Without Promote, the standby VM can't be reserved.
+	// Without Promote, the standby VM can't be reserved; nor with it while
+	// a retained VM still has room (the ranking may be stale).
 	if _, err := p.reserveOn(f.insts[0], claim{}); err != errNoRoom {
 		t.Fatalf("reserving a standby VM without promotion: %v", err)
 	}
-	if _, err := p.reserveOn(f.insts[0], cands[2].claim); err != nil {
-		t.Fatalf("promotion: %v", err)
+	if _, err := p.reserveOn(f.insts[0], cands[2].claim); err != errNoRoom {
+		t.Fatalf("promoting while retained VMs have room: %v", err)
 	}
-	if r := p.state(t).VMs["i-0"]; r.Role != roleRetained || r.Hold.IsZero() {
-		t.Fatalf("after promotion: %+v", r)
+	p.loaded(t, func(st *poolState) {
+		s := st.sched()
+		hold(s, "i-1", "x", now)
+		hold(s, "i-2", "y", now)
+		hold(s, "i-2", "z", now)
+	})
+	before := time.Now()
+	if _, err := p.reserveOn(f.insts[0], cands[2].claim); err != nil {
+		t.Fatalf("promotion with the retained VMs full: %v", err)
+	}
+	if r := p.state(t).VMs["i-0"]; r.Role != roleRetained || r.Hold.Before(before.Add(minResidence-time.Second)) {
+		t.Fatalf("after promotion: %+v (want retained, held for a minute)", r)
 	}
 }
 
@@ -180,7 +202,7 @@ func TestRankLatencyMode(t *testing.T) {
 	p.loaded(t, func(st *poolState) {
 		s := st.sched()
 		p.views(st, now)
-		s.EpochAt = now.Add(time.Hour)
+		s.EpochAt = now
 		s.VMs["i-0"].remember("mine", "repo", now)
 		s.VMs["i-0"].Role = roleStandby
 	})
@@ -197,21 +219,21 @@ func TestStandbyPromotionOrder(t *testing.T) {
 	p.loaded(t, func(st *poolState) {
 		s := st.sched()
 		p.views(st, now)
-		s.EpochAt = now.Add(time.Hour)
-		for i, id := range []string{"i-0", "i-1", "i-2"} {
-			s.VMs[id].Role, s.VMs[id].Since = roleStandby, now.Add(time.Duration(i)*time.Minute)
+		s.EpochAt = now
+		for i, id := range []string{"i-1", "i-0", "i-2"} {
+			s.VMs[id].Role, s.VMs[id].Since = roleStandby, now.Add(-time.Duration(i)*time.Minute)
 		}
 	})
 	cands, _, _, _ := p.Rank(context.Background(), nil, claim{})
-	if len(cands) != 3 || cands[0].ID != "i-2" || cands[2].ID != "i-0" {
-		t.Fatalf("promotion order %+v, want i-2, i-1, i-0", cands)
+	if len(cands) != 3 || cands[0].ID != "i-1" || cands[1].ID != "i-0" || cands[2].ID != "i-2" || !cands[0].claim.Promote {
+		t.Fatalf("promotion order %+v, want i-1, i-0, i-2 (most recently retired first), as promotions", cands)
 	}
 }
 
 // An exclusive job's fence keeps other processes' shared jobs off its VM,
 // and the controller doesn't shrink while it waits.
 func TestExclusiveFence(t *testing.T) {
-	p, _ := schedPool(t, 2, 2)
+	p, _ := schedPool(t, 3, 2)
 	now := time.Now()
 	// Another live process: an owner file someone holds.
 	other := "1-other"
@@ -230,8 +252,10 @@ func TestExclusiveFence(t *testing.T) {
 		s.Fences["i-0"] = &fence{Owner: other, At: now}
 	})
 	cands, _, _, _ := p.Rank(context.Background(), nil, claim{})
-	if len(cands) != 1 || cands[0].ID != "i-1" {
-		t.Fatalf("candidates %+v, want only the unfenced i-1", cands)
+	for _, c := range cands {
+		if c.ID == "i-0" {
+			t.Fatalf("candidates %+v include the fenced i-0", cands)
+		}
 	}
 	if _, err := p.reserveOn(cands[0].Instance, claim{}); err != nil {
 		t.Fatal(err)
@@ -246,19 +270,32 @@ func TestExclusiveFence(t *testing.T) {
 		for _, v := range s.VMs {
 			v.Hold = time.Time{}
 		}
+		allReady(st, now)
 		for sec := 0; sec <= 120; sec += 10 {
 			p.control(st, now.Add(time.Duration(sec)*time.Second))
 		}
-		if n := len(retainedIDs(st)); n != 2 {
-			t.Fatalf("%d retained while an exclusive job waits, want 2", n)
+		if n := len(retainedIDs(st)); n != 3 {
+			t.Fatalf("%d retained while an exclusive job waits, want all 3", n)
 		}
 	})
 	// This process's own fence: its VM comes first for it.
 	p2, _ := schedPool(t, 2, 2)
-	if id := p2.Fence(context.Background()); id == "" {
-		t.Fatal("no fence placed")
-	} else if cands, _, _, _ := p2.Rank(context.Background(), nil, claim{Exclusive: true}); len(cands) == 0 || cands[0].ID != id {
+	p2.loaded(t, func(st *poolState) {
+		s := st.sched()
+		p2.views(st, now)
+		s.VMs["i-0"].LastStart = now // fresher: Fence picks i-1 (least recent), the fixed order prefers i-0
+	})
+	id := p2.Fence(context.Background(), nil)
+	if id != "i-1" || p2.state(t).Fences["i-1"] == nil || p2.state(t).Fences["i-1"].Owner != processOwner() {
+		t.Fatalf("fence on %q, stored %v", id, p2.state(t).Fences)
+	}
+	if cands, _, _, _ := p2.Rank(context.Background(), nil, claim{Exclusive: true}); len(cands) == 0 || cands[0].ID != id {
 		t.Fatalf("own fenced VM %s not first: %+v", id, cands)
+	}
+	// Its VM turns standby: the next call fences another.
+	p2.loaded(t, func(st *poolState) { st.sched().VMs["i-1"].Role = roleStandby })
+	if id := p2.Fence(context.Background(), nil); id != "i-0" || p2.state(t).Fences["i-1"] != nil {
+		t.Fatalf("fence after its VM went standby: %q, %v", id, p2.state(t).Fences)
 	}
 	p2.Unfence()
 	if s := p2.state(t); len(s.Fences) != 0 {
@@ -276,6 +313,9 @@ func TestFenceOfDeadProcessDropped(t *testing.T) {
 	if cands, _, _, _ := p.Rank(context.Background(), nil, claim{}); len(cands) != 1 {
 		t.Fatalf("candidates %+v: a dead process's fence still holds the VM", cands)
 	}
+	if f := p.state(t).Fences; len(f) != 0 {
+		t.Fatalf("a dead process's fence was kept: %v", f)
+	}
 }
 
 // An early drain is committed locally before the VM is asked, only for a
@@ -289,7 +329,7 @@ func TestEarlyDrain(t *testing.T) {
 		p.loaded(t, func(st *poolState) {
 			s := st.sched()
 			p.views(st, now)
-			s.EpochAt = now.Add(time.Hour)
+			s.EpochAt = now
 			fn(s)
 		})
 	}
@@ -301,6 +341,7 @@ func TestEarlyDrain(t *testing.T) {
 	if _, ok, _ := p.BeginDrain(ctx, "i-1"); ok {
 		t.Fatal("drained a VM retired a moment ago")
 	}
+	setup(func(s *schedState) { s.VMs["i-2"].Since = now.Add(-time.Hour) })
 	if _, ok, _ := p.BeginDrain(ctx, "i-2"); ok {
 		t.Fatal("drained a retained VM")
 	}
@@ -345,10 +386,22 @@ func TestEarlyDrain(t *testing.T) {
 	if _, err := p.reserveOn(f.insts[0], claim{Promote: true}); err != errNoRoom {
 		t.Fatalf("reserving a drain-requested VM: %v", err)
 	}
-	// The VM was busy: asked again only after drainRetry, same operation.
+	// The VM was busy: asked again only drainRetry after that answer, with
+	// the same operation.
+	setup(func(s *schedState) { s.VMs["i-0"].DrainAt = now.Add(-time.Hour) })
 	p.FinishDrain("i-0", op, "busy", "1 session(s)")
 	if again, ok, _ := p.BeginDrain(ctx, "i-0"); ok || again != op {
-		t.Fatalf("retry too soon: %q %v", again, ok)
+		t.Fatalf("retry too soon after a busy answer: %q %v", again, ok)
+	}
+	setup(func(s *schedState) { s.VMs["i-0"].DrainAt = now.Add(-drainRetry - time.Second) })
+	if again, ok, _ := p.BeginDrain(ctx, "i-0"); !ok || again != op {
+		t.Fatalf("retry after drainRetry: %q %v, want the same op", again, ok)
+	}
+	// Not capacity while it waits: launches may replace it.
+	var closed bool
+	p.loaded(t, func(st *poolState) { closed = st.Notes["i-0"].closed() })
+	if !closed {
+		t.Fatal("a drain-requested VM still counts as capacity")
 	}
 	if v := p.state(t).VMs["i-0"]; v.Role != roleDrainRequested {
 		t.Fatalf("a busy answer reopened the VM: %+v", v)
@@ -363,4 +416,56 @@ func TestEarlyDrain(t *testing.T) {
 	if v := p.state(t).VMs["i-0"]; v.Role != roleDraining || !draining {
 		t.Fatalf("after drained: %+v, note closed %v", v, draining)
 	}
+}
+
+// End to end: with the retained VM full, a job is placed on a standby VM
+// (promoted) before anything launches.
+func TestAcquirePromotesStandbyBeforeLaunch(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"healthy": {"b1", "b2"}}, 0)
+	p := NewPool(pool[0], fleets["healthy"])
+	now := time.Now()
+	p.loaded(t, func(st *poolState) {
+		s := st.sched()
+		p.views(st, now)
+		s.EpochAt = now
+		s.VMs["i-b2"].Role, s.VMs["i-b2"].Since = roleStandby, now.Add(-time.Minute)
+		hold(s, "i-b1", "a", now)
+		hold(s, "i-b1", "b", now)
+	})
+	h := scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) { return &Lease{}, nil })
+	rep := &placeRep{}
+	l, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: rep, NoBoot: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if l.InstanceID != "i-b2" || h.count("b1") != 0 {
+		t.Fatalf("placed on %s (b1 probed %d times), want the standby i-b2 without contacting the full b1", l.InstanceID, h.count("b1"))
+	}
+	if v := p.state(t).VMs["i-b2"]; v.Role != roleRetained {
+		t.Fatalf("i-b2 after placement: %+v", v)
+	}
+	if !rep.saw("placed", "promoted") {
+		t.Fatalf("no promoted placement event: %v", rep.events)
+	}
+}
+
+type placeRep struct {
+	nopRep
+	events []map[string]any
+	names  []string
+}
+
+func (r *placeRep) Event(name string, f map[string]any) {
+	r.names = append(r.names, name)
+	r.events = append(r.events, f)
+}
+
+func (r *placeRep) saw(name, field string) bool {
+	for i, n := range r.names {
+		if n == name && r.events[i][field] != nil {
+			return true
+		}
+	}
+	return false
 }

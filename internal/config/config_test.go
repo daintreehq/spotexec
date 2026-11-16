@@ -1355,6 +1355,19 @@ func TestSchedulingSettings(t *testing.T) {
 	if p := g.Runners["plain"]; p.SchedPolicy() != PolicyConsolidate || p.SchedMode() != ModeBalanced || p.ResultRetention() != 10*time.Minute {
 		t.Fatalf("defaults: policy %s mode %s retention %s", p.SchedPolicy(), p.SchedMode(), p.ResultRetention())
 	}
+	if !g.Runners["aws"].Scheduling.EarlyDrain || g.Runners["plain"].Scheduling.EarlyDrain {
+		t.Fatal("early_drain defaults to false and is read when set")
+	}
+	g, err = loadGlobalText(t, "[runners.a]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nidle_timeout = \"3m\"\nscheduling = { policy = \"legacy\" }\n[runners.b]\ntype = \"sim\"\nscheduling = { policy = \"shadow\" }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := g.Runners["a"]; a.SchedPolicy() != PolicyLegacy || a.ResultRetention() != 3*time.Minute {
+		t.Fatalf("a: policy %s retention %s", a.SchedPolicy(), a.ResultRetention())
+	}
+	if b := g.Runners["b"]; b.SchedPolicy() != PolicyShadow {
+		t.Fatalf("b: policy %s", b.SchedPolicy())
+	}
 	for _, bad := range []string{"policy = \"newest\"", "mode = \"fast\"", "spare_slots = -1", "result_retention = \"-1m\""} {
 		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n[runners.aws.scheduling]\n"+bad+"\n"); err == nil || !strings.Contains(err.Error(), "scheduling.") {
 			t.Errorf("%s: %v", bad, err)

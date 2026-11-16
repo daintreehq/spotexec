@@ -37,6 +37,17 @@ func TestTryDrain(t *testing.T) {
 	}
 	f.Close()
 
+	// A token held (a status probe, or a session caught mid-teardown).
+	tok := Layout{Root: root}.TokenLock(1)
+	tl, ok, err := tryLock(tok)
+	if err != nil || !ok {
+		t.Fatalf("token lock: %v %v", ok, err)
+	}
+	if r := try("op1", 0); r.Result != DrainBusy || draining(root) {
+		t.Fatalf("with a token held: %+v", r)
+	}
+	tl.Unlock()
+
 	// Recently active: its results are kept.
 	if r := try("op1", time.Hour); r.Result != DrainProtected || draining(root) {
 		t.Fatalf("idle under the retention time: %+v", r)

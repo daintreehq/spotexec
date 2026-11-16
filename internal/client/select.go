@@ -224,6 +224,11 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				continue
 			}
 			if m.r.SchedPolicy() == config.PolicyConsolidate {
+				if round == 0 {
+					// Prices for the cost model, looked up at most every 15
+					// minutes for the whole machine, in the background.
+					go m.pool.RefreshPrices(context.WithoutCancel(ctx))
+				}
 				cands, usable, slots, err := m.pool.Rank(ctx, req.Exclude, claimFor(req))
 				if err != nil {
 					roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
@@ -369,7 +374,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		if mayProbe && req.Base.Exclusive {
 			for _, m := range members {
 				if m.pool != nil && m.fatal == nil && m.r.SchedPolicy() == config.PolicyConsolidate {
-					if id := m.pool.Fence(ctx); id != "" && !m.fenced {
+					if id := m.pool.Fence(ctx, req.Exclude); id != "" && !m.fenced {
 						m.fenced = true
 						req.Rep.Event("exclusive_fence", map[string]any{"runner": m.r.Name, "instance_id": id})
 					}

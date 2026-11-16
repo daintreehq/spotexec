@@ -135,6 +135,8 @@ type fleet struct {
 	killing    map[string]string            // terminations to retry until gone (id -> reason)
 	retire     map[string]provider.Instance // warm VMs to drain remotely, until confirmed
 	roles      map[string]string            // placement role of each VM (client.Pool.WarmSet)
+	warmPlan   []string                     // the last warm set WarmSet chose (nil: legacy)
+	unprobed   map[string]bool              // skipped by the last probe round on purpose
 	// Circuit breaker: replacements of instances that never became healthy.
 	failures []time.Time
 	paused   time.Time
@@ -507,31 +509,41 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// first, then the rest of the retained set, then standby VMs (which
 	// are left to idle out). The legacy policy packs onto the oldest VMs,
 	// so then the oldest are warm.
-	if warmIDs, roles, err := fl.pool.WarmSet(ctx); err == nil {
-		fl.roles = roles
-		if warmIDs != nil {
-			order := map[string]int{}
-			for i, id := range warmIDs {
-				order[id] = i
-			}
-			rank := func(in provider.Instance) (int, int) {
-				if i, ok := order[in.ID]; ok {
-					return 0, i
-				}
-				if roles[in.ID] == "retained" {
-					return 1, 0
-				}
-				return 2, 0
-			}
-			sort.SliceStable(running, func(i, j int) bool {
-				ai, aj := rank(running[i])
-				bi, bj := rank(running[j])
-				if ai != bi {
-					return ai < bi
-				}
-				return aj < bj
-			})
+	warmIDs, roles, err := fl.pool.WarmSet(ctx)
+	if err == nil {
+		fl.roles, fl.warmPlan = roles, warmIDs
+	} else {
+		// Keep the last plan (and its roles) rather than fall back to the
+		// oldest VMs, which may be standby ones left to idle out.
+		warmIDs, roles = fl.warmPlan, fl.roles
+		st.LastError = "placement policy: " + err.Error()
+	}
+	inPlan := map[string]bool{}
+	for _, id := range warmIDs {
+		inPlan[id] = true
+	}
+	if warmIDs != nil {
+		order := map[string]int{}
+		for i, id := range warmIDs {
+			order[id] = i
 		}
+		rank := func(in provider.Instance) (int, int) {
+			if i, ok := order[in.ID]; ok {
+				return 0, i
+			}
+			if roles[in.ID] == "retained" {
+				return 1, 0
+			}
+			return 2, 0
+		}
+		sort.SliceStable(running, func(i, j int) bool {
+			ai, aj := rank(running[i])
+			bi, bj := rank(running[j])
+			if ai != bi {
+				return ai < bi
+			}
+			return aj < bj
+		})
 	}
 
 	// 2. Retire a warm instance shortly before max_lifetime, while its jobs
@@ -558,7 +570,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			i++
 			// One at a time: warm VMs launched together would otherwise all
 			// retire in the same pass and leave no warm capacity.
-			if i <= r.MinInstances && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > retireAt {
+			if i <= r.MinInstances && (warmIDs == nil || inPlan[in.ID]) && len(fl.retire) == 0 && ready >= r.MinInstances && time.Since(in.LaunchedAt) > retireAt {
 				// Drained locally now (so the warm pool replaces it); the
 				// VM itself is told below, retried until it confirms.
 				d.action("%s: retiring warm instance %s ahead of max_lifetime", r.Name, in.ID)
@@ -576,9 +588,11 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			delete(fl.retire, id)
 		}
 	}
+	// With the placement policy's plan, exactly its warm VMs; otherwise
+	// (legacy) the oldest matching ones.
 	warm := map[string]bool{}
 	for _, in := range running {
-		if len(warm) < r.MinInstances && view.Mismatch[in.ID] == "" {
+		if len(warm) < r.MinInstances && view.Mismatch[in.ID] == "" && (warmIDs == nil || inPlan[in.ID]) {
 			warm[in.ID] = true
 		}
 	}
@@ -603,6 +617,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	if ctx.Err() != nil {
 		return st // stopping: a cancelled probe proves nothing
 	}
+	if probed {
+		fl.pool.RefreshPrices(ctx) // for the placement cost model (at most every 15m)
+	}
 	if probed && r.Scheduling.EarlyDrain {
 		for _, id := range d.earlyDrain(ctx, fl, running) {
 			view.Draining[id] = true
@@ -624,6 +641,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			since := fl.seen[in.ID]
 			if last, ok := fl.lastOK[in.ID]; ok {
 				since = last
+			}
+			if fl.unprobed[in.ID] {
+				continue // left unprobed on purpose (a standby VM without our helper): silence proves nothing
 			}
 			stale := time.Since(since) > unhealthyAfter && age > r.BootTimeout.Duration
 			stuck := (fl.booting[in.ID] && age > 2*r.BootTimeout.Duration+2*time.Minute) || fl.bootFailed[in.ID]
@@ -898,6 +918,7 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int)
 func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instance, warm map[string]bool) (notified []string, answered int) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	fl.unprobed = map[string]bool{}
 	wasBooting := map[string]bool{} // read-only copy for the goroutines
 	for id, b := range fl.booting {
 		wasBooting[id] = b
@@ -919,6 +940,9 @@ func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instan
 				if fl.roles[in.ID] == "standby" {
 					// Installing touches its idle clock: a surplus VM is left
 					// to idle out instead.
+					mu.Lock()
+					fl.unprobed[in.ID] = true
+					mu.Unlock()
 					return
 				}
 				// A first contact uploads the helper, which over a slow link

@@ -58,12 +58,17 @@ type note struct {
 	// when it does). Unlike Draining it is recomputed, so reverting the
 	// config puts the VM back in service.
 	Mismatch string `json:"mismatch,omitempty"`
+	// Retiring: an early drain was committed (sched.go drain_requested):
+	// never placed on again, and not capacity, though the VM itself may
+	// not have agreed to drain yet.
+	Retiring bool `json:"retiring,omitempty"`
 }
 
 // closed reports whether an instance takes no new runs and isn't capacity:
-// it is draining, or no longer matches the runner's requirements (it then
-// idles out, and replacements launch for waiting demand).
-func (n *note) closed() bool { return n != nil && (n.Draining || n.Mismatch != "") }
+// it is draining (or retiring), or no longer matches the runner's
+// requirements (it then idles out, and replacements launch for waiting
+// demand).
+func (n *note) closed() bool { return n != nil && (n.Draining || n.Retiring || n.Mismatch != "") }
 
 type launchRec struct {
 	ID         string    `json:"id"`
@@ -194,19 +199,17 @@ func (p *Pool) withCtx(ctx context.Context, fn func(st *poolState) error) error 
 	if err := fn(st); err != nil {
 		return err
 	}
+	// The ledger first: if pool.json then fails, the launch records it
+	// holds were never saved (so no launch is counted that nobody makes).
+	if st.Sched != nil {
+		b, _ := json.MarshalIndent(st.Sched, "", "  ")
+		if err := writeIfChanged(p.dir, "sched.json", b, origSched); err != nil {
+			return err
+		}
+		p.pendingDone(applied)
+	}
 	b, _ := json.MarshalIndent(st, "", "  ")
-	if err := writeIfChanged(p.dir, "pool.json", b, orig); err != nil {
-		return err
-	}
-	if st.Sched == nil {
-		return nil
-	}
-	b, _ = json.MarshalIndent(st.Sched, "", "  ")
-	if err := writeIfChanged(p.dir, "sched.json", b, origSched); err != nil {
-		return err
-	}
-	p.pendingDone(applied)
-	return nil
+	return writeIfChanged(p.dir, "pool.json", b, orig)
 }
 
 // writeIfChanged atomically replaces dir/name with b, unless it already
@@ -744,7 +747,7 @@ func (p *Pool) Cancel(id string) {
 // Reset forgets all local pool state (after `spotexec down`).
 func (p *Pool) Reset() {
 	_ = p.with(func(st *poolState) error {
-		*st = poolState{Notes: map[string]*note{}}
+		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}}
 		return nil
 	})
 }

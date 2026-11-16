@@ -113,10 +113,26 @@ func tryDrain(root, op, reason string, minIdle time.Duration, lockPath, activity
 		res.Detail = fmt.Sprintf("idle %s of the %s its results are kept", idle.Round(time.Second), minIdle)
 		return res
 	}
+	// Drained only once the marker is really there: the watchdog acts on
+	// it, and the caller never places on this VM again.
 	if op != "" {
-		_ = os.WriteFile(drainOpFile(root), []byte(op+"\n"), 0o644)
+		if err := os.WriteFile(drainOpFile(root), []byte(op+"\n"), 0o644); err != nil {
+			res.Result, res.Detail = DrainBusy, "recording the drain: "+err.Error()
+			return res
+		}
 	}
-	markDraining(root, reason)
+	if err := os.WriteFile(drainingFile(root), []byte(reason+"\n"), 0o644); err != nil || !draining(root) {
+		res.Result, res.Detail = DrainBusy, fmt.Sprintf("writing the drain marker: %v", err)
+		return res
+	}
 	res.Result = DrainDone
 	return res
+}
+
+// drainingFile is where markDraining writes.
+func drainingFile(root string) string {
+	if onSpotexecVM() {
+		return DrainingFile
+	}
+	return filepath.Join(root, "draining")
 }

@@ -99,6 +99,11 @@ type schedState struct {
 	// Seq numbers retained-set memberships, oldest member first: the core
 	// order work is packed in, kept through an empty lull.
 	Seq uint64 `json:"seq,omitempty"`
+	// Model: recent lease durations by task and cache warmth
+	// (sched_model.go).
+	Model map[string]*durStat `json:"model,omitempty"`
+	// PricesAt: when the VMs' prices were last looked up.
+	PricesAt time.Time `json:"prices_at,omitempty"`
 }
 
 // vmSched is what scheduling knows about one VM.
@@ -140,7 +145,8 @@ type claimRec struct {
 	Exact     bool      `json:"exact,omitempty"` // exec, pull, --same-slot
 	Worktree  string    `json:"worktree,omitempty"`
 	Repo      string    `json:"repo,omitempty"`
-	Task      string    `json:"task,omitempty"` // duration-model key
+	Task      string    `json:"task,omitempty"`  // duration-model key
+	Cache     int       `json:"cache,omitempty"` // cacheLevel of its VM when reserved
 	Gen       uint64    `json:"gen"`
 	At        time.Time `json:"at"`
 	SentAt    time.Time `json:"sent_at,omitempty"`
@@ -512,8 +518,11 @@ type claim struct {
 	Worktree  string // when the job syncs (its files will be there)
 	Repo      string
 	Task      string
-	// Promote: the VM is standby and the policy chose to bring it back.
+	// Promote: the VM is standby and the policy chose to bring it back
+	// (re-checked when reserving: only while no retained VM has room,
+	// unless Latency: latency mode returning a worktree to its files).
 	Promote bool
+	Latency bool
 	// Force: reserve whatever the ledger says (legacy placement, exact
 	// slots): the helper decides.
 	Force bool
@@ -547,10 +556,15 @@ func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 			case roleDrainRequested, roleDraining:
 				return errNoRoom
 			case roleStandby:
-				if !c.Promote {
+				if !c.Promote || (!c.Latency && p.retainedRoom(st, now, c)) {
+					// Not needed (any more): a retained VM has room.
 					return errNoRoom
 				}
-				s.promote(in.ID, now, "promoted: retained VMs were full")
+				why := "promoted: retained VMs were full"
+				if c.Latency {
+					why = "promoted: latency mode, this worktree's files are here"
+				}
+				s.promote(in.ID, now, why)
 			}
 			firm, _ := s.held(p.R, in.ID)
 			need := 1
@@ -563,7 +577,7 @@ func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 		}
 		a := &claimRec{Owner: owner, PID: os.Getpid(), VM: in.ID, State: attReserved, Units: 1,
 			Exclusive: c.Exclusive, Exact: c.Exact, Worktree: c.Worktree, Repo: c.Repo, Task: c.Task,
-			Gen: s.Generation, At: now}
+			Cache: cacheLevel(v, c, now), Gen: s.Generation, At: now}
 		if c.Exclusive {
 			a.Units = s.units(p.R, in.ID)
 		}
@@ -623,6 +637,11 @@ func (p *Pool) commitAttempt(id string, acq protocol.Acquired, expect time.Time)
 		}
 		now := time.Now()
 		a.State, a.GotAt, a.Expect = attAcquired, now, expect
+		if expect.IsZero() {
+			if mid, _, ok := s.predict(a.Task, a.Cache); ok {
+				a.Expect = now.Add(mid)
+			}
+		}
 		v := s.vm(a.VM, now)
 		if acq.MaxSlots > 0 {
 			v.Slots = acq.MaxSlots
@@ -672,7 +691,7 @@ func (p *Pool) loseAttempt(id string) {
 // leaves a slot it gave back looking taken.
 var (
 	pendingMu  sync.Mutex
-	pendingRel = map[string]map[string]bool{} // pool dir -> attempt IDs to forget
+	pendingRel = map[string]map[string]bool{} // pool dir -> attempt IDs to forget ("fence:" + owner: its fences)
 )
 
 func (p *Pool) applyPending(st *poolState) []string {
@@ -689,6 +708,14 @@ func (p *Pool) applyPending(st *poolState) []string {
 	s := st.sched()
 	now := time.Now()
 	for _, id := range out {
+		if owner, ok := strings.CutPrefix(id, "fence:"); ok {
+			for vm, f := range s.Fences {
+				if f.Owner == owner {
+					delete(s.Fences, vm)
+				}
+			}
+			continue
+		}
 		if a := s.Attempts[id]; a != nil {
 			if v := s.VMs[a.VM]; v != nil && a.State == attAcquired {
 				v.LastEnd = now
@@ -734,6 +761,9 @@ func (p *Pool) releaseAttempt(id string) {
 		now := time.Now()
 		if v := s.VMs[a.VM]; v != nil && a.State == attAcquired {
 			v.LastEnd = now
+		}
+		if a.State == attAcquired && !a.Exact {
+			s.observe(a.Task, a.Cache, now.Sub(a.GotAt), now)
 		}
 		delete(s.Attempts, id)
 		s.sample(p.R, now)
@@ -856,4 +886,30 @@ func legacyCandidates(ins []provider.Instance, req AcquireRequest) []candidate {
 		out = append(out, candidate{Instance: in, claim: c, mode: "legacy"})
 	}
 	return out
+}
+
+// retainedRoom reports whether some retained VM could take the claim now
+// (by this machine's ledger), so promoting a standby VM isn't needed.
+func (p *Pool) retainedRoom(st *poolState, now time.Time, c claim) bool {
+	s := st.sched()
+	owner := processOwner()
+	for _, w := range p.views(st, now) {
+		if !w.eligible || w.v.Role != roleRetained {
+			continue
+		}
+		if f := s.Fences[w.in.ID]; f != nil && f.Owner != owner {
+			continue
+		}
+		if n := st.Notes[w.in.ID]; n != nil && now.Before(n.BusyUntil) {
+			continue
+		}
+		need := 1
+		if c.Exclusive {
+			need = w.units
+		}
+		if w.firm+need <= w.units {
+			return true
+		}
+	}
+	return false
 }

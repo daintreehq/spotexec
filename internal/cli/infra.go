@@ -233,7 +233,7 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				cost, from := fallbackCost(r)
 				st := runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
 					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}}
-				if r.SchedPolicy() != config.PolicyLegacy {
+				if r.SchedPolicy() == config.PolicyConsolidate { // shadow roles are hypothetical
 					st.Role, st.RoleReason = roles[in.ID].Role, roles[in.ID].Reason
 				}
 				if rc, ok := f.(provider.Reclaimer); ok {

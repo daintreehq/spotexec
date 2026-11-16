@@ -241,6 +241,10 @@ func TestDemandP90(t *testing.T) {
 	if got := s.demandP90(now); got != 2 {
 		t.Fatalf("p90 %d, want 2 (6 for 1s, then 2 for 59s)", got)
 	}
+	s.Demand = []demandPoint{{at(0), 6}, {at(12), 2}}
+	if got := s.demandP90(now); got != 6 {
+		t.Fatalf("p90 %d, want 6 (6 for 20%% of the window: more than a median)", got)
+	}
 	s.Demand = []demandPoint{{at(-100), 1}, {at(5), 6}}
 	if got := s.demandP90(now); got != 6 {
 		t.Fatalf("p90 %d, want 6 (1 for 5s of the window, then 6 for 55s)", got)

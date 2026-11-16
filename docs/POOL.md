@@ -119,6 +119,30 @@ VMs end up on three, not six.
 before a retained VM without its files (keeping more VMs, for fewer cold
 syncs).
 
+**Cost-aware placement.** Once there is enough history, the retained VMs
+with room are compared by what the job would cost on each, rather than by
+the fixed order above alone:
+
+    extra VM time it causes × the VM's price  +  its expected lease × wait_cost
+
+The *extra VM time* is how much later the VM can idle out because of this
+job. Reviving a VM that has sat idle for 9 of its 10 minutes costs the
+job's whole lease plus those 9 minutes (its idle time already run down);
+a busy VM whose jobs outlast this one costs nothing; a busy VM whose job
+ends in a second costs nearly the whole lease. The *lease* (acquire to
+release, sync and write-back included) is learned per task (repository and
+command, hashed) and per how warm the VM is for it, so a cold sync shows up
+as a longer lease: the last 16 leases each, for the 96 most recent tasks,
+in `sched.json`. Prices are the VMs' current Spot prices, looked up at most
+every 15 minutes for the whole machine (by `sx` in the background, and by
+the pool manager), or the runner's `hourly_cost`. VMs within about a
+second's worth of cost of the cheapest keep the fixed order between them,
+and a VM whose `max_lifetime` would cut the job's slower leases short goes
+last. Until every candidate is priced and the task (and the jobs already on
+those VMs) has at least 3 leases, the fixed order stands: an unknown figure
+is never taken as zero. The `placed` event's `score_mode` says which
+(`measured` or `heuristic`), and `reason` why that VM.
+
 **Exclusive jobs.** An exclusive job at the head of the queue that finds no
 empty VM *fences* the retained VM with the fewest jobs: new shared jobs go
 elsewhere, so it empties. Launches go on meanwhile, so it doesn't wait
