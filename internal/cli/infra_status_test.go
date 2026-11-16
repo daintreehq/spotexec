@@ -143,39 +143,61 @@ func TestStatusShowsReachableRegions(t *testing.T) {
 	if !strings.Contains(text, "spot/ap-south-1: couldn't list ap-south-1: no answer within 15s") {
 		t.Fatalf("no reason:\n%s", text)
 	}
-	// Nothing listed and a region missing: not "0 instances".
+	// Nothing listed and regions missing: those regions, not "0 instances".
 	f.insts = nil
 	newProvider = func(*config.Runner) (provider.Provider, error) { return f, nil }
-	for _, row := range gatherStatus(context.Background(), []*config.Runner{r}, nil) {
-		if row.Info.State == provider.StateAbsent {
-			t.Fatalf("claimed an empty fleet while regions were unlisted: %+v", row)
-		}
+	rows = gatherStatus(context.Background(), []*config.Runner{r}, nil)
+	names = nil
+	for _, row := range rows {
+		names = append(names, row.Name+"="+string(row.Info.State)+" "+row.Error)
+	}
+	want := "spot/ap-south-1=unknown couldn't list ap-south-1: no answer within 15s|spot/eu-north-1=unknown couldn't list eu-north-1: UnauthorizedOperation"
+	if got := strings.Join(names, "|"); got != want {
+		t.Fatalf("rows %s", got)
 	}
 }
 
 // A fleet in one region keeps its strict listing.
 func TestListFleetPlain(t *testing.T) {
-	_, unlisted, err := listFleet(context.Background(), listOnlyFleet{err: errors.New("boom")})
-	if err == nil || unlisted != nil {
+	boom := errors.New("boom")
+	if _, unlisted, err := listFleet(context.Background(), listOnlyFleet{err: boom}); err != boom || unlisted != nil {
 		t.Fatalf("%v %v", unlisted, err)
+	}
+	insts, unlisted, err := listFleet(context.Background(), listOnlyFleet{insts: []provider.Instance{{ID: "i-one"}}})
+	if err != nil || unlisted != nil || len(insts) != 1 || insts[0].ID != "i-one" {
+		t.Fatalf("%v %v %v", insts, unlisted, err)
 	}
 }
 
 type listOnlyFleet struct {
 	provider.Fleet
-	err error
+	insts []provider.Instance
+	err   error
 }
 
-func (f listOnlyFleet) List(context.Context) ([]provider.Instance, error) { return nil, f.err }
+func (f listOnlyFleet) List(context.Context) ([]provider.Instance, error) { return f.insts, f.err }
 
-// Status reads a consolidating fleet's roles without waiting out a pool
-// manager that holds the pool's lock through a slow listing.
-func TestFleetRolesDontWaitForBusyPool(t *testing.T) {
+// Status reads a consolidating fleet's roles, but doesn't wait out a pool
+// manager that holds the pool's lock through a slow listing; a fleet under
+// another policy has no roles to show.
+func TestFleetRoles(t *testing.T) {
 	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
 	r := &config.Runner{Name: "spot", Type: config.TypeAWSSpot} // consolidate by default
 	dir := provider.RunnerStateDir(r.Name)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
+	}
+	sched := `{"version":1,"vms":{"i-a":{"role":"standby","reason":"surplus"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "sched.json"), []byte(sched), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := fleetRoles(context.Background(), r, client.NewPool(r, regionListerFleet{})); got["i-a"].Role != "standby" || got["i-a"].Reason != "surplus" {
+		t.Fatalf("roles %v", got)
+	}
+	shadow := *r
+	shadow.Scheduling.Policy = config.PolicyShadow
+	if got := fleetRoles(context.Background(), &shadow, client.NewPool(&shadow, regionListerFleet{})); len(got) != 0 {
+		t.Fatalf("shadow roles shown: %v", got)
 	}
 	lock, err := os.OpenFile(filepath.Join(dir, "pool.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {

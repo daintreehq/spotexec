@@ -87,6 +87,9 @@ type runnerStatus struct {
 	// why (on the fleet's first row).
 	LaunchHolds map[string]provider.RegionHold `json:"launch_holds,omitempty"`
 	r           *config.Runner
+	// unlisted marks a row standing for a region whose instances
+	// couldn't be listed.
+	unlisted bool
 	// reclaimed records a Spot interruption notice the VM reports.
 	reclaimed func()
 	// answered: this status request reached the VM over SSH.
@@ -230,7 +233,7 @@ func unlistedRows(r *config.Runner, unlisted map[string]error) []runnerStatus {
 	sort.Strings(regions)
 	var rows []runnerStatus
 	for _, rg := range regions {
-		rows = append(rows, runnerStatus{Name: r.Name + "/" + rg, Type: r.Type, r: r, Fleet: r.Name,
+		rows = append(rows, runnerStatus{Name: r.Name + "/" + rg, Type: r.Type, r: r, Fleet: r.Name, unlisted: true,
 			Error: fmt.Sprintf("couldn't list %s: %v", rg, unlisted[rg]),
 			Info:  provider.Info{State: provider.StateUnknown, Region: rg, Detail: "instances not listed"}})
 	}
@@ -557,7 +560,12 @@ func cmdMonitor() *cobra.Command {
 func burnLine(sts []runnerStatus) string {
 	burn, unpriced := 0.0, 0
 	from := map[string]bool{}
+	var unlisted []string
 	for _, s := range sts {
+		if s.unlisted && s.r != nil && s.r.Ephemeral() {
+			unlisted = append(unlisted, s.Info.Region)
+			continue
+		}
 		if s.Info.State != provider.StateRunning || s.r == nil || !s.r.Ephemeral() {
 			continue
 		}
@@ -581,6 +589,9 @@ func burnLine(sts []runnerStatus) string {
 	line := fmt.Sprintf("estimated burn: $%.3f/hour (from %s)", burn, src)
 	if unpriced > 0 {
 		line += fmt.Sprintf(", not counting %d running VM(s) with no known price", unpriced)
+	}
+	if len(unlisted) > 0 {
+		line += ", not counting VMs in " + strings.Join(unlisted, ", ") + " (not listed)"
 	}
 	return line
 }
