@@ -76,7 +76,7 @@ func configLinks(ctx context.Context, ws *Workspace, m *manifest.Manifest, find 
 	}
 	if ws.Git {
 		cmd := exec.CommandContext(ctx, "git", "-C", ws.Root, "ls-files", "-z", "-c", "-o", "--exclude-standard", "--",
-			":(icase,glob)**/.spotexec.toml", ":(icase,glob)**/.spotexecignore", ":(icase,glob)**/.spotexec/**")
+			":(icase,glob)**/.spotexec.toml", ":(icase,glob)**/.spotexecignore", ":(icase,glob)**/.spotexec", ":(icase,glob)**/.spotexec/**")
 		if out, err := cmd.Output(); err == nil {
 			for _, p := range strings.Split(string(out), "\x00") {
 				if p != "" {

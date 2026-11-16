@@ -159,6 +159,9 @@ func TestConfigLinksFindsNestedLinks(t *testing.T) {
 		if err := os.Symlink("../out/setup.sh", filepath.Join(dir, ".spotexec", "setup.sh")); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.Symlink("../gen", filepath.Join(dir, "sub", ".spotexec")); err != nil {
+			t.Fatal(err)
+		}
 		if git {
 			for _, args := range [][]string{{"init", "-q"}, {"add", "-A"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"}} {
 				cmd := exec.Command("git", args...)
@@ -170,7 +173,7 @@ func TestConfigLinksFindsNestedLinks(t *testing.T) {
 		}
 		ws := &Workspace{Root: dir, Git: git, Cwd: "."}
 		guard := configGuard(dir, configLinks(context.Background(), ws, nil, true))
-		for _, p := range []string{"out/config.toml", "out/setup.sh"} {
+		for _, p := range []string{"out/config.toml", "out/setup.sh", "gen/Dockerfile"} {
 			if !guard(p) {
 				t.Errorf("git %v: %s not protected", git, p)
 			}
