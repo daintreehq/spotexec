@@ -549,6 +549,13 @@ func scaffoldDockerfile(root string) (body, stack string, missing, notes []strin
 		node := nodeVersion(root, pkg)
 		stack, primary = "Node.js "+node, "js"
 		from = "node:" + debianTag("node", node)
+		deps, depNotes := browserDeps(root, pm, pkg)
+		if len(deps) > 0 {
+			// browserLibs installs Debian 12 package names (trixie renamed
+			// many, e.g. libasound2t64, libicu76), so a project that needs
+			// them stays on bookworm.
+			from = "node:" + node + "-bookworm"
+		}
 		switch {
 		case pm == "pnpm":
 			v := pmVer
@@ -582,13 +589,12 @@ RUN npm install -g --force yarn@1 && npm cache clean --force
 RUN npm install -g npm@%s && npm cache clean --force
 `, pmVer)
 		}
-		deps, n := browserDeps(root, pm, pkg)
 		libs, note := browserLibs(deps)
 		body += libs
 		if note != "" {
 			notes = append(notes, note)
 		}
-		notes = append(notes, n...)
+		notes = append(notes, depNotes...)
 	case exists(root, "uv.lock"):
 		py, uv := pythonVersion(root), uvVersion(root)
 		stack, primary = "Python "+py+", uv", "python"

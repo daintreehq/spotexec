@@ -136,8 +136,15 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		if slices.Contains(fields, "maven") != strings.HasSuffix(c.stack, ", Maven") {
 			t.Errorf("%s: maven installed = %v", stack, slices.Contains(fields, "maven"))
 		}
-		if strings.Count(body, "\nRUN apt-get update") != 1 {
-			t.Errorf("%s: want exactly one apt layer in:\n%s", stack, body)
+		// A Node.js project with Electron, Playwright or Puppeteer gets a
+		// second layer for their system libraries, after the runner tools.
+		layers := 1
+		if pj := c.files["package.json"]; !strings.HasPrefix(c.from, "FROM oven/bun:") &&
+			(strings.Contains(pj, "electron") || strings.Contains(pj, "playwright") || strings.Contains(pj, "puppeteer")) {
+			layers = 2
+		}
+		if strings.Count(body, "\nRUN apt-get update") != layers {
+			t.Errorf("%s: want %d apt layer(s) in:\n%s", stack, layers, body)
 		}
 	}
 }
