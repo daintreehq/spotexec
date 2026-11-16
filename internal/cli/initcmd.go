@@ -141,7 +141,7 @@ does a setup whose runners are all SSH machines.`,
 // initContainer sets up the project container when init detects a
 // toolchain: AWS VMs boot without one, and the image pins it exactly.
 func initContainer(ws *client.Workspace, skip bool) error {
-	_, stack, _ := scaffoldDockerfile(ws.Root)
+	_, stack, _, _ := scaffoldDockerfile(ws.Root)
 	switch {
 	case stack == "":
 		fmt.Println("no language toolchain detected, so commands use the runner's own tools; `spotexec container init` sets up a container image")

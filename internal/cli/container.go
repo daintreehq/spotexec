@@ -92,7 +92,7 @@ func containerInit(ws *client.Workspace, rel string, force bool) error {
 			return err
 		}
 	}
-	body, stack, missing := scaffoldDockerfile(ws.Root)
+	body, stack, missing, notes := scaffoldDockerfile(ws.Root)
 	if stack == "" {
 		stack = "no language toolchain detected: a generic Ubuntu image"
 	}
@@ -103,6 +103,9 @@ func containerInit(ws *client.Workspace, rel string, force bool) error {
 		return err
 	}
 	fmt.Printf("wrote %s (%s)\n", rel, stack)
+	for _, n := range notes {
+		fmt.Println("  " + n)
+	}
 	if len(missing) > 0 {
 		fmt.Printf("note: this repository also uses %s; add it to %s if your commands need it\n", strings.Join(missing, " and "), rel)
 	}
@@ -503,8 +506,10 @@ ENV LANG=C.UTF-8
 // ("" when it found no language toolchain). The image is built on the
 // first toolchain found (JavaScript, Python, Go, Rust, Java); Go and uv
 // are added to it when the repository uses them too, and any other
-// toolchain it also uses is listed in missing, to be added by hand.
-func scaffoldDockerfile(root string) (body, stack string, missing []string) {
+// toolchain it also uses is listed in missing, to be added by hand. notes
+// say what else went into the image and why (the system libraries Electron,
+// Playwright and Puppeteer need), or what to add by hand.
+func scaffoldDockerfile(root string) (body, stack string, missing, notes []string) {
 	pkg := readPackageJSON(root)
 	pm, pmVer := jsPackageManager(root, pkg)
 	// The image is from, then one apt layer of runnerTools plus the stack's
@@ -523,10 +528,34 @@ func scaffoldDockerfile(root string) (body, stack string, missing []string) {
 		}
 		stack, primary = "Bun "+v, "js"
 		from = "oven/bun:" + v
+		// The Bun image's Debian release depends on its version, and the
+		// library packages are named differently in each: name them only.
+		deps, n := browserDeps(root, pm, pkg)
+		if len(deps) > 0 {
+			var tools []string
+			for _, d := range deps {
+				tools = append(tools, d.tool)
+			}
+			need := " need"
+			if len(tools) == 1 {
+				need = " needs"
+			}
+			msg := joinAnd(tools) + need + " system libraries the Bun image doesn't have: add them to the apt-get install (`npx playwright install-deps --dry-run chromium` lists Chromium's)"
+			body += "\n# " + msg + ".\n"
+			notes = append(notes, msg)
+		}
+		notes = append(notes, n...)
 	case pm != "" || pkg != nil:
 		node := nodeVersion(root, pkg)
 		stack, primary = "Node.js "+node, "js"
 		from = "node:" + debianTag("node", node)
+		deps, depNotes := browserDeps(root, pm, pkg)
+		if len(deps) > 0 {
+			// browserLibs installs Debian 12 package names (trixie renamed
+			// many, e.g. libasound2t64, libicu76), so a project that needs
+			// them stays on bookworm.
+			from = "node:" + node + "-bookworm"
+		}
 		switch {
 		case pm == "pnpm":
 			v := pmVer
@@ -560,6 +589,12 @@ RUN npm install -g --force yarn@1 && npm cache clean --force
 RUN npm install -g npm@%s && npm cache clean --force
 `, pmVer)
 		}
+		libs, note := browserLibs(deps)
+		body += libs
+		if note != "" {
+			notes = append(notes, note)
+		}
+		notes = append(notes, depNotes...)
 	case exists(root, "uv.lock"):
 		py, uv := pythonVersion(root), uvVersion(root)
 		stack, primary = "Python "+py+", uv", "python"
@@ -720,7 +755,7 @@ ENV UV_PYTHON_DOWNLOADS=never
 #  && apt-get install -y --no-install-recommends postgresql-client \
 #  && rm -rf /var/lib/apt/lists/*
 `
-	return header + body + extra, stack, missing
+	return header + body + extra, stack, missing, notes
 }
 
 // runnerTools are command-line tools GitHub's hosted Ubuntu runners provide

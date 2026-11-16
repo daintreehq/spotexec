@@ -829,7 +829,7 @@ func doctorContainer(l *loaded, runners []string, check func(string, bool, strin
 		}
 		check("container", true, c.Dockerfile+" (the first sx builds it; `spotexec container build` builds it now)")
 	default:
-		_, stack, _ := scaffoldDockerfile(l.ws.Root)
+		_, stack, _, _ := scaffoldDockerfile(l.ws.Root)
 		rs, err := l.cfg.Pool(nil)
 		if len(runners) > 0 {
 			rs, err = selectRunners(l.cfg, runners)

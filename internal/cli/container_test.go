@@ -65,6 +65,12 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		{map[string]string{"uv.lock": "", "pyproject.toml": "[project]\nrequires-python = \"==3.12.7\"\n"}, "FROM python:3.12.7-bookworm", "", "Python 3.12.7, uv"},
 		{map[string]string{"Cargo.toml": "", "package.json": `{}`}, "FROM node:24-trixie", "also uses Rust", "Node.js 24"},
 		{map[string]string{}, "FROM ubuntu:24.04", "build-essential", ""},
+		// Electron, Playwright and Puppeteer get their system libraries; the
+		// stack is unchanged.
+		{map[string]string{"package.json": `{"devDependencies":{"electron":"^38"}}`, "package-lock.json": ""}, "FROM node:24-bookworm", " libnss3 ", "Node.js 24"},
+		{map[string]string{"package.json": `{"devDependencies":{"@playwright/test":"^1"}}`, "package-lock.json": ""}, "FROM node:24-bookworm", " libgtk-4-1 ", "Node.js 24"},
+		{map[string]string{"package.json": `{"dependencies":{"puppeteer":"^24"}}`, "yarn.lock": ""}, "FROM node:24-bookworm", "--no-sandbox", "Node.js 24, Yarn"},
+		{map[string]string{"package.json": `{"devDependencies":{"@playwright/test":"^1"}}`, "bun.lock": ""}, "FROM oven/bun:1", "# Playwright needs system libraries the Bun image doesn't have", "Bun 1"},
 	}
 	for _, c := range cases {
 		root := t.TempDir()
@@ -73,9 +79,13 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		body, stack, _ := scaffoldDockerfile(root)
+		body, stack, _, _ := scaffoldDockerfile(root)
 		if !strings.Contains(body, "\n"+c.from+"\n") || !strings.Contains(body, c.has) || stack != c.stack {
 			t.Errorf("%v: stack %q (want %q); want %q and %q in:\n%s", c.files, stack, c.stack, c.from, c.has, body)
+		}
+		if !strings.Contains(c.files["package.json"], "electron") && !strings.Contains(c.files["package.json"], "playwright") &&
+			!strings.Contains(c.files["package.json"], "puppeteer") && strings.Contains(body, "libnss3") {
+			t.Errorf("%v: browser libraries without a browser dependency", c.files)
 		}
 		if strings.Count(body, "\nFROM ") != 1 {
 			t.Errorf("%s: want exactly one FROM", stack)
@@ -126,8 +136,15 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		if slices.Contains(fields, "maven") != strings.HasSuffix(c.stack, ", Maven") {
 			t.Errorf("%s: maven installed = %v", stack, slices.Contains(fields, "maven"))
 		}
-		if strings.Count(body, "\nRUN apt-get update") != 1 {
-			t.Errorf("%s: want exactly one apt layer in:\n%s", stack, body)
+		// A Node.js project with Electron, Playwright or Puppeteer gets a
+		// second layer for their system libraries, after the runner tools.
+		layers := 1
+		if pj := c.files["package.json"]; !strings.HasPrefix(c.from, "FROM oven/bun:") &&
+			(strings.Contains(pj, "electron") || strings.Contains(pj, "playwright") || strings.Contains(pj, "puppeteer")) {
+			layers = 2
+		}
+		if strings.Count(body, "\nRUN apt-get update") != layers {
+			t.Errorf("%s: want %d apt layer(s) in:\n%s", stack, layers, body)
 		}
 	}
 }
