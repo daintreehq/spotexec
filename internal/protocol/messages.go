@@ -64,6 +64,10 @@ const (
 	CodeShutdown         = "RUNNER_SHUTTING_DOWN" // the VM began shutting down under the request
 )
 
+// BootTailMark ends a BOOTSTRAP_FAILED message's own words: the last lines
+// of the bootstrap log follow it.
+const BootTailMark = "last lines of /var/log/spotexec-bootstrap.log:"
+
 // ErrorMsg is sent by the helper for any failed request.
 type ErrorMsg struct {
 	Code    string `json:"code"`

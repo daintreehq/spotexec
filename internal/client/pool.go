@@ -801,6 +801,13 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 // ProvisionHeldThen is ProvisionHeld, calling launched (if set) as soon as
 // the launch request succeeds, before waiting for the VM to run.
 func (p *Pool) ProvisionHeldThen(ctx context.Context, id string, log provider.Logger, launched func(provider.Instance)) (provider.Instance, error) {
+	return p.provisionHeld(ctx, id, log, launched, nil)
+}
+
+// provisionHeld is ProvisionHeldThen, also calling failed (if set) when the
+// launch request fails. Both callbacks run before the launch's hold ends,
+// so a process exiting (WaitLaunches) still hears how its launch went.
+func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger, launched func(provider.Instance), failed func(error)) (provider.Instance, error) {
 	recorded := false
 	defer func() {
 		if !recorded {
@@ -838,6 +845,9 @@ func (p *Pool) ProvisionHeldThen(ctx context.Context, id string, log provider.Lo
 			st.ListedAt = staleListing(st.ListedAt)
 			return nil
 		})
+		if failed != nil {
+			failed(err)
+		}
 		return in, err
 	}
 	_ = p.with(func(st *poolState) error {

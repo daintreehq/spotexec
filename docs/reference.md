@@ -55,7 +55,7 @@ spotexec version
 | `~/.aws/credentials` `[spotexec]`, `~/.aws/config` `[profile spotexec]` | The access key and region written by `spotexec setup`. |
 | `~/.config/spotexec/owner-id` | This machine's permanent ID: it tags the instances it launches and its IAM user. A machine's runs only use its own instances. |
 | `~/.config/spotexec/machines.toml` | The machines `spotexec setup` has set up from here (for `setup --all`). |
-| `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log, dependency install logs (`logs/deps/`), the full stdout of failed `--rtk-filter` runs (`rtk/`) (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
+| `~/.local/state/spotexec/` | Pool ledgers, queue tickets, instance records, `known_hosts`, daemon state and log, dependency install logs (`logs/deps/`), image build logs (`logs/image/`), a record of each run (`logs/runs/`, see [run records](agents.md#run-records)), the full stdout of failed `--rtk-filter` runs (`rtk/`) (`SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` override). |
 | `.spotexec.toml`, `.spotexecignore` | Project config and extra sync excludes. |
 | `.git/spotexec/conflicts/`, `.git/spotexec/backup/` | Remote versions of files that conflicted on write-back, and local versions write-back replaced or deleted that Git had no copy of (`.spotexec/` outside Git). Linked worktrees use the shared git directory (`git rev-parse --git-common-dir`), so removing a worktree keeps them. Pruned automatically ([policy](running.md#write-back-and-artifacts)); `spotexec backups` lists them. |
 | `.spotexec/Dockerfile` | Project image from `spotexec init` or `spotexec container init`. |

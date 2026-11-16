@@ -140,6 +140,22 @@ type Result struct {
 	// SetupFailed: [setup] failed, timed out or couldn't start, so the
 	// command never ran (ExitCode is 1, or 124 for a timeout).
 	SetupFailed bool `json:"setup_failed,omitempty"`
+	// Phases is where the run's time went (PhaseQueued, PhaseSync, …),
+	// summed over its attempts. A phase the run never reached is absent.
+	Phases map[string]time.Duration `json:"-"`
+	// Attempts is how many attempts the run made: 2 when it was replayed
+	// after losing its runner, 0 when it failed before its first.
+	Attempts int `json:"-"`
+	// Where the last attempt ran, when it got a fleet VM: its instance,
+	// region, zone and type (empty for a static runner).
+	InstanceID   string `json:"-"`
+	Region       string `json:"-"`
+	Zone         string `json:"-"`
+	InstanceType string `json:"-"`
+	// LostCode, when the run lost its runner and wasn't replayed, is why
+	// (RUNNER_UNRESPONSIVE, MEMORY_PRESSURE, CLIENT_SUSPENDED): the code of
+	// the warning that explained it.
+	LostCode string `json:"-"`
 	// noReplay, when the runner was lost, is why the run must not be
 	// replayed elsewhere (see replayable).
 	noReplay noReplay
@@ -166,16 +182,59 @@ func (s stage) where() string {
 }
 
 // progress tracks an attempt's stage as it goes. It is read when the
-// runner is lost; helper events may update it from another goroutine.
+// runner is lost; helper events may update it from another goroutine. It
+// also times each phase, for the run's record.
 type progress struct {
-	mu sync.Mutex
-	at stage
+	mu    sync.Mutex
+	at    stage
+	since time.Time                // when the current phase began
+	spent map[string]time.Duration // by phaseKind
+	now   func() time.Time         // nil: time.Now
+}
+
+func newProgress(phase string) *progress {
+	p := &progress{at: stage{phase: phase}}
+	p.since = p.clock()
+	return p
+}
+
+func (p *progress) clock() time.Time {
+	if p.now != nil {
+		return p.now()
+	}
+	return time.Now()
+}
+
+// enter ends the current phase's timing and starts phase's (p.mu held).
+func (p *progress) enter(phase string) {
+	now := p.clock()
+	if k := phaseKind[p.at.phase]; k != "" && !p.since.IsZero() && !now.Before(p.since) {
+		if p.spent == nil {
+			p.spent = map[string]time.Duration{}
+		}
+		p.spent[k] += now.Sub(p.since) // reached, even for no measurable time
+	}
+	p.since = now
+	p.at.phase = phase
 }
 
 func (p *progress) set(phase string) {
 	p.mu.Lock()
-	p.at.phase = phase
+	p.enter(phase)
 	p.mu.Unlock()
+}
+
+// timings ends the current phase's timing and returns the time spent in
+// each kind of phase so far.
+func (p *progress) timings() map[string]time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.enter(p.at.phase)
+	out := make(map[string]time.Duration, len(p.spent))
+	for k, d := range p.spent {
+		out[k] = d
+	}
+	return out
 }
 
 // dispatch records that the command is being handed to the helper, from
@@ -187,6 +246,7 @@ func (p *progress) dispatch(setup bool) {
 		phase = phaseStartSetup
 	}
 	p.mu.Lock()
+	p.enter(phase)
 	p.at = stage{phase: phase, dispatched: true}
 	p.mu.Unlock()
 }
@@ -198,16 +258,19 @@ func (p *progress) started() {
 	defer p.mu.Unlock()
 	switch p.at.phase {
 	case phaseStartSetup:
-		p.at.phase, p.at.started = phaseSetup, true
+		p.enter(phaseSetup)
+		p.at.started = true
 	case phaseStartCommand:
-		p.at.phase, p.at.started = phaseCommand, true
+		p.enter(phaseCommand)
+		p.at.started = true
 	}
 }
 
 // setupDone records that [setup] run finished and the command is next.
 func (p *progress) setupDone() {
 	p.mu.Lock()
-	p.at.phase, p.at.started = phaseStartCommand, false
+	p.enter(phaseStartCommand)
+	p.at.started = false
 	p.mu.Unlock()
 }
 
@@ -264,13 +327,19 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 	defer KeepAwake()()
 	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}, fresh: new(bool)}
 	reached := false
+	spent := map[string]time.Duration{}
 	for {
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
 		reached = reached || res.Runner != ""
 		res.Reached = reached
+		for k, d := range res.Phases {
+			spent[k] += d
+		}
+		res.Phases, res.Attempts = spent, att.n
 		retry, code, why := replayable(lost, res, o, ctx.Err() != nil, att.n)
 		if why != "" {
 			o.Rep.Warn(code, "%s", why)
+			res.LostCode = code
 		}
 		if !retry {
 			return res, err
@@ -379,7 +448,39 @@ const (
 	phaseSetup        = "running [setup] run"
 	phaseStartCommand = "starting the command"
 	phaseCommand      = "running the command"
+	phaseWriteback    = "writing back the command's changes"
 )
+
+// Kinds of time a run spends, as its record names them (Result.Phases).
+const (
+	PhaseScan      = "scan"         // listing the worktree's files
+	PhaseQueued    = "queued"       // getting a runner and slot: probing, waiting, a VM booting
+	PhaseSync      = "sync"         // uploading files and seeding .git
+	PhaseImage     = "image"        // preparing the project container image
+	PhaseDeps      = "dependencies" // checking and installing dependencies
+	PhaseSetup     = "setup"        // [setup] run
+	PhaseCommand   = "command"      // the command itself
+	PhaseWriteback = "writeback"    // writing back its changes and pulling artifacts
+)
+
+// phaseKind is the kind of time each phase of an attempt counts as (none
+// for setting up the slot, which is brief).
+var phaseKind = map[string]string{
+	phaseSync: PhaseSync, phaseGitSeed: PhaseSync,
+	phaseImage:     PhaseImage,
+	phaseDepsCheck: PhaseDeps, phaseDeps: PhaseDeps,
+	phaseStartSetup: PhaseSetup, phaseSetup: PhaseSetup,
+	phaseStartCommand: PhaseCommand, phaseCommand: PhaseCommand,
+	phaseWriteback: PhaseWriteback,
+}
+
+// spend adds d to the run's time in phase kind k.
+func (r *Result) spend(k string, d time.Duration) {
+	if r.Phases == nil {
+		r.Phases = map[string]time.Duration{}
+	}
+	r.Phases[k] += d
+}
 
 // lastMemory describes the memory reading of s's latest heartbeat, "" when
 // none carried one.
@@ -490,6 +591,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		o.Rep.Status("scanning %s", ws.Root)
 		t := time.Now()
 		m, err = manifest.Build(ctx, ManifestOptions(ws.Root, p))
+		res.spend(PhaseScan, time.Since(t))
 		if err != nil {
 			return res, infra(fmt.Errorf("enumerating files: %w", err)), ""
 		}
@@ -549,25 +651,34 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if o.SameSlot {
 			fp = base.Fingerprint
 		}
+		t := time.Now()
 		lease, err = AcquireSlot(ctx, cfg, ws, r, lr, o.Rep, host, o.Display, o.Exclusive, o.QueueTimeout, o.SameSlot && o.Sync != "none", fp)
+		res.spend(PhaseQueued, time.Since(t))
 		if err != nil {
 			return res, infra(fmt.Errorf("can't return to this worktree's last slot (%s slot %d%s): %w", lr.Runner, lr.Slot, instanceSuffix(lr.InstanceID), err)), ""
 		}
 	} else {
+		t := time.Now()
 		lease, err = Acquire(ctx, req)
+		res.spend(PhaseQueued, time.Since(t))
 		if err != nil {
 			return res, infra(err), ""
 		}
 	}
 	defer lease.Close()
+	res.InstanceID = lease.InstanceID
+	res.Region, res.Zone, res.InstanceType = lease.Instance.Region, lease.Instance.Zone, lease.Instance.Type
 	if lease.InstanceID != "" {
 		lease.Sess.SetOnSilent(waitIfRunning(lease, o.Rep))
 	}
 	var noticed atomic.Bool // a reclamation notice arrived
 	// Before any replacement launches: steer it away from this VM's pool.
 	reclaimed := sync.OnceFunc(func() { noteReclaimed(lease) })
-	prog := &progress{at: stage{phase: phaseSlot}}
+	prog := newProgress(phaseSlot)
 	defer func() {
+		for k, d := range prog.timings() {
+			res.spend(k, d)
+		}
 		if lost != "" {
 			res.lostAt = prog.get()
 			if lease.InstanceID != "" {
@@ -805,6 +916,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		// the CLI exits 130).
 		return res, shutdownErr(label, result.ExitCode), shutdownRunner(lease)
 	}
+	prog.set(phaseWriteback)
 	checkCanceled()
 	// Post-exec work uses its own bounded context: an interrupt that already
 	// canceled ctx must not prevent writing back what the command changed.
