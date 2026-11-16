@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -50,9 +51,15 @@ const (
 
 const (
 	// uncertainTTL bounds how long an attempt whose process died still
-	// counts as holding a slot: the helper drops a silent client within
-	// helper.ClientTimeout (45s) and tears its session down soon after.
-	uncertainTTL = 2 * time.Minute
+	// counts as holding a slot: the helper drops a silent client after
+	// helper.ClientTimeout (45s), or up to four minutes more while the VM
+	// itself stalls, then tears the session down. Uncertain slots never
+	// stop a reservation (the helper is asked); they only keep the VM from
+	// being let go.
+	uncertainTTL = 6 * time.Minute
+	// settleMargin: how long an attempt must have been uncertain before a
+	// helper's holder list can settle it.
+	settleMargin = 10 * time.Second
 	// demandWindow is the history the shrink target looks at.
 	demandWindow = 60 * time.Second
 	// sustainSurplus: how long capacity must stay surplus before a VM is
@@ -186,30 +193,64 @@ var (
 
 func ownersDir() string { return filepath.Join(config.StateDir(), "owners") }
 
-// processOwner is this process's owner ID.
+// processOwner is this process's owner ID ("" if its owner file couldn't
+// be held: then this process records nothing in the ledger, rather than
+// records the others would take for a dead process's).
 func processOwner() string {
 	ownerOnce.Do(func() {
 		var b [6]byte
 		_, _ = rand.Read(b[:])
 		id := fmt.Sprintf("%d-%s", os.Getpid(), hex.EncodeToString(b[:]))
-		if err := os.MkdirAll(ownersDir(), 0o700); err == nil {
-			if f, err := os.OpenFile(filepath.Join(ownersDir(), id), os.O_CREATE|os.O_RDWR, 0o600); err == nil {
-				if syscall.Flock(int(f.Fd()), syscall.LOCK_EX) == nil {
-					ownerFile = f
-				} else {
-					f.Close()
-				}
-			}
+		if err := os.MkdirAll(ownersDir(), 0o700); err != nil {
+			return
 		}
-		ownerID = id
+		sweepOwners()
+		// Locked under a temporary name, then renamed: a sweep never sees
+		// it unlocked.
+		tmp := filepath.Join(ownersDir(), id+".new")
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return
+		}
+		if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil || os.Rename(tmp, filepath.Join(ownersDir(), id)) != nil {
+			f.Close()
+			_ = os.Remove(tmp)
+			return
+		}
+		ownerFile, ownerID = f, id
 	})
 	return ownerID
 }
 
+// sweepOwners removes the owner files of processes that have exited.
+func sweepOwners() {
+	ents, _ := os.ReadDir(ownersDir())
+	for _, e := range ents {
+		path := filepath.Join(ownersDir(), e.Name())
+		if strings.HasSuffix(e.Name(), ".new") {
+			if fi, err := e.Info(); err != nil || time.Since(fi.ModTime()) < time.Minute {
+				continue // being created
+			}
+		}
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			continue
+		}
+		if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+			_ = os.Remove(path)
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		}
+		f.Close()
+	}
+}
+
+// errNoOwner: this process can't take part in the ledger.
+var errNoOwner = errors.New("no ledger owner file")
+
 // ownerAlive reports whether the process that wrote owner still runs.
 // Without its owner file (it couldn't be created) it falls back to the PID.
 func ownerAlive(owner string, pid int) bool {
-	if owner == processOwner() {
+	if owner != "" && owner == processOwner() {
 		return true
 	}
 	path := filepath.Join(ownersDir(), owner)
@@ -490,6 +531,9 @@ var errNoRoom = errors.New("no room on this instance")
 func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 	id := newAttemptID()
 	owner := processOwner()
+	if owner == "" {
+		return "", errNoOwner
+	}
 	err := p.with(func(st *poolState) error {
 		s := st.sched()
 		now := time.Now()
@@ -555,9 +599,14 @@ func (s *schedState) promote(id string, now time.Time, why string) {
 // markSent records that an attempt's acquire is about to reach its VM.
 // Written before the request goes out: an attempt that is still
 // "reserved" when its process dies provably never reached the VM.
-func (p *Pool) markSent(id string) {
-	_ = p.with(func(st *poolState) error {
-		if a := st.sched().Attempts[id]; a != nil && a.State == attReserved {
+// It fails (and the request must not go out) if that can't be recorded.
+func (p *Pool) markSent(id string) error {
+	return p.with(func(st *poolState) error {
+		a := st.sched().Attempts[id]
+		if a == nil {
+			return errors.New("reservation lost")
+		}
+		if a.State == attReserved {
 			a.State, a.SentAt = attSent, time.Now()
 		}
 		return nil
@@ -594,7 +643,7 @@ func (p *Pool) commitAttempt(id string, acq protocol.Acquired, expect time.Time)
 // dropAttempt forgets an attempt the VM definitely refused (busy,
 // draining, booting) or that never reached it.
 func (p *Pool) dropAttempt(id string) {
-	_ = p.with(func(st *poolState) error {
+	err := p.with(func(st *poolState) error {
 		s := st.sched()
 		if _, ok := s.Attempts[id]; ok {
 			delete(s.Attempts, id)
@@ -602,6 +651,9 @@ func (p *Pool) dropAttempt(id string) {
 		}
 		return nil
 	})
+	if err != nil {
+		p.retryLater(id)
+	}
 }
 
 // loseAttempt marks an attempt whose outcome is unknown (the connection
@@ -615,9 +667,65 @@ func (p *Pool) loseAttempt(id string) {
 	})
 }
 
+// Releases that couldn't be saved (a full disk, say) are retried by this
+// process's next transaction on the same fleet, so a live process never
+// leaves a slot it gave back looking taken.
+var (
+	pendingMu  sync.Mutex
+	pendingRel = map[string]map[string]bool{} // pool dir -> attempt IDs to forget
+)
+
+func (p *Pool) applyPending(st *poolState) []string {
+	pendingMu.Lock()
+	ids := pendingRel[p.dir]
+	var out []string
+	for id := range ids {
+		out = append(out, id)
+	}
+	pendingMu.Unlock()
+	if len(out) == 0 || st.Sched == nil {
+		return out
+	}
+	s := st.sched()
+	now := time.Now()
+	for _, id := range out {
+		if a := s.Attempts[id]; a != nil {
+			if v := s.VMs[a.VM]; v != nil && a.State == attAcquired {
+				v.LastEnd = now
+			}
+			delete(s.Attempts, id)
+		}
+	}
+	s.sample(p.R, now)
+	return out
+}
+
+func (p *Pool) pendingDone(applied []string) {
+	if len(applied) == 0 {
+		return
+	}
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+	for _, id := range applied {
+		delete(pendingRel[p.dir], id)
+	}
+	if len(pendingRel[p.dir]) == 0 {
+		delete(pendingRel, p.dir)
+	}
+}
+
+func (p *Pool) retryLater(id string) {
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+	if pendingRel[p.dir] == nil {
+		pendingRel[p.dir] = map[string]bool{}
+	}
+	pendingRel[p.dir][id] = true
+}
+
 // releaseAttempt records that a job's slot is released.
 func (p *Pool) releaseAttempt(id string) {
-	_ = p.with(func(st *poolState) error {
+	err := p.with(func(st *poolState) error {
 		s := st.sched()
 		a := s.Attempts[id]
 		if a == nil {
@@ -631,17 +739,31 @@ func (p *Pool) releaseAttempt(id string) {
 		s.sample(p.R, now)
 		return nil
 	})
+	if err != nil {
+		p.retryLater(id)
+	}
 }
 
 // settleHolders reconciles uncertain attempts on a VM against the holders
 // its helper just reported: an attempt of this machine none of them
 // matches has released.
-func (p *Pool) settleHolders(vm string, holders []protocol.Holder) {
+//
+// Only attempts that were already uncertain settleMargin before the probe
+// was sent are settled: a newer one may still be in the helper's hands
+// (it takes the token before it records the holder), or have become
+// uncertain after the helper answered.
+func (p *Pool) settleHolders(vm string, holders []protocol.Holder, probed time.Time) {
 	host, _ := os.Hostname()
 	_ = p.with(func(st *poolState) error {
 		s := st.sched()
+		settled := false
+		defer func() {
+			if settled {
+				s.sample(p.R, time.Now())
+			}
+		}()
 		for id, a := range s.Attempts {
-			if a.VM != vm || a.State != attUncertain {
+			if a.VM != vm || a.State != attUncertain || !a.LostAt.Before(probed.Add(-settleMargin)) {
 				continue
 			}
 			found := false
@@ -652,6 +774,7 @@ func (p *Pool) settleHolders(vm string, holders []protocol.Holder) {
 			}
 			if !found {
 				delete(s.Attempts, id)
+				settled = true
 			}
 		}
 		return nil

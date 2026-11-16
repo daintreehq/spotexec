@@ -1342,3 +1342,22 @@ func TestMaxInstancesUnsetMeansNoCeiling(t *testing.T) {
 		t.Errorf("min above a ceiling: %v", err)
 	}
 }
+
+func TestSchedulingSettings(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nidle_timeout = \"8m\"\n[runners.aws.scheduling]\nmode = \"latency\"\nspare_slots = 2\nearly_drain = true\nresult_retention = \"2m\"\n[runners.plain]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := g.Runners["aws"]
+	if r.SchedPolicy() != PolicyConsolidate || r.SchedMode() != ModeLatency || r.Scheduling.SpareSlots != 2 || !r.Scheduling.EarlyDrain || r.ResultRetention() != 2*time.Minute {
+		t.Fatalf("scheduling %+v", r.Scheduling)
+	}
+	if p := g.Runners["plain"]; p.SchedPolicy() != PolicyConsolidate || p.SchedMode() != ModeBalanced || p.ResultRetention() != 10*time.Minute {
+		t.Fatalf("defaults: policy %s mode %s retention %s", p.SchedPolicy(), p.SchedMode(), p.ResultRetention())
+	}
+	for _, bad := range []string{"policy = \"newest\"", "mode = \"fast\"", "spare_slots = -1", "result_retention = \"-1m\""} {
+		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n[runners.aws.scheduling]\n"+bad+"\n"); err == nil || !strings.Contains(err.Error(), "scheduling.") {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+}

@@ -79,7 +79,11 @@ type runnerStatus struct {
 	// Mismatch says why a fleet VM no longer satisfies the runner's
 	// current requirements: it takes no new runs and idles out.
 	Mismatch string `json:"mismatch,omitempty"`
-	r        *config.Runner
+	// Role is a fleet VM's placement role (retained, standby, draining),
+	// and why.
+	Role       string `json:"role,omitempty"`
+	RoleReason string `json:"role_reason,omitempty"`
+	r          *config.Runner
 	// reclaimed records a Spot interruption notice the VM reports.
 	reclaimed func()
 }
@@ -224,10 +228,14 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			}
 			fleets = append(fleets, fleetInstances{r, insts})
 			mismatch := fleetMismatches(ctx, f, insts)
+			roles := client.NewPool(r, f).Roles()
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
 				st := runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
 					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}}
+				if r.SchedPolicy() != config.PolicyLegacy {
+					st.Role, st.RoleReason = roles[in.ID].Role, roles[in.ID].Reason
+				}
 				if rc, ok := f.(provider.Reclaimer); ok {
 					st.reclaimed = func() { rc.Reclaimed(in) }
 				}
@@ -328,6 +336,8 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		}
 		if s.Mismatch != "" && state != "draining" {
 			state = "outdated" // explained below the table
+		} else if s.Role == "standby" && state == string(provider.StateRunning) {
+			state = "standby" // explained below the table
 		}
 		typ := s.Type
 		if s.r != nil && s.Info.Region != "" && (s.r.MultiRegion() || s.Info.Region != s.r.Region) {
@@ -348,6 +358,8 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		}
 		if s.Mismatch != "" {
 			fmt.Fprintf(w, "  %s: doesn't match the current config (%s): takes no new runs and terminates when idle\n", s.Name, s.Mismatch)
+		} else if s.Role == "standby" {
+			fmt.Fprintf(w, "  %s: standby (%s): its runs finish, new ones go to the retained VMs unless they're full, and it terminates when idle\n", s.Name, s.RoleReason)
 		}
 		if s.Helper == nil {
 			continue

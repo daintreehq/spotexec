@@ -92,8 +92,10 @@ type poolState struct {
 	// The requirements (provider.MatchKey) the notes' Mismatch reasons
 	// were judged against.
 	MatchKey string `json:"match_key,omitempty"`
-	// Sched: the reservation ledger and placement policy (sched.go).
-	Sched *schedState `json:"sched,omitempty"`
+	// Sched: the reservation ledger and placement policy (sched.go). Kept
+	// in its own file, sched.json, under the same lock: a binary from
+	// before it would otherwise drop it whenever it rewrote pool.json.
+	Sched *schedState `json:"-"`
 }
 
 // quotaBlocked reports the quota (or max_price) refusal that still holds
@@ -181,18 +183,44 @@ func (p *Pool) withCtx(ctx context.Context, fn func(st *poolState) error) error 
 			st.Notes = map[string]*note{}
 		}
 	}
+	origSched, _ := os.ReadFile(filepath.Join(p.dir, "sched.json"))
+	if len(origSched) > 0 {
+		var s schedState
+		if json.Unmarshal(origSched, &s) == nil {
+			st.Sched = &s
+		}
+	}
+	applied := p.applyPending(st)
 	if err := fn(st); err != nil {
 		return err
 	}
 	b, _ := json.MarshalIndent(st, "", "  ")
-	if bytes.Equal(b, orig) {
-		return nil // unchanged: skip the write (lots of read-only callers)
-	}
-	tmp := filepath.Join(p.dir, "pool.json.tmp"+strconv.Itoa(os.Getpid()))
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	if err := writeIfChanged(p.dir, "pool.json", b, orig); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(p.dir, "pool.json"))
+	if st.Sched == nil {
+		return nil
+	}
+	b, _ = json.MarshalIndent(st.Sched, "", "  ")
+	if err := writeIfChanged(p.dir, "sched.json", b, origSched); err != nil {
+		return err
+	}
+	p.pendingDone(applied)
+	return nil
+}
+
+// writeIfChanged atomically replaces dir/name with b, unless it already
+// holds exactly that (lots of read-only callers).
+func writeIfChanged(dir, name string, b, orig []byte) error {
+	if bytes.Equal(b, orig) {
+		return nil
+	}
+	tmp := filepath.Join(dir, name+".tmp"+strconv.Itoa(os.Getpid()))
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, name))
 }
 
 // readyGrace: how long after an instance is first seen ready its launch

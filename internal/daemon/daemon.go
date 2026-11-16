@@ -134,6 +134,7 @@ type fleet struct {
 	counted    map[string]time.Time         // already counted by the circuit breaker (when)
 	killing    map[string]string            // terminations to retry until gone (id -> reason)
 	retire     map[string]provider.Instance // warm VMs to drain remotely, until confirmed
+	roles      map[string]string            // placement role of each VM (client.Pool.WarmSet)
 	// Circuit breaker: replacements of instances that never became healthy.
 	failures []time.Time
 	paused   time.Time
@@ -501,6 +502,37 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		}
 		return running[i].ID < running[j].ID
 	})
+	// The placement policy picks the warm VMs (from the VMs it keeps
+	// placing work on), so the manager keeps alive what sx uses: warm ones
+	// first, then the rest of the retained set, then standby VMs (which
+	// are left to idle out). The legacy policy packs onto the oldest VMs,
+	// so then the oldest are warm.
+	if warmIDs, roles, err := fl.pool.WarmSet(ctx); err == nil {
+		fl.roles = roles
+		if warmIDs != nil {
+			order := map[string]int{}
+			for i, id := range warmIDs {
+				order[id] = i
+			}
+			rank := func(in provider.Instance) (int, int) {
+				if i, ok := order[in.ID]; ok {
+					return 0, i
+				}
+				if roles[in.ID] == "retained" {
+					return 1, 0
+				}
+				return 2, 0
+			}
+			sort.SliceStable(running, func(i, j int) bool {
+				ai, aj := rank(running[i])
+				bi, bj := rank(running[j])
+				if ai != bi {
+					return ai < bi
+				}
+				return aj < bj
+			})
+		}
+	}
 
 	// 2. Retire a warm instance shortly before max_lifetime, while its jobs
 	// can still finish, so the VM's hard stop never kills one and the
@@ -826,6 +858,11 @@ func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instan
 			defer wg.Done()
 			c := transport.New(in.Target, fl.r.WorkRoot)
 			if _, done := d.installed.Load(in.ID); !done && !c.HelperInstalled() {
+				if fl.roles[in.ID] == "standby" {
+					// Installing touches its idle clock: a surplus VM is left
+					// to idle out instead.
+					return
+				}
 				// A first contact uploads the helper, which over a slow link
 				// can outlast this round: install it in the background (once
 				// per VM) and probe once it's there, so a slow upload neither
