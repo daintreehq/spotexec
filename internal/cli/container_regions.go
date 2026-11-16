@@ -30,13 +30,13 @@ func cmdContainerRegions() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "regions [runner]",
 		Short: "Show the image tag this checkout builds and which of an AWS runner's regions hold it (pushed when) and its dependency archive",
-		Long: `Show the tag this checkout's Dockerfile resolves to and, in every region
+		Long: fmt.Sprintf(`Show the tag this checkout's Dockerfile resolves to and, in every region
 the runner launches in, whether ECR holds the image with that tag (and when
 it was pushed), whether the region's dependency cache holds the archive for
 it, and the other tags the region's repository keeps (ECR keeps a region's
-newest 10 images). Each region builds and keeps its own image, so a run that
+newest %d builds). Each region builds and keeps its own image, so a run that
 lands in a region without them builds the image and installs dependencies
-first. Nothing is created or changed.`,
+first. Nothing is created or changed.`, provider.ECRKeepBuilds),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load("")
@@ -227,7 +227,7 @@ func (v regionsView) writeText(w io.Writer) {
 
 // writeKept lists the other tags each region's repository keeps.
 func (v regionsView) writeKept(w io.Writer) {
-	fmt.Fprintf(w, "\nOther tags kept (ECR keeps a region's newest 10 images):\n")
+	fmt.Fprintf(w, "\nOther tags kept (ECR keeps a region's newest %d builds):\n", provider.ECRKeepBuilds)
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	rows, listed := 0, 0
 	var failed []string

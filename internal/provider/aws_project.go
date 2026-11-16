@@ -160,8 +160,8 @@ func ecrHint(err error) string {
 	return msg
 }
 
-// ecrPagesMax bounds a repository listing: a lifecycle policy keeps 10
-// images, so more pages than this means the answers don't end.
+// ecrPagesMax bounds a repository listing: a lifecycle policy keeps
+// ECRKeepBuilds builds, so more pages than this means the answers don't end.
 const ecrPagesMax = 20
 
 // projectImages lists the tagged images the region's repository for

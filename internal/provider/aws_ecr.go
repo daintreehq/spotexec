@@ -21,9 +21,26 @@ type ImageRegistry interface {
 	RegistryFor(ctx context.Context, repoID string) (*protocol.RegistryAuth, error)
 }
 
+// ECRKeepBuilds is how many builds each project's ECR repository keeps,
+// newest first.
+const ECRKeepBuilds = 3
+
+// ecrLifecyclePolicy keeps the newest ECRKeepBuilds builds. A build is one
+// tagged entry (BuildKit's index, or a copy's single manifest) plus the
+// untagged image and attestation manifests it references, so the count is
+// of tagged entries only: counting every entry would keep as many builds as
+// fit in the number, however many entries each push writes. ECR never
+// expires a manifest an index still references, so the untagged rule only
+// removes what an expired index (or a retagged one) left behind, a day on
+// so a push in flight isn't cut short.
+var ecrLifecyclePolicy = fmt.Sprintf(`{"rules":[`+
+	`{"rulePriority":1,"description":"keep the newest %[1]d spotexec builds","selection":{"tagStatus":"tagged","tagPatternList":["*"],"countType":"imageCountMoreThan","countNumber":%[1]d},"action":{"type":"expire"}},`+
+	`{"rulePriority":2,"description":"expire what older spotexec builds left untagged","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":1},"action":{"type":"expire"}}`+
+	`]}`, ECRKeepBuilds)
+
 // RegistryFor returns a short-lived ECR login for the repository
-// spotexec/<repo-id>, creating it (keeping the newest 10 images) on first
-// use. The token goes to the runner for one pull/push and is never stored
+// spotexec/<repo-id>, creating it (keeping the newest ECRKeepBuilds
+// builds) on first use. The token goes to the runner for one pull/push and is never stored
 // in its default docker config.
 func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.RegistryAuth, error) {
 	name := "spotexec/" + ecrName(repoID)
@@ -43,13 +60,12 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 			} `json:"repositories"`
 		}
 		err := a.ecr(ctx, "DescribeRepositories", map[string]any{"repositoryNames": []string{name}}, &desc)
-		policy := `{"rules":[{"rulePriority":1,"description":"keep the newest 10 spotexec images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}`
 		switch {
 		case err == nil && len(desc.Repositories) > 0:
 			uri = desc.Repositories[0].URI
 			// (Re)apply the expiry rule: a first run that created the
 			// repository may have failed before setting it.
-			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": policy}, nil); err != nil {
+			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": ecrLifecyclePolicy}, nil); err != nil {
 				return nil, fmt.Errorf("ECR lifecycle policy for %s: %w", name, err)
 			}
 		case err == nil || strings.Contains(err.Error(), "RepositoryNotFoundException"):
@@ -65,7 +81,7 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 				return nil, fmt.Errorf("creating ECR repository %s: %w", name, err)
 			}
 			uri = created.Repository.URI
-			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": policy}, nil); err != nil {
+			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": ecrLifecyclePolicy}, nil); err != nil {
 				return nil, fmt.Errorf("ECR lifecycle policy for %s: %w", name, err)
 			}
 			if uri == "" {
