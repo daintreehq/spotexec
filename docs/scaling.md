@@ -9,7 +9,7 @@ spotexec exists to take heavy commands off one developer's machine. It isn't bui
 A VM is cheap to keep busy and costly to start:
 
 - **The cold start.** Before its first command, a new VM boots, pulls the project image, restores dependencies, takes a full sync of the worktree and runs the project's setup step. On [Daintree](case-study-daintree.md#one-vm-per-part-the-lesson) that came to about 3 minutes per VM, more than twice as long as the 74 to 84 seconds of tests it was launched for.
-- **The idle tail.** After its last job, a VM keeps running, and billing, for `idle_timeout` (10 minutes by default) in case more work arrives.
+- **The idle tail.** After its last job, a VM keeps running, and billing, for `idle_timeout` (10 minutes by default) in case more work arrives. A VM the placement policy no longer needs (standby) ends sooner, after `scheduling.result_retention` (2 minutes): see [Early drain](POOL.md#early-drain).
 
 A warm VM pays neither. The next command sends only the files that changed and starts within seconds.
 
@@ -122,7 +122,7 @@ What it adds:
 - **Warm pools.** It keeps `min_instances` per fleet running and keeps their idle clocks fresh, so the first job of the day doesn't wait for a boot. The warm VMs are the ones `sx` keeps placing work on (the [retained set](POOL.md#placement-the-retained-set)), and its controller runs every pass, so surplus VMs go standby even between jobs. About 25 minutes before a warm VM's `max_lifetime`, it drains that VM and boots its replacement, one VM at a time, so warm capacity stays up.
 - **Faster interruption recovery.** It probes every instance every 30s. A VM with a Spot notice is drained, and its replacement launches during the 2-minute notice, not after the VM is gone.
 - **Health replacement.** A VM that stops answering for 8 minutes, or never finishes first-boot setup, is terminated and replaced. If *no* VM answers, the problem is probably your network, so it replaces at most one every 30 minutes. A fleet whose new VMs fail to come up three times in an hour is paused for an hour.
-- **Early drain** (opt-in). With `scheduling.early_drain = true`, a VM the placement policy no longer needs (standby) is shut down once it has been idle for `scheduling.result_retention`, rather than at `idle_timeout`. See [Early drain](POOL.md#early-drain).
+- **Early drain, sooner.** [Early drain](POOL.md#early-drain) (on by default) needs no pool manager, since each `sx` hands out the drains due as its job ends. The daemon's controller runs between jobs too, so surplus VMs go standby, and are drained, without waiting for the next job to end.
 - **Reaping.** It terminates VMs past `max_lifetime` (in case a watchdog failed), VMs stuck without an address, and leftover image-bake builders.
 
 A warm VM costs its Spot price for as long as the daemon runs. Stopping the daemon terminates nothing: warm VMs idle out after `idle_timeout` like any other.

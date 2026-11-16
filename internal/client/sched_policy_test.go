@@ -329,7 +329,6 @@ func TestFenceOfDeadProcessDropped(t *testing.T) {
 // is never placed on again, whatever the VM answers.
 func TestEarlyDrain(t *testing.T) {
 	p, f := schedPool(t, 3, 2)
-	p.R.Scheduling.EarlyDrain = true
 	now := time.Now()
 	setup := func(fn func(s *schedState)) {
 		p.loaded(t, func(st *poolState) {
@@ -351,11 +350,12 @@ func TestEarlyDrain(t *testing.T) {
 	if _, ok, _ := p.BeginDrain(ctx, "i-2"); ok {
 		t.Fatal("drained a retained VM")
 	}
-	p.R.Scheduling.EarlyDrain = false
+	off := false
+	p.R.Scheduling.EarlyDrain = &off
 	if _, ok, _ := p.BeginDrain(ctx, "i-0"); ok {
 		t.Fatal("drained with early_drain off")
 	}
-	p.R.Scheduling.EarlyDrain = true
+	p.R.Scheduling.EarlyDrain = nil // the default: on
 
 	// Something of this machine's on it: not drained.
 	id, err := p.reserveOn(f.insts[0], claim{Exact: true, Force: true})
@@ -418,7 +418,7 @@ func TestEarlyDrain(t *testing.T) {
 	}
 	p.FinishDrain("i-0", op, "drained", "")
 	var draining bool
-	p.loaded(t, func(st *poolState) { draining = st.Notes["i-0"].closed() })
+	p.loaded(t, func(st *poolState) { draining = st.Notes["i-0"].Draining })
 	if v := p.state(t).VMs["i-0"]; v.Role != roleDraining || !draining {
 		t.Fatalf("after drained: %+v, note closed %v", v, draining)
 	}

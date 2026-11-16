@@ -136,3 +136,116 @@ func drainingFile(root string) string {
 	}
 	return filepath.Join(root, "draining")
 }
+
+// DrainScheduled: the VM's watchdog will end it once it has been idle for
+// the operation's min-idle (schedule-drain).
+const DrainScheduled = "scheduled"
+
+// Scheduled drains: when an early drain is committed the VM is usually
+// still keeping its results, and no process may be left on the client to
+// ask again once they have been kept long enough. schedule-drain hands the
+// wait to the VM instead: it records the least idle time in drain_after,
+// and the watchdog (cloud-init) ends the VM once it has been idle that long
+// with no session holding its lifecycle lock, exactly as it would at
+// idle_timeout. The record only ever shortens the wait; it is written once
+// and never withdrawn (the client has already stopped placing on the VM).
+
+// drainAfterFile and featuresFile live beside the drain marker.
+func drainAfterFile(root string) string {
+	if onSpotexecVM() {
+		return filepath.Join(LifecycleDir, "drain_after")
+	}
+	return filepath.Join(root, "drain_after")
+}
+
+func featuresFile(root string) string {
+	if onSpotexecVM() {
+		return filepath.Join(LifecycleDir, "features")
+	}
+	return filepath.Join(root, "features")
+}
+
+// watchdogReadsDrainAfter reports whether this VM's watchdog acts on
+// drain_after (one booted before it existed has no features file). An
+// error other than the file's absence is returned: it proves nothing.
+func watchdogReadsDrainAfter(root string) (bool, error) {
+	b, err := os.ReadFile(featuresFile(root))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, f := range strings.Fields(string(b)) {
+		if f == "drain_after" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ScheduleDrain is `spotexec-helper schedule-drain`: it records that this
+// VM ends once idle for minIdle, and prints a TryDrainResult.
+func ScheduleDrain(w io.Writer, root, op string, minIdle time.Duration) error {
+	return json.NewEncoder(w).Encode(scheduleDrain(root, op, minIdle, hasLifecycleLock()))
+}
+
+func scheduleDrain(root, op string, minIdle time.Duration, ephemeral bool) TryDrainResult {
+	res := TryDrainResult{Op: op, IdleS: -1}
+	// What is already in place first: "unsupported" must never be the
+	// answer for a VM that has a drain scheduled (the client would put it
+	// back into service), even if a check below fails on a retry.
+	if draining(root) {
+		if b, err := os.ReadFile(drainOpFile(root)); err == nil && op != "" && strings.TrimSpace(string(b)) == op {
+			res.Result = DrainDone
+		} else {
+			res.Result = DrainAlready
+		}
+		return res
+	}
+	if _, err := os.Stat(drainAfterFile(root)); err == nil {
+		// Already scheduled (a retry whose answer was lost, or another
+		// operation): the first record stands.
+		res.Result = DrainScheduled
+		return res
+	} else if !errors.Is(err, os.ErrNotExist) {
+		res.Result, res.Detail = DrainBusy, "reading the drain schedule: "+err.Error()
+		return res
+	}
+	if !ephemeral {
+		res.Result = DrainUnsupported
+		return res
+	}
+	if ok, err := watchdogReadsDrainAfter(root); err != nil {
+		res.Result, res.Detail = DrainBusy, "reading the watchdog's features: "+err.Error()
+		return res
+	} else if !ok {
+		res.Result, res.Detail = DrainUnsupported, "this VM's watchdog predates scheduled drains"
+		return res
+	}
+	if minIdle < 0 {
+		minIdle = 0
+	}
+	secs := int64((minIdle + time.Second - 1) / time.Second)
+	if op != "" {
+		if err := os.WriteFile(drainOpFile(root), []byte(op+"\n"), 0o644); err != nil {
+			res.Result, res.Detail = DrainBusy, "recording the drain: "+err.Error()
+			return res
+		}
+	}
+	// Written whole, then renamed into place: the watchdog reads it
+	// without a lock.
+	p := drainAfterFile(root)
+	tmp := fmt.Sprintf("%s.%d", p, os.Getpid())
+	if err := os.WriteFile(tmp, []byte(fmt.Sprintf("%d\n", secs)), 0o644); err != nil {
+		res.Result, res.Detail = DrainBusy, "scheduling the drain: "+err.Error()
+		return res
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
+		res.Result, res.Detail = DrainBusy, "scheduling the drain: "+err.Error()
+		return res
+	}
+	res.Result = DrainScheduled
+	return res
+}

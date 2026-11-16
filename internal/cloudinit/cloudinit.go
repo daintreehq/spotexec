@@ -14,6 +14,12 @@
 // shuts down if it can take that lock exclusively (no session in progress) and
 // activity is stale; it writes /var/tmp/spotexec/draining first so helpers
 // refuse new work. The max_lifetime cap ignores the lock.
+//
+// Early drain: a VM the placement policy no longer needs gets
+// /var/tmp/spotexec/drain_after (spotexec-helper schedule-drain), a number
+// of seconds; the watchdog then ends it once idle that long instead of
+// idle_timeout, under the same lock. /var/tmp/spotexec/features tells the
+// helper this watchdog reads it.
 package cloudinit
 
 import (
@@ -87,14 +93,25 @@ chmod 0644 "$D/lifecycle.lock"
 chmod 0644 "$D/activity"
 echo "{{.IdleText}}" > "$D/idle_timeout"
 echo "{{.MaxSecs}}" > "$D/max_lifetime"   # the helper stops taking new runs shortly before it
-rm -f "$D/draining" "$D/ready"
+rm -f "$D/draining" "$D/ready" "$D/drain_after" "$D/drain_op"
+echo "drain_after" > "$D/features"   # what this watchdog understands (the helper checks)
+chmod 0644 "$D/features"
 
 # ---- 1. Idle watchdog (armed before anything else can fail) ----
 cat > /usr/local/sbin/spotexec-watchdog <<'WATCHDOG'
 #!/bin/bash
 D=/var/tmp/spotexec
 IDLE={{.IdleSecs}}
+LIMIT="{{.IdleText}}"
 MAXLIFE={{.MaxSecs}}
+# A scheduled early drain (spotexec-helper schedule-drain): this VM is
+# surplus and ends once idle this many seconds, when that is sooner.
+after=$(head -c 16 "$D/drain_after" 2>/dev/null | head -n 1)
+case "$after" in ''|*[!0-9]*) after= ;; esac
+if [ -n "$after" ] && [ "${#after}" -le 9 ] && [ "$after" -lt "$IDLE" ]; then
+  IDLE=$after
+  LIMIT="${after}s, surplus: early drain"
+fi
 now=$(date +%s)
 created=$(cat "$D/created_at" 2>/dev/null || echo "$now")
 destroy() {
@@ -127,7 +144,7 @@ idle_for() {
 exec 9<"$D/lifecycle.lock"
 flock -n -x 9 || exit 0
 [ "$(idle_for)" -ge "$IDLE" ] || exit 0
-destroy "idle for $(idle_for)s (limit {{.IdleText}})"
+destroy "idle for $(idle_for)s (limit $LIMIT)"
 WATCHDOG
 chmod 0755 /usr/local/sbin/spotexec-watchdog
 

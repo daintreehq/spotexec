@@ -228,3 +228,113 @@ func TestRenderClaimsStateDirForRoot(t *testing.T) {
 		}
 	})
 }
+
+// The watchdog ends a VM with a scheduled early drain once it has been idle
+// for drain_after, and any other VM only at idle_timeout. Run against a
+// copy of the rendered script with its directory and power-off swapped
+// out (and flock, logger and GNU stat shimmed where the host lacks them).
+func TestWatchdogScheduledDrain(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("no bash")
+	}
+	s, err := Render(Options{User: "ubuntu", PublicKey: "ssh-ed25519 AAAA test", IdleTimeout: 10 * time.Minute,
+		MaxLifetime: 12 * time.Hour, SelfDestruct: `touch "$D/destroyed"`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(s, "<<'WATCHDOG'\n")
+	end := strings.Index(s, "\nWATCHDOG\n")
+	if start < 0 || end < start {
+		t.Fatal("watchdog script not found")
+	}
+	dir := t.TempDir()
+	d := filepath.Join(dir, "state")
+	bin := filepath.Join(dir, "bin")
+	for _, p := range []string{d, bin} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := strings.Replace(s[start+len("<<'WATCHDOG'\n"):end], "D=/var/tmp/spotexec", "D="+strconv.Quote(d), 1)
+	wd := filepath.Join(dir, "watchdog")
+	shims := map[string]string{
+		"logger": "#!/bin/sh\nshift 2; echo \"$*\" >> \"" + d + "/log\"\n",
+		// $FLOCK_HELD: a session holds the lifecycle lock; $FLOCK_TOUCH: one
+		// ends (touching activity) while the watchdog waits for it.
+		"flock": "#!/bin/sh\n[ -n \"$FLOCK_TOUCH\" ] && touch \"" + d + "/activity\"\n[ -z \"$FLOCK_HELD\" ]\n",
+	}
+	if exec.Command("stat", "-c", "%Y", dir).Run() != nil {
+		shims["stat"] = "#!/bin/sh\nexec /usr/bin/stat -f %m \"$3\"\n" // BSD stat
+	}
+	for name, body := range shims {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(wd, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	created := strconv.FormatInt(time.Now().Add(-time.Hour).Unix(), 10)
+	var env []string
+	run := func(drainAfter string, idle time.Duration) (destroyed bool, log string) {
+		t.Helper()
+		for _, f := range []string{"destroyed", "draining", "log", "drain_after"} {
+			os.Remove(filepath.Join(d, f))
+		}
+		os.WriteFile(filepath.Join(d, "created_at"), []byte(created+"\n"), 0o644)
+		os.WriteFile(filepath.Join(d, "lifecycle.lock"), nil, 0o644)
+		act := filepath.Join(d, "activity")
+		os.WriteFile(act, nil, 0o644)
+		at := time.Now().Add(-idle)
+		os.Chtimes(act, at, at)
+		if drainAfter != "" {
+			os.WriteFile(filepath.Join(d, "drain_after"), []byte(drainAfter), 0o644)
+		}
+		cmd := exec.Command("bash", wd)
+		cmd.Env = append(append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH")), env...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("watchdog: %v: %s", err, out)
+		}
+		_, err := os.Stat(filepath.Join(d, "destroyed"))
+		b, _ := os.ReadFile(filepath.Join(d, "log"))
+		return err == nil, string(b)
+	}
+	if gone, log := run("", 3*time.Minute); gone {
+		t.Fatalf("a retained VM ended before idle_timeout: %s", log)
+	}
+	if gone, log := run("", 11*time.Minute); !gone || !strings.Contains(log, "limit 10m0s") {
+		t.Fatalf("idle past idle_timeout: %v %q", gone, log)
+	}
+	if gone, log := run("120\n", 3*time.Minute); !gone || !strings.Contains(log, "limit 120s, surplus: early drain") {
+		t.Fatalf("a scheduled drain idle past drain_after: %v %q", gone, log)
+	}
+	if _, err := os.Stat(filepath.Join(d, "draining")); err != nil {
+		t.Fatal("ended without the drain marker (acquires must refuse first)")
+	}
+	if gone, _ := run("120\n", time.Minute); gone {
+		t.Fatal("a scheduled drain ended inside drain_after")
+	}
+	for _, bad := range []string{"12x\n", "-5\n", "\n", "99999999999999\n"} {
+		if gone, _ := run(bad, 3*time.Minute); gone {
+			t.Fatalf("drain_after %q shortened the wait", bad)
+		}
+	}
+	if gone, _ := run("1800\n", 3*time.Minute); gone {
+		t.Fatal("a drain_after past idle_timeout ended the VM early")
+	}
+	if gone, log := run("1800\n", 11*time.Minute); !gone || !strings.Contains(log, "limit 10m0s") {
+		t.Fatalf("a drain_after past idle_timeout kept the VM past it: %v %q", gone, log)
+	}
+	// Never under a session, nor right after one ended.
+	env = []string{"FLOCK_HELD=1"}
+	if gone, _ := run("120\n", 3*time.Minute); gone {
+		t.Fatal("ended under a session")
+	}
+	if _, err := os.Stat(filepath.Join(d, "draining")); err == nil {
+		t.Fatal("marked draining under a session")
+	}
+	env = []string{"FLOCK_TOUCH=1"}
+	if gone, _ := run("120\n", 3*time.Minute); gone {
+		t.Fatal("ended just after a session touched activity")
+	}
+}

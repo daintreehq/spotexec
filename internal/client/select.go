@@ -33,7 +33,8 @@ type Lease struct {
 	ledger *ledgerRef
 }
 
-// Close releases the slot.
+// Close releases the slot, then hands the fleet's surplus VMs their early
+// drains (Pool.DrainSurplus).
 func (l *Lease) Close() {
 	if l == nil {
 		return
@@ -41,7 +42,9 @@ func (l *Lease) Close() {
 	if l.Sess != nil {
 		l.Sess.Close()
 	}
-	l.ledger.release()
+	if pool := l.ledger.release(); pool != nil {
+		pool.DrainSurplus()
+	}
 }
 
 // AcquireRequest bundles what selection needs.

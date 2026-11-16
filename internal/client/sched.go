@@ -129,6 +129,9 @@ type vmSched struct {
 	// DrainOp names the committed early drain (roleDrainRequested).
 	DrainOp string    `json:"drain_op,omitempty"`
 	DrainAt time.Time `json:"drain_at,omitempty"`
+	// DrainScheduled: the VM took the drain over (schedule-drain): its
+	// watchdog ends it once idle result_retention, so it isn't asked again.
+	DrainScheduled bool `json:"drain_scheduled,omitempty"`
 	// Price: the VM's hourly price in USD when known, and when it was seen.
 	Price   float64   `json:"price,omitempty"`
 	PriceAt time.Time `json:"price_at,omitempty"`
@@ -821,11 +824,14 @@ type ledgerRef struct {
 	id   string
 }
 
-func (l *ledgerRef) release() {
+// release releases the attempt, once; it returns its pool the first time.
+func (l *ledgerRef) release() *Pool {
 	if l != nil && l.pool != nil && l.id != "" {
 		l.pool.releaseAttempt(l.id)
 		l.id = ""
+		return l.pool
 	}
+	return nil
 }
 
 // forgetGone drops the records of VMs no longer listed (their attempts
