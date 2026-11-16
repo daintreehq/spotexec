@@ -997,3 +997,135 @@ func TestConfigVersion(t *testing.T) {
 		})
 	}
 }
+
+// A repository may tune a fleet, never loosen what the user's own runner
+// allows: its image, its price, or how long and how many VMs bill (#152).
+func TestProjectRunnerCannotLoosenBase(t *testing.T) {
+	g, err := loadGlobalText(t, `[runners.aws]
+type = "aws-spot"
+region = "us-east-1"
+max_price = "0.40"
+max_instances = 4
+idle_timeout = "10m"
+max_lifetime = "6h"
+[runners.open]
+type = "aws-spot"
+region = "us-east-1"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for body, want := range map[string]string{
+		"[runners.big]\nextends = \"aws\"\nami = \"ami-0123456789abcdef0\"\n": `"ami" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\non_demand_fallback = true\n":       `"on_demand_fallback" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"\"\n":                `max_price`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"0.41\"\n":            `max_price`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"lots\"\n":            `max_price`,
+		"[runners.big]\nextends = \"aws\"\nmax_instances = 5\n":               `max_instances`,
+		"[runners.big]\nextends = \"aws\"\nidle_timeout = \"11m\"\n":          `idle_timeout`,
+		"[runners.big]\nextends = \"aws\"\nmax_lifetime = \"7h\"\n":           `max_lifetime`,
+		"[runners.big]\nextends = \"open\"\nmax_lifetime = \"13h\"\n":         `max_lifetime`,
+		"[runners.big]\nextends = \"aws\"\nvolume_gb = 1000000\n":             `volume_gb`,
+		"[runners.aws]\nmax_instances = 40\n":                                 `max_instances`,
+	} {
+		if _, err := mergeProject(t, g, body); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want %q, got %v", body, want, err)
+		}
+	}
+	// Tightening is fine.
+	c, err := mergeProject(t, g, `[runners.big]
+extends = "aws"
+max_price = "0.25"
+max_instances = 2
+idle_timeout = "5m"
+max_lifetime = "2h"
+volume_gb = 200
+[runners.capped]
+extends = "open"
+max_price = "1.00"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := c.Global.Runners["big"]; r.MaxPrice != "0.25" || r.MaxInstances != 2 || r.IdleTimeout.Duration != 5*time.Minute || r.MaxLifetime.Duration != 2*time.Hour || r.VolumeGB != 200 {
+		t.Fatalf("big: %+v", r)
+	}
+	if r := c.Global.Runners["capped"]; r.MaxPrice != "1.00" {
+		t.Fatalf("capped: %+v", r)
+	}
+}
+
+// Wildcard instance_types narrow the base's types; they say nothing about
+// the architecture, so the base's arch stays (#152).
+func TestProjectTypePatternsKeepBaseArch(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.arm]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\narch = \"arm64\"\nvcpus = 8\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := mergeProject(t, g, `[runners.mem]
+extends = "arm"
+vcpus = 8
+instance_types = ["m*", "r*"]
+[runners.concrete]
+extends = "arm"
+instance_types = ["c7a.2xlarge"]
+[runners.explicit]
+extends = "arm"
+vcpus = 8
+instance_types = ["c*"]
+arch = "amd64"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"mem": "arm64", "concrete": "amd64", "explicit": "amd64"} {
+		if got := c.Global.Runners[name].Arch; got != want {
+			t.Errorf("%s: arch %q, want %q", name, got, want)
+		}
+	}
+}
+
+// Every duration in .spotexec.toml must be positive, and a task's pool must
+// name runners, like the project's (#152).
+func TestProjectDurationsAndTaskPools(t *testing.T) {
+	load := func(body string) (*Project, error) {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		if err := os.WriteFile(pp, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return LoadProject(pp)
+	}
+	for _, body := range []string{
+		"timeout = \"0s\"\n",
+		"timeout = \"-1m\"\n",
+		"grace_period = \"0s\"\n",
+		"grace_period = \"-1s\"\n",
+		"queue_timeout = \"0s\"\n",
+		"queue_timeout = \"-5m\"\n",
+		"[deps]\ntimeout = \"0s\"\n",
+		"[deps]\ntimeout = \"-1m\"\n",
+		"[container]\nimage = \"node:22\"\ntimeout = \"0s\"\n",
+		"[container]\nimage = \"node:22\"\ntimeout = \"-1m\"\n",
+		"[tasks.a]\nrun = \"x\"\ntimeout = \"0s\"\n",
+		"[tasks.a]\nrun = \"x\"\ntimeout = \"-1m\"\n",
+	} {
+		if _, err := load(body); err == nil || !strings.Contains(err.Error(), "must be positive") {
+			t.Errorf("%q: got %v", body, err)
+		}
+	}
+	if p, err := load("timeout = \"30m\"\n[tasks.a]\nrun = \"x\"\n"); err != nil || p.Timeout.Duration != 30*time.Minute || p.Tasks["a"].Timeout.Duration != 0 {
+		t.Errorf("positive and unset durations: %+v, %v", p, err)
+	}
+
+	g, err := loadGlobalText(t, "[runners.homelab]\ntype = \"ssh\"\nhost = \"box\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mergeProject(t, g, "[tasks.a]\nrun = \"x\"\npool = [\"homelab\", \"nope\"]\n"); err == nil || !strings.Contains(err.Error(), `task "a": pool references unknown runner "nope"`) {
+		t.Errorf("task pool: %v", err)
+	}
+	// A task pool naming a fleet this user can't back loads, like a project pool.
+	if _, err := mergeProject(t, g, "[runners.big]\nextends = \"aws\"\n[tasks.a]\nrun = \"x\"\npool = [\"big\"]\n"); err != nil {
+		t.Errorf("unavailable fleet in a task pool: %v", err)
+	}
+}
