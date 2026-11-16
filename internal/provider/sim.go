@@ -68,7 +68,7 @@ for b in systemctl systemd-run; do printf '#!/bin/sh\nexit 0\n' > /tmp/fakebin/$
 printf '%s' "$USER_DATA_B64" | base64 -d > /tmp/user-data.sh
 # Like cloud-init, user-data runs while the watchdog timer is already ticking.
 PATH=/tmp/fakebin:$PATH bash /tmp/user-data.sh >/var/log/spotexec-userdata.log 2>&1 &
-mkdir -p /var/tmp/spotexec/sim && chmod 1777 /var/tmp/spotexec/sim  # marks the simulator (no IMDS)
+mkdir -p /var/tmp/spotexec/sim  # marks the simulator (no IMDS); root-owned, or the helper ignores it
 chmod 1777 /simcache 2>/dev/null || true  # shared "S3" for the dependency cache
 while true; do
   sleep 2 & wait $!

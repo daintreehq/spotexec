@@ -59,4 +59,4 @@ spotexec version
 | `.spotexec/Dockerfile` | Project image from `spotexec init` or `spotexec container init`. |
 | `~/.cache/spotexec/` | Local SSH ControlMaster sockets (`cm/`) and helper install markers. |
 | Runner: `~/.cache/spotexec/` | Helper binary, slots, dependency caches (`work_root`). |
-| Runner: `/var/tmp/spotexec/`, `/var/log/spotexec-bootstrap.log` | Lifecycle state and bootstrap log on ephemeral VMs. |
+| Runner: `/var/tmp/spotexec/`, `/var/log/spotexec-bootstrap.log` | Lifecycle state and bootstrap log on ephemeral VMs. The helper treats a host as one of spotexec's VMs only when `/var/tmp/spotexec` is a real directory (not a symlink) owned by root and not writable by everyone, so another account on a shared SSH runner can't fake one. |

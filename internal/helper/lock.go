@@ -212,8 +212,8 @@ func touchActivity(root string) {
 			continue
 		}
 		// Rewriting the content (rather than utimes with explicit times) only
-		// needs write permission, so it works on the root-owned 0666 file that
-		// cloud-init creates.
+		// needs write permission, so it works on the root-owned file that
+		// cloud-init opens to the runner user's group.
 		_ = os.WriteFile(p, []byte(strconv.FormatInt(now.Unix(), 10)+"\n"), 0o666)
 	}
 }

@@ -50,25 +50,15 @@ func TestTrustedDir(t *testing.T) {
 			t.Errorf("%s: trustedDir = %v, want %v", tc.name, got, tc.want)
 		}
 	}
-	// The simulator's notice directory is 1777 by design: owned is enough.
-	if _, ok := ownedDir(open, uid); !ok {
-		t.Error("ownedDir refuses a world-writable directory its owner made")
-	}
-	if _, ok := ownedDir(link, uid); ok {
-		t.Error("ownedDir follows a symlink")
-	}
 }
 
-// A test run is never root, so nothing it (or any account but root) makes
-// at the lifecycle path turns the host into a spotexec VM.
+// Whatever an account other than root put at the lifecycle path (in CI,
+// usually nothing) never turns the host into a spotexec VM.
 func TestOnSpotexecVMNeedsRoot(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("running as root")
+	if trustedDir(LifecycleDir, 0) {
+		t.Skip("running on one of spotexec's VMs")
 	}
-	if fi, err := os.Lstat(LifecycleDir); err == nil {
-		t.Logf("%s exists (%s)", LifecycleDir, fi.Mode())
-	}
-	if _, ok := ownedDir(LifecycleDir, uint32(os.Getuid())); ok && onSpotexecVM() {
-		t.Fatal("a directory this account owns counts as spotexec's VM")
+	if onSpotexecVM() || simulated() {
+		t.Fatalf("%s isn't a directory root owns, yet counts as spotexec's VM", LifecycleDir)
 	}
 }
