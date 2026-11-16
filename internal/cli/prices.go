@@ -65,6 +65,7 @@ func cmdPrices() *cobra.Command {
 			}
 			k := g.Rank(t)
 			v := pricesView{r: r, t: t, k: k, cool: g.Cooldowns(t.Prices), held: g.HeldBack(t.Prices), project: project}
+			v.unreach, _ = g.RegionHolds()
 			v.next, v.hasNext = g.NextLaunch(t)
 			if asJSON {
 				return v.writeJSON(os.Stdout)
@@ -114,7 +115,8 @@ type pricesView struct {
 	t       provider.PriceTable
 	k       provider.Ranking // the options in launch order
 	cool    map[string]string
-	held    map[string]string // held back after a Spot interruption
+	held    map[string]string              // held back after a Spot interruption
+	unreach map[string]provider.RegionHold // regions this client can't reach: no launches there for now
 	next    provider.SpotPrice
 	hasNext bool
 }
@@ -149,6 +151,9 @@ func (v pricesView) writeJSON(w io.Writer) error {
 		"launch_order": v.k.Order, "prices": rows}
 	if v.k.Model != nil {
 		out["run_cost_model"] = v.k.Model
+	}
+	if len(v.unreach) > 0 {
+		out["launch_holds"] = v.unreach
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
@@ -198,7 +203,9 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 			break
 		}
 		mark, note := " ", ""
-		if why := v.cool[optionKey(sp)]; why != "" {
+		if _, ok := v.unreach[sp.Region]; ok {
+			note = "skipped for now: this client can't reach " + sp.Region + " (below)"
+		} else if why := v.cool[optionKey(sp)]; why != "" {
 			note = "skipped for now: " + why
 		} else if maxPrice > 0 && sp.USD() > maxPrice {
 			note = "above max_price " + r.MaxPrice.String()
@@ -235,6 +242,17 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 		fmt.Fprintln(tw, row+note)
 	}
 	tw.Flush()
+	if len(v.unreach) > 0 {
+		var keys []string
+		for rg := range v.unreach {
+			keys = append(keys, rg)
+		}
+		sort.Strings(keys)
+		fmt.Fprintf(w, "\nNo launches for now:\n")
+		for _, rg := range keys {
+			fmt.Fprintf(w, "  %s: %s\n", rg, v.unreach[rg].Why)
+		}
+	}
 	if len(t.Unpriced) > 0 {
 		var keys []string
 		for rg := range t.Unpriced {

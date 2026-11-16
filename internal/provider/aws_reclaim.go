@@ -117,8 +117,11 @@ func heldLast(ps []SpotPrice, held map[string]cooldown) []int {
 
 // coolMemory is how long after a cooldown ends its backoff step is kept.
 func coolMemory(key string) time.Duration {
-	if strings.HasPrefix(key, reclaimPrefix) {
+	switch {
+	case strings.HasPrefix(key, reclaimPrefix):
 		return reclaimHoldMax
+	case strings.HasPrefix(key, unreachPrefix):
+		return unreachHoldMax
 	}
 	return poolCoolMax
 }

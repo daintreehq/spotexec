@@ -62,6 +62,17 @@ type note struct {
 	// never placed on again, and not capacity, though the VM itself may
 	// not have agreed to drain yet.
 	Retiring bool `json:"retiring,omitempty"`
+	// Reached: when the VM last answered this client (any reply, even
+	// booting, draining or an error). Ready says it once served. Silent:
+	// when a probe last got no answer at all.
+	Reached time.Time `json:"reached,omitempty"`
+	Silent  time.Time `json:"silent,omitempty"`
+	// Reaping: when a process began ending the VM to make room (reach.go):
+	// no new runs go there meanwhile.
+	Reaping time.Time `json:"reaping,omitempty"`
+	// ReapCommitted: its termination request is going out: no claim at
+	// all, an exact slot's included, reserves it now.
+	ReapCommitted bool `json:"reap_committed,omitempty"`
 }
 
 // closed reports whether an instance takes no new runs and isn't capacity:
@@ -97,6 +108,9 @@ type poolState struct {
 	// The requirements (provider.MatchKey) the notes' Mismatch reasons
 	// were judged against.
 	MatchKey string `json:"match_key,omitempty"`
+	// Held: regions this client found it can't reach, and when it last
+	// asked the fleet to hold launches out of them (reach.go).
+	Held map[string]time.Time `json:"held,omitempty"`
 	// Sched: the reservation ledger and placement policy (sched.go). Kept
 	// in its own file, sched.json, under the same lock: a binary from
 	// before it would otherwise drop it whenever it rewrote pool.json.
@@ -439,7 +453,7 @@ func (p *Pool) Candidates(ctx context.Context, exclude map[string]bool) (out []p
 			if !n.closed() {
 				usable++
 			}
-			if n != nil && (n.closed() || now.Before(n.SuspectUntil) || now.Before(n.BusyUntil)) {
+			if n != nil && (n.closed() || n.reaping(now) || now.Before(n.SuspectUntil) || now.Before(n.BusyUntil)) {
 				continue
 			}
 			out = append(out, in)
@@ -468,9 +482,20 @@ const (
 	// outSkipped: not contacted, the ledger shows no room (or the policy no
 	// longer places work there).
 	outSkipped
+	// outRefused: the helper answered with an error this side doesn't
+	// recognize: judged like OutUnreachable, but it is an answer.
+	outRefused
+	// outDrainReply: the VM answered that it is draining (OutDraining is
+	// also recorded with no contact at all, after a termination).
+	outDrainReply
+	// outContact: the VM answered, and nothing else is recorded (an
+	// exclusive probe finding it partly busy; `spotexec status`).
+	outContact
 )
 
-// Observe records a probe result.
+// Observe records a probe result, and holds launches out of the VM's
+// region when it shows the client can't reach the region (or ends that
+// hold when the VM answered).
 func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 	if o == outSkipped {
 		return
@@ -481,21 +506,33 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 		switch o {
 		case OutAcquired:
 			n.markReady(now)
-			n.LastUsed, n.SuspectUntil, n.Failures = now, time.Time{}, 0
+			n.LastUsed, n.SuspectUntil, n.Failures, n.Reached = now, time.Time{}, 0, now
 		case OutBusy:
 			n.markReady(now)
 			n.SawFull = true
-			n.BusyUntil, n.SuspectUntil, n.Failures = now.Add(busyHintFor), time.Time{}, 0
+			n.BusyUntil, n.SuspectUntil, n.Failures, n.Reached = now.Add(busyHintFor), time.Time{}, 0, now
 		case OutDraining:
 			n.Draining = true
+		case outDrainReply:
+			n.Draining = true
+			n.Failures, n.Reached = 0, now
+		case outContact:
+			n.SuspectUntil, n.Failures, n.Reached = time.Time{}, 0, now
 		case OutBootFailed:
 			n.Draining, n.BootFailed = true, true
+			n.Failures, n.Reached = 0, now
 			if n.BootFailedAt.IsZero() {
 				n.BootFailedAt = now
 			}
 		case OutBooting:
 			n.BusyUntil = now.Add(2 * time.Second)
-		case OutUnreachable:
+			n.Failures, n.Reached = 0, now
+		case OutUnreachable, outRefused:
+			if o == OutUnreachable {
+				n.Silent = now
+			} else {
+				n.Reached = now
+			}
 			// A young instance is probably still booting sshd; an older one is
 			// suspect (but still counts toward capacity: unreachable is not
 			// absent).
@@ -506,6 +543,9 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 				n.SuspectUntil = now.Add(suspectFor)
 			}
 		}
+		// The fleet's hold is set under this lock too, so a reply and a
+		// failure observed at once can't leave it out of step with Held.
+		p.applyReach(p.judgeRegion(st, id, o, now))
 		return nil
 	})
 }
@@ -523,6 +563,9 @@ type LaunchDecision struct {
 	// every Spot price) blocks launches: the fleet can only serve from the
 	// VMs it already has.
 	QuotaErr string
+	// Reap: VMs to terminate before a launch can make room under
+	// max_instances: they are in a region this client can't reach.
+	Reap []string
 }
 
 // Plan decides, under the pool lock, whether this process should launch one
@@ -556,6 +599,11 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 				if n := st.Notes[l.InstanceID]; n != nil && (n.closed() || (n.Ready && (n.SawFull || readyFor(n) > readyGrace))) {
 					// Dying, or already serving (full, or ready a while):
 					// not capacity a waiting agent can count on.
+					continue
+				}
+				if listed[l.InstanceID] && p.lostVM(st, l.InstanceID, time.Now()) {
+					// Never reached, in a region this client can't reach: it
+					// won't serve, so another launch (elsewhere) may.
 					continue
 				}
 			}
@@ -598,6 +646,12 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = "waiting for instances being launched"
 		case !p.R.BelowMax(usable):
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
+			if id, region := p.reapable(st, time.Now()); id != "" {
+				d.Reap = []string{id}
+				n := st.note(id)
+				n.Reaping, n.ReapCommitted = time.Now(), false
+				d.Reason += fmt.Sprintf("; ending %s, in %s, which this client can't reach, to make room", id, region)
+			}
 		case p.R.Capped() && total >= 2*p.R.MaxInstances:
 			d.Reason = liveCapReason(st, p.R.MaxInstances)
 		case d.QuotaErr != "":
@@ -747,7 +801,9 @@ func (p *Pool) Cancel(id string) {
 // Reset forgets all local pool state (after `spotexec down`).
 func (p *Pool) Reset() {
 	_ = p.with(func(st *poolState) error {
-		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}}
+		// Held stays: the fleet's region holds outlive a teardown, and an
+		// answer from the region must still end them.
+		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}, Held: st.Held}
 		return nil
 	})
 }

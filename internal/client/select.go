@@ -326,10 +326,16 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				for _, c := range fleetCands[m] {
 					in := c.Instance
 					lease, holders, out := m.probeInstance(ctx, req, c, deadline)
+					if out == OutUnreachable && ctx.Err() != nil {
+						out = outSkipped // a cancelled probe proves nothing about the VM
+					}
 					if !(out == OutBusy && req.Base.Exclusive) {
-						// An exclusive probe finding a partly busy instance must
-						// not hide its free slots from everyone else.
 						m.pool.Observe(in.ID, out, in.LaunchedAt)
+					} else {
+						// An exclusive probe finding a partly busy instance must
+						// not hide its free slots from everyone else; it still
+						// answered.
+						m.pool.Observe(in.ID, outContact, in.LaunchedAt)
 					}
 					if lease != nil {
 						if m.shadow != nil {
@@ -448,6 +454,21 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			if err != nil {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
+			}
+			for _, id := range d.Reap {
+				if !m.pool.commitReap(id) {
+					continue // a run reserved it meanwhile
+				}
+				// At max_instances with VMs this client can't reach: end one,
+				// so the next round launches where it can. Marked draining
+				// only once the request succeeded, so a failed attempt is
+				// retried by the next round.
+				req.Rep.Warn("VM_UNREACHABLE", "%s: %s", m.r.Name, d.Reason)
+				tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				if err := m.pool.Fleet.Terminate(tctx, id); err == nil {
+					m.pool.Observe(id, OutDraining, time.Time{})
+				}
+				cancel()
 			}
 			if d.Live == 0 && d.Pending == 0 {
 				// No VM to wait for, and none will be launched.
@@ -607,7 +628,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	// Recorded in the fleet's ledger before any contact, so concurrent sx
 	// processes see the slot as taken while this acquire is in flight.
 	aid, rerr := m.pool.reserveOn(in, c.claim)
-	if errors.Is(rerr, errNoRoom) {
+	if errors.Is(rerr, errNoRoom) || errors.Is(rerr, errReaping) {
 		return nil, nil, outSkipped
 	}
 	sent := false
@@ -658,7 +679,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	case err == nil:
 		return nil, holders, OutBusy
 	case isDraining(err):
-		return nil, nil, OutDraining
+		return nil, nil, outDrainReply
 	case isCode(err, protocol.CodeBooting):
 		m.sawBooting(req.Rep, in, err)
 		return nil, nil, OutBooting
@@ -666,6 +687,8 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 		// The setup itself is broken: another VM would fail the same way.
 		m.fatal = err
 		return nil, nil, OutBootFailed
+	case isRefusal(err):
+		return nil, nil, outRefused // an answer, if not one this side knows
 	}
 	return nil, nil, OutUnreachable
 }
@@ -1016,7 +1039,11 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 		if syncing {
 			c.Worktree = ws.WorktreeKey
 		}
-		if id, err := pool.reserveOn(in, c); err == nil {
+		id, err := pool.reserveOn(in, c)
+		if errors.Is(err, errReaping) {
+			return nil, fmt.Errorf("%w: %s, which held it, is %v", ErrSlotGone, lr.InstanceID, err)
+		}
+		if err == nil {
 			aid = id
 			req.Base.Client.Attempt = aid
 			req.onSend = func() error {

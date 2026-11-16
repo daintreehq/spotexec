@@ -83,9 +83,14 @@ type runnerStatus struct {
 	// and why.
 	Role       string `json:"role,omitempty"`
 	RoleReason string `json:"role_reason,omitempty"`
-	r          *config.Runner
+	// LaunchHolds: the regions a fleet launches nothing into for now, and
+	// why (on the fleet's first row).
+	LaunchHolds map[string]provider.RegionHold `json:"launch_holds,omitempty"`
+	r           *config.Runner
 	// reclaimed records a Spot interruption notice the VM reports.
 	reclaimed func()
+	// answered: this status request reached the VM over SSH.
+	answered bool
 }
 
 const (
@@ -206,6 +211,13 @@ func fleetMismatches(ctx context.Context, f provider.Fleet, insts []provider.Ins
 func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []runnerStatus {
 	var rows []runnerStatus
 	var fleets []fleetInstances
+	// Fleets that keep region holds: their pool, and their first row.
+	type holder struct {
+		rh    provider.RegionHolder
+		pool  *client.Pool
+		first int
+	}
+	var holders []holder
 	for _, r := range rs {
 		p, err := provider.New(r)
 		if err != nil {
@@ -218,6 +230,7 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, Error: err.Error(), r: r, Info: provider.Info{State: provider.StateUnknown}})
 				continue
 			}
+			first := len(rows)
 			if len(insts) == 0 {
 				detail := "0 instances; scales on demand"
 				if r.Capped() {
@@ -228,7 +241,8 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			}
 			fleets = append(fleets, fleetInstances{r, insts})
 			mismatch := fleetMismatches(ctx, f, insts)
-			roles := client.NewPool(r, f).Roles()
+			pool := client.NewPool(r, f)
+			roles := pool.Roles()
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
 				st := runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
@@ -240,6 +254,9 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 					st.reclaimed = func() { rc.Reclaimed(in) }
 				}
 				rows = append(rows, st)
+			}
+			if rh, ok := f.(provider.RegionHolder); ok && len(rows) > first {
+				holders = append(holders, holder{rh, pool, first})
 			}
 			continue
 		}
@@ -275,6 +292,10 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				return
 			}
 			b, err := c.HelperCmd(cctx, "status")
+			// Reached it, even if its helper failed (an existing SSH master
+			// may answer for a connection that is gone: only the command
+			// says, and one cut short by the deadline says nothing).
+			st.answered = err == nil || (!transport.IsConnError(err) && cctx.Err() == nil)
 			if err != nil {
 				st.Error = err.Error()
 				return
@@ -293,6 +314,17 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 		}()
 	}
 	wg.Wait()
+	// A VM that answered ends its region's hold; the holds left are shown.
+	for _, h := range holders {
+		for i := h.first; i < len(rows) && rows[i].Fleet == rows[h.first].Fleet; i++ {
+			if rows[i].answered {
+				h.pool.Reached(provider.Instance{ID: rows[i].Info.InstanceID, Region: rows[i].Info.Region})
+			}
+		}
+		if holds, _ := h.rh.RegionHolds(); len(holds) > 0 {
+			rows[h.first].LaunchHolds = holds
+		}
+	}
 	return rows
 }
 
@@ -353,6 +385,14 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 	}
 	tw.Flush()
 	for _, s := range sts {
+		var held []string
+		for rg := range s.LaunchHolds {
+			held = append(held, rg)
+		}
+		sort.Strings(held)
+		for _, rg := range held {
+			fmt.Fprintf(w, "  %s: no launches into %s: %s\n", s.Fleet, rg, s.LaunchHolds[rg].Why)
+		}
 		if s.Error != "" {
 			fmt.Fprintf(w, "  %s: %s\n", s.Name, s.Error)
 		}

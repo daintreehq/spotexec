@@ -48,6 +48,17 @@ takes part in scheduling, and every VM shuts itself down.
    - An instance that cannot be reached stays in the cache and still counts
      as capacity, but isn't probed again for 3s, or for 30s once it is
      older than `boot_timeout` and has failed to answer twice in a row.
+   - When none of a region's VMs answered its last probe, and either two or
+     more past `boot_timeout` have failed twice in a row or one has never
+     answered since its launch, the region is held as **unreachable from
+     this client** (the cloud's own health checks may still pass: it is
+     this machine's network path that failed). New launches skip it until
+     any VM there answers again. A hold with no answer lapses after 10
+     minutes; one VM may then launch there to try it, and if that one never
+     answers either the region is held again, twice as long (up to an
+     hour). A never-reached VM in a held region stops covering waiting
+     jobs at once, so their launch goes elsewhere. `spotexec status` and
+     `spotexec prices` say which regions are held and why.
 3. **Queue and scale out.** If every slot is busy, the job takes a ticket in
    a fair local queue (priority, then arrival; `queue.go`) and registers as
    demand on each fleet (a waiter file under `waiters/`). Under `pool.lock`,
@@ -58,6 +69,11 @@ takes part in scheduling, and every VM shuts itself down.
    - Draining and outdated VMs don't count toward `max_instances`, but
      with one set, launches pause while twice `max_instances` VMs are
      alive, until some end; the wait reason counts the draining and outdated VMs holding them.
+   - A fleet at `max_instances` with jobs waiting ends one VM at a time in
+     a region held as unreachable (one that failed its last probes and
+     has none of this machine's runs on it), so the launch can go to a
+     region it can reach. It doesn't when every region is held: those VMs
+     are how the region is seen to answer again.
    - Ledger entries record the launching PID, so a dead `sx` frees its
      reservation; an ambiguous launch (the request may have created an
      instance) keeps its reservation until listings can show it.
