@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -141,14 +142,14 @@ func TestBootFailureWaitsForBusyRunner(t *testing.T) {
 func TestBootFailureAloneFailsAtOnce(t *testing.T) {
 	pool := fleetsOf(t, map[string][]string{"broken": {"a1"}})
 	scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) { return nil, bootFailed() })
-	start := time.Now()
-	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: nopRep{}})
+	rep := &recRep{}
+	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: rep})
 	WaitLaunches(5 * time.Second)
 	if err == nil {
 		t.Fatal("acquire succeeded on a broken setup")
 	}
-	if took := time.Since(start); took > 5*time.Second {
-		t.Fatalf("took %s to fail", took)
+	if slices.Contains(rep.events, "queued") || slices.Contains(rep.events, "scale_out") {
+		t.Fatalf("queued or launched before failing: %v", rep.events)
 	}
 	if want := "broken: BOOTSTRAP_FAILED"; !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "fix bootstrap_script, then `spotexec down broken`") || !isCode(err, protocol.CodeBootFailed) {
 		t.Fatalf("error = %v", err)
@@ -159,13 +160,84 @@ func TestBootFailureAloneFailsAtOnce(t *testing.T) {
 func TestBootFailureEverywhereFailsAtOnce(t *testing.T) {
 	pool := fleetsOf(t, map[string][]string{"broken": {"a1"}, "healthy": {"b1"}})
 	scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) { return nil, bootFailed() })
-	start := time.Now()
-	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: nopRep{}})
+	rep := &recRep{}
+	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: rep})
 	WaitLaunches(5 * time.Second)
 	if err == nil || !isCode(err, protocol.CodeBootFailed) {
 		t.Fatalf("error = %v", err)
 	}
-	if took := time.Since(start); took > 5*time.Second {
+	if slices.Contains(rep.events, "queued") || slices.Contains(rep.events, "scale_out") {
+		t.Fatalf("queued or launched before failing: %v", rep.events)
+	}
+}
+
+// A broken fleet that had already registered demand (it was busy at first)
+// withdraws it once its setup is found broken, so it doesn't count toward
+// launches while the run waits for the healthy runner.
+func TestBootFailureWithdrawsDemand(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"broken": {"a1"}, "healthy": {"b1"}}, 0)
+	broken, healthy := NewPool(pool[0], fleets["broken"]), NewPool(pool[1], fleets["healthy"])
+	afterFail, brokenDemand, healthyDemand := 0, -1, -1
+	var h *helperScript
+	h = scriptHelpers(t, func(_ AcquireRequest, host string, n int) (*Lease, error) {
+		if host == "a1" {
+			if n == 1 {
+				return nil, nil // busy: the run queues, registering demand
+			}
+			return nil, bootFailed()
+		}
+		if h.count("a1") < 2 {
+			return nil, nil
+		}
+		// The broken fleet is withdrawn after the round that found it.
+		if afterFail++; afterFail < 2 {
+			return nil, nil
+		}
+		brokenDemand, healthyDemand = broken.waiterDemand(), healthy.waiterDemand()
+		return &Lease{}, nil
+	})
+	if _, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: nopRep{}}); err != nil {
+		t.Fatal(err)
+	}
+	WaitLaunches(5 * time.Second)
+	if brokenDemand != 0 || healthyDemand != 1 {
+		t.Fatalf("demand while waiting: broken %d, healthy %d; want 0, 1", brokenDemand, healthyDemand)
+	}
+}
+
+// A broken fleet's other VMs don't keep the pool looking reachable: with
+// nothing else able to serve (no launches allowed), the run fails promptly
+// instead of queueing until it times out, and they are never probed.
+func TestBootFailureNoBootFailsPromptly(t *testing.T) {
+	pool := fleetsOf(t, map[string][]string{"broken": {"a1", "a2"}, "healthy": {}})
+	h := scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) { return nil, bootFailed() })
+	start := time.Now()
+	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: nopRep{}, NoBoot: true})
+	if err == nil || !strings.Contains(err.Error(), "BOOTSTRAP_FAILED") || !strings.Contains(err.Error(), "spotexec down broken") {
+		t.Fatalf("error = %v", err)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Fatalf("took %s to fail", took)
+	}
+	if n := h.count("a2"); n != 0 {
+		t.Fatalf("broken fleet's other VM probed %d times", n)
+	}
+}
+
+// A broken fleet with VMs left, beside a fleet that can't launch (quota):
+// nothing can serve, so the run fails promptly with what to fix.
+func TestBootFailureBesideQuotaFailsPromptly(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"broken": {"a1", "a2"}, "healthy": {}}, 2)
+	fleets["healthy"].fail = quotaErr()
+	scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) { return nil, bootFailed() })
+	start := time.Now()
+	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: nopRep{}})
+	took := time.Since(start)
+	WaitLaunches(5 * time.Second)
+	if err == nil || strings.Contains(err.Error(), protocol.CodeQueueTimeout) {
+		t.Fatalf("error = %v", err)
+	}
+	if took > 15*time.Second {
 		t.Fatalf("took %s to fail", took)
 	}
 }

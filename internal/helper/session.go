@@ -204,6 +204,23 @@ func perr(code, format string, a ...any) error {
 	return &protoError{code: code, msg: fmt.Sprintf(format, a...)}
 }
 
+// stoppingNow is systemStopping (tests stand in for the VM shutting down).
+var stoppingNow = systemStopping
+
+// cutShort reports a dependency install or image build that failed as the
+// VM began shutting down under it (dockerd stopped, the install killed) as
+// the runner shutting down, not the build failing: a client's runs waiting
+// on that build then hand it to one of them, rather than all building at
+// once as for a build that would fail again (#162), and the run is
+// replayed elsewhere.
+func cutShort(err error) error {
+	var pe *protoError
+	if errors.As(err, &pe) && (pe.code == protocol.CodeDepsFailed || pe.code == protocol.CodeImageFailed) && stoppingNow() {
+		return &protoError{code: protocol.CodeShutdown, msg: "the runner is shutting down: " + pe.msg, detail: pe.detail}
+	}
+	return err
+}
+
 func (s *Session) readLoop() {
 	for {
 		f, err := s.c.ReadFrame()
@@ -353,7 +370,7 @@ func (s *Session) dispatch(env protocol.Envelope) error {
 		if err := env.Unmarshal(&d); err != nil {
 			return err
 		}
-		return s.deps(d)
+		return cutShort(s.deps(d))
 	case protocol.TypeExec:
 		var e protocol.Exec
 		if err := env.Unmarshal(&e); err != nil {
@@ -371,7 +388,7 @@ func (s *Session) dispatch(env protocol.Envelope) error {
 		if err := env.Unmarshal(&m); err != nil {
 			return err
 		}
-		return s.image(m)
+		return cutShort(s.image(m))
 	case protocol.TypePull:
 		var p protocol.Pull
 		if err := env.Unmarshal(&p); err != nil {
