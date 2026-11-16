@@ -218,7 +218,8 @@ var trixieFrom = map[string]struct {
 // image publishes one for it, else on bookworm. A partial version (20, 3.12)
 // is the newest release with that prefix, and a name (lts, current) or a
 // version shorter than a line (golang's and rust's "1") follows the newest
-// line, which has trixie.
+// line, which has trixie. version comes from the scaffold's own parsers, so
+// the only names it can be are node's lts and current.
 func debianTag(image, version string) string {
 	if hasTrixie(image, version) {
 		return version + "-trixie"
@@ -227,7 +228,10 @@ func debianTag(image, version string) string {
 }
 
 func hasTrixie(image, version string) bool {
-	t := trixieFrom[image]
+	t, ok := trixieFrom[image]
+	if !ok {
+		return false
+	}
 	if !exactVer.MatchString(version) {
 		return true
 	}

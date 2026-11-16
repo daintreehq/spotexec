@@ -41,6 +41,7 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		{map[string]string{"requirements.txt": "", ".python-version": "3.12.11\n"}, "FROM python:3.12.11-trixie", "", "Python 3.12.11"},
 		{map[string]string{"Cargo.toml": "", "rust-toolchain.toml": "[toolchain]\nchannel = \"1.88.0\"\n"}, "FROM rust:1.88.0-trixie", "", "Rust 1.88.0"},
 		{map[string]string{"Cargo.toml": ""}, "FROM rust:1-trixie", "", "Rust 1"},
+		{map[string]string{"go.mod": "module x\n\ngo 1.25.3\n", "package.json": `{}`, "package-lock.json": "", ".nvmrc": "18.19.0"}, "FROM node:18.19.0-bookworm", "COPY --from=golang:1.25.3-trixie /usr/local/go", "Node.js 18.19.0 + Go 1.25.3"},
 		{map[string]string{"go.mod": "module x\n\ngo 1.24.2\n", "package.json": `{}`, "package-lock.json": ""}, "FROM node:24-trixie", "COPY --from=golang:1.24.2-bookworm /usr/local/go", "Node.js 24 + Go 1.24.2"},
 		{map[string]string{"pom.xml": "<properties><maven.compiler.release>17</maven.compiler.release></properties>"}, "FROM eclipse-temurin:17-jdk", "git maven", "Java 17, Maven"},
 		{map[string]string{"build.gradle.kts": "java { toolchain { languageVersion = JavaLanguageVersion.of(23) } }"}, "FROM eclipse-temurin:23-jdk", "", "Java 23, Gradle wrapper"},
@@ -120,6 +121,7 @@ func TestDebianTag(t *testing.T) {
 		{"rust", "1.87.0", "1.87.0-bookworm"},
 		{"rust", "1.88", "1.88-trixie"},
 		{"rust", "1.100.0", "1.100.0-trixie"},
+		{"oven/bun", "1", "1-bookworm"},
 	} {
 		if got := debianTag(c.image, c.version); got != c.want {
 			t.Errorf("debianTag(%q, %q) = %q, want %q", c.image, c.version, got, c.want)
