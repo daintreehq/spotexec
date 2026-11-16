@@ -19,16 +19,18 @@ The Dockerfile is commented and pinned as precisely as the repository allows:
 
 | Stack | Base image |
 | --- | --- |
-| Node.js (npm, pnpm, Yarn) | `node:<version>-bookworm`. The version comes from `.node-version`, `.nvmrc` (including `lts/<name>`), `.tool-versions` or `volta.node`, exact where they give one, else the major of `engines.node`, else 24. The package manager is pinned from `packageManager`: pnpm and npm with `npm install -g`, Yarn through Corepack. Without one, pnpm's major follows the lockfile format and Yarn is 1. |
+| Node.js (npm, pnpm, Yarn) | `node:<version>-trixie`. The version comes from `.node-version`, `.nvmrc` (including `lts/<name>`), `.tool-versions` or `volta.node`, exact where they give one, else the major of `engines.node`, else 24. The package manager is pinned from `packageManager`: pnpm and npm with `npm install -g`, Yarn through Corepack. Without one, pnpm's major follows the lockfile format and Yarn is 1. |
 | Bun | `oven/bun:<version>`, from `packageManager`, `.bun-version` or `.tool-versions`, else `1` |
-| Python with uv | `python:<version>-bookworm` plus the `uv` binary. The version comes from `.python-version` or `.tool-versions` (exact where given), else the lower bound of `requires-python`, else 3.12. uv is pinned when `[tool.uv] required-version` names one version. |
-| Python | `python:<version>-bookworm`, found the same way |
-| Go | `golang:<version>-bookworm`, from go.mod's `toolchain` line, else its `go` line |
-| Rust | `rust:<version>-bookworm`, with a numeric version from `rust-toolchain(.toml)` (otherwise `1`), plus clippy and rustfmt |
+| Python with uv | `python:<version>-trixie` plus the `uv` binary. The version comes from `.python-version` or `.tool-versions` (exact where given), else the lower bound of `requires-python`, else 3.12. uv is pinned when `[tool.uv] required-version` names one version. |
+| Python | `python:<version>-trixie`, found the same way |
+| Go | `golang:<version>-trixie`, from go.mod's `toolchain` line, else its `go` line |
+| Rust | `rust:<version>-trixie`, with a numeric version from `rust-toolchain(.toml)` (otherwise `1`), plus clippy and rustfmt |
 | Maven / Gradle | `eclipse-temurin:<major>-jdk`, from `.java-version`, `.sdkmanrc`, `.tool-versions`, or the build's release / toolchain setting, else 21; plus `maven` when there's no `./mvnw` (Gradle projects use `./gradlew`) |
 | Anything else | `ubuntu:24.04` with build-essential (`container init` only) |
 
 Every image except the Java one, whose base image already sets `en_US.UTF-8`, sets `LANG=C.UTF-8` as GitHub's Linux runners do, so tools that read the locale (Python's default encoding, `sort` collation, `Intl` defaults) see the same UTF-8 locale as in CI.
+
+The Debian-based images use trixie (Debian 13) wherever the official image publishes it for the detected version, and bookworm for older releases that never got a trixie variant (such as Node.js 18 and 22.17, Python 3.12.10, Go 1.24.5 and Rust 1.87).
 
 The image is built on the first toolchain in that order. When the repository also has a `go.mod` or a `uv.lock`, Go, or uv with its Python, is added to the image too; any other toolchain it uses is named in a comment and in the command's output, for you to add. The `[deps]` install that `init` writes uses the same package manager as the image (`packageManager` wins over a leftover lockfile).
 
@@ -50,7 +52,7 @@ The repository is per region, and so is the [dependency archive](#dependency-cac
 ```toml
 [container]
 dockerfile = ".spotexec/Dockerfile"   # built on the runner; or:
-# image = "node:22-bookworm"          # pulled as-is
+# image = "node:22-trixie"            # pulled as-is
 # context = "."                       # default: the Dockerfile's directory
 # options = ["--shm-size=1g"]         # extra `docker run` arguments
 # network = "private"                 # "host" (default: the runner's network) or "private" (one per run)

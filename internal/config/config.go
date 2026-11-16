@@ -393,7 +393,7 @@ func (t *Task) Describe() string {
 // Container is [container]: run every command (and the dependency install)
 // inside this image on the runner.
 type Container struct {
-	Image      string   `toml:"image"`      // pull this image (e.g. "node:22-bookworm")
+	Image      string   `toml:"image"`      // pull this image (e.g. "node:22-trixie")
 	Dockerfile string   `toml:"dockerfile"` // or build this Dockerfile (repo-relative)
 	Context    string   `toml:"context"`    // build context (default: the Dockerfile's directory)
 	Options    []string `toml:"options"`    // extra `docker run` arguments

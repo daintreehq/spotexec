@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -196,6 +197,82 @@ const (
 var ltsNodes = map[string]string{
 	"argon": "4", "boron": "6", "carbon": "8", "dubnium": "10", "erbium": "12", "fermium": "14",
 	"gallium": "16", "hydrogen": "18", "iron": "20", "jod": "22", "krypton": "24",
+}
+
+// trixieFrom says where each official image starts publishing Debian 13
+// (trixie) variants: every release of line all and later, plus, on older
+// lines, every release from the one given. A line is the major for node and
+// major.minor for the others. Lines older than all and not listed only ever
+// got bookworm (e.g. node 18, 21 and 23, python 3.8, golang 1.23, rust 1.87).
+var trixieFrom = map[string]struct {
+	all   string
+	lines map[string]string
+}{
+	"node":   {"25", map[string]string{"20": "20.19.4", "22": "22.18.0", "24": "24.5.0"}},
+	"python": {"3.14", map[string]string{"3.9": "3.9.23", "3.10": "3.10.18", "3.11": "3.11.13", "3.12": "3.12.11", "3.13": "3.13.6"}},
+	"golang": {"1.25", map[string]string{"1.24": "1.24.6"}},
+	"rust":   {"1.88", nil},
+}
+
+// debianTag is image's tag for version on Debian trixie when the official
+// image publishes one for it, else on bookworm. A partial version (20, 3.12)
+// is the newest release with that prefix, and a name (lts, current) or a
+// version shorter than a line (golang's and rust's "1") follows the newest
+// line, which has trixie.
+func debianTag(image, version string) string {
+	if hasTrixie(image, version) {
+		return version + "-trixie"
+	}
+	return version + "-bookworm"
+}
+
+func hasTrixie(image, version string) bool {
+	t := trixieFrom[image]
+	if !exactVer.MatchString(version) {
+		return true
+	}
+	n := 2
+	if image == "node" {
+		n = 1
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < n {
+		return true
+	}
+	line := strings.Join(parts[:n], ".")
+	if versionAtLeast(line, t.all) {
+		return true
+	}
+	first, ok := t.lines[line]
+	if !ok {
+		return false
+	}
+	// Compare only as many parts as version names: 22.18 floats to 22.18.x,
+	// whose newest release is on or past 22.18.0.
+	fp := strings.Split(first, ".")
+	if len(fp) > len(parts) {
+		fp = fp[:len(parts)]
+	}
+	return versionAtLeast(version, strings.Join(fp, "."))
+}
+
+// versionAtLeast compares dotted numeric versions part by part (a missing
+// part counts as 0).
+func versionAtLeast(v, min string) bool {
+	a, b := strings.Split(v, "."), strings.Split(min, ".")
+	for i := 0; i < len(a) || i < len(b); i++ {
+		var x, y int
+		if i < len(a) {
+			x, _ = strconv.Atoi(a[i])
+		}
+		if i < len(b) {
+			y, _ = strconv.Atoi(b[i])
+		}
+		if x != y {
+			return x > y
+		}
+	}
+	return true
 }
 
 func readSmall(root, name string) string {
@@ -447,7 +524,7 @@ RUN apt-get update \
 	case pm != "" || pkg != nil:
 		node := nodeVersion(root, pkg)
 		stack, primary = "Node.js "+node, "js"
-		body = fmt.Sprintf("FROM node:%s-bookworm\n", node)
+		body = fmt.Sprintf("FROM node:%s\n", debianTag("node", node))
 		switch {
 		case pm == "pnpm":
 			v := pmVer
@@ -484,7 +561,7 @@ RUN npm install -g npm@%s && npm cache clean --force
 	case exists(root, "uv.lock"):
 		py, uv := pythonVersion(root), uvVersion(root)
 		stack, primary = "Python "+py+", uv", "python"
-		body = fmt.Sprintf(`FROM python:%s-bookworm
+		body = fmt.Sprintf(`FROM python:%s
 
 # uv (pinned from [tool.uv] required-version when it names one exact version).
 COPY --from=ghcr.io/astral-sh/uv:%s /uv /uvx /usr/local/bin/
@@ -492,26 +569,26 @@ COPY --from=ghcr.io/astral-sh/uv:%s /uv /uvx /usr/local/bin/
 # Use the image's Python; copy (not hardlink) out of uv's cache.
 ENV UV_PYTHON_DOWNLOADS=never \
     UV_LINK_MODE=copy
-`, py, uv)
+`, debianTag("python", py), uv)
 	case exists(root, "pyproject.toml") || exists(root, "requirements.txt") || exists(root, "setup.py"):
 		py := pythonVersion(root)
 		stack, primary = "Python "+py, "python"
-		body = fmt.Sprintf(`FROM python:%s-bookworm
+		body = fmt.Sprintf(`FROM python:%s
 
 # Commands run as a non-root user, so install packages into a virtualenv in
 # the workspace (and list it in [deps] cache_dirs), or bake them in here:
 # RUN pip install --no-cache-dir pytest
-`, py)
+`, debianTag("python", py))
 	case exists(root, "go.mod"):
 		gv := goVersion(root)
 		stack, primary = "Go "+gv, "go"
-		body = fmt.Sprintf(`FROM golang:%s-bookworm
+		body = fmt.Sprintf(`FROM golang:%s
 
 # Keep the module and build caches in the slot's persistent HOME, so they
 # survive between runs (the container itself is thrown away each time).
 ENV GOMODCACHE=/home/spotexec/go/pkg/mod \
     GOCACHE=/home/spotexec/.cache/go-build
-`, gv)
+`, debianTag("golang", gv))
 	case exists(root, "Cargo.toml"):
 		rv := "1"
 		for _, f := range []string{"rust-toolchain.toml", "rust-toolchain"} {
@@ -526,7 +603,7 @@ ENV GOMODCACHE=/home/spotexec/go/pkg/mod \
 			}
 		}
 		stack, primary = "Rust "+rv, "rust"
-		body = fmt.Sprintf(`FROM rust:%s-bookworm
+		body = fmt.Sprintf(`FROM rust:%s
 
 # Components are installed as root: keep the toolchain writable for the
 # non-root user, as the base image does. Install extra tools system-wide:
@@ -537,7 +614,7 @@ RUN rustup component add clippy rustfmt && chmod -R a+w "$RUSTUP_HOME" "$CARGO_H
 # HOME, so they survive between runs (the container itself is thrown away).
 ENV CARGO_HOME=/home/spotexec/.cargo \
     PATH=/home/spotexec/.cargo/bin:$PATH
-`, rv)
+`, debianTag("rust", rv))
 	case exists(root, "pom.xml") || exists(root, "build.gradle") || exists(root, "build.gradle.kts"):
 		jv := javaVersion(root)
 		stack, primary = "Java "+jv, "java"
@@ -580,11 +657,11 @@ RUN apt-get update \
 			stack += " + Go " + gv
 			body += fmt.Sprintf(`
 # Go %[1]s too (go.mod), with its caches in the slot's persistent HOME.
-COPY --from=golang:%[1]s-bookworm /usr/local/go /usr/local/go
+COPY --from=golang:%[2]s /usr/local/go /usr/local/go
 ENV PATH=/usr/local/go/bin:$PATH \
     GOMODCACHE=/home/spotexec/go/pkg/mod \
     GOCACHE=/home/spotexec/.cache/go-build
-`, gv)
+`, gv, debianTag("golang", gv))
 		}
 		if primary != "python" && exists(root, "uv.lock") {
 			py := pythonVersion(root)
