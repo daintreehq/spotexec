@@ -1433,6 +1433,7 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	log := newDepsLog(depsLogDir(), label)
 	dr, shared, upload, err := fetchDeps(ctx, sessionRPC{s}, onEvent, o, label, log, req, resign, p.Deps.Timeout.Duration+shareSlack)
 	log.Close()
+	recordDepsInstall(lease, ws, dr) // even when waiting for its upload failed after
 	// The install's status (and plain mode's heartbeat of it) ends here:
 	// the command's own phase starts next.
 	o.Rep.Clear()
@@ -2088,6 +2089,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 	log := newDepsLog(imageLogDir(), label)
 	r, shared, push, err := fetchImage(ctx, sessionRPC{s}, o, label, errW, log, newImageMemo(ws.RepoID), req, locate, c.Timeout.Duration+shareSlack)
 	log.Close()
+	recordImageBuild(lease, ws, r) // even when waiting for its push failed after
 	if err != nil {
 		return "", "", err
 	}
