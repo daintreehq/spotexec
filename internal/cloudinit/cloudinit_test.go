@@ -196,7 +196,7 @@ func TestRenderClaimsStateDirForRoot(t *testing.T) {
 		os.WriteFile(filepath.Join(bin, "stat"), []byte("#!/bin/sh\nexit 1\n"), 0o755)
 		script := strings.NewReplacer("/var/tmp/spotexec", d, "0:d", uid+":d", "sleep 120; poweroff -f", ":").Replace(block)
 		cmd := exec.Command("bash", "-c", "set -u\n"+script)
-		cmd.Env = append(append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH")), env...)
+		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
 		out, err := cmd.CombinedOutput()
 		if err == nil || !strings.Contains(string(out), "DESTROYED") {
 			t.Fatalf("boot went on without knowing who owns the directory: %v: %s", err, out)
