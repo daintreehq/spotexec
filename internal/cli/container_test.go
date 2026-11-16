@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -10,6 +11,10 @@ import (
 )
 
 func TestScaffoldDockerfileStacks(t *testing.T) {
+	// The CLI tools GitHub's Ubuntu runners provide that every image gets,
+	// listed here rather than read from runnerTools so a removal is caught.
+	wantTools := []string{"bzip2", "ca-certificates", "curl", "file", "git", "jq", "lsof", "make",
+		"openssh-client", "procps", "rsync", "sqlite3", "unzip", "wget", "xz-utils", "zip", "zsh"}
 	cases := []struct {
 		files map[string]string
 		from  string
@@ -44,7 +49,7 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		{map[string]string{"Cargo.toml": ""}, "FROM rust:1-trixie", "", "Rust 1"},
 		{map[string]string{"go.mod": "module x\n\ngo 1.25.3\n", "package.json": `{}`, "package-lock.json": "", ".nvmrc": "18.19.0"}, "FROM node:18.19.0-bookworm", "COPY --from=golang:1.25.3-trixie /usr/local/go", "Node.js 18.19.0 + Go 1.25.3"},
 		{map[string]string{"go.mod": "module x\n\ngo 1.24.2\n", "package.json": `{}`, "package-lock.json": ""}, "FROM node:24-trixie", "COPY --from=golang:1.24.2-bookworm /usr/local/go", "Node.js 24 + Go 1.24.2"},
-		{map[string]string{"pom.xml": "<properties><maven.compiler.release>17</maven.compiler.release></properties>"}, "FROM eclipse-temurin:17-jdk", "git maven", "Java 17, Maven"},
+		{map[string]string{"pom.xml": "<properties><maven.compiler.release>17</maven.compiler.release></properties>"}, "FROM eclipse-temurin:17-jdk", " maven ", "Java 17, Maven"},
 		{map[string]string{"build.gradle.kts": "java { toolchain { languageVersion = JavaLanguageVersion.of(23) } }"}, "FROM eclipse-temurin:23-jdk", "", "Java 23, Gradle wrapper"},
 		{map[string]string{"pom.xml": "", "mvnw": "", ".sdkmanrc": "java=21.0.2-tem\n"}, "FROM eclipse-temurin:21-jdk", "", "Java 21, Maven wrapper"},
 		{map[string]string{".java-version": "1.8.0_402\n", "build.gradle": ""}, "FROM eclipse-temurin:8-jdk", "", "Java 8, Gradle wrapper"},
@@ -83,6 +88,46 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		}
 		if n := strings.Count(body, "\n"+c.from+"\n"+utf8Locale); n != want || strings.Count(body, "ENV LANG=") != want {
 			t.Errorf("%s: want %d UTF-8 locale(s), right after FROM, in:\n%s", stack, want, body)
+		}
+		// Every stack installs the tools GitHub's runners provide, in one
+		// apt RUN that is the first instruction after FROM (and its UTF-8
+		// locale), each of its lines continued until the cleanup that ends it.
+		var fields []string
+		closed := false
+		after := body[strings.Index(body, "\n"+c.from+"\n")+len(c.from)+2:]
+		lines := strings.Split(strings.TrimPrefix(after, utf8Locale), "\n")
+		for len(lines) > 0 && (lines[0] == "" || strings.HasPrefix(lines[0], "#")) {
+			lines = lines[1:]
+		}
+		for i, l := range lines {
+			if i == 0 && l != "RUN apt-get update \\" {
+				t.Errorf("%s: first instruction after FROM is %q, want the apt layer", stack, l)
+				break
+			}
+			if l == " && rm -rf /var/lib/apt/lists/*" {
+				closed = true
+				break
+			}
+			if !strings.HasSuffix(l, " \\") {
+				t.Errorf("%s: apt layer line %q isn't continued", stack, l)
+				break
+			}
+			fields = append(fields, strings.Fields(l)...)
+		}
+		if !closed {
+			t.Errorf("%s: apt layer doesn't end in its cleanup in:\n%s", stack, body)
+		}
+		for _, tool := range wantTools {
+			if !slices.Contains(fields, tool) {
+				t.Errorf("%s: %s not installed in:\n%s", stack, tool, body)
+			}
+		}
+		// Maven is installed only for a pom.xml project without ./mvnw.
+		if slices.Contains(fields, "maven") != strings.HasSuffix(c.stack, ", Maven") {
+			t.Errorf("%s: maven installed = %v", stack, slices.Contains(fields, "maven"))
+		}
+		if strings.Count(body, "\nRUN apt-get update") != 1 {
+			t.Errorf("%s: want exactly one apt layer in:\n%s", stack, body)
 		}
 	}
 }
