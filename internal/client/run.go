@@ -1077,6 +1077,7 @@ func spareRequest(req AcquireRequest, doomed string, lost map[string]bool) Acqui
 		spare.Exclude[k] = true
 	}
 	spare.Base.Fingerprint = ""
+	spare.Task = "" // a probe for room, not the job: no lease to learn from
 	return spare
 }
 

@@ -531,3 +531,11 @@ func TestSetupFailureExitCode(t *testing.T) {
 		t.Errorf("setup timeout: run exits %d (%s)", got, msg)
 	}
 }
+
+// A spare-capacity probe never teaches the duration model.
+func TestSpareRequestHasNoTask(t *testing.T) {
+	spare := spareRequest(AcquireRequest{Task: "t"}, "i-1", nil)
+	if spare.Task != "" || !spare.Exclude["i-1"] {
+		t.Fatalf("spare request %+v", spare)
+	}
+}

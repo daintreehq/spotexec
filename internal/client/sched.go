@@ -523,6 +523,8 @@ type claim struct {
 	// unless Latency: latency mode returning a worktree to its files).
 	Promote bool
 	Latency bool
+	// Exclude: VMs this job may not use (not stored).
+	Exclude map[string]bool
 	// Force: reserve whatever the ledger says (legacy placement, exact
 	// slots): the helper decides.
 	Force bool
@@ -869,7 +871,7 @@ func (c candidate) event() map[string]any {
 
 // claimFor is the claim req makes on a fleet VM.
 func claimFor(req AcquireRequest) claim {
-	c := claim{Exclusive: req.Base.Exclusive, Repo: req.Base.RepoID, Task: req.Task}
+	c := claim{Exclusive: req.Base.Exclusive, Repo: req.Base.RepoID, Task: req.Task, Exclude: req.Exclude}
 	if !req.Base.KeepOwner {
 		c.Worktree = req.Base.WorktreeKey // its files will be synced there
 	}
@@ -894,7 +896,7 @@ func (p *Pool) retainedRoom(st *poolState, now time.Time, c claim) bool {
 	s := st.sched()
 	owner := processOwner()
 	for _, w := range p.views(st, now) {
-		if !w.eligible || w.v.Role != roleRetained {
+		if !w.eligible || w.v.Role != roleRetained || c.Exclude[w.in.ID] {
 			continue
 		}
 		if f := s.Fences[w.in.ID]; f != nil && f.Owner != owner {
@@ -903,11 +905,13 @@ func (p *Pool) retainedRoom(st *poolState, now time.Time, c claim) bool {
 		if n := st.Notes[w.in.ID]; n != nil && now.Before(n.BusyUntil) {
 			continue
 		}
-		need := 1
+		used, need := w.firm, 1
 		if c.Exclusive {
-			need = w.units
+			// An exclusive probe finding a VM partly busy leaves no busy
+			// hint: count uncertain slots too.
+			used, need = w.firm+w.unc, w.units
 		}
-		if w.firm+need <= w.units {
+		if used+need <= w.units {
 			return true
 		}
 	}

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,8 +47,17 @@ func TestModelPredict(t *testing.T) {
 	for i := 0; i < 2*modelKeys; i++ {
 		s.observe(TaskKey("r", string(rune('a'+i%26))+string(rune('a'+i/26))), 0, time.Second, now.Add(time.Duration(i)*time.Second))
 	}
-	if len(s.Model) > modelKeys {
-		t.Fatalf("%d model keys, more than %d", len(s.Model), modelKeys)
+	tasks := map[string]int{}
+	for k := range s.Model {
+		tasks[k[:strings.Index(k, "|")]]++
+	}
+	if len(tasks) != modelKeys {
+		t.Fatalf("%d tasks kept, want %d", len(tasks), modelKeys)
+	}
+	for task, n := range tasks {
+		if n != 2 {
+			t.Fatalf("task %s kept %d of its 2 entries: tasks are evicted whole", task, n)
+		}
 	}
 	for i := 0; i < 3*modelSamples; i++ {
 		s.observe("u", 0, time.Second, now.Add(time.Hour))

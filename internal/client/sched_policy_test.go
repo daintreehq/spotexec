@@ -210,6 +210,12 @@ func TestRankLatencyMode(t *testing.T) {
 	if len(cands) != 2 || cands[0].ID != "i-0" || !cands[0].claim.Promote {
 		t.Fatalf("latency mode: %+v, want the worktree's standby VM first", cands)
 	}
+	// A retained VM with its files too: no promotion needed first.
+	p.loaded(t, func(st *poolState) { st.sched().VMs["i-1"].remember("mine", "repo", now) })
+	cands, _, _, _ = p.Rank(context.Background(), nil, claim{Worktree: "mine"})
+	if len(cands) != 2 || cands[0].ID != "i-1" || cands[0].claim.Promote {
+		t.Fatalf("latency mode with a warm retained VM: %+v, want i-1 first", cands)
+	}
 }
 
 // Standby VMs come back most recently retired first.

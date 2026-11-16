@@ -55,6 +55,9 @@ func (p *Pool) views(st *poolState, now time.Time) []vmView {
 		} else if n != nil && n.Retiring && v.Role != roleDraining && v.Role != roleDrainRequested {
 			v.Role, v.Since, v.Reason = roleDrainRequested, now, "early drain requested"
 			s.Generation++
+		} else if v.Role == roleDrainRequested && (n == nil || !n.Retiring) {
+			st.note(in.ID).Retiring = true // the two files disagreed: a committed drain wins
+			n = st.Notes[in.ID]
 		}
 		f, u := s.held(p.R, in.ID)
 		out = append(out, vmView{
@@ -386,12 +389,21 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 				idx[r.in.ID] = i
 			}
 			sort.SliceStable(keep, func(i, j int) bool {
-				a, b := measured[keep[i].in.ID], measured[keep[j].in.ID]
+				ki, kj := keep[i], keep[j]
+				// Never costed: this process's own fence, and a VM needing
+				// no helper upload first (the lease model can't see one).
+				if fa, fb := fenced(ki.vmView), fenced(kj.vmView); fa != fb {
+					return fa
+				}
+				if ki.ready != kj.ready {
+					return ki.ready
+				}
+				a, b := measured[ki.in.ID], measured[kj.in.ID]
 				if a.rank != b.rank {
 					return a.rank < b.rank
 				}
 				if a.rank == 0 {
-					return idx[keep[i].in.ID] < idx[keep[j].in.ID]
+					return idx[ki.in.ID] < idx[kj.in.ID]
 				}
 				return a.cost < b.cost
 			})
@@ -402,29 +414,27 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 		add := func(w vmView, cl claim, why string) {
 			out = append(out, candidate{Instance: w.in, claim: cl, reason: why, mode: mode})
 		}
-		warmFirst := len(keep)
-		for i, r := range keep {
-			if r.cache < 2 {
-				warmFirst = i
-				break
-			}
+		// Latency mode: the worktree's own standby VM comes before the
+		// retained ones, unless a retained VM already holds its files.
+		warmRetained := false
+		for _, r := range keep {
+			warmRetained = warmRetained || r.cache == 2
 		}
-		for i, r := range keep {
-			if i == warmFirst {
-				for _, l := range latency {
-					cl := base
-					cl.Promote, cl.Latency = true, true
-					add(l.vmView, cl, "latency mode: this worktree's files are on this standby VM")
-				}
-			}
-			add(r.vmView, base, retainedReason(r.cache, r.firm))
-		}
-		if warmFirst == len(keep) {
+		addLatency := func() {
 			for _, l := range latency {
 				cl := base
 				cl.Promote, cl.Latency = true, true
 				add(l.vmView, cl, "latency mode: this worktree's files are on this standby VM")
 			}
+		}
+		if !warmRetained {
+			addLatency()
+		}
+		for _, r := range keep {
+			add(r.vmView, base, retainedReason(r.cache, r.firm))
+		}
+		if warmRetained {
+			addLatency()
 		}
 		for _, w := range standbyOrder(standby) {
 			cl := base
@@ -590,6 +600,7 @@ func (p *Pool) BeginDrain(ctx context.Context, id string) (op string, ok bool, e
 			return nil
 		}
 		if v.Role == roleDrainRequested {
+			st.note(id).Retiring = true
 			op, ok = v.DrainOp, now.Sub(v.DrainAt) >= drainRetry
 			return nil
 		}

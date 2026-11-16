@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -89,14 +90,30 @@ func (s *schedState) observe(task string, cache int, d time.Duration, now time.T
 			delete(s.Model, k)
 		}
 	}
-	for len(s.Model) > modelKeys {
-		oldest, ot := "", time.Time{}
+	// At most modelKeys tasks, each with all its warmth levels: the task
+	// used least recently goes whole.
+	for {
+		last := map[string]time.Time{}
 		for k, st := range s.Model {
-			if oldest == "" || st.At.Before(ot) {
-				oldest, ot = k, st.At
+			t, _, _ := strings.Cut(k, "|")
+			if st.At.After(last[t]) {
+				last[t] = st.At
 			}
 		}
-		delete(s.Model, oldest)
+		if len(last) <= modelKeys {
+			return
+		}
+		oldest, ot := "", time.Time{}
+		for t, at := range last {
+			if oldest == "" || at.Before(ot) {
+				oldest, ot = t, at
+			}
+		}
+		for k := range s.Model {
+			if t, _, _ := strings.Cut(k, "|"); t == oldest {
+				delete(s.Model, k)
+			}
+		}
 	}
 }
 
@@ -253,10 +270,13 @@ func (p *Pool) RefreshPrices(ctx context.Context) {
 	_ = p.withCtx(ctx, func(st *poolState) error {
 		s := st.sched()
 		now := time.Now()
-		if now.Sub(s.PricesAt) < pricesEvery && !s.PricesAt.After(now) {
+		if len(st.Instances) == 0 || (now.Sub(s.PricesAt) < pricesEvery && !s.PricesAt.After(now)) {
 			return nil
 		}
-		s.PricesAt = now // claimed: other processes skip it meanwhile
+		// Claimed: other processes skip it meanwhile. Until the answer is
+		// in, it counts as a lookup a minute ago at most-every-15m, so one
+		// that fails (or a process that exits) is retried in a minute.
+		s.PricesAt = now.Add(-pricesEvery + time.Minute)
 		insts = append(insts, st.Instances...)
 		return nil
 	})
@@ -276,6 +296,7 @@ func (p *Pool) RefreshPrices(ctx context.Context) {
 	_ = p.withCtx(ctx, func(st *poolState) error {
 		s := st.sched()
 		now := time.Now()
+		s.PricesAt = now
 		for id, usd := range prices {
 			if v := s.VMs[id]; v != nil && usd > 0 {
 				v.Price, v.PriceAt = usd, now
