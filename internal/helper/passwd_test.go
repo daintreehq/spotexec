@@ -73,15 +73,16 @@ func TestWithRunUser(t *testing.T) {
 			// Comments and NIS directives aren't entries for the uid.
 			name: "comment and directive", passwd: debianPasswd + "#node:x:1000:1000::/home/node:/bin/sh\n+node:x:1000:1000::/home/node:/bin/sh\n",
 			group: debianGroup + "#node:x:1000:\n-node:x:1000:\n", uid: 1000, gid: 1000,
-			wantPasswd: debianPasswd + "#node:x:1000:1000::/home/node:/bin/sh\n+node:x:1000:1000::/home/node:/bin/sh\nspotexec:x:1000:1000:spotexec:/home/spotexec:/bin/sh\n",
-			wantGroup:  debianGroup + "#node:x:1000:\n-node:x:1000:\nspotexec:x:1000:\n",
+			// ...and the new one goes first, since musl reads them as entries.
+			wantPasswd: debianPasswd + "spotexec:x:1000:1000:spotexec:/home/spotexec:/bin/sh\n#node:x:1000:1000::/home/node:/bin/sh\n+node:x:1000:1000::/home/node:/bin/sh\n",
+			wantGroup:  debianGroup + "spotexec:x:1000:\n#node:x:1000:\n-node:x:1000:\n",
 		},
 		{
 			// ...indented too.
 			name: "indented comment", passwd: debianPasswd + "  #node:x:1000:1000::/home/node:/bin/sh\n",
 			group: debianGroup + "\t#node:x:1000:\n", uid: 1000, gid: 1000,
-			wantPasswd: debianPasswd + "  #node:x:1000:1000::/home/node:/bin/sh\nspotexec:x:1000:1000:spotexec:/home/spotexec:/bin/sh\n",
-			wantGroup:  debianGroup + "\t#node:x:1000:\nspotexec:x:1000:\n",
+			wantPasswd: debianPasswd + "spotexec:x:1000:1000:spotexec:/home/spotexec:/bin/sh\n  #node:x:1000:1000::/home/node:/bin/sh\n",
+			wantGroup:  debianGroup + "spotexec:x:1000:\n\t#node:x:1000:\n",
 		},
 		{
 			// No files at all (an image built from scratch).
@@ -156,8 +157,8 @@ func TestContainerScriptRunUser(t *testing.T) {
 
 	host := run(&protocol.ContainerRun{Image: "python:3"})
 	mounts := regexp.MustCompile(`type=bind,source=([^,]+),target=/etc/(passwd|group),readonly`).FindAllStringSubmatch(host, -1)
-	if len(mounts) != 2 {
-		t.Fatalf("no passwd and group mounts: %s", host)
+	if len(mounts) != 2 || mounts[0][2] != "passwd" {
+		t.Fatalf("no passwd and group mounts, in that order: %s", host)
 	}
 	want := map[string]string{
 		"passwd": "root:x:0:0:root:/root:/bin/bash\nspotexec:x:" + uid + ":" + gid + ":spotexec:/home/spotexec:/bin/sh\n",
@@ -269,6 +270,7 @@ func TestMountsAt(t *testing.T) {
 		{[]string{"-v", "/x:/etc/./passwd:ro"}, true},
 		{[]string{"--mount", "Type=bind,Source=/x,Target=/etc/passwd/"}, true},
 		{[]string{"-itv", "/x:/etc/passwd"}, true},
+		{[]string{"--mount", `type=bind,src=/x,"target=/etc/passwd",readonly`}, true},
 		{[]string{"-v=/x:/etc/passwd"}, true},
 		{[]string{"-v", "/etc/passwd"}, true}, // an anonymous volume there
 		{[]string{"-e", "A=/etc/passwd"}, false},

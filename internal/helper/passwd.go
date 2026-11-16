@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -50,8 +51,7 @@ func withRunUser(passwd, group []byte, uid, gid int) ([]byte, []byte) {
 		if !hasID(lines, 7, 0) && uid != 0 {
 			lines = append([]string{"root:x:0:0:root:/root:/bin/sh"}, lines...)
 		}
-		name := freeName(lines, u)
-		lines = append(lines, name+":x:"+u+":"+g+":"+runUserName+":"+runUserHome+":/bin/sh")
+		lines = insertEntry(lines, 7, uid, freeName(lines, u)+":x:"+u+":"+g+":"+runUserName+":"+runUserHome+":/bin/sh")
 	}
 	newPasswd := joinLines(lines)
 
@@ -60,7 +60,7 @@ func withRunUser(passwd, group []byte, uid, gid int) ([]byte, []byte) {
 		if !hasID(glines, 4, 0) && gid != 0 {
 			glines = append([]string{"root:x:0:"}, glines...)
 		}
-		glines = append(glines, freeName(glines, g)+":x:"+g+":")
+		glines = insertEntry(glines, 4, gid, freeName(glines, g)+":x:"+g+":")
 	}
 	return newPasswd, joinLines(glines)
 }
@@ -99,6 +99,22 @@ func isEntry(f []string, fields, id int) bool {
 	}
 	n, err := strconv.Atoi(f[2])
 	return err == nil && n == id
+}
+
+// insertEntry adds entry, for id, at the end of lines, or before the first
+// comment or NIS line that is otherwise an entry for id: musl reads those
+// as accounts and returns the first match.
+func insertEntry(lines []string, fields, id int, entry string) []string {
+	at := len(lines)
+	for i, l := range lines {
+		if f := strings.Split(l, ":"); len(f) == fields {
+			if n, err := strconv.Atoi(f[2]); err == nil && n == id {
+				at = i
+				break
+			}
+		}
+	}
+	return slices.Insert(lines, at, entry)
 }
 
 // freeName returns runUserName, or the first of runUserName-id,
@@ -275,7 +291,12 @@ func mountsAt(opts []string, dst string) bool {
 		}
 	}
 	for _, v := range dockerFlagValues(opts, "--mount") {
-		for _, kv := range strings.Split(v, ",") {
+		// CSV, as Docker reads it: "target=/etc/passwd" may be quoted.
+		kvs, err := csv.NewReader(strings.NewReader(v)).Read()
+		if err != nil {
+			kvs = strings.Split(v, ",")
+		}
+		for _, kv := range kvs {
 			k, d, _ := strings.Cut(kv, "=")
 			if k = strings.ToLower(strings.TrimSpace(k)); (k == "target" || k == "dst" || k == "destination") && path.Clean(d) == dst {
 				return true
