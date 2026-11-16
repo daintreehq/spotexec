@@ -8,6 +8,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -134,7 +135,13 @@ func (s *Session) deps(d protocol.Deps) error {
 	cacheRoot := filepath.Join(s.layout.Deps(s.repoID), key)
 	ready := filepath.Join(cacheRoot, ".ready")
 
-	if dirs := expandCacheDirs(s.workspace, d.CacheDirs); s.state.DepsKey == key && len(dirs) > 0 {
+	// A slot an older helper relocated (text files only) from a cache that
+	// doesn't record its origin: its activate scripts now name this slot,
+	// so nothing says where its symlinks point. It is hydrated afresh.
+	dirs := expandCacheDirs(s.workspace, d.CacheDirs)
+	unknownOrigin := s.state.VenvsRelocated && s.state.VenvRelocation < venvRelocation && len(cacheOrigins(cacheRoot)) == 0 &&
+		slices.ContainsFunc(dirs, func(rel string) bool { return len(venvsAt(filepath.Join(s.workspace, filepath.FromSlash(rel)))) > 0 })
+	if s.state.DepsKey == key && len(dirs) > 0 && !unknownOrigin {
 		if s.state.VenvRelocation < venvRelocation {
 			// Hydrated by an older helper, which copied venvs as they were
 			// or left their symlinks pointing into another slot.

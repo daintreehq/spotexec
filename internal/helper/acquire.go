@@ -336,6 +336,7 @@ func (s *Session) rollbackAcquire() {
 	s.owned.Store(nil)
 	s.relMu.Lock() // not concurrently with a shutdown's release
 	defer s.relMu.Unlock()
+	s.parkIfStopping()
 	defer func() { s.workspace = "" }()
 	for i, t := range s.tokens {
 		if t != nil {
@@ -469,6 +470,7 @@ func (s *Session) releaseCapacity() {
 	}
 	s.relMu.Lock()
 	defer s.relMu.Unlock()
+	s.parkIfStopping()
 	for _, t := range s.tokens {
 		t.Unlock()
 	}

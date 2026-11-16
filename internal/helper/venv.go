@@ -66,18 +66,7 @@ func relocateVenvs(dir, rel string, origins []string, ws string) error {
 	if r, err := filepath.EvalSymlinks(ws); err == nil {
 		ws = r
 	}
-	venvs := []string{dir}
-	if ents, err := os.ReadDir(dir); err == nil {
-		for _, e := range ents {
-			if e.IsDir() {
-				venvs = append(venvs, filepath.Join(dir, e.Name()))
-			}
-		}
-	}
-	for _, v := range venvs {
-		if fi, err := os.Lstat(filepath.Join(v, "pyvenv.cfg")); err != nil || !fi.Mode().IsRegular() {
-			continue
-		}
+	for _, v := range venvsAt(dir) {
 		var olds []string
 		for _, o := range append(origins, venvOrigin(v, dir, rel)) {
 			if filepath.IsAbs(o) && o != ws {
@@ -92,6 +81,26 @@ func relocateVenvs(dir, rel string, origins []string, ws string) error {
 		}
 	}
 	return nil
+}
+
+// venvsAt lists the virtualenvs at dir and in its immediate
+// subdirectories.
+func venvsAt(dir string) []string {
+	cands := []string{dir}
+	if ents, err := os.ReadDir(dir); err == nil {
+		for _, e := range ents {
+			if e.IsDir() {
+				cands = append(cands, filepath.Join(dir, e.Name()))
+			}
+		}
+	}
+	var venvs []string
+	for _, v := range cands {
+		if fi, err := os.Lstat(filepath.Join(v, "pyvenv.cfg")); err == nil && fi.Mode().IsRegular() {
+			venvs = append(venvs, v)
+		}
+	}
+	return venvs
 }
 
 // venvOrigin infers the workspace a venv was built in from its activate
@@ -190,7 +199,9 @@ func relocateVenvLinks(v string, olds []string, ws string) error {
 		// Replaced whole: rename swaps the link itself, never what it
 		// points at.
 		tmp := p + ".spotexec-relocate"
-		_ = os.Remove(tmp)
+		if fi, err := os.Lstat(tmp); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			_ = os.Remove(tmp) // left by an interrupted relocation; anything else stays
+		}
 		if err := os.Symlink(moved, tmp); err != nil {
 			return err
 		}
@@ -237,15 +248,12 @@ func readSmallFile(p string) ([]byte, error) {
 // replacing the file rather than writing into it: a hardlink-hydrated copy
 // shares its inode with the cache. A symlink to a file holding an old path
 // (uv's link-mode = "symlink") is replaced by a rewritten regular file; its
-// target is left alone. A symlink into the workspace repl (relocated by
-// relocateVenvLinks, or relative) stays: what it points at is the
-// workspace's own file.
+// target is left alone. A symlink that really resolves into the workspace
+// repl (relocated by relocateVenvLinks, or relative) stays: what it points
+// at is the workspace's own file.
 func rewritePaths(p string, olds []string, repl string) error {
-	if target, err := os.Readlink(p); err == nil {
-		if !filepath.IsAbs(target) {
-			target = filepath.Join(filepath.Dir(p), target)
-		}
-		if pathWithin(filepath.Clean(target), repl) {
+	if li, err := os.Lstat(p); err == nil && li.Mode()&fs.ModeSymlink != 0 {
+		if r, err := filepath.EvalSymlinks(p); err == nil && pathWithin(r, repl) {
 			return nil
 		}
 	}

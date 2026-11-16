@@ -104,9 +104,10 @@ func Shutdown(code int) {
 }
 
 // teardown cleans up what the session owns (its command's process group,
-// containers, slot locks) before the process exits. Acquire may be running
-// meanwhile: the slot's paths are read under relMu, and stopping makes it
-// stop instead of taking more.
+// containers, slot locks) before the process exits. The dispatch goroutine
+// may be acquiring or releasing meanwhile: once stopping is set it gives up
+// nothing and takes nothing more (it parks; see parkIfStopping), so the
+// slot read here under relMu stays this session's until release below.
 func (s *Session) teardown() {
 	s.stopping.Store(true)
 	s.procMu.Lock() // wait out a start in progress; none begins after this
@@ -116,6 +117,9 @@ func (s *Session) teardown() {
 	}
 	s.relMu.Lock()
 	workspace, slotDir := s.workspace, s.slotDir
+	if s.exiting.Load() {
+		workspace, slotDir = "", "" // already released: another run's now
+	}
 	s.relMu.Unlock()
 	if workspace != "" {
 		reapWorkspace(workspace, 2*time.Second)
@@ -124,7 +128,18 @@ func (s *Session) teardown() {
 	if slotDir != "" {
 		_ = os.RemoveAll(filepath.Join(slotDir, "run"))
 	}
-	s.release()
+	s.releaseLocks(true)
+}
+
+// parkIfStopping, called with relMu held, parks the calling goroutine for
+// good (releasing relMu) once teardown has begun: teardown releases
+// everything and exits, and must not find the slot given up or taken
+// underneath it.
+func (s *Session) parkIfStopping() {
+	if s.stopping.Load() {
+		s.relMu.Unlock()
+		select {}
+	}
 }
 
 // own publishes what acquire just took (locks, the slot's paths) under
@@ -132,6 +147,7 @@ func (s *Session) teardown() {
 func (s *Session) own(f func()) {
 	s.relMu.Lock()
 	defer s.relMu.Unlock()
+	s.parkIfStopping()
 	f()
 }
 
@@ -508,12 +524,18 @@ func (s *Session) hello(h protocol.Hello) error {
 }
 
 // release drops every lock (also on abnormal exit).
-func (s *Session) release() {
+func (s *Session) release() { s.releaseLocks(false) }
+
+// releaseLocks is release; only teardown's goes ahead once it has begun.
+func (s *Session) releaseLocks(teardown bool) {
 	s.owned.Store(nil)
 	// Shutdown (a signal) and Serve's own exit may both get here: the
 	// second waits for the first to finish rather than exiting mid-release.
 	s.relMu.Lock()
 	defer s.relMu.Unlock()
+	if !teardown {
+		s.parkIfStopping()
+	}
 	if s.exiting.Swap(true) {
 		return
 	}

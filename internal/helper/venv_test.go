@@ -230,6 +230,19 @@ func TestRelocateVenvSymlinkTargets(t *testing.T) {
 	if err := os.WriteFile(pth, []byte(wsA+"/src\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The workspace links to a uv cache outside it.
+	if err := os.MkdirAll(filepath.Join(root, "uv-cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "uv-cache", "ext.pth"), []byte(wsA+"/src\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "uv-cache"), filepath.Join(wsB, "cache")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(wsB, "cache", "ext.pth"), filepath.Join(sp, "ext.pth")); err != nil {
+		t.Fatal(err)
+	}
 	links := map[string]struct{ target, want string }{
 		"bin/python":                            {wsA + "/.python/bin/python3", wsB + "/.python/bin/python3"},
 		"bin/python3":                           {"/usr/bin/python3", "/usr/bin/python3"},
@@ -258,6 +271,14 @@ func TestRelocateVenvSymlinkTargets(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(pth); string(b) != wsA+"/src\n" {
 		t.Errorf("wrote through a relocated link into the project: %q", b)
+	}
+	// Into the workspace only on paper (through a link to elsewhere): it
+	// is rewritten as a file of its own, never written through.
+	if b, _ := os.ReadFile(filepath.Join(sp, "ext.pth")); string(b) != wsB+"/src\n" {
+		t.Errorf("ext.pth = %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "uv-cache", "ext.pth")); string(b) != wsA+"/src\n" {
+		t.Errorf("wrote through into the uv cache: %q", b)
 	}
 	if b, _ := os.ReadFile(filepath.Join(v, "pyvenv.cfg")); string(b) != "home = "+wsB+"/.python/bin\n" {
 		t.Errorf("pyvenv.cfg = %q", b)
