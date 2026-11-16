@@ -2235,7 +2235,7 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 		}
 	}
 	sh := sharer{
-		lock:  shareLockFor("image", imageLockID(req.Registry, req.Tag)),
+		lock:  shareLockFor("image", imageLockID(req.Registry, req.Tag, locate != nil)),
 		who:   shareWho(o, label),
 		limit: limit,
 		probe: func(ctx context.Context) (bool, error) {
@@ -2301,12 +2301,17 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 	return r, shared, push, err
 }
 
-// imageLockID names what an image share lock is for: the registry's
-// account, the repository's path and the tag, but not the registry's
-// region, so the runs on this machine that need one image in different
-// regions build it once, and the others copy it (#192). Every runner uses
-// it, so runners of one account that share a region share the lock too.
-func imageLockID(reg *protocol.RegistryAuth, tag string) string {
+// imageLockID names what an image share lock is for. Runs that can copy
+// the image from another region (anyRegion) name the registry's account,
+// the repository's path and the tag, but not the region, so the runs on
+// this machine that need one image in different regions build it once,
+// and the others copy it (#192). Runs that can't copy it name the region's
+// repository: waiting for a build in another region would gain them
+// nothing.
+func imageLockID(reg *protocol.RegistryAuth, tag string, anyRegion bool) string {
+	if !anyRegion {
+		return reg.Repo + ":" + tag
+	}
 	account, _, _ := strings.Cut(reg.Server, ".")
 	return account + "/" + strings.TrimPrefix(strings.TrimPrefix(reg.Repo, reg.Server), "/") + ":" + tag
 }

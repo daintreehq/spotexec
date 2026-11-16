@@ -433,7 +433,7 @@ func TestFetchImageCopiesFromAnotherRegion(t *testing.T) {
 func TestFetchImageWaitsForABuildInAnotherRegion(t *testing.T) {
 	ctx := fastShare(t)
 	other := regionImage("us-east-1")
-	lock := shareLockFor("image", imageLockID(other.Registry, other.Tag))
+	lock := shareLockFor("image", imageLockID(other.Registry, other.Tag, true))
 	held, err := lock.take(ctx, lock.verdict(), "test 2/8 on aws#4", time.Minute, nil)
 	if err != nil || !held.lead {
 		t.Fatalf("take %+v, %v", held, err)
@@ -503,16 +503,23 @@ func TestFetchImageLeaderCopiesAndWaitsForThePush(t *testing.T) {
 	}
 }
 
-// The image lock names the image, not the region holding it.
-func TestImageLockIDIgnoresTheRegion(t *testing.T) {
+// The image lock names the image, not the region holding it, for runs that
+// can copy it from another region; for the rest, the region's repository.
+func TestImageLockID(t *testing.T) {
 	a, b := regionImage("us-east-1"), regionImage("ap-south-1")
-	if imageLockID(a.Registry, a.Tag) != imageLockID(b.Registry, b.Tag) {
-		t.Fatalf("%s != %s", imageLockID(a.Registry, a.Tag), imageLockID(b.Registry, b.Tag))
+	if imageLockID(a.Registry, a.Tag, true) != imageLockID(b.Registry, b.Tag, true) {
+		t.Fatalf("%s != %s", imageLockID(a.Registry, a.Tag, true), imageLockID(b.Registry, b.Tag, true))
+	}
+	if imageLockID(a.Registry, a.Tag, false) == imageLockID(b.Registry, b.Tag, false) {
+		t.Fatal("runs that can't copy across regions wait on each other")
+	}
+	if got := imageLockID(a.Registry, a.Tag, false); got != a.Registry.Repo+":"+a.Tag {
+		t.Fatalf("single-region lock %s", got)
 	}
 	c := regionImage("us-east-1")
 	c.Registry.Server = "2.dkr.ecr.us-east-1.amazonaws.com"
 	c.Registry.Repo = c.Registry.Server + "/spotexec/r"
-	if imageLockID(a.Registry, a.Tag) == imageLockID(c.Registry, c.Tag) || imageLockID(a.Registry, a.Tag) == imageLockID(a.Registry, "other") {
+	if imageLockID(a.Registry, a.Tag, true) == imageLockID(c.Registry, c.Tag, true) || imageLockID(a.Registry, a.Tag, true) == imageLockID(a.Registry, "other", true) {
 		t.Fatal("other accounts or tags share the lock")
 	}
 }
