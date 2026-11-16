@@ -249,7 +249,7 @@ func writeback(ctx context.Context, fetchFiles fetchFunc, ws *Workspace, m *mani
 	for _, d := range deleted {
 		gone[strings.ToLower(d)] = true
 	}
-	isConfig := configGuard(ws.Root, configLinks(ws, m))
+	isConfig := configGuard(ws.Root, configLinks(ctx, ws, m, false))
 	var renamed, holdable []protocol.Entry
 	for _, c := range fresh {
 		if gone[strings.ToLower(c.Path)] || isConfig(c.Path) {
@@ -394,7 +394,7 @@ func applyWriteback(ctx context.Context, ws *Workspace, m *manifest.Manifest, re
 	// nor is what it leads to through a symlink: the runner's version of
 	// each such path is stashed for review and the local one left as it is
 	// (see configGuard).
-	isConfig := configGuard(ws.Root, configLinks(ws, m))
+	isConfig := configGuard(ws.Root, configLinks(ctx, ws, m, false))
 	config := map[string]bool{}
 	for _, p := range paths {
 		if !isConfig(p) {
@@ -1358,7 +1358,7 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 		}
 	}
 	if len(inWS) > 0 {
-		isConfig := configGuard(ws.Root, configLinks(ws, nil))
+		isConfig := configGuard(ws.Root, configLinks(ctx, ws, nil, true))
 		prot, err := protectedPaths(ctx, ws.Root, inWS)
 		if err != nil {
 			return 0, err
