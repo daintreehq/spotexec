@@ -126,7 +126,23 @@ func (c *awsClient) endpoint(service string) string {
 	if e, ok := c.endpoints[service]; ok {
 		return e
 	}
+	if service == "iam" {
+		// One endpoint per partition, whatever the client's region.
+		if partitionOf(c.region) == partitionGovUS {
+			return iamEndpointGov
+		}
+		return iamEndpointAWS
+	}
 	return "https://" + service + "." + c.region + ".amazonaws.com/"
+}
+
+// signingRegion is the region a request to service is signed for: IAM's
+// is its partition's home region.
+func (c *awsClient) signingRegion(service string) string {
+	if service == "iam" {
+		return accountRegion(c.region)
+	}
+	return c.region
 }
 
 func (c *awsClient) do(ctx context.Context, service, contentType string, extra map[string]string, body []byte) (int, []byte, error) {
@@ -149,7 +165,7 @@ func (c *awsClient) do(ctx context.Context, service, contentType string, extra m
 	if c.now != nil {
 		now = c.now
 	}
-	signV4(req, body, creds, c.region, service, now())
+	signV4(req, body, creds, c.signingRegion(service), service, now())
 	req.Header.Set("User-Agent", "spotexec")
 	resp, err := c.http.Do(req)
 	if err != nil {

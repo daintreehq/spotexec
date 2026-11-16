@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -726,6 +727,22 @@ func (r *remoteSetup) close() {
 
 var adminSession = provider.AdminSession // tests
 
+// runnerRegions are the AWS runners' home regions here, which say the
+// partition (commercial or GovCloud) the admin session signs in to.
+func runnerRegions() []string {
+	g, err := config.LoadGlobal()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, r := range awsRunners(g) {
+		if r.Region != "" && !slices.Contains(out, r.Region) {
+			out = append(out, r.Region)
+		}
+	}
+	return out
+}
+
 // setupHosts connects to each host in turn, then sets them up four at a
 // time, printing each one's output as a block when it finishes, and records
 // them in the machine list.
@@ -743,7 +760,7 @@ func setupHosts(ctx context.Context, hosts []string, base remoteSetup) error {
 	}
 	defer os.RemoveAll(dir)
 	if base.aws {
-		base.adminEnv, base.adminARN, base.adminErr = adminSession(ctx, base.adminProfile)
+		base.adminEnv, base.adminARN, base.adminErr = adminSession(ctx, base.adminProfile, runnerRegions())
 		if base.adminErr == nil && strings.Contains(base.adminARN, ":user/spotexec/") {
 			// A machine's own spotexec user can't manage IAM users: setting
 			// up others with it would only fail on AccessDenied.
