@@ -22,6 +22,7 @@ func cmdDaemon() *cobra.Command {
 	c := &cobra.Command{Use: "daemon", Short: "Optional background pool manager: warm pools, demand assist, health checks, reaping"}
 	run := &cobra.Command{
 		Use:   "run",
+		Args:  noArgs,
 		Short: "Run the pool manager in the foreground",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Validate before taking the lock, so `daemon start` never reports
@@ -46,6 +47,7 @@ func cmdDaemon() *cobra.Command {
 	}
 	start := &cobra.Command{
 		Use:   "start",
+		Args:  noArgs,
 		Short: "Start the pool manager in the background",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if pid := daemon.Running(); pid != 0 {
@@ -94,6 +96,7 @@ func cmdDaemon() *cobra.Command {
 	}
 	stopCmd := &cobra.Command{
 		Use:   "stop",
+		Args:  noArgs,
 		Short: "Stop the background pool manager (instances keep their own idle timers)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pid := daemon.Running()
@@ -119,6 +122,7 @@ func cmdDaemon() *cobra.Command {
 	var asJSON bool
 	status := &cobra.Command{
 		Use:   "status",
+		Args:  noArgs,
 		Short: "Show what the pool manager sees and has done",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pid := daemon.Running()

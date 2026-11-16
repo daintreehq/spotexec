@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -57,22 +58,33 @@ func MainAs(name string, args []string) int {
 		fs.SetInterspersed(false)
 		fs.Usage = func() {}
 		f.register(fs)
+		// -h after run flags asks for the help, as spotexec -h prints it;
+		// a real flag, so --help=false is no request and --help=x an error.
+		help := fs.BoolP("help", "h", false, "")
 		fs.SetOutput(nopWriter{})
-		err := fs.Parse(args)
 		// Only run flags come before the first word here (subcommands take
 		// their flags after their name), so a parse failure is a mistake in
 		// a run: like sx and spotexec run, it exits 125, not Cobra's 1.
-		if err != nil {
+		if err := fs.Parse(args); err != nil {
 			fmt.Fprintf(os.Stderr, "spotexec: %v (spotexec run -h lists the run flags)\n", err)
 			return client.ExitInfra
 		}
 		rest := fs.Args()
 		dashed := fs.ArgsLenAtDash() == 0
-		if len(rest) > 0 && (dashed || !subcommands[rest[0]]) {
+		runFlagsGiven := fs.NFlag() > 0 && !(fs.NFlag() == 1 && fs.Changed("help"))
+		switch {
+		case *help:
+			args = []string{"--help"}
+		case len(rest) > 0 && (dashed || !subcommands[rest[0]]):
 			return shorthand(&f, rest, dashed)
-		}
-		if len(rest) == 0 && (fs.NFlag() > 0 || dashed) {
+		case len(rest) == 0 && (runFlagsGiven || dashed):
 			fmt.Fprintln(os.Stderr, "spotexec: missing command")
+			return client.ExitInfra
+		case runFlagsGiven:
+			// Cobra's root doesn't know the run flags: it would take the
+			// subcommand's name as a flag's value and run the next word as
+			// the subcommand (spotexec --json run sync-plan ran sync-plan).
+			fmt.Fprintf(os.Stderr, "spotexec: run flags can't come before the %[1]s subcommand: put its flags after the subcommand name (spotexec %[1]s [flags] ...), or use -- to run a command named %[1]s (spotexec [run flags] -- %[1]s ...)\n", rest[0])
 			return client.ExitInfra
 		}
 	}
@@ -92,8 +104,14 @@ type nopWriter struct{}
 
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
+// isHelpFlag reports a first word that asks for the help or the version.
+// --help=false asks for neither: the run flags after it are parsed as run
+// flags, not handed to Cobra's root, which doesn't know them.
 func isHelpFlag(s string) bool {
-	s, _, _ = strings.Cut(s, "=") // --help=true too
+	s, v, valued := strings.Cut(s, "=") // --help=true too
+	if on, err := strconv.ParseBool(v); s == "--help" && valued && (err != nil || !on) {
+		return false
+	}
 	return s == "-h" || s == "--help" || s == "--version" || s == "-v"
 }
 
@@ -173,6 +191,7 @@ func newRoot() *cobra.Command {
 func cmdVersion() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
+		Args:  noArgs,
 		Short: "Print version",
 		Run:   func(*cobra.Command, []string) { fmt.Println("spotexec", Version) },
 	}
@@ -198,6 +217,15 @@ func cmdRun() *cobra.Command {
 	c.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return infraExit(err) })
 	c.Args = commandArgs
 	return c
+}
+
+// noArgs is the argument check of a command that takes none: one it would
+// ignore is a mistake (spotexec hook install codex meant --codex).
+func noArgs(cmd *cobra.Command, args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("%[1]s takes no arguments, got %[2]q (%[1]s -h lists its flags)", cmd.CommandPath(), args[0])
+	}
+	return nil
 }
 
 // commandArgs is run's and exec's argument check: a command that isn't
@@ -234,6 +262,7 @@ func cmdExec() *cobra.Command {
 func cmdTasks() *cobra.Command {
 	return &cobra.Command{
 		Use:   "tasks",
+		Args:  noArgs,
 		Short: "List named tasks from .spotexec.toml",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load("")

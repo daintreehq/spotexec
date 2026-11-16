@@ -51,6 +51,7 @@ func cmdBackupsClear() *cobra.Command {
 	var all, dry bool
 	c := &cobra.Command{
 		Use:   "clear ([<run-id>...] [--older-than AGE] | --all)",
+		Args:  cobra.ArbitraryArgs,
 		Short: "Delete kept backups and conflict copies",
 		Long: `Delete kept backups and conflict copies: the runs named (both kinds), the
 runs at least --older-than old, the named runs at least that old when given

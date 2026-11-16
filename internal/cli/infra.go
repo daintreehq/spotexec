@@ -363,6 +363,7 @@ func cmdStatus() *cobra.Command {
 	var asJSON, everyone bool
 	c := &cobra.Command{
 		Use:   "status [runner...]",
+		Args:  cobra.ArbitraryArgs,
 		Short: "Show runner states, active slots, lock holders and idle timers",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadGlobal()
@@ -410,6 +411,7 @@ func cmdMonitor() *cobra.Command {
 	var interval time.Duration
 	c := &cobra.Command{
 		Use:   "monitor [runner...]",
+		Args:  cobra.ArbitraryArgs,
 		Short: "Live dashboard of runner load, active slots and estimated burn rate",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadGlobal()
@@ -625,6 +627,7 @@ func cmdDown() *cobra.Command {
 	var machine string
 	c := &cobra.Command{
 		Use:   "down [runner...]",
+		Args:  cobra.ArbitraryArgs,
 		Short: "Terminate ephemeral runner(s) now",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadGlobal()
@@ -689,6 +692,7 @@ func cmdDown() *cobra.Command {
 func cmdDoctor() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor [runner...]",
+		Args:  cobra.ArbitraryArgs,
 		Short: "Verify SSH, ControlMaster, helper binaries, config and cloud credentials",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ok := true
@@ -986,6 +990,7 @@ func cmdPrune() *cobra.Command {
 	var dry bool
 	c := &cobra.Command{
 		Use:   "prune [runner[/instance-id]...]",
+		Args:  cobra.ArbitraryArgs,
 		Short: "Remove old dependency caches and idle slot workspaces on runners",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			age, err := parseAge(olderThan)
@@ -1008,6 +1013,7 @@ func cmdSync() *cobra.Command {
 	var f runFlags
 	c := &cobra.Command{
 		Use:   "sync",
+		Args:  noArgs,
 		Short: "Pre-sync the worktree (and dependencies) to a slot without running anything",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load(f.dir)
@@ -1025,6 +1031,7 @@ func cmdSyncPlan() *cobra.Command {
 	var asJSON bool
 	c := &cobra.Command{
 		Use:   "sync-plan",
+		Args:  noArgs,
 		Short: "Dry-run: show what would be synced (file count, bytes, largest files, exclusions, dependency key files)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load("")
