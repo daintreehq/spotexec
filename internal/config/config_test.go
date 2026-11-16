@@ -1021,13 +1021,22 @@ region = "us-east-1"
 	for body, want := range map[string]string{
 		"[runners.big]\nextends = \"aws\"\nami = \"ami-0123456789abcdef0\"\n": `"ami" can only be set in the global config`,
 		"[runners.big]\nextends = \"aws\"\non_demand_fallback = true\n":       `"on_demand_fallback" can only be set in the global config`,
-		"[runners.big]\nextends = \"aws\"\nmax_price = \"\"\n":                `max_price`,
-		"[runners.big]\nextends = \"aws\"\nmax_price = \"0.41\"\n":            `max_price`,
-		"[runners.big]\nextends = \"aws\"\nmax_price = \"lots\"\n":            `max_price`,
-		"[runners.big]\nextends = \"aws\"\nmax_instances = 5\n":               `max_instances`,
-		"[runners.big]\nextends = \"aws\"\nidle_timeout = \"11m\"\n":          `idle_timeout`,
-		"[runners.big]\nextends = \"aws\"\nmax_lifetime = \"7h\"\n":           `max_lifetime`,
-		"[runners.big]\nextends = \"open\"\nmax_lifetime = \"13h\"\n":         `max_lifetime`,
+		"[runners.big]\nextends = \"aws\"\nAMI = \"ami-0123456789abcdef0\"\n": `"ami" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\nOn_Demand_Fallback = true\n":       `"on_demand_fallback" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\nPROFILE = \"x\"\n":                 `"profile" can only be set in the global config`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"\"\n":                `max_price can't be removed`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"0.41\"\n":            `max_price = "0.41" is more than your runner "aws" allows (0.40 an hour)`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"lots\"\n":            `max_price must be a positive number`,
+		"[runners.big]\nextends = \"aws\"\nmax_instances = 5\n":               `max_instances = 5 is more than your runner "aws" allows (4)`,
+		"[runners.big]\nextends = \"aws\"\nidle_timeout = \"11m\"\n":          `idle_timeout = 11m0s is longer than your runner "aws" allows (10m0s)`,
+		"[runners.big]\nextends = \"aws\"\nmax_lifetime = \"7h\"\n":           `max_lifetime = 7h0m0s is longer than your runner "aws" allows (6h0m0s)`,
+		"[runners.big]\nextends = \"open\"\nmax_lifetime = \"13h\"\n":         `max_lifetime = 13h0m0s is longer than your runner "open" allows (12h0m0s)`,
+		"[runners.aws]\nmax_price = \"\"\n":                                   `max_price can't be removed`,
+		"[runners.aws]\nmax_price = \"0.5\"\n":                                `is more than your runner "aws" allows`,
+		"[runners.aws]\nidle_timeout = \"1h\"\n":                              `idle_timeout = 1h0m0s is longer`,
+		"[runners.aws]\nmax_lifetime = \"24h\"\n":                             `max_lifetime = 24h0m0s is longer`,
+		"[runners.sim]\nidle_timeout = \"11m\"\n":                             `idle_timeout = 11m0s is longer than your runner "sim" allows (10m0s)`,
+		"[runners.big]\nextends_type = \"sim\"\nmax_lifetime = \"3h\"\n":      `max_lifetime = 3h0m0s is longer than your runner "sim" allows (2h0m0s)`,
 		"[runners.big]\nextends = \"aws\"\nvolume_gb = 16385\n":               `volume_gb must be between 8 and 16384`,
 		"[runners.big]\nextends = \"aws\"\nmax_price = \"NaN\"\n":             `max_price must be a positive number`,
 		"[runners.big]\nextends = \"aws\"\nmax_price = \"0\"\n":               `max_price must be a positive number`,
@@ -1035,7 +1044,7 @@ region = "us-east-1"
 		"[runners.big]\nextends = \"open\"\nmax_price = \"Inf\"\n":            `max_price must be a positive number`,
 		"[runners.big]\nextends = \"open\"\nmax_price = \"cheap\"\n":          `max_price must be a positive number`,
 		"[runners.big]\nextends_type = \"sim\"\nmax_price = \"x\"\n":          `max_price must be a positive number`,
-		"[runners.sim]\nmax_instances = 3\n":                                  `max_instances`,
+		"[runners.sim]\nmax_instances = 3\n":                                  `max_instances = 3 is more than your runner "sim" allows (2)`,
 		"[runners.aws]\nmax_instances = 40\n":                                 `max_instances`,
 	} {
 		if _, err := mergeProject(t, g, body); err == nil || !strings.Contains(err.Error(), want) {
@@ -1073,8 +1082,26 @@ max_price = "1.00"
 	if r := c.Global.Runners["same"]; r.MaxPrice != "0.4" || r.MaxInstances != 4 {
 		t.Fatalf("same: %+v", r)
 	}
+	if r := c.Global.Runners["same"]; r.VolumeGB != 16384 || r.IdleTimeout.Duration != 10*time.Minute || r.MaxLifetime.Duration != 6*time.Hour {
+		t.Fatalf("same: %+v", r)
+	}
 	if b := g.Runners["aws"]; b.MaxPrice != "0.40" || b.MaxInstances != 4 || b.MaxLifetime.Duration != 6*time.Hour {
 		t.Fatalf("base runner must not be modified: %+v", b)
+	}
+	if b := g.Runners["open"]; b.MaxLifetime.Duration != 12*time.Hour {
+		t.Fatalf("the open fixture relies on the 12h default lifetime: %s", b.MaxLifetime.Duration)
+	}
+	// A same-name override may tighten too, and an SSH base has no fleet
+	// limits to keep.
+	if _, err := mergeProject(t, g, "[runners.aws]\nmax_price = \"0.3\"\nidle_timeout = \"5m\"\nmax_lifetime = \"1h\"\nmax_instances = 1\n"); err != nil {
+		t.Errorf("same-name tightening: %v", err)
+	}
+	gs, err := loadGlobalText(t, "[runners.box]\ntype = \"ssh\"\nhost = \"box\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mergeProject(t, gs, "[runners.box]\nmax_instances = 9\nidle_timeout = \"1h\"\n"); err != nil {
+		t.Errorf("ssh override: %v", err)
 	}
 	if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nmax_price = \"$0.40\"\n"); err == nil || !strings.Contains(err.Error(), "max_price must be a positive number") {
 		t.Errorf("global max_price: %v", err)
@@ -1099,6 +1126,20 @@ instance_types = ["c7a.2xlarge"]
 extends = "arm"
 vcpus = 8
 instance_types = ["m*g*"]
+[runners.mixed]
+extends = "arm"
+vcpus = 8
+instance_types = ["m*", "c7a.2xlarge"]
+[runners.mixed2]
+extends = "arm"
+vcpus = 8
+instance_types = ["c7a.2xlarge", "m*"]
+[runners.empty]
+extends = "arm"
+instance_types = []
+[runners.untouched]
+extends = "arm"
+max_slots = 2
 [runners.explicit]
 extends = "arm"
 vcpus = 8
@@ -1108,10 +1149,14 @@ arch = "amd64"
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, want := range map[string]string{"mem": "arm64", "graviton": "arm64", "concrete": "amd64", "explicit": "amd64"} {
+	for name, want := range map[string]string{"mem": "arm64", "graviton": "arm64", "mixed": "amd64", "mixed2": "amd64", "empty": "amd64", "concrete": "amd64", "explicit": "amd64", "untouched": "arm64"} {
 		if got := c.Global.Runners[name].Arch; got != want {
 			t.Errorf("%s: arch %q, want %q", name, got, want)
 		}
+	}
+	// instance_types alone drop the inherited vcpus, so patterns need their own.
+	if _, err := mergeProject(t, g, "[runners.x]\nextends = \"arm\"\ninstance_types = [\"m*\"]\n"); err == nil || !strings.Contains(err.Error(), "is a pattern, which needs vcpus") {
+		t.Errorf("patterns without vcpus: %v", err)
 	}
 }
 
@@ -1125,34 +1170,57 @@ func TestProjectDurationsAndTaskPools(t *testing.T) {
 		}
 		return LoadProject(pp)
 	}
-	for _, body := range []string{
-		"timeout = \"0s\"\n",
-		"timeout = \"-1m\"\n",
-		"grace_period = \"0s\"\n",
-		"grace_period = \"-1s\"\n",
-		"queue_timeout = \"0s\"\n",
-		"queue_timeout = \"-5m\"\n",
-		"[deps]\ntimeout = \"0s\"\n",
-		"[deps]\ntimeout = \"-1m\"\n",
-		"[container]\nimage = \"node:22\"\ntimeout = \"0s\"\n",
-		"[container]\nimage = \"node:22\"\ntimeout = \"-1m\"\n",
-		"[tasks.a]\nrun = \"x\"\ntimeout = \"0s\"\n",
-		"[tasks.a]\nrun = \"x\"\ntimeout = \"-1m\"\n",
+	for body, want := range map[string]string{
+		"timeout = \"0s\"\n":                                    "timeout must be positive (got 0s)",
+		"timeout = \"-1m\"\n":                                   "timeout must be positive (got -1m0s)",
+		"Timeout = \"0s\"\n":                                    "timeout must be positive (got 0s)",
+		"grace_period = \"0s\"\n":                               "grace_period must be positive",
+		"grace_period = \"-1s\"\n":                              "grace_period must be positive",
+		"queue_timeout = \"0s\"\n":                              "queue_timeout must be positive",
+		"queue_timeout = \"-5m\"\n":                             "queue_timeout must be positive",
+		"[deps]\ntimeout = \"0s\"\n":                            "deps.timeout must be positive",
+		"[deps]\ntimeout = \"-1m\"\n":                           "deps.timeout must be positive",
+		"[container]\nimage = \"node:22\"\ntimeout = \"0s\"\n":  "container.timeout must be positive",
+		"[container]\nimage = \"node:22\"\ntimeout = \"-1m\"\n": "container.timeout must be positive",
+		"[tasks.a]\nrun = \"x\"\ntimeout = \"0s\"\n":            "tasks.a.timeout must be positive",
+		"[tasks.a]\nrun = \"x\"\ntimeout = \"-1m\"\n":           "tasks.a.timeout must be positive",
+		"[tasks.a]\nrun = \"x\"\nTIMEOUT = \"0s\"\n":            "tasks.a.timeout must be positive",
 	} {
-		if _, err := load(body); err == nil || !strings.Contains(err.Error(), "must be positive") {
-			t.Errorf("%q: got %v", body, err)
+		if _, err := load(body); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want %q, got %v", body, want, err)
 		}
 	}
-	if p, err := load("timeout = \"30m\"\n[tasks.a]\nrun = \"x\"\n"); err != nil || p.Timeout.Duration != 30*time.Minute || p.Tasks["a"].Timeout.Duration != 0 {
-		t.Errorf("positive and unset durations: %+v, %v", p, err)
+	// Unset durations get their defaults (a task's inherits the command's).
+	for _, body := range []string{"", "[deps]\nhydrate = \"copy\"\n[container]\nimage = \"node:22\"\n[tasks.a]\nrun = \"x\"\n"} {
+		p, err := load(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Timeout.Duration != 5*time.Minute || p.Grace.Duration != 5*time.Second || p.QueueTimeout.Duration != 10*time.Minute || p.Deps.Timeout.Duration != 20*time.Minute || p.Container.Timeout.Duration != 20*time.Minute {
+			t.Errorf("%q: defaults %+v", body, p)
+		}
+		if a := p.Tasks["a"]; a != nil && a.Timeout.Duration != 0 {
+			t.Errorf("unset task timeout: %s", a.Timeout.Duration)
+		}
+	}
+	p, err := load("timeout = \"30m\"\ngrace_period = \"2s\"\nqueue_timeout = \"1h\"\n[deps]\ntimeout = \"3m\"\n[container]\nimage = \"node:22\"\ntimeout = \"4m\"\n[tasks.a]\nrun = \"x\"\ntimeout = \"7m\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Timeout.Duration != 30*time.Minute || p.Grace.Duration != 2*time.Second || p.QueueTimeout.Duration != time.Hour || p.Deps.Timeout.Duration != 3*time.Minute || p.Container.Timeout.Duration != 4*time.Minute || p.Tasks["a"].Timeout.Duration != 7*time.Minute {
+		t.Errorf("positive durations: %+v", p)
 	}
 
 	g, err := loadGlobalText(t, "[runners.homelab]\ntype = \"ssh\"\nhost = \"box\"\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mergeProject(t, g, "[tasks.a]\nrun = \"x\"\npool = [\"homelab\", \"nope\"]\n"); err == nil || !strings.Contains(err.Error(), `task "a": pool references unknown runner "nope"`) {
+	// Tasks are checked in name order, each pool in its own order.
+	if _, err := mergeProject(t, g, "[tasks.b]\nrun = \"x\"\npool = [\"zz\"]\n[tasks.a]\nrun = \"x\"\npool = [\"homelab\", \"nope\", \"also\"]\n"); err == nil || !strings.Contains(err.Error(), `task "a": pool references unknown runner "nope"`) {
 		t.Errorf("task pool: %v", err)
+	}
+	if _, err := mergeProject(t, g, "[tasks.a]\nrun = \"x\"\npool = [\"homelab\"]\n"); err != nil {
+		t.Errorf("valid task pool: %v", err)
 	}
 	// A task pool naming a fleet this user can't back loads, like a project pool.
 	if _, err := mergeProject(t, g, "[runners.big]\nextends = \"aws\"\n[tasks.a]\nrun = \"x\"\npool = [\"big\"]\n"); err != nil {

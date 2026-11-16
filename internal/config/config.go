@@ -489,6 +489,33 @@ func checkVersion(md toml.MetaData, v int) error {
 	return fmt.Errorf("version = %d isn't supported (supported: %d)", v, ConfigVersion)
 }
 
+// defined reports whether the file sets key as the decoder reads it: the
+// decoder matches schema keys case-insensitively (TIMEOUT sets timeout),
+// while MetaData.IsDefined is exact, so a check built on it could be
+// sidestepped by spelling a key in capitals. The runner or task name under
+// [runners] or [tasks] still matches exactly.
+func defined(md toml.MetaData, key ...string) bool {
+	isName := func(i int) bool {
+		return i == 1 && (strings.EqualFold(key[0], "runners") || strings.EqualFold(key[0], "tasks"))
+	}
+	for _, k := range md.Keys() {
+		if len(k) != len(key) {
+			continue
+		}
+		match := true
+		for i := range key {
+			if k[i] != key[i] && (isName(i) || !strings.EqualFold(k[i], key[i])) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 // CheckVersion reads only the version of the config at path, for commands
 // that edit the file without loading it.
 func CheckVersion(path string) error {
@@ -526,10 +553,10 @@ func LoadGlobal() (*Global, error) {
 	}
 	for name, r := range g.Runners {
 		r.Name = name
-		if md.IsDefined("runners", name, "extends_type") {
+		if defined(md, "runners", name, "extends_type") {
 			return nil, fmt.Errorf("%s: runner %q: extends_type is for runners in a project's .spotexec.toml", g.Path, name)
 		}
-		if md.IsDefined("runners", name, "region") && md.IsDefined("runners", name, "regions") {
+		if defined(md, "runners", name, "region") && defined(md, "runners", name, "regions") {
 			return nil, fmt.Errorf("%s: runner %q: set region or regions, not both", g.Path, name)
 		}
 		if err := r.applyDefaults(); err != nil {
@@ -947,13 +974,13 @@ func LoadProject(path string) (*Project, error) {
 func (p *Project) applyDefaults() {
 	// Defaults fill unset durations; an explicit zero is left for validate
 	// to reject.
-	if p.Timeout.Duration == 0 && !p.md.IsDefined("timeout") {
+	if p.Timeout.Duration == 0 && !defined(p.md, "timeout") {
 		p.Timeout.Duration = 5 * time.Minute
 	}
-	if p.Grace.Duration == 0 && !p.md.IsDefined("grace_period") {
+	if p.Grace.Duration == 0 && !defined(p.md, "grace_period") {
 		p.Grace.Duration = 5 * time.Second
 	}
-	if p.QueueTimeout.Duration == 0 && !p.md.IsDefined("queue_timeout") {
+	if p.QueueTimeout.Duration == 0 && !defined(p.md, "queue_timeout") {
 		p.QueueTimeout.Duration = 10 * time.Minute
 	}
 	if p.Sync.Mode == "" {
@@ -963,10 +990,10 @@ func (p *Project) applyDefaults() {
 		p.Sync.Writeback = "always"
 	}
 	// An explicit 0 turns a limit off, so only a missing key gets the default.
-	if !p.md.IsDefined("sync", "writeback_max_files") {
+	if !defined(p.md, "sync", "writeback_max_files") {
 		p.Sync.WritebackMaxFiles = DefaultWritebackMaxFiles
 	}
-	if !p.md.IsDefined("sync", "writeback_max_bytes") {
+	if !defined(p.md, "sync", "writeback_max_bytes") {
 		p.Sync.WritebackMaxBytes = DefaultWritebackMaxBytes
 	}
 	if p.Sync.WritebackOver == "" {
@@ -975,10 +1002,10 @@ func (p *Project) applyDefaults() {
 	if p.Deps.Hydrate == "" {
 		p.Deps.Hydrate = "auto"
 	}
-	if p.Deps.Timeout.Duration == 0 && !p.md.IsDefined("deps", "timeout") {
+	if p.Deps.Timeout.Duration == 0 && !defined(p.md, "deps", "timeout") {
 		p.Deps.Timeout.Duration = 20 * time.Minute
 	}
-	if p.Container.Timeout.Duration == 0 && !p.md.IsDefined("container", "timeout") {
+	if p.Container.Timeout.Duration == 0 && !defined(p.md, "container", "timeout") {
 		p.Container.Timeout.Duration = 20 * time.Minute
 	}
 	if p.Tasks == nil {
@@ -1023,7 +1050,7 @@ func (p *Project) validate() error {
 	if _, _, err := depskey.Expand(p.Deps.Lockfiles, nil); err != nil {
 		return err // a malformed or escaping pattern; literal paths are checked when read
 	}
-	if p.md.IsDefined("setup") && strings.TrimSpace(p.Setup.Run) == "" {
+	if defined(p.md, "setup") && strings.TrimSpace(p.Setup.Run) == "" {
 		return errors.New("setup.run must be set when [setup] is present")
 	}
 	for _, d := range []struct {
@@ -1054,7 +1081,7 @@ func (p *Project) validate() error {
 		if (t.Run == "") == (len(t.Parallel) == 0) {
 			return fmt.Errorf("task %q must set exactly one of run or parallel", name)
 		}
-		if t.Shards != 0 || p.md.IsDefined("tasks", name, "shards") {
+		if t.Shards != 0 || defined(p.md, "tasks", name, "shards") {
 			if len(t.Parallel) > 0 {
 				return fmt.Errorf("task %q: shards applies to a run task, not a parallel one (shard the tasks it lists instead)", name)
 			}
@@ -1086,7 +1113,7 @@ func (p *Project) validate() error {
 // positive rejects a negative duration, or a zero one the file sets (unset
 // means the default): a zero timeout would end every command at once.
 func (p *Project) positive(d time.Duration, key ...string) error {
-	if d < 0 || d == 0 && p.md.IsDefined(key...) {
+	if d < 0 || d == 0 && defined(p.md, key...) {
 		return fmt.Errorf("%s must be positive (got %s)", strings.Join(key, "."), d)
 	}
 	return nil
@@ -1143,7 +1170,7 @@ func (c *Config) MergeProjectRunners() error {
 		// stay in the global config. Sizing, scheduling and the VM's own setup
 		// may be overridden.
 		for _, key := range globalOnlyKeys {
-			if p.md.IsDefined("runners", name, key) {
+			if defined(p.md, "runners", name, key) {
 				return fmt.Errorf("%s: runner %q: %q can only be set in the global config (%s)", p.Path, name, key, GlobalPath())
 			}
 		}
@@ -1183,10 +1210,10 @@ func (c *Config) MergeProjectRunners() error {
 		// instance_types alone drop inherited requirements, and requirements
 		// alone drop inherited instance_types (which would otherwise narrow
 		// them).
-		setsTypes := p.md.IsDefined("runners", name, "instance_types")
+		setsTypes := defined(p.md, "runners", name, "instance_types")
 		setsReqs := false
 		for _, k := range []string{"vcpus", "min_memory_gib", "min_generation", "exclude_instance_types"} {
-			setsReqs = setsReqs || p.md.IsDefined("runners", name, k)
+			setsReqs = setsReqs || defined(p.md, "runners", name, k)
 		}
 		if setsTypes && !setsReqs {
 			base.VCPUs, base.MinMemoryGiB, base.MinGeneration, base.ExcludeInstanceTypes = 0, 0, 0, nil
@@ -1195,13 +1222,13 @@ func (c *Config) MergeProjectRunners() error {
 			base.InstanceTypes = nil
 			// "listed" needs the list just dropped; run_cost and cheapest
 			// carry over.
-			if !p.md.IsDefined("runners", name, "launch_order") && base.LaunchOrder == LaunchListed {
+			if !defined(p.md, "runners", name, "launch_order") && base.LaunchOrder == LaunchListed {
 				base.LaunchOrder = ""
 			}
 		}
 		// Re-derive the arch from the new instance types, unless they are all
 		// patterns, which narrow the base's types without naming an arch.
-		if setsTypes && !p.md.IsDefined("runners", name, "arch") && !allPatterns(probe.InstanceTypes) {
+		if setsTypes && !defined(p.md, "runners", name, "arch") && !allPatterns(probe.InstanceTypes) {
 			base.Arch = ""
 		}
 		if err := p.md.PrimitiveDecode(prim, &base); err != nil {
