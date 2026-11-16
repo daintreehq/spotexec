@@ -92,6 +92,8 @@ type poolState struct {
 	// The requirements (provider.MatchKey) the notes' Mismatch reasons
 	// were judged against.
 	MatchKey string `json:"match_key,omitempty"`
+	// Sched: the reservation ledger and placement policy (sched.go).
+	Sched *schedState `json:"sched,omitempty"`
 }
 
 // quotaBlocked reports the quota (or max_price) refusal that still holds
@@ -376,6 +378,7 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 		}
 	}
 	st.Launches = keep
+	st.sched().forgetGone(live)
 	return nil
 }
 
@@ -431,10 +434,16 @@ const (
 	OutDraining
 	OutUnreachable
 	OutBootFailed // its bootstrap_script failed: draining, and a fleet problem
+	// outSkipped: not contacted, the ledger shows no room (or the policy no
+	// longer places work there).
+	outSkipped
 )
 
 // Observe records a probe result.
 func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
+	if o == outSkipped {
+		return
+	}
 	_ = p.with(func(st *poolState) error {
 		n := st.note(id)
 		now := time.Now()
