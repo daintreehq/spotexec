@@ -52,6 +52,7 @@ type fakeRegionsEC2 struct {
 	pushed      map[string]map[string]int64  // region -> ECR tag -> push time (Unix ms); DescribeImages pages one image at a time
 	describeErr map[string]string            // region -> error type DescribeImages answers
 	loginErr    map[string]bool              // regions whose GetAuthorizationToken fails
+	policyErr   map[string]bool              // regions whose PutLifecyclePolicy is denied
 	cached      map[string]map[string]bool   // region -> dependency cache object keys held
 	cacheErr    map[string]int               // region -> HTTP status the cache bucket answers
 	calls       []string                     // "region Action [detail]"
@@ -190,6 +191,30 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			_ = json.Unmarshal(body, &in)
 			if r.Header.Get("X-Amz-Target") == "AmazonEC2ContainerRegistry_V20150921.DescribeImages" {
 				f.describeImages(w, region, body)
+				return
+			}
+			switch r.Header.Get("X-Amz-Target") {
+			case "AmazonEC2ContainerRegistry_V20150921.DescribeRepositories":
+				var d struct {
+					Names []string `json:"repositoryNames"`
+				}
+				_ = json.Unmarshal(body, &d)
+				f.log(region, "DescribeRepositories "+strings.Join(d.Names, ","))
+				if _, ok := f.images[region]; !ok || len(d.Names) != 1 {
+					w.WriteHeader(400)
+					fmt.Fprint(w, `{"__type":"RepositoryNotFoundException","message":"no repository"}`)
+					return
+				}
+				fmt.Fprintf(w, `{"repositories":[{"repositoryUri":"123456789012.dkr.ecr.%s.amazonaws.com/%s"}]}`, region, d.Names[0])
+				return
+			case "AmazonEC2ContainerRegistry_V20150921.PutLifecyclePolicy":
+				f.log(region, "PutLifecyclePolicy "+in.Repo)
+				if f.policyErr[region] {
+					w.WriteHeader(400)
+					fmt.Fprint(w, `{"__type":"AccessDeniedException","message":"not authorized to perform ecr:PutLifecyclePolicy"}`)
+					return
+				}
+				fmt.Fprint(w, `{}`)
 				return
 			}
 			if r.Header.Get("X-Amz-Target") == "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken" {

@@ -39,11 +39,17 @@ func (p *regionsProvider) ImageSource(ctx context.Context, instanceID, repoID, t
 	return p.source, nil
 }
 
-// localScript answers image requests as a runner without a registry of
-// its own would: from the runner when it has the image, else by copying
-// it from Source when inSource, else (not probing) by building it. The
-// source each request named is recorded.
-func localScript(t *testing.T, onRunner, inSource bool, sources *[]string) *scriptRPC {
+// runner is how a runner without a registry of its own answers image
+// requests: from the image it has, else by copying from Source when
+// inSource (only once probing is over, when lateCopy: the first copy
+// failed), else (not probing) by building it, which fails when buildFails.
+type runner struct {
+	onRunner, inSource, lateCopy, buildFails bool
+}
+
+// localScript answers image requests as rn says. The source each request
+// named is recorded.
+func localScript(t *testing.T, rn runner, sources *[]string) *scriptRPC {
 	return newScript(t, func(c *protocol.Conn, typ string, msg json.RawMessage) {
 		var m protocol.Image
 		_ = json.Unmarshal(msg, &m)
@@ -56,12 +62,14 @@ func localScript(t *testing.T, onRunner, inSource bool, sources *[]string) *scri
 		}
 		*sources = append(*sources, src)
 		switch {
-		case onRunner:
+		case rn.onRunner:
 			_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Image: "spotexec-local/r:abc", ImageID: "sha256:0"})
-		case m.Source != nil && inSource:
+		case m.Source != nil && rn.inSource && !(rn.lateCopy && m.Probe):
 			_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Image: "spotexec-local/r:abc", ImageID: "sha256:1", Pulled: true, Copied: true})
 		case m.Probe:
 			_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Missing: true, InstalledDocker: len(*sources) == 1})
+		case rn.buildFails:
+			_ = c.Send(protocol.TypeError, protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "docker build .spotexec/Dockerfile: exit 100", BuildFailed: true})
 		default:
 			_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Image: "spotexec-local/r:abc", ImageID: "sha256:2", Built: true})
 		}
@@ -79,7 +87,7 @@ func localImage() protocol.Image {
 func TestImageRegistriesLookupTimesOut(t *testing.T) {
 	ctx := fastShare(t)
 	old := registryTimeout
-	registryTimeout = 20 * time.Millisecond
+	registryTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { registryTimeout = old })
 	src := &protocol.RegistryAuth{Server: "1.dkr.ecr.us-east-2.amazonaws.com", Repo: "1.dkr.ecr.us-east-2.amazonaws.com/spotexec/r"}
 	p := &regionsProvider{source: src, registry: func(ctx context.Context) (*protocol.RegistryAuth, error) {
@@ -96,7 +104,7 @@ func TestImageRegistriesLookupTimesOut(t *testing.T) {
 		t.Fatalf("warns %v", rep.warns)
 	}
 	var sources []string
-	c := localScript(t, false, true, &sources)
+	c := localScript(t, runner{inSource: true}, &sources)
 	req := localImage()
 	req.Registry = reg
 	r, shared, push, err := fetchImage(ctx, c, Options{Rep: rep}, "aws#1", io.Discard, nil, imageMemo{}, req, locate, time.Minute)
@@ -150,6 +158,7 @@ func TestFetchImageWithoutRegistryCopiesFromAnotherRegion(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		onRunner   bool
+		lateCopy   bool // the source probe's copy fails, the request's works
 		found      *protocol.RegistryAuth
 		lookupErr  error
 		failed     bool // a build failure is remembered
@@ -167,15 +176,20 @@ func TestFetchImageWithoutRegistryCopiesFromAnotherRegion(t *testing.T) {
 		{name: "the lookup fails", lookupErr: errors.New("timed out"), sent: "[image:probe image]", sources: "[ ]", looked: 1, warns: 1, built: true},
 		{name: "copied despite a remembered failure", found: src, failed: true, sent: "[image:probe image:probe]", sources: "[ " + src.Repo + "]", looked: 1, copied: true},
 		{name: "a remembered failure with no region holding it", failed: true, sent: "[image:probe]", sources: "[]", looked: 1, cachedFail: true},
+		// The request keeps the source: copying is tried again before
+		// building.
+		{name: "a copy that failed once is tried again", found: src, lateCopy: true, sent: "[image:probe image:probe image]", sources: "[ " + src.Repo + " " + src.Repo + "]", looked: 1, copied: true},
+		{name: "a copy failing again with a failure remembered", found: src, lateCopy: true, failed: true, sent: "[image:probe image:probe]", sources: "[ " + src.Repo + "]", looked: 1, cachedFail: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := fastShare(t)
 			rep := &recRep{}
 			var sources []string
-			c := localScript(t, tc.onRunner, true, &sources)
-			if tc.found == nil {
-				c = localScript(t, tc.onRunner, false, &sources)
+			rn := runner{onRunner: tc.onRunner, inSource: tc.found != nil, lateCopy: tc.lateCopy}
+			if tc.lateCopy && tc.failed {
+				rn.inSource = false // the copy fails every time
 			}
+			c := localScript(t, rn, &sources)
 			looked := 0
 			locate := func(context.Context) (*protocol.RegistryAuth, error) {
 				looked++
@@ -215,5 +229,32 @@ func TestFetchImageWithoutRegistryCopiesFromAnotherRegion(t *testing.T) {
 				t.Fatal("the failure is still remembered")
 			}
 		})
+	}
+}
+
+// #218: a build that fails on a runner without a registry of its own is
+// remembered, so the next run needing the image fails at once rather than
+// building it again.
+func TestFetchImageWithoutRegistryRemembersAFailedBuild(t *testing.T) {
+	ctx := fastShare(t)
+	memo := newImageMemo("repo")
+	locate := func(context.Context) (*protocol.RegistryAuth, error) { return nil, nil }
+	var sources []string
+	c := localScript(t, runner{buildFails: true}, &sources)
+	_, _, _, err := fetchImage(ctx, c, Options{Rep: &recRep{}}, "aws#1", io.Discard, nil, memo, localImage(), locate, time.Minute)
+	var be *ImageBuildError
+	if !errors.As(err, &be) || be.Cached || memo.recall(localImage().Tag) == nil {
+		t.Fatalf("err %#v", err)
+	}
+	if got := fmt.Sprint(c.sent); got != "[image:probe image]" {
+		t.Fatalf("sent %s", got)
+	}
+	c = localScript(t, runner{buildFails: true}, &sources)
+	_, _, _, err = fetchImage(ctx, c, Options{Rep: &recRep{}}, "aws#2", io.Discard, nil, memo, localImage(), locate, time.Minute)
+	if !errors.As(err, &be) || !be.Cached {
+		t.Fatalf("err %#v", err)
+	}
+	if got := fmt.Sprint(c.sent); got != "[image:probe]" {
+		t.Fatalf("sent %s", got)
 	}
 }

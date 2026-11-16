@@ -136,6 +136,10 @@ func TestRegistryForSurvivesALifecyclePolicyFailure(t *testing.T) {
 					body = `{"repository":{"repositoryUri":"1.dkr.ecr.ap-south-1.amazonaws.com/spotexec/x"}}`
 				case "PutLifecyclePolicy":
 					if tc.hangs {
+						// Bounded by its own deadline, not the lookup's.
+						if d, ok := r.Context().Deadline(); !ok || time.Until(d) > ecrLifecycleTimeout {
+							t.Errorf("policy call deadline %v (%v)", d, ok)
+						}
 						<-r.Context().Done()
 						return nil, r.Context().Err()
 					}
@@ -151,7 +155,11 @@ func TestRegistryForSurvivesALifecyclePolicyFailure(t *testing.T) {
 					http: &http.Client{Transport: rt}},
 				dir: t.TempDir(),
 			}
-			auth, err := a.RegistryFor(context.Background(), "x")
+			// The lookup's own deadline: a policy call that held it would
+			// leave the login none.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			auth, err := a.RegistryFor(ctx, "x")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -170,6 +178,39 @@ func TestRegistryForSurvivesALifecyclePolicyFailure(t *testing.T) {
 				t.Fatalf("second lookup %s", got)
 			}
 		})
+	}
+}
+
+// #218: on a multi-region runner whose instance's region can't set the
+// expiry rule, both the region's own registry and the copy from another
+// region holding the tag are still to be had.
+func TestImageLookupsSurviveALifecyclePolicyFailure(t *testing.T) {
+	f := &fakeRegionsEC2{
+		images:    map[string]map[string]string{"r-one-1": {}, "r-two-1": {"t1": "sha256:a"}},
+		policyErr: map[string]bool{"r-one-1": true},
+	}
+	g := newGlobalEnv(t, f, "r-two-1", "r-one-1")
+	discovered(t, g)
+	if err := g.remember([]Instance{{ID: "i-1", Region: "r-one-1", LaunchedAt: time.Now()}}); err != nil {
+		t.Fatal(err)
+	}
+	reg, ok := ForInstance(context.Background(), g, "i-1").(ImageRegistry)
+	if !ok {
+		t.Fatal("the instance's region has no registry")
+	}
+	home, err := reg.RegistryFor(context.Background(), "repo1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if home.Repo != "123456789012.dkr.ecr.r-one-1.amazonaws.com/spotexec/repo1" {
+		t.Fatalf("home %+v", home)
+	}
+	if got := f.callsOf("PutLifecyclePolicy"); len(got) != 1 || !strings.HasPrefix(got[0], "r-one-1 ") {
+		t.Fatalf("policy calls %v", got)
+	}
+	src, err := g.ImageSource(context.Background(), "i-1", "repo1", "t1")
+	if err != nil || src == nil || src.Repo != "123456789012.dkr.ecr.r-two-1.amazonaws.com/spotexec/repo1" {
+		t.Fatalf("src %+v, %v", src, err)
 	}
 }
 
