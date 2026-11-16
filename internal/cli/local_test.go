@@ -600,3 +600,30 @@ func TestPipedStdinIsFlaggedNotForwarded(t *testing.T) {
 		t.Errorf("--json: exit %d, stderr %q", code, stderr)
 	}
 }
+
+func TestRunLocalWorkspaceWithSpaces(t *testing.T) {
+	// Locally SPOTEXEC_WORKSPACE is the worktree itself, here with a space,
+	// so a rewritten path must stay one word, and an argument read after a
+	// cd must still name the same file.
+	l := testLoaded()
+	root := filepath.Join(t.TempDir(), "My Projects", "repo")
+	l.ws.Root = root
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rep, _ := ui.New(ui.ModeQuiet, os.Stderr, "")
+	for _, args := range [][]string{
+		{"cat " + strings.ReplaceAll(root, " ", `\ `) + "/f.txt"},
+		{`cat "` + root + `/f.txt"`},
+		{"sh", "-c", `cd sub && cat "$1"`, "sh", root + "/f.txt"},
+	} {
+		var out lockedBuf
+		o := client.Options{Command: buildCommand(l.ws, args), Stdout: &out, Stderr: &out}
+		if code := runLocal(context.Background(), nil, l, o, rep, 0, 1); code != 0 || out.String() != "ok\n" {
+			t.Errorf("%q ran %q: exit %d, output %q", args, o.Command, code, out.String())
+		}
+	}
+}

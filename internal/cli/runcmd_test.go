@@ -184,6 +184,11 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 		{`printf "<%s>" "#not" a#b '# nor'`, "<#not><a#b><# nor><a><two words>"},
 		{"printf \"<%s>\" \"multi\n# line\"", "<multi\n# line><a><two words>"},
 		{`printf "<%s>" \# # escaped`, "<#><a><two words>"},
+		{`printf "<%s>" x\ #y # after an escaped space '#' is data`, "<x #y><a><two words>"},
+		{`printf "<%s>";# no space`, "<a><two words>"},
+		{`printf "<%s>" 2>&1 ;`, "<a><two words>"},
+		{"printf \"<%s>\" &", "<a><two words>"},
+		{"printf \"<%s>\" # it's \"unbalanced\n# more", "<a><two words>"},
 	}
 	for _, c := range cases {
 		line := taskCommand(c.tmpl, []string{"a", "two words"})
@@ -194,5 +199,10 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 		if string(out) != c.want {
 			t.Errorf("template %q: line %q printed %q, want %q", c.tmpl, line, out, c.want)
 		}
+	}
+	// A run that is only a comment must not run its arguments.
+	line := taskCommand("# nothing yet", []string{"touch", "x"})
+	if out, err := exec.Command("sh", "-c", line+"\necho done").Output(); err != nil || string(out) != "done\n" {
+		t.Errorf("comment-only run %q: %q %v", line, out, err)
 	}
 }

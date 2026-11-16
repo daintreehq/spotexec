@@ -19,6 +19,7 @@ func TestRewriteRoot(t *testing.T) {
 		{"--out=/Users/me/repo/dist", `--out="${SPOTEXEC_WORKSPACE:?}"/dist`},
 		{`ls /Users/me/re\po/x`, `ls "${SPOTEXEC_WORKSPACE:?}"/x`},
 		{`ls '/Users/me/re\po'`, `ls '/Users/me/re\po'`},
+		{`ls x\ /Users/me/repo`, `ls x\ /Users/me/repo`},
 	}
 	for _, c := range cases {
 		if got := rewriteRoot(c.in, root); got != c.want {
@@ -101,10 +102,24 @@ func TestSnippetWorkspaceDoesNotWordSplit(t *testing.T) {
 	if got, want := runWith(t, line), "</remote ws/a></remote ws/b></remote ws/c><--out=/remote ws/d></remote ws>"; got != want {
 		t.Errorf("line %q printed %q, want %q", line, got, want)
 	}
+	// A task's arguments pass through the same rewriting.
+	if got, want := runWith(t, buildTaskLine(&loaded{ws: ws}, `printf '<%s>' # each`, []string{"/Users/me/repo/x", "it's"})), "</remote ws/x><it's>"; got != want {
+		t.Errorf("task line printed %q, want %q", got, want)
+	}
 	// A worktree whose path has a space, written with it escaped.
 	ws = &client.Workspace{Root: "/Users/me/My Projects/repo", Cwd: "."}
 	line = buildCommand(ws, []string{`printf '<%s>' /Users/me/My\ Projects/repo/x "/Users/me/My Projects/repo/y" /Users/me/My\ Projects/repo-other`})
 	if got, want := runWith(t, line), "</remote ws/x></remote ws/y></Users/me/My Projects/repo-other>"; got != want {
 		t.Errorf("line %q printed %q, want %q", line, got, want)
+	}
+	// Unescaped, the space and the quote are syntax, not part of the path.
+	root := "/Users/me/it's repo"
+	for _, in := range []string{`ls /Users/me/it's repo'`, `ls /Users/me/it\'s repo`} {
+		if got := rewriteRoot(in, root); got != in {
+			t.Errorf("rewriteRoot(%q) = %q, want it unchanged", in, got)
+		}
+	}
+	if got, want := rewriteRoot(`ls /Users/me/it\'s\ repo/a`, root), `ls "${SPOTEXEC_WORKSPACE:?}"/a`; got != want {
+		t.Errorf("got %q want %q", got, want)
 	}
 }
