@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -620,7 +622,7 @@ func cmdHook() *cobra.Command {
 						fmt.Println("note: the hook only offloads in projects with a .spotexec.toml (run `spotexec init`)")
 					}
 					rtkNote(p, wd)
-					fmt.Println("note: permission rules now see `spotexec run -- <cmd>`; allow `Bash(spotexec run:*)` if you pre-approve test commands")
+					fmt.Println("note: your Claude Code permission rules still apply to the commands as the agent writes them: the hook passes them on (no `Bash(spotexec run:*)` rule needed)")
 				}
 			}
 			if codex {
@@ -694,8 +696,11 @@ func cmdHook() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			orig := strings.Join(args, " ")
+			d.In(wd)
+			orig := hooks.Normalize(strings.Join(args, " "))
 			line, explicit, raw := hooks.UnwrapRTK(orig)
+			perm := hooks.CheckPermissions(orig, wd, d.Prefixes())
+			ok, why := d.Why(line)
 			runnersErr := hooks.RunnersFor(line, wd, l.cfg.Project)
 			// The same decision the hook makes (project opt-in, disabled,
 			// cd outside the repository).
@@ -704,29 +709,123 @@ func cmdHook() *cobra.Command {
 				fmt.Println("local (no .spotexec.toml: the hook only offloads in projects that opt in)")
 			case l.cfg.Project.Hook.Disabled:
 				fmt.Println("local ([hook] disabled = true)")
-			case !d.ShouldOffload(line):
-				fmt.Println("local")
+			case !ok:
+				fmt.Printf("local (%s)\n", why)
 			case !hooks.CdsInside(line, wd):
 				fmt.Println("local (cd leaves the repository)")
 			case l.cfg.Project.Hook.WhenLoadAbove > 0 && belowLoad(l.cfg.Project.Hook.WhenLoadAbove):
 				fmt.Printf("local (load per CPU is below when_load_above = %.2f)\n", l.cfg.Project.Hook.WhenLoadAbove)
+			case perm.Verdict == hooks.VerdictDeny:
+				fmt.Printf("local (your rule %s in %s denies it: Claude Code refuses it as written)\n", perm.Rule, perm.File)
 			case runnersErr != nil:
 				fmt.Printf("local (no usable runners: %v)\n", runnersErr)
 			default:
 				rtk := hooks.RTKFor(wd)
 				wrapped := hooks.WrapRTK("spotexec", line, !raw && (explicit || rtk.InUse()))
-				if file, ok := rtk.Races(orig); ok {
+				file, races := rtk.Races(orig)
+				block := l.cfg.Project.Hook.Mode == "block"
+				switch {
+				case perm.Verdict == hooks.VerdictAsk && (block || races):
+					fmt.Printf("local (your rule %s in %s asks about it, and the hook would deny it with instructions to re-run, which the rule wouldn't see)\n", perm.Rule, perm.File)
+					return errors.New("not offloaded")
+				case races && !block:
 					fmt.Printf("offload, by denying it with instructions to re-run as: %s\n(RTK's hook in %s would rewrite it too; chain the hooks with `spotexec hook install`)\n", wrapped, file)
+					return nil
+				case block:
+					fmt.Printf("offload, by denying it with instructions to re-run as: %s\n([hook] mode = \"block\")\n", wrapped)
 					return nil
 				}
 				fmt.Println("offload:", wrapped)
+				switch perm.Verdict {
+				case hooks.VerdictAsk:
+					fmt.Printf("(asks first: your rule %s in %s)\n", perm.Rule, perm.File)
+				case hooks.VerdictAllow:
+					fmt.Printf("(allowed by your rule %s in %s)\n", perm.Rule, perm.File)
+				}
 				return nil
 			}
 			return errors.New("not offloaded")
 		},
 	}
-	c.AddCommand(install, handler, check)
+	var days, limit int
+	var asJSON bool
+	discover := &cobra.Command{
+		Use:   "discover",
+		Short: "Show which heavy commands in past Claude Code sessions the hook keeps local, and why",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			wd, _ := os.Getwd()
+			l, err := load(wd)
+			if err != nil {
+				return err
+			}
+			ws, err := client.Resolve(wd)
+			if err != nil {
+				return err
+			}
+			d, err := hooks.NewDecider(l.cfg.Project.Hook)
+			if err != nil {
+				return err
+			}
+			since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+			res, err := hooks.Discover(hooks.ClaudeProjectsDir(), hooks.Worktrees(ws.Root), since, d)
+			if err != nil {
+				return fmt.Errorf("reading Claude Code sessions: %w", err)
+			}
+			if l.cfg.Project.Hook.Disabled && !asJSON {
+				fmt.Println("note: [hook] disabled = true in this project: the hook offloads nothing; the counts show what it would do if enabled.")
+			}
+			if asJSON {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(res)
+			}
+			printDiscovery(os.Stdout, res, days, limit)
+			return nil
+		},
+	}
+	discover.Flags().IntVar(&days, "days", 30, "how many days of sessions to read")
+	discover.Flags().IntVar(&limit, "limit", 15, "how many of the most frequent commands kept local to list")
+	discover.Flags().BoolVar(&asJSON, "json", false, "print the report as JSON")
+	c.AddCommand(install, handler, check, discover)
 	return c
+}
+
+// printDiscovery prints a hook discover report.
+func printDiscovery(w io.Writer, res hooks.Discovery, days, limit int) {
+	missed := 0
+	for _, r := range res.Reasons {
+		missed += r.Count
+	}
+	where := strings.Join(res.Roots, ", ")
+	if len(res.Roots) > 1 {
+		where = fmt.Sprintf("%s and %d other worktrees", res.Roots[len(res.Roots)-1], len(res.Roots)-1)
+	}
+	fmt.Fprintf(w, "Claude Code sessions in %s, last %d days: %d sessions, %d Bash commands.\n", where, days, res.Sessions, res.Commands)
+	if res.Commands == 0 {
+		return
+	}
+	fmt.Fprintf(w, "  %5d heavy commands the hook offloads\n", res.Offloaded)
+	fmt.Fprintf(w, "  %5d ran through spotexec directly\n", res.Direct)
+	fmt.Fprintf(w, "  %5d heavy commands kept local\n", missed)
+	for _, r := range res.Reasons {
+		fmt.Fprintf(w, "        %5d  %s\n", r.Count, r.Reason)
+	}
+	if len(res.Missed) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "\nMost frequent heavy commands kept local:")
+	for i, m := range res.Missed {
+		if i == limit {
+			fmt.Fprintf(w, "  ... and %d more (--limit)\n", len(res.Missed)-limit)
+			break
+		}
+		c := m.Command
+		if len(c) > 110 {
+			c = c[:107] + "..."
+		}
+		fmt.Fprintf(w, "  %4d  %s\n        %s\n", m.Count, c, m.Reason)
+	}
 }
 
 // claudeHook handles one Claude Code PreToolUse event on stdin, handing it

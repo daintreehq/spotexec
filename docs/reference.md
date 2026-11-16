@@ -37,7 +37,8 @@ spotexec unlock [runner[/id]] (--slot N | --all)
 spotexec prune [runner[/id]...] [--older-than 7d] [--dry-run]
 spotexec init [--global] [--force] [--yes] [--no-container]  .spotexec.toml and the project container (or the runner config)
 spotexec hook install [--claude] [--codex] [--shared|--global] [--uninstall]
-spotexec hook check '<command>'              show whether the hook offloads a command
+spotexec hook check '<command>'              show whether the hook offloads a command, and why
+spotexec hook discover [--days N] [--limit N] [--json]  heavy commands from past Claude Code sessions that stayed local, and why
 spotexec cloud-init [runner]                 print the first-boot user-data
 spotexec completion bash|zsh|fish|powershell shell completion script
 spotexec completion sx bash|zsh|fish|powershell   the same for sx (flags and task names)
