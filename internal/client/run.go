@@ -1521,7 +1521,7 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	// failure just means installing without the cache, and says why.
 	// The cache lives in the instance's own region (multi-region fleets).
 	var resign func(context.Context) (string, string, error)
-	if dc := depsCacheFor(ctx, o, lease.Provider, lease.InstanceID); dc != nil {
+	if dc := depsCacheFor(ctx, o, r, lease.Provider, lease.InstanceID); dc != nil {
 		key, err := depskey.Key(ws.Root, depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Image: image, Toolchain: req.Toolchain, OS: s.Hello.OS, Arch: s.Hello.Arch})
 		if err != nil {
 			o.Rep.Warn("DEPS_CACHE", "shared dependency cache unavailable: computing its key: %v", err)
@@ -1597,10 +1597,14 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 const depsCacheTimeout = 20 * time.Second
 
 // depsCacheFor is the shared dependency cache in the instance's own region
-// (nil: none). A multi-region fleet that can't tell the instance's region
-// offers none, and the run says why (#228) instead of installing without
-// the cache unannounced.
-func depsCacheFor(ctx context.Context, o Options, p provider.Provider, instanceID string) provider.DepsCache {
+// (nil: none, or turned off with cache_bucket). A multi-region fleet that
+// can't tell the instance's region offers none, and the run says why
+// (#228) instead of installing without the cache unannounced.
+func depsCacheFor(ctx context.Context, o Options, r *config.Runner, p provider.Provider, instanceID string) provider.DepsCache {
+	switch r.CacheBucket {
+	case "off", "none", "false":
+		return nil
+	}
 	if pl, ok := p.(provider.Placed); ok && instanceID != "" {
 		cctx, cancel := context.WithTimeout(ctx, depsCacheTimeout)
 		q, err := pl.For(cctx, instanceID)
@@ -1669,7 +1673,13 @@ func fetchDeps(ctx context.Context, c rpc, onEvent func(protocol.Event), o Optio
 		},
 		build: func(ctx context.Context) error {
 			if resign != nil && time.Since(signed) > resignAfter {
-				if get, put, err := resign(ctx); err == nil && get != "" {
+				get, put, err := resign(ctx)
+				switch {
+				case err != nil:
+					// The URLs signed before may have expired: a restore then
+					// misses, and an upload fails.
+					o.Rep.Warn("DEPS_CACHE", "signing fresh shared dependency cache URLs failed (using those signed %s ago): %v", ui.Dur(time.Since(signed)), err)
+				case get != "":
 					req.CacheGet, req.CachePut = get, put
 				}
 			}

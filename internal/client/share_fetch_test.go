@@ -149,6 +149,39 @@ func TestFetchDepsResignsStaleURLs(t *testing.T) {
 	}
 }
 
+// URLs that can't be signed afresh are a warning: the old ones are used,
+// and may have expired (#228).
+func TestFetchDepsWarnsWhenResigningFails(t *testing.T) {
+	ctx := fastShare(t)
+	old := resignAfter
+	resignAfter = 0
+	t.Cleanup(func() { resignAfter = old })
+	var gets []string
+	c := newScript(t, func(c *protocol.Conn, typ string, msg json.RawMessage) {
+		var d protocol.Deps
+		_ = json.Unmarshal(msg, &d)
+		gets = append(gets, d.CacheGet)
+		if d.Probe {
+			sendDeps(c, protocol.DepsResult{Missing: true})
+			return
+		}
+		sendDeps(c, protocol.DepsResult{Built: true})
+	})
+	rep := &recRep{}
+	_, _, _, err := depsFetchSigned(ctx, t, c, rep, sharedDeps(), func(context.Context) (string, string, error) {
+		return "", "", errors.New("finding the AWS account: timeout")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gets) != 2 || gets[1] != sharedDeps().CacheGet {
+		t.Fatalf("cache_get sent %q, want the old URL", gets)
+	}
+	if len(rep.warns) != 1 || !strings.HasPrefix(rep.warns[0], "DEPS_CACHE: signing fresh shared dependency cache URLs failed") || !strings.Contains(rep.warns[0], "finding the AWS account: timeout") {
+		t.Fatalf("warnings %q", rep.warns)
+	}
+}
+
 // The helper giving up on this client while it waits for the upload is a
 // lost session: an error, and no verdict, so a waiting run takes over.
 func TestFetchDepsSessionErrorDuringUpload(t *testing.T) {

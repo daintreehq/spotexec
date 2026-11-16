@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -236,29 +237,35 @@ func TestEnsureBucketForbidden(t *testing.T) {
 // answer. The URLs are signed anyway, for the VM in that region to use, so
 // a fresh VM still restores the archive the bucket holds.
 func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
-	old := accountLookupTimeout
-	accountLookupTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { accountLookupTimeout = old })
+	oldAcct, oldRule := accountLookupTimeout, cacheRuleTimeout
+	accountLookupTimeout, cacheRuleTimeout = 50*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { accountLookupTimeout, cacheRuleTimeout = oldAcct, oldRule })
 	const identity = `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`
 	for _, tc := range []struct {
 		name         string
 		sts, head    string // "ok", "fail", "hang" or "503"
 		rule         string
-		heads, rules int // calls made by two lookups
+		heads, rules int      // calls made by two lookups
+		stsAsked     []string // STS regions asked, in order
 		budget       time.Duration
 	}{
-		// Unchecked: the next lookup checks again.
+		// Unchecked: the next lookup checks again. The bucket check has no
+		// timeout of its own: the caller's budget bounds it.
 		{name: "bucket check fails", sts: "ok", head: "fail", heads: 2},
 		{name: "bucket check hangs", sts: "ok", head: "hang", heads: 2, budget: 300 * time.Millisecond},
 		{name: "bucket check answers 503", sts: "ok", head: "503", heads: 2},
-		// The bucket exists: only the rule is tried again.
+		// The bucket exists: only the rule is tried again, within its own
+		// timeout.
 		{name: "expiry rule fails", sts: "ok", head: "ok", rule: "fail", heads: 1, rules: 2},
-		{name: "expiry rule hangs", sts: "ok", head: "ok", rule: "hang", heads: 1, rules: 2, budget: 300 * time.Millisecond},
-		// The account comes from the partition's home region.
-		{name: "regional STS hangs", sts: "hang", head: "ok", rule: "ok", heads: 1, rules: 1},
+		{name: "expiry rule hangs", sts: "ok", head: "ok", rule: "hang", heads: 1, rules: 2},
+		// The account comes from the partition's home region, after the
+		// runner's own region gets its bounded turn.
+		{name: "regional STS hangs", sts: "hang", head: "ok", rule: "ok", heads: 1, rules: 1, stsAsked: []string{"ap-south-1", "us-east-1"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var heads, rules atomic.Int32
+			var mu sync.Mutex
+			var stsAsked []string
 			rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				resp := func(st int, body string) (*http.Response, error) {
 					return &http.Response{StatusCode: st, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
@@ -274,6 +281,11 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 						return resp(503, "")
 					}
 					return resp(200, "")
+				}
+				if rg, ok := strings.CutPrefix(r.URL.Host, "sts."); ok {
+					mu.Lock()
+					stsAsked = append(stsAsked, strings.TrimSuffix(rg, ".amazonaws.com"))
+					mu.Unlock()
 				}
 				switch {
 				case r.URL.Host == "sts.us-east-1.amazonaws.com":
@@ -300,15 +312,23 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 					http: &http.Client{Transport: rt}},
 				dir: t.TempDir(),
 			}
+			budget := tc.budget
+			if budget == 0 {
+				// Long enough that only the steps' own timeouts keep a
+				// lookup under a second.
+				budget = 5 * time.Second
+			}
 			for range 2 {
-				ctx, cancel := context.Background(), context.CancelFunc(func() {})
-				if tc.budget > 0 {
-					ctx, cancel = context.WithTimeout(ctx, tc.budget)
-				}
+				ctx, cancel := context.WithTimeout(context.Background(), budget)
+				start := time.Now()
 				get, put, err := a.CacheURLs(ctx, "repo", "k")
+				took := time.Since(start)
 				cancel()
 				if err != nil {
 					t.Fatalf("CacheURLs: %v", err)
+				}
+				if took > time.Second {
+					t.Fatalf("lookup took %s: a step outlived its own timeout", took)
 				}
 				for _, u := range []string{get, put} {
 					p, err := url.Parse(u)
@@ -321,6 +341,15 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 			if int(heads.Load()) != tc.heads || int(rules.Load()) != tc.rules {
 				t.Fatalf("bucket checks %d, expiry rules %d; want %d, %d", heads.Load(), rules.Load(), tc.heads, tc.rules)
 			}
+			want := tc.stsAsked
+			if want == nil {
+				want = []string{"ap-south-1"} // once: the account is remembered
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(stsAsked, want) {
+				t.Fatalf("STS asked in %q, want %q", stsAsked, want)
+			}
 		})
 	}
 }
@@ -328,6 +357,8 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 // Neither the region's STS nor the home region's answers: the error says
 // where the account was looked for.
 func TestAccountIDTriesBothRegions(t *testing.T) {
+	var mu sync.Mutex
+	var hosts []string
 	old := accountLookupTimeout
 	accountLookupTimeout = 50 * time.Millisecond
 	t.Cleanup(func() { accountLookupTimeout = old })
@@ -335,6 +366,9 @@ func TestAccountIDTriesBothRegions(t *testing.T) {
 		r: &config.Runner{Name: "aws", Region: "ap-south-1", Profile: "p"},
 		api: &awsClient{region: "ap-south-1", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "s"}},
 			http: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				mu.Lock()
+				hosts = append(hosts, r.URL.Host)
+				mu.Unlock()
 				<-r.Context().Done()
 				return nil, r.Context().Err()
 			})}},
@@ -345,5 +379,32 @@ func TestAccountIDTriesBothRegions(t *testing.T) {
 	_, err := a.accountID(ctx)
 	if err == nil || !strings.Contains(err.Error(), "ap-south-1 and us-east-1") {
 		t.Fatalf("accountID error = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"sts.ap-south-1.amazonaws.com", "sts.us-east-1.amazonaws.com"}; !slices.Equal(hosts, want) {
+		t.Fatalf("asked %q, want %q", hosts, want)
+	}
+}
+
+// A bucket whose expiry rule couldn't be set, and which has been deleted
+// since, is checked (and created) again rather than trusted as existing.
+func TestEnsureBucketForgetsADeletedBucket(t *testing.T) {
+	a, puts, heads := fakeCacheBucketAWS(t, func(n int) (int, string) {
+		switch n {
+		case 1:
+			return http.StatusInternalServerError, ""
+		case 2:
+			return http.StatusNotFound, `<Error><Code>NoSuchBucket</Code></Error>`
+		}
+		return 200, ""
+	})
+	for range 3 {
+		if _, _, err := a.ensureBucket(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if puts() != 3 || heads() != 2 {
+		t.Fatalf("PUTs %d, HEADs %d; want 3, 2 (checked again after the 404)", puts(), heads())
 	}
 }

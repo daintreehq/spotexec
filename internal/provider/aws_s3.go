@@ -183,8 +183,14 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 			_ = os.WriteFile(exists, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o600)
 		}
 	}
-	if auto && !a.setCacheRule(ctx, bucket, acct) {
-		return bucket, acct, nil // the rule is tried again next time
+	if auto {
+		if st := a.setCacheRule(ctx, bucket, acct); st/100 != 2 {
+			if st == http.StatusNotFound {
+				// The bucket is gone since: check (and create) it again.
+				_ = os.Remove(exists)
+			}
+			return bucket, acct, nil // the rule is tried again next time
+		}
 	}
 	_ = os.MkdirAll(a.dir, 0o700)
 	_ = os.WriteFile(marker, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o600)
@@ -192,17 +198,20 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 	return bucket, acct, nil
 }
 
-// setCacheRule applies the cache bucket's 14-day expiry rule, reporting
-// whether it is set. It gets its own timeout, so a region that is slow to
-// reach doesn't spend the signing's budget on it.
-func (a *AWSSpot) setCacheRule(ctx context.Context, bucket, acct string) bool {
+// setCacheRule applies the cache bucket's 14-day expiry rule, returning
+// S3's status (0: no answer). It gets its own timeout, so a region that is
+// slow to reach doesn't spend the signing's budget on it.
+func (a *AWSSpot) setCacheRule(ctx context.Context, bucket, acct string) int {
 	ctx, cancel := context.WithTimeout(ctx, cacheRuleTimeout)
 	defer cancel()
 	lifecycle := []byte(`<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>spotexec-expire</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>14</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>`)
 	sum := md5.Sum(lifecycle)
 	hdr := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:]), "x-amz-expected-bucket-owner": acct}
 	st, _, err := a.s3Settled(ctx, http.MethodPut, bucket, "?lifecycle", lifecycle, hdr)
-	return err == nil && st/100 == 2
+	if err != nil {
+		return 0
+	}
+	return st
 }
 
 // cacheBucket names the region's cache bucket and the account that must
