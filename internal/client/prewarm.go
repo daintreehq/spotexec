@@ -41,6 +41,17 @@ func (p *Pool) Prewarm(ctx context.Context, id string, log provider.Logger, read
 		p.Cancel(id) // interrupted before the launch request: don't send it
 		return provider.Instance{}, ctx.Err()
 	}
+	// When the launch was planned, for timing it (its record may be pruned
+	// before a slow setup finishes).
+	var started time.Time
+	_ = p.with(func(st *poolState) error {
+		for _, l := range st.Launches {
+			if l.ID == id {
+				started = l.Started
+			}
+		}
+		return nil
+	})
 	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), p.R.BootTimeout.Duration+time.Minute)
 	in, err := p.Provision(pctx, id, log)
 	expired := pctx.Err() != nil
@@ -58,10 +69,13 @@ func (p *Pool) Prewarm(ctx context.Context, id string, log provider.Logger, read
 	}
 	if err == nil {
 		// Watched until it finished setup: an exact launch lead for Plan.
-		_ = p.with(func(st *poolState) error {
-			st.timeLaunch(in.ID, time.Now())
-			return nil
-		})
+		if !started.IsZero() {
+			_ = p.with(func(st *poolState) error {
+				now := time.Now()
+				st.sched().observeLaunch(in.ID, now.Sub(started), now)
+				return nil
+			})
+		}
 		return in, nil
 	}
 	bg := context.WithoutCancel(ctx)

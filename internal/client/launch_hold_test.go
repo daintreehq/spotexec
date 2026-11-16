@@ -310,7 +310,10 @@ func TestPrewarmTimesItsLaunch(t *testing.T) {
 	ctx := context.Background()
 	p, _ := testPool(t, 2)
 	ids, _ := p.Reserve(ctx, 1)
-	in, err := p.Prewarm(ctx, ids[0], nil, func(context.Context, provider.Instance) error { return nil }, nil)
+	in, err := p.Prewarm(ctx, ids[0], nil, func(context.Context, provider.Instance) error {
+		// A setup slow enough that the launch record is pruned meanwhile.
+		return p.with(func(st *poolState) error { st.Launches = nil; return nil })
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +333,7 @@ func TestHeldDemandIsCoveredAcrossFleets(t *testing.T) {
 		p    *Pool
 		vm   string
 		ends time.Time
-	}{{first, "i-b1", now.Add(3 * time.Second)}, {second, "i-h1", time.Time{}}} {
+	}{{first, "i-b1", now.Add(30 * time.Second)}, {second, "i-h1", time.Time{}}} {
 		c.p.loaded(t, func(st *poolState) {
 			s := st.sched()
 			allReady(st, now)
