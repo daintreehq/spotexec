@@ -900,9 +900,15 @@ func TestSetupClaudeHookOptIn(t *testing.T) {
 	if err := os.WriteFile(settings, []byte(stale), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out = captureStdout(t, func() { setupClaudeHook(true, false, false) })
-	if got := readFile(settings); strings.Contains(got, "/gone/") || !hooks.HasClaude(settings) || !strings.Contains(out, "✓ updated the Claude Code hook") {
-		t.Fatalf("stale path kept:\n%s\n%s", got, out)
+	out = captureStdout(t, func() {
+		// A refresh is no opt-in to pass on.
+		if in, declined := setupClaudeHook(true, false, false); in || declined {
+			t.Errorf("refresh: %v, %v", in, declined)
+		}
+	})
+	want := `"command": "` + transportQuote(hookBinary()) + ` hook claude"`
+	if got := readFile(settings); !strings.Contains(got, want) || !strings.Contains(out, "✓ updated the Claude Code hook") {
+		t.Fatalf("want %s:\n%s\n%s", want, got, out)
 	}
 }
 

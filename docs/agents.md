@@ -90,11 +90,11 @@ The hook rewrites heavy Bash commands to `spotexec run -- '<cmd>'` before they e
 
 The `[hook]` table tunes it:
 - `when_load_above = 0.6` offloads only when the laptop is busy;
-- `patterns` / `exclude` add your own regexes (`patterns` match each command of a `&&`/`;` list, `exclude` the whole line);
+- `patterns` / `exclude` add your own regexes (`patterns` match each command of a `&&`/`;` list, `exclude` the whole line before any local output filter);
 - `mode = "block"` denies the command with instructions, instead of rewriting it;
 - `disabled = true` turns it off.
 
-A hook that v0.2.0 installed as `sx hook claude` still works the same way; `spotexec setup` (unless `--no-hooks`) and `spotexec hook install` rewrite it in place to call `spotexec`. They also update a hook that calls spotexec by an old path, after a switch of install method, and add a `Bash` entry when spotexec's hook only sits under another matcher.
+A hook that v0.2.0 installed as `sx hook claude` still works the same way; `spotexec setup` (unless `--no-hooks`) and `spotexec hook install` rewrite it in place to call `spotexec`. They also update a hook that calls spotexec by an old path, after a switch of install method. A spotexec hook under a matcher that doesn't cover Bash doesn't count as installed: `spotexec hook install` (or `spotexec setup --hooks`) adds a `Bash` entry beside it.
 
 ### With RTK
 

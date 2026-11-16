@@ -126,9 +126,13 @@ func (d *Decider) ShouldOffload(command string) bool {
 	return true
 }
 
-// shellHazard reports shell syntax the splitters don't model: a comment
-// (which could hide an operator) or a backslash escape outside quotes.
+// shellHazard reports shell syntax the splitters don't model: a newline
+// (which separates commands, and the splitters trim), a comment (which could
+// hide an operator) or a backslash escape outside quotes.
 func shellHazard(c string) bool {
+	if strings.ContainsRune(c, '\n') {
+		return true
+	}
 	var q byte
 	for i := 0; i < len(c); i++ {
 		ch := c[i]
@@ -347,39 +351,50 @@ func bareSeg(seg string) string {
 // own words (`vitest watch`, `pnpm dev`, `npm run test:watch`), never by an
 // argument (`pytest -k watch`, `go test ./cmd/spotexec`, `cargo test -p sx`).
 func localCommand(seg string) bool {
-	exe, _, _, ok := shellWord(seg)
-	if !ok || exe == "" {
+	toks := shellWords(seg)
+	if len(toks) == 0 || toks[0] == "" {
 		return true
 	}
-	exe = filepath.Base(exe)
-	if exe == "spotexec" || exe == "sx" {
+	toks[0] = filepath.Base(toks[0])
+	// Past a package runner, the script or tool it runs.
+	switch t := toks; {
+	case t[0] == "npx" || t[0] == "bunx":
+		toks = t[1:]
+	case len(t) > 1 && (t[0] == "bun" && t[1] == "x" || t[0] == "npm" && t[1] == "exec" ||
+		t[0] == "pnpm" && (t[1] == "exec" || t[1] == "dlx")):
+		toks = t[2:]
+	case t[0] == "npm" || t[0] == "pnpm" || t[0] == "yarn" || t[0] == "bun":
+		toks = t[1:]
+		if len(toks) > 0 && toks[0] == "run" {
+			toks = toks[1:]
+		}
+	}
+	if len(toks) == 0 {
+		return false
+	}
+	tool := filepath.Base(toks[0])
+	if tool == "spotexec" || tool == "sx" {
 		return true
 	}
-	// The command words: the executable and the plain words after it, up
-	// to the first option, path or quoted word.
-	words := []string{exe}
-	for _, w := range strings.Fields(seg)[1:] {
+	// The command words: the tool and the plain words after it, up to the
+	// first option or path. vitest's watch and dev subcommands may follow
+	// its options (`vitest --no-color watch`), so all its plain words count.
+	words := []string{tool}
+	for _, w := range toks[1:] {
 		if !commandWord.MatchString(w) {
+			if tool == "vitest" {
+				continue
+			}
 			break
 		}
 		words = append(words, w)
 	}
-	// Past a package runner, the script or tool it runs.
-	switch {
-	case words[0] == "npx" || words[0] == "bunx":
-		words = words[1:]
-	case len(words) > 1 && (words[0] == "bun" && words[1] == "x" || words[0] == "npm" && words[1] == "exec" ||
-		words[0] == "pnpm" && (words[1] == "exec" || words[1] == "dlx")):
-		words = words[2:]
-	case words[0] == "npm" || words[0] == "pnpm" || words[0] == "yarn" || words[0] == "bun":
-		words = words[1:]
-		if len(words) > 0 && words[0] == "run" {
-			words = words[1:]
-		}
+	if tool != "vitest" {
+		// The script or tool's name and its subcommand: `test:watch`,
+		// `ng serve`, `dev:server`.
+		words = words[:min(2, len(words))]
 	}
-	// The script or tool's name and its subcommand: `test:watch`,
-	// `vitest watch`, `ng serve`, `dev:server`.
-	for _, w := range words[:min(2, len(words))] {
+	for _, w := range words {
 		parts := strings.Split(w, ":")
 		if parts[0] == "dev" || parts[0] == "start" {
 			return true
@@ -391,6 +406,20 @@ func localCommand(seg string) bool {
 		}
 	}
 	return false
+}
+
+// shellWords splits a command without operators into its words, unquoted.
+func shellWords(s string) []string {
+	var out []string
+	for s = strings.TrimLeft(s, " \t"); s != ""; s = strings.TrimLeft(s, " \t") {
+		w, rest, _, ok := shellWord(s)
+		if !ok || len(rest) == len(s) {
+			break
+		}
+		out = append(out, w)
+		s = rest
+	}
+	return out
 }
 
 // Wrap returns the offloaded form of command, meaning the same as the
@@ -915,8 +944,8 @@ func hasForm(settingsPath string, form int) bool {
 		return false
 	}
 	for _, e := range preEntries(settings) {
-		if !matchesBash(e.matcher) {
-			continue // it never sees a Bash command
+		if !coversBash(e.matcher) {
+			continue // it may never see a Bash command
 		}
 		for _, hm := range e.hooks {
 			if c, _ := hm["command"].(string); hookForm(c) == form {
@@ -929,7 +958,8 @@ func hasForm(settingsPath string, form int) bool {
 
 // refreshHook is an installed spotexec hook command calling spotexec the
 // way hookCmd does: after a switch of install method (a release binary for
-// Homebrew, say), the old path may be gone. A chain keeps its next hook.
+// Homebrew, say), the old path may be gone. Only the executable changes: a
+// chain's --then argument stays exactly as written.
 func refreshHook(cmd, hookCmd string) string {
 	if hookForm(cmd) != hookCurrent {
 		return cmd
@@ -939,10 +969,10 @@ func refreshHook(cmd, hookCmd string) string {
 	if !ok || !ok2 || have == want {
 		return cmd
 	}
-	if then, ok := thenOf(cmd); ok {
-		return chainCmd(hookCmd, then)
-	}
-	return hookCmd
+	cmd, hookCmd = strings.TrimSpace(cmd), strings.TrimSpace(hookCmd)
+	_, args, _, _ := shellWord(cmd)
+	_, wantArgs, _, _ := shellWord(hookCmd)
+	return hookCmd[:len(hookCmd)-len(wantArgs)] + args
 }
 
 // HasClaude reports whether a Claude Code settings file has the hook for
@@ -988,7 +1018,7 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 		for _, h := range hs {
 			hm, _ := h.(map[string]any)
 			c, _ := hm["command"].(string)
-			if then, ok := thenOf(c); ok && isRTKHook(then) && matchesBash(m) {
+			if then, ok := thenOf(c); ok && isRTKHook(then) && coversBash(m) {
 				hadChain = true
 			}
 		}
@@ -1010,7 +1040,7 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 			}
 			// Only a chain that sees Bash commands stands in for spotexec's
 			// own entry.
-			if _, ok := thenOf(c); ok && matchesBash(m) {
+			if _, ok := thenOf(c); ok && coversBash(m) {
 				chained = true
 			}
 		}
@@ -1021,7 +1051,7 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 		m, _ := em["matcher"].(string)
 		// A hook under another matcher (Edit, say) never sees a Bash
 		// command, so it doesn't stand in for spotexec's Bash entry.
-		bash := matchesBash(m)
+		bash := coversBash(m)
 		hs, _ := em["hooks"].([]any)
 		// Each legacy command is rewritten in place, keeping its matcher and
 		// options, unless its own entry already calls spotexec.

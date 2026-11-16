@@ -207,6 +207,18 @@ func matchesBash(m string) bool {
 
 var plainMatcher = regexp.MustCompile(`^[A-Za-z0-9_\- ,|]+$`)
 
+// coversBash is matchesBash for spotexec's own hook, which must surely see
+// Bash commands: a matcher Go can't compile (a lookahead, say) may well
+// exclude Bash, so it doesn't count.
+func coversBash(m string) bool {
+	if m != "" && m != "*" && !plainMatcher.MatchString(m) {
+		if _, err := regexp.Compile(m); err != nil {
+			return false
+		}
+	}
+	return matchesBash(m)
+}
+
 // rtkHook is an RTK hook found in a Claude Code settings file.
 type rtkHook struct {
 	bin  string // rtk's executable

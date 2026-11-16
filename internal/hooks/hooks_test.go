@@ -508,7 +508,7 @@ func TestShouldOffloadQuotedAndArguments(t *testing.T) {
 		"pytest -k 'a or (b and c)'", `pytest -k "a or (b and c)" | tail`, "pytest -k 'a;b' | tail",
 		"pytest -k 'x && y'", "go test ./cmd/spotexec", "cargo test -p sx", "pytest -k watch",
 		"cargo test --features dev", "pytest tests/start", "go test ./internal/serve/...",
-		"pnpm test 2>&1 && pnpm lint 2>&1",
+		"pnpm test 2>&1 && pnpm lint 2>&1", "pytest -k '$FILTER'", "vitest run --reporter=dot src/a.test.ts",
 	}
 	no := []string{
 		"X='1 pytest; pytest' git commit -m wip", `X="pytest && pytest" git push`,
@@ -517,6 +517,12 @@ func TestShouldOffloadQuotedAndArguments(t *testing.T) {
 		"CI=1 sx pnpm test", "cd pkg && sx go test", "npm start", "pnpm start", "yarn dev",
 		"npx vitest watch", "pnpm vitest watch", "vitest dev", "pnpm run test:watch",
 		"pnpm test 2>&1 > out.txt", "pnpm test 2>&1 &",
+		// Expansions run with this machine's values or the runner's.
+		`pytest -k "$FILTER"`, `pytest -k "$(cat f)"`, "pytest -k \"`cat f`\"", "X=\"$(id)\" pytest",
+		// bash refuses these as written; joined, they would run.
+		"go test\n&& go test", "go test\n| tail", "pytest -k 'a\nb'",
+		// The subcommand may follow vitest's options.
+		"vitest --no-color watch", "npx vitest --reporter=dot dev",
 	}
 	for _, c := range yes {
 		if !d.ShouldOffload(c) {
@@ -568,6 +574,7 @@ func TestCdsInsideQuotedAndMerged(t *testing.T) {
 		"cd pkg 2>&1 && go test ./...":      true,
 		"cd .. 2>&1 && go test ./...":       false,
 		"X='a; cd /tmp' pytest":             true,
+		"X='a; b' cd .. && pytest":          false,
 		"cd pkg && pytest -k 'x; cd /tmp'":  true,
 		"cd pkg && pytest | grep 'a; cd /'": true,
 	} {
@@ -640,5 +647,68 @@ func TestInstallRefreshesStalePath(t *testing.T) {
 	os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'/opt/homebrew/bin/spotexec' hook claude"}]}]}}`), 0o644)
 	if ok, err := InstallClaude(p, want); err != nil || ok {
 		t.Fatal("same executable rewritten", ok, err)
+	}
+}
+
+// Through a package runner, spotexec is still spotexec.
+func TestShouldOffloadRunnerWrappedSpotexec(t *testing.T) {
+	d, err := NewDecider(config.Hook{Patterns: []string{`^pnpm exec `, `^npx `}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []string{"pnpm exec sx pytest", "pnpm exec '/opt/tools/spotexec' run -- pytest", "npx spotexec run -- pytest"} {
+		if d.ShouldOffload(c) {
+			t.Errorf("expected local: %q", c)
+		}
+	}
+	if !d.ShouldOffload("pnpm exec vitest run") {
+		t.Error("expected offload: pnpm exec vitest run")
+	}
+}
+
+func TestWrapDirMerged(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "pkg"), 0o755)
+	want, _ := filepath.EvalSymlinks(filepath.Join(root, "pkg"))
+	for _, c := range []string{"cd pkg 2>&1 && pnpm test", "X='a; b' cd pkg && pnpm test"} {
+		if got := wrapDir(c, root); got != want {
+			t.Errorf("wrapDir(%q) = %q, want %q", c, got, want)
+		}
+	}
+}
+
+// A matcher Go can't compile may exclude Bash: it doesn't count as
+// installed, nor does a legacy hook under another matcher.
+func TestInstallIgnoresUncertainMatchers(t *testing.T) {
+	for name, entry := range map[string]string{
+		"lookahead": `{"matcher":"^(?!Bash$).*$","hooks":[{"type":"command","command":"spotexec hook claude"}]}`,
+		"legacy":    `{"matcher":"Edit","hooks":[{"type":"command","command":"sx hook claude"}]}`,
+	} {
+		p := filepath.Join(t.TempDir(), "settings.json")
+		os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[`+entry+`]}}`), 0o644)
+		if HasClaude(p) {
+			t.Errorf("%s: counted as installed", name)
+		}
+		if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || !ok {
+			t.Fatal(name, ok, err)
+		}
+		b, _ := os.ReadFile(p)
+		if !HasClaude(p) || !strings.Contains(string(b), `"matcher": "Bash"`) {
+			t.Errorf("%s: no Bash entry added:\n%s", name, b)
+		}
+	}
+}
+
+// Refreshing the executable leaves a chain's argument exactly as written,
+// expansions included.
+func TestInstallRefreshKeepsChainVerbatim(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "settings.json")
+	os.WriteFile(p, []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/old/spotexec hook claude --then \"$NEXT\""}]}]}}`), 0o644)
+	if ok, err := InstallClaude(p, "/new/spotexec hook claude"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	b, _ := os.ReadFile(p)
+	if !strings.Contains(string(b), `"command": "/new/spotexec hook claude --then \"$NEXT\""`) {
+		t.Fatalf("chain argument changed:\n%s", b)
 	}
 }
