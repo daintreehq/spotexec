@@ -489,6 +489,34 @@ func checkVersion(md toml.MetaData, v int) error {
 	return fmt.Errorf("version = %d isn't supported (supported: %d)", v, ConfigVersion)
 }
 
+// defined reports whether the file sets key as the decoder reads it: the
+// decoder matches schema keys case-insensitively (TIMEOUT sets timeout),
+// while MetaData.IsDefined is exact, so a check built on it could be
+// sidestepped by spelling a key in capitals. The runner or task name under
+// [runners] or [tasks] still matches exactly. Like IsDefined, a table counts
+// as set when only keys inside it are (setup.timeout = "1m" sets [setup]).
+func defined(md toml.MetaData, key ...string) bool {
+	isName := func(i int) bool {
+		return i == 1 && (strings.EqualFold(key[0], "runners") || strings.EqualFold(key[0], "tasks"))
+	}
+	for _, k := range md.Keys() {
+		if len(k) < len(key) {
+			continue
+		}
+		match := true
+		for i := range key {
+			if k[i] != key[i] && (isName(i) || !strings.EqualFold(k[i], key[i])) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 // CheckVersion reads only the version of the config at path, for commands
 // that edit the file without loading it.
 func CheckVersion(path string) error {
@@ -526,10 +554,10 @@ func LoadGlobal() (*Global, error) {
 	}
 	for name, r := range g.Runners {
 		r.Name = name
-		if md.IsDefined("runners", name, "extends_type") {
+		if defined(md, "runners", name, "extends_type") {
 			return nil, fmt.Errorf("%s: runner %q: extends_type is for runners in a project's .spotexec.toml", g.Path, name)
 		}
-		if md.IsDefined("runners", name, "region") && md.IsDefined("runners", name, "regions") {
+		if defined(md, "runners", name, "region") && defined(md, "runners", name, "regions") {
 			return nil, fmt.Errorf("%s: runner %q: set region or regions, not both", g.Path, name)
 		}
 		if err := r.applyDefaults(); err != nil {
@@ -656,6 +684,12 @@ func (r *Runner) validate() error {
 			return fmt.Errorf("%s must not be negative", name)
 		}
 	}
+	if r.MaxPrice != "" {
+		// The launch filter reads an unparsable or non-positive cap as none.
+		if v, err := strconv.ParseFloat(r.MaxPrice, 64); err != nil || !(v > 0) || math.IsInf(v, 0) {
+			return fmt.Errorf("max_price must be a positive number of US dollars an hour, such as \"0.40\" (got %q)", r.MaxPrice)
+		}
+	}
 	if !r.Ephemeral() {
 		return nil
 	}
@@ -680,12 +714,17 @@ func (r *Runner) validate() error {
 		if err := r.validateTypes(); err != nil {
 			return err
 		}
-		if r.VolumeGB < 8 {
-			return fmt.Errorf("volume_gb must be at least 8 (got %d)", r.VolumeGB)
+		if r.VolumeGB < 8 || r.VolumeGB > MaxVolumeGB {
+			return fmt.Errorf("volume_gb must be between 8 and %d (got %d)", MaxVolumeGB, r.VolumeGB)
 		}
 	}
 	return nil
 }
+
+// MaxVolumeGB is the largest root volume a runner may ask for (16 TiB): a
+// spotexec limit well past any build's needs, so a typo can't buy a
+// volume that bills by the terabyte.
+const MaxVolumeGB = 16384
 
 // validateTypes checks how an aws-spot runner chooses instance types.
 func (r *Runner) validateTypes() error {
@@ -916,7 +955,7 @@ func LoadProject(path string) (*Project, error) {
 		}
 		var und []toml.Key
 		for _, k := range md.Undecoded() {
-			if len(k) > 0 && k[0] == "runners" {
+			if len(k) > 0 && strings.EqualFold(k[0], "runners") {
 				continue // decoded later, by MergeProjectRunners
 			}
 			und = append(und, k)
@@ -934,13 +973,15 @@ func LoadProject(path string) (*Project, error) {
 }
 
 func (p *Project) applyDefaults() {
-	if p.Timeout.Duration == 0 {
+	// Defaults fill unset durations; an explicit zero is left for validate
+	// to reject.
+	if p.Timeout.Duration == 0 && !defined(p.md, "timeout") {
 		p.Timeout.Duration = 5 * time.Minute
 	}
-	if p.Grace.Duration == 0 {
+	if p.Grace.Duration == 0 && !defined(p.md, "grace_period") {
 		p.Grace.Duration = 5 * time.Second
 	}
-	if p.QueueTimeout.Duration == 0 {
+	if p.QueueTimeout.Duration == 0 && !defined(p.md, "queue_timeout") {
 		p.QueueTimeout.Duration = 10 * time.Minute
 	}
 	if p.Sync.Mode == "" {
@@ -950,10 +991,10 @@ func (p *Project) applyDefaults() {
 		p.Sync.Writeback = "always"
 	}
 	// An explicit 0 turns a limit off, so only a missing key gets the default.
-	if !p.md.IsDefined("sync", "writeback_max_files") {
+	if !defined(p.md, "sync", "writeback_max_files") {
 		p.Sync.WritebackMaxFiles = DefaultWritebackMaxFiles
 	}
-	if !p.md.IsDefined("sync", "writeback_max_bytes") {
+	if !defined(p.md, "sync", "writeback_max_bytes") {
 		p.Sync.WritebackMaxBytes = DefaultWritebackMaxBytes
 	}
 	if p.Sync.WritebackOver == "" {
@@ -962,10 +1003,10 @@ func (p *Project) applyDefaults() {
 	if p.Deps.Hydrate == "" {
 		p.Deps.Hydrate = "auto"
 	}
-	if p.Deps.Timeout.Duration == 0 {
+	if p.Deps.Timeout.Duration == 0 && !defined(p.md, "deps", "timeout") {
 		p.Deps.Timeout.Duration = 20 * time.Minute
 	}
-	if p.Container.Timeout.Duration == 0 {
+	if p.Container.Timeout.Duration == 0 && !defined(p.md, "container", "timeout") {
 		p.Container.Timeout.Duration = 20 * time.Minute
 	}
 	if p.Tasks == nil {
@@ -1010,11 +1051,23 @@ func (p *Project) validate() error {
 	if _, _, err := depskey.Expand(p.Deps.Lockfiles, nil); err != nil {
 		return err // a malformed or escaping pattern; literal paths are checked when read
 	}
-	if p.md.IsDefined("setup") && strings.TrimSpace(p.Setup.Run) == "" {
+	if defined(p.md, "setup") && strings.TrimSpace(p.Setup.Run) == "" {
 		return errors.New("setup.run must be set when [setup] is present")
 	}
-	if p.Setup.Timeout.Duration < 0 || p.md.IsDefined("setup", "timeout") && p.Setup.Timeout.Duration == 0 {
-		return fmt.Errorf("setup.timeout must be positive (got %s)", p.Setup.Timeout.Duration)
+	for _, d := range []struct {
+		key []string
+		v   time.Duration
+	}{
+		{[]string{"timeout"}, p.Timeout.Duration},
+		{[]string{"grace_period"}, p.Grace.Duration},
+		{[]string{"queue_timeout"}, p.QueueTimeout.Duration},
+		{[]string{"deps", "timeout"}, p.Deps.Timeout.Duration},
+		{[]string{"setup", "timeout"}, p.Setup.Timeout.Duration},
+		{[]string{"container", "timeout"}, p.Container.Timeout.Duration},
+	} {
+		if err := p.positive(d.v, d.key...); err != nil {
+			return err
+		}
 	}
 	if !oneOf(p.Sync.Source, "", "git", "directory") {
 		return fmt.Errorf("sync.source must be git or directory (got %q)", p.Sync.Source)
@@ -1029,7 +1082,7 @@ func (p *Project) validate() error {
 		if (t.Run == "") == (len(t.Parallel) == 0) {
 			return fmt.Errorf("task %q must set exactly one of run or parallel", name)
 		}
-		if t.Shards != 0 || p.md.IsDefined("tasks", name, "shards") {
+		if t.Shards != 0 || defined(p.md, "tasks", name, "shards") {
 			if len(t.Parallel) > 0 {
 				return fmt.Errorf("task %q: shards applies to a run task, not a parallel one (shard the tasks it lists instead)", name)
 			}
@@ -1051,15 +1104,31 @@ func (p *Project) validate() error {
 		if t.Sync != "" && !oneOf(t.Sync, "auto", "in", "none") {
 			return fmt.Errorf("task %q: sync must be auto, in or none", name)
 		}
+		if err := p.positive(t.Timeout.Duration, "tasks", name, "timeout"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// positive rejects a negative duration, or a zero one the file sets (unset
+// means the default): a zero timeout would end every command at once.
+func (p *Project) positive(d time.Duration, key ...string) error {
+	if d < 0 || d == 0 && defined(p.md, key...) {
+		return fmt.Errorf("%s must be positive (got %s)", strings.Join(key, "."), d)
 	}
 	return nil
 }
 
 // globalOnlyKeys are runner settings a project (.spotexec.toml) may not set.
+// ami is among them because an image without cloud-init never arms the
+// watchdog, so its VMs never power off; on_demand_fallback because it
+// trades Spot prices for on-demand ones.
 var globalOnlyKeys = []string{
 	"type", "host", "hosts", "ssh_options", "identity_file", "work_root",
 	"profile", "region", "subnet_id", "security_group_ids", "ssh_cidr",
-	"user", "cache_bucket", "regions", "exclude_regions",
+	"user", "cache_bucket", "regions", "exclude_regions", "ami",
+	"on_demand_fallback",
 }
 
 var (
@@ -1102,7 +1171,7 @@ func (c *Config) MergeProjectRunners() error {
 		// stay in the global config. Sizing, scheduling and the VM's own setup
 		// may be overridden.
 		for _, key := range globalOnlyKeys {
-			if p.md.IsDefined("runners", name, key) {
+			if defined(p.md, "runners", name, key) {
 				return fmt.Errorf("%s: runner %q: %q can only be set in the global config (%s)", p.Path, name, key, GlobalPath())
 			}
 		}
@@ -1142,10 +1211,10 @@ func (c *Config) MergeProjectRunners() error {
 		// instance_types alone drop inherited requirements, and requirements
 		// alone drop inherited instance_types (which would otherwise narrow
 		// them).
-		setsTypes := p.md.IsDefined("runners", name, "instance_types")
+		setsTypes := defined(p.md, "runners", name, "instance_types")
 		setsReqs := false
 		for _, k := range []string{"vcpus", "min_memory_gib", "min_generation", "exclude_instance_types"} {
-			setsReqs = setsReqs || p.md.IsDefined("runners", name, k)
+			setsReqs = setsReqs || defined(p.md, "runners", name, k)
 		}
 		if setsTypes && !setsReqs {
 			base.VCPUs, base.MinMemoryGiB, base.MinGeneration, base.ExcludeInstanceTypes = 0, 0, 0, nil
@@ -1154,12 +1223,14 @@ func (c *Config) MergeProjectRunners() error {
 			base.InstanceTypes = nil
 			// "listed" needs the list just dropped; run_cost and cheapest
 			// carry over.
-			if !p.md.IsDefined("runners", name, "launch_order") && base.LaunchOrder == LaunchListed {
+			if !defined(p.md, "runners", name, "launch_order") && base.LaunchOrder == LaunchListed {
 				base.LaunchOrder = ""
 			}
 		}
-		if setsTypes && !p.md.IsDefined("runners", name, "arch") {
-			base.Arch = "" // re-derive from the new instance types
+		// Re-derive the arch from the new instance types, unless they are all
+		// patterns, which narrow the base's types without naming an arch.
+		if setsTypes && !defined(p.md, "runners", name, "arch") && !allPatterns(probe.InstanceTypes) {
+			base.Arch = ""
 		}
 		if err := p.md.PrimitiveDecode(prim, &base); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
@@ -1168,12 +1239,15 @@ func (c *Config) MergeProjectRunners() error {
 		if err := base.applyDefaults(); err != nil {
 			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
 		}
+		if err := base.withinBase(g); err != nil {
+			return fmt.Errorf("%s: runner %q: %w", p.Path, name, err)
+		}
 		c.Global.Runners[name] = &base
 	}
 	if und := p.md.Undecoded(); len(und) > 0 {
 		var keys []string
 		for _, k := range und {
-			if len(k) > 0 && k[0] == "runners" {
+			if len(k) > 0 && strings.EqualFold(k[0], "runners") {
 				keys = append(keys, k.String())
 			}
 		}
@@ -1182,9 +1256,71 @@ func (c *Config) MergeProjectRunners() error {
 		}
 	}
 	for _, n := range p.Pool {
-		if _, ok := c.Global.Runners[n]; !ok && c.Unavailable[n] == nil {
+		if !c.known(n) {
 			return fmt.Errorf("%s: pool references unknown runner %q", p.Path, n)
 		}
+	}
+	for _, task := range p.TaskNames() {
+		for _, n := range p.Tasks[task].Pool {
+			if !c.known(n) {
+				return fmt.Errorf("%s: task %q: pool references unknown runner %q", p.Path, task, n)
+			}
+		}
+	}
+	return nil
+}
+
+// known reports whether a pool may name n: a configured runner, or a project
+// runner this user's runners can't back (which fails only where it's used).
+func (c *Config) known(n string) bool {
+	_, ok := c.Global.Runners[n]
+	return ok || c.Unavailable[n] != nil
+}
+
+// allPatterns reports whether types is a non-empty list of wildcard
+// patterns only.
+func allPatterns(types []string) bool {
+	for _, t := range types {
+		if !IsTypePattern(t) {
+			return false
+		}
+	}
+	return len(types) > 0
+}
+
+// withinBase rejects a project runner that would spend more than the
+// user's runner it builds on allows: a repository can lower the fleet
+// ceiling, the idle and lifetime limits and the Spot price cap, never
+// raise or remove them.
+func (r *Runner) withinBase(g *Runner) error {
+	if !g.Ephemeral() {
+		return nil
+	}
+	yours := fmt.Sprintf("your runner %q", g.Name)
+	if r.MaxInstances > g.MaxInstances {
+		return fmt.Errorf("max_instances = %d is more than %s allows (%d); a project can lower it, not raise it", r.MaxInstances, yours, g.MaxInstances)
+	}
+	for _, d := range []struct {
+		key       string
+		got, base time.Duration
+	}{
+		{"idle_timeout", r.IdleTimeout.Duration, g.IdleTimeout.Duration},
+		{"max_lifetime", r.MaxLifetime.Duration, g.MaxLifetime.Duration},
+	} {
+		if d.got > d.base {
+			return fmt.Errorf("%s = %s is longer than %s allows (%s); a project can shorten it, not lengthen it", d.key, d.got, yours, d.base)
+		}
+	}
+	if g.MaxPrice == "" || r.MaxPrice == g.MaxPrice {
+		return nil
+	}
+	if r.MaxPrice == "" {
+		return fmt.Errorf("max_price can't be removed: %s caps the Spot price at %s an hour", yours, g.MaxPrice)
+	}
+	// Both parse: validate checked them.
+	limit, _ := strconv.ParseFloat(g.MaxPrice, 64)
+	if v, _ := strconv.ParseFloat(r.MaxPrice, 64); v > limit {
+		return fmt.Errorf("max_price = %q is more than %s allows (%s an hour); a project can lower it, not raise it", r.MaxPrice, yours, g.MaxPrice)
 	}
 	return nil
 }
