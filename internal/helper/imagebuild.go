@@ -47,16 +47,16 @@ var (
 	// A line quoting the Dockerfile: a step's heading ("#5 [2/2] RUN …",
 	// " > [2/2] RUN …:", the legacy "Step 2/2 : RUN …") or the summary's
 	// excerpt ("   2 | >>> RUN …"). It's no evidence of anything.
-	dockerfileLineRe = regexp.MustCompile(`^(?:#\d+ \[|\s*> \[|Step \d+/\d+ : |\s*\d+ \| )`)
+	dockerfileLineRe = regexp.MustCompile(`^(?:#\d+ | > )\[(?:[^\]]* )?\d+/\d+\] [A-Z]+ |^Step \d+/\d+ : [A-Z]+ |^\s+\d+ \| (?:>>> |    )`)
 	// The RUN command Docker quotes in its diagnostics, which is the
 	// Dockerfile's text and no evidence either ("RUN grep ECONNRESET log").
 	quotedCommands = []struct {
 		re   *regexp.Regexp
 		repl string
 	}{
-		{regexp.MustCompile(`process ".*" did not complete`), `process "…" did not complete`},
-		{regexp.MustCompile(`executor failed running \[.*\]`), `executor failed running […]`},
-		{regexp.MustCompile(`The command '.*' returned`), `The command '…' returned`},
+		{regexp.MustCompile(`process ".*?" did not complete successfully: exit code:`), `process "…" did not complete successfully: exit code:`},
+		{regexp.MustCompile(`executor failed running \[.*?\]: exit code:`), `executor failed running […]: exit code:`},
+		{regexp.MustCompile(`The command '.*?' returned a non-zero code:`), `The command '…' returned a non-zero code:`},
 	}
 	// Evidence of Docker, the network or the machine failing, anywhere in
 	// the output, which wins over the above: a RUN step that fails because
@@ -118,14 +118,17 @@ func (b *buildLog) line(l string, long bool) {
 	// Where the line came from is decided on all of it: a progress bar's
 	// rewrites (\r) could otherwise hide that a step printed it.
 	if !dockerfileLineRe.MatchString(l) {
+		step := stepLineRe.MatchString(l)
 		bare := l
-		for _, q := range quotedCommands {
-			bare = q.re.ReplaceAllLiteralString(bare, q.repl)
+		if !step {
+			for _, q := range quotedCommands {
+				bare = q.re.ReplaceAllLiteralString(bare, q.repl)
+			}
 		}
 		if buildInfraRe.MatchString(bare) {
 			b.infra = true
 		}
-		if b.project == "" && !long && !stepLineRe.MatchString(l) {
+		if b.project == "" && !long && !step {
 			b.project = projectCause(bare)
 		}
 	}
