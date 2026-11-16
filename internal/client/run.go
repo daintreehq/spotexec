@@ -2109,6 +2109,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 // log keeps the build's output.
 func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Writer, log *depsLog, memo imageMemo, req protocol.Image, limit time.Duration) (r protocol.ImageResult, shared shareOutcome, push *protocol.ShareDone, err error) {
 	building := false // the helper said it is building: its output goes to log too
+	pushing := false  // the helper is pushing the image: it has it
 	ask := func(req protocol.Image) (protocol.ImageResult, error) {
 		if err := c.send(protocol.TypeImage, req); err != nil {
 			return protocol.ImageResult{}, err
@@ -2136,6 +2137,7 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 				var ev protocol.Event
 				_ = env.Unmarshal(&ev)
 				building = building || ev.Name == "image_build"
+				pushing = pushing || ev.Name == "image_push"
 				o.Rep.Status("%s · %s %s", label, strings.ReplaceAll(ev.Name, "_", " "), ev.Message)
 				c.event(ev)
 			case protocol.TypeError:
@@ -2163,11 +2165,11 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 		return nil
 	}
 	// built settles a build before the runs waiting on it are let go: an
-	// image had, or a forced build that didn't fail as a build (it may have
-	// built the image and failed to push it), forgets an earlier failure,
-	// and a failure of the build itself is remembered, with its output.
+	// image had forgets an earlier failure (even when pushing it then
+	// failed), and a failure of the build itself is remembered, with its
+	// output.
 	built := func(err error) error {
-		if o.WaitPush || err == nil && r.Image != "" {
+		if pushing || err == nil && r.Image != "" {
 			memo.forget(req.Tag)
 		}
 		var re *transport.RemoteError

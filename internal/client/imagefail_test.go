@@ -194,20 +194,51 @@ func TestFetchImageForgetsTheFailureOnceTheImageIsHad(t *testing.T) {
 	}
 }
 
-// `container build` that builds the image but can't push it still forgets
-// the failure: the build works now.
-func TestFetchImageForcedBuildFailingItsPushForgetsTheFailure(t *testing.T) {
-	ctx := fastShare(t)
-	if _, _, err := imageRun(ctx, t, buildFails, Options{}, sharedImage()); err == nil {
-		t.Fatal("the build didn't fail")
-	}
-	s := buildFails
-	s.fail = protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "built .spotexec/Dockerfile but could not push it"}
-	if _, _, err := imageRun(ctx, t, s, Options{WaitPush: true}, sharedImage()); err == nil {
-		t.Fatal("the push didn't fail")
-	}
-	if f := newImageMemo("repo").recall(sharedImage().Tag); f != nil {
-		t.Fatalf("still remembered: %+v", f)
+// `container build` that builds the image but can't push it forgets the
+// failure: the build works now. One cancelled, or failing before it has the
+// image, leaves it remembered.
+func TestFetchImageForcedBuildForgetsTheFailureOnlyOnceItHasTheImage(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		push      bool // the helper got as far as pushing
+		cancel    bool
+		forgotten bool
+	}{
+		{"built, push failed", true, false, true},
+		{"cancelled", false, true, false},
+		{"failed before building", false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := fastShare(t)
+			if _, _, err := imageRun(ctx, t, buildFails, Options{}, sharedImage()); err == nil {
+				t.Fatal("the build didn't fail")
+			}
+			cctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			c := newScript(t, func(c *protocol.Conn, typ string, msg json.RawMessage) {
+				var m protocol.Image
+				_ = json.Unmarshal(msg, &m)
+				if m.Probe {
+					_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Missing: true})
+					return
+				}
+				if tc.push {
+					_ = c.Send(protocol.TypeEvent, protocol.Event{Name: "image_build"})
+					_ = c.Send(protocol.TypeEvent, protocol.Event{Name: "image_push"})
+				}
+				if tc.cancel {
+					cancel()
+				}
+				_ = c.Send(protocol.TypeError, protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "registry login: denied"})
+			})
+			_, _, _, err := fetchImage(cctx, c, Options{Rep: &recRep{}, WaitPush: true}, "aws#1", io.Discard, nil, newImageMemo("repo"), sharedImage(), time.Minute)
+			if err == nil || fmt.Sprint(c.sent) != "[image:probe image]" {
+				t.Fatalf("sent %v, %v", c.sent, err)
+			}
+			if f := newImageMemo("repo").recall(sharedImage().Tag); (f == nil) != tc.forgotten {
+				t.Fatalf("remembered %+v, want forgotten %v", f, tc.forgotten)
+			}
+		})
 	}
 }
 
