@@ -409,6 +409,13 @@ RUN (command -v corepack >/dev/null || npm install -g corepack) \
 `, name, version)
 }
 
+// utf8Locale follows the FROM line of every Debian or Ubuntu scaffold.
+const utf8Locale = `
+# A UTF-8 locale, as GitHub's Linux runners use (without it, commands run
+# under POSIX with an ASCII charset).
+ENV LANG=C.UTF-8
+`
+
 // scaffoldDockerfile proposes a Dockerfile for the project in root, pinned
 // as precisely as the repository allows, and names the stack it detected
 // ("" when it found no language toolchain). The image is built on the
@@ -557,6 +564,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential git curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 `
+	}
+	// A UTF-8 locale, as on GitHub's Linux runners. Most of these base images
+	// leave LANG unset, so commands would run under POSIX with an ASCII
+	// charset; C.UTF-8 ships with glibc, so no locales package is needed.
+	// eclipse-temurin already sets LANG and LC_ALL to en_US.UTF-8.
+	if primary != "java" {
+		from, rest, _ := strings.Cut(body, "\n")
+		body = from + "\n" + utf8Locale + rest
 	}
 	// Other toolchains the repository uses (its tasks may run them).
 	if primary != "" {
