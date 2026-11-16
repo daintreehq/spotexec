@@ -224,7 +224,7 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 				cold += " " + c.ColdParts.Paid()
 			}
 			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t%s\t", c.Score, added(c.Speed), cold, added(c.Distance), added(c.Failures))
-			if c.FailedHere != nil && c.Failures >= 0.0005 {
+			if c.FailedHere != nil { // even when too little to show in USD
 				failed := "failed here lately: " + c.FailedHere.String()
 				if note != "" {
 					failed = "; " + failed

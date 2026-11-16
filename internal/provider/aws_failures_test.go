@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -177,10 +178,30 @@ func TestEarlyReclaimCounts(t *testing.T) {
 	if len(g.HeldBack(tbl.Prices)) != 0 {
 		t.Fatalf("still held back: %v", g.HeldBack(tbl.Prices))
 	}
+	found := false
 	for _, p := range k.Prices {
-		if c, _ := k.CostOf(p); p == pool && (c.Failures == 0 || !strings.Contains(c.Factors(), "VMs reclaimed within 1 hour of launch")) {
-			t.Fatalf("after the hold: %+v", c)
+		if poolKey(p) != poolKey(pool) {
+			continue
 		}
+		found = true
+		c, _ := k.CostOf(p)
+		// Two early reclaims, a half-life (4 h) of decay later.
+		want := (p.USD() + g.r.WaitCostPerHour()) * failCost.Hours() * 2 * math.Exp2(-(reclaimHoldMax+time.Minute).Hours()/failHalfLife.Hours())
+		if c.FailedHere == nil || c.FailedHere.Capacity != 0 || !near(c.Failures, want) ||
+			!strings.Contains(c.Factors(), "VMs reclaimed within 1 hour of launch") {
+			t.Fatalf("after the hold: %+v %+v, want failures %v", c, c.FailedHere, want)
+		}
+	}
+	if !found {
+		t.Fatal("pool not ranked")
+	}
+}
+
+// History too small to show as a count still says what it was.
+func TestFailureHistoryTinyParts(t *testing.T) {
+	h := FailureHistory{Capacity: 0.008, Reclaims: 0.008}
+	if got := h.String(); got != "<0.1 capacity refusals; <0.1 VMs reclaimed within 1 hour of launch" {
+		t.Fatalf("%q", got)
 	}
 }
 
@@ -190,6 +211,13 @@ func TestFailureHistoryOnlyRunCost(t *testing.T) {
 	g, f, now := dryNewestEnv(t)
 	g.r.LaunchOrder = config.LaunchCheapest
 	f.prices["r-one-1"][0][2] = "0.0500" // the dry pool is the cheapest
+	// Enough history that run_cost would put the dry pool last.
+	for i := 0; i < failMaxWeight; i++ {
+		g.coolPool(SpotPrice{Region: "r-one-1", Zone: "r-one-1a", Type: "m7a.2xlarge"}, "InsufficientInstanceCapacity")
+	}
+	if _, k := ranking(t, g); k.Cost != nil || k.Model != nil || k.Prices[0].Type != "m7a.2xlarge" {
+		t.Fatalf("cheapest ranked by run cost: %+v", k)
+	}
 	for round := 0; round < 3; round++ {
 		*now = now.Add(poolCoolMax + time.Minute)
 		resetCalls(f)

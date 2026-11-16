@@ -104,10 +104,15 @@ type FailureHistory struct {
 func (h FailureHistory) String() string {
 	var parts []string
 	add := func(w float64, what string, last time.Time) {
-		if w < failForget {
+		if w <= 0 {
 			return
 		}
-		s := fmt.Sprintf("%.1f %s", w, what)
+		// History kept for its combined weight may have tiny parts.
+		n := fmt.Sprintf("%.1f", w)
+		if w < 0.05 {
+			n = "<0.1"
+		}
+		s := n + " " + what
 		if !last.IsZero() {
 			s += ", last " + last.Local().Format("15:04")
 		}
