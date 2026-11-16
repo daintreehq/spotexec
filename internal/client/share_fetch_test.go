@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -314,7 +317,7 @@ func TestFetchImageColdBuildsAndWaitsForItsPush(t *testing.T) {
 			_ = c.Send(protocol.TypeShareDone, protocol.ShareDone{OK: true, MS: 99})
 		}
 	})
-	r, shared, push, err := fetchImage(ctx, c, Options{Rep: rep}, "aws#1", io.Discard, nil, imageMemo{}, sharedImage(), time.Minute)
+	r, shared, push, err := fetchImage(ctx, c, Options{Rep: rep}, "aws#1", io.Discard, nil, imageMemo{}, sharedImage(), nil, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,11 +335,234 @@ func TestFetchImageWithoutRegistrySendsOneRequest(t *testing.T) {
 	c := newScript(t, func(c *protocol.Conn, typ string, msg json.RawMessage) {
 		_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Image: "node:22", Pulled: true})
 	})
-	r, shared, push, err := fetchImage(ctx, c, Options{Rep: &recRep{}}, "aws#1", io.Discard, nil, imageMemo{}, protocol.Image{Ref: "node:22"}, time.Minute)
+	r, shared, push, err := fetchImage(ctx, c, Options{Rep: &recRep{}}, "aws#1", io.Discard, nil, imageMemo{}, protocol.Image{Ref: "node:22"}, nil, time.Minute)
 	if err != nil || r.Image != "node:22" || shared.led || push != nil {
 		t.Fatalf("r %+v, shared %+v, push %+v, %v", r, shared, push, err)
 	}
 	if got := fmt.Sprint(c.sent); got != "[image]" {
 		t.Fatalf("sent %s", got)
+	}
+}
+
+// regionImage is sharedImage's request in region rg of account 1.
+func regionImage(rg string) protocol.Image {
+	req := sharedImage()
+	server := "1.dkr.ecr." + rg + ".amazonaws.com"
+	req.Registry = &protocol.RegistryAuth{Server: server, Repo: server + "/spotexec/r"}
+	return req
+}
+
+// regionScript answers an image request from where the image is: on the
+// runner's own registry never, in Source when has says so. The source each
+// request named is recorded.
+func regionScript(t *testing.T, has bool, sources *[]string) *scriptRPC {
+	return newScript(t, func(c *protocol.Conn, typ string, msg json.RawMessage) {
+		var m protocol.Image
+		_ = json.Unmarshal(msg, &m)
+		src := ""
+		if m.Source != nil {
+			src = m.Source.Repo
+		}
+		*sources = append(*sources, src)
+		switch {
+		case typ == protocol.TypeShareWait:
+			_ = c.Send(protocol.TypeShareDone, protocol.ShareDone{OK: true})
+		case m.Source != nil && has:
+			_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Image: "spotexec-local/r:abc", ImageID: "sha256:1", Pulled: true, Copied: true, Pushing: true})
+		case m.Probe:
+			_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Missing: true, InstalledDocker: len(*sources) == 1})
+		default:
+			_ = c.Send(protocol.TypeImageResult, protocol.ImageResult{Image: "spotexec-local/r:abc", ImageID: "sha256:2", Built: true, Pushing: true})
+		}
+	})
+}
+
+// #192: an image the runner's region lacks but another region holds is
+// copied from there, never built; a lookup that finds none, or fails,
+// leaves the build to this run as before.
+func TestFetchImageCopiesFromAnotherRegion(t *testing.T) {
+	src := &protocol.RegistryAuth{Server: "1.dkr.ecr.us-east-1.amazonaws.com", Repo: "1.dkr.ecr.us-east-1.amazonaws.com/spotexec/r"}
+	for _, tc := range []struct {
+		name          string
+		found         *protocol.RegistryAuth
+		err           error
+		sent          string
+		sources       string
+		copied        bool
+		looked, warns int
+	}{
+		{"another region holds it", src, nil, "[image:probe image:probe]", "[ " + src.Repo + "]", true, 1, 0},
+		// Looked for again before building: another run may have pushed it.
+		{"no region holds it", nil, nil, "[image:probe image share_wait]", "[  ]", false, 2, 0},
+		{"the lookup fails", nil, fmt.Errorf("denied"), "[image:probe image share_wait]", "[  ]", false, 2, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := fastShare(t)
+			rep := &recRep{}
+			var sources []string
+			c := regionScript(t, true, &sources)
+			looked := 0
+			locate := func(context.Context) (*protocol.RegistryAuth, error) {
+				looked++
+				return tc.found, tc.err
+			}
+			r, shared, push, err := fetchImage(ctx, c, Options{Rep: rep}, "aws#1", io.Discard, nil, imageMemo{}, regionImage("ap-south-1"), locate, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := fmt.Sprint(c.sent); got != strings.Replace(tc.sent, "share_wait", "share_wait:image", 1) {
+				t.Fatalf("sent %s", got)
+			}
+			if got := fmt.Sprint(sources); got != tc.sources {
+				t.Fatalf("sources %s", got)
+			}
+			if looked != tc.looked || r.Copied != tc.copied || r.Built == tc.copied || !r.InstalledDocker || len(rep.warns) != tc.warns {
+				t.Fatalf("looked %d, r %+v, warns %v", looked, r, rep.warns)
+			}
+			// A run that copied it never led a build; one that built it
+			// waited for its push.
+			if shared.led == tc.copied || (push != nil) == tc.copied {
+				t.Fatalf("shared %+v, push %+v", shared, push)
+			}
+		})
+	}
+}
+
+// #192: a run waiting for another run on this machine that builds the same
+// image in another region copies it from there once it is pushed, rather
+// than building it again.
+func TestFetchImageWaitsForABuildInAnotherRegion(t *testing.T) {
+	ctx := fastShare(t)
+	other := regionImage("us-east-1")
+	lock := shareLockFor("image", imageLockID(other.Registry, other.Tag, true))
+	held, err := lock.take(ctx, lock.verdict(), "test 2/8 on aws#4", time.Minute, nil)
+	if err != nil || !held.lead {
+		t.Fatalf("take %+v, %v", held, err)
+	}
+	rep := &recRep{}
+	var sources []string
+	c := regionScript(t, true, &sources)
+	var pushed atomic.Bool
+	locate := func(context.Context) (*protocol.RegistryAuth, error) {
+		if !pushed.Load() {
+			return nil, nil
+		}
+		return other.Registry, nil
+	}
+	go func() {
+		for rep.event("image_wait") == nil {
+			time.Sleep(time.Millisecond)
+		}
+		pushed.Store(true)
+		held.release(shareDone)
+	}()
+	r, shared, push, err := fetchImage(ctx, c, Options{Rep: rep}, "aws#1", io.Discard, nil, imageMemo{}, regionImage("ap-south-1"), locate, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Copied || r.Built || shared.led || shared.waited <= 0 || push != nil {
+		t.Fatalf("r %+v, shared %+v, push %+v", r, shared, push)
+	}
+	if got := fmt.Sprint(c.sent); got != "[image:probe image]" {
+		t.Fatalf("sent %s", got)
+	}
+	if got := fmt.Sprint(sources); got != "[ "+other.Registry.Repo+"]" {
+		t.Fatalf("sources %s", got)
+	}
+}
+
+// #192: a region found holding the image only once this run leads (the
+// other run's push ended between the probe and the lock, without a wait)
+// is copied from, and the leader waits for the copy's push to its own
+// region, as for a build.
+func TestFetchImageLeaderCopiesAndWaitsForThePush(t *testing.T) {
+	ctx := fastShare(t)
+	src := regionImage("us-east-1").Registry
+	rep := &recRep{}
+	var sources []string
+	c := regionScript(t, true, &sources)
+	looked := 0
+	locate := func(context.Context) (*protocol.RegistryAuth, error) {
+		looked++
+		if looked == 1 {
+			return nil, nil
+		}
+		return src, nil
+	}
+	r, shared, push, err := fetchImage(ctx, c, Options{Rep: rep}, "aws#1", io.Discard, nil, imageMemo{}, regionImage("ap-south-1"), locate, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Copied || r.Built || !shared.led || shared.waited != 0 || push == nil || !push.OK {
+		t.Fatalf("r %+v, shared %+v, push %+v", r, shared, push)
+	}
+	if got := fmt.Sprint(c.sent); got != "[image:probe image share_wait:image]" {
+		t.Fatalf("sent %s", got)
+	}
+	if got := fmt.Sprint(sources); got != "[ "+src.Repo+" ]" {
+		t.Fatalf("sources %s", got)
+	}
+}
+
+// The image lock names the image, not the region holding it, for runs that
+// can copy it from another region; for the rest, the region's repository.
+func TestImageLockID(t *testing.T) {
+	a, b := regionImage("us-east-1"), regionImage("ap-south-1")
+	if imageLockID(a.Registry, a.Tag, true) != imageLockID(b.Registry, b.Tag, true) {
+		t.Fatalf("%s != %s", imageLockID(a.Registry, a.Tag, true), imageLockID(b.Registry, b.Tag, true))
+	}
+	if imageLockID(a.Registry, a.Tag, false) == imageLockID(b.Registry, b.Tag, false) {
+		t.Fatal("runs that can't copy across regions wait on each other")
+	}
+	if got := imageLockID(a.Registry, a.Tag, false); got != a.Registry.Repo+":"+a.Tag {
+		t.Fatalf("single-region lock %s", got)
+	}
+	c := regionImage("us-east-1")
+	c.Registry.Server = "2.dkr.ecr.us-east-1.amazonaws.com"
+	c.Registry.Repo = c.Registry.Server + "/spotexec/r"
+	if imageLockID(a.Registry, a.Tag, true) == imageLockID(c.Registry, c.Tag, true) || imageLockID(a.Registry, a.Tag, true) == imageLockID(a.Registry, "other", true) {
+		t.Fatal("other accounts or tags share the lock")
+	}
+}
+
+// #192 with #194: an image whose build failed here but that another of the
+// runner's regions holds is copied from there rather than failing, and the
+// failure is forgotten; with no region holding it, the run fails at once.
+func TestFetchImageCopiesDespiteARememberedFailure(t *testing.T) {
+	src := &protocol.RegistryAuth{Server: "1.dkr.ecr.us-east-1.amazonaws.com", Repo: "1.dkr.ecr.us-east-1.amazonaws.com/spotexec/r"}
+	for _, tc := range []struct {
+		name  string
+		found *protocol.RegistryAuth
+		sent  string
+	}{
+		{"another region holds it", src, "[image:probe image:probe]"},
+		{"no region holds it", nil, "[image:probe]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := fastShare(t)
+			req := regionImage("ap-south-1")
+			memo := newImageMemo("repo")
+			memo.remember(imageFailure{Tag: req.Tag, Message: "docker build .spotexec/Dockerfile: exit 1", Who: "aws#2", At: time.Now()})
+			var sources []string
+			c := regionScript(t, true, &sources)
+			locate := func(context.Context) (*protocol.RegistryAuth, error) { return tc.found, nil }
+			r, _, _, err := fetchImage(ctx, c, Options{Rep: &recRep{}}, "aws#1", io.Discard, nil, memo, req, locate, time.Minute)
+			if got := fmt.Sprint(c.sent); got != tc.sent {
+				t.Fatalf("sent %s, %v", got, err)
+			}
+			var be *ImageBuildError
+			if tc.found == nil {
+				if !errors.As(err, &be) || !be.Cached {
+					t.Fatalf("got %#v", err)
+				}
+				return
+			}
+			if err != nil || !r.Copied || r.Built {
+				t.Fatalf("r %+v, %v", r, err)
+			}
+			if f := newImageMemo("repo").recall(req.Tag); f != nil {
+				t.Fatalf("still remembered %+v", f)
+			}
+		})
 	}
 }

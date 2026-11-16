@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,6 +51,7 @@ type fakeRegionsEC2 struct {
 	imageErr    map[string]string            // region -> error type BatchGetImage answers
 	pushed      map[string]map[string]int64  // region -> ECR tag -> push time (Unix ms); DescribeImages pages one image at a time
 	describeErr map[string]string            // region -> error type DescribeImages answers
+	loginErr    map[string]bool              // regions whose GetAuthorizationToken fails
 	cached      map[string]map[string]bool   // region -> dependency cache object keys held
 	cacheErr    map[string]int               // region -> HTTP status the cache bucket answers
 	calls       []string                     // "region Action [detail]"
@@ -188,6 +190,22 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			_ = json.Unmarshal(body, &in)
 			if r.Header.Get("X-Amz-Target") == "AmazonEC2ContainerRegistry_V20150921.DescribeImages" {
 				f.describeImages(w, region, body)
+				return
+			}
+			if r.Header.Get("X-Amz-Target") == "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken" {
+				f.log(region, "GetAuthorizationToken")
+				if f.loginErr[region] {
+					w.WriteHeader(400)
+					fmt.Fprint(w, `{"__type":"AccessDeniedException","message":"no"}`)
+					return
+				}
+				fmt.Fprintf(w, `{"authorizationData":[{"authorizationToken":%q,"proxyEndpoint":"https://123456789012.dkr.ecr.%s.amazonaws.com"}]}`,
+					base64.StdEncoding.EncodeToString([]byte("AWS:pw-"+region)), region)
+				return
+			}
+			if len(in.IDs) == 0 {
+				t.Errorf("unexpected ECR request %s %s", r.Header.Get("X-Amz-Target"), body)
+				w.WriteHeader(400)
 				return
 			}
 			f.log(region, "BatchGetImage "+in.Repo+":"+in.IDs[0]["imageTag"])

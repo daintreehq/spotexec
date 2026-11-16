@@ -35,6 +35,16 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if len(os.Args) > 1 && os.Args[1] == "image-push" {
+		fs := flag.NewFlagSet("image-push", flag.ExitOnError)
+		root := fs.String("work-root", "", "")
+		_ = fs.Parse(os.Args[2:])
+		if err := ImagePush(*root); err != nil {
+			fmt.Fprintln(os.Stderr, "spotexec-helper:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "docker-proxy" {
 		if err := DockerProxy(); err != nil {
 			fmt.Fprintln(os.Stderr, "spotexec-helper:", err)

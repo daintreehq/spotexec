@@ -319,26 +319,43 @@ func TestShareWaitEndsWhenTheClientIsGone(t *testing.T) {
 	}
 }
 
-// registryDocker puts a docker on PATH that has the images named in the
-// returned directory (files local-<tag>, remote-<tag>) and logs builds.
+// registryDocker puts a docker on PATH that tracks images by full
+// reference, each with its ID. The returned directory seeds them: files
+// local-<tag> (spotexec-local/r:<tag>, ID sha256:feed), remote-<tag> (the
+// runner's registry, ID sha256:home) and source-<tag> (another region's
+// registry src.example, ID sha256:src); nologin-<server> fails that login.
+// Builds and pushes ("<ref> <id>") are logged.
 func registryDocker(t *testing.T) (dir string) {
 	t.Helper()
 	dir = t.TempDir()
 	script := `#!/bin/sh
 d=` + shq(dir) + `
+ref() { echo "$d/ref-$(echo "$1" | tr '/:' '__')"; }
+id() {
+  if [ -e "$(ref "$1")" ]; then cat "$(ref "$1")"; return 0; fi
+  case "$1" in spotexec-local/r:*) [ -e "$d/local-${1##*:}" ] && { echo sha256:feed; return 0; } ;; esac
+  return 1
+}
 [ "$1" = --config ] && shift 2
 case "$1" in
 info) exit 0 ;;
-login) cat >/dev/null; exit 0 ;;
-image) [ "$2" = inspect ] || exit 1
-  for a; do ref=$a; done
-  tag=${ref##*:}; [ -e "$d/local-$tag" ] || exit 1
-  echo sha256:feed; exit 0 ;;
-pull) for a; do ref=$a; done; tag=${ref##*:}
-  [ -e "$d/remote-$tag" ] || { echo "manifest unknown" >&2; exit 1; }
+login) cat >/dev/null; for a; do srv=$a; done
+  [ -e "$d/nologin-$srv" ] && { echo "denied" >&2; exit 1; }
   exit 0 ;;
-tag) tag=${3##*:}; touch "$d/local-$tag"; exit 0 ;;
+image) [ "$2" = inspect ] || exit 1
+  for a; do r=$a; done
+  id "$r" || exit 1; exit 0 ;;
+pull) for a; do r=$a; done; tag=${r##*:}; have=remote; img=sha256:home
+  case "$r" in src.example/*) have=source; img=sha256:src ;; esac
+  [ -e "$d/$have-$tag" ] || { echo "manifest unknown" >&2; exit 1; }
+  echo "$img" > "$(ref "$r")"; exit 0 ;;
+tag) i=$(id "$2") || { echo "no such image $2" >&2; exit 1; }
+  echo "$i" > "$(ref "$3")"; exit 0 ;;
+rmi) rm -f "$(ref "$2")"; exit 0 ;;
 build) echo "$@" >> "$d/builds"; exit 0 ;;
+push) for a; do r=$a; done
+  i=$(id "$r") || { echo "no such image $r" >&2; exit 1; }
+  echo "$r $i" >> "$d/pushes"; exit 0 ;;
 *) exit 0 ;;
 esac
 `
@@ -476,6 +493,88 @@ func TestStreamExitBuilt(t *testing.T) {
 		if got := tc.e.built(); got != tc.want {
 			t.Errorf("%+v: built %v, want %v", tc.e, got, tc.want)
 		}
+	}
+}
+
+// #192: an image the runner's registry lacks but another region's holds is
+// copied from there and pushed to the runner's registry, never built.
+func TestImageCopiesFromAnotherRegion(t *testing.T) {
+	const tag = "0123456789abcdef"
+	for _, tc := range []struct {
+		name               string
+		inSource, waitPush bool
+		probe, noLogin     bool
+	}{
+		{"probe copies and pushes in the background", true, false, true, false},
+		{"container build waits for the push", true, true, false, false},
+		{"a source without it is a miss", false, false, true, false},
+		{"container build can't push without a login", true, true, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := registryDocker(t)
+			seed := func(name string) {
+				if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.inSource {
+				seed("source-" + tag)
+			}
+			if tc.noLogin {
+				seed("nologin-reg.example")
+			}
+			s := testSession(t, t.TempDir())
+			if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+				t.Fatal(err)
+			}
+			out := &syncBuf{}
+			s.c = protocol.NewConn(strings.NewReader(""), out)
+			err := s.image(protocol.Image{Dockerfile: "Dockerfile", Tag: tag, Probe: tc.probe, WaitPush: tc.waitPush,
+				Registry: &protocol.RegistryAuth{Server: "reg.example", Repo: "reg.example/spotexec/r", User: "AWS", Password: "pw"},
+				Source:   &protocol.RegistryAuth{Server: "src.example", Repo: "src.example/spotexec/r", User: "AWS", Password: "pw2"}})
+			if tc.noLogin {
+				if err == nil || !strings.Contains(err.Error(), "could not log in to push") {
+					t.Fatalf("err = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var res protocol.ImageResult
+			replies(t, out, protocol.TypeImageResult, &res)
+			if _, err := os.Stat(filepath.Join(dir, "builds")); !os.IsNotExist(err) {
+				t.Fatalf("built the image: %v", err)
+			}
+			if !tc.inSource {
+				if !res.Missing || res.Copied || res.Pulled {
+					t.Fatalf("result %+v", res)
+				}
+				return
+			}
+			// The source's image, under the local name, with its ID.
+			if res.Missing || !res.Copied || !res.Pulled || res.Built || res.ImageID != "sha256:src" || res.Image != "spotexec-local/r:"+tag {
+				t.Fatalf("result %+v", res)
+			}
+			if tc.waitPush != res.Pushed || tc.waitPush == res.Pushing {
+				t.Fatalf("pushed %v, pushing %v", res.Pushed, res.Pushing)
+			}
+			if res.Pushing {
+				tr := s.transfers[protocol.ShareImage]
+				select {
+				case <-tr.done:
+				case <-time.After(time.Minute):
+					t.Fatal("the push never ended")
+				}
+				if tr.err != nil {
+					b, _ := os.ReadFile(filepath.Join(s.layout.Root, "image-push.log"))
+					t.Fatalf("push: %v: %s", tr.err, b)
+				}
+			}
+			if b, _ := os.ReadFile(filepath.Join(dir, "pushes")); strings.TrimSpace(string(b)) != "reg.example/spotexec/r:"+tag+" sha256:src" {
+				t.Fatalf("pushed %q", b)
+			}
+		})
 	}
 }
 
