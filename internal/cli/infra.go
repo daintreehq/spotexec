@@ -1013,7 +1013,7 @@ func cmdSync() *cobra.Command {
 	var f runFlags
 	c := &cobra.Command{
 		Use:   "sync",
-		Args:  cobra.NoArgs,
+		Args:  noArgs,
 		Short: "Pre-sync the worktree (and dependencies) to a slot without running anything",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load(f.dir)
@@ -1031,7 +1031,7 @@ func cmdSyncPlan() *cobra.Command {
 	var asJSON bool
 	c := &cobra.Command{
 		Use:   "sync-plan",
-		Args:  cobra.NoArgs,
+		Args:  noArgs,
 		Short: "Dry-run: show what would be synced (file count, bytes, largest files, exclusions, dependency key files)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load("")
