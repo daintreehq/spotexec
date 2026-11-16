@@ -90,17 +90,36 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 			t.Errorf("%s: want %d UTF-8 locale(s), right after FROM, in:\n%s", stack, want, body)
 		}
 		// Every stack installs the tools GitHub's runners provide, in one
-		// apt layer straight after FROM.
-		start := strings.Index(body, "\n"+c.from+"\n")
-		end := strings.Index(body, "rm -rf /var/lib/apt/lists/*")
-		if start < 0 || end < start {
-			t.Errorf("%s: no apt layer after FROM in:\n%s", stack, body)
-			continue
+		// apt RUN that is the first instruction after FROM (and its UTF-8
+		// locale), each of its lines continued until the cleanup that ends it.
+		var fields []string
+		closed := false
+		after := body[strings.Index(body, "\n"+c.from+"\n")+len(c.from)+2:]
+		lines := strings.Split(strings.TrimPrefix(after, utf8Locale), "\n")
+		for len(lines) > 0 && (lines[0] == "" || strings.HasPrefix(lines[0], "#")) {
+			lines = lines[1:]
 		}
-		fields := strings.Fields(body[start:end])
+		for i, l := range lines {
+			if i == 0 && l != "RUN apt-get update \\" {
+				t.Errorf("%s: first instruction after FROM is %q, want the apt layer", stack, l)
+				break
+			}
+			if l == " && rm -rf /var/lib/apt/lists/*" {
+				closed = true
+				break
+			}
+			if !strings.HasSuffix(l, " \\") {
+				t.Errorf("%s: apt layer line %q isn't continued", stack, l)
+				break
+			}
+			fields = append(fields, strings.Fields(l)...)
+		}
+		if !closed {
+			t.Errorf("%s: apt layer doesn't end in its cleanup in:\n%s", stack, body)
+		}
 		for _, tool := range wantTools {
 			if !slices.Contains(fields, tool) {
-				t.Errorf("%s: %s not installed in:\n%s", stack, tool, body[start:end])
+				t.Errorf("%s: %s not installed in:\n%s", stack, tool, body)
 			}
 		}
 		// Maven is installed only for a pom.xml project without ./mvnw.
