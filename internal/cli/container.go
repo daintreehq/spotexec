@@ -723,11 +723,11 @@ ENV UV_PYTHON_DOWNLOADS=never
 	return header + body + extra, stack, missing
 }
 
-// runnerTools are command-line tools GitHub's hosted Ubuntu runners ship that
-// test suites shell out to or probe for. Every scaffold installs them, so a
-// suite that passes in GitHub Actions runs the same tests under sx, rather
-// than skipping the ones that look for a tool or failing with "command not
-// found". The package names are the same on Debian and Ubuntu.
+// runnerTools are command-line tools GitHub's hosted Ubuntu runners provide
+// that test suites shell out to or probe for. Every scaffold installs them, so
+// a test that passes in GitHub Actions isn't skipped under sx for want of one
+// (or failed with "command not found"). The package names are the same on
+// Debian and Ubuntu.
 var runnerTools = []string{
 	"bzip2", "ca-certificates", "curl", "file", "git", "jq", "lsof", "make",
 	"openssh-client", "procps", "rsync", "sqlite3", "unzip", "wget", "xz-utils",

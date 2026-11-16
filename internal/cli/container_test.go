@@ -11,6 +11,10 @@ import (
 )
 
 func TestScaffoldDockerfileStacks(t *testing.T) {
+	// The CLI tools GitHub's Ubuntu runners provide that every image gets,
+	// listed here rather than read from runnerTools so a removal is caught.
+	wantTools := []string{"bzip2", "ca-certificates", "curl", "file", "git", "jq", "lsof", "make",
+		"openssh-client", "procps", "rsync", "sqlite3", "unzip", "wget", "xz-utils", "zip", "zsh"}
 	cases := []struct {
 		files map[string]string
 		from  string
@@ -87,13 +91,21 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		}
 		// Every stack installs the tools GitHub's runners provide, in one
 		// apt layer straight after FROM.
-		layer := body[strings.Index(body, "\n"+c.from+"\n"):]
-		layer = layer[:strings.Index(layer, "rm -rf /var/lib/apt/lists/*")]
-		fields := strings.Fields(layer)
-		for _, tool := range runnerTools {
+		start := strings.Index(body, "\n"+c.from+"\n")
+		end := strings.Index(body, "rm -rf /var/lib/apt/lists/*")
+		if start < 0 || end < start {
+			t.Errorf("%s: no apt layer after FROM in:\n%s", stack, body)
+			continue
+		}
+		fields := strings.Fields(body[start:end])
+		for _, tool := range wantTools {
 			if !slices.Contains(fields, tool) {
-				t.Errorf("%s: %s not installed in:\n%s", stack, tool, layer)
+				t.Errorf("%s: %s not installed in:\n%s", stack, tool, body[start:end])
 			}
+		}
+		// Maven is installed only for a pom.xml project without ./mvnw.
+		if slices.Contains(fields, "maven") != strings.HasSuffix(c.stack, ", Maven") {
+			t.Errorf("%s: maven installed = %v", stack, slices.Contains(fields, "maven"))
 		}
 		if strings.Count(body, "\nRUN apt-get update") != 1 {
 			t.Errorf("%s: want exactly one apt layer in:\n%s", stack, body)
