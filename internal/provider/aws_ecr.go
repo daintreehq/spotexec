@@ -54,6 +54,7 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 		}
 	}
 	if uri == "" {
+		kept := false // the expiry rule is set: the URI may be cached
 		var desc struct {
 			Repositories []struct {
 				URI string `json:"repositoryUri"`
@@ -65,7 +66,7 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 			uri = desc.Repositories[0].URI
 			// (Re)apply the expiry rule: a first run that created the
 			// repository may have failed before setting it.
-			a.ecrLifecycle(ctx, name)
+			kept = a.ecrLifecycle(ctx, name)
 		case err == nil || strings.Contains(err.Error(), "RepositoryNotFoundException"):
 			var created struct {
 				Repository struct {
@@ -79,15 +80,17 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 				return nil, fmt.Errorf("creating ECR repository %s: %w", name, err)
 			}
 			uri = created.Repository.URI
-			a.ecrLifecycle(ctx, name)
+			kept = a.ecrLifecycle(ctx, name)
 			if uri == "" {
 				return a.RegistryFor(ctx, repoID) // created concurrently: describe again
 			}
 		default:
 			return nil, fmt.Errorf("ECR: %w", err)
 		}
-		_ = os.MkdirAll(a.dir, 0o700)
-		_ = os.WriteFile(marker, []byte(uri+"\n"), 0o600)
+		if kept {
+			_ = os.MkdirAll(a.dir, 0o700)
+			_ = os.WriteFile(marker, []byte(uri+"\n"), 0o600)
+		}
 	}
 	auth, err := a.ecrLogin(ctx)
 	if err != nil {
@@ -101,11 +104,18 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 	return auth, nil
 }
 
-// ecrLifecycle sets the repository's expiry rule. It only bounds what the
-// repository keeps, so failing to set it never stops a pull or a push
-// (#218): it is applied again when the cached repository URI expires.
-func (a *AWSSpot) ecrLifecycle(ctx context.Context, name string) {
-	_ = a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": ecrLifecyclePolicy}, nil)
+// ecrLifecycleTimeout bounds setting a repository's expiry rule, so a slow
+// call leaves the lookup time to log in.
+var ecrLifecycleTimeout = 10 * time.Second
+
+// ecrLifecycle sets the repository's expiry rule, reporting whether it did.
+// The rule only bounds what the repository keeps, so failing to set it
+// never stops a pull or a push (#218): the repository's URI then isn't
+// cached, and the next lookup sets it again.
+func (a *AWSSpot) ecrLifecycle(ctx context.Context, name string) bool {
+	ctx, cancel := context.WithTimeout(ctx, ecrLifecycleTimeout)
+	defer cancel()
+	return a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": ecrLifecyclePolicy}, nil) == nil
 }
 
 // ecrLogin returns a short-lived login for the region's registry, without

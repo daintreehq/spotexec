@@ -65,6 +65,14 @@ func TestRegistryForLifecyclePolicy(t *testing.T) {
 			if got := strings.Join(calls, " "); got != want || len(policies) != 1 {
 				t.Fatalf("calls %s, want %s", got, want)
 			}
+			// With the rule set, the repository's URI is cached.
+			calls = nil
+			if _, err := a.RegistryFor(context.Background(), "x"); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(calls, " "); got != "GetAuthorizationToken" {
+				t.Fatalf("second lookup %s", got)
+			}
 			var pol struct {
 				Rules []struct {
 					Priority  int `json:"rulePriority"`
@@ -99,11 +107,19 @@ func TestRegistryForLifecyclePolicy(t *testing.T) {
 	}
 }
 
-// #218: a repository whose expiry rule can't be set still gives the login,
-// so the runner pulls (or pushes) the image rather than building it.
+// #218: a repository whose expiry rule can't be set (denied, or the call
+// hangs) still gives the login, so the runner pulls (or pushes) the image
+// rather than building it. The next lookup sets the rule again.
 func TestRegistryForSurvivesALifecyclePolicyFailure(t *testing.T) {
-	for _, exists := range []bool{true, false} {
-		t.Run(map[bool]string{true: "existing repository", false: "new repository"}[exists], func(t *testing.T) {
+	old := ecrLifecycleTimeout
+	ecrLifecycleTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { ecrLifecycleTimeout = old })
+	for _, tc := range []struct {
+		exists, hangs bool
+	}{{true, false}, {false, false}, {true, true}} {
+		name := map[bool]string{true: "existing repository", false: "new repository"}[tc.exists] + map[bool]string{true: ", policy call hangs", false: ", policy denied"}[tc.hangs]
+		t.Run(name, func(t *testing.T) {
+			exists := tc.exists
 			var calls []string
 			rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				st, body := 200, "{}"
@@ -119,6 +135,10 @@ func TestRegistryForSurvivesALifecyclePolicyFailure(t *testing.T) {
 				case "CreateRepository":
 					body = `{"repository":{"repositoryUri":"1.dkr.ecr.ap-south-1.amazonaws.com/spotexec/x"}}`
 				case "PutLifecyclePolicy":
+					if tc.hangs {
+						<-r.Context().Done()
+						return nil, r.Context().Err()
+					}
 					st, body = 400, `{"__type":"AccessDeniedException","message":"not authorized to perform ecr:PutLifecyclePolicy"}`
 				case "GetAuthorizationToken":
 					body = `{"authorizationData":[{"authorizationToken":"QVdTOnB3","proxyEndpoint":"https://1.dkr.ecr.ap-south-1.amazonaws.com"}]}`
@@ -140,6 +160,14 @@ func TestRegistryForSurvivesALifecyclePolicyFailure(t *testing.T) {
 			}
 			if !strings.Contains(strings.Join(calls, " "), "PutLifecyclePolicy GetAuthorizationToken") {
 				t.Fatalf("calls %v", calls)
+			}
+			// The repository is now found, and its rule tried again.
+			exists, calls = true, nil
+			if _, err := a.RegistryFor(context.Background(), "x"); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(calls, " "); got != "DescribeRepositories PutLifecyclePolicy GetAuthorizationToken" {
+				t.Fatalf("second lookup %s", got)
 			}
 		})
 	}

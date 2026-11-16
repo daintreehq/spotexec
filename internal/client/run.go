@@ -2065,26 +2065,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 			return "", "", err
 		}
 		req.Dockerfile, req.Context, req.Tag = c.Dockerfile, c.Context, tag
-		if reg, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.ImageRegistry); ok {
-			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			auth, err := reg.RegistryFor(cctx, ws.RepoID)
-			cancel()
-			if err != nil {
-				o.Rep.Warn("IMAGE_REGISTRY", "image registry unavailable (building on this runner only): %v", err)
-			} else {
-				req.Registry = auth
-			}
-		}
-		// A multi-region runner copies an image another region holds
-		// rather than building it again (#192).
-		if src, ok := lease.Provider.(provider.ImageSource); ok && req.Registry != nil {
-			inst, repoID := lease.InstanceID, ws.RepoID
-			locate = func(ctx context.Context) (*protocol.RegistryAuth, error) {
-				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				defer cancel()
-				return src.ImageSource(cctx, inst, repoID, tag)
-			}
-		}
+		req.Registry, locate = imageRegistries(ctx, o, lease.Provider, lease.InstanceID, ws.RepoID, tag)
 	}
 	o.Rep.Status("%s · preparing container image", label)
 	t := time.Now()
@@ -2108,6 +2089,42 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 	return r.Image, r.ImageID, nil
 }
 
+// registryTimeout bounds each lookup of an image registry.
+var registryTimeout = 30 * time.Second
+
+// imageRegistries returns the registry of the instance's region for the
+// project's images (nil when the provider has none or it can't be had,
+// which only warns) and, for a runner in several regions, a lookup of the
+// others for tag, to copy it from one holding it rather than build it again
+// (#192). That lookup is offered even without the region's own registry: a
+// VM whose region can't be reached still copies the image (#218).
+func imageRegistries(ctx context.Context, o Options, p provider.Provider, instanceID, repoID, tag string) (*protocol.RegistryAuth, func(context.Context) (*protocol.RegistryAuth, error)) {
+	var locate func(context.Context) (*protocol.RegistryAuth, error)
+	if src, ok := p.(provider.ImageSource); ok {
+		locate = func(ctx context.Context) (*protocol.RegistryAuth, error) {
+			cctx, cancel := context.WithTimeout(ctx, registryTimeout)
+			defer cancel()
+			return src.ImageSource(cctx, instanceID, repoID, tag)
+		}
+	}
+	reg, ok := provider.ForInstance(ctx, p, instanceID).(provider.ImageRegistry)
+	if !ok {
+		return nil, locate
+	}
+	cctx, cancel := context.WithTimeout(ctx, registryTimeout)
+	auth, err := reg.RegistryFor(cctx, repoID)
+	cancel()
+	if err != nil {
+		then := "building on this runner only"
+		if locate != nil {
+			then = "copying the image from another of the runner's regions, else building it on this runner"
+		}
+		o.Rep.Warn("IMAGE_REGISTRY", "image registry unavailable (%s): %v", then, err)
+		return nil, locate
+	}
+	return auth, locate
+}
+
 // fetchImage sends the image request. With a registry, which may lack this
 // image, of the runs on this machine needing it now one builds and pushes
 // it, and the rest wait for it and pull it (#139), as fetchDeps does. A
@@ -2117,7 +2134,9 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 // log keeps the build's output. locate (nil: none) finds the image in
 // another region of the runner when its own registry lacks it, to copy from
 // there instead (#192): runs that landed in different regions then share
-// one build too.
+// one build too. Without a registry of its own (it couldn't be had), the
+// run still copies the image from another region before building it
+// (#218), but shares nothing with other runs.
 func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Writer, log *depsLog, memo imageMemo, req protocol.Image, locate func(context.Context) (*protocol.RegistryAuth, error), limit time.Duration) (r protocol.ImageResult, shared shareOutcome, push *protocol.ShareDone, err error) {
 	building := false // the helper said it is building: its output goes to log too
 	pushing := false  // the helper is pushing the image: it has it
@@ -2227,6 +2246,42 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 	}()
 	probe := req
 	probe.Probe = true
+	// find looks for another region holding the image, for the requests
+	// that follow to copy it from. A failed lookup only warns: the image is
+	// then built here, as before.
+	find := func(ctx context.Context) {
+		src, err := locate(ctx)
+		if err != nil {
+			o.Rep.Warn("IMAGE_REGISTRY", "could not look for the image in the runner's other regions (building it here if needed): %v", err)
+			return
+		}
+		if src != nil {
+			probe.Source, req.Source = src, src
+		}
+	}
+	if req.Registry == nil && req.Tag != "" && locate != nil {
+		// The region's registry couldn't be had (#218): the image may be on
+		// the runner already, or be copied from another region. Neither
+		// builds it, so a remembered failure rules out only the build.
+		got, err := ask(probe)
+		installed := got.InstalledDocker
+		if err == nil && got.Missing {
+			if find(ctx); probe.Source != nil {
+				got, err = ask(probe)
+				installed = installed || got.InstalledDocker
+			}
+		}
+		if err != nil || !got.Missing {
+			got.InstalledDocker = got.InstalledDocker || installed
+			return got, shared, nil, err
+		}
+		if failed := recall(); failed != nil {
+			return protocol.ImageResult{InstalledDocker: installed}, shared, nil, failed
+		}
+		r, err = ask(req)
+		r.InstalledDocker = r.InstalledDocker || installed
+		return r, shared, nil, built(err)
+	}
 	if req.Registry == nil || req.Tag == "" {
 		if failed := recall(); failed != nil {
 			// The runner may have the image already: only building it is
@@ -2241,19 +2296,6 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 	}
 	holder := ""
 	installed := false // a probe installed Docker
-	// find looks for another region holding the image, for the requests
-	// that follow to copy it from. A failed lookup only warns: the image is
-	// then built here, as before.
-	find := func(ctx context.Context) {
-		src, err := locate(ctx)
-		if err != nil {
-			o.Rep.Warn("IMAGE_REGISTRY", "could not look for the image in the runner's other regions (building it here if needed): %v", err)
-			return
-		}
-		if src != nil {
-			probe.Source, req.Source = src, src
-		}
-	}
 	sh := sharer{
 		lock:  shareLockFor("image", imageLockID(req.Registry, req.Tag, locate != nil)),
 		who:   shareWho(o, label),
