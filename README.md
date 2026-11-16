@@ -9,7 +9,7 @@
 <h1 align="center">Run your tests and builds off your&nbsp;laptop</h1>
 
 <p align="center">
-  Coding agents in parallel worktrees run test suites, type checks and builds all at once, and your laptop pays for it. Put <code>sx</code> in front of those commands and they run on a homelab box over SSH, or on AWS Spot VMs that shut down when idle. Output and exit codes stream back, and changed files return through a 3-way check that keeps any edits you made meanwhile.
+  Coding agents in parallel worktrees run test suites, type checks and builds all at once, and your laptop pays for it. Put <code>sx</code> in front of those commands and they run on a homelab box over SSH, or on a few AWS Spot VMs that every command shares and that shut down when idle. Output and exit codes stream back, and changed files return through a 3-way check that keeps any edits you made meanwhile.
 </p>
 
 <p align="center">
@@ -42,15 +42,15 @@ When several coding agents work at once, one per git worktree, each checks its w
 
 The usual ways out each cost something. **CI** is minutes away from the edit. A **cloud dev environment** moves your editor, checkout and agents off your machine. A **shared build box** needs someone to keep it running and in sync.
 
-spotexec keeps everything local except the work. Only the heavy commands move, and only while they run. On [Daintree](docs/case-study-daintree.md), an Electron app with 114,000 unit tests, the full suite runs in under 11 minutes across four Spot VMs, instead of 15 to 20 minutes with the laptop locked up. [When to use spotexec](docs/when-to-use.md) covers where it helps, where it doesn't, and what it costs.
+spotexec keeps everything local except the work. Only the heavy commands move, and only while they run, on a small pool of VMs that stay warm between commands. On [Daintree](docs/case-study-daintree.md), an Electron app with 114,000 unit tests, the full suite runs as one job on a warm Spot VM instead of locking the laptop up for 15 to 20 minutes, and every agent's checks share the same handful of VMs. [When to use spotexec](docs/when-to-use.md) covers where it helps, where it doesn't, and what it costs.
 
 - **Your command, unchanged.** Output streams back as it runs, the exit code is the command's own, and remote paths in stack traces are rewritten to local ones.
 - **Only what changed travels.** Each run sends just the files the runner is missing. Dependencies restore from a cache keyed by your lockfiles.
 - **Your edits come first.** Changed files come back through a 3-way check. If you edited a file during the run, your version stays and the runner's is [saved separately](docs/running.md#write-back-and-artifacts).
-- **VMs that clean up after themselves.** Spot fleets grow from zero as work queues up, each VM launches on the cheapest instance type and zone available at the time, and every VM powers itself off when idle. A run that loses its VM to an interruption is replayed once on a replacement.
+- **A few warm VMs, shared.** Every command from every worktree goes to the same small pool, a couple of jobs to a VM. `max_instances` is a ceiling: past it, work queues for a warm VM instead of starting another, since each extra VM costs a cold start and then bills its idle timeout after its last job. VMs launch on the cheapest instance type and zone available at the time, power themselves off when idle, and a run that loses its VM to an interruption is replayed once.
 - **Jobs stay out of each other's way.** Each job sees only its slot's CPUs, so test runners size themselves correctly, and a job that runs out of memory is killed and reported on its own, without taking down the VM or the jobs beside it.
 - **Nothing to host.** No control plane, no service in your account, and no AWS credentials on the VMs. Coordination lives on your machine and in EC2 tags.
-- **Made for agents.** Worktrees share one fleet through isolated slots and a fair queue. Agents see one summary line, or NDJSON events with `--json`.
+- **Made for agents.** Worktrees share one pool through isolated slots and a fair queue. Agents see one summary line, or NDJSON events with `--json`.
 
 ## Install
 
@@ -149,24 +149,26 @@ sx pnpm test                   # sync, run remotely, write changes back
 sx pnpm tsc --noEmit           # type checks
 sx pnpm prettier --write .     # formatted files land in your worktree
 sx test --reporter=dot         # a task from .spotexec.toml, extra args
-sx verify                      # a parallel task fanned out over slots
-sx test-all                    # a sharded task: one test suite split across the fleet
+sx verify                      # a parallel task: its parts at once, each in a slot
+sx test-all                    # the whole suite on a whole VM
 spotexec status                # what's running where, and idle timers
 ```
 
 Files the command changes come back. Ignored outputs such as coverage reports need `pull_artifacts` in `.spotexec.toml`, or a flag like `--pull coverage/`; see [write-back and artifacts](docs/running.md#write-back-and-artifacts).
 
-`sx test-all` above is a [sharded task](docs/configuration.md#tasks): one test suite split across the fleet, using the test runner's own shard option. Extra arguments go to every shard.
+`sx test-all` above is an `exclusive` task: one run of the whole suite that takes a VM to itself, so the test runner uses all of its CPUs and memory. Everything else shares VMs a slot at a time. Extra arguments go to the command.
 
 ```toml
 [tasks.test-all]
-run = "npx vitest run --shard={shard}/{shards} {args}"
-shards = 8
+run = "npx vitest run {args}"
+exclusive = true
 ```
+
+One run on a warm VM usually beats the same suite [sharded across fresh VMs](docs/scaling.md#when-sharding-pays): every extra VM pays a cold start before it runs anything, then idles until its timeout.
 
 The runner's copy of your project has no `.git` unless you set `git_seed = true` under `[sync]`. Turn it on if your build or tests ask Git about the checkout (commit stamps, `git ls-files`, changed-files modes); see [Git on the runner](docs/running.md#git-on-the-runner).
 
-The first AWS run boots a VM, which takes about a minute plus your bootstrap, builds the project container there and installs your dependencies once; later VMs pull the built image and restore dependencies from the cache instead. While it boots, `sx` shows how long it has been going and the latest line of the VM's bootstrap log. Later runs reuse the VM until it has been idle for `idle_timeout`. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
+The first AWS run boots a VM, which takes about a minute plus your bootstrap, builds the project container there and installs your dependencies once; later VMs pull the built image and restore dependencies from the cache instead. While it boots, `sx` shows how long it has been going and the latest line of the VM's bootstrap log. Later runs reuse the VM until it has been idle for `idle_timeout`. Every extra VM pays that cold start again, so keep `max_instances` small and let work queue for the VMs you have. [Bake an image](docs/environments.md#baked-images) to bring cold boots close to bare boot time, and before a demo do one warm-up `sx` run.
 
 ## With coding agents
 
@@ -218,7 +220,7 @@ If you'd rather not have commands rewritten, skip the hook and tell your agents 
 | [Running commands](docs/running.md) | Run flags, the environment on the runner, exit codes, write-back and artifacts. |
 | [Coding agents](docs/agents.md) | What agents see, `--same-slot`, NDJSON events, the Claude Code hook. |
 | [Toolchains&nbsp;and&nbsp;caches](docs/environments.md) | Project containers, the dependency cache, baked images. |
-| [Scaling](docs/scaling.md) | Slots, queueing, CPU sizing and warm pools. The [pool design](docs/POOL.md) has the scheduling details. |
+| [Scaling](docs/scaling.md) | Keeping the pool small, what each VM costs, slots, queueing, sharding, CPU sizing and warm pools. The [pool design](docs/POOL.md) has the scheduling details. |
 | [Configuration](docs/configuration.md) | Every key in `config.toml` and `.spotexec.toml`. |
 | [Troubleshooting](docs/troubleshooting.md) | Error codes and what to do about them. |
 | [Commands and files](docs/reference.md) | Every command, and every file spotexec reads or writes. |

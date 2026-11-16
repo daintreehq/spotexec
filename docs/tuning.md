@@ -72,17 +72,18 @@ Compute-optimized instance types such as c6a and c7a have 2 GB of memory per vCP
 
 A container sees only its slot's CPUs, so tools that size themselves by core count start the right number of workers on their own. Vitest (through Node's `os.availableParallelism()`), Go's `GOMAXPROCS` and `make -j$(nproc)` all see the slot's share. Hard-coded counts (`-j8`, `workers: 8`) still oversubscribe a slot; use `$SPOTEXEC_CPUS` for those.
 
-### Shard the suite the way CI does
+### Run the whole suite on one warm VM, not sharded like CI
 
-Use your test runner's own shard option in a [sharded task](configuration.md#tasks):
+CI shards a suite because every CI job starts on a fresh machine anyway. On spotexec, a warm VM is the cheap part: each extra VM costs a cold start (boot, image, dependency restore, sync and setup) and then bills its idle timeout. Run the whole suite as one `exclusive` task, and let the test runner spread across all of the VM's CPUs:
 
 ```toml
 [tasks.test-all]
-run = "npx vitest run --shard={shard}/{shards} {args}"
-shards = 8
+run = "npx vitest run {args}"
+exclusive = true
+timeout = "30m"
 ```
 
-Pick the shard count for your fleet. At most `max_instances × max_slots` parts run at once (16 with the default fleet), and each part pays the per-run setup, so more shards isn't always faster. Jobs your CI runs separately can run as their own part, next to the shards in a `parallel` task.
+Shard only a suite that runs many times longer than a cold start, with the test runner's own shard option in a [sharded task](configuration.md#tasks) (`shards = 4` and `--shard={shard}/{shards}`). Parts beyond the free slots launch VMs, each paying the cold start and the per-run setup, so more shards can be slower as well as costlier. [When sharding pays](scaling.md#when-sharding-pays) has the trade-off, and [the Daintree case study](case-study-daintree.md#one-vm-per-part-the-lesson) shows it on a real suite. Jobs your CI runs separately can still run side by side as the parts of a `parallel` task.
 
 ## Checking it
 
