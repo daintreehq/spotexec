@@ -162,6 +162,40 @@ fi`
 	return d, true, err
 }
 
+// build runs the project's docker build, its output streaming to the client
+// as it comes. A build that fails because of the Dockerfile itself is
+// IMAGE_BUILD_FAILED, with the end of its output; any other failure (Docker,
+// the network, the VM, a timeout) is IMAGE_FAILED (#193). Either is marked
+// BuildFailed when docker build itself ran and failed with the daemon still
+// answering (up), so the client remembers it (#194).
+func (s *Session) build(ctx context.Context, script, dockerfile string, up func() bool) error {
+	left := time.Until(deadlineOf(ctx))
+	if left <= 0 {
+		return perr(protocol.CodeImageFailed, "docker build %s: image preparation timed out", dockerfile)
+	}
+	var log buildLog
+	pr := s.runProc(script, s.workspace, nil, left, 5*time.Second, false, teeOut(func(kind byte, p []byte) {
+		i := 0
+		if kind == protocol.KindStderr {
+			i = 1
+		}
+		log.write(i, p)
+	}))
+	switch {
+	case pr.startErr != nil:
+		return perr(protocol.CodeImageFailed, "docker build %s: %v", dockerfile, pr.startErr)
+	case pr.code != 0:
+		se := &streamExit{code: pr.code, ran: !pr.timedOut && !pr.canceled && !pr.spotIntr && pr.signal == ""}
+		err := log.failure(dockerfile, pr, se)
+		var pe *protoError
+		if errors.As(err, &pe) {
+			pe.buildFailed = se.built() && up()
+		}
+		return err
+	}
+	return nil
+}
+
 // imageName turns a repo id into a valid Docker/ECR repository component.
 func imageName(repoID string) string {
 	var b strings.Builder
@@ -363,11 +397,8 @@ func (s *Session) image(m protocol.Image) error {
 		}
 		defer cleanup()
 		_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_build", Message: m.Dockerfile})
-		if err := stream(d.cmd("build -f " + shq(dockerfile) + " -t " + shq(local) + " " + shq(buildCtx))); err != nil {
-			e := &protoError{code: protocol.CodeImageFailed, msg: fmt.Sprintf("docker build %s: %v", m.Dockerfile, err)}
-			var se *streamExit
-			e.buildFailed = errors.As(err, &se) && se.built() && daemonUp(d)
-			return e
+		if err := s.build(ctx, d.cmd("build -f "+shq(dockerfile)+" -t "+shq(local)+" "+shq(buildCtx)), m.Dockerfile, func() bool { return daemonUp(d) }); err != nil {
+			return err
 		}
 		res.Built = true
 		if m.Registry != nil && cfgDir != "" {
