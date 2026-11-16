@@ -229,6 +229,12 @@ func TestShareLostLeaderHandsOver(t *testing.T) {
 		cancel bool
 	}{
 		{"runner lost", errors.New("runner stopped responding"), false},
+		// #162: the runner reporting that it is going away (a Spot reclaim
+		// shutting the VM down, a drain, a helper fault) is losing it, not
+		// the build failing: one waiting part takes over, not all at once.
+		{"vm shutting down", fmt.Errorf("deps: %w", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeShutdown, Message: "the VM began shutting down"}}), false},
+		{"draining", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeDraining}}, false},
+		{"helper fault", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeInternal}}, false},
 		// A failure the runner reports as the run is cancelled (fail_fast)
 		// is the cancel's, not the install's.
 		{"cancelled", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeDepsFailed, Message: "install command exited 143"}}, true},

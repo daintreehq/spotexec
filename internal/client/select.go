@@ -84,6 +84,9 @@ type member struct {
 	ready     bool
 }
 
+// tryAcquireFn is tryAcquire (tests script the helpers' answers).
+var tryAcquireFn = tryAcquire
+
 // Acquire finds a free slot anywhere in the pool, scaling fleets out as
 // needed (docs/POOL.md):
 //
@@ -188,6 +191,11 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		staticUp := 0 // static runners not known to be down (busy counts as up)
 		roundErrs := []string{}
 		for _, m := range members {
+			if m.fatal != nil {
+				// Its setup is broken: no VM of it can serve (#162).
+				roundErrs = append(roundErrs, m.fatalErr().Error())
+				continue
+			}
 			if m.pool == nil {
 				window += slotsOf(m.r)
 				continue
@@ -230,6 +238,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		}
 		if mayProbe {
 			for _, m := range members {
+				if m.fatal != nil {
+					continue
+				}
 				if m.pool == nil && req.Base.Exclusive && len(members) == 1 && ticket != nil && qs.Position == 0 && m.ready {
 					// Head of the queue for a whole static machine: wait in its
 					// helper, which holds the host gate against newcomers from
@@ -270,7 +281,12 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 						return lease, nil
 					}
 					if m.fatal != nil {
-						return nil, fmt.Errorf("%s: %w (fix bootstrap_script, then `spotexec down %s`)", m.r.Name, m.fatal, m.r.Name)
+						if onlyFatal(members) {
+							return nil, m.fatalErr()
+						}
+						// Another runner in the pool may still serve: stop
+						// probing this one and fail over (#162).
+						break
 					}
 					if out == OutBusy {
 						lastHolders = holders
@@ -325,6 +341,19 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				continue
 			}
 			fleets++
+			if m.fatal != nil {
+				// Launches nothing, and its demand must not draw launches
+				// from the fleets that can serve.
+				blocked++
+				blockErr = m.fatalErr()
+				if w := waiters[m.r.Name]; w != nil {
+					wmu.Lock()
+					w.Done()
+					delete(waiters, m.r.Name)
+					wmu.Unlock()
+				}
+				continue
+			}
 			if req.NoBoot {
 				continue // can't grow: don't signal demand others would launch for
 			}
@@ -421,6 +450,22 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 	}
 }
 
+// fatalErr is why m can't serve, with how to fix it.
+func (m *member) fatalErr() error {
+	return fmt.Errorf("%s: %w (fix bootstrap_script, then `spotexec down %s`)", m.r.Name, m.fatal, m.r.Name)
+}
+
+// onlyFatal reports whether every member of the pool has failed in a way no
+// other instance of it would avoid: nothing is left to fail over to.
+func onlyFatal(members []*member) bool {
+	for _, m := range members {
+		if m.fatal == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // slotsOf is a runner's slots per machine as the helper will compute it:
 // max_slots, or (unset) vCPUs / 4, at least 1, at most protocol.MaxSlots.
 // For AWS the vCPUs are known from the instance type; otherwise 4 until the
@@ -451,7 +496,7 @@ func (m *member) probeStatic(ctx context.Context, req AcquireRequest) (*Lease, [
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	lease, holders, err := tryAcquire(cctx, req, m.r, m.p, m.t, false)
+	lease, holders, err := tryAcquireFn(cctx, req, m.r, m.p, m.t, false)
 	if err != nil && transport.IsConnError(err) {
 		m.ready = false
 		m.p.Forget()
@@ -489,7 +534,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, in provi
 	}
 	cctx, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
-	lease, holders, err := tryAcquire(cctx, req, m.r, m.p, in.Target, false)
+	lease, holders, err := tryAcquireFn(cctx, req, m.r, m.p, in.Target, false)
 	if m.boot != nil && m.boot.id == in.ID && !isCode(err, protocol.CodeBooting) {
 		m.boot = nil // that VM is past its first boot (or gone)
 	}
@@ -610,10 +655,11 @@ func isCode(err error, code string) bool {
 	return errors.As(err, &re) && re.Code == code
 }
 
-// EnsureSpare makes sure the pool has a free slot somewhere other than the
-// excluded instances, launching one if needed, without keeping it: used when
-// an instance announces its reclamation, so a replacement is warm by the
-// time the doomed run needs it.
+// EnsureSpare makes sure the pool has room for req somewhere other than the
+// excluded instances (a free slot, or a whole idle VM for an exclusive
+// request), launching a VM if needed, without keeping it: used when an
+// instance announces its reclamation, so a replacement is warm by the time
+// the doomed run needs it.
 func EnsureSpare(ctx context.Context, req AcquireRequest) {
 	req.Rep = quietReporter{req.Rep}
 	req.Base.KeepOwner = true // only probing for room, not using the slot
