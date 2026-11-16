@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -44,7 +45,7 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		{map[string]string{"Cargo.toml": ""}, "FROM rust:1-trixie", "", "Rust 1"},
 		{map[string]string{"go.mod": "module x\n\ngo 1.25.3\n", "package.json": `{}`, "package-lock.json": "", ".nvmrc": "18.19.0"}, "FROM node:18.19.0-bookworm", "COPY --from=golang:1.25.3-trixie /usr/local/go", "Node.js 18.19.0 + Go 1.25.3"},
 		{map[string]string{"go.mod": "module x\n\ngo 1.24.2\n", "package.json": `{}`, "package-lock.json": ""}, "FROM node:24-trixie", "COPY --from=golang:1.24.2-bookworm /usr/local/go", "Node.js 24 + Go 1.24.2"},
-		{map[string]string{"pom.xml": "<properties><maven.compiler.release>17</maven.compiler.release></properties>"}, "FROM eclipse-temurin:17-jdk", "git maven", "Java 17, Maven"},
+		{map[string]string{"pom.xml": "<properties><maven.compiler.release>17</maven.compiler.release></properties>"}, "FROM eclipse-temurin:17-jdk", " maven ", "Java 17, Maven"},
 		{map[string]string{"build.gradle.kts": "java { toolchain { languageVersion = JavaLanguageVersion.of(23) } }"}, "FROM eclipse-temurin:23-jdk", "", "Java 23, Gradle wrapper"},
 		{map[string]string{"pom.xml": "", "mvnw": "", ".sdkmanrc": "java=21.0.2-tem\n"}, "FROM eclipse-temurin:21-jdk", "", "Java 21, Maven wrapper"},
 		{map[string]string{".java-version": "1.8.0_402\n", "build.gradle": ""}, "FROM eclipse-temurin:8-jdk", "", "Java 8, Gradle wrapper"},
@@ -83,6 +84,19 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		}
 		if n := strings.Count(body, "\n"+c.from+"\n"+utf8Locale); n != want || strings.Count(body, "ENV LANG=") != want {
 			t.Errorf("%s: want %d UTF-8 locale(s), right after FROM, in:\n%s", stack, want, body)
+		}
+		// Every stack installs the tools GitHub's runners provide, in one
+		// apt layer straight after FROM.
+		layer := body[strings.Index(body, "\n"+c.from+"\n"):]
+		layer = layer[:strings.Index(layer, "rm -rf /var/lib/apt/lists/*")]
+		fields := strings.Fields(layer)
+		for _, tool := range runnerTools {
+			if !slices.Contains(fields, tool) {
+				t.Errorf("%s: %s not installed in:\n%s", stack, tool, layer)
+			}
+		}
+		if strings.Count(body, "\nRUN apt-get update") != 1 {
+			t.Errorf("%s: want exactly one apt layer in:\n%s", stack, body)
 		}
 	}
 }

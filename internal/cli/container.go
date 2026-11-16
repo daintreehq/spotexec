@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -506,7 +507,10 @@ ENV LANG=C.UTF-8
 func scaffoldDockerfile(root string) (body, stack string, missing []string) {
 	pkg := readPackageJSON(root)
 	pm, pmVer := jsPackageManager(root, pkg)
-	primary := ""
+	// The image is from, then one apt layer of runnerTools plus the stack's
+	// own system packages, then body.
+	primary, from := "", ""
+	var pkgs []string
 	switch {
 	case pm == "bun":
 		v := "1"
@@ -518,17 +522,11 @@ func scaffoldDockerfile(root string) (body, stack string, missing []string) {
 			v = b
 		}
 		stack, primary = "Bun "+v, "js"
-		body = fmt.Sprintf(`FROM oven/bun:%s
-
-# Tools many test suites expect (the base image is slim).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates curl \
- && rm -rf /var/lib/apt/lists/*
-`, v)
+		from = "oven/bun:" + v
 	case pm != "" || pkg != nil:
 		node := nodeVersion(root, pkg)
 		stack, primary = "Node.js "+node, "js"
-		body = fmt.Sprintf("FROM node:%s\n", debianTag("node", node))
+		from = "node:" + debianTag("node", node)
 		switch {
 		case pm == "pnpm":
 			v := pmVer
@@ -565,34 +563,34 @@ RUN npm install -g npm@%s && npm cache clean --force
 	case exists(root, "uv.lock"):
 		py, uv := pythonVersion(root), uvVersion(root)
 		stack, primary = "Python "+py+", uv", "python"
-		body = fmt.Sprintf(`FROM python:%s
-
+		from = "python:" + debianTag("python", py)
+		body = fmt.Sprintf(`
 # uv (pinned from [tool.uv] required-version when it names one exact version).
 COPY --from=ghcr.io/astral-sh/uv:%s /uv /uvx /usr/local/bin/
 
 # Use the image's Python; copy (not hardlink) out of uv's cache.
 ENV UV_PYTHON_DOWNLOADS=never \
     UV_LINK_MODE=copy
-`, debianTag("python", py), uv)
+`, uv)
 	case exists(root, "pyproject.toml") || exists(root, "requirements.txt") || exists(root, "setup.py"):
 		py := pythonVersion(root)
 		stack, primary = "Python "+py, "python"
-		body = fmt.Sprintf(`FROM python:%s
-
+		from = "python:" + debianTag("python", py)
+		body = `
 # Commands run as a non-root user, so install packages into a virtualenv in
 # the workspace (and list it in [deps] cache_dirs), or bake them in here:
 # RUN pip install --no-cache-dir pytest
-`, debianTag("python", py))
+`
 	case exists(root, "go.mod"):
 		gv := goVersion(root)
 		stack, primary = "Go "+gv, "go"
-		body = fmt.Sprintf(`FROM golang:%s
-
+		from = "golang:" + debianTag("golang", gv)
+		body = `
 # Keep the module and build caches in the slot's persistent HOME, so they
 # survive between runs (the container itself is thrown away each time).
 ENV GOMODCACHE=/home/spotexec/go/pkg/mod \
     GOCACHE=/home/spotexec/.cache/go-build
-`, debianTag("golang", gv))
+`
 	case exists(root, "Cargo.toml"):
 		rv := "1"
 		for _, f := range []string{"rust-toolchain.toml", "rust-toolchain"} {
@@ -607,8 +605,8 @@ ENV GOMODCACHE=/home/spotexec/go/pkg/mod \
 			}
 		}
 		stack, primary = "Rust "+rv, "rust"
-		body = fmt.Sprintf(`FROM rust:%s
-
+		from = "rust:" + debianTag("rust", rv)
+		body = `
 # Components are installed as root: keep the toolchain writable for the
 # non-root user, as the base image does. Install extra tools system-wide:
 # RUN cargo install --root /usr/local/cargo cargo-nextest
@@ -618,42 +616,35 @@ RUN rustup component add clippy rustfmt && chmod -R a+w "$RUSTUP_HOME" "$CARGO_H
 # HOME, so they survive between runs (the container itself is thrown away).
 ENV CARGO_HOME=/home/spotexec/.cargo \
     PATH=/home/spotexec/.cargo/bin:$PATH
-`, debianTag("rust", rv))
+`
 	case exists(root, "pom.xml") || exists(root, "build.gradle") || exists(root, "build.gradle.kts"):
 		jv := javaVersion(root)
 		stack, primary = "Java "+jv, "java"
-		tools := "git"
+		from = "eclipse-temurin:" + jv + "-jdk"
 		if exists(root, "pom.xml") && !exists(root, "mvnw") {
-			tools += " maven"
+			pkgs = append(pkgs, "maven")
 			stack += ", Maven"
 		} else if exists(root, "pom.xml") {
 			stack += ", Maven wrapper"
 		} else {
 			stack += ", Gradle wrapper"
 		}
-		body = fmt.Sprintf(`FROM eclipse-temurin:%s-jdk
-
+		body = `
 # ./mvnw and ./gradlew download into HOME (persistent per slot).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends %s \
- && rm -rf /var/lib/apt/lists/*
-`, jv, tools)
-	default:
-		body = `FROM ubuntu:24.04
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential git curl ca-certificates \
- && rm -rf /var/lib/apt/lists/*
 `
+	default:
+		from, pkgs = "ubuntu:24.04", []string{"build-essential"}
 	}
-	// A UTF-8 locale, as on GitHub's Linux runners. Most of these base images
-	// leave LANG unset, so commands would run under POSIX with an ASCII
-	// charset; C.UTF-8 ships with glibc, so no locales package is needed.
-	// eclipse-temurin already sets LANG and LC_ALL to en_US.UTF-8.
+	// A UTF-8 locale, as on GitHub's Linux runners, straight after FROM. Most
+	// of these base images leave LANG unset, so commands would run under
+	// POSIX with an ASCII charset; C.UTF-8 ships with glibc, so no locales
+	// package is needed. eclipse-temurin already sets LANG and LC_ALL to
+	// en_US.UTF-8.
+	locale := ""
 	if primary != "java" {
-		from, rest, _ := strings.Cut(body, "\n")
-		body = from + "\n" + utf8Locale + rest
+		locale = utf8Locale
 	}
+	body = "FROM " + from + "\n" + locale + aptLayer(pkgs) + body
 	// Other toolchains the repository uses (its tasks may run them).
 	if primary != "" {
 		if primary != "go" && exists(root, "go.mod") {
@@ -726,10 +717,44 @@ ENV UV_PYTHON_DOWNLOADS=never
 	extra := `
 # Extra system packages your commands need, for example:
 # RUN apt-get update \
-#  && apt-get install -y --no-install-recommends postgresql-client jq \
+#  && apt-get install -y --no-install-recommends postgresql-client \
 #  && rm -rf /var/lib/apt/lists/*
 `
 	return header + body + extra, stack, missing
+}
+
+// runnerTools are command-line tools GitHub's hosted Ubuntu runners ship that
+// test suites shell out to or probe for. Every scaffold installs them, so a
+// suite that passes in GitHub Actions runs the same tests under sx, rather
+// than skipping the ones that look for a tool or failing with "command not
+// found". The package names are the same on Debian and Ubuntu.
+var runnerTools = []string{
+	"bzip2", "ca-certificates", "curl", "file", "git", "jq", "lsof", "make",
+	"openssh-client", "procps", "rsync", "sqlite3", "unzip", "wget", "xz-utils",
+	"zip", "zsh",
+}
+
+// aptLayer installs runnerTools and the stack's own packages in one layer.
+func aptLayer(extra []string) string {
+	pkgs := append(append([]string{}, extra...), runnerTools...)
+	sort.Strings(pkgs)
+	var b strings.Builder
+	b.WriteString(`
+# Command-line tools GitHub's Ubuntu runners provide, which test suites often
+# call or probe for (a test that checks for a missing tool skips silently).
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+`)
+	line := "     "
+	for _, p := range pkgs {
+		if len(line)+1+len(p) > 76 {
+			b.WriteString(line + " \\\n")
+			line = "     "
+		}
+		line += " " + p
+	}
+	b.WriteString(line + " \\\n && rm -rf /var/lib/apt/lists/*\n")
+	return b.String()
 }
 
 func firstMatch(re *regexp.Regexp, s string) string {
