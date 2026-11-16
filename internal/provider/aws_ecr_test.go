@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -139,6 +140,7 @@ func TestRegistryForSurvivesALifecyclePolicyFailure(t *testing.T) {
 						// Bounded by its own deadline, not the lookup's.
 						if d, ok := r.Context().Deadline(); !ok || time.Until(d) > ecrLifecycleTimeout {
 							t.Errorf("policy call deadline %v (%v)", d, ok)
+							return nil, errors.New("no deadline of its own") // fail, don't hang
 						}
 						<-r.Context().Done()
 						return nil, r.Context().Err()
@@ -171,7 +173,7 @@ func TestRegistryForSurvivesALifecyclePolicyFailure(t *testing.T) {
 			}
 			// The repository is now found, and its rule tried again.
 			exists, calls = true, nil
-			if _, err := a.RegistryFor(context.Background(), "x"); err != nil {
+			if _, err := a.RegistryFor(ctx, "x"); err != nil {
 				t.Fatal(err)
 			}
 			if got := strings.Join(calls, " "); got != "DescribeRepositories PutLifecyclePolicy GetAuthorizationToken" {
