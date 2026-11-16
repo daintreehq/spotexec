@@ -76,6 +76,7 @@ func cmdInit() *cobra.Command {
 	var global, force, yes, noContainer bool
 	c := &cobra.Command{
 		Use:   "init",
+		Args:  cobra.NoArgs,
 		Short: "Generate .spotexec.toml for this repo, and a container for its toolchain (or --global runner config)",
 		Long: `Generate .spotexec.toml for this repository: dependency caching and tasks
 detected from its lockfiles and scripts.
@@ -570,6 +571,7 @@ func cmdHook() *cobra.Command {
 	var claude, codex, globalScope, shared, uninstall bool
 	install := &cobra.Command{
 		Use:   "install [--claude] [--codex]",
+		Args:  cobra.NoArgs,
 		Short: "Install the Claude Code PreToolUse hook and/or an AGENTS.md snippet",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !claude && !codex {
@@ -662,6 +664,9 @@ func cmdHook() *cobra.Command {
 		Use:    "claude",
 		Short:  "PreToolUse hook handler (reads the event JSON on stdin)",
 		Hidden: true,
+		// A hook line in someone's settings must never start failing: the
+		// handler reads stdin and has always ignored any words after it.
+		Args: cobra.ArbitraryArgs,
 		Run: func(*cobra.Command, []string) {
 			if code := claudeHook(then); code != 0 {
 				os.Exit(code)

@@ -173,6 +173,7 @@ func newRoot() *cobra.Command {
 func cmdVersion() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
+		Args:  cobra.NoArgs,
 		Short: "Print version",
 		Run:   func(*cobra.Command, []string) { fmt.Println("spotexec", Version) },
 	}
@@ -234,6 +235,7 @@ func cmdExec() *cobra.Command {
 func cmdTasks() *cobra.Command {
 	return &cobra.Command{
 		Use:   "tasks",
+		Args:  cobra.NoArgs,
 		Short: "List named tasks from .spotexec.toml",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load("")
