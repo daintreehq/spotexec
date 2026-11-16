@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, "release/**"]
 
 permissions:
   contents: read
@@ -29,6 +29,29 @@ jobs:
       - name: Smoke
         run: ./bin/spotexec version && ./bin/sx --help >/dev/null
 
+  e2e:
+    # The end-to-end suites against Docker: a throwaway SSH runner, then the
+    # Spot fleet simulator and the pool manager on it. Each suite runs even
+    # when an earlier one fails, so one run shows every broken scenario.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build (with embedded helpers)
+        id: build
+        run: make build
+      - name: SSH runner (scripts/e2e.sh)
+        run: ./scripts/e2e.sh
+      - name: Spot fleet simulator (scripts/e2e-pool.sh)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: ./scripts/e2e-pool.sh
+      - name: Pool manager (scripts/e2e-daemon.sh)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: ./scripts/e2e-daemon.sh
+
   release-smoke:
     # Builds the release artifacts the way the Release workflow does (a
     # snapshot, nothing published), then tests what users install: the
@@ -48,7 +71,7 @@ jobs:
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: "v2.20.2"   # pinned; bump in ci.yml and release.yml together
           args: release --snapshot --clean --skip=publish
         env:
           # Referenced by the brews section; a snapshot never pushes the tap.

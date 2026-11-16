@@ -93,9 +93,10 @@ To build from source you need Go 1.26 or later:
 
 ```sh
 git clone https://github.com/daintreehq/spotexec.git && cd spotexec
-mkdir -p "$(go env GOPATH)/bin"    # must exist, and be on your PATH
-make install                       # builds spotexec and sx, installs both there
+make install    # builds spotexec and sx, installs both in $GOBIN or $GOPATH/bin
 ```
+
+That directory must be on your `PATH`; `make install BINDIR="$HOME/.local/bin"` installs somewhere else.
 
 `go install` isn't supported. The build cross-compiles the remote helper for Linux and macOS (amd64 and arm64) and embeds it in the binary, which `make` and the release builds do.
 

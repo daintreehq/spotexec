@@ -32,7 +32,11 @@ checksum:
 changelog:
   sort: asc
   filters:
-    exclude: ["^docs:", "^test:", "^chore:"]
+    # Release notes list user-facing changes only: drop maintenance commits,
+    # scoped or not (`test(transport): ...`, `ci!: ...`), and merge commits.
+    exclude:
+      - '^(docs|test|tests|chore|style|ci|build|release)(\([^)]*\))?!?:'
+      - '^Merge (pull request|branch|remote-tracking branch) '
 
 # Linux packages (apt / dnf / apk), attached to each GitHub release.
 nfpms:
@@ -84,6 +88,10 @@ nfpms:
 
 # Homebrew formula (macOS and Linux) in daintreehq/homebrew-tap, pushed with
 # a deploy key that can write to that repository only.
+# `brews` is deprecated in favour of `homebrew_casks` (removal is due in
+# GoReleaser v3). It stays a formula for now, with GoReleaser pinned in the
+# workflows: a cask would be quarantined on macOS (the binary is unsigned)
+# and changes how existing installs and `spotexec setup` upgrade.
 brews:
   - name: spotexec
     repository:
