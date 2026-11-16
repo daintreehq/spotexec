@@ -983,7 +983,7 @@ func TestGlobalMaxPriceFiltersOptions(t *testing.T) {
 // launch it, and a launch with every option over the cap stays a
 // PriceCapError rather than a fallback (#153).
 func TestGlobalMaxPriceCapsOnDemandFallback(t *testing.T) {
-	cap := config.Dollars{V: 0.04, Set: true}
+	capUSD := config.Dollars{V: 0.04, Set: true}
 	f := &fakeRegionsEC2{prices: map[string][][3]string{
 		"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}},
 		"r-two-1": {{"r-two-1a", "c7a.2xlarge", "0.30"}},
