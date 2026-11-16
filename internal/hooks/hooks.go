@@ -37,8 +37,8 @@ var DefaultPatterns = []string{
 	`^go (test|vet|build)\b`,
 	`^(make|just) (test|check|lint|build|ci)\b`,
 	`^(bundle exec )?(rspec|rake test|rails test)\b`,
-	`^(mvn|\./mvnw)( -[\w.=-]+)* (clean )?(test|verify|compile|test-compile|package|checkstyle:check|spotless:check)\b`,
-	`^(gradle|\./gradlew)( -[\w.=-]+)* (clean )?(test|check|build|compileJava|compileKotlin|lint|spotlessCheck)\b`,
+	`^(mvn|(\./)?mvnw)( -[\w.=-]+)* (clean )?(test|verify|compile|test-compile|package|checkstyle:check|spotless:check)\b`,
+	`^(gradle|(\./)?gradlew)( -[\w.=-]+)* (clean )?((:[\w.-]+)*:)?(test|check|build|compileJava|compileKotlin|lint|spotlessCheck)\b`,
 }
 
 // DefaultExclude keeps watch flags local, and honours the agent's explicit
@@ -55,20 +55,37 @@ var DefaultExclude = []string{
 
 var (
 	trailingMerge = regexp.MustCompile(`\s+2>&1$`)
-	cdSeg         = regexp.MustCompile(`^cd\s+\S+$`)
-	assignName    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
-	commandWord   = regexp.MustCompile(`^[A-Za-z0-9_][\w.:@+-]*$`)
+	// trailingRedirect is a segment's trailing redirects that send nothing
+	// to a file: 2>&1, >&2, and stdout or stderr into /dev/null. They mean
+	// the same on the runner (other descriptors aren't passed there).
+	trailingRedirect = regexp.MustCompile(`(\s+([12]?>&[12]|[12&]?>>?\s*/dev/null))+$`)
+	cdSeg            = regexp.MustCompile(`^cd\s+\S+$`)
+	assignName       = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+	commandWord      = regexp.MustCompile(`^[A-Za-z0-9_][\w.:@+-]*$`)
 )
 
 // Decider decides which commands to offload.
 type Decider struct {
 	include []*regexp.Regexp
 	exclude []*regexp.Regexp
+	// prefixes are the user's transparent_prefixes, words collapsed.
+	prefixes []string
+	// root is the repository and dir the directory the command runs in
+	// (symlinks resolved), for paths and directory options; "" accepts only
+	// relative paths without "..".
+	root, dir string
 }
 
 // NewDecider compiles defaults plus user patterns.
 func NewDecider(h config.Hook) (*Decider, error) {
 	d := &Decider{}
+	for _, p := range h.TransparentPrefixes {
+		w := strings.Join(strings.Fields(p), " ")
+		if w == "" || shellSyntax(w) || strings.Contains(w, "#") {
+			return nil, fmt.Errorf("hook transparent_prefixes entry %q: must be plain words, such as \"direnv exec .\"", p)
+		}
+		d.prefixes = append(d.prefixes, w)
+	}
 	for _, p := range append(append([]string{}, DefaultPatterns...), h.Patterns...) {
 		re, err := regexp.Compile(p)
 		if err != nil {
@@ -86,24 +103,50 @@ func NewDecider(h config.Hook) (*Decider, error) {
 	return d, nil
 }
 
-// ShouldOffload reports whether a Bash command line should run remotely.
-// Every `&&`/`;`-separated segment must be either a heavy command or a
-// harmless prefix (cd, env assignment). The line may end in a pipeline of
-// simple output filters (`| tail -50`, `| grep FAIL`), which keep running
-// locally on the streamed output. Redirects into files, subshells,
-// background jobs and anything else keep the command local.
+// In sets the directory the command runs in, so paths and directory options
+// are checked against its repository.
+func (d *Decider) In(dir string) *Decider {
+	d.root = gitRootResolved(dir)
+	d.dir = ""
+	if d.root != "" {
+		d.dir = resolve(dir)
+	}
+	return d
+}
+
+// Prefixes are the user's transparent prefixes.
+func (d *Decider) Prefixes() []string { return d.prefixes }
+
+// ShouldOffload reports whether a Bash command line (through Normalize)
+// should run remotely. Every `&&`/`||`/`;`-separated segment must be a heavy
+// command (possibly behind wrappers such as `timeout 600` or `env CI=1`), a
+// leading cd, or a harmless trailer (`true`, `echo "exit $?"`), with at
+// least one heavy command. The line may end in a pipeline of simple output
+// filters (`| tail -50`, `|& grep FAIL`), which keep running locally on the
+// streamed output. Redirects into files, subshells, background jobs and
+// anything else keep the command local.
 //
 // A pipe binds tighter than && and ;, so in `a && b | tail` only b is
 // filtered. Splitting that across two runs could land them on different
 // machines (b would miss a's build output), so a filtered line offloads only
 // when a single heavy command (after any leading cds) feeds the filters.
 func (d *Decider) ShouldOffload(command string) bool {
+	ok, _ := d.Why(command)
+	return ok
+}
+
+// Why is ShouldOffload with the reason a line stays local.
+func (d *Decider) Why(command string) (bool, string) {
 	if shellHazard(command) {
-		return false
+		return false, "a line break, carriage return, comment or backslash escape it can't read"
 	}
 	head, filters, ok := splitFilters(command)
-	if !ok || !d.shouldOffload(head) {
-		return false
+	if !ok {
+		// Pipes inside the list (`go vet | grep -c x; go test`): the whole
+		// line runs on the runner, if every filter only reads its input.
+		if head, ok = innerPipes(command); !ok {
+			return false, "a pipe into something other than an output filter"
+		}
 	}
 	segs, ops := splitList(head)
 	k := 0 // leading cds, which Wrap runs locally
@@ -112,26 +155,212 @@ func (d *Decider) ShouldOffload(command string) bool {
 	}
 	for _, seg := range segs {
 		if seg == "" {
-			return false // `a;; b`, `a && && b`: bash refuses the line
+			return false, "an empty command, which bash refuses" // `a;; b`, `a && && b`
 		}
 	}
-	if k > 0 && ops[k-1] == "&&" && slices.Contains(ops[k:], ";") {
-		// `cd x && a; b` runs b even when the cd fails; hoisted, the cd
-		// would gate the whole rest of the line.
+	// Paths and directory options resolve from where the leading cds end,
+	// and a cd before `;` may fail and leave the directory as it was: the
+	// command must be fine from each place it may run in.
+	dirs := []string{d.dir}
+	for i := 0; i < k && d.dir != ""; i++ {
+		t, ok := cdTarget(bareSeg(segs[i]), dirs[len(dirs)-1])
+		if !ok {
+			dirs = []string{""}
+			break
+		}
+		if ops[i] == ";" {
+			dirs = append(dirs, t)
+		} else {
+			dirs = append(dirs[:len(dirs)-1], t)
+		}
+	}
+	for _, dir := range dirs {
+		if ok, why := d.why(head, place{root: d.root, dir: dir}); !ok {
+			return false, why
+		}
+	}
+	if slices.Contains(ops[:k], "||") {
+		return false, "a cd decides what runs (cd x || ...)"
+	}
+	if k > 0 && ops[k-1] == "&&" && (slices.Contains(ops[k:], ";") || slices.Contains(ops[k:], "||")) {
+		// `cd x && a; b` runs b even when the cd fails, and so does
+		// `cd x && a || b`; hoisted, the cd would gate the whole rest.
+		return false, "a cd && list followed by ; or ||"
+	}
+	if filters != "" && len(segs)-k > 1 && !portableFilters(filters) {
+		// The filters would have to run on the runner with the commands
+		// (see WrapRTK): only ones that read nothing but their input and
+		// mean the same there.
+		return false, "a pipe after several commands into a filter that can't run on the runner"
+	}
+	if filters != "" && len(segs)-k == 1 && timed(segs[k]) {
+		// `time` times the whole pipeline; offloaded, it would time only
+		// the remote part.
+		return false, "`time` before a pipeline"
+	}
+	return true, ""
+}
+
+// timed reports a segment that starts with the time keyword.
+func timed(seg string) bool {
+	w := rawWords(seg)
+	return len(w) > 0 && w[0].text == "time" && strings.HasPrefix(strings.TrimSpace(seg), "time")
+}
+
+// innerPipes is a list with pipelines inside it (`a | grep x; b`), each cut
+// to its first command for judging. ok is false unless every later stage is
+// a read-only filter, which can run on the runner with the command before
+// it, and no cd is piped (it would change nothing).
+func innerPipes(command string) (string, bool) {
+	segs, ops := splitList(command)
+	for i, seg := range segs {
+		parts, amps, ok := splitPipes(seg)
+		if !ok {
+			return "", false
+		}
+		if len(parts) == 1 {
+			continue
+		}
+		for _, f := range parts[1:] {
+			if !portableFilter(f) {
+				return "", false
+			}
+		}
+		head := strings.TrimSpace(parts[0])
+		if isCd(head) {
+			return "", false
+		}
+		if amps[0] && !trailingMerge.MatchString(head) {
+			head += " 2>&1"
+		}
+		segs[i] = head
+	}
+	return joinList(segs, ops), true
+}
+
+// portableFilters reports filters that may run on the runner (see
+// portableFilter).
+func portableFilters(filters string) bool {
+	parts, _, ok := splitPipes(filters)
+	if !ok {
 		return false
 	}
-	if filters != "" && len(segs)-k > 1 {
-		return false
+	for _, f := range parts {
+		if !portableFilter(f) {
+			return false
+		}
 	}
 	return true
 }
+
+// portableFilter reports a filter stage that reads nothing but its input and
+// means the same with the runner's GNU tools as with this machine's: cat,
+// head, tail, wc, grep, cut or tr, with no file operand (which would be the
+// runner's file), no expansion or redirect, and only options both share
+// (not BSD tail -r or GNU grep -P).
+func portableFilter(stage string) bool {
+	t := strings.TrimSpace(stage)
+	if t == "" || shellSyntax(t) || hasUnquoted(t, "*?[~") {
+		return false // also globs and ~, which the runner would expand
+	}
+	ws := rawWords(t)
+	args := make([]string, 0, len(ws))
+	for _, w := range ws[1:] {
+		args = append(args, w.text)
+	}
+	num := func(s string) bool { return s != "" && strings.Trim(s, "0123456789") == "" }
+	switch ws[0].text {
+	case "cat":
+		return len(args) == 0
+	case "head", "tail":
+		for i := 0; i < len(args); i++ {
+			switch a := args[i]; {
+			case a == "-n" || a == "-c":
+				i++
+				if i >= len(args) || !num(strings.TrimPrefix(args[i], "+")) {
+					return false
+				}
+			case (strings.HasPrefix(a, "-n") || strings.HasPrefix(a, "-c")) && num(strings.TrimPrefix(a[2:], "+")):
+			case strings.HasPrefix(a, "-") && num(a[1:]):
+			default:
+				return false
+			}
+		}
+		return true
+	case "wc":
+		for _, a := range args {
+			if a != "-l" && a != "-w" && a != "-c" && a != "-m" {
+				return false
+			}
+		}
+		return true
+	case "grep", "egrep", "fgrep":
+		pattern := false
+		for i := 0; i < len(args); i++ {
+			a := args[i]
+			switch {
+			case a == "-e":
+				i++
+				if i >= len(args) {
+					return false
+				}
+				pattern = true
+			case a == "-m" || a == "-A" || a == "-B" || a == "-C":
+				i++
+				if i >= len(args) || !num(args[i]) {
+					return false
+				}
+			case grepFlags.MatchString(a) || grepCount.MatchString(a):
+			case strings.HasPrefix(a, "-") && a != "-":
+				return false
+			case pattern:
+				return false // a file operand
+			default:
+				pattern = true
+			}
+		}
+		return pattern
+	case "cut":
+		for i := 0; i < len(args); i++ {
+			switch a := args[i]; {
+			case a == "-c" || a == "-f" || a == "-d" || a == "-b":
+				i++
+				if i >= len(args) {
+					return false
+				}
+			case a == "-s" || len(a) > 2 && (a[:2] == "-c" || a[:2] == "-f" || a[:2] == "-d" || a[:2] == "-b"):
+			default:
+				return false
+			}
+		}
+		return len(args) > 0
+	case "tr":
+		sets := 0
+		for _, a := range args {
+			switch {
+			case sets == 0 && (a == "-d" || a == "-s" || a == "-c" || a == "-ds" || a == "-cd" || a == "-cs"):
+			case strings.HasPrefix(a, "-") && len(a) > 1:
+				return false
+			default:
+				sets++
+			}
+		}
+		return sets == 1 || sets == 2
+	}
+	return false
+}
+
+var (
+	grepFlags = regexp.MustCompile(`^-[cviEFnowxqsHh]+$`)
+	grepCount = regexp.MustCompile(`^-[mABC][0-9]+$`)
+)
 
 // shellHazard reports shell syntax the splitters don't model: a newline
 // (which separates commands, and the splitters trim), a comment (which could
 // hide an operator) or a backslash escape outside quotes.
 func shellHazard(c string) bool {
-	if strings.ContainsRune(c, '\n') {
-		return true
+	if strings.ContainsAny(c, "\n\r") {
+		return true // a CR is part of a word to bash, and trimming would drop it
 	}
 	var q byte
 	for i := 0; i < len(c); i++ {
@@ -158,28 +387,38 @@ func shellHazard(c string) bool {
 var outputFilter = regexp.MustCompile(`^(tail|head|grep|egrep|fgrep|rg|sed|awk|wc|sort|uniq|cut|tr|cat|tee|column|jq|less|more|nl|fold|ts)(\s|$)`)
 
 // splitFilters splits "heavy | filter | filter" at unquoted single pipes.
-// ok is false when a part after the first isn't a plain output filter.
+// ok is false when a part after the first isn't a plain output filter. A
+// `|&` after the heavy part (its stderr into the pipe too) becomes a 2>&1
+// on it, so spotexec's own messages stay outside the pipe.
 func splitFilters(command string) (head, filters string, ok bool) {
-	parts, ok := splitPipes(strings.TrimSpace(command))
+	parts, amps, ok := splitPipes(strings.TrimSpace(command))
 	if !ok {
 		return "", "", false
 	}
 	if len(parts) == 1 {
 		return parts[0], "", true
 	}
-	for _, f := range parts[1:] {
-		f = strings.TrimSpace(f)
-		if !outputFilter.MatchString(f) || hasUnquoted(f, "<>;&`$(){}\n") {
+	var b strings.Builder
+	for i, f := range parts[1:] {
+		if t := strings.TrimSpace(f); !outputFilter.MatchString(t) || hasUnquoted(t, "<>;&`$(){}\n") {
 			return "", "", false
 		}
+		if i > 0 {
+			b.WriteString(map[bool]string{false: "|", true: "|&"}[amps[i]])
+		}
+		b.WriteString(f)
 	}
-	return strings.TrimSpace(parts[0]), strings.TrimSpace(strings.Join(parts[1:], "|")), true
+	head = strings.TrimSpace(parts[0])
+	if amps[0] && !trailingMerge.MatchString(head) {
+		head += " 2>&1"
+	}
+	return head, strings.TrimSpace(b.String()), true
 }
 
-// splitPipes splits at unquoted "|" (not "||"). ok is false for unbalanced
-// quotes or an empty part.
-func splitPipes(c string) ([]string, bool) {
-	var parts []string
+// splitPipes splits at unquoted "|" and "|&" (not "||"); amps[i] says the
+// pipe after parts[i] was "|&". ok is false for unbalanced quotes or an
+// empty part.
+func splitPipes(c string) (parts []string, amps []bool, ok bool) {
 	var q rune
 	start := 0
 	for i := 0; i < len(c); i++ {
@@ -201,19 +440,24 @@ func splitPipes(c string) ([]string, bool) {
 				continue
 			}
 			parts = append(parts, c[start:i])
+			amp := i+1 < len(c) && c[i+1] == '&'
+			if amp {
+				i++
+			}
+			amps = append(amps, amp)
 			start = i + 1
 		}
 	}
 	if q != 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	parts = append(parts, c[start:])
 	for _, p := range parts {
 		if strings.TrimSpace(p) == "" {
-			return nil, false
+			return nil, nil, false
 		}
 	}
-	return parts, true
+	return parts, amps, true
 }
 
 // hasUnquoted reports whether s has any of chars outside quotes.
@@ -235,55 +479,112 @@ func hasUnquoted(s, chars string) bool {
 	return false
 }
 
-func (d *Decider) shouldOffload(command string) bool {
+func (d *Decider) why(command string, at place) (bool, string) {
 	c := strings.TrimSpace(command)
 	// A trailing 2>&1 (agents add it to nearly everything) only merges the
 	// streams: harmless, and it stays part of the offloaded command. User
 	// excludes see the line without it, as they always have.
 	line := strings.TrimSpace(trailingMerge.ReplaceAllString(c, ""))
 	if line == "" {
-		return false
+		return false, "an empty command"
 	}
 	for _, re := range d.exclude {
 		if re.MatchString(line) {
-			return false
+			return false, "excluded by " + re.String()
 		}
 	}
 	segs, _ := splitList(c)
-	heavy := false
+	heavy, leading := false, true
 	for _, seg := range segs {
-		seg = strings.TrimSpace(trailingMerge.ReplaceAllString(seg, ""))
-		if shellSyntax(seg) {
-			return false
-		}
-		seg = strings.TrimSpace(seg[len(envPrefix(seg)):])
-		if seg == "" {
-			continue
-		}
-		if cdSeg.MatchString(seg) {
-			if heavy {
-				// Offloaded, this cd would happen only remotely: the
-				// agent's shell would stay where it was.
-				return false
+		// A cd is read exactly as Wrap hoists it (isCd): `cd x >/dev/null`
+		// is not one, and stays on the runner like any other command.
+		if isCd(seg) && !shellSyntax(bareSeg(seg)) {
+			if !leading {
+				// Only leading cds run locally (see Wrap): offloaded,
+				// this one would happen only remotely, and the agent's
+				// shell would stay where it was.
+				return false, "a cd after another command"
 			}
 			continue
 		}
-		if localCommand(seg) {
-			return false
+		leading = false
+		seg = strings.TrimSpace(trailingRedirect.ReplaceAllString(seg, ""))
+		if trailer(seg, heavy) || rideAlong.MatchString(seg) && !shellSyntax(seg) {
+			continue
+		}
+		if shellSyntax(seg) {
+			return false, "shell syntax in " + quoteSeg(seg) + " (a redirect, expansion, subshell or background job)"
+		}
+		_, cmd, ok := splitPrefix(seg, d.prefixes)
+		if !ok {
+			return false, "a wrapper with nothing to run"
+		}
+		cmd = strings.TrimSpace(cmd)
+		form, escapes := toolFormOK(cmd, at)
+		if escapes {
+			return false, quoteSeg(seg) + " works in a directory outside the repository"
+		}
+		form = uvForm(form, at)
+		if localCommand(form) {
+			return false, quoteSeg(seg) + " stays local (spotexec itself, a dev server or a watch mode)"
 		}
 		matched := false
 		for _, re := range d.include {
-			if re.MatchString(seg) {
+			if re.MatchString(cmd) || re.MatchString(form) {
 				matched = true
 				break
 			}
 		}
 		if !matched {
-			return false
+			return false, "mixed with " + quoteSeg(seg) + ", which isn't a heavy command"
 		}
 		heavy = true
 	}
-	return heavy
+	if !heavy {
+		return false, "no heavy command"
+	}
+	return true, ""
+}
+
+// quoteSeg is a segment for a message, shortened.
+func quoteSeg(seg string) string {
+	seg = strings.ReplaceAll(seg, "`", "'")
+	if len(seg) > 60 {
+		seg = seg[:57] + "..."
+	}
+	return "`" + seg + "`"
+}
+
+// trailerCmd is a command that only prints or sets a status, harmless to run
+// on the runner after (or before) a heavy one: `pnpm test || true`,
+// `cargo test; echo "exit=$?"`.
+var trailerCmd = regexp.MustCompile(`^(true|:|echo|printf)(\s|$)`)
+
+// printfAssign is a printf conversion that assigns: %n, with any flags,
+// width or length (%10n, %ln).
+var printfAssign = regexp.MustCompile(`%[-+ #0-9.*]*[hlLqjzt]*n`)
+
+// rideAlong are quick commands that aren't worth offloading alone but run
+// the same on the runner, in a list with heavy ones (`gofmt -l . && go
+// test ./...`).
+var rideAlong = regexp.MustCompile(`^(gofmt|goimports|go fmt|go mod verify)(\s|$)`)
+
+// trailer reports a harmless trailer segment. Its $? is fine after a heavy
+// command (on the runner it is that command's status, as here), not before
+// one, where it would be the runner's own. printf -v and %n assign shell
+// variables, so those aren't trailers.
+func trailer(seg string, afterHeavy bool) bool {
+	if !trailerCmd.MatchString(seg) || !afterHeavy && strings.Contains(seg, "$?") {
+		return false
+	}
+	if strings.HasPrefix(seg, "printf") {
+		for _, w := range rawWords(seg)[1:] {
+			if strings.HasPrefix(w.text, "-v") || printfAssign.MatchString(w.text) {
+				return false
+			}
+		}
+	}
+	return !shellSyntax(strings.ReplaceAll(seg, "$?", ""))
 }
 
 // shellSyntax reports syntax in one list segment that the decider doesn't
@@ -460,7 +761,15 @@ func WrapRTK(bin, command string, rtk bool) string {
 			flags, segs[0] = "--rtk-filter "+name+" ", run
 		}
 	}
-	b.WriteString(bin + " run " + flags + "-- " + shellQuote(joinList(segs, ops)))
+	run := joinList(segs, ops)
+	if filters != "" && len(segs) > 1 {
+		// A pipe binds tighter than && and ;, so the filters read the last
+		// command only: they go with the commands, in one run, rather than
+		// split across two machines (ShouldOffload lets only read-only
+		// filters through here).
+		run, filters = run+" | "+filters, ""
+	}
+	b.WriteString(bin + " run " + flags + "-- " + shellQuote(run))
 	if filters != "" {
 		b.WriteString(" | " + filters)
 	}
@@ -471,9 +780,9 @@ func isCd(seg string) bool {
 	return cdSeg.MatchString(bareSeg(seg))
 }
 
-// splitList splits a command list at unquoted "&&" and ";" (the only list
-// operators ShouldOffload lets through), returning the trimmed segments and
-// the operators between them.
+// splitList splits a command list at unquoted "&&", "||" and ";" (the only
+// list operators ShouldOffload lets through), returning the trimmed segments
+// and the operators between them.
 func splitList(c string) (segs, ops []string) {
 	var q rune
 	start := 0
@@ -490,11 +799,11 @@ func splitList(c string) (segs, ops []string) {
 			q = ch
 		case ch == '\\':
 			i++
-		case ch == ';' || ch == '&' && i+1 < len(c) && c[i+1] == '&':
+		case ch == ';' || (ch == '&' || ch == '|') && i+1 < len(c) && rune(c[i+1]) == ch:
 			segs = append(segs, strings.TrimSpace(c[start:i]))
 			op := ";"
-			if ch == '&' {
-				op = "&&"
+			if ch != ';' {
+				op = string([]rune{ch, ch})
 				i++
 			}
 			ops = append(ops, op)
@@ -537,6 +846,9 @@ type claudeInput struct {
 	ToolName  string         `json:"tool_name"`
 	ToolInput map[string]any `json:"tool_input"`
 	Cwd       string         `json:"cwd"`
+	// PermissionMode is Claude Code's mode: default, acceptEdits, plan,
+	// bypassPermissions, dontAsk.
+	PermissionMode string `json:"permission_mode"`
 }
 
 // BashTimeoutMS is the Bash tool timeout an offloaded command gets when the
@@ -636,14 +948,25 @@ func decide(raw []byte, o ClaudeOptions) (resp map[string]any, took bool) {
 	if err != nil {
 		return nil, false
 	}
+	d.In(dir)
+	// Comments, line continuations and line breaks, as bash reads them.
+	norm := Normalize(cmd)
 	// `rtk cargo test` is `cargo test` with its output compacted.
-	line, explicit, raw2 := UnwrapRTK(cmd)
+	line, explicit, raw2 := UnwrapRTK(norm)
 	if !d.ShouldOffload(line) {
 		return nil, false
 	}
 	// `cd` must stay inside this repository: sx syncs only this worktree.
 	if !cdsInside(line, dir) {
 		return nil, false
+	}
+	// The user's rules about the command as the agent wrote it.
+	perm := CheckPermissions(norm, dir, d.prefixes)
+	if perm.Verdict == VerdictDeny {
+		// For Claude Code to deny, as it would have. Not handed on to a
+		// chained hook either: its rewrite (`rtk cargo test`) could slip
+		// past the rule.
+		return nil, true
 	}
 	if h.WhenLoadAbove > 0 {
 		if l, err := LoadPerCPU(); err != nil || l < h.WhenLoadAbove {
@@ -668,6 +991,13 @@ func decide(raw []byte, o ClaudeOptions) (resp map[string]any, took bool) {
 	rtk := scanRTK(dir)
 	filtered := !raw2 && (explicit || rtk.inUse || isRTKHook(o.Then))
 	wrapped := WrapRTK(o.Bin, line, filtered)
+	if perm.Verdict == VerdictAsk && (h.Mode == "block" || rtk.unchainedRewrites(cmd)) {
+		// Both paths deny with instructions to re-run through spotexec,
+		// and an ask rule doesn't match that retry: leave the command as
+		// it is, for Claude Code to ask about (and not to a chained hook,
+		// whose rewrite might not match the rule either).
+		return nil, true
+	}
 	if racer, ok := rtk.racer(cmd); ok && h.Mode != "block" {
 		// RTK's hook will rewrite this command too, and either rewrite
 		// could win: have the agent run the offloaded form, which RTK leaves
@@ -697,10 +1027,19 @@ func decide(raw []byte, o ClaudeOptions) (resp map[string]any, took bool) {
 	if t, _ := newInput["timeout"].(float64); t <= 0 {
 		newInput["timeout"] = bashTimeout()
 	}
-	return map[string]any{"hookSpecificOutput": map[string]any{
+	out := map[string]any{
 		"hookEventName": "PreToolUse",
 		"updatedInput":  newInput,
-	}}, true
+	}
+	switch {
+	case perm.Verdict == VerdictAsk:
+		out["permissionDecision"] = "ask"
+		out["permissionDecisionReason"] = fmt.Sprintf("spotexec offloads this to a remote runner; your rule %s (%s) asks before it runs", perm.Rule, shortFile(perm.File))
+	case perm.Verdict == VerdictAllow && ev.PermissionMode != "plan":
+		out["permissionDecision"] = "allow"
+		out["permissionDecisionReason"] = fmt.Sprintf("spotexec offloads this to a remote runner; allowed by your rule %s (%s)", perm.Rule, shortFile(perm.File))
+	}
+	return map[string]any{"hookSpecificOutput": out}, true
 }
 
 // RunnersFor is UsableRunners for the config the wrapped command line will
@@ -827,7 +1166,7 @@ func cdTarget(seg, cur string) (string, bool) {
 func wrapDir(command, dir string) string {
 	head, _, ok := splitFilters(command)
 	if !ok {
-		return dir
+		head = command // pipes inside the list: none on a leading cd
 	}
 	segs, _ := splitList(head)
 	cur := dir

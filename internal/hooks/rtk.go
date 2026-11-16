@@ -272,6 +272,13 @@ func scanRTK(dir string) rtkState {
 	return st
 }
 
+// unchainedRewrites reports whether an unchained RTK hook would rewrite
+// command.
+func (st rtkState) unchainedRewrites(command string) bool {
+	_, ok := st.racer(command)
+	return ok
+}
+
 // racer returns the unchained RTK hook that would rewrite command, if any.
 func (st rtkState) racer(command string) (rtkHook, bool) {
 	for _, h := range st.unchained {
@@ -368,10 +375,13 @@ var rtkFilters = []struct {
 var rtkNoFilter = regexp.MustCompile(`(^|\s)--?json=(false|0|f|F|FALSE|False)(\s|$)`)
 
 // rtkFilterFor returns the RTK pipe filter for a single command segment and
-// the segment as it must run to feed it.
+// the segment as it must run to feed it. Wrappers (`timeout 600`, `env
+// CI=1`) are looked past and kept.
 func rtkFilterFor(seg string) (filter, run string, ok bool) {
-	env := envPrefix(seg)
-	rest := seg[len(env):]
+	env, rest, ok := splitPrefix(seg, nil)
+	if !ok {
+		return "", "", false
+	}
 	if rtkNoFilter.MatchString(rest) {
 		return "", "", false
 	}

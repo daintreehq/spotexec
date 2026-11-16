@@ -408,6 +408,9 @@ type Hook struct {
 	WhenLoadAbove float64  `toml:"when_load_above"` // only offload when local load/CPU exceeds this
 	Mode          string   `toml:"mode"`            // rewrite (default) | block
 	Disabled      bool     `toml:"disabled"`
+	// TransparentPrefixes are wrapper commands the hook looks past to judge
+	// the command they run (`direnv exec .`); they run on the runner too.
+	TransparentPrefixes []string `toml:"transparent_prefixes"`
 }
 
 // Project is .spotexec.toml.
