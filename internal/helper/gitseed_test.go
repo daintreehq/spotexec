@@ -444,6 +444,126 @@ func TestGitSeedUnbornBranch(t *testing.T) {
 	}
 }
 
+// An unborn branch stages every file as intent-to-add: more paths than one
+// command line holds (ARG_MAX: 1 MiB on macOS, 2 MiB on Linux) still seed,
+// instead of failing with E2BIG and leaving the slot without a .git.
+func TestGitSeedManyStagedFiles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes 10,000 files")
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	local, _ := filepath.EvalSymlinks(t.TempDir())
+	gitIn(t, local, "init", "-q", "-b", "main")
+	long := strings.Repeat("d", 200)
+	var rels []string
+	for i := range 10000 {
+		rels = append(rels, fmt.Sprintf("%s/%02d/file-%05d-%s.txt", long, i%50, i, strings.Repeat("x", 40)))
+	}
+	for _, rel := range rels {
+		writeFile(t, local, rel, "x\n")
+	}
+	gitIn(t, local, "add", ".")
+	f := &seedFixture{local: local}
+	m, err := manifest.Build(context.Background(), manifest.Options{Root: local})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.m = m
+	f.s = testSession(t, t.TempDir())
+	if err := f.s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range rels {
+		writeFile(t, f.s.workspace, rel, "x\n")
+	}
+	p := f.plan(t)
+	if n := len(p.Seed.IntentToAdd); n != len(rels) {
+		t.Fatalf("%d intent-to-add paths, want %d", n, len(rels))
+	}
+	if res, _ := f.seed(t, p); res.Warning != "" {
+		t.Fatal(res.Warning)
+	}
+	if got := gitIn(t, f.s.workspace, "ls-files"); strings.Count(got, "\n")+1 != len(rels) {
+		t.Fatalf("index holds %d paths, want %d", strings.Count(got, "\n")+1, len(rels))
+	}
+	// Seeding again with nothing changed reuses the seed: the digest of
+	// what was built matches.
+	if res, _ := f.seed(t, p); res.Warning != "" || res.Reseeded {
+		t.Fatalf("second seed %+v", res)
+	}
+}
+
+// The intent-to-add listing, run in batches, hashes exactly as one command
+// would list it (in index order, once each), whatever the batches and
+// the request's order: a seed built before batching still matches.
+func TestIndexDigestBatches(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	ws, _ := filepath.EvalSymlinks(t.TempDir())
+	gitIn(t, ws, "init", "-q", "-b", "main")
+	ita := []string{"z.txt", "a b.txt", "dir/é.txt", "dir/a.txt", "B.txt", "empty.txt"}
+	for _, p := range ita {
+		writeFile(t, ws, p, p+"\n")
+	}
+	writeFile(t, ws, "empty.txt", "")
+	gitIn(t, ws, "add", "-N", "--", "z.txt", "a b.txt", "dir/é.txt", "dir/a.txt", "B.txt")
+	gitIn(t, ws, "add", "--", "empty.txt") // really added: not listed
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := func(req []string) string {
+		t.Helper()
+		d, err := newSeedRepo(ws, git, protocol.GitSeed{IntentToAdd: req}).indexDigest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	want := digest(ita)
+	// The digest before batching: ls-files, then one diff-files.
+	h := sha1.New()
+	for _, args := range [][]string{{"ls-files", "-s", "-v", "-z"}, append([]string{"diff-files", "--name-only", "-z", "--"}, ita...)} {
+		c := exec.Command("git", args...)
+		c.Dir = ws
+		out, err := c.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if args[0] == "diff-files" {
+			h.Write([]byte{0, 1})
+		}
+		h.Write(out)
+	}
+	if one := hex.EncodeToString(h.Sum(nil)); want != one {
+		t.Fatalf("digest %s, one command's %s", want, one)
+	}
+	old := argBatch
+	t.Cleanup(func() { argBatch = old })
+	argBatch.paths = 2
+	shuffled := []string{"dir/a.txt", "B.txt", "z.txt", "empty.txt", "a b.txt", "dir/é.txt", "z.txt"}
+	if got := digest(shuffled); got != want {
+		t.Fatalf("batched digest %s, want %s", got, want)
+	}
+	argBatch.paths, argBatch.bytes = 500, 1
+	if got := digest(ita); got != want {
+		t.Fatalf("digest in one-path batches %s, want %s", got, want)
+	}
+}
+
+func TestPathBatches(t *testing.T) {
+	old := argBatch
+	t.Cleanup(func() { argBatch = old })
+	argBatch.paths, argBatch.bytes = 3, 10
+	got := pathBatches([]string{"aaaa", "bbbb", "c", "d", "e", "ffffffffffffffff", "g"})
+	want := [][]string{{"aaaa", "bbbb"}, {"c", "d", "e"}, {"ffffffffffffffff"}, {"g"}}
+	if !slices.EqualFunc(got, want, slices.Equal) {
+		t.Fatalf("batches %q, want %q", got, want)
+	}
+	if got := pathBatches(nil); len(got) != 0 {
+		t.Fatalf("batches of nothing %q", got)
+	}
+}
+
 func TestValidateSeed(t *testing.T) {
 	id := strings.Repeat("a", 40)
 	for _, bad := range []protocol.GitSeed{

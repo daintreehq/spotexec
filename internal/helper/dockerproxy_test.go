@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,18 @@ import (
 // The test binary stands in for spotexec-helper when startDockerProxy runs
 // os.Executable() docker-proxy.
 func TestMain(m *testing.M) {
+	// The test binary stands in for the helper's detached subcommands.
+	if len(os.Args) > 1 && os.Args[1] == "cache-put" {
+		fs := flag.NewFlagSet("cache-put", flag.ExitOnError)
+		root, src, lock := fs.String("work-root", "", ""), fs.String("src", "", ""), fs.String("lock", "", "")
+		fd := fs.Int("lifecycle-fd", 0, "")
+		_ = fs.Parse(os.Args[2:])
+		if err := CachePut(*root, *src, *lock, *fd); err != nil {
+			fmt.Fprintln(os.Stderr, "spotexec-helper:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "docker-proxy" {
 		if err := DockerProxy(); err != nil {
 			fmt.Fprintln(os.Stderr, "spotexec-helper:", err)

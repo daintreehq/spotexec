@@ -276,27 +276,27 @@ func TestWrapScriptResetsOOMScore(t *testing.T) {
 // A client that seems silent only because the helper itself was stalled
 // (heartbeats still queued in the pipe) isn't taken for gone.
 func TestClientGoneAfterOwnStall(t *testing.T) {
-	s := &Session{}
-	s.lastSeen.Store(time.Now().Add(-2 * ClientTimeout).UnixNano())
+	s := newSession()
+	s.lastSeen.Store(s.now() - int64(2*ClientTimeout))
 	if !s.clientGone() {
 		t.Fatal("silent client not gone")
 	}
-	s.stalledAt.Store(time.Now().UnixNano())
+	s.stalledAt.Store(s.now())
 	if s.clientGone() {
 		t.Fatal("client taken for gone right after the helper's own stall")
 	}
-	s.stalledAt.Store(time.Now().Add(-stallGrace - time.Second).UnixNano())
+	s.stalledAt.Store(s.now() - int64(stallGrace+time.Second))
 	if !s.clientGone() {
 		t.Fatal("an old stall still excuses the client")
 	}
 	// Woken before the stall sampler after a stall: its tick is overdue.
-	s.stallTick.Store(time.Now().Add(-10 * time.Second).UnixNano())
+	s.stallTick.Store(s.now() - int64(10*time.Second))
 	if s.clientGone() {
 		t.Fatal("client taken for gone before the stall sampler caught up")
 	}
 	// Stall after stall can't excuse a dead client forever.
-	s.stalledAt.Store(time.Now().UnixNano())
-	s.lastSeen.Store(time.Now().Add(-ClientTimeout - stallCap - time.Second).UnixNano())
+	s.stalledAt.Store(s.now())
+	s.lastSeen.Store(s.now() - int64(ClientTimeout+stallCap+time.Second))
 	if !s.clientGone() {
 		t.Fatal("stalls excuse a client silent past the cap")
 	}
@@ -304,7 +304,7 @@ func TestClientGoneAfterOwnStall(t *testing.T) {
 
 // The stall sampler notices the helper going unscheduled.
 func TestWatchStalls(t *testing.T) {
-	s := &Session{}
+	s := newSession()
 	done := make(chan struct{})
 	defer close(done)
 	go s.watchStalls(done)
@@ -313,5 +313,40 @@ func TestWatchStalls(t *testing.T) {
 	}
 	if s.recentlyStalled() {
 		t.Fatal("stalled without a stall")
+	}
+}
+
+// Liveness is measured on the session's monotonic clock: its timestamps are
+// offsets from the session's start, not wall-clock instants, so NTP
+// stepping a just-booted VM's clock neither ends a live client's run nor
+// keeps a dead client's going.
+func TestLivenessUsesTheMonotonicClock(t *testing.T) {
+	s := newSession()
+	if seen := time.Duration(s.lastSeen.Load()); seen <= 0 || seen > time.Minute {
+		t.Fatalf("lastSeen = %v: not an offset from the session's start", seen)
+	}
+	// The session's start carries a monotonic reading (time.Since then
+	// ignores the wall clock); one rebuilt from wall-clock nanoseconds
+	// wouldn't.
+	if !strings.Contains(s.born.String(), " m=") {
+		t.Fatalf("born %v has no monotonic reading", s.born)
+	}
+	if s.clientGone() {
+		t.Fatal("a client just heard from is gone")
+	}
+	now := s.lastSeen.Load()
+	if s.silentForAt(now+int64(ClientTimeout), ClientTimeout) {
+		t.Fatal("silent at the limit")
+	}
+	if !s.silentForAt(now+int64(ClientTimeout+time.Second), ClientTimeout) {
+		t.Fatal("not silent past the limit")
+	}
+	// No stall yet: a fresh session's first seconds aren't excused as one.
+	if s.recentlyStalledAt(now + int64(time.Second)) {
+		t.Fatal("a fresh session counts as stalled")
+	}
+	s.stalledAt.Store(now)
+	if !s.recentlyStalledAt(now+int64(stallGrace-time.Second)) || s.recentlyStalledAt(now+int64(stallGrace+time.Second)) {
+		t.Fatal("stall grace misjudged")
 	}
 }

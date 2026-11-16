@@ -75,7 +75,7 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 		if err != nil {
 			return perr(protocol.CodeDraining, "%v", err)
 		}
-		s.lifecycle = l
+		s.own(func() { s.lifecycle = l })
 		if draining(s.layout.Root) {
 			return perr(protocol.CodeDraining, "runner is draining")
 		}
@@ -125,7 +125,7 @@ capacity:
 				ok = s.tryAll(max)
 			}
 			if ok {
-				s.gate = gate
+				s.own(func() { s.gate = gate })
 				if ok, err := s.takeOnlySlot(a, only, &holder); err != nil || ok {
 					if err != nil {
 						return err
@@ -150,13 +150,13 @@ capacity:
 						return err
 					}
 					if ok {
-						s.tokens, s.tokenIdx = []*flock{l}, i
+						s.own(func() { s.tokens, s.tokenIdx = []*flock{l}, i })
 						break
 					}
 				}
 			}
 			if len(s.tokens) > 0 {
-				s.gate = gate
+				s.own(func() { s.gate = gate })
 				if ok, err := s.takeOnlySlot(a, only, &holder); err != nil || ok {
 					if err != nil {
 						return err
@@ -200,7 +200,7 @@ capacity:
 	// Pick a workspace slot. Preference: an explicitly requested slot, then a
 	// slot whose content already matches (0ms sync), then the slot this
 	// worktree used most recently, then the least recently used slot.
-	s.repoID = a.RepoID
+	s.own(func() { s.repoID = a.RepoID })
 	type cand struct {
 		n     int
 		score int
@@ -244,7 +244,7 @@ capacity:
 				return err
 			}
 			if ok {
-				s.slotLock, s.slotDir = l, dir
+				s.own(func() { s.slotLock, s.slotDir = l, dir })
 				holder.Slot = n
 				break
 			}
@@ -257,7 +257,7 @@ capacity:
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
-	s.workspace = filepath.Join(s.slotDir, "workspace")
+	s.own(func() { s.workspace = filepath.Join(s.slotDir, "workspace") })
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		return err
 	}
@@ -280,7 +280,7 @@ capacity:
 	}
 	// ...and its containers.
 	if _, err := exec.LookPath("docker"); err == nil {
-		s.repoID = a.RepoID
+		s.own(func() { s.repoID = a.RepoID })
 		if left := s.removeContainers(true); left != "" {
 			return perr(protocol.CodeInternal, "workspace slot %d: containers from an earlier run can't be removed: %s", holder.Slot, left)
 		}
@@ -336,6 +336,7 @@ func (s *Session) rollbackAcquire() {
 	s.owned.Store(nil)
 	s.relMu.Lock() // not concurrently with a shutdown's release
 	defer s.relMu.Unlock()
+	s.parkIfStopping()
 	defer func() { s.workspace = "" }()
 	for i, t := range s.tokens {
 		if t != nil {
@@ -371,7 +372,7 @@ func (s *Session) tryAll(max int) bool {
 		}
 		got = append(got, l)
 	}
-	s.tokens, s.tokenIdx = got, 1
+	s.own(func() { s.tokens, s.tokenIdx = got, 1 })
 	return true
 }
 
@@ -454,7 +455,7 @@ func (s *Session) takeOnlySlot(a protocol.Acquire, only bool, h *protocol.Holder
 		return false, err
 	}
 	if ok {
-		s.slotLock, s.slotDir = l, dir
+		s.own(func() { s.slotLock, s.slotDir = l, dir })
 		h.Slot = a.PreferSlot
 		return true, nil
 	}
@@ -469,6 +470,7 @@ func (s *Session) releaseCapacity() {
 	}
 	s.relMu.Lock()
 	defer s.relMu.Unlock()
+	s.parkIfStopping()
 	for _, t := range s.tokens {
 		t.Unlock()
 	}
