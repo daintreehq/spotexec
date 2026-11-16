@@ -1042,6 +1042,24 @@ func TestGlobalMaxPriceCapsOnDemandFallback(t *testing.T) {
 	if markets := fz.callsOf("market"); len(markets) != 2 || len(fz.callsOf("market on-demand")) != 0 {
 		t.Fatalf("markets %v", markets)
 	}
+	// A refusal at the cap still cooling down from an earlier launch counts
+	// too, even for an option this launch never reaches (here skipped for
+	// quota once the cheaper type is refused for it).
+	fq := &fakeRegionsEC2{
+		prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.02"}, {"r-one-1a", "c6a.2xlarge", "0.03"}}},
+		runErr: map[string]string{"r-one-1/c7a.2xlarge": "VcpuLimitExceeded", "r-one-1/c7a.2xlarge/on-demand": "InsufficientInstanceCapacity"},
+	}
+	gq := newGlobalEnv(t, fq, "r-one-1", "r-two-1")
+	gq.r.MaxPrice, gq.r.OnDemandFallback = capUSD, true
+	gq.coolPool(SpotPrice{Region: "r-one-1", Zone: "r-one-1a", Type: "c6a.2xlarge"}, "SpotMaxPriceTooLow")
+	if in, err := gq.Launch(context.Background(), t.Logf); err == nil {
+		t.Fatalf("launched a type refused at the cap: %+v via %v", in, fq.callsOf("RunInstances"))
+	}
+	for _, run := range fq.callsOf("RunInstances") {
+		if strings.Contains(run, "c6a") {
+			t.Fatalf("tried the type refused at the cap: %v", fq.callsOf("RunInstances"))
+		}
+	}
 	// Per region: the same type over the cap in one region and at it in
 	// another falls back only where it's at the cap.
 	fr := &fakeRegionsEC2{

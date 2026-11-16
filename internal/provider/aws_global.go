@@ -920,6 +920,22 @@ func (g *AWSGlobal) cooldowns(ps []SpotPrice) map[string]cooldown {
 	return out
 }
 
+// refusedAtCap returns, by region/type, the listed options EC2 refused at
+// max_price (SpotMaxPriceTooLow) whose pool is still cooling down for it,
+// whatever region or zone cooldown may hide that.
+func (g *AWSGlobal) refusedAtCap(ps []SpotPrice) map[string]bool {
+	out := map[string]bool{}
+	now := g.clock()
+	_ = g.withState(func(st *placementState) {
+		for _, p := range ps {
+			if c, ok := st.Cooldown[poolKey(p)]; ok && now.Before(c.Until) && strings.Contains(c.Why, "SpotMaxPriceTooLow") {
+				out[p.Region+"/"+p.Type] = true
+			}
+		}
+	})
+	return out
+}
+
 func (g *AWSGlobal) coolPool(p SpotPrice, why string) {
 	_ = g.withState(func(st *placementState) {
 		c := st.Cooldown[poolKey(p)]
@@ -1212,8 +1228,8 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	skipRegion := map[string]string{}
 	skipQuota := map[string][]quotaSkip{} // region -> what its quota refused during this launch
 	skipZone := map[string]bool{}
-	atCap := map[string]bool{}  // region/type refused at max_price (SpotMaxPriceTooLow)
-	broken := g.brokenRegions() // regions whose setup failed (no on-demand there either)
+	atCap := g.refusedAtCap(t.Prices) // region/type refused at max_price (SpotMaxPriceTooLow)
+	broken := g.brokenRegions()       // regions whose setup failed (no on-demand there either)
 	var tried []string
 	// When quota is all that stopped every option (others can't work as
 	// configured: no network there, or above max_price), the error is a
@@ -1253,9 +1269,6 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		}
 		if cd, ok := cool[poolKey(c)]; ok {
 			ahead.add("cooling down")
-			if strings.Contains(cd.Why, "SpotMaxPriceTooLow") {
-				atCap[c.Region+"/"+c.Type] = true
-			}
 			switch {
 			case cd.Transient:
 				otherFailure = true // may have cleared since
