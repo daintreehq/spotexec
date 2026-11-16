@@ -157,6 +157,7 @@ func TestGlobalPruningKeepsBootingTrial(t *testing.T) {
 		t.Fatal("no trial")
 	}
 	now = now.Add(time.Minute + time.Second) // past Until + coolMemory
+	_, _ = g.RegionHolds()                   // prunes after reading
 	if holds, _ := g.RegionHolds(); len(holds) != 1 {
 		t.Fatalf("the booting trial's hold was pruned: %v", holds)
 	}

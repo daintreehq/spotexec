@@ -37,6 +37,12 @@ type regionReach struct {
 // that leaves the region silent holds it (renewed at most every
 // holdRenew).
 func (p *Pool) judgeRegion(st *poolState, id string, o Outcome, now time.Time) regionReach {
+	return p.judgeRegionIn(st, id, "", o, now)
+}
+
+// judgeRegionIn is judgeRegion, with id's region given when the cached
+// listing may not have it ("": look it up).
+func (p *Pool) judgeRegionIn(st *poolState, id, region string, o Outcome, now time.Time) regionReach {
 	if _, ok := p.Fleet.(provider.RegionHolder); !ok {
 		return regionReach{}
 	}
@@ -45,9 +51,8 @@ func (p *Pool) judgeRegion(st *poolState, id string, o Outcome, now time.Time) r
 			delete(st.Held, rg)
 		}
 	}
-	region := ""
 	for _, in := range st.Instances {
-		if in.ID == id {
+		if region == "" && in.ID == id {
 			region = in.Region
 			break
 		}
@@ -137,9 +142,31 @@ func (n *note) reaping(now time.Time) bool {
 	return n != nil && !n.Reaping.IsZero() && now.Sub(n.Reaping) < time.Minute
 }
 
+// stillReaping reports, just before it is terminated, whether a VM Plan
+// chose to end still is: no run reserved it since (an exact slot clears
+// the mark).
+func (p *Pool) stillReaping(id string) bool {
+	ok := false
+	_ = p.with(func(st *poolState) error {
+		ok = st.Notes[id].reaping(time.Now()) && !st.sched().protected(id)
+		return nil
+	})
+	return ok
+}
+
 // Reached records that a VM answered this client outside a job's probe
-// (`spotexec status`), ending its region's hold.
-func (p *Pool) Reached(id string) { p.Observe(id, outContact, time.Time{}) }
+// (`spotexec status`, which lists it afresh: its region is taken from in
+// when the pool's cached listing doesn't have it yet), ending its region's
+// hold.
+func (p *Pool) Reached(in provider.Instance) {
+	_ = p.with(func(st *poolState) error {
+		now := time.Now()
+		n := st.note(in.ID)
+		n.SuspectUntil, n.Failures, n.Reached = time.Time{}, 0, now
+		p.applyReach(p.judgeRegionIn(st, in.ID, in.Region, outContact, now))
+		return nil
+	})
+}
 
 // reached reports whether the VM ever answered this client (Ready: it
 // served, which notes from before Reached existed only say this way).

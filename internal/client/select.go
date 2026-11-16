@@ -456,6 +456,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				continue
 			}
 			for _, id := range d.Reap {
+				if !m.pool.stillReaping(id) {
+					continue // a run reserved it meanwhile
+				}
 				// At max_instances with VMs this client can't reach: end one,
 				// so the next round launches where it can. Marked draining
 				// only once the request succeeded, so a failed attempt is

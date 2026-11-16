@@ -414,9 +414,12 @@ func (g *AWSGlobal) withStateWait(wait time.Duration, fn func(st *placementState
 		}
 	}
 	for k, v := range st.Cooldown {
+		if !v.Trial.IsZero() && now.Before(v.Trial.Add(g.trialFor())) {
+			continue // a trial still booting keeps its region's hold
+		}
 		end := v.Until
 		if v.Trial.After(end) {
-			end = v.Trial // a trial still booting keeps its region's hold
+			end = v.Trial
 		}
 		if now.After(end.Add(coolMemory(k))) {
 			delete(st.Cooldown, k) // forget the backoff step too, eventually

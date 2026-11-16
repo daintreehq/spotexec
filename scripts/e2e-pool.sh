@@ -348,12 +348,12 @@ check "the job ran, on a VM in sim-b (${U1:-none})" "[ $code = 0 ] && grep -q se
 check "its first launch, into sim-a, is still running but was never used (regions: $(regions))" "[ \"\$(regions)\" = 'sim-a sim-b ' ]"
 "$SX" status "$RR" >"$WORK/u-status.out" 2>&1
 check "status says sim-a takes no launches, and why" "grep -q \"$RR: no launches into sim-a: unreachable from this client\" $WORK/u-status.out && grep -q 'never answered SSH' $WORK/u-status.out"
-for i in 1 2; do SPOTEXEC_POOL=$RR "$SX" --json "sleep 4; echo busy$i" >"$WORK/u2$i.out" 2>"$WORK/u2$i.err" & done; wait
+for i in 1 2; do SPOTEXEC_POOL=$RR "$SX" --json "sleep 15; echo busy$i" >"$WORK/u2$i.out" 2>"$WORK/u2$i.err" & done; wait
 check "with sim-a still held, the next launch goes to sim-b too (regions: $(regions))" "[ \$(cat $WORK/u2*.out | grep -c '^busy') = 2 ] && [ \"\$(regions)\" = 'sim-a sim-b sim-b ' ]"
 "$SX" sim network "$RR" sim-a up >/dev/null
 "$SX" status "$RR" >"$WORK/u-status2.out" 2>&1
 check "sim-a answers again (here, to status): its hold is gone" "! grep -q 'no launches into sim-a' $WORK/u-status2.out"
-for i in 1 2 3 4; do SPOTEXEC_POOL=$RR "$SX" --json "sleep 6; echo again$i" >"$WORK/u4$i.out" 2>"$WORK/u4$i.err" & done; wait
+for i in 1 2 3 4; do SPOTEXEC_POOL=$RR "$SX" --json "sleep 15; echo again$i" >"$WORK/u4$i.out" 2>"$WORK/u4$i.err" & done; wait
 check "with every VM busy, a new launch goes to sim-a again (regions: $(regions))" "[ \$(cat $WORK/u4*.out | grep -c '^again') = 4 ] && [ \"\$(regions)\" = 'sim-a sim-a sim-b sim-b ' ]"
 unset SPOTEXEC_SIM_REGIONS
 

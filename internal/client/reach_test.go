@@ -280,7 +280,7 @@ func TestAnswersEndHolds(t *testing.T) {
 	// Status reaching a VM ends a hold too.
 	failTwice(p, a1)
 	failTwice(p, a2)
-	p.Reached(a1.ID)
+	p.Reached(a1)
 	if len(h.reached) != 1 {
 		t.Fatalf("reached %v", h.reached)
 	}
@@ -299,5 +299,34 @@ func TestResetKeepsHeld(t *testing.T) {
 	p.Observe(old.ID, OutAcquired, old.LaunchedAt)
 	if len(h.reached) != 1 {
 		t.Fatalf("reached %v after a reset", h.reached)
+	}
+}
+
+// An exact slot (exec, pull, --same-slot) on a VM being reaped wins: the
+// reaper stands down before terminating it.
+func TestExactSlotStopsReap(t *testing.T) {
+	a1, a2 := vmIn("i-a1", "r-a", time.Hour), vmIn("i-a2", "r-a", 2*time.Hour)
+	p, _ := regionPool(t, 2, a1, a2)
+	failTwice(p, a1)
+	failTwice(p, a2)
+	if d := planOnce(t, p); len(d.Reap) != 1 || d.Reap[0] != "i-a2" || !p.stillReaping("i-a2") {
+		t.Fatalf("%+v", d)
+	}
+	if _, err := p.reserveOn(a2, claim{Exact: true, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if p.stillReaping("i-a2") {
+		t.Fatal("reaping a VM an exact slot reserved")
+	}
+}
+
+// Status reaches VMs from a fresh listing the pool may not have cached.
+func TestReachedUsesGivenRegion(t *testing.T) {
+	old := vmIn("i-old", "r-a", 11*time.Minute)
+	p, h := regionPool(t, 4, old)
+	failTwice(p, old)
+	p.Reached(provider.Instance{ID: "i-new", Region: "r-a"}) // not listed yet
+	if len(h.reached) != 1 || h.reached[0] != "r-a" {
+		t.Fatalf("reached %v", h.reached)
 	}
 }

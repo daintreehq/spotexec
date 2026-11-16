@@ -307,8 +307,9 @@ func (s *Sim) withHolds(fn func(m map[string]cooldown)) error {
 	}
 	fn(m)
 	now := time.Now()
+	tf := trialFor(s.r.BootTimeout.Duration)
 	for k, c := range m {
-		if now.After(c.Until.Add(unreachHoldMax)) && (c.Trial.IsZero() || now.After(c.Trial.Add(unreachHoldMax))) {
+		if now.After(c.Until.Add(unreachHoldMax)) && (c.Trial.IsZero() || now.After(c.Trial.Add(max(unreachHoldMax, tf)))) {
 			delete(m, k)
 		}
 	}

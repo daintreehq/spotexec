@@ -291,8 +291,11 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				st.Error = err.Error()
 				return
 			}
-			st.answered = true // reached over SSH, whatever its helper says
 			b, err := c.HelperCmd(cctx, "status")
+			// Reached it, even if its helper failed (an existing SSH master
+			// may answer for a connection that is gone: only the command
+			// says).
+			st.answered = err == nil || !transport.IsConnError(err)
 			if err != nil {
 				st.Error = err.Error()
 				return
@@ -315,7 +318,7 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 	for _, h := range holders {
 		for i := h.first; i < len(rows) && rows[i].Fleet == rows[h.first].Fleet; i++ {
 			if rows[i].answered {
-				h.pool.Reached(rows[i].Info.InstanceID)
+				h.pool.Reached(provider.Instance{ID: rows[i].Info.InstanceID, Region: rows[i].Info.Region})
 			}
 		}
 		if holds, _ := h.rh.RegionHolds(); len(holds) > 0 {

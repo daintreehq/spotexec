@@ -553,8 +553,11 @@ func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 		now := time.Now()
 		s.reconcileOwners(now)
 		v := s.vm(in.ID, now)
-		if st.Notes[in.ID].reaping(now) {
-			return errNoRoom // being ended to make room: it can't be reached anyway
+		if n := st.Notes[in.ID]; n.reaping(now) {
+			if !c.Force {
+				return errNoRoom // being ended to make room: it can't be reached anyway
+			}
+			n.Reaping = time.Time{} // an exact slot wins: the reaper sees its claim and stands down
 		}
 		if !c.Force {
 			if f := s.Fences[in.ID]; f != nil && f.Owner != owner && !c.Exact {
