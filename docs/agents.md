@@ -72,6 +72,21 @@ Other events include:
 - `warning` events with stable codes (`SYNC_CONFLICT`, `SYNC_COLLISION`, `WRITEBACK_CONFIG`, `LARGE_WRITEBACK`, `WRITEBACK_HELD`, `RUNNER_LOST`, `SPOT_INTERRUPTION`, `TIMEOUT`, `LOCAL_FALLBACK`, `RTK_FILTER`, `STDIN_IGNORED`, …). `UNKNOWN_TASK` follows an exit 127 of `sx <word>` (no `--`) when the word is a plain name, no task has it, and the shell found no command by that name: its message names the closest task when exactly one is near, and `spotexec tasks` lists them all;
 - `error` when spotexec itself fails (exit `125`), or the project's Dockerfile fails to build (exit `123`, code `IMAGE_BUILD_FAILED`), with its `message` and a `code` to branch on: the specific reason when there is one, `SPOTEXEC_ERROR` otherwise (an SSH failure, an unknown runner, a config error). The reasons are `QUEUE_TIMEOUT` (no free slot within `--queue-timeout`), `BOOTSTRAP_FAILED` (the VM's `bootstrap_script` failed), `DEPS_FAILED` (the dependency install failed; see `deps_failed`), `SYNC_FAILED`, `IMAGE_FAILED` (the project container couldn't be built, pulled or managed, for a reason other than the Dockerfile itself), `IMAGE_BUILD_FAILED` (the Dockerfile itself failed to build: exit `123`; see `image_build_failed`), `RUNNER_BOOTING`, `RUNNER_DRAINING`, `RUNNER_SHUTTING_DOWN`, `BAD_REQUEST` (the runner refused the request, such as a slot that no longer exists or an invalid image reference) and `INTERNAL` (the runner couldn't do its own part, such as clearing a slot of an earlier run's processes or containers). A single run ends with it, with no `result` event; in a parallel or sharded task each part that failed this way has its own, with its `task`, before the task's `result`.
 
+## Run records
+
+Every run also leaves a record on your machine, whatever mode it ran in, so a busy period can be looked into after the terminals that showed it are gone: one JSON file per `sx`, `spotexec run`, `exec` or task, in `~/.local/state/spotexec/logs/runs/` (under `SPOTEXEC_STATE_DIR` or `XDG_STATE_HOME` when set), named by when it started. The newest 2000 are kept, and no more than 32 MB of them.
+
+A record has the run's `started_at` and `ended_at`, `duration_ms`, `exit_code`, `worktree` and `pid`, any `warnings` raised for a whole task, and `parts`: one for a single run, one per part of a parallel or sharded task (its `name`). Each part has:
+
+- its `command`, `status` (`passed`, `failed`, `interrupted`, or `stopped` by `fail_fast`), `exit_code`, and `local` when it ran here with `--fallback-local`;
+- where it ran: `runner`, `slot` and, on a fleet VM, `instance_id`, `region`, `zone` and `instance_type`; `attempts` is 2 when it was replayed after losing its runner;
+- `phases_ms`, where its time went: `scan` (listing the worktree's files), `queued` (getting a runner and slot, including waiting for one and a VM booting), `sync`, `image`, `dependencies`, `setup`, `command` and `writeback` (with artifact pulls), summed over its attempts;
+- its `warnings`, each with its `at`, `code` and `message`;
+- `error` when spotexec failed it (exit `125`, or `123`): the `code` its `error` event has, its `message`, and, when it lost its runner and wasn't replayed, the `reason` (`RUNNER_UNRESPONSIVE`, `MEMORY_PRESSURE` or `CLIENT_SUSPENDED`);
+- `launches`, the VMs its demand launched or tried to: each `launch_id`, `runner`, `status` (`requested`, `launched`, `running` or `failed`), the `demand` and live `instances` when it was asked for, the `instance_id`, `region`, `zone`, `instance_type` and `placement` it got, its `error`, and `log`, the provider's messages, which name the options it skipped before the one it launched.
+
+The command's output is never recorded; warnings, errors and messages are cut to 1 KB, and each list is capped (`*_dropped` counts what was left out). For example, `jq -r 'select(any(.parts[]; .error.reason == "RUNNER_UNRESPONSIVE")) | .started_at' ~/.local/state/spotexec/logs/runs/*.json` lists the runs that ended that way.
+
 ## Claude Code hook
 
 ```sh

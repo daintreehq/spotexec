@@ -590,10 +590,21 @@ func (f *runFlags) options(l *loaded, s runSpec, rep ui.Reporter, intr <-chan st
 }
 
 // execute runs one spec end to end and returns the process exit code.
-func (f *runFlags) execute(l *loaded, s runSpec) int {
+func (f *runFlags) execute(l *loaded, s runSpec) (code int) {
+	var rec *recorder
 	// A scale-out started by this process must record its instance ID before
-	// we exit, or the pool could lose track of it for a while.
-	defer waitLaunches()
+	// we exit, or the pool could lose track of it for a while. The run's
+	// record is saved before that wait, and again after it with how the
+	// launches went.
+	defer func() {
+		if rec != nil {
+			rec.finish(code)
+		}
+		waitLaunches()
+		if rec != nil {
+			rec.settle()
+		}
+	}()
 	f.applyEnv()
 	if err := f.check(s); err != nil {
 		fmt.Fprintln(os.Stderr, "spotexec:", err)
@@ -604,6 +615,27 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 		fmt.Fprintln(os.Stderr, "spotexec:", err)
 		return client.ExitInfra
 	}
+	rec = newRecorder(l.ws, "")
+	part, rep := rec.part(rep, "", s.display)
+	var res client.Result
+	local, localStart := false, time.Time{}
+	defer func() {
+		if local {
+			rec.localPhase(part, time.Since(localStart))
+		}
+		status := partFailed
+		switch {
+		case code == client.ExitInterrupted:
+			status = partInterrupted
+		case code == 0:
+			status = partPassed
+		}
+		var failed error
+		if !local && status != partInterrupted {
+			failed = err
+		}
+		rec.end(part, res, failed, code, status, local)
+	}()
 	ctx, intr, stop := signals()
 	defer stop()
 	var stdout io.Writer = os.Stdout
@@ -627,7 +659,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 	stdin := newStdinNotice(s.command)
 	stdin.check(rep)
 	o := f.options(l, s, stdin.reporter(clientRep), intr, stdout, stderr)
-	res, err := client.Run(ctx, l.cfg, l.ws, o)
+	res, err = client.Run(ctx, l.cfg, l.ws, o)
 	if ctx.Err() == nil {
 		// A run that failed reports no result to look before.
 		stdin.check(rep)
@@ -641,6 +673,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) int {
 			rep.Warn("LOCAL_FALLBACK", "no runner available (%v); running locally", err)
 			// Unwatched: a terminal stays one for the local command.
 			o.Stderr, o.Rep = os.Stderr, rep
+			local, localStart = true, time.Now()
 			code := runLocal(ctx, intr, l, o, rep, 0, 1)
 			if ctx.Err() == nil {
 				stdin.check(rep)
@@ -1011,7 +1044,6 @@ func (pt taskPart) spec(l *loaded) runSpec {
 // runTask executes a named task (possibly a parallel or sharded fan-out).
 func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	t := l.cfg.Project.Tasks[name]
-	defer waitLaunches()
 	parts := taskParts(l.cfg.Project, name, args)
 	// A blank run, or run = "{args}" given none, would run nothing and pass;
 	// checked for every part before any of them syncs.
@@ -1046,11 +1078,21 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		fmt.Fprintf(os.Stderr, "spotexec: %s is a parallel task (%s), so it can't take extra arguments; run a part on its own: sx %s %s\n", name, strings.Join(t.Parallel, ", "), t.Parallel[0], strings.Join(args, " "))
 		return client.ExitInfra
 	}
-	rep, err := f.reporter()
+	base, err := f.reporter()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "spotexec:", err)
 		return client.ExitInfra
 	}
+	// Each part's warnings and launches go in its part of the record; rep
+	// records the task's own.
+	rec := newRecorder(l.ws, name)
+	rep := rec.reporter(base)
+	exit := client.ExitInfra
+	defer func() {
+		rec.finish(exit)
+		waitLaunches()
+		rec.settle()
+	}()
 	group := f.grouped(t, os.Getenv("SPOTEXEC_AGENT") == "1" && !ui.IsTerminal(os.Stdout))
 	ctx, intr, stop := signals()
 	defer stop()
@@ -1094,7 +1136,8 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 		wg.Add(1)
 		go func(i int, part taskPart) {
 			defer wg.Done()
-			sr := &taskReporter{Reporter: rep, task: part.name, shard: part.shard, shards: part.shards, mu: &mu}
+			rp, prep := rec.part(base, part.label, part.spec(l).display)
+			sr := &taskReporter{Reporter: prep, task: part.name, shard: part.shard, shards: part.shards, mu: &mu}
 			prefix := fmt.Sprintf("[%s] ", part.label)
 			var grp *ui.Group
 			var stdout, stderr io.Writer
@@ -1114,9 +1157,11 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot, conflicts: len(res.Conflicts)}
 			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
 				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, part.label)
+				localStart := time.Now()
 				out.code, err = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(parts)), nil
 				out.runner, out.slot, out.local = "", 0, true
 				interrupted = ctx.Err() != nil
+				rec.localPhase(rp, time.Since(localStart))
 			}
 			if err != nil {
 				out.code = failExit(err)
@@ -1145,6 +1190,11 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			// output is printed but not its error or summary.
 			wasStopped := stopped[i]
 			mu.Unlock()
+			failed := err
+			if out.status == partStopped || out.status == partInterrupted {
+				failed = nil
+			}
+			rec.end(rp, res, failed, code, out.status, out.local)
 			// report runs with mu held.
 			report := func() {
 				if wasStopped {
@@ -1200,7 +1250,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	}
 	saveFirstLastRun(l.ws, records)
 	interrupted := ctx.Err() != nil
-	exit := taskExit(outs, interrupted)
+	exit = taskExit(outs, interrupted)
 	took := time.Since(start)
 	result := map[string]any{"task": name, "exit_code": exit, "duration_ms": took.Milliseconds(), "parts": resultParts(outs), "conflict_count": totalConflicts(outs)}
 	if len(t.Parallel) > 0 {
