@@ -202,6 +202,8 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 		{`printf "<%s>" x # << note`, "<x><a><two words>"},
 		{"printf \"<%s>\" `echo '#'` # c", "<#><a><two words>"},
 		{`printf "<%s>" $((1+2)) <<< x # c`, "<3><a><two words>"},
+		{`n=d#1; printf "<%s>" ${n//[ #]/_}`, "<d_1><a><two words>"},
+		{`printf "<%s>" "${n:-"x #"}" # c`, "<x #><a><two words>"},
 	}
 	for _, c := range cases {
 		line := taskCommand(c.tmpl, []string{"a", "two words"})
@@ -212,6 +214,11 @@ func TestTaskCommandArgsSurviveTrailingComment(t *testing.T) {
 		if string(out) != c.want {
 			t.Errorf("template %q: line %q printed %q, want %q", c.tmpl, line, out, c.want)
 		}
+	}
+	// A case pattern's ')' doesn't end $(...). (Checked as text: bash 3.2,
+	// macOS's sh, misparses this case inside $(...).)
+	if got := taskCommand(`printf "<%s>" "$(case r in r) printf "r #1";; *) :;; esac)" # c`, []string{"a"}); !strings.HasSuffix(got, `esac)" "$@" # c`) {
+		t.Errorf("case in $(...): got %q", got)
 	}
 	// A run that is only a comment must not run its arguments, and an
 	// operator at the end still takes them as its right-hand side.

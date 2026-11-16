@@ -27,6 +27,9 @@ func TestRewriteRoot(t *testing.T) {
 		{`ls prefix/Users/me/repo/x`, `ls prefix/Users/me/repo/x`},
 		{"cat <<EOF\n/Users/me/repo/x\nEOF", "cat <<EOF\n${SPOTEXEC_WORKSPACE:?}/x\nEOF"},
 		{"cat <<< /Users/me/repo/x", `cat <<< "${SPOTEXEC_WORKSPACE:?}"/x`},
+		{`echo "$(dirname "/Users/me/repo/x")"`, `echo "$(dirname "${SPOTEXEC_WORKSPACE:?}/x")"`},
+		{`echo "$(ls /Users/me/repo) /Users/me/repo"`, `echo "$(ls "${SPOTEXEC_WORKSPACE:?}") ${SPOTEXEC_WORKSPACE:?}"`},
+		{`(cd /Users/me/repo/x && make) "/Users/me/repo"`, `(cd "${SPOTEXEC_WORKSPACE:?}"/x && make) "${SPOTEXEC_WORKSPACE:?}"`},
 	}
 	for _, c := range cases {
 		if got := rewriteRoot(c.in, root); got != c.want {

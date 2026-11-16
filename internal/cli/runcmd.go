@@ -347,10 +347,15 @@ func envAssignment(s string) (name, value string, ok bool) {
 // around it, and ${...:?} aborts rather than expanding to "" if unset.
 func rewriteRoot(s, root string) string {
 	var b strings.Builder
-	inSingle, inDouble, heredoc := false, false, false
+	// The quoting context: 0 at the top, '"' in double quotes, '(' in
+	// $(...) or a subshell, where quoting starts afresh. Single quotes nest
+	// in neither.
+	ctx := []byte{0}
+	inSingle, heredoc := false, false
 	atBoundary := true // where a path may start: not mid-word, as after My\ x
 	for i := 0; i < len(s); {
 		c := s[i]
+		inDouble := ctx[len(ctx)-1] == '"'
 		if end := matchRoot(s, i, root, !inSingle && !inDouble); end >= 0 && atBoundary && boundaryAfter(s, end) {
 			switch {
 			case inSingle:
@@ -370,7 +375,9 @@ func rewriteRoot(s, root string) string {
 			continue
 		}
 		switch {
-		case c == '\\' && !inSingle && i+1 < len(s):
+		case inSingle:
+			inSingle = c != '\''
+		case c == '\\' && i+1 < len(s):
 			b.WriteByte(c)
 			b.WriteByte(s[i+1])
 			i += 2
@@ -379,11 +386,24 @@ func rewriteRoot(s, root string) string {
 				atBoundary = false
 			}
 			continue
-		case c == '\'' && !inDouble:
-			inSingle = !inSingle
-		case c == '"' && !inSingle:
-			inDouble = !inDouble
-		case c == '<' && !inSingle && !inDouble && strings.HasPrefix(s[i:], "<<") && !strings.HasPrefix(s[i:], "<<<") && (i == 0 || s[i-1] != '<'):
+		case c == '"' && inDouble:
+			ctx = ctx[:len(ctx)-1]
+		case c == '"':
+			ctx = append(ctx, '"')
+		case c == '$' && i+1 < len(s) && s[i+1] == '(':
+			ctx = append(ctx, '(')
+			b.WriteString("$(")
+			i += 2
+			atBoundary = true
+			continue
+		case inDouble:
+		case c == '\'':
+			inSingle = true
+		case c == '(':
+			ctx = append(ctx, '(')
+		case c == ')' && len(ctx) > 1:
+			ctx = ctx[:len(ctx)-1]
+		case c == '<' && strings.HasPrefix(s[i:], "<<") && !strings.HasPrefix(s[i:], "<<<") && (i == 0 || s[i-1] != '<'):
 			heredoc = true
 		}
 		b.WriteByte(c)
@@ -721,7 +741,7 @@ func taskCommand(run string, args []string) string {
 // endOfCode returns where run's last command ends: after its last byte that
 // is not whitespace, a closing ';' or '&', or part of a comment (a '#' that
 // begins a word outside quotes, to the end of its line). Quoted strings,
-// $(...) and `...` are skipped whole. A run that is only comments, or has a
+// $(...), ${...} and `...` are skipped whole. A run that is only comments, or has a
 // here-document (whose lines are data), ends at its end: arguments are
 // appended as they always were.
 func endOfCode(run string) int {
@@ -757,6 +777,8 @@ func endOfCode(run string) int {
 			i, wordStart = closeBacktick(run, i), false
 		case c == '$' && i+1 < len(run) && run[i+1] == '(':
 			i, wordStart = closeParen(run, i+1), false
+		case c == '$' && i+1 < len(run) && run[i+1] == '{':
+			i, wordStart = closeBrace(run, i+1), false
 		case c == '<' && strings.HasPrefix(run[i:], "<<<"):
 			i, wordStart, op = i+2, true, true
 		case c == '<' && strings.HasPrefix(run[i:], "<<"):
@@ -811,14 +833,63 @@ func closeDouble(run string, i int) int {
 			j = closeBacktick(run, j)
 		case run[j] == '$' && j+1 < len(run) && run[j+1] == '(':
 			j = closeParen(run, j+1)
+		case run[j] == '$' && j+1 < len(run) && run[j+1] == '{':
+			j = closeBrace(run, j+1)
 		}
 	}
 	return len(run) - 1
 }
 
 // closeParen returns the index of the ')' matching the '(' at run[i], or the
-// last index.
+// last index. Inside case ... esac a pattern's ')' doesn't close it.
 func closeParen(run string, i int) int {
+	depth, cases := 0, 0
+	for j := i; j < len(run); j++ {
+		c := run[j]
+		if j > i && strings.IndexByte(" \t\n;&|(", run[j-1]) >= 0 {
+			switch {
+			case keywordAt(run, j, "case"):
+				cases, j = cases+1, j+3
+				continue
+			case keywordAt(run, j, "esac") && cases > 0:
+				cases, j = cases-1, j+3
+				continue
+			}
+		}
+		switch {
+		case c == '\\':
+			j++
+		case c == '\'':
+			j = closeSingle(run, j, run[j-1] == '$')
+		case c == '"':
+			j = closeDouble(run, j)
+		case c == '`':
+			j = closeBacktick(run, j)
+		case c == '$' && j+1 < len(run) && run[j+1] == '{':
+			j = closeBrace(run, j+1)
+		case c == '$' && j+1 < len(run) && run[j+1] == '(':
+			j = closeParen(run, j+1)
+		case cases > 0:
+		case c == '(':
+			depth++
+		case c == ')':
+			if depth--; depth <= 0 {
+				return j
+			}
+		}
+	}
+	return len(run) - 1
+}
+
+// keywordAt reports whether the word at run[j:] is kw.
+func keywordAt(run string, j int, kw string) bool {
+	k := j + len(kw)
+	return strings.HasPrefix(run[j:], kw) && (k == len(run) || strings.IndexByte(" \t\n;&|)", run[k]) >= 0)
+}
+
+// closeBrace returns the index of the '}' matching the '{' at run[i] (of a
+// ${...}), or the last index.
+func closeBrace(run string, i int) int {
 	depth := 0
 	for j := i; j < len(run); j++ {
 		switch c := run[j]; {
@@ -830,10 +901,12 @@ func closeParen(run string, i int) int {
 			j = closeDouble(run, j)
 		case c == '`':
 			j = closeBacktick(run, j)
-		case c == '(':
+		case c == '$' && j+1 < len(run) && run[j+1] == '(':
+			j = closeParen(run, j+1)
+		case c == '{':
 			depth++
-		case c == ')':
-			if depth--; depth == 0 {
+		case c == '}':
+			if depth--; depth <= 0 {
 				return j
 			}
 		}
