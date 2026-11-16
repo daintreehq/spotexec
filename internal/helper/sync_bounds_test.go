@@ -200,7 +200,44 @@ func TestExtractChecksTheWholeStream(t *testing.T) {
 	if err := run(bad); !errors.Is(err, gzip.ErrChecksum) {
 		t.Fatalf("bad CRC: got %v", err)
 	}
-	if err := run(archive(make([]byte, 1<<20))); err == nil || !strings.Contains(err.Error(), "after the end") {
+	// Padding after the archive is refused after a bounded read, not
+	// decompressed to its end.
+	padded := archive(make([]byte, 64<<20))
+	cr := &countingReader{r: bytes.NewReader(padded)}
+	if err := runFrom(t, cr); err == nil || !strings.Contains(err.Error(), "after the end") {
 		t.Fatalf("trailing data: got %v", err)
 	}
+	if cr.n > int64(len(padded))/2 {
+		t.Fatalf("read %d of %d compressed bytes: the padding was decompressed", cr.n, len(padded))
+	}
+	// A second gzip member is left unread (the blob drain discards it),
+	// never decompressed.
+	var second bytes.Buffer
+	zw := gzip.NewWriter(&second)
+	zw.Write(make([]byte, 1<<20))
+	zw.Close()
+	if err := run(append(archive(nil), second.Bytes()...)); err != nil {
+		t.Fatalf("second member: %v", err)
+	}
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+func runFrom(t *testing.T, r io.Reader) error {
+	s := testSession(t, t.TempDir())
+	if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	s.loadStored()
+	_, _, _, err := s.extract(r, map[string]bool{"a": true}, nil)
+	return err
 }
