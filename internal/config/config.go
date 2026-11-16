@@ -656,6 +656,12 @@ func (r *Runner) validate() error {
 			return fmt.Errorf("%s must not be negative", name)
 		}
 	}
+	if r.MaxPrice != "" {
+		// The launch filter reads an unparsable or non-positive cap as none.
+		if v, err := strconv.ParseFloat(r.MaxPrice, 64); err != nil || !(v > 0) || math.IsInf(v, 0) {
+			return fmt.Errorf("max_price must be a positive number of US dollars an hour, such as \"0.40\" (got %q)", r.MaxPrice)
+		}
+	}
 	if !r.Ephemeral() {
 		return nil
 	}
@@ -687,8 +693,9 @@ func (r *Runner) validate() error {
 	return nil
 }
 
-// MaxVolumeGB is the largest root volume a runner may ask for: the most an
-// EBS gp3 volume holds.
+// MaxVolumeGB is the largest root volume a runner may ask for (16 TiB): a
+// spotexec limit well past any build's needs, so a typo can't buy a
+// volume that bills by the terabyte.
 const MaxVolumeGB = 16384
 
 // validateTypes checks how an aws-spot runner chooses instance types.
@@ -1282,11 +1289,9 @@ func (r *Runner) withinBase(g *Runner) error {
 	if r.MaxPrice == "" {
 		return fmt.Errorf("max_price can't be removed: %s caps the Spot price at %s an hour", yours, g.MaxPrice)
 	}
-	limit, err := strconv.ParseFloat(g.MaxPrice, 64)
-	if err != nil {
-		return fmt.Errorf("max_price can't be changed: %s caps the Spot price at %q, which isn't a number", yours, g.MaxPrice)
-	}
-	if v, err := strconv.ParseFloat(r.MaxPrice, 64); err != nil || v > limit {
+	// Both parse: validate checked them.
+	limit, _ := strconv.ParseFloat(g.MaxPrice, 64)
+	if v, _ := strconv.ParseFloat(r.MaxPrice, 64); v > limit {
 		return fmt.Errorf("max_price = %q is more than %s allows (%s an hour); a project can lower it, not raise it", r.MaxPrice, yours, g.MaxPrice)
 	}
 	return nil

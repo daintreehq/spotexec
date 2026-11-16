@@ -1001,7 +1001,10 @@ func TestConfigVersion(t *testing.T) {
 // A repository may tune a fleet, never loosen what the user's own runner
 // allows: its image, its price, or how long and how many VMs bill (#152).
 func TestProjectRunnerCannotLoosenBase(t *testing.T) {
-	g, err := loadGlobalText(t, `[runners.aws]
+	g, err := loadGlobalText(t, `[runners.sim]
+type = "sim"
+max_instances = 2
+[runners.aws]
 type = "aws-spot"
 region = "us-east-1"
 max_price = "0.40"
@@ -1025,14 +1028,21 @@ region = "us-east-1"
 		"[runners.big]\nextends = \"aws\"\nidle_timeout = \"11m\"\n":          `idle_timeout`,
 		"[runners.big]\nextends = \"aws\"\nmax_lifetime = \"7h\"\n":           `max_lifetime`,
 		"[runners.big]\nextends = \"open\"\nmax_lifetime = \"13h\"\n":         `max_lifetime`,
-		"[runners.big]\nextends = \"aws\"\nvolume_gb = 1000000\n":             `volume_gb`,
+		"[runners.big]\nextends = \"aws\"\nvolume_gb = 16385\n":               `volume_gb must be between 8 and 16384`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"NaN\"\n":             `max_price must be a positive number`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"0\"\n":               `max_price must be a positive number`,
+		"[runners.big]\nextends = \"aws\"\nmax_price = \"-1\"\n":              `max_price must be a positive number`,
+		"[runners.big]\nextends = \"open\"\nmax_price = \"Inf\"\n":            `max_price must be a positive number`,
+		"[runners.big]\nextends = \"open\"\nmax_price = \"cheap\"\n":          `max_price must be a positive number`,
+		"[runners.big]\nextends_type = \"sim\"\nmax_price = \"x\"\n":          `max_price must be a positive number`,
+		"[runners.sim]\nmax_instances = 3\n":                                  `max_instances`,
 		"[runners.aws]\nmax_instances = 40\n":                                 `max_instances`,
 	} {
 		if _, err := mergeProject(t, g, body); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: want %q, got %v", body, want, err)
 		}
 	}
-	// Tightening is fine.
+	// Tightening, or matching the base, is fine.
 	c, err := mergeProject(t, g, `[runners.big]
 extends = "aws"
 max_price = "0.25"
@@ -1040,6 +1050,13 @@ max_instances = 2
 idle_timeout = "5m"
 max_lifetime = "2h"
 volume_gb = 200
+[runners.same]
+extends = "aws"
+max_price = "0.4"
+max_instances = 4
+idle_timeout = "10m"
+max_lifetime = "6h"
+volume_gb = 16384
 [runners.capped]
 extends = "open"
 max_price = "1.00"
@@ -1052,6 +1069,15 @@ max_price = "1.00"
 	}
 	if r := c.Global.Runners["capped"]; r.MaxPrice != "1.00" {
 		t.Fatalf("capped: %+v", r)
+	}
+	if r := c.Global.Runners["same"]; r.MaxPrice != "0.4" || r.MaxInstances != 4 {
+		t.Fatalf("same: %+v", r)
+	}
+	if b := g.Runners["aws"]; b.MaxPrice != "0.40" || b.MaxInstances != 4 || b.MaxLifetime.Duration != 6*time.Hour {
+		t.Fatalf("base runner must not be modified: %+v", b)
+	}
+	if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nmax_price = \"$0.40\"\n"); err == nil || !strings.Contains(err.Error(), "max_price must be a positive number") {
+		t.Errorf("global max_price: %v", err)
 	}
 }
 
@@ -1069,6 +1095,10 @@ instance_types = ["m*", "r*"]
 [runners.concrete]
 extends = "arm"
 instance_types = ["c7a.2xlarge"]
+[runners.graviton]
+extends = "arm"
+vcpus = 8
+instance_types = ["m*g*"]
 [runners.explicit]
 extends = "arm"
 vcpus = 8
@@ -1078,7 +1108,7 @@ arch = "amd64"
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, want := range map[string]string{"mem": "arm64", "concrete": "amd64", "explicit": "amd64"} {
+	for name, want := range map[string]string{"mem": "arm64", "graviton": "arm64", "concrete": "amd64", "explicit": "amd64"} {
 		if got := c.Global.Runners[name].Arch; got != want {
 			t.Errorf("%s: arch %q, want %q", name, got, want)
 		}

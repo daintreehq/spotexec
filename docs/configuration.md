@@ -121,9 +121,9 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `boot_timeout` | `15m` | Longest wait for first-boot setup; a VM that takes longer is terminated. |
 | `bootstrap_script` | (none) | Runs as root on first boot, after the watchdog is armed. Bounded by `boot_timeout`. |
 | `user_bootstrap_script` | (none) | Then runs as the login user, in a login shell. |
-| `max_price` | the on-demand price | Spot bid cap in USD per hour, as a string (`"0.40"`). |
+| `max_price` | the on-demand price | Spot bid cap in USD per hour, as a string of a positive number (`"0.40"`). |
 | `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available, trying the types in their Spot-price order. |
-| `volume_gb` | `64` | Root gp3 volume (at least 8). |
+| `volume_gb` | `64` | Root gp3 volume, from 8 to 16384. |
 | `ami` | `auto` | `auto` uses the newest matching bake, else Ubuntu 24.04. `base` ignores bakes. An `ami-…` ID pins one image. |
 | `user` | `ubuntu` | Login user of the AMI. |
 | `subnet_id`, `security_group_ids` | default VPC, a managed `spotexec-ssh` group | Network placement. |
@@ -132,7 +132,7 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 
 ## Project config: `.spotexec.toml`
 
-Every key is optional. `spotexec init` writes a starting point for npm, pnpm, yarn, bun, Go, Rust and Python projects.
+Every key is optional. `spotexec init` writes a starting point for npm, pnpm, yarn, bun, Go, Rust and Python projects. Durations (`timeout`, `grace_period`, `queue_timeout`, and the `timeout` of `[deps]`, `[setup]`, `[container]` and each task) must be positive: zero or a negative value is an error when the file loads.
 
 ```toml
 version = 1
@@ -262,7 +262,7 @@ pool = ["ci-big"]              # only this task needs the big fleet
 
 Most projects don't need one. An `exclusive` task gets a whole VM from your shared pool, while a project fleet starts its own VMs, with their own cold starts and idle timeouts, even when the pool has room. Keep project fleets for jobs that need a different machine, such as more memory per job.
 
-A project runner builds on one of your global runners. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts. It picks its base this way:
+A project runner builds on one of your global runners. It may only change sizing, scheduling and the VM's own setup: instance types, slots, instance counts, timeouts, price, volume, bootstrap scripts. It can't spend more than your runner allows: `max_instances`, `idle_timeout` and `max_lifetime` may go down but not up, and when your runner sets `max_price`, the project may lower it but not raise or remove it. Instance types that are all patterns (`["m*", "r*"]`) keep your runner's `arch`; a concrete type or `arch` sets it. It picks its base this way:
 
 - `extends = "name"` uses your runner of that name. With neither key, a project runner of the same name as one of yours overrides it.
 - `extends_type = "ssh" | "aws-spot" | "sim"` uses your runner of that type when `extends` names none you have (or one of another type). With several of that type, the first one in your `default_pool` wins.
@@ -282,4 +282,4 @@ max_slots = 2
 
 Setting `vcpus` (or another requirement key) without `instance_types` drops the inherited `instance_types`, and setting `instance_types` alone drops inherited requirements: the project's way of choosing types replaces yours. Set both to narrow the requirements with patterns.
 
-How you connect and which account and network are used stay in your global config. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `regions`, `exclude_regions`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, or open a port. See [Security model](architecture.md#security-model).
+How you connect and which account and network are used stay in your global config. So do the image your VMs boot and whether they may fall back to on-demand prices. A project setting any of these is an error: `type`, `host`, `hosts`, `ssh_options`, `identity_file`, `work_root`, `profile`, `region`, `regions`, `exclude_regions`, `subnet_id`, `security_group_ids`, `ssh_cidr`, `user`, `cache_bucket`, `ami`, `on_demand_fallback`. A cloned repository therefore can't redirect your SSH, pick a different AWS account, open a port, or boot an image without the watchdog that powers idle VMs off. See [Security model](architecture.md#security-model).
