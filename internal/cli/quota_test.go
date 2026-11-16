@@ -92,8 +92,8 @@ func TestStarterTemplateSizing(t *testing.T) {
 	if provider.VCPUsOf(small.InstanceTypes[0]) != 4 || small.MaxSlots != 2 || small.MaxInstances != big.MaxInstances {
 		t.Fatalf("sized runner: %v slots %d max %d", small.InstanceTypes, small.MaxSlots, small.MaxInstances)
 	}
-	if fits := quotaFits([]*config.Runner{small}, nil, map[string]float64{"us-east-2": 5}); len(fits) != 1 || fits[0].Blocked() || !fits[0].Limited() {
-		t.Fatalf("a 5-vCPU quota should fit one 4-vCPU VM: %+v", fits)
+	if fits := quotaFits([]*config.Runner{small}, nil, map[string]float64{"us-east-2": 5}); len(fits) != 1 || fits[0].Blocked() || fits[0].Limited() || !fits[0].Uncapped {
+		t.Fatalf("a 5-vCPU quota should fit one 4-vCPU VM, and limit the uncapped starter fleet: %+v", fits)
 	}
 	// Edited since: left alone.
 	if ok, _ := sizeStarterFleet(p); ok {
@@ -154,6 +154,24 @@ func TestReportQuotas(t *testing.T) {
 	}
 	if requested != 0 {
 		t.Fatal("requested without asking")
+	}
+	// Without max_instances the quota is the limit: a note, no command,
+	// unless a capped fleet in the same region wants more.
+	b.Reset()
+	uncapped := provider.QuotaFit{Region: "us-east-2", Quota: 16, OneVM: 4, Uncapped: true}
+	mixed := provider.QuotaFit{Region: "eu-west-1", Quota: 16, OneVM: 4, Fleet: 32, Uncapped: true}
+	reportQuotas(&b, []provider.QuotaFit{uncapped, mixed}, nil, req)
+	out = b.String()
+	for _, w := range []string{
+		"✓ Spot vCPU quota in us-east-2: 16 (with no max_instances, this is what limits how many VMs run at once)",
+		"✓ Spot vCPU quota in eu-west-1: 16. Note: your runners there may use up to 32",
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("output lacks %q:\n%s", w, out)
+		}
+	}
+	if strings.Contains(out, "--region us-east-2") {
+		t.Errorf("an uncapped fleet needs no increase command:\n%s", out)
 	}
 	// Offered for the blocker only, and done when accepted.
 	asked := 0

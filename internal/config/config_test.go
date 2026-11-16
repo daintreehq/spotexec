@@ -1122,7 +1122,7 @@ region = "us-east-1"
 		"[runners.big]\nextends = \"open\"\nmax_price = \"Inf\"\n":            `max_price must be a positive number`,
 		"[runners.big]\nextends = \"open\"\nmax_price = \"cheap\"\n":          `"runners.big.max_price"): invalid amount "cheap"`,
 		"[runners.big]\nextends_type = \"sim\"\nmax_price = \"x\"\n":          `"runners.big.max_price"): invalid amount "x"`,
-		"[runners.big]\nextends = \"aws\"\nmax_instances = -1\n":              `max_instances must be >= 1`,
+		"[runners.big]\nextends = \"aws\"\nmax_instances = -1\n":              `max_instances must be at least 1 (leave it unset for no ceiling)`,
 	} {
 		if _, _, err := merge(body); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: want %q, got %v", body, want, err)
@@ -1152,8 +1152,14 @@ region = "us-east-1"
 		// What the project leaves unset comes from the base.
 		{"inherit", "[runners.aws]\nmax_instances = 12\n",
 			limits{12, 10 * time.Minute, 6 * time.Hour, 0.40}},
+		{"inherit ceiling", "[runners.big]\nextends = \"aws\"\nidle_timeout = \"1h\"\n",
+			limits{4, time.Hour, 6 * time.Hour, 0.40}},
+		// An explicit 0 removes the base's ceiling.
+		{"uncap", "[runners.big]\nextends = \"aws\"\nmax_instances = 0\n",
+			limits{0, 10 * time.Minute, 6 * time.Hour, 0.40}},
+		// The open base has no ceiling, so neither does the project fleet.
 		{"inherit defaults", "[runners.big]\nextends = \"open\"\nmax_lifetime = \"13h\"\nmax_price = \"1.00\"\n",
-			limits{4, 10 * time.Minute, 13 * time.Hour, 1.00}},
+			limits{0, 10 * time.Minute, 13 * time.Hour, 1.00}},
 		{"sim", "[runners.big]\nextends_type = \"sim\"\nmax_instances = 3\nidle_timeout = \"11m\"\nmax_lifetime = \"3h\"\n",
 			limits{3, 11 * time.Minute, 3 * time.Hour, 0}},
 	} {
@@ -1316,5 +1322,23 @@ func TestProjectDurationsAndTaskPools(t *testing.T) {
 	// A task pool naming a fleet this user can't back loads, like a project pool.
 	if _, err := mergeProject(t, g, "[runners.big]\nextends = \"aws\"\n[tasks.a]\nrun = \"x\"\npool = [\"big\"]\n"); err != nil {
 		t.Errorf("unavailable fleet in a task pool: %v", err)
+	}
+}
+
+// A fleet has no ceiling unless max_instances sets one: it grows with
+// demand, up to the account's Spot quota.
+func TestMaxInstancesUnsetMeansNoCeiling(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nmin_instances = 3\n[runners.capped]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nmax_instances = 2\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := g.Runners["aws"]; r.Capped() || r.MaxInstances != 0 || !r.BelowMax(1000) {
+		t.Fatalf("unset max_instances must mean no ceiling: %+v", r)
+	}
+	if r := g.Runners["capped"]; !r.Capped() || !r.BelowMax(1) || r.BelowMax(2) {
+		t.Fatalf("max_instances = 2: %+v", r)
+	}
+	if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nmax_instances = 2\nmin_instances = 3\n"); err == nil || !strings.Contains(err.Error(), "min_instances must be between 0 and max_instances") {
+		t.Errorf("min above a ceiling: %v", err)
 	}
 }

@@ -146,7 +146,11 @@ func cmdDaemon() *cobra.Command {
 				return nil
 			}
 			for _, f := range st.Fleets {
-				fmt.Printf("\n%s: %d instance(s) (min %d, max %d), %d queued, %d launching\n", f.Runner, len(f.Instances), f.Min, f.Max, f.Demand, f.Launching)
+				max := "no max"
+				if f.Max > 0 {
+					max = fmt.Sprintf("max %d", f.Max)
+				}
+				fmt.Printf("\n%s: %d instance(s) (min %d, %s), %d queued, %d launching\n", f.Runner, len(f.Instances), f.Min, max, f.Demand, f.Launching)
 				for _, in := range f.Instances {
 					tags := ""
 					if in.Warm {

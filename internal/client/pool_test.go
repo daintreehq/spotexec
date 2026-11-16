@@ -557,3 +557,46 @@ func TestWaitLaunchesCoversLaunchedEvent(t *testing.T) {
 		t.Fatal("WaitLaunches never returned")
 	}
 }
+
+// Without max_instances, demand alone decides how many VMs launch; with
+// it, launches stop at the ceiling.
+func TestUncappedFleetLaunchesForDemand(t *testing.T) {
+	ctx := context.Background()
+	launches := func(p *Pool) (int, LaunchDecision) {
+		t.Helper()
+		w, err := p.Register(20) // 10 VMs' worth of 2-slot demand
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Done()
+		n := 0
+		for {
+			d, err := p.Plan(ctx, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d.Launch {
+				return n, d
+			}
+			if n++; n > 50 {
+				t.Fatal("launches never stop")
+			}
+		}
+	}
+	p, _ := testPool(t, 0)
+	if n, d := launches(p); n != 10 || d.Reason != "waiting for instances being launched" {
+		t.Fatalf("uncapped: %d launches, then %+v", n, d)
+	}
+	p, _ = testPool(t, 4)
+	if n, d := launches(p); n != 4 || d.Reason != "at max_instances (4)" {
+		t.Fatalf("capped: %d launches, then %+v", n, d)
+	}
+
+	p, _ = testPool(t, 0)
+	if ids, err := p.EnsureMin(ctx, 12); err != nil || len(ids) != 12 {
+		t.Fatalf("EnsureMin without a ceiling: %d %v", len(ids), err)
+	}
+	if ids, err := p.Reserve(ctx, 20); err != nil || len(ids) != 20 {
+		t.Fatalf("Reserve without a ceiling: %d %v", len(ids), err)
+	}
+}

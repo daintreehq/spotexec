@@ -205,7 +205,7 @@ type Runner struct {
 	WaitCost             Dollars  `toml:"wait_cost"`    // USD an hour of waiting is worth against the Spot bill (run_cost); default DefaultWaitCost
 
 	// fleets (aws-spot, sim)
-	MaxInstances int `toml:"max_instances"`
+	MaxInstances int `toml:"max_instances"` // fleet ceiling; 0 (the default): none, the Spot quota is the only limit
 	MinInstances int `toml:"min_instances"` // kept warm by `spotexec daemon` (default 0)
 
 	// sim
@@ -294,6 +294,14 @@ func MatchType(pattern, t string) bool {
 
 // Ephemeral reports whether the runner is provisioned on demand.
 func (r *Runner) Ephemeral() bool { return r.Type == TypeAWSSpot || r.Type == TypeSim }
+
+// Capped reports whether the fleet has a max_instances ceiling. Without
+// one it grows with demand, limited only by the account's Spot quota.
+func (r *Runner) Capped() bool { return r.MaxInstances > 0 }
+
+// BelowMax reports whether a fleet of n VMs may launch another: always,
+// without a ceiling.
+func (r *Runner) BelowMax(n int) bool { return !r.Capped() || n < r.MaxInstances }
 
 // Global is ~/.config/spotexec/config.toml.
 type Global struct {
@@ -672,13 +680,10 @@ func (r *Runner) applyDefaults() error {
 		return fmt.Errorf("unsupported type %q (supported: ssh, aws-spot, sim)", r.Type)
 	}
 	if r.Ephemeral() {
-		if r.MaxInstances == 0 {
-			r.MaxInstances = 4
-		}
 		if r.MaxInstances < 0 {
-			return errors.New("max_instances must be >= 1")
+			return errors.New("max_instances must be at least 1 (leave it unset for no ceiling)")
 		}
-		if r.MinInstances < 0 || r.MinInstances > r.MaxInstances {
+		if r.MinInstances < 0 || (r.Capped() && r.MinInstances > r.MaxInstances) {
 			return errors.New("min_instances must be between 0 and max_instances")
 		}
 	}

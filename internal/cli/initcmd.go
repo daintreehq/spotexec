@@ -25,9 +25,9 @@ const globalTemplate = `# spotexec global runner config (personal; never committ
 # Reference: https://github.com/daintreehq/spotexec/blob/main/docs/configuration.md
 version = 1
 
-# Runners are tried in priority order (lowest first). A fleet grows (up to
-# max_instances) when every slot is busy, and each VM terminates itself
-# after idle_timeout.
+# Runners are tried in priority order (lowest first). A fleet grows when
+# every slot is busy (up to max_instances, if you set one), and each VM
+# terminates itself after idle_timeout.
 default_pool = ["aws"]
 
 # Never silently fall back to running on this laptop.
@@ -42,7 +42,7 @@ instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]  # 8 vCPUs; each 
 # vcpus = 8                    # exact, so every VM gets the same slots
 # min_memory_gib = 16
 max_slots = 4                  # concurrent jobs per VM (SPOTEXEC_CPUS = 2 each)
-max_instances = 4              # fleet ceiling
+# max_instances = 4            # fleet ceiling; unset, the fleet grows with demand up to your Spot quota
 priority = 20
 idle_timeout = "10m"           # the VM terminates itself after this much idle time (15m suits long agent pauses)
 max_lifetime = "12h"           # hard cap regardless of activity

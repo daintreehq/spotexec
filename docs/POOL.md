@@ -1,7 +1,8 @@
 # Spot worker pools: design
 
 A pool runner (`type = "aws-spot"`, or `type = "sim"` for local testing) is a
-fleet of 0 to `max_instances` identical VMs. Each VM offers `max_slots`
+fleet of identical VMs: from 0 up to `max_instances`, or with that unset,
+as many as demand and the account's Spot vCPU quota allow. Each VM offers `max_slots`
 concurrent job slots. Nothing runs outside the VMs: every `sx` invocation
 takes part in scheduling, and every VM shuts itself down.
 
@@ -55,12 +56,12 @@ takes part in scheduling, and every VM shuts itself down.
    a fair local queue (priority, then arrival; `queue.go`) and registers as
    demand on each fleet (a waiter file under `waiters/`). Under `pool.lock`,
    `Plan` launches only while waiting demand exceeds the capacity already
-   starting (the launch ledger in `pool.json`), up to `max_instances`.
+   starting (the launch ledger in `pool.json`), up to `max_instances` when set.
    - Lower-priority fleets only launch for demand the higher-priority ones
      can't cover.
    - Draining and outdated VMs don't count toward `max_instances`, but
-     launches pause while twice `max_instances` VMs are alive, until some
-     end; the wait reason counts the draining and outdated VMs holding them.
+     with one set, launches pause while twice `max_instances` VMs are
+     alive, until some end; the wait reason counts the draining and outdated VMs holding them.
    - Ledger entries record the launching PID, so a dead `sx` frees its
      reservation; an ambiguous launch (the request may have created an
      instance) keeps its reservation until listings can show it.

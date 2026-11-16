@@ -23,13 +23,13 @@ aws login                      # or aws sso login / aws configure: an identity t
 spotexec setup
 ```
 
-1. **Runner config.** If `~/.config/spotexec/config.toml` doesn't exist, setup writes a starting one with a single `aws` runner (up to four 8-vCPU Spot VMs, 4 slots each) in the region of the AWS profile it signs in with (`AWS_REGION` or `AWS_DEFAULT_REGION`, else that profile's `region` in `~/.aws/config`, else `us-east-1`), and says which it picked. An existing config is left as it is.
+1. **Runner config.** If `~/.config/spotexec/config.toml` doesn't exist, setup writes a starting one with a single `aws` runner (8-vCPU Spot VMs, 4 slots each, with no `max_instances` ceiling: the fleet grows with demand, up to your Spot quota) in the region of the AWS profile it signs in with (`AWS_REGION` or `AWS_DEFAULT_REGION`, else that profile's `region` in `~/.aws/config`, else `us-east-1`), and says which it picked. An existing config is left as it is.
 2. **AWS access**, for each `aws-spot` runner. Setup shows what it's about to do and asks before changing anything, then:
    - creates an IAM user for this machine, `spotexec-<hostname>` (path `/spotexec/`), with only [spotexec's permissions](aws.md#3-grant-permissions) as an inline policy. The user is tagged with this machine's permanent ID, so two Macs that share a hostname each get their own user (the second gets a suffix), and a machine whose hostname changes keeps its user. A `spotexec` profile copied from another machine (a synced `~/.aws`) is replaced with this machine's own user and key, leaving the other machine's key alone, unless you name that user with `--user`. That takes an administrator's sign-in; without one, setup stops and says so. (A key whose policy predates this check can't read its own user, so then only a run with an administrator's sign-in can tell.) If the profile signs in to a different AWS account from your admin session, setup stops before changing anything;
    - creates an access key for that user and saves it as the AWS CLI profile `spotexec` (`~/.aws/credentials`, mode 600, with the region in `~/.aws/config`). It waits until the key works and checks that nothing else in `~/.aws` overrides it, then deletes any older keys the user has;
    - sets `profile = "spotexec"` on your AWS runners;
    - prepares the account: it creates the EC2 Spot service-linked role and, if the runner's region has no default VPC (common in older accounts), the default VPC. That's AWS's standard network and costs nothing; `--no-vpc` skips it;
-   - checks your Spot vCPU quota. New accounts get about 5 vCPUs, too few for one of the starter config's 8-vCPU VMs, so a starter config setup has just written switches to 4-vCPU VMs (`c7a.xlarge`…, 2 slots each) instead, keeping `max_instances`. A config that already existed is never resized. If the quota can't fit even one VM, setup says so, prints the command to raise it and, in a terminal, offers to request the increase with your AWS sign-in. If it only limits how many VMs run at once, setup notes that and prints the command. spotexec never falls back to on-demand instances unless you set `on_demand_fallback`.
+   - checks your Spot vCPU quota. New accounts get about 5 vCPUs, too few for one of the starter config's 8-vCPU VMs, so a starter config setup has just written switches to 4-vCPU VMs (`c7a.xlarge`…, 2 slots each) instead. A config that already existed is never resized. If the quota can't fit even one VM, setup says so, prints the command to raise it and, in a terminal, offers to request the increase with your AWS sign-in. If it only holds a fleet below its `max_instances`, setup notes that and prints the command; for a fleet without `max_instances`, it notes that the quota is what limits how many VMs run at once. spotexec never falls back to on-demand instances unless you set `on_demand_fallback`.
 
    With runners in several regions, the network and quota checks cover each region.
 3. **The Claude Code hook (opt-in).** If Claude Code is on this machine, setup asks whether to install its hook for all your projects, which rewrites agents' heavy commands to run on your runners (see [coding agents](agents.md#claude-code-hook)). The answer defaults to no, and `--yes` alone, or a run without a terminal, leaves it out: without the hook, agents and you run commands on the fleet with `sx`. `--hooks` installs it without asking. The hook only acts in projects with a `.spotexec.toml`. An installed hook is kept up to date (a v0.2.0 `sx hook claude` entry is rewritten, and RTK's hook chained behind it) unless you pass `--no-hooks`, which also skips the question.
@@ -59,8 +59,7 @@ Continue? [Y/n]
 ✓ AWS profile spotexec → arn:aws:iam::123456789012:user/spotexec/spotexec-studio-02 (key AKIA…; it doesn't expire)
 ✓ set profile = "spotexec" on aws in /Users/me/.config/spotexec/config.toml
 ✓ sized the starter fleet to the Spot quota in us-east-2 (5 vCPUs): 4-vCPU VMs instead of 8-vCPU ones
-✓ Spot vCPU quota in us-east-2: 5. Note: your runners there may use up to 16, so fewer VMs run at once until it's raised:
-  aws service-quotas request-service-quota-increase --region us-east-2 --service-code ec2 --quota-code L-34B43A08 --desired-value 16
+✓ Spot vCPU quota in us-east-2: 5 (with no max_instances, this is what limits how many VMs run at once)
 ```
 
 Setup ends by saying what's next: in each repository, `spotexec init`, then `sx <command>`. When `init` detects the project's toolchain, it also writes a pinned [project container](environments.md#project-containers), since the VMs boot plain Ubuntu (unless every runner is an SSH machine, or you pass `--no-container`); the first `sx` builds it. `spotexec doctor` checks everything end to end.
@@ -95,7 +94,7 @@ profile = "spotexec"   # set by `spotexec setup`
 region = "us-east-2"   # always set it: the AWS profile's region is not used
 instance_types = ["c7a.2xlarge", "m7a.2xlarge", "c6a.2xlarge"]   # 8 vCPUs; each VM gets the cheapest with Spot capacity
 max_slots = 4          # concurrent jobs per VM
-max_instances = 4      # fleet ceiling
+# max_instances = 4    # fleet ceiling; unset, the fleet grows with demand up to your Spot quota
 idle_timeout = "10m"   # the VM powers itself off after this long without work
 ```
 

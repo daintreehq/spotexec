@@ -488,7 +488,7 @@ type LaunchDecision struct {
 // Plan decides, under the pool lock, whether this process should launch one
 // more instance: only if waiting demand (minus `covered`, the capacity that
 // higher-priority fleets are already launching) exceeds the capacity this
-// fleet is launching, and the fleet is below max_instances.
+// fleet is launching, and the fleet is below max_instances (when it has one).
 func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
@@ -556,9 +556,9 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = "demand covered by higher-priority runners"
 		case d.Demand <= d.Capacity:
 			d.Reason = "waiting for instances being launched"
-		case usable >= p.R.MaxInstances:
+		case !p.R.BelowMax(usable):
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
-		case total >= 2*p.R.MaxInstances:
+		case p.R.Capped() && total >= 2*p.R.MaxInstances:
 			d.Reason = liveCapReason(st, p.R.MaxInstances)
 		case d.QuotaErr != "":
 			d.Reason = blockedReason(st.QuotaPrice)
@@ -612,7 +612,7 @@ func liveCapReason(st *poolState, maxInstances int) string {
 }
 
 // Reserve records up to n launches regardless of waiting demand (spotexec
-// up), still respecting max_instances. It returns the launch IDs.
+// up), still respecting max_instances (when set). It returns the launch IDs.
 func (p *Pool) Reserve(ctx context.Context, n int) ([]string, error) {
 	var ids []string
 	err := p.withCtx(ctx, func(st *poolState) error {
@@ -632,7 +632,7 @@ func (p *Pool) Reserve(ctx context.Context, n int) ([]string, error) {
 				usable++
 			}
 		}
-		for i := 0; i < n && usable < p.R.MaxInstances; i++ {
+		for i := 0; i < n && p.R.BelowMax(usable); i++ {
 			var b [6]byte
 			_, _ = rand.Read(b[:])
 			id := hex.EncodeToString(b[:])
@@ -670,7 +670,7 @@ func (p *Pool) EnsureMin(ctx context.Context, min int) ([]string, error) {
 				total++
 			}
 		}
-		if time.Now().Before(st.BackoffUntil) || total >= 2*p.R.MaxInstances || st.quotaBlocked(time.Time{}) != "" {
+		if time.Now().Before(st.BackoffUntil) || (p.R.Capped() && total >= 2*p.R.MaxInstances) || st.quotaBlocked(time.Time{}) != "" {
 			return nil
 		}
 		for _, n := range st.Notes {
@@ -678,7 +678,7 @@ func (p *Pool) EnsureMin(ctx context.Context, min int) ([]string, error) {
 				return nil // the setup is broken: don't warm more of it
 			}
 		}
-		for usable < min && usable < p.R.MaxInstances && total < 2*p.R.MaxInstances {
+		for usable < min && p.R.BelowMax(usable) && !(p.R.Capped() && total >= 2*p.R.MaxInstances) {
 			var b [6]byte
 			_, _ = rand.Read(b[:])
 			id := hex.EncodeToString(b[:])

@@ -420,11 +420,20 @@ func TestDoctorQuotaFinding(t *testing.T) {
 	if !c.OK || strings.Contains(c.Msg, "request-service-quota-increase") {
 		t.Fatalf("fine: %+v", c)
 	}
+	// No max_instances: the quota is the limit, which is not a problem.
+	c = quotaFinding(QuotaFit{Region: "us-east-2", Quota: 16, OneVM: 8, Uncapped: true})
+	if !c.OK || !strings.Contains(c.Msg, "with no max_instances, this quota is what limits") || strings.Contains(c.Msg, "request-service-quota-increase") {
+		t.Fatalf("uncapped: %+v", c)
+	}
 	// Through the provider: a 4-vCPU fleet on a new account's 5 vCPUs.
 	a := (&fakeAWS{quota: 5}).server(t)
 	a.r.InstanceTypes = []string{"c7a.xlarge"}
 	if c, ok := a.quotaCheck(context.Background()); !ok || !c.OK {
 		t.Fatalf("one 4-vCPU VM fits 5 vCPUs: %+v", c)
+	}
+	a.r.MaxInstances = 0
+	if c, ok := a.quotaCheck(context.Background()); !ok || !c.OK || !strings.Contains(c.Msg, "with no max_instances") {
+		t.Fatalf("uncapped runner: %+v", c)
 	}
 	a.r.InstanceTypes = []string{"g5.xlarge"}
 	if _, ok := a.quotaCheck(context.Background()); ok {

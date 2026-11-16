@@ -160,6 +160,7 @@ func quotaFits(runners []*config.Runner, launches map[string][]string, quotas ma
 			}
 			f.OneVM = min(f.OneVM, one)
 			f.Fleet += r.MaxInstances * provider.VMVCPUs(r)
+			f.Uncapped = f.Uncapped || !r.Capped()
 		}
 	}
 	out := make([]provider.QuotaFit, 0, len(order))
@@ -194,6 +195,8 @@ func reportQuotas(w io.Writer, fits []provider.QuotaFit, ask func(provider.Quota
 		case f.Limited():
 			fmt.Fprintf(w, "✓ Spot vCPU quota in %s: %d. Note: your runners there may use up to %d, so fewer VMs run at once until it's raised:\n", f.Region, f.Quota, f.Fleet)
 			fmt.Fprintf(w, "  %s\n", f.Command())
+		case f.Uncapped:
+			fmt.Fprintf(w, "✓ Spot vCPU quota in %s: %d (with no max_instances, this is what limits how many VMs run at once)\n", f.Region, f.Quota)
 		default:
 			fmt.Fprintf(w, "✓ Spot vCPU quota in %s: %d (runners need up to %d)\n", f.Region, f.Quota, f.Fleet)
 		}

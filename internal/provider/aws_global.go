@@ -1783,8 +1783,12 @@ func (g *AWSGlobal) Doctor(ctx context.Context) []Check {
 			out = append(out, Check{Name: "network " + rg, OK: true, Msg: "default VPC " + vpc})
 		}
 		if q, err := a.spotQuota(ctx); err == nil {
+			fleet := "no max_instances, so the quota is what limits the fleet"
+			if g.r.Capped() {
+				fleet = fmt.Sprintf("the fleet may use up to %d across all regions", g.r.MaxInstances*need)
+			}
 			out = append(out, Check{Name: "spot vCPU quota " + rg, OK: q >= need,
-				Msg: fmt.Sprintf("%d vCPUs (one %s needs %d; the fleet may use up to %d across all regions)", q, best.Type, need, g.r.MaxInstances*need)})
+				Msg: fmt.Sprintf("%d vCPUs (one %s needs %d; %s)", q, best.Type, need, fleet)})
 		}
 	}
 	out = append(out, Check{Name: "console", OK: true, Msg: fmt.Sprintf("instances can appear in any of these regions; filter by tag %s=%s (`spotexec status` shows each one's region)", tagRunner, g.r.Name)})

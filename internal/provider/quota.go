@@ -304,6 +304,9 @@ type QuotaFit struct {
 	Quota  int // vCPUs
 	OneVM  int // the smallest launch
 	Fleet  int // every fleet at max_instances
+	// Uncapped: a runner there has no max_instances, so the quota alone
+	// limits how many VMs run at once (Fleet counts only the capped ones).
+	Uncapped bool
 	// Others: the runners can also launch types outside the standard
 	// families, which have quotas of their own.
 	Others bool
@@ -312,7 +315,9 @@ type QuotaFit struct {
 // Blocked: not even one VM can launch.
 func (f QuotaFit) Blocked() bool { return f.Quota < f.OneVM }
 
-// Limited: fewer VMs than max_instances can run at once.
+// Limited: fewer VMs than max_instances can run at once. Fleet counts only
+// the capped fleets: one without max_instances is always limited by the
+// quota, which is not news.
 func (f QuotaFit) Limited() bool { return f.Quota < f.Fleet }
 
 // Desired is the quota to ask for: room for every fleet at max_instances.
@@ -374,7 +379,7 @@ func (a *AWSSpot) quotaCheck(ctx context.Context) (Check, bool) {
 		return Check{}, false
 	}
 	return quotaFinding(QuotaFit{Region: a.r.Region, Quota: q, OneVM: one, Fleet: a.r.MaxInstances * VMVCPUs(a.r),
-		Others: HasOtherFamiliesFor(a.r)}), true
+		Uncapped: !a.r.Capped(), Others: HasOtherFamiliesFor(a.r)}), true
 }
 
 // HasOtherFamilies reports instance types outside the standard families.
@@ -396,6 +401,8 @@ func quotaFinding(f QuotaFit) Check {
 		c.Msg = fmt.Sprintf("%d vCPUs for standard Spot instances in %s: not enough for one VM (%d vCPUs), so nothing can launch. Raise it (as an AWS administrator): %s", f.Quota, f.Region, f.OneVM, f.Command())
 	case f.Limited():
 		c.Msg = fmt.Sprintf("%d vCPUs for standard Spot instances in %s: fewer VMs run at once than max_instances allows (up to %d vCPUs). To run them all at once (as an AWS administrator): %s", f.Quota, f.Region, f.Fleet, f.Command())
+	case f.Uncapped:
+		c.Msg = fmt.Sprintf("%d vCPUs for standard Spot instances in %s; with no max_instances, this quota is what limits how many VMs run at once", f.Quota, f.Region)
 	default:
 		c.Msg = fmt.Sprintf("%d vCPUs for standard Spot instances in %s; this runner may use up to %d", f.Quota, f.Region, f.Fleet)
 	}

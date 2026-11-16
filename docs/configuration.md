@@ -114,7 +114,7 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `launch_order` | `run_cost` | How launches rank the options. `run_cost`: by the expected cost of an hour of work, the Spot price plus the waiting (at `wait_cost`) that a slower generation (`vcpus` runners), a cold region or a farther region (several regions) adds; a runner in one region with a fixed list ranks by price, as with `cheapest`. `cheapest`: the Spot price alone. `listed`: `instance_types` in the listed order, each in its cheapest zone first. See [Rank by the cost of the run](aws.md#rank-by-the-cost-of-the-run). |
 | `wait_cost` | `1` | With `launch_order = "run_cost"`: what an hour of waiting for results is worth, in USD, against the Spot bill. `0` counts only the bill; higher values favor warm regions and faster types more. A number or a string (`"1.50"`). |
 | `arch` | from the first instance type that isn't a pattern, else `amd64` | `amd64` or `arm64` (Graviton). |
-| `max_instances` | `4` | Fleet ceiling, not a target: past it, runs queue for a free slot instead of launching more VMs. Every VM pays a cold start and then its `idle_timeout`, so set it to the most VMs you're willing to pay for at once. See [A few warm VMs](scaling.md#a-few-warm-vms). |
+| `max_instances` | none | Fleet ceiling, not a target: past it, runs queue for a free slot instead of launching more VMs. Unset (or `0`), the fleet grows with demand, limited only by the account's Spot vCPU quota. Every VM pays a cold start and then its `idle_timeout`, so to bound the bill, set it to the most VMs you're willing to pay for at once. See [A few warm VMs](scaling.md#a-few-warm-vms). |
 | `min_instances` | `0` | Warm floor, kept only while the [pool manager](scaling.md#pool-manager-optional) runs. |
 | `idle_timeout` | `10m` | The VM powers off after this long with no work, and bills until then. |
 | `max_lifetime` | `12h` | Hard cap, regardless of activity. Must exceed `boot_timeout`. New runs stop going to a VM 15 minutes before it (a quarter of a shorter lifetime). |
@@ -226,7 +226,7 @@ Ignored outputs from earlier runs stay in a slot, so a setup that builds into `d
 | `pool`, `priority` | Send this task to a different fleet, or move it ahead in the queue. |
 | `setup` | `false` skips the project's [`[setup]`](#setup) for this task (on a parallel task, for each of its parts). |
 
-A sharded task splits one command into parts, for test runners that take a shard option. Each part needs a slot, and parts beyond the free slots launch VMs, up to `max_instances`, each paying a cold start and then its idle timeout. For most suites, one `exclusive` run on a warm VM costs less; shard a suite when it is long enough to be worth it (see [when sharding pays](scaling.md#when-sharding-pays)):
+A sharded task splits one command into parts, for test runners that take a shard option. Each part needs a slot, and parts beyond the free slots launch VMs, up to `max_instances` when set, each paying a cold start and then its idle timeout. For most suites, one `exclusive` run on a warm VM costs less; shard a suite when it is long enough to be worth it (see [when sharding pays](scaling.md#when-sharding-pays)):
 
 ```toml
 [tasks.test-all]

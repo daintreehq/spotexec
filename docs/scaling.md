@@ -15,7 +15,7 @@ A warm VM pays neither. The next command sends only the files that changed and s
 
 ### Queueing is the normal path
 
-`max_instances` is a ceiling, not a target. When every slot is busy, a run registers demand and the fleet launches VMs for it, up to `max_instances`. Past that, runs wait in a fair queue and take the next slot that frees up. With a few VMs shared by several agents, that is expected, not a sign that the pool is too small.
+`max_instances` is a ceiling, not a target. When every slot is busy, a run registers demand and the fleet launches VMs for it, up to `max_instances` when you set one (without it, up to what the account's Spot vCPU quota allows). Past that, runs wait in a fair queue and take the next slot that frees up. With a few VMs shared by several agents, that is expected, not a sign that the pool is too small.
 
 Set `max_instances` to the most VMs you're willing to pay for at once, not to the most parts you might run at once. Size `queue_timeout` (10 minutes by default) for the longest task a run might wait behind: a run that waits longer fails with `QUEUE_TIMEOUT`.
 
@@ -71,7 +71,7 @@ Every `sx` process schedules for itself, against shared local state:
 
 - **Placement.** Runners are tried in `priority` order, lowest first, whether they are `ssh` machines or fleets. On a fleet, a job takes a free slot on the **oldest** instance that has one. Packing work onto old VMs lets the newest ones go idle and scale in, with no coordinator. The exception is a warm VM: if a worktree's last run got its files synced less than 10 minutes ago, the worktree's next run tries that run's VM first, since its slot still holds the worktree's files and build caches. After that, work consolidates onto the oldest VMs again. A VM close to its `max_lifetime` takes no new runs at all (see *Retiring* below).
 - **Queueing.** When every slot is busy, the job takes a ticket in a fair local queue: priority first, then arrival. Spinners show `queued #3 of 9`, and agents get `queue_position` events.
-- **Scaling out.** A queued job registers demand, and the fleet launches while waiting demand exceeds the capacity already booting, up to `max_instances`. Lower-priority fleets only launch for demand the higher-priority ones can't cover. A failed launch backs the fleet off for 20s. A launch the account's vCPU quota refuses is different: the fleet stops launching and runs queue for its running VMs until one ends (or five minutes pass), and with no VM running the run fails at once with the command to raise the quota.
+- **Scaling out.** A queued job registers demand, and the fleet launches while waiting demand exceeds the capacity already booting, up to `max_instances` when set. Lower-priority fleets only launch for demand the higher-priority ones can't cover. A failed launch backs the fleet off for 20s. A launch the account's vCPU quota refuses is different: the fleet stops launching and runs queue for its running VMs until one ends (or five minutes pass), and with no VM running the run fails at once with the command to raise the quota.
 - **Memory.** Each job's fair share of the VM's memory is `$SPOTEXEC_MEMORY` MiB, after a reserve for the runner itself; size heaps and worker counts from it. In project containers on spotexec's VMs, jobs sharing a VM are capped together at the VM's memory less the reserve, so they can burst, and if one spikes past what's left, it is OOM-killed (`OOM_KILLED`) instead of exhausting the VM for every slot. Give memory-hungry jobs `--exclusive` or a fleet with fewer `max_slots`. A VM that stops answering while EC2 still reports it running gets 3 more minutes before its runs are given up on, and a run lost on a VM that was out of memory, or still running after the command was handed to it, isn't replayed elsewhere, unless the VM announced it was going away (a Spot notice, or the helper reporting its shutdown).
 - **Scaling in.** Each VM powers itself off after `idle_timeout`. Nothing has to tell it to.
 - **Retiring.** A VM stops taking new runs 15 minutes before its `max_lifetime` (a quarter of a shorter one), so the hard cap never interrupts a run that started after that point. Runs already on it carry on; longer ones can still meet the cap.
@@ -83,7 +83,7 @@ Every `sx` process schedules for itself, against shared local state:
   pytest -n $SPOTEXEC_CPUS
   go test -p $SPOTEXEC_CPUS ./...
   ```
-- **Sharding.** A [sharded task](configuration.md#tasks) with `shards = 8` queues eight parts at once, so the fleet launches VMs for them like any other demand, up to `max_instances`, and each part runs its `--shard={shard}/{shards}` slice. Read [when sharding pays](#when-sharding-pays) before reaching for it.
+- **Sharding.** A [sharded task](configuration.md#tasks) with `shards = 8` queues eight parts at once, so the fleet launches VMs for them like any other demand, up to `max_instances` when set, and each part runs its `--shard={shard}/{shards}` slice. Read [when sharding pays](#when-sharding-pays) before reaching for it.
 
 ### Several machines, one Spot quota
 
