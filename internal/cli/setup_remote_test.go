@@ -894,6 +894,22 @@ func TestSetupClaudeHookOptIn(t *testing.T) {
 	if !hooks.HasClaude(settings) || !strings.Contains(out, "✓ Claude Code hook in") {
 		t.Fatalf("output:\n%s", out)
 	}
+	// A hook left calling spotexec where an old install put it is updated
+	// to call this one.
+	stale := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/gone/bin/spotexec hook claude","timeout":10}]}]}}`
+	if err := os.WriteFile(settings, []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() {
+		// A refresh is no opt-in to pass on.
+		if in, declined := setupClaudeHook(true, false, false); in || declined {
+			t.Errorf("refresh: %v, %v", in, declined)
+		}
+	})
+	want := `"command": "` + transportQuote(hookBinary()) + ` hook claude"`
+	if got := readFile(settings); !strings.Contains(got, want) || !strings.Contains(out, "✓ updated the Claude Code hook") {
+		t.Fatalf("want %s:\n%s\n%s", want, got, out)
+	}
 }
 
 func readFile(p string) string { b, _ := os.ReadFile(p); return string(b) }

@@ -40,17 +40,22 @@ func TestUnwrapRTK(t *testing.T) {
 
 func TestWrapRTK(t *testing.T) {
 	for in, want := range map[string]string{
-		"cargo test":                "sx run --rtk-filter cargo-test -- 'cargo test'",
-		"cargo test 2>&1":           "sx run --rtk-filter cargo-test -- 'cargo test 2>&1'",
-		"go test ./...":             "sx run --rtk-filter go-test -- 'go test -json ./...'",
-		"CI=1 go test -json ./...":  "sx run --rtk-filter go-test -- 'CI=1 go test -json ./...'",
-		"go test":                   "sx run --rtk-filter go-test -- 'go test -json'",
-		"cd pkg && cargo test":      "cd pkg && sx run --rtk-filter cargo-test -- 'cargo test'",
-		"cargo test | tail -50":     "sx run -- 'cargo test' | tail -50",
-		"cargo build && cargo test": "sx run -- 'cargo build && cargo test'",
-		"pnpm test":                 "sx run -- 'pnpm test'",
-		"pytest -x":                 "sx run -- 'pytest -x'",
-		"cargo testing":             "sx run -- 'cargo testing'",
+		"cargo test":      "sx run --rtk-filter cargo-test -- 'cargo test'",
+		"cargo test 2>&1": "sx run --rtk-filter cargo-test -- 'cargo test 2>&1'",
+		// go-test reads stdout as JSON: compiler errors stay on stderr.
+		"go test ./... 2>&1":                      "sx run --rtk-filter go-test -- 'go test -json ./...'",
+		"cd pkg && CI=1 go test -json ./... 2>&1": "cd pkg && sx run --rtk-filter go-test -- 'CI=1 go test -json ./...'",
+		"go test -run 'TestA|TestB' ./...":        `sx run --rtk-filter go-test -- 'go test -json -run '\''TestA|TestB'\'' ./...'`,
+		"go test ./... 2>&1 | tail":               "sx run -- 'go test ./... 2>&1' | tail",
+		"go test ./...":                           "sx run --rtk-filter go-test -- 'go test -json ./...'",
+		"CI=1 go test -json ./...":                "sx run --rtk-filter go-test -- 'CI=1 go test -json ./...'",
+		"go test":                                 "sx run --rtk-filter go-test -- 'go test -json'",
+		"cd pkg && cargo test":                    "cd pkg && sx run --rtk-filter cargo-test -- 'cargo test'",
+		"cargo test | tail -50":                   "sx run -- 'cargo test' | tail -50",
+		"cargo build && cargo test":               "sx run -- 'cargo build && cargo test'",
+		"pnpm test":                               "sx run -- 'pnpm test'",
+		"pytest -x":                               "sx run -- 'pytest -x'",
+		"cargo testing":                           "sx run -- 'cargo testing'",
 	} {
 		if got := WrapRTK("sx", in, true); got != want {
 			t.Errorf("WrapRTK(%q) = %q, want %q", in, got, want)

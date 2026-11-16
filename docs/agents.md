@@ -82,6 +82,7 @@ The hook rewrites heavy Bash commands to `spotexec run -- '<cmd>'` before they e
 - **Offloaded:** tests, `tsc`, linters, formatters, builds, Maven and Gradle verify goals.
 - **Output filters stay local.** Agents often trim output with a pipe, as in `pnpm test 2>&1 | tail -50` or `cargo test | grep -E 'FAIL|panicked'`. The heavy part runs remotely and the filters (`tail`, `head`, `grep`, `sed`, `awk`, `wc`, `sort`, `uniq`, `cut`, `tr`, `tee`, `jq`, …) read its streamed output on your machine: `spotexec run -- 'pnpm test 2>&1' | tail -50`. spotexec's own warnings and summary go to stderr, outside the pipe, so a filter never hides a write-back conflict or a timeout.
 - **Same meaning as the original line.** A leading `cd` runs locally, so the agent's shell and any local filter end up where it asked (`cd api && pnpm test | tee test.log` becomes `cd api && spotexec run -- 'pnpm test' | tee test.log`). A pipe filters only the command right before it, so a line like `pnpm build && pnpm test | tail -50` stays local rather than being split into two runs that could land on different machines.
+- **Quoted text is data.** Operators inside quotes don't count, so `go test -run 'TestA|TestB' ./...` and `pytest -k 'a or (b and c)'` offload, while `X='a; pytest' git commit` stays local. Dev servers and watch modes are recognised by the command's own words (`pnpm dev`, `vitest watch`, `npm run test:watch`), never by an argument such as `pytest -k watch` or `go test ./cmd/spotexec`.
 - **Kept local:** `git`, `ls`, `rg`, dev servers, watch modes, any other pipe, redirects into files, background jobs, anything that `cd`s out of the repo or after a heavy command, and anything prefixed with `SPOTEXEC_LOCAL=1`. Use that prefix, for example, for a test that needs `localhost:5432`.
 - **Timeout:** an offloaded command gets a Bash timeout of 10 minutes (or `BASH_MAX_TIMEOUT_MS`, if that is higher) unless the agent set one, since booting a Spot VM and installing dependencies can outlast Claude Code's 2-minute default.
 - **No runners yet:** when spotexec has no usable runner (say the hook was installed before `spotexec setup`), heavy commands run locally and the hook says so once per session, to you and to the agent.
@@ -89,11 +90,11 @@ The hook rewrites heavy Bash commands to `spotexec run -- '<cmd>'` before they e
 
 The `[hook]` table tunes it:
 - `when_load_above = 0.6` offloads only when the laptop is busy;
-- `patterns` / `exclude` add your own regexes;
+- `patterns` / `exclude` add your own regexes (`patterns` match each command of a `&&`/`;` list, `exclude` the whole line before any local output filter);
 - `mode = "block"` denies the command with instructions, instead of rewriting it;
 - `disabled = true` turns it off.
 
-A hook that v0.2.0 installed as `sx hook claude` still works the same way; `spotexec setup` (unless `--no-hooks`) and `spotexec hook install` rewrite it in place to call `spotexec`.
+A hook that v0.2.0 installed as `sx hook claude` still works the same way; `spotexec setup` (unless `--no-hooks`) and `spotexec hook install` rewrite it in place to call `spotexec`. They also update a hook that calls spotexec by an old path, after a switch of install method. A spotexec hook under a matcher that doesn't cover Bash doesn't count as installed: `spotexec hook install` (or `spotexec setup --hooks`) adds a `Bash` entry beside it.
 
 ### With RTK
 
@@ -103,12 +104,12 @@ So only one hook decides:
 - **Chained.** `spotexec hook install`, and `spotexec setup` when it installs or keeps up spotexec's hook (not with `--no-hooks`), find RTK's hook in the settings file they install into and chain it behind spotexec's, in place: `spotexec hook claude --then 'rtk hook claude'`. spotexec decides first. Every command it doesn't offload goes to RTK unchanged, and so does every command outside a project with a `.spotexec.toml`. `--uninstall` puts RTK's own hook back. RTK doesn't recognise the chained form, so it may say `No hook installed — run rtk init -g` even though `rtk verify` passes. If `rtk init -g` adds RTK's hook again, run `spotexec hook install --claude --global` to fold it back into the chain.
 - **Not chained.** RTK's hook may be in a different file, say `~/.claude/settings.json` when spotexec's is in the project. Then a command RTK would also rewrite is denied, and the reason tells the agent to run the offloaded form, which RTK leaves alone. The first denial in a session tells you which `spotexec hook install` command chains them. `spotexec hook check` shows when this would happen.
 
-Where RTK is in use, offloaded output is still compacted. `rtk pipe` runs on this machine once the command finishes, through `spotexec run --rtk-filter <filter>`. The exit code stays the command's own, and spotexec's warnings and summary still reach stderr. If the command fails, the output ends with `[full output: <path>]` (the last 20 are kept). If RTK fails, the output is printed unfiltered with an `RTK_FILTER` warning. The hook adds `--rtk-filter` only for the commands whose raw output RTK's filters are known to read correctly:
+Where RTK is in use, offloaded output is still compacted. `rtk pipe` runs on this machine once the command finishes, through `spotexec run --rtk-filter <filter>`. The exit code stays the command's own, and spotexec's warnings and summary still reach stderr. Only stdout goes through RTK; stderr is shown as it comes, unfiltered. If the command fails, the output ends with `[full stdout: <path>]` (the last 20 are kept). If RTK fails, the output is printed unfiltered with an `RTK_FILTER` warning. The hook adds `--rtk-filter` only for the commands whose raw output RTK's filters are known to read correctly:
 
 | Command | Runs as | Filter |
 | --- | --- | --- |
 | `cargo test` | unchanged | `cargo-test` |
-| `go test` | with `-json` added | `go-test` |
+| `go test` | with `-json` added, and a trailing `2>&1` dropped so stdout stays JSON | `go-test` |
 
 Every other offloaded command comes back uncompacted, exactly as it ran. RTK's other pipe filters can't read raw output that `rtk <tool>` didn't produce itself. Given plain `go test` or pytest output, they report "no tests" and hide the failures. A line the agent filters itself (`cargo test | tail -50`) is still offloaded, with its own filter kept and no RTK compaction.
 

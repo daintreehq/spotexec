@@ -635,6 +635,16 @@ func setupClaudeHookFrom(yes, want, skip, interactive bool, in io.Reader) (opted
 		return want, false
 	}
 	if hooks.HasClaude(p) {
+		// An install method switch may have moved spotexec: keep the hook
+		// calling the one running now.
+		if !skip {
+			if ok, err := hooks.InstallClaude(p, transportQuote(hookBinary())+" hook claude"); err != nil {
+				fmt.Printf("! couldn't update the Claude Code hook: %v\n", err)
+			} else if ok {
+				fmt.Printf("✓ updated the Claude Code hook in %s to call this spotexec\n", p)
+				return want, false
+			}
+		}
 		fmt.Printf("✓ Claude Code hook in %s\n", p)
 		return want, false
 	}

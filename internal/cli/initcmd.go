@@ -600,7 +600,7 @@ func cmdHook() *cobra.Command {
 					fmt.Printf("%s: %s\n", p, map[bool]string{true: "removed spotexec hook", false: "no spotexec hook found"}[ok])
 				} else {
 					hookCmd := transportQuote(hookBinary()) + " hook claude"
-					legacy, rtk := hooks.HasLegacyClaude(p), hooks.HasRTK(p)
+					legacy, rtk, had := hooks.HasLegacyClaude(p), hooks.HasRTK(p), hooks.HasClaude(p)
 					ok, err := hooks.InstallClaude(p, hookCmd)
 					if err != nil {
 						return err
@@ -609,6 +609,8 @@ func cmdHook() *cobra.Command {
 						fmt.Printf("chained RTK's PreToolUse hook behind spotexec's in %s: spotexec decides first and hands every other command to RTK\n", p)
 					} else if ok && legacy {
 						fmt.Printf("updated the PreToolUse hook in %s to call spotexec (sx only runs commands)\n", p)
+					} else if ok && had {
+						fmt.Printf("updated the PreToolUse hook in %s to call %s\n", p, hookCmd)
 					} else if ok {
 						fmt.Printf("installed PreToolUse hook in %s\n", p)
 					} else {
