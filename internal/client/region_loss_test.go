@@ -29,8 +29,13 @@ func regionFleet() (*config.Runner, *fakeFleet) {
 }
 
 // stubProbes makes probeReachable report reach for each VM (Unreachable
-// for any not named), and records which VMs were probed.
+// for any not named), and records which VMs were probed, and the host each
+// probe went to.
 func stubProbes(t *testing.T, reach map[string]transport.Reach) *[]string {
+	return stubProbesTo(t, reach, map[string]string{})
+}
+
+func stubProbesTo(t *testing.T, reach map[string]transport.Reach, hosts map[string]string) *[]string {
 	t.Helper()
 	old := probeReachable
 	t.Cleanup(func() { probeReachable = old })
@@ -40,6 +45,7 @@ func stubProbes(t *testing.T, reach map[string]transport.Reach) *[]string {
 		mu.Lock()
 		defer mu.Unlock()
 		*probed = append(*probed, in.ID)
+		hosts[in.ID] = in.Target.Host
 		if r, ok := reach[in.ID]; ok {
 			return r
 		}
@@ -53,7 +59,7 @@ func stubKnownGood(t *testing.T, f *fakeFleet, bad ...string) {
 	t.Helper()
 	old := knownGood
 	t.Cleanup(func() { knownGood = old })
-	knownGood = func(*config.Runner, provider.Fleet) map[string]bool {
+	knownGood = func(context.Context, *config.Runner, provider.Fleet) map[string]bool {
 		ok := map[string]bool{}
 		for _, in := range f.insts {
 			ok[in.ID] = true
@@ -66,7 +72,7 @@ func stubKnownGood(t *testing.T, f *fakeFleet, bad ...string) {
 }
 
 func lostLease(r *config.Runner, f provider.Fleet) *Lease {
-	return &Lease{Runner: r, Provider: f, InstanceID: "i-lost", Target: provider.Target{Host: "i-lost"}, Instance: provider.Instance{ID: "i-lost", Region: "ap-south-1"}}
+	return &Lease{Runner: r, Provider: f, InstanceID: "i-lost", Target: provider.Target{Host: "lease-host"}, Instance: provider.Instance{ID: "i-lost", Region: "ap-south-1"}}
 }
 
 // #229: a lost VM's region counts as silent only when it and its other
@@ -89,6 +95,7 @@ func TestRegionSilent(t *testing.T) {
 		{"the lost VM answers again", nil, nil, map[string]transport.Reach{"i-lost": up, "i-us1": up}, false, 0, ""},
 		{"the lost VM fails for another reason", nil, nil, map[string]transport.Reach{"i-lost": unknown, "i-us1": up}, false, 0, ""},
 		{"not in the listing, the lost VM answers", nil, []string{"i-lost"}, map[string]transport.Reach{"i-lost": up, "i-us1": up}, false, 0, ""},
+		{"not in the listing, the lost VM silent too", nil, []string{"i-lost"}, map[string]transport.Reach{"i-us1": up}, true, 2, "us-east-1"},
 		{"no region answers", nil, nil, nil, false, 0, ""},
 		{"another region fails for another reason", nil, nil, map[string]transport.Reach{"i-us1": unknown, "i-eu1": unknown}, false, 0, ""},
 		{"only a later region answers", nil, nil, map[string]transport.Reach{"i-eu1": up}, true, 2, "eu-north-1"},
@@ -107,8 +114,18 @@ func TestRegionSilent(t *testing.T) {
 				}
 			}
 			f.insts = kept
-			probed := stubProbes(t, c.reach)
+			hosts := map[string]string{}
+			probed := stubProbesTo(t, c.reach, hosts)
 			got := regionSilent(context.Background(), lostLease(r, f))
+			if h, ok := hosts["i-lost"]; ok {
+				want := "i-lost" // as listed
+				if strings.Contains(" "+strings.Join(c.drop, " ")+" ", " i-lost ") {
+					want = "lease-host" // not listed: where the lease connected
+				}
+				if h != want {
+					t.Errorf("probed the lost VM at %q, want %q", h, want)
+				}
+			}
 			if (got != nil) != c.region {
 				t.Fatalf("regional loss %+v, want %v (probed %v)", got, c.region, *probed)
 			}
@@ -159,7 +176,7 @@ func TestKnownGood(t *testing.T) {
 	p.Observe("i-draining", OutAcquired, time.Time{})
 	p.Observe("i-draining", OutDraining, time.Time{})
 	p.Observe("i-booting", OutBooting, time.Time{})
-	got := knownGood(p.R, f)
+	got := knownGood(context.Background(), p.R, f)
 	if len(got) != 2 || !got["i-ready"] || !got["i-busy"] {
 		t.Fatalf("known good: %v", got)
 	}

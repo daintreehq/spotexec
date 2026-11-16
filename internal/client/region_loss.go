@@ -54,9 +54,9 @@ var regionSilentFn = regionSilent
 // still places runs on (its pool notes: ready, not draining, retiring or
 // mismatched): a VM like that going silent says something about the
 // network; one that never answered, or is on its way out, doesn't.
-var knownGood = func(r *config.Runner, f provider.Fleet) map[string]bool {
+var knownGood = func(ctx context.Context, r *config.Runner, f provider.Fleet) map[string]bool {
 	ok := map[string]bool{}
-	_ = NewPool(r, f).with(func(st *poolState) error {
+	_ = NewPool(r, f).withCtx(ctx, func(st *poolState) error {
 		for id, n := range st.Notes {
 			if n != nil && n.Ready && !n.closed() {
 				ok[id] = true
@@ -88,7 +88,7 @@ func regionSilent(ctx context.Context, lease *Lease) *regionLoss {
 	if err != nil {
 		return nil
 	}
-	good := knownGood(lease.Runner, f)
+	good := knownGood(ctx, lease.Runner, f)
 	lostVM := lease.Instance
 	lostVM.ID = lease.InstanceID
 	if lostVM.Target.Host == "" {

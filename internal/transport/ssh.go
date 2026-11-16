@@ -455,11 +455,21 @@ func (c *Client) Reachable(ctx context.Context, d time.Duration) Reach {
 	case errors.Is(rctx.Err(), context.DeadlineExceeded):
 		return Unreachable
 	}
+	return probeResult(err, errb.String())
+}
+
+// probeResult classifies a probe that failed in time: ssh's own failure
+// (exit 255) by what it printed, the remote shell failing as an answer,
+// and anything else (ssh couldn't start, or was killed) as unknown.
+func probeResult(err error, stderr string) Reach {
 	var ee *exec.ExitError
-	if !errors.As(err, &ee) || ee.ExitCode() != 255 {
+	switch {
+	case !errors.As(err, &ee) || ee.ExitCode() < 0:
+		return ReachUnknown
+	case ee.ExitCode() != 255:
 		return Reachable // the remote shell ran, and failed
 	}
-	return networkFailure(errb.String())
+	return networkFailure(stderr)
 }
 
 // networkFailure classifies the error ssh printed when it couldn't connect.
