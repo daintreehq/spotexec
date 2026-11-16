@@ -93,12 +93,15 @@ func TestConfigGuardFollowsLinks(t *testing.T) {
 		tree
 		yes, no []string
 	}{
-		"file link":                      {tree{nil, map[string]string{".spotexec.toml": "conf/s.toml"}}, []string{"conf/s.toml", "conf/s.toml/x", "conf"}, []string{"conf/other.toml", "src/main.go"}},
-		"dot-dot after a directory link": {tree{[]string{"nested/dir"}, map[string]string{".spotexec.toml": "cfg/../x.toml", "cfg": "nested/dir"}}, []string{"nested/x.toml", "cfg"}, []string{"x.toml", "nested/dir/a"}},
-		"chain of directory links":       {tree{[]string{"real", "l1"}, map[string]string{"l1/.spotexec.toml": "../c1/x.toml", "c1": "bridge", "bridge": "real"}}, []string{"c1", "bridge", "real/x.toml"}, []string{"real/y.toml", "l1/other"}},
-		"missing directory":              {tree{[]string{"real2"}, map[string]string{".spotexecignore": "c2/new/ign", "c2": "real2"}}, []string{"real2/new/ign", "real2/new", "c2"}, []string{"real2/other"}},
-		"absolute target":                {tree{nil, map[string]string{"sub/.spotexec.toml": "@root/abs.toml"}}, []string{"abs.toml"}, []string{"sub/x"}},
-		"link to the root":               {tree{nil, map[string]string{".spotexec": "."}}, []string{"setup.sh", "src/main.go"}, nil},
+		"file link":                         {tree{nil, map[string]string{".spotexec.toml": "conf/s.toml"}}, []string{"conf/s.toml", "conf/s.toml/x", "conf"}, []string{"conf/other.toml", "src/main.go"}},
+		"dot-dot after a directory link":    {tree{[]string{"nested/dir"}, map[string]string{".spotexec.toml": "cfg/../x.toml", "cfg": "nested/dir"}}, []string{"nested/x.toml", "cfg"}, []string{"x.toml", "nested/dir/a"}},
+		"chain of directory links":          {tree{[]string{"real", "l1"}, map[string]string{"l1/.spotexec.toml": "../c1/x.toml", "c1": "bridge", "bridge": "real"}}, []string{"c1", "bridge", "real/x.toml"}, []string{"real/y.toml", "l1/other"}},
+		"missing directory":                 {tree{[]string{"real2"}, map[string]string{".spotexecignore": "c2/new/ign", "c2": "real2"}}, []string{"real2/new/ign", "real2/new", "c2"}, []string{"real2/other"}},
+		"absolute target":                   {tree{nil, map[string]string{"sub/.spotexec.toml": "@root/abs.toml"}}, []string{"abs.toml"}, []string{"sub/x"}},
+		"link to the root":                  {tree{nil, map[string]string{".spotexec": "."}}, []string{"setup.sh", "src/main.go"}, nil},
+		"absolute chain":                    {tree{nil, map[string]string{".spotexec.toml": "@root/alias.toml", "alias.toml": "config.toml"}}, []string{"alias.toml", "config.toml"}, []string{"other.toml"}},
+		"absolute dot-dot after a dir link": {tree{[]string{"nested/dir"}, map[string]string{".spotexec.toml": "@root/cfg/../settings.toml", "cfg": "nested/dir"}}, []string{"nested/settings.toml", "cfg"}, []string{"settings.toml"}},
+		"out of the root and back":          {tree{nil, map[string]string{".spotexec.toml": "../@base/settings.toml"}}, []string{"settings.toml"}, []string{"other.toml"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir() // unresolved: /var on macOS is /private/var
@@ -113,7 +116,8 @@ func TestConfigGuardFollowsLinks(t *testing.T) {
 				if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.Symlink(strings.ReplaceAll(target, "@root", root), full); err != nil {
+				target = strings.ReplaceAll(strings.ReplaceAll(target, "@root", root), "@base", filepath.Base(root))
+				if err := os.Symlink(target, full); err != nil {
 					t.Fatal(err)
 				}
 				if spotexecConfigPath(l) {
@@ -149,6 +153,12 @@ func TestConfigLinksFindsNestedLinks(t *testing.T) {
 		if err := os.Symlink("../out/config.toml", filepath.Join(dir, "sub", ".spotexec.toml")); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.MkdirAll(filepath.Join(dir, ".spotexec", "conflicts"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../out/setup.sh", filepath.Join(dir, ".spotexec", "setup.sh")); err != nil {
+			t.Fatal(err)
+		}
 		if git {
 			for _, args := range [][]string{{"init", "-q"}, {"add", "-A"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"}} {
 				cmd := exec.Command("git", args...)
@@ -159,8 +169,14 @@ func TestConfigLinksFindsNestedLinks(t *testing.T) {
 			}
 		}
 		ws := &Workspace{Root: dir, Git: git, Cwd: "."}
-		if !configGuard(dir, configLinks(context.Background(), ws, nil, true))("out/config.toml") {
-			t.Errorf("git %v: out/config.toml not protected", git)
+		guard := configGuard(dir, configLinks(context.Background(), ws, nil, true))
+		for _, p := range []string{"out/config.toml", "out/setup.sh"} {
+			if !guard(p) {
+				t.Errorf("git %v: %s not protected", git, p)
+			}
+		}
+		if guard("out/report.xml") {
+			t.Errorf("git %v: out/report.xml protected", git)
 		}
 		if configGuard(dir, configLinks(context.Background(), ws, nil, false))("out/config.toml") {
 			t.Errorf("git %v: found without looking", git)

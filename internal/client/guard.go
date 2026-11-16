@@ -76,7 +76,7 @@ func configLinks(ctx context.Context, ws *Workspace, m *manifest.Manifest, find 
 	}
 	if ws.Git {
 		cmd := exec.CommandContext(ctx, "git", "-C", ws.Root, "ls-files", "-z", "-c", "-o", "--exclude-standard", "--",
-			":(icase,glob)**/.spotexec.toml", ":(icase,glob)**/.spotexecignore", ":(icase,glob)**/.spotexec")
+			":(icase,glob)**/.spotexec.toml", ":(icase,glob)**/.spotexecignore", ":(icase,glob)**/.spotexec/**")
 		if out, err := cmd.Output(); err == nil {
 			for _, p := range strings.Split(string(out), "\x00") {
 				if p != "" {
@@ -96,15 +96,22 @@ func configLinks(ctx context.Context, ws *Workspace, m *manifest.Manifest, find 
 		}
 		rel, _ := filepath.Rel(ws.Root, full)
 		rel = filepath.ToSlash(rel)
+		if d.IsDir() && rel != "." && (heavy[d.Name()] && !strings.EqualFold(d.Name(), ".spotexec") || stateDir(rel)) {
+			return filepath.SkipDir
+		}
 		if spotexecConfigPath(rel) && d.Type()&fs.ModeSymlink != 0 {
 			links = append(links, rel)
-		}
-		if d.IsDir() && rel != "." && heavy[d.Name()] {
-			return filepath.SkipDir
 		}
 		return nil
 	})
 	return links
+}
+
+// stateDir reports whether rel is spotexec's own state in a .spotexec
+// directory (conflicts, backups), which holds no config.
+func stateDir(rel string) bool {
+	dir, name := path.Split(rel)
+	return strings.EqualFold(path.Base(strings.TrimSuffix(dir, "/")), ".spotexec") && (strings.EqualFold(name, "conflicts") || strings.EqualFold(name, "backup"))
 }
 
 // configGuard returns whether a run may not write p: spotexec's own config
@@ -143,13 +150,22 @@ func configGuard(root string, links []string) func(string) bool {
 	}
 }
 
-// resolveLinks resolves p (relative to root, which is canonical) through
-// symlinks a component at a time, calling visit with every root-relative
-// symlink it passes through and where it ends. A component that doesn't
-// exist is taken as spelled. It stops on leaving root, or after 40 links.
+// resolveLinks resolves root/p (root canonical) through symlinks a
+// component at a time from /, as the kernel does: an absolute target starts
+// again at /, and .. leaves what is resolved so far, wherever that is. visit
+// gets, relative to root, every symlink passed through inside root and
+// where p ends, if inside root. A component that doesn't exist is taken as
+// spelled. It stops after 40 links.
 func resolveLinks(root, p string, visit func(string)) {
-	todo := strings.Split(p, "/")
-	cur := "." // resolved so far
+	inRoot := func(abs string) {
+		if rel, err := filepath.Rel(root, filepath.FromSlash(abs)); err == nil {
+			if rel = filepath.ToSlash(rel); rel != ".." && !strings.HasPrefix(rel, "../") {
+				visit(rel)
+			}
+		}
+	}
+	todo := strings.Split(filepath.ToSlash(filepath.Join(root, filepath.FromSlash(p))), "/")
+	cur := "/"
 	for hops := 0; len(todo) > 0; {
 		c := todo[0]
 		todo = todo[1:]
@@ -157,58 +173,29 @@ func resolveLinks(root, p string, visit func(string)) {
 		case "", ".":
 			continue
 		case "..":
-			if cur == "." {
-				return // above the root
-			}
 			cur = path.Dir(cur)
 			continue
 		}
 		next := path.Join(cur, c)
-		full := filepath.Join(root, filepath.FromSlash(next))
-		fi, err := os.Lstat(full)
+		fi, err := os.Lstat(filepath.FromSlash(next))
 		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
 			cur = next
 			continue
 		}
-		visit(next)
+		inRoot(next)
 		if hops++; hops > 40 {
 			return
 		}
-		t, err := os.Readlink(full)
+		t, err := os.Readlink(filepath.FromSlash(next))
 		if err != nil {
 			return
 		}
-		if filepath.IsAbs(t) {
-			rel, ok := underRoot(root, t)
-			if !ok {
-				return
-			}
-			cur, t = ".", rel
+		if t = filepath.ToSlash(t); path.IsAbs(t) {
+			cur = "/"
 		}
-		todo = append(strings.Split(filepath.ToSlash(t), "/"), todo...)
+		todo = append(strings.Split(t, "/"), todo...)
 	}
-	visit(cur)
-}
-
-// underRoot returns abs relative to root (canonical), judged by where abs
-// really is: its longest existing prefix resolved, so an alias (/var for
-// /private/var) still counts. false when it is outside.
-func underRoot(root, abs string) (string, bool) {
-	abs = filepath.Clean(abs)
-	for d := abs; ; d = filepath.Dir(d) {
-		if r, err := filepath.EvalSymlinks(d); err == nil {
-			rest, _ := filepath.Rel(d, abs)
-			rel, err := filepath.Rel(root, filepath.Join(r, rest))
-			rel = filepath.ToSlash(rel)
-			if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
-				return "", false
-			}
-			return rel, true
-		}
-		if d == filepath.Dir(d) {
-			return "", false
-		}
-	}
+	inRoot(cur)
 }
 
 // pullMatches reports whether p (workspace-relative) was asked for by one of
