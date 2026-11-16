@@ -137,6 +137,10 @@ func TestTaskExit(t *testing.T) {
 		{"a conflict-only failure counts", []partOutcome{part(partPassed, 0), part(partFailed, client.ExitWritebackConflict)}, false, client.ExitWritebackConflict},
 		{"125 outranks an earlier failure", []partOutcome{part(partFailed, client.ExitWritebackConflict), part(partFailed, client.ExitInfra)}, false, client.ExitInfra},
 		{"125 stays over a later failure", []partOutcome{part(partFailed, client.ExitInfra), part(partFailed, 1)}, false, client.ExitInfra},
+		{"a broken Dockerfile outranks a command's failure", []partOutcome{part(partFailed, 1), part(partFailed, client.ExitImageBuild)}, false, client.ExitImageBuild},
+		{"a broken Dockerfile stays over a later command failure", []partOutcome{part(partFailed, client.ExitImageBuild), part(partFailed, 1)}, false, client.ExitImageBuild},
+		{"125 outranks a broken Dockerfile", []partOutcome{part(partFailed, client.ExitImageBuild), part(partFailed, client.ExitInfra)}, false, client.ExitInfra},
+		{"125 stays over a broken Dockerfile", []partOutcome{part(partFailed, client.ExitInfra), part(partFailed, client.ExitImageBuild)}, false, client.ExitInfra},
 		{"stopped parts don't count", []partOutcome{part(partStopped, 130), part(partPassed, 0)}, false, 0},
 		{"interrupted wins", []partOutcome{part(partFailed, client.ExitInfra)}, true, client.ExitInterrupted},
 	} {

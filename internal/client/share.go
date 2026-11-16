@@ -36,9 +36,11 @@ var sharePoll = 250 * time.Millisecond
 
 // shareDone is the verdict a leader leaves when it finished: the artifact
 // is published, or the build failed in a way that would fail again (the
-// install or image build itself failed: buildFailed). Either way the runs waiting go on at once, each
-// fetching it or building it for itself. A leader that was lost or
-// cancelled leaves none: the next waiting run builds instead.
+// install or image build itself failed: buildFailed). Either way the runs
+// waiting go on at once, each fetching it or building it for itself; an
+// image whose build failed is remembered, and they fail with its error
+// instead (#194, imagefail.go). A leader that was lost or cancelled leaves
+// none: the next waiting run builds instead.
 const shareDone = "done"
 
 // shareLock is the local lock on building one artifact.
@@ -247,7 +249,7 @@ func (s sharer) run(ctx context.Context) (shareOutcome, error) {
 // instead of every waiting run at once (#162).
 func buildFailed(re *transport.RemoteError) bool {
 	switch re.Code {
-	case protocol.CodeDepsFailed, protocol.CodeImageFailed:
+	case protocol.CodeDepsFailed, protocol.CodeImageFailed, protocol.CodeImageBuildFailed:
 		return true
 	}
 	return false

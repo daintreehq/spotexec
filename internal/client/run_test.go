@@ -186,6 +186,10 @@ func TestShutdownIsALostRunner(t *testing.T) {
 	if got := lostRunner(spot, other); got != "" {
 		t.Fatalf("an ordinary helper error counted as a lost runner (%q)", got)
 	}
+	broken := imageBuildError(fmt.Errorf("container image: %w", &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageBuildFailed, Message: "x"}}))
+	if got := lostRunner(spot, broken); got != "" {
+		t.Fatalf("a broken Dockerfile counted as a lost runner (%q)", got)
+	}
 	static := &Lease{Runner: &config.Runner{Type: config.TypeSSH}}
 	if got := lostRunner(static, shutdown); got != "" {
 		t.Fatalf("a static runner is never replayed (%q)", got)
@@ -525,5 +529,13 @@ func TestSetupFailureExitCode(t *testing.T) {
 	got, msg := setupFailure(p, Options{Timeout: 3 * time.Minute}, protocol.Result{ExitCode: 124, TimedOut: true, SetupFailed: true})
 	if got != ExitTimeout || !strings.Contains(msg, "exceeded 3m0s") {
 		t.Errorf("setup timeout: run exits %d (%s)", got, msg)
+	}
+}
+
+// A spare-capacity probe never teaches the duration model.
+func TestSpareRequestHasNoTask(t *testing.T) {
+	spare := spareRequest(AcquireRequest{Task: "t"}, "i-1", nil)
+	if spare.Task != "" || !spare.Exclude["i-1"] {
+		t.Fatalf("spare request %+v", spare)
 	}
 }

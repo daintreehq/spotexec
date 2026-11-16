@@ -28,7 +28,8 @@ var (
 			Deps:  provider.ColdPart{Cost: 0.0343, Why: "no dependency archive for the project"},
 			Image: provider.ColdPart{Warm: true, Why: "the project's image"}}},
 	}
-	model = &provider.RunCostModel{WaitCost: 1, HorizonMinutes: 60, ColdMinutes: 4, BootMinutes: 1, DepsMinutes: 2, ImageMinutes: 1, WarmDays: 7, WarmAfterMin: 10, GenSpeedup: 1.1, RoundTrips: 300, SpeedByGen: true, Regions: true}
+	model = &provider.RunCostModel{WaitCost: 1, HorizonMinutes: 60, ColdMinutes: 4, BootMinutes: 1, DepsMinutes: 2, ImageMinutes: 1, WarmDays: 7, WarmAfterMin: 10, GenSpeedup: 1.1, RoundTrips: 300, SpeedByGen: true, Regions: true,
+		DepsFrom: provider.ColdEstimate{Source: "default"}, ImageFrom: provider.ColdEstimate{Source: "default"}}
 )
 
 func runCostView() pricesView {
@@ -69,7 +70,7 @@ func TestPricesShowRunCostBreakdown(t *testing.T) {
 		}
 	}
 	for _, want := range []string{`launch_order = "run_cost"`, "with waiting valued at $1/h (wait_cost)", "a slower type (each instance generation counts as 10% faster per vCPU)",
-		"a cold region (COLD, in minutes: boot 1 without a bake of aws there, deps 2 without the project's archive in the region's cache, image 1 without the project's image in its registry; outside a project, deps and image count as warm where a VM of aws was up 10 minutes or more in the last 7 days)", `"cheapest" ranks by price alone`} {
+		"a cold region (COLD, in minutes: boot 1 without a bake of aws there, deps 2 (a default) without the project's archive in the region's cache, image 1 (a default) without the project's image in its registry; outside a project, deps and image count as warm where a VM of aws was up 10 minutes or more in the last 7 days)", `"cheapest" ranks by price alone`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}
@@ -81,6 +82,29 @@ func TestPricesShowRunCostBreakdown(t *testing.T) {
 	v.writeText(&b, 20)
 	if !strings.Contains(b.String(), "; deps and image checked for app)") {
 		t.Errorf("project:\n%s", b.String())
+	}
+	// Its measured installs price the deps part, and the note says so.
+	b.Reset()
+	v = runCostView()
+	v.project = "app"
+	m := *model
+	m.DepsMinutes, m.DepsFrom = 14.25, provider.ColdEstimate{Source: "measured", At: seen}
+	m.ImageMinutes, m.ImageFrom = 60, provider.ColdEstimate{Source: "measured", At: seen, Capped: true}
+	v.k.Model = &m
+	v.writeText(&b, 20)
+	day := seen.Local().Format("Jan 2")
+	for _, want := range []string{"deps 14.3 (the project's longest install on aws lately, " + day + ") without the project's archive",
+		"image 60 (capped: the project's longest image build on aws lately, " + day + ", took longer) without",
+	} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("missing %q in:\n%s", want, b.String())
+		}
+	}
+	b.Reset()
+	v.k.Model = model
+	v.writeText(&b, 20)
+	if !strings.Contains(b.String(), "deps 2 (a default: no install of the project on aws measured lately)") {
+		t.Errorf("project default:\n%s", b.String())
 	}
 	// --limit cuts the list after that many rows.
 	b.Reset()
@@ -110,11 +134,36 @@ func TestPricesJSONRunCost(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The parts' keys, as scripts read them.
-	if out := b.String(); !strings.Contains(out, `"cold_parts": {`) || !strings.Contains(out, `"dependencies": {`) || !strings.Contains(out, `"cold_deps_minutes": 2`) {
+	if out := b.String(); !strings.Contains(out, `"cold_parts": {`) || !strings.Contains(out, `"dependencies": {`) || !strings.Contains(out, `"cold_deps_minutes": 2`) ||
+		!strings.Contains(out, `"cold_deps_estimate": {`) || !strings.Contains(out, `"source": "default"`) {
 		t.Fatalf("json keys: %s", out)
 	}
 	if got.Order != "run_cost" || !reflect.DeepEqual(got.Model, model) || len(got.Prices) != 3 {
 		t.Fatalf("json: %s", b.String())
+	}
+	// Measured parts say when the longest was taken and whether capped, in
+	// the keys scripts read.
+	v := runCostView()
+	m := *model
+	at := time.Date(2026, 11, 2, 9, 30, 0, 0, time.UTC)
+	m.DepsMinutes, m.DepsFrom = 14.25, provider.ColdEstimate{Source: "measured", At: at}
+	m.ImageMinutes, m.ImageFrom = 60, provider.ColdEstimate{Source: "measured", At: at, Capped: true}
+	v.k.Model = &m
+	b.Reset()
+	if err := v.writeJSON(&b); err != nil {
+		t.Fatal(err)
+	}
+	var raw struct {
+		Model map[string]any `json:"run_cost_model"`
+	}
+	if err := json.Unmarshal(b.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	wantDeps := map[string]any{"source": "measured", "at": "2026-11-02T09:30:00Z"}
+	wantImage := map[string]any{"source": "measured", "at": "2026-11-02T09:30:00Z", "capped": true}
+	if !reflect.DeepEqual(raw.Model["cold_deps_estimate"], wantDeps) || !reflect.DeepEqual(raw.Model["cold_image_estimate"], wantImage) ||
+		raw.Model["cold_deps_minutes"] != 14.25 || raw.Model["cold_image_minutes"] != float64(60) {
+		t.Fatalf("measured json: %v", raw.Model)
 	}
 	for i, want := range []provider.SpotPrice{warmOpt, coldOpt, slowOpt} {
 		p := got.Prices[i]

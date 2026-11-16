@@ -35,6 +35,16 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if len(os.Args) > 1 && os.Args[1] == "image-push" {
+		fs := flag.NewFlagSet("image-push", flag.ExitOnError)
+		root := fs.String("work-root", "", "")
+		_ = fs.Parse(os.Args[2:])
+		if err := ImagePush(*root); err != nil {
+			fmt.Fprintln(os.Stderr, "spotexec-helper:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "docker-proxy" {
 		if err := DockerProxy(); err != nil {
 			fmt.Fprintln(os.Stderr, "spotexec-helper:", err)
@@ -515,7 +525,8 @@ func TestStartDockerProxyNoDaemon(t *testing.T) {
 // statefulDocker is a docker that works and holds the containers, networks
 // and volumes named in its state files (ps, network, volume): listing one
 // by label prints its file, removing it (rm -fv, network rm, volume rm)
-// empties the file, unless stuck. Every call is logged, one per line.
+// empties the file, unless stuck. docker info prints the info file, if
+// any. Every call is logged, one per line.
 func statefulDocker(t *testing.T, stuck bool, ps, network, volume string) (bin, log string) {
 	t.Helper()
 	bin = t.TempDir()
@@ -537,8 +548,15 @@ case "$1 $2" in
 "ps "*) case "$*" in *label=*) cat "$d/ps" ;; esac ;;
 "rm -fv") k=ps; shift 2; ` + rm + ` ;;
 "network ls"|"volume ls") cat "$d/$1" ;;
+"info "*) cat "$d/info" 2>/dev/null ;;
 "network rm") k=network; shift 2; ` + rm + ` ;;
 "volume rm") k=volume; shift 3; ` + rm + ` ;;
+"image inspect") echo sha256:` + strings.Repeat("0", 64) + ` ;;
+"cp -L")
+	[ -f "$d/cp-fail" ] && { echo "Error response from daemon: boom" >&2; exit 1; }
+	f="$d/tar-${3##*/}"
+	[ -f "$f" ] || { echo "Error: No such container:path: $3" >&2; exit 1; }
+	cat "$f" ;;
 esac
 exit 0
 `

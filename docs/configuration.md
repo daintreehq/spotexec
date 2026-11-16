@@ -64,6 +64,7 @@ max_slots = 2                     # shared jobs per VM; an exclusive task takes 
 max_instances = 4                 # a ceiling: past it, runs queue for a free slot
 min_instances = 0                 # kept warm only while `spotexec daemon` runs
 priority = 20
+# scheduling = { policy = "consolidate", spare_slots = 0 }   # see docs/POOL.md
 idle_timeout = "10m"
 max_lifetime = "12h"
 volume_gb = 64
@@ -116,6 +117,11 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `arch` | from the first instance type that isn't a pattern, else `amd64` | `amd64` or `arm64` (Graviton). |
 | `max_instances` | none | Fleet ceiling, not a target: past it, runs queue for a free slot instead of launching more VMs. Unset (or `0`), the fleet grows with demand, limited only by the account's Spot vCPU quota. Every VM pays a cold start and then its `idle_timeout`, so to bound the bill, set it to the most VMs you're willing to pay for at once. See [A few warm VMs](scaling.md#a-few-warm-vms). |
 | `min_instances` | `0` | Warm floor, kept only while the [pool manager](scaling.md#pool-manager-optional) runs. |
+| `scheduling.policy` | `consolidate` | How jobs are placed on running VMs. `consolidate`: inside a retained set sized to the last minute's demand; surplus VMs go standby and idle out. `shadow`: as `legacy`, reporting what `consolidate` would do (`placement_shadow` events). `legacy`: the oldest VM with a free slot, or the worktree's last VM within 10 minutes. See [Placement](POOL.md#placement-the-retained-set). |
+| `scheduling.mode` | `balanced` | `latency` lets a worktree return to its own standby VM before a retained VM without its files: fewer cold syncs, more VMs kept. |
+| `scheduling.spare_slots` | `0` | Slots kept retained on top of recent demand, for bursts. |
+| `scheduling.early_drain` | `false` | Let the pool manager shut a standby VM down once it is idle and `result_retention` has passed, instead of at `idle_timeout`. See [Early drain](POOL.md#early-drain). |
+| `scheduling.result_retention` | `idle_timeout` | With `early_drain`: how long after its last job a VM stays up so `exec`, `pull` and `--same-slot` can still reach its workspaces. |
 | `idle_timeout` | `10m` | The VM powers off after this long with no work, and bills until then. |
 | `max_lifetime` | `12h` | Hard cap, regardless of activity. Must exceed `boot_timeout`. New runs stop going to a VM 15 minutes before it (a quarter of a shorter lifetime). |
 | `boot_timeout` | `15m` | Longest wait for first-boot setup; a VM that takes longer is terminated. |

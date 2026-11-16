@@ -7,6 +7,8 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -20,7 +22,7 @@ import (
 const defaultDockerfile = ".spotexec/Dockerfile"
 
 func cmdContainer() *cobra.Command {
-	c := &cobra.Command{Use: "container", Short: "Project container image: scaffold a Dockerfile and build it on a runner"}
+	c := &cobra.Command{Use: "container", Short: "Project container image: scaffold a Dockerfile, build it on a runner, and see which regions hold it"}
 
 	var force, yes bool
 	var dfPath string
@@ -47,7 +49,7 @@ func cmdContainer() *cobra.Command {
 	var f runFlags
 	build := &cobra.Command{
 		Use:   "build [flags]",
-		Short: "Build (or pull) the project image on a runner now; on AWS it is pushed to ECR for every VM",
+		Short: "Build (or pull) the project image on a runner now, even if its last build failed; on AWS it is pushed to ECR in that VM's region, and VMs in the runner's other regions copy it from there",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			l, err := load(f.dir)
@@ -62,7 +64,7 @@ func cmdContainer() *cobra.Command {
 		},
 	}
 	f.register(build.Flags())
-	c.AddCommand(initC, build)
+	c.AddCommand(initC, build, cmdContainerRegions())
 	return c
 }
 
@@ -90,7 +92,7 @@ func containerInit(ws *client.Workspace, rel string, force bool) error {
 			return err
 		}
 	}
-	body, stack, missing := scaffoldDockerfile(ws.Root)
+	body, stack, missing, notes := scaffoldDockerfile(ws.Root)
 	if stack == "" {
 		stack = "no language toolchain detected: a generic Ubuntu image"
 	}
@@ -101,6 +103,9 @@ func containerInit(ws *client.Workspace, rel string, force bool) error {
 		return err
 	}
 	fmt.Printf("wrote %s (%s)\n", rel, stack)
+	for _, n := range notes {
+		fmt.Println("  " + n)
+	}
 	if len(missing) > 0 {
 		fmt.Printf("note: this repository also uses %s; add it to %s if your commands need it\n", strings.Join(missing, " and "), rel)
 	}
@@ -196,6 +201,86 @@ const (
 var ltsNodes = map[string]string{
 	"argon": "4", "boron": "6", "carbon": "8", "dubnium": "10", "erbium": "12", "fermium": "14",
 	"gallium": "16", "hydrogen": "18", "iron": "20", "jod": "22", "krypton": "24",
+}
+
+// trixieFrom says where each official image starts publishing Debian 13
+// (trixie) variants: every release of line all and later, plus, on older
+// lines, every release from the one given. A line is the major for node and
+// major.minor for the others. Lines older than all and not listed only ever
+// got bookworm (e.g. node 18, 21 and 23, python 3.8, golang 1.23, rust 1.87).
+var trixieFrom = map[string]struct {
+	all   string
+	lines map[string]string
+}{
+	"node":   {"25", map[string]string{"20": "20.19.4", "22": "22.18.0", "24": "24.5.0"}},
+	"python": {"3.14", map[string]string{"3.9": "3.9.23", "3.10": "3.10.18", "3.11": "3.11.13", "3.12": "3.12.11", "3.13": "3.13.6"}},
+	"golang": {"1.25", map[string]string{"1.24": "1.24.6"}},
+	"rust":   {"1.88", nil},
+}
+
+// debianTag is image's tag for version on Debian trixie when the official
+// image publishes one for it, else on bookworm. A partial version (20, 3.12)
+// is the newest release with that prefix, and a name (lts, current) or a
+// version shorter than a line (golang's and rust's "1") follows the newest
+// line, which has trixie. version comes from the scaffold's own parsers, so
+// the only names it can be are node's lts and current.
+func debianTag(image, version string) string {
+	if hasTrixie(image, version) {
+		return version + "-trixie"
+	}
+	return version + "-bookworm"
+}
+
+func hasTrixie(image, version string) bool {
+	t, ok := trixieFrom[image]
+	if !ok {
+		return false
+	}
+	if !exactVer.MatchString(version) {
+		return true
+	}
+	n := 2
+	if image == "node" {
+		n = 1
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < n {
+		return true
+	}
+	line := strings.Join(parts[:n], ".")
+	if versionAtLeast(line, t.all) {
+		return true
+	}
+	first, ok := t.lines[line]
+	if !ok {
+		return false
+	}
+	// Compare only as many parts as version names: 22.18 floats to 22.18.x,
+	// whose newest release is on or past 22.18.0.
+	fp := strings.Split(first, ".")
+	if len(fp) > len(parts) {
+		fp = fp[:len(parts)]
+	}
+	return versionAtLeast(version, strings.Join(fp, "."))
+}
+
+// versionAtLeast compares dotted numeric versions part by part (a missing
+// part counts as 0).
+func versionAtLeast(v, min string) bool {
+	a, b := strings.Split(v, "."), strings.Split(min, ".")
+	for i := 0; i < len(a) || i < len(b); i++ {
+		var x, y int
+		if i < len(a) {
+			x, _ = strconv.Atoi(a[i])
+		}
+		if i < len(b) {
+			y, _ = strconv.Atoi(b[i])
+		}
+		if x != y {
+			return x > y
+		}
+	}
+	return true
 }
 
 func readSmall(root, name string) string {
@@ -409,16 +494,28 @@ RUN (command -v corepack >/dev/null || npm install -g corepack) \
 `, name, version)
 }
 
+// utf8Locale follows the FROM line of every Debian or Ubuntu scaffold.
+const utf8Locale = `
+# A UTF-8 locale, as GitHub's Linux runners use (without it, commands run
+# under POSIX with an ASCII charset).
+ENV LANG=C.UTF-8
+`
+
 // scaffoldDockerfile proposes a Dockerfile for the project in root, pinned
 // as precisely as the repository allows, and names the stack it detected
 // ("" when it found no language toolchain). The image is built on the
 // first toolchain found (JavaScript, Python, Go, Rust, Java); Go and uv
 // are added to it when the repository uses them too, and any other
-// toolchain it also uses is listed in missing, to be added by hand.
-func scaffoldDockerfile(root string) (body, stack string, missing []string) {
+// toolchain it also uses is listed in missing, to be added by hand. notes
+// say what else went into the image and why (the system libraries Electron,
+// Playwright and Puppeteer need), or what to add by hand.
+func scaffoldDockerfile(root string) (body, stack string, missing, notes []string) {
 	pkg := readPackageJSON(root)
 	pm, pmVer := jsPackageManager(root, pkg)
-	primary := ""
+	// The image is from, then one apt layer of runnerTools plus the stack's
+	// own system packages, then body.
+	primary, from := "", ""
+	var pkgs []string
 	switch {
 	case pm == "bun":
 		v := "1"
@@ -430,17 +527,35 @@ func scaffoldDockerfile(root string) (body, stack string, missing []string) {
 			v = b
 		}
 		stack, primary = "Bun "+v, "js"
-		body = fmt.Sprintf(`FROM oven/bun:%s
-
-# Tools many test suites expect (the base image is slim).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates curl \
- && rm -rf /var/lib/apt/lists/*
-`, v)
+		from = "oven/bun:" + v
+		// The Bun image's Debian release depends on its version, and the
+		// library packages are named differently in each: name them only.
+		deps, n := browserDeps(root, pm, pkg)
+		if len(deps) > 0 {
+			var tools []string
+			for _, d := range deps {
+				tools = append(tools, d.tool)
+			}
+			need := " need"
+			if len(tools) == 1 {
+				need = " needs"
+			}
+			msg := joinAnd(tools) + need + " system libraries the Bun image doesn't have: add them to the apt-get install (`npx playwright install-deps --dry-run chromium` lists Chromium's)"
+			body += "\n# " + msg + ".\n"
+			notes = append(notes, msg)
+		}
+		notes = append(notes, n...)
 	case pm != "" || pkg != nil:
 		node := nodeVersion(root, pkg)
 		stack, primary = "Node.js "+node, "js"
-		body = fmt.Sprintf("FROM node:%s-bookworm\n", node)
+		from = "node:" + debianTag("node", node)
+		deps, depNotes := browserDeps(root, pm, pkg)
+		if len(deps) > 0 {
+			// browserLibs installs Debian 12 package names (trixie renamed
+			// many, e.g. libasound2t64, libicu76), so a project that needs
+			// them stays on bookworm.
+			from = "node:" + node + "-bookworm"
+		}
 		switch {
 		case pm == "pnpm":
 			v := pmVer
@@ -474,37 +589,43 @@ RUN npm install -g --force yarn@1 && npm cache clean --force
 RUN npm install -g npm@%s && npm cache clean --force
 `, pmVer)
 		}
+		libs, note := browserLibs(deps)
+		body += libs
+		if note != "" {
+			notes = append(notes, note)
+		}
+		notes = append(notes, depNotes...)
 	case exists(root, "uv.lock"):
 		py, uv := pythonVersion(root), uvVersion(root)
 		stack, primary = "Python "+py+", uv", "python"
-		body = fmt.Sprintf(`FROM python:%s-bookworm
-
+		from = "python:" + debianTag("python", py)
+		body = fmt.Sprintf(`
 # uv (pinned from [tool.uv] required-version when it names one exact version).
 COPY --from=ghcr.io/astral-sh/uv:%s /uv /uvx /usr/local/bin/
 
 # Use the image's Python; copy (not hardlink) out of uv's cache.
 ENV UV_PYTHON_DOWNLOADS=never \
     UV_LINK_MODE=copy
-`, py, uv)
+`, uv)
 	case exists(root, "pyproject.toml") || exists(root, "requirements.txt") || exists(root, "setup.py"):
 		py := pythonVersion(root)
 		stack, primary = "Python "+py, "python"
-		body = fmt.Sprintf(`FROM python:%s-bookworm
-
+		from = "python:" + debianTag("python", py)
+		body = `
 # Commands run as a non-root user, so install packages into a virtualenv in
 # the workspace (and list it in [deps] cache_dirs), or bake them in here:
 # RUN pip install --no-cache-dir pytest
-`, py)
+`
 	case exists(root, "go.mod"):
 		gv := goVersion(root)
 		stack, primary = "Go "+gv, "go"
-		body = fmt.Sprintf(`FROM golang:%s-bookworm
-
+		from = "golang:" + debianTag("golang", gv)
+		body = `
 # Keep the module and build caches in the slot's persistent HOME, so they
 # survive between runs (the container itself is thrown away each time).
 ENV GOMODCACHE=/home/spotexec/go/pkg/mod \
     GOCACHE=/home/spotexec/.cache/go-build
-`, gv)
+`
 	case exists(root, "Cargo.toml"):
 		rv := "1"
 		for _, f := range []string{"rust-toolchain.toml", "rust-toolchain"} {
@@ -519,8 +640,8 @@ ENV GOMODCACHE=/home/spotexec/go/pkg/mod \
 			}
 		}
 		stack, primary = "Rust "+rv, "rust"
-		body = fmt.Sprintf(`FROM rust:%s-bookworm
-
+		from = "rust:" + debianTag("rust", rv)
+		body = `
 # Components are installed as root: keep the toolchain writable for the
 # non-root user, as the base image does. Install extra tools system-wide:
 # RUN cargo install --root /usr/local/cargo cargo-nextest
@@ -530,34 +651,35 @@ RUN rustup component add clippy rustfmt && chmod -R a+w "$RUSTUP_HOME" "$CARGO_H
 # HOME, so they survive between runs (the container itself is thrown away).
 ENV CARGO_HOME=/home/spotexec/.cargo \
     PATH=/home/spotexec/.cargo/bin:$PATH
-`, rv)
+`
 	case exists(root, "pom.xml") || exists(root, "build.gradle") || exists(root, "build.gradle.kts"):
 		jv := javaVersion(root)
 		stack, primary = "Java "+jv, "java"
-		tools := "git"
+		from = "eclipse-temurin:" + jv + "-jdk"
 		if exists(root, "pom.xml") && !exists(root, "mvnw") {
-			tools += " maven"
+			pkgs = append(pkgs, "maven")
 			stack += ", Maven"
 		} else if exists(root, "pom.xml") {
 			stack += ", Maven wrapper"
 		} else {
 			stack += ", Gradle wrapper"
 		}
-		body = fmt.Sprintf(`FROM eclipse-temurin:%s-jdk
-
+		body = `
 # ./mvnw and ./gradlew download into HOME (persistent per slot).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends %s \
- && rm -rf /var/lib/apt/lists/*
-`, jv, tools)
-	default:
-		body = `FROM ubuntu:24.04
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential git curl ca-certificates \
- && rm -rf /var/lib/apt/lists/*
 `
+	default:
+		from, pkgs = "ubuntu:24.04", []string{"build-essential"}
 	}
+	// A UTF-8 locale, as on GitHub's Linux runners, straight after FROM. Most
+	// of these base images leave LANG unset, so commands would run under
+	// POSIX with an ASCII charset; C.UTF-8 ships with glibc, so no locales
+	// package is needed. eclipse-temurin already sets LANG and LC_ALL to
+	// en_US.UTF-8.
+	locale := ""
+	if primary != "java" {
+		locale = utf8Locale
+	}
+	body = "FROM " + from + "\n" + locale + aptLayer(pkgs) + body
 	// Other toolchains the repository uses (its tasks may run them).
 	if primary != "" {
 		if primary != "go" && exists(root, "go.mod") {
@@ -565,11 +687,11 @@ RUN apt-get update \
 			stack += " + Go " + gv
 			body += fmt.Sprintf(`
 # Go %[1]s too (go.mod), with its caches in the slot's persistent HOME.
-COPY --from=golang:%[1]s-bookworm /usr/local/go /usr/local/go
+COPY --from=golang:%[2]s /usr/local/go /usr/local/go
 ENV PATH=/usr/local/go/bin:$PATH \
     GOMODCACHE=/home/spotexec/go/pkg/mod \
     GOCACHE=/home/spotexec/.cache/go-build
-`, gv)
+`, gv, debianTag("golang", gv))
 		}
 		if primary != "python" && exists(root, "uv.lock") {
 			py := pythonVersion(root)
@@ -630,10 +752,44 @@ ENV UV_PYTHON_DOWNLOADS=never
 	extra := `
 # Extra system packages your commands need, for example:
 # RUN apt-get update \
-#  && apt-get install -y --no-install-recommends postgresql-client jq \
+#  && apt-get install -y --no-install-recommends postgresql-client \
 #  && rm -rf /var/lib/apt/lists/*
 `
-	return header + body + extra, stack, missing
+	return header + body + extra, stack, missing, notes
+}
+
+// runnerTools are command-line tools GitHub's hosted Ubuntu runners provide
+// that test suites shell out to or probe for. Every scaffold installs them, so
+// a test that passes in GitHub Actions isn't skipped under sx for want of one
+// (or failed with "command not found"). The package names are the same on
+// Debian and Ubuntu.
+var runnerTools = []string{
+	"bzip2", "ca-certificates", "curl", "file", "git", "jq", "lsof", "make",
+	"openssh-client", "procps", "rsync", "sqlite3", "unzip", "wget", "xz-utils",
+	"zip", "zsh",
+}
+
+// aptLayer installs runnerTools and the stack's own packages in one layer.
+func aptLayer(extra []string) string {
+	pkgs := append(append([]string{}, extra...), runnerTools...)
+	sort.Strings(pkgs)
+	var b strings.Builder
+	b.WriteString(`
+# Command-line tools GitHub's Ubuntu runners provide, which test suites often
+# call or probe for (a test that checks for a missing tool skips silently).
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+`)
+	line := "     "
+	for _, p := range pkgs {
+		if len(line)+1+len(p) > 76 {
+			b.WriteString(line + " \\\n")
+			line = "     "
+		}
+		line += " " + p
+	}
+	b.WriteString(line + " \\\n && rm -rf /var/lib/apt/lists/*\n")
+	return b.String()
 }
 
 func firstMatch(re *regexp.Regexp, s string) string {

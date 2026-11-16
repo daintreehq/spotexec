@@ -44,6 +44,9 @@ const (
 	// ExitWritebackConflict: with Options.FailOnConflict, the command
 	// succeeded but write-back kept a local edit over one of its changes.
 	ExitWritebackConflict = 122
+	// ExitImageBuild: the project's own Dockerfile failed to build
+	// (ImageBuildError), so the command never ran.
+	ExitImageBuild = 123
 )
 
 // Large-sync guardrails.
@@ -510,14 +513,16 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	// Without a sync the slot's files are not ours: don't claim ownership.
 	base.KeepOwner = o.Sync == "none"
-	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority}
+	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority,
+		Task: TaskKey(ws.RepoID, o.Display)}
 	if o.Sync != "none" {
 		// A launch for this run prefers regions that hold its caches.
 		req.Project = func(r *config.Runner) *provider.Project { return PlacementProject(p, ws, m, o.NoDeps, r) }
 	}
 	// Recently used here: go back to that VM while it has room (warm files
 	// and build caches). After a while, let work consolidate onto the
-	// oldest VMs again so younger ones can idle out.
+	// oldest VMs again so younger ones can idle out. (The legacy and shadow
+	// policies; the consolidating one weighs the worktree's files itself.)
 	if fi, err := os.Stat(lastRunPath(ws)); err == nil && time.Since(fi.ModTime()) < 10*time.Minute {
 		if lr, err := LoadLastRun(ws); err == nil {
 			req.PreferInstance = lr.InstanceID
@@ -640,7 +645,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		prog.set(phaseImage)
 		ref, id, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
 		if err != nil {
-			return res, infra(err), lostRunner(lease, err)
+			err, lost := imageErr(lease, err)
+			return res, err, lost
 		}
 		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root", Network: p.Container.Network, Docker: p.Container.Docker}
 		imageID = id
@@ -1071,6 +1077,7 @@ func spareRequest(req AcquireRequest, doomed string, lost map[string]bool) Acqui
 		spare.Exclude[k] = true
 	}
 	spare.Base.Fingerprint = ""
+	spare.Task = "" // a probe for room, not the job: no lease to learn from
 	return spare
 }
 
@@ -1429,6 +1436,7 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	log := newDepsLog(depsLogDir(), label)
 	dr, shared, upload, err := fetchDeps(ctx, sessionRPC{s}, onEvent, o, label, log, req, resign, p.Deps.Timeout.Duration+shareSlack)
 	log.Close()
+	recordDepsInstall(lease, ws, dr) // even when waiting for its upload failed after
 	// The install's status (and plain mode's heartbeat of it) ends here:
 	// the command's own phase starts next.
 	o.Rep.Clear()
@@ -2041,6 +2049,7 @@ func containerInputs(m *manifest.Manifest, dockerfile, buildCtx string, read fun
 func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, o Options, label string, ws *Workspace, lease *Lease, m *manifest.Manifest) (string, string, error) {
 	c := p.Container
 	req := protocol.Image{TimeoutMS: c.Timeout.Milliseconds(), WaitPush: o.WaitPush}
+	var locate func(context.Context) (*protocol.RegistryAuth, error)
 	if c.Image != "" {
 		req.Ref = c.Image
 	} else if o.PreferLast {
@@ -2066,15 +2075,28 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 				req.Registry = auth
 			}
 		}
+		// A multi-region runner copies an image another region holds
+		// rather than building it again (#192).
+		if src, ok := lease.Provider.(provider.ImageSource); ok && req.Registry != nil {
+			inst, repoID := lease.InstanceID, ws.RepoID
+			locate = func(ctx context.Context) (*protocol.RegistryAuth, error) {
+				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				return src.ImageSource(cctx, inst, repoID, tag)
+			}
+		}
 	}
 	o.Rep.Status("%s · preparing container image", label)
 	t := time.Now()
 	errW := &ui.ClearingWriter{W: o.Stderr, R: o.Rep}
-	r, shared, push, err := fetchImage(ctx, sessionRPC{s}, o, label, errW, req, c.Timeout.Duration+shareSlack)
+	log := newDepsLog(imageLogDir(), label)
+	r, shared, push, err := fetchImage(ctx, sessionRPC{s}, o, label, errW, log, newImageMemo(ws.RepoID), req, locate, c.Timeout.Duration+shareSlack)
+	log.Close()
+	recordImageBuild(lease, ws, r) // even when waiting for its push failed after
 	if err != nil {
 		return "", "", err
 	}
-	ev := map[string]any{"image": r.Image, "image_id": r.ImageID, "pulled": r.Pulled, "built": r.Built, "pushing": r.Pushing, "pushed": r.Pushed,
+	ev := map[string]any{"image": r.Image, "image_id": r.ImageID, "pulled": r.Pulled, "copied": r.Copied, "built": r.Built, "pushing": r.Pushing, "pushed": r.Pushed,
 		"installed_docker": r.InstalledDocker, "duration_ms": time.Since(t).Milliseconds()}
 	if shared.waited > 0 {
 		ev["waited_ms"] = shared.waited.Milliseconds()
@@ -2088,8 +2110,27 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 
 // fetchImage sends the image request. With a registry, which may lack this
 // image, of the runs on this machine needing it now one builds and pushes
-// it, and the rest wait for it and pull it (#139), as fetchDeps does.
-func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Writer, req protocol.Image, limit time.Duration) (r protocol.ImageResult, shared shareOutcome, push *protocol.ShareDone, err error) {
+// it, and the rest wait for it and pull it (#139), as fetchDeps does. A
+// build that fails is remembered in memo, and a run needing an image whose
+// build failed fails at once instead of building it again (#194), unless
+// the image can be had without building or o.WaitPush forces the build.
+// log keeps the build's output. locate (nil: none) finds the image in
+// another region of the runner when its own registry lacks it, to copy from
+// there instead (#192): runs that landed in different regions then share
+// one build too.
+func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Writer, log *depsLog, memo imageMemo, req protocol.Image, locate func(context.Context) (*protocol.RegistryAuth, error), limit time.Duration) (r protocol.ImageResult, shared shareOutcome, push *protocol.ShareDone, err error) {
+	building := false // the helper said it is building: its output goes to log too
+	pushing := false  // the helper is pushing the image: it has it
+	start := time.Now()
+	defer func() {
+		// A failed build: the runner may have found the Dockerfile itself
+		// at fault (#193).
+		err = imageBuildError(err)
+		var be *ImageBuildError
+		if errors.As(err, &be) {
+			imageFailedEvent(o, be, req.Dockerfile, time.Since(start))
+		}
+	}()
 	ask := func(req protocol.Image) (protocol.ImageResult, error) {
 		if err := c.send(protocol.TypeImage, req); err != nil {
 			return protocol.ImageResult{}, err
@@ -2102,6 +2143,9 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			switch f.Kind {
 			case protocol.KindStdout, protocol.KindStderr:
 				errW.Write(f.Data) // pull/build output goes to stderr
+				if building && log != nil {
+					log.Write(f.Data)
+				}
 				continue
 			}
 			env, err := protocol.Decode(f)
@@ -2113,6 +2157,8 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			case protocol.TypeEvent:
 				var ev protocol.Event
 				_ = env.Unmarshal(&ev)
+				building = building || ev.Name == "image_build"
+				pushing = pushing || ev.Name == "image_push"
 				o.Rep.Status("%s · %s %s", label, strings.ReplaceAll(ev.Name, "_", " "), ev.Message)
 				c.event(ev)
 			case protocol.TypeError:
@@ -2128,33 +2174,124 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			}
 		}
 	}
+	// recall is the failure of an earlier build of this image, if one is
+	// remembered and not to be built again regardless.
+	recall := func() error {
+		if o.WaitPush {
+			return nil
+		}
+		if f := memo.recall(req.Tag); f != nil {
+			return f.cachedError(memo.clock())
+		}
+		return nil
+	}
+	// built settles a build before the runs waiting on it are let go: an
+	// image had forgets an earlier failure (even when pushing it then
+	// failed), and a failure of the build itself is remembered, with its
+	// output.
+	built := func(err error) error {
+		if pushing || err == nil && r.Image != "" {
+			memo.forget(req.Tag)
+		}
+		var re *transport.RemoteError
+		if err == nil || !errors.As(err, &re) {
+			return err
+		}
+		// A broken Dockerfile (#193) is reported with its output even when
+		// it isn't remembered.
+		remember := memo.on(req.Tag) && ctx.Err() == nil && re.BuildFailed
+		if !remember && re.Code != protocol.CodeImageBuildFailed {
+			return err
+		}
+		f := imageFailure{Tag: req.Tag, Code: re.Code, Message: re.Message, Who: shareWho(o, label), At: memo.clock()}
+		if log != nil {
+			log.Close()
+			f.Tail, f.Truncated = log.Tail(depsTailLines)
+			f.Log = log.Path()
+		}
+		if f.Tail == "" {
+			f.Tail = re.Detail // the runner's own tail of the build
+		}
+		be := &ImageBuildError{Err: err, imageFailure: f}
+		if remember {
+			memo.remember(f)
+			be.Until = f.At.Add(imageFailAge)
+		}
+		be.Repo = memo.repo
+		return be
+	}
+	defer func() {
+		if pushing || err == nil && r.Image != "" {
+			memo.forget(req.Tag)
+		}
+	}()
+	probe := req
+	probe.Probe = true
 	if req.Registry == nil || req.Tag == "" {
+		if failed := recall(); failed != nil {
+			// The runner may have the image already: only building it is
+			// ruled out.
+			if r, err = ask(probe); err == nil && r.Missing {
+				return protocol.ImageResult{InstalledDocker: r.InstalledDocker}, shared, nil, failed
+			}
+			return r, shared, nil, err
+		}
 		r, err = ask(req)
-		return r, shared, nil, err
+		return r, shared, nil, built(err)
 	}
 	holder := ""
 	installed := false // a probe installed Docker
-	probe := req
-	probe.Probe = true
+	// find looks for another region holding the image, for the requests
+	// that follow to copy it from. A failed lookup only warns: the image is
+	// then built here, as before.
+	find := func(ctx context.Context) {
+		src, err := locate(ctx)
+		if err != nil {
+			o.Rep.Warn("IMAGE_REGISTRY", "could not look for the image in the runner's other regions (building it here if needed): %v", err)
+			return
+		}
+		if src != nil {
+			probe.Source, req.Source = src, src
+		}
+	}
 	sh := sharer{
-		lock:  shareLockFor("image", req.Registry.Repo+":"+req.Tag),
+		lock:  shareLockFor("image", imageLockID(req.Registry, req.Tag, locate != nil)),
 		who:   shareWho(o, label),
 		limit: limit,
-		probe: func(context.Context) (bool, error) {
+		probe: func(ctx context.Context) (bool, error) {
 			got, err := ask(probe)
-			installed = got.InstalledDocker
+			installed = installed || got.InstalledDocker
+			if err == nil && got.Missing && locate != nil {
+				if find(ctx); probe.Source != nil {
+					got, err = ask(probe)
+					installed = installed || got.InstalledDocker
+				}
+			}
+			if err == nil && got.Missing {
+				err = recall()
+			}
 			if err != nil || got.Missing {
 				return false, err
 			}
 			r = got
 			return true, nil
 		},
-		build: func(context.Context) error {
+		build: func(ctx context.Context) error {
+			// A run that waited on another's build that failed (or gave up
+			// waiting) doesn't build it again.
+			if failed := recall(); failed != nil {
+				return failed
+			}
+			// A run that held the lock may have pushed the image in another
+			// region since the probe looked.
+			if req.Source == nil && locate != nil {
+				find(ctx)
+			}
 			r, err = ask(req)
-			return err
+			return built(err)
 		},
 		publish: func(ctx context.Context) error {
-			if !r.Built || !r.Pushing {
+			if !r.Pushing {
 				return nil
 			}
 			o.Rep.Status("%s · pushing the image, for other runs to pull", label)
@@ -2182,6 +2319,21 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 		o.Rep.Warn("IMAGE_WAIT", "waited %s for %s to build the container image; built it here instead", ui.Dur(shared.waited), holder)
 	}
 	return r, shared, push, err
+}
+
+// imageLockID names what an image share lock is for. Runs that can copy
+// the image from another region (anyRegion) name the registry's account,
+// the repository's path and the tag, but not the region, so the runs on
+// this machine that need one image in different regions build it once,
+// and the others copy it (#192). Runs that can't copy it name the region's
+// repository: waiting for a build in another region would gain them
+// nothing.
+func imageLockID(reg *protocol.RegistryAuth, tag string, anyRegion bool) string {
+	if !anyRegion {
+		return reg.Repo + ":" + tag
+	}
+	account, _, _ := strings.Cut(reg.Server, ".")
+	return account + "/" + strings.TrimPrefix(strings.TrimPrefix(reg.Repo, reg.Server), "/") + ":" + tag
 }
 
 // toolchainFor fingerprints what the dependency install depends on besides

@@ -28,6 +28,11 @@ func scriptHelpers(t *testing.T, answer func(req AcquireRequest, host string, n 
 	h := &helperScript{probes: map[string]int{}, answer: answer}
 	old := tryAcquireFn
 	tryAcquireFn = func(_ context.Context, req AcquireRequest, r *config.Runner, _ provider.Provider, tg provider.Target, _ bool) (*Lease, []protocol.Holder, error) {
+		if req.onSend != nil { // as tryAcquire does, just before sending
+			if err := req.onSend(); err != nil {
+				return nil, nil, err
+			}
+		}
 		h.mu.Lock()
 		h.probes[tg.Host]++
 		n := h.probes[tg.Host]

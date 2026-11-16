@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -19,9 +21,26 @@ type ImageRegistry interface {
 	RegistryFor(ctx context.Context, repoID string) (*protocol.RegistryAuth, error)
 }
 
+// ECRKeepBuilds is how many builds each project's ECR repository keeps,
+// newest first.
+const ECRKeepBuilds = 3
+
+// ecrLifecyclePolicy keeps the newest ECRKeepBuilds builds. A build is one
+// tagged entry (BuildKit's index, or a copy's single manifest) plus the
+// untagged image and attestation manifests it references, so the count is
+// of tagged entries only: counting every entry would keep as many builds as
+// fit in the number, however many entries each push writes. ECR never
+// expires a manifest an index still references, so the untagged rule only
+// removes what an expired index (or a retagged one) left behind, a day on
+// so a push in flight isn't cut short.
+var ecrLifecyclePolicy = fmt.Sprintf(`{"rules":[`+
+	`{"rulePriority":1,"description":"keep the newest %[1]d spotexec builds","selection":{"tagStatus":"tagged","tagPatternList":["*"],"countType":"imageCountMoreThan","countNumber":%[1]d},"action":{"type":"expire"}},`+
+	`{"rulePriority":2,"description":"expire what older spotexec builds left untagged","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":1},"action":{"type":"expire"}}`+
+	`]}`, ECRKeepBuilds)
+
 // RegistryFor returns a short-lived ECR login for the repository
-// spotexec/<repo-id>, creating it (keeping the newest 10 images) on first
-// use. The token goes to the runner for one pull/push and is never stored
+// spotexec/<repo-id>, creating it (keeping the newest ECRKeepBuilds
+// builds) on first use. The token goes to the runner for one pull/push and is never stored
 // in its default docker config.
 func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.RegistryAuth, error) {
 	name := "spotexec/" + ecrName(repoID)
@@ -41,13 +60,12 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 			} `json:"repositories"`
 		}
 		err := a.ecr(ctx, "DescribeRepositories", map[string]any{"repositoryNames": []string{name}}, &desc)
-		policy := `{"rules":[{"rulePriority":1,"description":"keep the newest 10 spotexec images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}`
 		switch {
 		case err == nil && len(desc.Repositories) > 0:
 			uri = desc.Repositories[0].URI
 			// (Re)apply the expiry rule: a first run that created the
 			// repository may have failed before setting it.
-			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": policy}, nil); err != nil {
+			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": ecrLifecyclePolicy}, nil); err != nil {
 				return nil, fmt.Errorf("ECR lifecycle policy for %s: %w", name, err)
 			}
 		case err == nil || strings.Contains(err.Error(), "RepositoryNotFoundException"):
@@ -63,7 +81,7 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 				return nil, fmt.Errorf("creating ECR repository %s: %w", name, err)
 			}
 			uri = created.Repository.URI
-			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": policy}, nil); err != nil {
+			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": ecrLifecyclePolicy}, nil); err != nil {
 				return nil, fmt.Errorf("ECR lifecycle policy for %s: %w", name, err)
 			}
 			if uri == "" {
@@ -75,6 +93,21 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 		_ = os.MkdirAll(a.dir, 0o700)
 		_ = os.WriteFile(marker, []byte(uri+"\n"), 0o600)
 	}
+	auth, err := a.ecrLogin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(uri, auth.Server+"/") {
+		_ = os.Remove(marker) // stale record (other account/region): re-describe next time
+		return nil, fmt.Errorf("ECR repository %s is not in registry %s", uri, auth.Server)
+	}
+	auth.Repo = uri
+	return auth, nil
+}
+
+// ecrLogin returns a short-lived login for the region's registry, without
+// a repository.
+func (a *AWSSpot) ecrLogin(ctx context.Context) (*protocol.RegistryAuth, error) {
 	var tok struct {
 		Data []struct {
 			Token    string `json:"authorizationToken"`
@@ -96,11 +129,10 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 		return nil, fmt.Errorf("ECR login: malformed token")
 	}
 	server := strings.TrimPrefix(tok.Data[0].Endpoint, "https://")
-	if !strings.HasPrefix(uri, server+"/") {
-		_ = os.Remove(marker) // stale record (other account/region): re-describe next time
-		return nil, fmt.Errorf("ECR repository %s is not in registry %s", uri, server)
+	if server == "" {
+		return nil, fmt.Errorf("ECR login: no registry endpoint")
 	}
-	return &protocol.RegistryAuth{Server: server, Repo: uri, User: user, Password: pass}, nil
+	return &protocol.RegistryAuth{Server: server, User: user, Password: pass}, nil
 }
 
 // ecr calls an ECR JSON 1.1 action.
@@ -192,4 +224,88 @@ func (a *AWSSpot) projectImage(ctx context.Context, repoID, tag string) (string,
 		return "", fmt.Errorf("ECR: unreadable manifest for %s (%s)", tag, img.MediaType)
 	}
 	return m.Config.Digest, nil
+}
+
+// ImageSource is implemented by providers whose instances live in several
+// regions, each with its own registry: an image one region holds is copied
+// to another, never built there again (#192).
+type ImageSource interface {
+	// ImageSource returns a login for the repository of repoID in another
+	// of the runner's regions that holds tag, for the region of instanceID
+	// to copy it from. It is nil with no error when no other region holds
+	// it, and an error when one that might couldn't be asked.
+	ImageSource(ctx context.Context, instanceID, repoID, tag string) (*protocol.RegistryAuth, error)
+}
+
+// ImageSource looks for tag in the project's repository in every region
+// the runner may use or has used, other than instanceID's own. Of the
+// regions holding it, the first in the runner's order wins: the regions
+// it lists, then the rest by name.
+func (g *AWSGlobal) ImageSource(ctx context.Context, instanceID, repoID, tag string) (*protocol.RegistryAuth, error) {
+	home, err := g.regionOf(ctx, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	regions, merr := g.managedRegions(ctx)
+	if len(regions) == 0 {
+		return nil, merr
+	}
+	var others []string
+	for _, rg := range regions {
+		if rg != home {
+			others = append(others, rg)
+		}
+	}
+	others = imageSourceOrder(g.r.Regions, others)
+	var mu sync.Mutex
+	holds := map[string]bool{}
+	errs := eachRegion(ctx, others, func(ctx context.Context, rg string) error {
+		id, err := g.Regional(rg).projectImage(ctx, repoID, tag)
+		if err == nil && id != "" {
+			mu.Lock()
+			holds[rg] = true
+			mu.Unlock()
+		}
+		return err
+	})
+	for _, rg := range others {
+		if !holds[rg] {
+			continue
+		}
+		a := g.Regional(rg)
+		auth, err := a.ecrLogin(ctx)
+		if err != nil {
+			errs[rg] = err
+			continue
+		}
+		auth.Repo = auth.Server + "/spotexec/" + ecrName(repoID)
+		return auth, nil
+	}
+	// A region that couldn't be asked, or logged into, or listed, may hold
+	// it.
+	return nil, errors.Join(merr, joinRegionErrors(errs))
+}
+
+// imageSourceOrder orders regions: those listed (in their order), then
+// the rest by name.
+func imageSourceOrder(listed, regions []string) []string {
+	in := map[string]bool{}
+	for _, rg := range regions {
+		in[rg] = true
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, rg := range listed {
+		if in[rg] && !seen[rg] {
+			seen[rg] = true
+			out = append(out, rg)
+		}
+	}
+	for _, rg := range regions {
+		if !seen[rg] {
+			seen[rg] = true
+			out = append(out, rg)
+		}
+	}
+	return out
 }

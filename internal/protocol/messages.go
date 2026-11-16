@@ -56,7 +56,12 @@ const (
 	CodeSyncFailed   = "SYNC_FAILED"
 	CodeDepsFailed   = "DEPS_FAILED"
 	CodeImageFailed  = "IMAGE_FAILED"
-	CodeShutdown     = "RUNNER_SHUTTING_DOWN" // the VM began shutting down under the request
+	// CodeImageBuildFailed: the project's own Dockerfile failed to build
+	// (a RUN step failing, a syntax error, a COPY source missing), the
+	// project's failure rather than spotexec's. Detail is the end of the
+	// build's output.
+	CodeImageBuildFailed = "IMAGE_BUILD_FAILED"
+	CodeShutdown         = "RUNNER_SHUTTING_DOWN" // the VM began shutting down under the request
 )
 
 // ErrorMsg is sent by the helper for any failed request.
@@ -66,6 +71,11 @@ type ErrorMsg struct {
 	// Detail adds context for some codes: with RUNNER_BOOTING, the latest
 	// line of the VM's bootstrap log.
 	Detail string `json:"detail,omitempty"`
+	// BuildFailed marks an IMAGE_FAILED from the image build itself exiting
+	// non-zero (not a pull, login, push or setup failure, nor a timeout or
+	// cancellation): building the same tag again would fail the same way,
+	// so the client remembers it (#194).
+	BuildFailed bool `json:"build_failed,omitempty"`
 }
 
 // Hello opens a session.
@@ -93,6 +103,9 @@ type ClientInfo struct {
 	Worktree string `json:"worktree"`
 	Command  string `json:"command"`
 	RunID    string `json:"run_id"`
+	// Attempt: the client's reservation for this acquire (its pool
+	// ledger), echoed in holders so the client can match them.
+	Attempt string `json:"attempt,omitempty"`
 }
 
 // Acquire asks for a concurrency token and a workspace slot.
@@ -229,6 +242,10 @@ type Image struct {
 	// Probe uses an image already on the runner or in Registry, but never
 	// builds one: a miss is reported as ImageResult.Missing.
 	Probe bool `json:"probe,omitempty"`
+	// Source is another region's registry holding Tag: when Registry lacks
+	// it, the image is pulled from Source (keeping its ID) and pushed to
+	// Registry, instead of being built again (#192).
+	Source *RegistryAuth `json:"source,omitempty"`
 }
 
 // ImageResult reports the local image reference to run.
@@ -240,6 +257,7 @@ type ImageResult struct {
 	Pushing         bool   `json:"pushing"`
 	Pushed          bool   `json:"pushed,omitempty"`
 	Missing         bool   `json:"missing,omitempty"` // Probe: neither on the runner nor in the registry
+	Copied          bool   `json:"copied,omitempty"`  // pulled from Image.Source (another region)
 	InstalledDocker bool   `json:"installed_docker"`
 	MS              int64  `json:"ms"`
 }

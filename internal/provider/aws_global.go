@@ -324,6 +324,9 @@ type placementState struct {
 	Evidence        map[string]evidence `json:"evidence,omitempty"`
 	EvidenceProfile string              `json:"evidence_profile,omitempty"`
 	BakesForgotAt   time.Time           `json:"bakes_forgot_at,omitempty"`
+	// ColdWork: repository ID -> how long the project's image builds and
+	// dependency installs took on VMs of this runner (see RecordColdWork).
+	ColdWork map[string]*coldWork `json:"cold_work,omitempty"`
 	// Discovered: every managed region has been listed once. Until then
 	// (first use, an upgrade from single-region, a lost state file) listings
 	// cover them all rather than trusting Active.
@@ -333,6 +336,15 @@ type placementState struct {
 // withState runs fn on placement.json under placement.lock and saves it.
 // Never call the cloud inside fn.
 func (g *AWSGlobal) withState(fn func(st *placementState)) error {
+	return g.withStateWait(0, fn)
+}
+
+// errStateBusy: placement.lock stayed held past withStateWait's wait.
+var errStateBusy = errors.New("placement state busy")
+
+// withStateWait is withState for what may be skipped: it waits at most
+// wait for placement.lock (0: as long as it takes), else errStateBusy.
+func (g *AWSGlobal) withStateWait(wait time.Duration, fn func(st *placementState)) error {
 	if err := os.MkdirAll(g.dir, 0o700); err != nil {
 		return err
 	}
@@ -341,8 +353,25 @@ func (g *AWSGlobal) withState(fn func(st *placementState)) error {
 		return err
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return err
+	if wait <= 0 {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			return err
+		}
+	} else {
+		deadline := time.Now().Add(wait)
+		for {
+			err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, syscall.EWOULDBLOCK) {
+				return err
+			}
+			if time.Now().After(deadline) {
+				return errStateBusy
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	path := filepath.Join(g.dir, "placement.json")
@@ -704,6 +733,9 @@ type PriceTable struct {
 	// warmth: what each region holds of a cold start's parts, for the
 	// project the table was looked up for (run_cost across regions).
 	warmth map[string]regionWarmth
+	// repoID: that project's repository ID ("" outside a project), whose
+	// measured builds and installs price the cold start.
+	repoID string
 }
 
 func (g *AWSGlobal) priceKey(regions []string) string {
@@ -773,6 +805,7 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 		})
 		if t.Cached {
 			t.warmth = g.warmth(ctx, t, false)
+			t.repoID = repoOf(ctx)
 			return t, nil
 		}
 	}
@@ -859,6 +892,7 @@ func (g *AWSGlobal) Prices(ctx context.Context, refresh bool) (PriceTable, error
 		saveRTTs(st, regions)
 	})
 	t.warmth = g.warmth(ctx, t, refresh)
+	t.repoID = repoOf(ctx)
 	return t, nil
 }
 

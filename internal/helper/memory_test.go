@@ -350,3 +350,81 @@ func TestLivenessUsesTheMonotonicClock(t *testing.T) {
 		t.Fatal("stall grace misjudged")
 	}
 }
+
+// /dev/shm is half the job's fair share of the daemon's memory, or 1 GiB
+// when that's unknown.
+func TestShmSize(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		total     int64
+		slots     int
+		exclusive bool
+		wantMiB   int64
+	}{
+		{"16 GiB, 4 slots", 16 * gb, 4, false, 1920},
+		{"16 GiB, exclusive", 16 * gb, 4, true, 7680},
+		{"16 GiB, one slot", 16 * gb, 1, false, 7680},
+		{"4 GiB, 2 slots", 4 * gb, 2, false, 896},
+		{"an odd share rounds down to a MiB", 15*gb + 601<<20, 3, false, (15*gb + 601<<20 - (15*gb+601<<20)/16) / 3 / 2 >> 20},
+		{"more slots than memory: half the 256 MiB share floor", 2 * gb, 44, false, 128},
+		{"unknown memory", 0, 4, false, 1024},
+	} {
+		got := shmSize(c.total, c.slots, c.exclusive)
+		if got>>20 != c.wantMiB || got&(1<<20-1) != 0 {
+			t.Errorf("%s: %d bytes, want %d MiB", c.name, got, c.wantMiB)
+		}
+	}
+}
+
+// A project container gets a /dev/shm sized from the daemon's memory
+// unless container.options sets its own, or its own IPC.
+func TestShmArgs(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	s := &Session{maxSlots: 4, tokens: []*flock{nil}, tokenIdx: 2}
+	d := dockerRunner{info: " Context:    default\n Total Memory: 16GiB\n"}
+	want := []string{"--shm-size", strconv.FormatInt(shmSize(16*gb, 4, false), 10)}
+	for _, o := range [][]string{nil, {"--label", "--shm-size"}, {"--label", "--ipc=host"}, {"-e", "--ipc"},
+		{"--memory=4g"}, {"--cgroup-parent", "x"}, {"--cpus=2"}, {"--network", "none"},
+		{"--mount", "type=tmpfs,target=/dev/shm"}, {"-v", "/dev/shm:/dev/shm"}, {"-it", "--rm"}} {
+		if got := s.shmArgs(&protocol.ContainerRun{Options: o}, d); !slices.Equal(got, want) {
+			t.Errorf("%v: %v, want %v", o, got, want)
+		}
+	}
+	for _, o := range [][]string{{"--shm-size=1g"}, {"--shm-size", "1g"}, {"--ipc=host"}, {"--ipc", "private"},
+		{"--ipc=shareable"}, {"--ipc", "container:x"}, {"--ipc=none"}, {"--use-api-socket", "--ipc", "host"}, {"-it", "--shm-size=2g"}} {
+		if got := s.shmArgs(&protocol.ContainerRun{Options: o}, d); got != nil {
+			t.Errorf("%v: %v, want none", o, got)
+		}
+	}
+	// A job alone on the machine (--exclusive, or holding more than one
+	// slot's token) gets half of all it can use.
+	for name, s := range map[string]*Session{
+		"--exclusive": {acq: protocol.Acquire{Exclusive: true}, maxSlots: 4, tokens: []*flock{nil}},
+		"two tokens":  {maxSlots: 4, tokens: []*flock{nil, nil}},
+		"one slot":    {maxSlots: 1, tokens: []*flock{nil}},
+	} {
+		if got := s.shmArgs(&protocol.ContainerRun{}, d); got[1] != strconv.FormatInt(shmSize(16*gb, 1, false), 10) {
+			t.Errorf("%s: %v", name, got)
+		}
+	}
+	// Without the daemon's memory, a local Linux daemon is sized from the
+	// runner's; any other gets the fallback.
+	wantLocal := int64(shmFallback)
+	if runtime.GOOS == "linux" {
+		wantLocal = shmSize(hostMemTotal(), 4, false)
+	}
+	if got := s.shmArgs(&protocol.ContainerRun{}, dockerRunner{info: " Context:    default\n"}); got[1] != strconv.FormatInt(wantLocal, 10) {
+		t.Errorf("local daemon, memory unknown: %v, want %d", got, wantLocal)
+	}
+	// A remote daemon: the runner's memory isn't Docker's.
+	if got := s.shmArgs(&protocol.ContainerRun{}, dockerRunner{info: " Context:    build-box\n"}); got[1] != strconv.FormatInt(shmFallback, 10) {
+		t.Errorf("remote context, memory unknown: %v", got)
+	}
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.1:2375")
+	if got := s.shmArgs(&protocol.ContainerRun{}, dockerRunner{}); got[1] != strconv.FormatInt(shmFallback, 10) {
+		t.Errorf("remote daemon, memory unknown: %v", got)
+	}
+	if got := s.shmArgs(&protocol.ContainerRun{}, d); !slices.Equal(got, want) {
+		t.Errorf("remote daemon that reports its memory: %v, want %v", got, want)
+	}
+}

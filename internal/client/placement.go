@@ -1,9 +1,13 @@
 package client
 
 import (
+	"fmt"
+	"time"
+
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/depskey"
 	"github.com/daintreehq/spotexec/internal/manifest"
+	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 )
 
@@ -17,9 +21,21 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 	if p == nil || ws == nil || r.Type != config.TypeAWSSpot || !r.MultiRegion() {
 		return nil
 	}
+	pj, _ := ProjectKeys(p, ws, m, noDeps, r)
+	return pj
+}
+
+// ProjectKeys is what a run of this checkout on aws-spot runner r keeps in
+// a region (see provider.Project): the content tag of the image it builds
+// from its Dockerfile and the key of its dependency archive, computed as
+// the run computes them, in one region or several. A key that can't be
+// computed is left unset, and the first such failure is returned with
+// what could be (m nil fails none: the keys are just unknown).
+func ProjectKeys(p *config.Project, ws *Workspace, m *manifest.Manifest, noDeps bool, r *config.Runner) (*provider.Project, error) {
 	// AWS VMs are Linux; the runner's arch is the Go name the helper reports.
 	goos, arch := "linux", r.Arch
 	pj := &provider.Project{RepoID: ws.RepoID}
+	var first error
 	c := p.Container
 	if c.Enabled() && c.Image == "" {
 		pj.Image = true
@@ -27,18 +43,26 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 			// unknown without the manifest
 		} else if tag, err := imageTag(m, c.Dockerfile, c.Context, goos+"/"+arch, readFrom(ws.Root)); err == nil {
 			pj.ImageTag = tag
+		} else {
+			first = fmt.Errorf("image tag: %w", err)
 		}
 	}
 	if p.Deps.Install == "" || noDeps || len(p.Deps.Lockfiles) == 0 {
-		return pj
+		return pj, first
 	}
 	pj.Deps = true
 	if m == nil {
-		return pj
+		return pj, first
 	}
 	lockfiles, _, err := DepsLockfiles(m, p.Deps.Lockfiles)
-	if err != nil || len(lockfiles) == 0 {
-		return pj
+	if err != nil {
+		if first == nil {
+			first = fmt.Errorf("dependency lockfiles: %w", err)
+		}
+		return pj, first
+	}
+	if len(lockfiles) == 0 {
+		return pj, first
 	}
 	spec := depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, OS: goos, Arch: arch}
 	switch {
@@ -46,6 +70,8 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 		spec.Toolchain = toolchainFor(r, nil)
 		if key, err := depskey.Key(ws.Root, spec); err == nil {
 			pj.DepsKey = key
+		} else if first == nil {
+			first = fmt.Errorf("dependency key: %w", err)
 		}
 	case pj.Image:
 		// Keyed by the image's ID, which differs from region to region
@@ -57,11 +83,37 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 			return depskey.Key(ws.Root, s)
 		}
 	}
-	return pj
+	return pj, first
 }
 
 // PlacementNeedsManifest reports whether PlacementProject needs the
 // project's manifest: for a dependency key or an image tag.
 func PlacementNeedsManifest(p *config.Project) bool {
 	return p.Deps.Install != "" || p.Container.Enabled() && p.Container.Image == ""
+}
+
+// recordImageBuild keeps how long the run's image build took on the leased
+// runner, for the runner's next launch to price a region without the image
+// by (#195). A pull or a reuse built nothing, and isn't kept.
+func recordImageBuild(lease *Lease, ws *Workspace, r protocol.ImageResult) {
+	if r.Built {
+		recordColdWork(lease, ws, provider.ColdImage, r.MS)
+	}
+}
+
+// recordDepsInstall is recordImageBuild for the dependency install: a
+// restore or a hydration from the runner's cache installed nothing.
+func recordDepsInstall(lease *Lease, ws *Workspace, dr protocol.DepsResult) {
+	if dr.Built {
+		recordColdWork(lease, ws, provider.ColdDeps, dr.MS)
+	}
+}
+
+// recordColdWork records one measurement. Best effort: a failure to save it
+// never fails the run.
+func recordColdWork(lease *Lease, ws *Workspace, part provider.ColdWorkPart, ms int64) {
+	if lease == nil || ws == nil || ms <= 0 {
+		return
+	}
+	_ = provider.RecordColdWork(lease.Runner, ws.RepoID, part, time.Duration(ms)*time.Millisecond)
 }

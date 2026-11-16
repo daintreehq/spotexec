@@ -319,26 +319,43 @@ func TestShareWaitEndsWhenTheClientIsGone(t *testing.T) {
 	}
 }
 
-// registryDocker puts a docker on PATH that has the images named in the
-// returned directory (files local-<tag>, remote-<tag>) and logs builds.
+// registryDocker puts a docker on PATH that tracks images by full
+// reference, each with its ID. The returned directory seeds them: files
+// local-<tag> (spotexec-local/r:<tag>, ID sha256:feed), remote-<tag> (the
+// runner's registry, ID sha256:home) and source-<tag> (another region's
+// registry src.example, ID sha256:src); nologin-<server> fails that login.
+// Builds and pushes ("<ref> <id>") are logged.
 func registryDocker(t *testing.T) (dir string) {
 	t.Helper()
 	dir = t.TempDir()
 	script := `#!/bin/sh
 d=` + shq(dir) + `
+ref() { echo "$d/ref-$(echo "$1" | tr '/:' '__')"; }
+id() {
+  if [ -e "$(ref "$1")" ]; then cat "$(ref "$1")"; return 0; fi
+  case "$1" in spotexec-local/r:*) [ -e "$d/local-${1##*:}" ] && { echo sha256:feed; return 0; } ;; esac
+  return 1
+}
 [ "$1" = --config ] && shift 2
 case "$1" in
 info) exit 0 ;;
-login) cat >/dev/null; exit 0 ;;
-image) [ "$2" = inspect ] || exit 1
-  for a; do ref=$a; done
-  tag=${ref##*:}; [ -e "$d/local-$tag" ] || exit 1
-  echo sha256:feed; exit 0 ;;
-pull) for a; do ref=$a; done; tag=${ref##*:}
-  [ -e "$d/remote-$tag" ] || { echo "manifest unknown" >&2; exit 1; }
+login) cat >/dev/null; for a; do srv=$a; done
+  [ -e "$d/nologin-$srv" ] && { echo "denied" >&2; exit 1; }
   exit 0 ;;
-tag) tag=${3##*:}; touch "$d/local-$tag"; exit 0 ;;
+image) [ "$2" = inspect ] || exit 1
+  for a; do r=$a; done
+  id "$r" || exit 1; exit 0 ;;
+pull) for a; do r=$a; done; tag=${r##*:}; have=remote; img=sha256:home
+  case "$r" in src.example/*) have=source; img=sha256:src ;; esac
+  [ -e "$d/$have-$tag" ] || { echo "manifest unknown" >&2; exit 1; }
+  echo "$img" > "$(ref "$r")"; exit 0 ;;
+tag) i=$(id "$2") || { echo "no such image $2" >&2; exit 1; }
+  echo "$i" > "$(ref "$3")"; exit 0 ;;
+rmi) rm -f "$(ref "$2")"; exit 0 ;;
 build) echo "$@" >> "$d/builds"; exit 0 ;;
+push) for a; do r=$a; done
+  i=$(id "$r") || { echo "no such image $r" >&2; exit 1; }
+  echo "$r $i" >> "$d/pushes"; exit 0 ;;
 *) exit 0 ;;
 esac
 `
@@ -387,6 +404,175 @@ func TestImageProbe(t *testing.T) {
 			}
 			if _, err := os.Stat(filepath.Join(dir, "builds")); !os.IsNotExist(err) {
 				t.Fatalf("probe built the image: %v", err)
+			}
+		})
+	}
+}
+
+// #194: only the image build itself failing is marked as a failure to
+// remember: not docker missing under the shell, the login profile giving
+// up, a build killed under its shell, the daemon going away during the
+// build, or a setup failure. The mark reaches the client.
+func TestImageBuildFailureIsMarked(t *testing.T) {
+	const tag = "0123456789abcdef"
+	for _, tc := range []struct {
+		name       string
+		exit       int
+		daemonGone bool // the build takes the daemon down with it
+		synced     bool
+		marked     bool
+	}{
+		{"the build fails", 1, false, true, true},
+		{"the profile gives up", 125, false, true, false},
+		{"docker isn't there", 127, false, true, false},
+		{"the build is killed", 137, false, true, false},
+		{"the daemon goes away", 1, true, true, false},
+		{"the Dockerfile wasn't synced", 1, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			gone := ""
+			if tc.daemonGone {
+				gone = "touch \"$d/gone\"; "
+			}
+			script := fmt.Sprintf("#!/bin/sh\nd=%s\ncase \"$1\" in\ninfo) [ -e \"$d/gone\" ] && exit 1; exit 0 ;;\nimage) exit 1 ;;\nbuild) touch \"$d/built\"; %secho 'RUN false: exit 1' >&2; exit %d ;;\nesac\nexit 0\n", shq(dir), gone, tc.exit)
+			if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// The build runs under a login profile, which may set its own
+			// PATH (macOS's /etc/paths.d puts any installed docker first):
+			// the profile in HOME puts the stub back in front.
+			home := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, ".profile"), []byte("PATH="+shq(dir)+":$PATH\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", home)
+			t.Setenv("PATH", dir+":/usr/bin:/bin")
+			s := testSession(t, t.TempDir())
+			if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(s.workspace, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			s.stored = map[string]storedEntry{}
+			if tc.synced {
+				s.stored["Dockerfile"] = storedEntry{}
+			}
+			s.c = protocol.NewConn(strings.NewReader(""), &syncBuf{})
+			err := s.image(protocol.Image{Dockerfile: "Dockerfile", Tag: tag})
+			var pe *protoError
+			if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed {
+				t.Fatalf("got %v", err)
+			}
+			if _, serr := os.Stat(filepath.Join(dir, "built")); (serr == nil) != tc.synced {
+				t.Fatalf("stub build ran: %v, want %v", serr == nil, tc.synced)
+			}
+			if pe.buildFailed != tc.marked || pe.wire().BuildFailed != tc.marked {
+				t.Fatalf("%v: marked %v (sent %v), want %v", err, pe.buildFailed, pe.wire().BuildFailed, tc.marked)
+			}
+		})
+	}
+}
+
+// Only docker itself running to a failing exit is a failed build.
+func TestStreamExitBuilt(t *testing.T) {
+	for _, tc := range []struct {
+		e    streamExit
+		want bool
+	}{
+		{streamExit{code: 1, ran: true}, true},
+		{streamExit{code: 2, ran: true}, true},
+		{streamExit{code: 1, ran: false}, false}, // canceled
+		{streamExit{code: 125, ran: true}, false},
+		{streamExit{code: 126, ran: true}, false},
+		{streamExit{code: 127, ran: true}, false},
+		{streamExit{code: 124, ran: false}, false}, // timed out
+		{streamExit{code: 143, ran: false}, false}, // killed
+	} {
+		if got := tc.e.built(); got != tc.want {
+			t.Errorf("%+v: built %v, want %v", tc.e, got, tc.want)
+		}
+	}
+}
+
+// #192: an image the runner's registry lacks but another region's holds is
+// copied from there and pushed to the runner's registry, never built.
+func TestImageCopiesFromAnotherRegion(t *testing.T) {
+	const tag = "0123456789abcdef"
+	for _, tc := range []struct {
+		name               string
+		inSource, waitPush bool
+		probe, noLogin     bool
+	}{
+		{"probe copies and pushes in the background", true, false, true, false},
+		{"container build waits for the push", true, true, false, false},
+		{"a source without it is a miss", false, false, true, false},
+		{"container build can't push without a login", true, true, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := registryDocker(t)
+			seed := func(name string) {
+				if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.inSource {
+				seed("source-" + tag)
+			}
+			if tc.noLogin {
+				seed("nologin-reg.example")
+			}
+			s := testSession(t, t.TempDir())
+			if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err != nil {
+				t.Fatal(err)
+			}
+			out := &syncBuf{}
+			s.c = protocol.NewConn(strings.NewReader(""), out)
+			err := s.image(protocol.Image{Dockerfile: "Dockerfile", Tag: tag, Probe: tc.probe, WaitPush: tc.waitPush,
+				Registry: &protocol.RegistryAuth{Server: "reg.example", Repo: "reg.example/spotexec/r", User: "AWS", Password: "pw"},
+				Source:   &protocol.RegistryAuth{Server: "src.example", Repo: "src.example/spotexec/r", User: "AWS", Password: "pw2"}})
+			if tc.noLogin {
+				if err == nil || !strings.Contains(err.Error(), "could not log in to push") {
+					t.Fatalf("err = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var res protocol.ImageResult
+			replies(t, out, protocol.TypeImageResult, &res)
+			if _, err := os.Stat(filepath.Join(dir, "builds")); !os.IsNotExist(err) {
+				t.Fatalf("built the image: %v", err)
+			}
+			if !tc.inSource {
+				if !res.Missing || res.Copied || res.Pulled {
+					t.Fatalf("result %+v", res)
+				}
+				return
+			}
+			// The source's image, under the local name, with its ID.
+			if res.Missing || !res.Copied || !res.Pulled || res.Built || res.ImageID != "sha256:src" || res.Image != "spotexec-local/r:"+tag {
+				t.Fatalf("result %+v", res)
+			}
+			if tc.waitPush != res.Pushed || tc.waitPush == res.Pushing {
+				t.Fatalf("pushed %v, pushing %v", res.Pushed, res.Pushing)
+			}
+			if res.Pushing {
+				tr := s.transfers[protocol.ShareImage]
+				select {
+				case <-tr.done:
+				case <-time.After(time.Minute):
+					t.Fatal("the push never ended")
+				}
+				if tr.err != nil {
+					b, _ := os.ReadFile(filepath.Join(s.layout.Root, "image-push.log"))
+					t.Fatalf("push: %v: %s", tr.err, b)
+				}
+			}
+			if b, _ := os.ReadFile(filepath.Join(dir, "pushes")); strings.TrimSpace(string(b)) != "reg.example/spotexec/r:"+tag+" sha256:src" {
+				t.Fatalf("pushed %q", b)
 			}
 		})
 	}

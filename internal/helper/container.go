@@ -162,6 +162,40 @@ fi`
 	return d, true, err
 }
 
+// build runs the project's docker build, its output streaming to the client
+// as it comes. A build that fails because of the Dockerfile itself is
+// IMAGE_BUILD_FAILED, with the end of its output; any other failure (Docker,
+// the network, the VM, a timeout) is IMAGE_FAILED (#193). Either is marked
+// BuildFailed when docker build itself ran and failed with the daemon still
+// answering (up), so the client remembers it (#194).
+func (s *Session) build(ctx context.Context, script, dockerfile string, up func() bool) error {
+	left := time.Until(deadlineOf(ctx))
+	if left <= 0 {
+		return perr(protocol.CodeImageFailed, "docker build %s: image preparation timed out", dockerfile)
+	}
+	var log buildLog
+	pr := s.runProc(script, s.workspace, nil, left, 5*time.Second, false, teeOut(func(kind byte, p []byte) {
+		i := 0
+		if kind == protocol.KindStderr {
+			i = 1
+		}
+		log.write(i, p)
+	}))
+	switch {
+	case pr.startErr != nil:
+		return perr(protocol.CodeImageFailed, "docker build %s: %v", dockerfile, pr.startErr)
+	case pr.code != 0:
+		se := &streamExit{code: pr.code, ran: !pr.timedOut && !pr.canceled && !pr.spotIntr && pr.signal == ""}
+		err := log.failure(dockerfile, pr, se)
+		var pe *protoError
+		if errors.As(err, &pe) {
+			pe.buildFailed = se.built() && up()
+		}
+		return err
+	}
+	return nil
+}
+
 // imageName turns a repo id into a valid Docker/ECR repository component.
 func imageName(repoID string) string {
 	var b strings.Builder
@@ -176,6 +210,29 @@ func imageName(repoID string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
+}
+
+// streamExit is a streamed docker command exiting non-zero.
+type streamExit struct {
+	code int
+	ran  bool // it ran to its own exit: not timed out, canceled or killed
+}
+
+func (e *streamExit) Error() string { return fmt.Sprintf("exit %d", e.code) }
+
+// built reports whether docker itself ran and failed, rather than what is
+// in front of it or under it: the login profile giving up (125), the shell
+// or sg (126: not executable, 127: not found), or a process killed by a
+// signal and reported by its shell (128+n).
+func (e *streamExit) built() bool { return e.ran && e.code < 125 }
+
+// daemonUp reports whether the Docker daemon answers: a build that failed
+// because it went away (restarted, crashed) is not the build failing.
+func daemonUp(d dockerRunner) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := runShell(ctx, d.cmd("info")+" >/dev/null 2>&1")
+	return err == nil
 }
 
 func (s *Session) image(m protocol.Image) error {
@@ -208,7 +265,7 @@ func (s *Session) image(m protocol.Image) error {
 			return pr.startErr
 		}
 		if pr.code != 0 {
-			return fmt.Errorf("exit %d", pr.code)
+			return &streamExit{code: pr.code, ran: !pr.timedOut && !pr.canceled && !pr.spotIntr && pr.signal == ""}
 		}
 		return nil
 	}
@@ -298,6 +355,35 @@ func (s *Session) image(m protocol.Image) error {
 				}
 			}
 		}
+		if m.Source != nil {
+			// Another region holds the image: copy it rather than build it
+			// again, so every region runs the same image (#192).
+			copied, err := s.copyImage(ctx, d, m.Source, m.Tag, local)
+			if err != nil {
+				_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_registry_error", Message: err.Error()})
+			}
+			if copied {
+				res.Pulled, res.Copied = true, true
+				if m.WaitPush && m.Registry != nil && cfgDir == "" {
+					// container build promises the push: the login failed.
+					return perr(protocol.CodeImageFailed, "copied %s from %s but could not log in to push it to %s", m.Dockerfile, m.Source.Server, m.Registry.Repo)
+				}
+				if m.Registry != nil && cfgDir != "" {
+					remote := m.Registry.Repo + ":" + m.Tag
+					if m.WaitPush {
+						_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_push", Message: remote})
+						if out, err := runShell(ctx, d.cmd("tag "+shq(local)+" "+shq(remote))+" && "+d.cmd("--config "+shq(cfgDir)+" push -q "+shq(remote))); err != nil {
+							return perr(protocol.CodeImageFailed, "copied %s from %s but could not push it to %s: %v: %s", m.Dockerfile, m.Source.Server, remote, err, firstLines(string(out), 3))
+						}
+						res.Pushed = true
+					} else if t, err := startImagePush(s.layout.Root, d, local, remote, cfgDir); err == nil {
+						s.track(protocol.ShareImage, t)
+						res.Pushing = true
+					}
+				}
+				break
+			}
+		}
 		if m.Probe {
 			// The client decides who builds (one run for every runner
 			// waiting on this tag), and asks again.
@@ -311,8 +397,8 @@ func (s *Session) image(m protocol.Image) error {
 		}
 		defer cleanup()
 		_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_build", Message: m.Dockerfile})
-		if err := stream(d.cmd("build -f " + shq(dockerfile) + " -t " + shq(local) + " " + shq(buildCtx))); err != nil {
-			return perr(protocol.CodeImageFailed, "docker build %s: %v", m.Dockerfile, err)
+		if err := s.build(ctx, d.cmd("build -f "+shq(dockerfile)+" -t "+shq(local)+" "+shq(buildCtx)), m.Dockerfile, func() bool { return daemonUp(d) }); err != nil {
+			return err
 		}
 		res.Built = true
 		if m.Registry != nil && cfgDir != "" {
@@ -354,6 +440,29 @@ func firstLines(s string, n int) string {
 		lines = lines[:n]
 	}
 	return strings.Join(lines, " | ")
+}
+
+// copyImage pulls tag from another region's registry src and tags it
+// local, keeping its image ID. A tag src doesn't hold (it expired meanwhile)
+// is no copy and no error.
+func (s *Session) copyImage(ctx context.Context, d dockerRunner, src *protocol.RegistryAuth, tag, local string) (bool, error) {
+	cfgDir, err := dockerLogin(ctx, d, src)
+	if err != nil {
+		return false, fmt.Errorf("source registry %s: %v", src.Server, err)
+	}
+	defer os.RemoveAll(cfgDir)
+	remote := src.Repo + ":" + tag
+	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_copy", Message: remote})
+	out, err := runShell(ctx, d.cmd("--config "+shq(cfgDir)+" pull -q "+shq(remote))+" && "+d.cmd("tag "+shq(remote)+" "+shq(local)))
+	if err != nil {
+		if msg := string(out); !strings.Contains(msg, "not found") && !strings.Contains(msg, "manifest unknown") {
+			return false, fmt.Errorf("copying %s: %s", remote, firstLines(msg, 3))
+		}
+		return false, nil
+	}
+	// The source's name for it isn't needed on this VM.
+	_, _ = runShell(ctx, d.cmd("rmi "+shq(remote))+" >/dev/null 2>&1")
+	return true, nil
 }
 
 // stageContext builds the docker build context from exactly the synced
@@ -645,12 +754,31 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	}
 	// Before procMu: these may send an event.
 	limits := append(s.cpusetArgs(run, d), s.memoryArgs(run, d)...)
+	limits = append(limits, s.shmArgs(run, d)...)
 	s.procMu.Lock()
 	if s.stopping.Load() {
 		s.procMu.Unlock()
 		select {}
 	}
 	defer s.procMu.Unlock()
+	// Under procMu, so teardown waits for the container it creates.
+	var users []string
+	if uid, gid := os.Getuid(), os.Getgid(); !run.Root && uid != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		passwd, group, err := s.runUserFiles(ctx, d, run.Image, uid, gid)
+		cancel()
+		if err != nil {
+			return "", nil, nil, perr(protocol.CodeImageFailed, "%v", err)
+		}
+		// --mount, not -v: a missing source fails the run instead of
+		// becoming an empty directory. A file container.options already
+		// mounts there is left to it (Docker refuses two mounts at one path).
+		for _, m := range [][2]string{{passwd, "/etc/passwd"}, {group, "/etc/group"}} {
+			if !mountsAt(run.Options, m[1]) {
+				users = append(users, "--mount", "type=bind,source="+m[0]+",target="+m[1]+",readonly")
+			}
+		}
+	}
 	runDir := filepath.Join(s.slotDir, "run")
 	home := filepath.Join(s.slotDir, "home")
 	for _, dd := range []string{runDir, home} {
@@ -754,7 +882,8 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 
 	if !run.Root {
 		args = append(args, "--user", strconv.Itoa(os.Getuid())+":"+strconv.Itoa(os.Getgid()),
-			"-v", home+":/home/spotexec", "-e", "HOME=/home/spotexec")
+			"-v", home+":"+runUserHome, "-e", "HOME="+runUserHome)
+		args = append(args, users...)
 	}
 	args = append(args, limits...)
 	args = append(args, run.Options...)
@@ -1057,7 +1186,8 @@ func (s *Session) removeContainers(prefixOnly bool) string {
 // returns those that still exist.
 func (s *Session) sweepSlotContainers(ctx context.Context, d dockerRunner) string {
 	filter := "--filter " + shq("name=^"+s.containerPrefix())
-	_, _ = runShell(ctx, d.cmd("ps -aq "+filter+" | xargs -r docker rm -f")+" >/dev/null 2>&1")
+	// -v: anonymous volumes too (an image's VOLUME makes them at create).
+	_, _ = runShell(ctx, d.cmd("ps -aq "+filter+" | xargs -r docker rm -fv")+" >/dev/null 2>&1")
 	out, err := runShell(ctx, d.cmd("ps -a --format '{{.Names}}' "+filter))
 	if err != nil {
 		return "(docker ps failed: " + strings.TrimSpace(string(out)) + ")"

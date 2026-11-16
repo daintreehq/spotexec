@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,32 +27,35 @@ import (
 // fakeRegionsEC2 serves just enough of EC2/SSM, per region, for multi-region
 // placement: prices, launches, listings and terminations.
 type fakeRegionsEC2 struct {
-	mu         sync.Mutex
-	prices     map[string][][3]string       // region -> {zone, type, price}
-	runErr     map[string]string            // "region/type" -> AWS error code for RunInstances
-	listErr    map[string]string            // region -> error code for tag-filtered DescribeInstances
-	noSubnet   map[string]bool              // zones without a default subnet
-	hang       bool                         // RunInstances never answers (until the client gives up)
-	fullSubnet map[string]bool              // zones whose subnet has no free addresses
-	launched   string                       // launch time reported for listed instances
-	state      map[string]string            // instance ID -> state (default running)
-	builders   map[string]bool              // regions holding a bake builder
-	instances  map[string]map[string]string // region -> id -> type
-	quota      map[string]int               // region -> standard Spot vCPU quota (unset: GetServiceQuota fails)
-	dead       map[string]bool              // regions whose endpoint never answers (not enabled); set before use
-	deny       map[string]bool              // regions answering AuthFailure to everything (not enabled); set before use
-	noRegions  bool                         // DescribeRegions is denied everywhere
-	priceErr   map[string]string            // region -> error code DescribeSpotPriceHistory answers
-	types      map[string][]string          // region -> DescribeInstanceTypes items (typeXML)
-	typesErr   map[string]string            // region -> error code DescribeInstanceTypes answers
-	subnetZone map[string]string            // subnet ID -> its zone (DescribeSubnets by ID)
-	bakes      map[string]bool              // regions holding a current bake of the runner
-	images     map[string]map[string]string // region -> ECR tag -> config digest (nil: no repository)
-	imageErr   map[string]string            // region -> error type BatchGetImage answers
-	cached     map[string]map[string]bool   // region -> dependency cache object keys held
-	cacheErr   map[string]int               // region -> HTTP status the cache bucket answers
-	calls      []string                     // "region Action [detail]"
-	next       int
+	mu          sync.Mutex
+	prices      map[string][][3]string       // region -> {zone, type, price}
+	runErr      map[string]string            // "region/type" -> AWS error code for RunInstances
+	listErr     map[string]string            // region -> error code for tag-filtered DescribeInstances
+	noSubnet    map[string]bool              // zones without a default subnet
+	hang        bool                         // RunInstances never answers (until the client gives up)
+	fullSubnet  map[string]bool              // zones whose subnet has no free addresses
+	launched    string                       // launch time reported for listed instances
+	state       map[string]string            // instance ID -> state (default running)
+	builders    map[string]bool              // regions holding a bake builder
+	instances   map[string]map[string]string // region -> id -> type
+	quota       map[string]int               // region -> standard Spot vCPU quota (unset: GetServiceQuota fails)
+	dead        map[string]bool              // regions whose endpoint never answers (not enabled); set before use
+	deny        map[string]bool              // regions answering AuthFailure to everything (not enabled); set before use
+	noRegions   bool                         // DescribeRegions is denied everywhere
+	priceErr    map[string]string            // region -> error code DescribeSpotPriceHistory answers
+	types       map[string][]string          // region -> DescribeInstanceTypes items (typeXML)
+	typesErr    map[string]string            // region -> error code DescribeInstanceTypes answers
+	subnetZone  map[string]string            // subnet ID -> its zone (DescribeSubnets by ID)
+	bakes       map[string]bool              // regions holding a current bake of the runner
+	images      map[string]map[string]string // region -> ECR tag -> config digest (nil: no repository)
+	imageErr    map[string]string            // region -> error type BatchGetImage answers
+	pushed      map[string]map[string]int64  // region -> ECR tag -> push time (Unix ms); DescribeImages pages one image at a time
+	describeErr map[string]string            // region -> error type DescribeImages answers
+	loginErr    map[string]bool              // regions whose GetAuthorizationToken fails
+	cached      map[string]map[string]bool   // region -> dependency cache object keys held
+	cacheErr    map[string]int               // region -> HTTP status the cache bucket answers
+	calls       []string                     // "region Action [detail]"
+	next        int
 }
 
 func (f *fakeRegionsEC2) log(region, s string) {
@@ -66,6 +72,52 @@ func (f *fakeRegionsEC2) callsOf(action string) []string {
 		}
 	}
 	return out
+}
+
+// describeImages answers ECR DescribeImages from f.images and f.pushed,
+// one image per page, newest tag name first (unsorted by time, as ECR).
+func (f *fakeRegionsEC2) describeImages(w http.ResponseWriter, region string, body []byte) {
+	var in struct {
+		Repo   string            `json:"repositoryName"`
+		Filter map[string]string `json:"filter"`
+		Token  string            `json:"nextToken"`
+	}
+	_ = json.Unmarshal(body, &in)
+	f.log(region, "DescribeImages "+in.Repo+" "+in.Token)
+	tags, ok := f.images[region]
+	switch {
+	case f.describeErr[region] != "":
+		w.WriteHeader(400)
+		fmt.Fprintf(w, `{"__type":%q,"message":"no"}`, f.describeErr[region])
+		return
+	case !ok:
+		w.WriteHeader(400)
+		fmt.Fprint(w, `{"__type":"RepositoryNotFoundException","message":"no repository"}`)
+		return
+	case in.Filter["tagStatus"] != "TAGGED":
+		w.WriteHeader(400)
+		return
+	}
+	var names []string
+	for tag := range tags {
+		names = append(names, tag)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	i := 0
+	if in.Token != "" {
+		i, _ = strconv.Atoi(strings.TrimPrefix(in.Token, "page-"))
+	}
+	out := map[string]any{"imageDetails": []any{}}
+	if i < len(names) {
+		tag := names[i]
+		out["imageDetails"] = []any{map[string]any{"imageDigest": "sha256:m-" + tag, "imageTags": []string{tag},
+			"imagePushedAt": float64(f.pushed[region][tag]) / 1000, "imageSizeInBytes": 1000}}
+		if i+1 < len(names) {
+			out["nextToken"] = fmt.Sprintf("page-%d", i+1)
+		}
+	}
+	b, _ := json.Marshal(out)
+	w.Write(b)
 }
 
 func (f *fakeRegionsEC2) launchTime() string {
@@ -136,6 +188,26 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 				Types []string            `json:"acceptedMediaTypes"`
 			}
 			_ = json.Unmarshal(body, &in)
+			if r.Header.Get("X-Amz-Target") == "AmazonEC2ContainerRegistry_V20150921.DescribeImages" {
+				f.describeImages(w, region, body)
+				return
+			}
+			if r.Header.Get("X-Amz-Target") == "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken" {
+				f.log(region, "GetAuthorizationToken")
+				if f.loginErr[region] {
+					w.WriteHeader(400)
+					fmt.Fprint(w, `{"__type":"AccessDeniedException","message":"no"}`)
+					return
+				}
+				fmt.Fprintf(w, `{"authorizationData":[{"authorizationToken":%q,"proxyEndpoint":"https://123456789012.dkr.ecr.%s.amazonaws.com"}]}`,
+					base64.StdEncoding.EncodeToString([]byte("AWS:pw-"+region)), region)
+				return
+			}
+			if len(in.IDs) == 0 {
+				t.Errorf("unexpected ECR request %s %s", r.Header.Get("X-Amz-Target"), body)
+				w.WriteHeader(400)
+				return
+			}
 			f.log(region, "BatchGetImage "+in.Repo+":"+in.IDs[0]["imageTag"])
 			if r.Header.Get("X-Amz-Target") != "AmazonEC2ContainerRegistry_V20150921.BatchGetImage" || len(in.Types) == 0 {
 				t.Errorf("unexpected ECR request %s %s", r.Header.Get("X-Amz-Target"), body)
