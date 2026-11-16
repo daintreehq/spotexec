@@ -117,8 +117,11 @@ func TestBrowserLibs(t *testing.T) {
 	pkgs := func(body string) map[string]bool {
 		set := map[string]bool{}
 		// Every line of the RUN but its last continues onto the next.
-		_, block, _ := strings.Cut(body, "\nRUN apt-get update")
-		block, _, _ = strings.Cut(block, "&& rm -rf /var/lib/apt/lists/*\n")
+		_, block, ok1 := strings.Cut(body, "\nRUN apt-get update \\\n")
+		block, _, ok2 := strings.Cut(block, "&& rm -rf /var/lib/apt/lists/*\n")
+		if !ok1 || !ok2 || !strings.Contains(block, "apt-get install -y --no-install-recommends \\\n") {
+			t.Fatalf("no apt-get RUN in:\n%s", body)
+		}
 		for _, l := range strings.Split(block, "\n") {
 			if strings.TrimSpace(l) != "" && !strings.HasSuffix(l, " \\") {
 				t.Errorf("RUN line doesn't continue: %q", l)
