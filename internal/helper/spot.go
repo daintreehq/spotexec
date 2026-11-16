@@ -60,7 +60,7 @@ func (s *Session) watchNotices() {
 // systemStopping reports whether the machine is shutting down (systemd's
 // "stopping" state; in the simulator, a marker file standing in for it).
 func systemStopping() bool {
-	if _, err := os.Stat(SimDir); err == nil {
+	if simulated() {
 		_, err := os.Stat(filepath.Join(SimDir, "stopping"))
 		return err == nil
 	}
@@ -72,7 +72,7 @@ func systemStopping() bool {
 
 func markDraining(root, msg string) {
 	p := filepath.Join(root, "draining")
-	if _, err := os.Stat(LifecycleDir); err == nil {
+	if onSpotexecVM() {
 		p = DrainingFile
 	}
 	_ = os.WriteFile(p, []byte(msg+"\n"), 0o644)
@@ -83,8 +83,7 @@ func markDraining(root, msg string) {
 // an interruption. Metadata errors back off but never disable polling: a
 // transient failure must not hide a later interruption notice.
 func pollNotices(ctx context.Context, out chan<- notice) {
-	_, err := os.Stat(SimDir)
-	sim := err == nil
+	sim := simulated()
 	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	var token string
 	var tokenAt time.Time
@@ -158,10 +157,10 @@ func imdsGet(ctx context.Context, c *http.Client, token *string, path string) (s
 // SpotNotice checks once (no session needed) for a pending interruption:
 // the simulator file or IMDSv2 spot/instance-action. "" means none.
 func SpotNotice(ctx context.Context) string {
-	if b, err := os.ReadFile(filepath.Join(SimDir, "instance-action")); err == nil {
-		return "spot interruption notice: " + strings.TrimSpace(string(b))
-	}
-	if _, err := os.Stat(SimDir); err == nil {
+	if simulated() {
+		if b, err := os.ReadFile(filepath.Join(SimDir, "instance-action")); err == nil {
+			return "spot interruption notice: " + strings.TrimSpace(string(b))
+		}
 		return ""
 	}
 	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{Proxy: nil}}

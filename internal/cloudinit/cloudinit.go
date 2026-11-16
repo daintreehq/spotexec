@@ -50,7 +50,34 @@ var tmpl = template.Must(template.New("ud").Parse(`#!/bin/bash
 # user's bootstrap scripts.
 set -u
 D=/var/tmp/spotexec
-mkdir -p "$D"
+# /var/tmp is world-writable, so on a custom image another account may
+# already have put a directory, file or symlink at $D, or files in a
+# world-writable one (a planted created_at -> /etc/passwd, written below as
+# root). The helper trusts only a real directory root owns that others
+# can't write to, and so does everything below: anything else is removed
+# (a link itself, never its target). Once root owns the entry, /var/tmp's
+# sticky bit keeps everyone else from replacing it.
+# Owner and mode come from one stat, and anything it can't read fails.
+sx_rootdir() {
+  [ ! -L "$D" ] && [ -d "$D" ] || return 1
+  case "$(stat -c %u:%A "$D" 2>/dev/null)" in
+    0:d???????w?) return 1 ;; # others can write
+    0:d*) return 0 ;;
+  esac
+  return 1
+}
+for _ in 1 2 3; do
+  if [ -e "$D" ] || [ -L "$D" ]; then sx_rootdir || timeout 60 rm -rf "$D"; fi
+  mkdir -p "$D" 2>/dev/null
+  sx_rootdir && break
+done
+if ! sx_rootdir; then
+  # The watchdog isn't armed yet: nothing else would ever stop this VM.
+  logger -t spotexec "$D is not a directory root owns; shutting down" 2>/dev/null
+  {{.SelfDestruct}}
+  sleep 120; poweroff -f
+  exit 1
+fi
 chmod 0755 "$D"   # opened to the runner user's group below
 # User-data runs once per instance, so this is the instance's own birth time
 # (an AMI baked from a runner must not inherit an old one).

@@ -24,7 +24,7 @@ import (
 // the default score (oomLowered), since children inherit it. Off spotexec's
 // VMs (an ssh runner someone else runs) nothing is changed.
 func protectControlPlane() {
-	if _, err := os.Stat(LifecycleDir); err != nil {
+	if !onSpotexecVM() {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

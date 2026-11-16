@@ -62,13 +62,17 @@ func GetStatus(root string) Status {
 		st.Holders = []protocol.Holder{}
 	}
 	st.Waiters = readWaiters(l)
+	vm := onSpotexecVM()
 	for _, p := range []string{ActivityFile, filepath.Join(root, "activity")} {
+		if p == ActivityFile && !vm {
+			continue
+		}
 		if fi, err := os.Stat(p); err == nil {
 			st.IdleS = max(0, int64(time.Since(fi.ModTime()).Seconds()))
 			break
 		}
 	}
-	if b, err := os.ReadFile(filepath.Join(LifecycleDir, "idle_timeout")); err == nil {
+	if b, err := lifecycleFile("idle_timeout"); err == nil {
 		st.Ephemeral = true
 		st.IdleTimeout = strings.TrimSpace(string(b))
 		if b, err := os.ReadFile(filepath.Join(LifecycleDir, "ready")); err != nil {

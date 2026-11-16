@@ -46,7 +46,7 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	}
 	// Ephemeral runners refuse work until first-boot setup has finished.
 	// (Checked before draining, so a failed setup keeps reporting why.)
-	if _, err := os.Stat(LifecycleDir); err == nil {
+	if onSpotexecVM() {
 		b, err := os.ReadFile(filepath.Join(LifecycleDir, "ready"))
 		if err != nil {
 			return &protoError{code: protocol.CodeBooting, msg: "runner is still running its first-boot setup", detail: latestBootLine(bootLog)}
@@ -70,7 +70,7 @@ func (s *Session) acquire(a protocol.Acquire) (err error) {
 	}
 	// Ephemeral runners: hold the lifecycle lock shared so the idle watchdog
 	// (which needs it exclusively) cannot shut the VM down under us.
-	if _, err := os.Stat(LifecycleLock); err == nil {
+	if hasLifecycleLock() {
 		l, err := lockShared(LifecycleLock, 10*time.Second)
 		if err != nil {
 			return perr(protocol.CodeDraining, "%v", err)
@@ -558,6 +558,9 @@ func lifetimeGate(a protocol.Acquire) error {
 // protocol.LifetimeDrainAhead of its max_lifetime (cloud-init records both
 // its birth and its lifetime), and how long it has left.
 func nearMaxLifetime() (time.Duration, bool) {
+	if !onSpotexecVM() {
+		return 0, false
+	}
 	return lifetimeLeft(LifecycleDir, time.Now())
 }
 
