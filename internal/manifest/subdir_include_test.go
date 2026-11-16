@@ -116,6 +116,7 @@ func TestUnstagedGitattributesDisablesIndexIDs(t *testing.T) {
 			xdg := filepath.Join(home, "xdg")
 			// Only this test's git configuration applies.
 			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
 			t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(home, "gitconfig"))
 			t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 			t.Setenv("XDG_CONFIG_HOME", "")

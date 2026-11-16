@@ -475,7 +475,7 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 		if check(filepath.Join(x, "git", "attributes")) {
 			return true
 		}
-	} else if h, err := os.UserHomeDir(); err == nil {
+	} else if h := gitHome(); h != "" {
 		if check(filepath.Join(h, ".config", "git", "attributes")) {
 			return true
 		}
@@ -490,6 +490,16 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 		}
 	}
 	return false
+}
+
+// gitHome is the home directory Git uses: $HOME when set (Git for Windows
+// too), else the OS's own.
+func gitHome() string {
+	if h := os.Getenv("HOME"); h != "" {
+		return h
+	}
+	h, _ := os.UserHomeDir()
+	return h
 }
 
 func isGitWorktree(ctx context.Context, root string) bool {
