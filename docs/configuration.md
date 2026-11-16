@@ -180,6 +180,7 @@ fail_fast = false
 
 [hook]
 when_load_above = 0.6          # agents offload only when the laptop is busy
+transparent_prefixes = ["direnv exec ."]  # wrappers the hook looks past (they run on the runner too)
 ```
 
 `git_seed` gives the slot a minimal `.git` before the command runs (off by default), so tools that ask Git about the checkout, such as a build stamping the commit SHA or a test recording `git status`, answer as they do locally. See [Git on the runner](running.md#git-on-the-runner) for what it holds and what it can't do.
