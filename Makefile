@@ -5,11 +5,16 @@ PKG     := github.com/daintreehq/spotexec
 LDFLAGS := -s -w -X $(PKG)/internal/cli.Version=$(VERSION) -X $(PKG)/internal/helper.Version=$(VERSION)
 HELPER_TARGETS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 EMBED_DIR := internal/helperbin/dist
+# Where `make install` puts spotexec and sx: GOBIN, else the first GOPATH
+# entry's bin, as `go install` would. BINDIR=... overrides both.
+BINDIR ?= $(shell b=$$(go env GOBIN); [ -n "$$b" ] || b="$$(go env GOPATH | cut -d: -f1)/bin"; printf '%s' "$$b")
 
 .PHONY: build helpers completions install test vet e2e clean
 
+# CGO off, as in the release builds (.goreleaser.yaml), so a local binary
+# behaves like the one users install.
 build: helpers
-	go build -trimpath -ldflags '$(LDFLAGS)' -o bin/spotexec ./cmd/spotexec
+	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o bin/spotexec ./cmd/spotexec
 	ln -sf spotexec bin/sx
 
 # Cross-compile the remote helper for every supported runner platform and
@@ -36,8 +41,9 @@ completions:
 	@rm -f completions/.gen
 
 install: build
-	install -m 0755 bin/spotexec $(shell go env GOPATH)/bin/spotexec
-	ln -sf spotexec $(shell go env GOPATH)/bin/sx
+	install -d '$(BINDIR)'
+	install -m 0755 bin/spotexec '$(BINDIR)/spotexec'
+	ln -sf spotexec '$(BINDIR)/sx'
 
 test:
 	go test ./...

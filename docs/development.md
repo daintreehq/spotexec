@@ -13,6 +13,8 @@ make e2e            # builds, then runs all three end-to-end suites:
                     #   scripts/e2e-daemon.sh  pool manager scenarios on the simulator
 ```
 
+CI runs the three suites as separate steps of one Ubuntu job, so a failure in one still runs the others.
+
 The **`sim` provider** runs a Spot fleet as Docker containers on your machine, so the full lifecycle can be tested without an AWS account.
 - Each instance is a container running sshd and booting the same cloud-init user-data.
 - `spotexec sim interrupt` delivers an interruption notice; `spotexec sim rebalance` sends a rebalance recommendation.
