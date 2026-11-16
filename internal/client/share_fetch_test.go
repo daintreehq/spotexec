@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -521,5 +522,47 @@ func TestImageLockID(t *testing.T) {
 	c.Registry.Repo = c.Registry.Server + "/spotexec/r"
 	if imageLockID(a.Registry, a.Tag, true) == imageLockID(c.Registry, c.Tag, true) || imageLockID(a.Registry, a.Tag, true) == imageLockID(a.Registry, "other", true) {
 		t.Fatal("other accounts or tags share the lock")
+	}
+}
+
+// #192 with #194: an image whose build failed here but that another of the
+// runner's regions holds is copied from there rather than failing, and the
+// failure is forgotten; with no region holding it, the run fails at once.
+func TestFetchImageCopiesDespiteARememberedFailure(t *testing.T) {
+	src := &protocol.RegistryAuth{Server: "1.dkr.ecr.us-east-1.amazonaws.com", Repo: "1.dkr.ecr.us-east-1.amazonaws.com/spotexec/r"}
+	for _, tc := range []struct {
+		name  string
+		found *protocol.RegistryAuth
+		sent  string
+	}{
+		{"another region holds it", src, "[image:probe image:probe]"},
+		{"no region holds it", nil, "[image:probe]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := fastShare(t)
+			req := regionImage("ap-south-1")
+			memo := newImageMemo("repo")
+			memo.remember(imageFailure{Tag: req.Tag, Message: "docker build .spotexec/Dockerfile: exit 1", Who: "aws#2", At: time.Now()})
+			var sources []string
+			c := regionScript(t, true, &sources)
+			locate := func(context.Context) (*protocol.RegistryAuth, error) { return tc.found, nil }
+			r, _, _, err := fetchImage(ctx, c, Options{Rep: &recRep{}}, "aws#1", io.Discard, nil, memo, req, locate, time.Minute)
+			if got := fmt.Sprint(c.sent); got != tc.sent {
+				t.Fatalf("sent %s, %v", got, err)
+			}
+			var be *ImageBuildError
+			if tc.found == nil {
+				if !errors.As(err, &be) || !be.Cached {
+					t.Fatalf("got %#v", err)
+				}
+				return
+			}
+			if err != nil || !r.Copied || r.Built {
+				t.Fatalf("r %+v, %v", r, err)
+			}
+			if f := newImageMemo("repo").recall(req.Tag); f != nil {
+				t.Fatalf("still remembered %+v", f)
+			}
+		})
 	}
 }
