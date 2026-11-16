@@ -2163,10 +2163,11 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 		return nil
 	}
 	// built settles a build before the runs waiting on it are let go: an
-	// image had forgets an earlier failure, and a failure of the build itself
-	// is remembered, with its output.
+	// image had, or a forced build that didn't fail as a build (it may have
+	// built the image and failed to push it), forgets an earlier failure,
+	// and a failure of the build itself is remembered, with its output.
 	built := func(err error) error {
-		if err == nil && r.Image != "" {
+		if o.WaitPush || err == nil && r.Image != "" {
 			memo.forget(req.Tag)
 		}
 		var re *transport.RemoteError

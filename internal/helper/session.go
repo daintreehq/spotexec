@@ -243,7 +243,7 @@ func Serve(in io.Reader, out io.Writer) error {
 			}
 			var pe *protoError
 			if errors.As(err, &pe) {
-				_ = s.c.Send(protocol.TypeError, protocol.ErrorMsg{Code: pe.code, Message: pe.msg, Detail: pe.detail, BuildFailed: pe.buildFailed})
+				_ = s.c.Send(protocol.TypeError, pe.wire())
 				continue
 			}
 			_ = s.c.Send(protocol.TypeError, protocol.ErrorMsg{Code: protocol.CodeInternal, Message: err.Error()})
@@ -260,6 +260,11 @@ type protoError struct {
 }
 
 func (e *protoError) Error() string { return e.code + ": " + e.msg }
+
+// wire is the error as sent to the client.
+func (e *protoError) wire() protocol.ErrorMsg {
+	return protocol.ErrorMsg{Code: e.code, Message: e.msg, Detail: e.detail, BuildFailed: e.buildFailed}
+}
 
 func perr(code, format string, a ...any) error {
 	return &protoError{code: code, msg: fmt.Sprintf(format, a...)}

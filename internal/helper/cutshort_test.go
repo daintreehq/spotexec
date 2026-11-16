@@ -31,12 +31,16 @@ func TestCutShortOnlyWhileStopping(t *testing.T) {
 			t.Errorf("%v while stopping=%v: got %v, want %s", tc.err, tc.stopping, cutShort(tc.err), tc.want)
 		}
 	}
-	stoppingNow = func() bool { return true }
-	// A build cut short is no failure to remember (#194).
-	var pe *protoError
-	if !errors.As(cutShort(&protoError{code: protocol.CodeImageFailed, msg: "docker build: exit 1", buildFailed: true}), &pe) || pe.buildFailed {
-		t.Errorf("a build cut short is still marked failed: %+v", pe)
+	// A build cut short is no failure to remember (#194); one that failed
+	// while the VM runs on is.
+	for _, stopping := range []bool{true, false} {
+		stoppingNow = func() bool { return stopping }
+		var pe *protoError
+		if !errors.As(cutShort(&protoError{code: protocol.CodeImageFailed, msg: "docker build: exit 1", buildFailed: true}), &pe) || pe.buildFailed == stopping || pe.wire().BuildFailed == stopping {
+			t.Errorf("stopping=%v: marked %+v", stopping, pe)
+		}
 	}
+	stoppingNow = func() bool { return true }
 	if err := cutShort(nil); err != nil {
 		t.Errorf("success became %v", err)
 	}

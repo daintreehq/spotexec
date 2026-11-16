@@ -148,7 +148,7 @@ func withRegistry(req protocol.Image, repo string) protocol.Image {
 
 // A failure the helper doesn't mark as the build's own (a push, a login,
 // an older helper) is not remembered: the next run builds.
-func TestFetchImageForgetsAnUnmarkedFailure(t *testing.T) {
+func TestFetchImageDoesNotRememberAnUnmarkedFailure(t *testing.T) {
 	ctx := fastShare(t)
 	s := buildFails
 	s.fail.BuildFailed = false
@@ -191,6 +191,43 @@ func TestFetchImageForgetsTheFailureOnceTheImageIsHad(t *testing.T) {
 				t.Fatalf("still remembered: %+v", f)
 			}
 		})
+	}
+}
+
+// `container build` that builds the image but can't push it still forgets
+// the failure: the build works now.
+func TestFetchImageForcedBuildFailingItsPushForgetsTheFailure(t *testing.T) {
+	ctx := fastShare(t)
+	if _, _, err := imageRun(ctx, t, buildFails, Options{}, sharedImage()); err == nil {
+		t.Fatal("the build didn't fail")
+	}
+	s := buildFails
+	s.fail = protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "built .spotexec/Dockerfile but could not push it"}
+	if _, _, err := imageRun(ctx, t, s, Options{WaitPush: true}, sharedImage()); err == nil {
+		t.Fatal("the push didn't fail")
+	}
+	if f := newImageMemo("repo").recall(sharedImage().Tag); f != nil {
+		t.Fatalf("still remembered: %+v", f)
+	}
+}
+
+// A run that finds the image missing and its build failed doesn't wait
+// behind another run building it: it fails at once.
+func TestFetchImageRememberedFailureDoesNotWait(t *testing.T) {
+	ctx := fastShare(t)
+	req := sharedImage()
+	newImageMemo("repo").remember(imageFailure{Tag: req.Tag, Message: "docker build .spotexec/Dockerfile: exit 1", Who: "aws#2", At: time.Now()})
+	lock := shareLockFor("image", req.Registry.Repo+":"+req.Tag)
+	held, err := lock.take(ctx, lock.verdict(), "test 2/8 on aws#4", time.Minute, nil)
+	if err != nil || !held.lead {
+		t.Fatalf("take %+v, %v", held, err)
+	}
+	defer held.release("")
+	rep := &recRep{}
+	c, _, err := imageRun(ctx, t, builds, Options{Rep: rep}, req)
+	var be *ImageBuildError
+	if !errors.As(err, &be) || !be.Cached || fmt.Sprint(c.sent) != "[image:probe]" || rep.event("image_wait") != nil {
+		t.Fatalf("sent %v, waited %v, %#v", c.sent, rep.event("image_wait"), err)
 	}
 }
 
