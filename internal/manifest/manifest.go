@@ -148,7 +148,7 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		if err != nil {
 			return nil, err
 		}
-		trustIndex := !hasWorktreeFilters(o.Root, staged, untracked)
+		trustIndex := !hasWorktreeFilters(o.Root, staged)
 		// With autocrlf (true or input) git reports a CRLF worktree file as
 		// clean while its index ID describes the LF-normalised blob, so the
 		// ID would not match the bytes we sync: hash the worktree instead.
@@ -433,8 +433,9 @@ func statusDirty(ctx context.Context, root string) (map[string]bool, []string, e
 // hasWorktreeFilters reports whether any .gitattributes declares content
 // transformations (filters, eol, encodings), in which case index blob IDs do
 // not describe worktree bytes and everything must be hashed from disk. Git
-// reads .gitattributes from the worktree, so an untracked one counts too.
-func hasWorktreeFilters(root string, staged map[string]stageEntry, untracked []string) bool {
+// reads .gitattributes from the worktree whether it is tracked, untracked or
+// ignored, so every directory above an indexed file is looked at.
+func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 	check := func(p string) bool {
 		b, err := os.ReadFile(p)
 		if err != nil {
@@ -447,14 +448,30 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry, untracked []s
 			strings.Contains(s, "working-tree-encoding") || strings.Contains(s, "ident") ||
 			textAttr.MatchString(s)
 	}
-	isAttrs := func(p string) bool { return p == ".gitattributes" || strings.HasSuffix(p, "/.gitattributes") }
+	dirs := map[string]bool{".": true}
 	for p := range staged {
-		if isAttrs(p) && check(filepath.Join(root, filepath.FromSlash(p))) {
+		// Each directory's ancestors were added with it.
+		for d := path.Dir(p); !dirs[d]; d = path.Dir(d) {
+			dirs[d] = true
+		}
+	}
+	for d := range dirs {
+		if check(filepath.Join(root, filepath.FromSlash(d), ".gitattributes")) {
 			return true
 		}
 	}
-	for _, p := range untracked {
-		if isAttrs(p) && check(filepath.Join(root, filepath.FromSlash(p))) {
+	// The global attributes file (core.attributesFile, by default
+	// $XDG_CONFIG_HOME/git/attributes) applies to every repository.
+	if out, err := exec.Command("git", "-C", root, "config", "--path", "--get", "core.attributesFile").Output(); err == nil {
+		if check(strings.TrimSpace(string(out))) {
+			return true
+		}
+	} else if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		if check(filepath.Join(x, "git", "attributes")) {
+			return true
+		}
+	} else if h, err := os.UserHomeDir(); err == nil {
+		if check(filepath.Join(h, ".config", "git", "attributes")) {
 			return true
 		}
 	}

@@ -61,24 +61,56 @@ func TestSubdirContextRespectsGitignore(t *testing.T) {
 	}
 }
 
-// An untracked .gitattributes applies before it is staged: a clean filter
-// it names makes the index blob differ from the worktree bytes, so the
-// manifest must hash the worktree.
-func TestUntrackedGitattributesDisablesIndexIDs(t *testing.T) {
-	root := t.TempDir()
-	gitIn(t, root, "init", "-q")
-	gitIn(t, root, "config", "filter.up.clean", "tr a-z A-Z")
-	gitIn(t, root, "config", "filter.up.smudge", "cat")
-	writeTree(t, root, "a.txt")
-	if err := os.WriteFile(filepath.Join(root, ".gitattributes"), []byte("*.txt filter=up\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitIn(t, root, "add", "--", "a.txt")
-	m, err := Build(context.Background(), Options{Root: root})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := m.ByPath["a.txt"].ID, fsid.Bytes([]byte("a.txt")); got != want {
-		t.Fatalf("manifest ID %s, want worktree bytes' ID %s", got, want)
+// A .gitattributes applies before it is staged, and even when Git ignores
+// it: a clean filter it names makes the index blob differ from the worktree
+// bytes, so the manifest must hash the worktree. So does the global
+// attributes file.
+func TestUnstagedGitattributesDisablesIndexIDs(t *testing.T) {
+	for _, tc := range []struct{ name, attrs, gitignore string }{
+		{"untracked", ".gitattributes", ""},
+		{"nested", "sub/.gitattributes", ""},
+		{"ignored", "sub/.gitattributes", ".gitattributes\n"},
+		{"global", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			xdg := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", xdg)
+			gitIn(t, root, "init", "-q")
+			gitIn(t, root, "config", "filter.up.clean", "tr a-z A-Z")
+			gitIn(t, root, "config", "filter.up.smudge", "cat")
+			writeTree(t, root, "sub/a.txt")
+			attrs := filepath.Join(xdg, "git", "attributes")
+			if tc.attrs != "" {
+				attrs = filepath.Join(root, filepath.FromSlash(tc.attrs))
+			}
+			if err := os.MkdirAll(filepath.Dir(attrs), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(attrs, []byte("*.txt filter=up\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tc.gitignore != "" {
+				if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(tc.gitignore), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gitIn(t, root, "add", "--", "sub/a.txt")
+			want := fsid.Bytes([]byte("sub/a.txt"))
+			staged, err := lsStage(context.Background(), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if staged["sub/a.txt"].id == want {
+				t.Fatal("the filter didn't apply: the index blob is the worktree bytes")
+			}
+			m, err := Build(context.Background(), Options{Root: root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := m.ByPath["sub/a.txt"].ID; got != want {
+				t.Fatalf("manifest ID %s, want worktree bytes' ID %s", got, want)
+			}
+		})
 	}
 }
