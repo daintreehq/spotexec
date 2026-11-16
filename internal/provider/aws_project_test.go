@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -32,8 +33,11 @@ func holdingsEnv(t *testing.T) (*AWSGlobal, *fakeRegionsEC2) {
 func TestProjectHoldingsImageAndDeps(t *testing.T) {
 	g, f := holdingsEnv(t)
 	f.cached = map[string]map[string]bool{"r-one-1": {"repo1/k-sha256:one.tar": true}}
+	var mu sync.Mutex
 	var keyed []string
 	pj := &Project{RepoID: "repo1", Image: true, ImageTag: "t1", Deps: true, DepsKeyFor: func(id string) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
 		keyed = append(keyed, id)
 		return "k-" + id, nil
 	}}
@@ -155,5 +159,22 @@ func TestProjectHoldingsFailures(t *testing.T) {
 	hs, _ = g.ProjectHoldings(context.Background(), pj)
 	if two := hs[1]; two.Image.State != HoldMissing || two.Kept != nil || two.KeptErr != "" {
 		t.Fatalf("no repository: %+v", two)
+	}
+}
+
+// Regions the deadline leaves unlooked-up say so, listing included.
+func TestProjectHoldingsCancelled(t *testing.T) {
+	g, _ := holdingsEnv(t)
+	discovered(t, g) // the region list comes from local state, not the cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	hs, _ := g.ProjectHoldings(ctx, &Project{RepoID: "repo1", Image: true, ImageTag: "t1"})
+	if len(hs) != 2 {
+		t.Fatalf("regions %+v", hs)
+	}
+	for _, h := range hs {
+		if h.Image.State != HoldUnknown || h.KeptErr == "" || h.Kept != nil {
+			t.Fatalf("cancelled: %+v", h)
+		}
 	}
 }

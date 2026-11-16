@@ -65,7 +65,8 @@ func (g *AWSGlobal) ProjectHoldings(ctx context.Context, pj *Project) ([]RegionH
 	sort.Strings(regions)
 	out := make([]RegionHolding, len(regions))
 	for i, rg := range regions {
-		out[i] = RegionHolding{Region: rg, Image: Holding{HoldUnknown, "not looked up"}, Deps: Holding{HoldUnknown, "not looked up"}}
+		// A region the deadline skips keeps these.
+		out[i] = RegionHolding{Region: rg, Image: Holding{HoldUnknown, "not looked up"}, Deps: Holding{HoldUnknown, "not looked up"}, KeptErr: "not looked up"}
 	}
 	index := map[string]int{}
 	for i, rg := range regions {
