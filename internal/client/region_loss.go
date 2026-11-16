@@ -32,8 +32,9 @@ func (r *regionLoss) String() string {
 }
 
 // Probing a region after a loss: how many of its VMs (besides the lost
-// one) and of other regions' to try, how long one probe may take (a new
-// connection gets ConnectTimeout=10s), and how long the whole check may.
+// one) and of other regions (one VM each) to try, how long one probe may
+// take (a new connection gets ConnectTimeout=10s), and how long the whole
+// check may.
 const (
 	regionPeerProbes  = 6
 	otherRegionProbes = 3
@@ -41,76 +42,96 @@ const (
 	regionCheckTime   = 25 * time.Second
 )
 
-// probeReachable reports whether a VM answers SSH within d (tests replace
-// it).
-var probeReachable = func(ctx context.Context, r *config.Runner, in provider.Instance, d time.Duration) bool {
+// probeReachable probes a VM over SSH within d (tests replace it).
+var probeReachable = func(ctx context.Context, r *config.Runner, in provider.Instance, d time.Duration) transport.Reach {
 	return transport.New(in.Target, r.WorkRoot).Reachable(ctx, d)
 }
 
 // regionSilentFn is regionSilent (tests replace it).
 var regionSilentFn = regionSilent
 
+// knownGood lists the fleet's VMs this machine has reached before and
+// still places runs on (its pool notes: ready, not draining, retiring or
+// mismatched): a VM like that going silent says something about the
+// network; one that never answered, or is on its way out, doesn't.
+var knownGood = func(r *config.Runner, f provider.Fleet) map[string]bool {
+	ok := map[string]bool{}
+	_ = NewPool(r, f).with(func(st *poolState) error {
+		for id, n := range st.Notes {
+			if n != nil && n.Ready && !n.closed() {
+				ok[id] = true
+			}
+		}
+		return nil
+	})
+	return ok
+}
+
 // regionSilent checks, once a fleet lease's VM has been lost to silence
 // while the cloud still runs it, whether its whole region went silent: the
-// VM and every other running VM of the fleet there that is past booting
-// (up to regionPeerProbes of them; at least one) fail a fresh SSH probe,
-// while a VM in another region answers one. A VM alone in its region
-// proves nothing either way, nor does a client that reaches no region at
-// all: nil then, as when the fleet can't be listed or the check runs out
-// of time.
-func regionSilent(lease *Lease) *regionLoss {
+// VM and every other VM of the fleet there that this machine has reached
+// before and still uses (knownGood, up to regionPeerProbes of them; at
+// least one) fail a fresh SSH probe for want of a network path, while a VM
+// in another region answers one. A VM alone in its region proves nothing
+// either way, nor does a client that reaches no region at all, nor a probe
+// that failed for some other reason: nil then, as when the fleet can't be
+// listed, ctx ends, or the check runs out of time.
+func regionSilent(ctx context.Context, lease *Lease) *regionLoss {
 	f, ok := lease.Provider.(provider.Fleet)
 	region := lease.Instance.Region
-	if !ok || region == "" || lease.Runner == nil || lease.InstanceID == "" {
+	if !ok || region == "" || lease.Runner == nil || lease.InstanceID == "" || ctx.Err() != nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), regionCheckTime)
+	ctx, cancel := context.WithTimeout(ctx, regionCheckTime)
 	defer cancel()
 	list, err := f.List(ctx)
 	if err != nil {
 		return nil
 	}
-	var lostVM *provider.Instance
+	good := knownGood(lease.Runner, f)
+	lostVM := lease.Instance
+	lostVM.ID = lease.InstanceID
+	if lostVM.Target.Host == "" {
+		lostVM.Target = lease.Target
+	}
 	var peers, others []provider.Instance
+	seen := map[string]bool{region: true}
 	for _, in := range list {
 		if in.State != provider.StateRunning || in.Target.Host == "" {
 			continue
 		}
 		switch {
 		case in.ID == lease.InstanceID:
-			v := in
-			lostVM = &v
+			lostVM = in
 		case in.Region == region:
-			// A VM still booting may not answer yet whatever the network.
-			if time.Since(in.LaunchedAt) >= lease.Runner.BootTimeout.Duration && len(peers) < regionPeerProbes {
+			if good[in.ID] && len(peers) < regionPeerProbes {
 				peers = append(peers, in)
 			}
-		case in.Region != "" && len(others) < otherRegionProbes:
+		case in.Region != "" && !seen[in.Region] && len(others) < otherRegionProbes:
+			// One VM per region, so a region that answers gets asked.
+			seen[in.Region] = true
 			others = append(others, in)
 		}
 	}
 	if len(peers) == 0 || len(others) == 0 {
 		return nil
 	}
-	same := peers
-	if lostVM != nil {
-		same = append(same, *lostVM) // it may answer again by now
-	}
 	var mu sync.Mutex
-	sameAnswered, answered := false, ""
+	vetoed, answered := false, ""
 	var wg sync.WaitGroup
 	probe := func(in provider.Instance, same bool) {
 		defer wg.Done()
-		ok := probeReachable(ctx, lease.Runner, in, regionProbeTime)
+		got := probeReachable(ctx, lease.Runner, in, regionProbeTime)
 		mu.Lock()
 		defer mu.Unlock()
-		if ok && same {
-			sameAnswered = true
-		} else if ok && answered == "" {
+		switch {
+		case same && got != transport.Unreachable:
+			vetoed = true // it answered, or failed for some other reason
+		case !same && got == transport.Reachable && answered == "":
 			answered = in.Region
 		}
 	}
-	for _, in := range same {
+	for _, in := range append(peers, lostVM) {
 		wg.Add(1)
 		go probe(in, true)
 	}
@@ -119,17 +140,20 @@ func regionSilent(lease *Lease) *regionLoss {
 		go probe(in, false)
 	}
 	wg.Wait()
-	if sameAnswered || answered == "" || ctx.Err() != nil {
+	if vetoed || answered == "" || ctx.Err() != nil {
 		return nil
 	}
 	return &regionLoss{region: region, peers: len(peers), answered: answered}
 }
 
 // regionReplayAfter is how long after losing a VM to a silent region a run
-// waits before it is replayed: until the helper there has certainly given
-// up on this client and stopped the run (helper.OrphanLimit), with time for
-// its teardown, so the lost attempt can't still be running, or finish,
-// alongside the replay. Tests shorten it.
+// waits before it is replayed: past the longest a helper outlives the last
+// word from its client before it tears the run down and exits
+// (helper.OrphanLimit), with time for that teardown, so the lost attempt
+// isn't still running alongside the replay. The client sent its last word
+// no later than when it gave up (Result.lostWhen); bytes it had queued and
+// that arrive later are followed by the connection's end, which stops the
+// run at once. Tests shorten it.
 var regionReplayAfter = helper.OrphanLimit + 30*time.Second
 
 // regionReplayWait is how much longer a run lost at lostAt must wait
@@ -165,13 +189,13 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 // replayAfterRegion readies att to replay a run lost to its region going
 // silent (res.noReplay.region): on a VM outside that region that is already
-// there (a launch might well go to the silent region), once the lost
-// attempt has certainly stopped. It waits for that, and is false when ctx
+// there (a launch might well go to the silent region), once the helper
+// there has given up on the lost attempt (regionReplayAfter). It waits for that, and is false when ctx
 // ended first.
 func replayAfterRegion(ctx context.Context, rep ui.Reporter, att *attempt, res Result, lost string) bool {
 	rl := res.noReplay.region
 	wait := regionReplayWait(res.lostWhen)
-	rep.Warn("RUNNER_LOST", "lost %s %s: %s; replaying the run on a VM outside %s in %s, once the runner there has given up on this client and stopped the lost attempt", lost, res.lostAt.where(), rl, rl.region, ui.Dur(wait.Round(time.Second)))
+	rep.Warn("RUNNER_LOST", "lost %s %s: %s; replaying the run on a VM outside %s in %s, once the runner there has given up on this client and torn the lost attempt down", lost, res.lostAt.where(), rl, rl.region, ui.Dur(wait.Round(time.Second)))
 	rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "lost": lost, "region_unreachable": rl.region})
 	att.exclude[regionKey(rl.region)] = true
 	att.noBoot = true

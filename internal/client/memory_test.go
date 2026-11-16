@@ -101,7 +101,7 @@ func TestWhyNoReplay(t *testing.T) {
 func TestLostBeforeTheCommandIsReplayed(t *testing.T) {
 	r, f := testFleet()
 	lease := &Lease{Runner: r, Provider: f, InstanceID: "i-run"}
-	res := Result{noReplay: replayVerdict(lease, false, io.EOF, depsCheck, true), lostAt: depsCheck}
+	res := Result{noReplay: replayVerdict(context.Background(), lease, false, io.EOF, depsCheck, true), lostAt: depsCheck}
 	retry, code, why := replayable("i-run", res, Options{RetryPreempt: true, Sync: "auto", Exclusive: true}, false, 1)
 	if !retry || code != "" || why != "" {
 		t.Fatalf("not replayed: %v %q %q", retry, code, why)
@@ -249,7 +249,7 @@ func TestHelperShutdownIsANotice(t *testing.T) {
 		"helper error":  {&InfraError{Err: fmt.Errorf("lost runner aws during execution: %w", shutdown)}, lostRunner(lease, shutdown)},
 		"killed result": {shutdownErr("aws#1", 143), shutdownRunner(lease)},
 	} {
-		res := Result{noReplay: replayVerdict(lease, false, c.err, running, false)}
+		res := Result{noReplay: replayVerdict(context.Background(), lease, false, c.err, running, false)}
 		if res.noReplay.code != "" {
 			t.Fatalf("%s: a shutdown on a running VM withheld the replay: %q (%q)", name, res.noReplay.code, res.noReplay.why)
 		}
@@ -264,7 +264,7 @@ func TestHelperShutdownIsANotice(t *testing.T) {
 			t.Errorf("%v counted as a shutdown", e)
 		}
 	}
-	if got := replayVerdict(lease, false, io.EOF, running, false); got.code != "RUNNER_UNRESPONSIVE" {
+	if got := replayVerdict(context.Background(), lease, false, io.EOF, running, false); got.code != "RUNNER_UNRESPONSIVE" {
 		t.Fatalf("a dropped connection on a running VM: %q, want RUNNER_UNRESPONSIVE", got.code)
 	}
 }

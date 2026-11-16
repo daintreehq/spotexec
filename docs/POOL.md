@@ -286,18 +286,21 @@ silent helper whose VM is still running, the CLI waits 3 more minutes, so a
 VM that recovers keeps its runs.
 
 A VM that goes silent with its whole region is not the run's doing. When the
-CLI gives up on a running VM after handing it the command, it probes the
-fleet's other VMs past booting in that region (up to 6) and some in other
-regions (up to 3) over SSH. If the lost VM and at least one other VM in its
-region fail, none there answers, and a VM in another region does, the region
-is taken to be unreachable from this client (a network partition), and the
-run is replayed instead: on a VM already up outside that region (it launches
-nothing, since a launch could go to the silent region), and only after the
-helper there has certainly given up on this client and stopped the lost
-attempt (about 6 minutes after the loss). Memory pressure still rules a
-replay out, and so does a VM whose heartbeats never reported its memory
-(`REGION_UNREACHABLE`; exit 125). A VM alone in its region, or a client that
-reaches no region, proves nothing and keeps `RUNNER_UNRESPONSIVE`.
+CLI gives up on a running VM after handing it the command, it probes over SSH,
+each on a connection of its own: the lost VM, the fleet's other VMs in that
+region that this machine has reached before and still uses (up to 6), and one
+VM in each of up to 3 other regions. If the lost VM and those peers (at least
+one) all fail for want of a network path (a timeout, no route), and a VM in
+another region answers, the region is taken to be unreachable from this
+client (a network partition), and the run is replayed instead: on a VM already
+up outside that region (it launches nothing, since a launch could go to the
+silent region), and only after the longest a helper outlives the last word
+from its client before it tears the run down and exits (about 6 minutes after
+the loss), so the lost attempt isn't still running alongside the replay.
+Memory pressure still rules a replay out, and so does a VM whose heartbeats
+never reported its memory (`REGION_UNREACHABLE`; exit 125). A VM alone in its
+region, a client that reaches no region, or a probe that fails for another
+reason (authentication, say) proves nothing and keeps `RUNNER_UNRESPONSIVE`.
 
 ## Simulation (`type = "sim"`)
 

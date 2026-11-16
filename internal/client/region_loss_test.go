@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -11,122 +12,156 @@ import (
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/helper"
 	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/transport"
 	"github.com/daintreehq/spotexec/internal/transport/sshtest"
 )
 
-// regionFleet is a fleet in two regions: the lost VM i-lost and its peers
-// in ap-south-1, and VMs in us-east-1, all past booting unless young.
-func regionFleet(young ...string) (*config.Runner, *fakeFleet) {
+// regionFleet is a fleet in three regions: the lost VM i-lost and its
+// peers in ap-south-1, three VMs in us-east-1 and one in eu-north-1.
+func regionFleet() (*config.Runner, *fakeFleet) {
 	r := &config.Runner{Name: "aws", Type: config.TypeAWSSpot}
-	r.BootTimeout.Duration = 5 * time.Minute
-	old := time.Now().Add(-time.Hour)
 	f := &fakeFleet{r: r}
-	add := func(id, region string) {
-		in := provider.Instance{ID: id, State: provider.StateRunning, Region: region, LaunchedAt: old, Target: provider.Target{Host: id}}
-		for _, y := range young {
-			if y == id {
-				in.LaunchedAt = time.Now()
-			}
-		}
-		f.insts = append(f.insts, in)
+	for _, v := range [][2]string{{"i-lost", "ap-south-1"}, {"i-peer1", "ap-south-1"}, {"i-peer2", "ap-south-1"},
+		{"i-us1", "us-east-1"}, {"i-us2", "us-east-1"}, {"i-us3", "us-east-1"}, {"i-eu1", "eu-north-1"}} {
+		f.insts = append(f.insts, provider.Instance{ID: v[0], State: provider.StateRunning, Region: v[1], Target: provider.Target{Host: v[0]}})
 	}
-	add("i-lost", "ap-south-1")
-	add("i-peer1", "ap-south-1")
-	add("i-peer2", "ap-south-1")
-	add("i-us1", "us-east-1")
-	add("i-us2", "us-east-1")
 	return r, f
 }
 
-// stubProbes makes probeReachable answer for the VMs in up only, and
-// records which VMs were probed.
-func stubProbes(t *testing.T, up ...string) *[]string {
+// stubProbes makes probeReachable report reach for each VM (Unreachable
+// for any not named), and records which VMs were probed.
+func stubProbes(t *testing.T, reach map[string]transport.Reach) *[]string {
 	t.Helper()
 	old := probeReachable
 	t.Cleanup(func() { probeReachable = old })
 	var mu sync.Mutex
 	probed := &[]string{}
-	probeReachable = func(_ context.Context, _ *config.Runner, in provider.Instance, _ time.Duration) bool {
+	probeReachable = func(_ context.Context, _ *config.Runner, in provider.Instance, _ time.Duration) transport.Reach {
 		mu.Lock()
 		defer mu.Unlock()
 		*probed = append(*probed, in.ID)
-		for _, id := range up {
-			if id == in.ID {
-				return true
-			}
+		if r, ok := reach[in.ID]; ok {
+			return r
 		}
-		return false
+		return transport.Unreachable
 	}
 	return probed
 }
 
-func lostLease(r *config.Runner, f provider.Fleet) *Lease {
-	return &Lease{Runner: r, Provider: f, InstanceID: "i-lost", Instance: provider.Instance{ID: "i-lost", Region: "ap-south-1"}}
+// stubKnownGood makes knownGood every VM but those in bad.
+func stubKnownGood(t *testing.T, f *fakeFleet, bad ...string) {
+	t.Helper()
+	old := knownGood
+	t.Cleanup(func() { knownGood = old })
+	knownGood = func(*config.Runner, provider.Fleet) map[string]bool {
+		ok := map[string]bool{}
+		for _, in := range f.insts {
+			ok[in.ID] = true
+		}
+		for _, id := range bad {
+			delete(ok, id)
+		}
+		return ok
+	}
 }
 
-// #229: a lost VM's region counts as silent only when its other
-// established VMs there fail a fresh probe too, and another region's VM
-// answers one.
+func lostLease(r *config.Runner, f provider.Fleet) *Lease {
+	return &Lease{Runner: r, Provider: f, InstanceID: "i-lost", Target: provider.Target{Host: "i-lost"}, Instance: provider.Instance{ID: "i-lost", Region: "ap-south-1"}}
+}
+
+// #229: a lost VM's region counts as silent only when it and its other
+// VMs there that this machine has reached before fail a fresh probe for
+// want of a network path, and another region's VM answers one.
 func TestRegionSilent(t *testing.T) {
+	up, unknown := transport.Reachable, transport.ReachUnknown
 	for _, c := range []struct {
-		name   string
-		young  []string
-		drop   []string // VMs not in the listing
-		up     []string
-		region bool
-		peers  int
+		name     string
+		bad      []string // not known good
+		drop     []string // not in the listing
+		reach    map[string]transport.Reach
+		region   bool
+		peers    int
+		answered string
 	}{
-		{"region silent, another answers", nil, nil, []string{"i-us2"}, true, 2},
-		{"a peer answers", nil, nil, []string{"i-peer2", "i-us1"}, false, 0},
-		{"the lost VM answers again", nil, nil, []string{"i-lost", "i-us1"}, false, 0},
-		{"no region answers", nil, nil, nil, false, 0},
-		{"alone in its region", nil, []string{"i-peer1", "i-peer2"}, []string{"i-us1"}, false, 0},
-		{"its peers are still booting", []string{"i-peer1", "i-peer2"}, nil, []string{"i-us1"}, false, 0},
-		{"one peer booting, the other silent", []string{"i-peer1"}, nil, []string{"i-us1"}, true, 1},
-		{"no other region", nil, []string{"i-us1", "i-us2"}, nil, false, 0},
+		{"region silent, another answers", nil, nil, map[string]transport.Reach{"i-us1": up}, true, 2, "us-east-1"},
+		{"a peer answers", nil, nil, map[string]transport.Reach{"i-peer2": up, "i-us1": up}, false, 0, ""},
+		{"a peer fails for another reason", nil, nil, map[string]transport.Reach{"i-peer1": unknown, "i-us1": up}, false, 0, ""},
+		{"the lost VM answers again", nil, nil, map[string]transport.Reach{"i-lost": up, "i-us1": up}, false, 0, ""},
+		{"the lost VM fails for another reason", nil, nil, map[string]transport.Reach{"i-lost": unknown, "i-us1": up}, false, 0, ""},
+		{"not in the listing, the lost VM answers", nil, []string{"i-lost"}, map[string]transport.Reach{"i-lost": up, "i-us1": up}, false, 0, ""},
+		{"no region answers", nil, nil, nil, false, 0, ""},
+		{"another region fails for another reason", nil, nil, map[string]transport.Reach{"i-us1": unknown, "i-eu1": unknown}, false, 0, ""},
+		{"only a later region answers", nil, nil, map[string]transport.Reach{"i-eu1": up}, true, 2, "eu-north-1"},
+		{"alone in its region", nil, []string{"i-peer1", "i-peer2"}, map[string]transport.Reach{"i-us1": up}, false, 0, ""},
+		{"its peers were never reached", []string{"i-peer1", "i-peer2"}, nil, map[string]transport.Reach{"i-us1": up}, false, 0, ""},
+		{"one peer never reached, the other silent", []string{"i-peer1"}, nil, map[string]transport.Reach{"i-us1": up}, true, 1, "us-east-1"},
+		{"no other region", nil, []string{"i-us1", "i-us2", "i-us3", "i-eu1"}, nil, false, 0, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			r, f := regionFleet(c.young...)
+			r, f := regionFleet()
+			stubKnownGood(t, f, c.bad...)
 			kept := f.insts[:0]
 			for _, in := range f.insts {
-				drop := false
-				for _, d := range c.drop {
-					drop = drop || d == in.ID
-				}
-				if !drop {
+				if !strings.Contains(" "+strings.Join(c.drop, " ")+" ", " "+in.ID+" ") {
 					kept = append(kept, in)
 				}
 			}
 			f.insts = kept
-			probed := stubProbes(t, c.up...)
-			got := regionSilent(lostLease(r, f))
+			probed := stubProbes(t, c.reach)
+			got := regionSilent(context.Background(), lostLease(r, f))
 			if (got != nil) != c.region {
 				t.Fatalf("regional loss %+v, want %v (probed %v)", got, c.region, *probed)
+			}
+			all := " " + strings.Join(*probed, " ") + " "
+			for _, id := range c.bad {
+				if strings.Contains(all, " "+id+" ") {
+					t.Errorf("probed %s, never reached before", id)
+				}
+			}
+			if strings.Contains(all, " i-us2 ") || strings.Contains(all, " i-us3 ") {
+				t.Errorf("probed a second VM in one other region: %v", *probed)
+			}
+			if len(*probed) > 0 && !strings.Contains(all, " i-lost ") {
+				t.Errorf("never probed the lost VM again: %v", *probed)
 			}
 			if got == nil {
 				return
 			}
-			if got.region != "ap-south-1" || got.answered != "us-east-1" || got.peers != c.peers {
+			if got.region != "ap-south-1" || got.answered != c.answered || got.peers != c.peers {
 				t.Fatalf("%+v", got)
 			}
-			for _, id := range c.young {
-				for _, p := range *probed {
-					if p == id {
-						t.Errorf("probed %s, still booting", id)
-					}
-				}
-			}
 			msg := got.String()
-			if !strings.Contains(msg, "ap-south-1 looks unreachable from this client") || !strings.Contains(msg, "one in us-east-1 did") {
+			if !strings.Contains(msg, "ap-south-1 looks unreachable from this client") || !strings.Contains(msg, "one in "+c.answered+" did") || !strings.Contains(msg, fmt.Sprintf("its %d other", c.peers)) {
 				t.Errorf("message: %q", msg)
 			}
 		})
 	}
-	// Not a fleet VM with a region: nothing to compare, and no probe.
-	probed := stubProbes(t)
+	// Not a fleet VM with a region, or a run already interrupted: nothing
+	// to compare, and no probe.
 	r, f := regionFleet()
-	if got := regionSilent(&Lease{Runner: r, Provider: f, InstanceID: "i-lost"}); got != nil || len(*probed) != 0 {
+	stubKnownGood(t, f)
+	probed := stubProbes(t, map[string]transport.Reach{"i-us1": up})
+	if got := regionSilent(context.Background(), &Lease{Runner: r, Provider: f, InstanceID: "i-lost"}); got != nil || len(*probed) != 0 {
 		t.Fatalf("no region: %+v, probed %v", got, *probed)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := regionSilent(ctx, lostLease(r, f)); got != nil || len(*probed) != 0 {
+		t.Fatalf("interrupted: %+v, probed %v", got, *probed)
+	}
+}
+
+// knownGood counts only VMs this machine has reached that still take runs.
+func TestKnownGood(t *testing.T) {
+	p, f := testPool(t, 4)
+	p.Observe("i-ready", OutAcquired, time.Time{})
+	p.Observe("i-busy", OutBusy, time.Time{})
+	p.Observe("i-draining", OutAcquired, time.Time{})
+	p.Observe("i-draining", OutDraining, time.Time{})
+	p.Observe("i-booting", OutBooting, time.Time{})
+	got := knownGood(p.R, f)
+	if len(got) != 2 || !got["i-ready"] || !got["i-busy"] {
+		t.Fatalf("known good: %v", got)
 	}
 }
 
@@ -135,7 +170,7 @@ func stubRegionSilent(t *testing.T, rl *regionLoss) *int {
 	old := regionSilentFn
 	t.Cleanup(func() { regionSilentFn = old })
 	calls := new(int)
-	regionSilentFn = func(*Lease) *regionLoss { *calls++; return rl }
+	regionSilentFn = func(context.Context, *Lease) *regionLoss { *calls++; return rl }
 	return calls
 }
 
@@ -241,8 +276,8 @@ func TestMemoryPressureOutranksRegionLoss(t *testing.T) {
 }
 
 // A regional replay avoids the whole region (VMs listed later included),
-// launches nothing, and waits until the lost attempt has certainly
-// stopped, unless interrupted.
+// launches nothing, and waits until the helper there has given up on the
+// lost attempt, unless interrupted.
 func TestReplayAfterRegion(t *testing.T) {
 	if regionReplayAfter <= helper.OrphanLimit {
 		t.Fatalf("waits %s, no longer than a helper may outlive its client (%s)", regionReplayAfter, helper.OrphanLimit)
@@ -260,7 +295,7 @@ func TestReplayAfterRegion(t *testing.T) {
 		t.Fatal("not ready to replay")
 	}
 	if d := time.Since(start); d < 100*time.Millisecond {
-		t.Fatalf("replayed after %s, before the lost attempt had certainly stopped", d)
+		t.Fatalf("replayed after %s, before the helper had given up on the lost attempt", d)
 	}
 	if !att.noBoot || !excluded(att.exclude, provider.Instance{ID: "i-new", Region: "ap-south-1"}) || excluded(att.exclude, provider.Instance{ID: "i-us", Region: "us-east-1"}) {
 		t.Fatalf("attempt: %+v", att)
@@ -305,5 +340,34 @@ func TestCandidatesExcludeRegion(t *testing.T) {
 	}
 	if strings.Join(ids, ",") != "i-none,i-us" || usable != 2 {
 		t.Fatalf("candidates %v, usable %d", ids, usable)
+	}
+}
+
+// Rank and Fence keep an excluded region's VMs out too.
+func TestRankAndFenceExcludeRegion(t *testing.T) {
+	p, f := schedPool(t, 3, 2)
+	f.insts[0].Region, f.insts[1].Region, f.insts[2].Region = "ap-south-1", "ap-south-1", "us-east-1"
+	now := time.Now()
+	p.loaded(t, func(st *poolState) {
+		p.views(st, now)
+		st.sched().EpochAt = now
+	})
+	away := map[string]bool{regionKey("ap-south-1"): true}
+	cands, _, _, err := p.Rank(context.Background(), away, claim{Worktree: "mine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].ID != "i-2" {
+		t.Fatalf("candidates %+v, want only i-2", cands)
+	}
+
+	p2, f2 := schedPool(t, 2, 2)
+	f2.insts[1].Region = "ap-south-1"
+	p2.loaded(t, func(st *poolState) {
+		p2.views(st, now)
+		st.sched().VMs["i-0"].LastStart = now // Fence would pick i-1 (least recent)
+	})
+	if id := p2.Fence(context.Background(), away); id != "i-0" {
+		t.Fatalf("fence on %q, want i-0: i-1 is in the excluded region", id)
 	}
 }

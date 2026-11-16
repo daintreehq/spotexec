@@ -420,13 +420,57 @@ func (c *Client) runWithin(ctx context.Context, d time.Duration, remoteCmd strin
 	return out, err
 }
 
-// Reachable reports whether the target answers a trivial command within
-// d: an SSH channel opened and closed, a full round trip to the VM (over
-// the runner's ControlMaster when one is up, which itself holds only while
-// the VM answers its keepalives).
-func (c *Client) Reachable(ctx context.Context, d time.Duration) bool {
-	_, err := c.runWithin(ctx, d, "true", nil)
-	return err == nil
+// Reach is what a reachability probe found (Client.Reachable).
+type Reach int
+
+const (
+	// ReachUnknown: the probe failed in a way that says nothing about the
+	// network (authentication, the remote shell, ssh itself).
+	ReachUnknown Reach = iota
+	// Reachable: the target answered.
+	Reachable
+	// Unreachable: no answer, or the network said there is no way to it.
+	Unreachable
+)
+
+// Reachable probes the target with a trivial command over a connection of
+// its own (never the runner's ControlMaster, whose state proves nothing
+// about the network now), within d. Only a timeout, or ssh reporting that
+// the network can't get there, counts as Unreachable.
+func (c *Client) Reachable(ctx context.Context, d time.Duration) Reach {
+	rctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	own := *c
+	own.ctlPath = "none"
+	cmd := exec.CommandContext(rctx, "ssh", own.Args("true")...)
+	cmd.WaitDelay = 2 * time.Second
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	err := cmd.Run()
+	switch {
+	case err == nil:
+		return Reachable
+	case ctx.Err() != nil:
+		return ReachUnknown // given up on, not timed out
+	case errors.Is(rctx.Err(), context.DeadlineExceeded):
+		return Unreachable
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 255 {
+		return Reachable // the remote shell ran, and failed
+	}
+	return networkFailure(errb.String())
+}
+
+// networkFailure classifies the error ssh printed when it couldn't connect.
+func networkFailure(stderr string) Reach {
+	s := strings.ToLower(stderr)
+	for _, m := range []string{"timed out", "no route to host", "network is unreachable", "host is down"} {
+		if strings.Contains(s, m) {
+			return Unreachable
+		}
+	}
+	return ReachUnknown
 }
 
 // EnsureHelper makes sure the right helper is installed and returns the

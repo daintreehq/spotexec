@@ -335,9 +335,9 @@ const lastResortAfter = ClientTimeout + 30*time.Second
 // client: by then lastResort has seen the silence (it polls every 5s), even
 // past the longest excuse a stall of the helper's own earns (stallCap), and
 // has begun tearing the session's processes and containers down before it
-// exits. A client that stopped talking to a runner this long ago knows the
-// run it handed over is no longer running there (only teardown itself may
-// still be finishing).
+// exits. A client that stopped talking to a runner this long ago can count
+// on the run it handed over having been torn down there (teardown itself
+// may still be finishing).
 const OrphanLimit = lastResortAfter + stallCap + 5*time.Second
 
 // lastResort exits the process if the client has been silent well past the

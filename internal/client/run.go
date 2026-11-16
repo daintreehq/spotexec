@@ -286,8 +286,8 @@ func (p *progress) get() stage {
 
 // noReplay is a warning code and the reason behind it. region is set when
 // the VM's whole region went silent (regionSilent): with no code, the run
-// is replayed, outside that region and only once the lost attempt has
-// certainly stopped (regionReplayAfter).
+// is replayed, outside that region and only once the helper there has given
+// up on the lost attempt (regionReplayAfter).
 type noReplay struct {
 	code, why string
 	region    *regionLoss
@@ -423,10 +423,16 @@ func replayable(lost string, res Result, o Options, canceled bool, n int) (retry
 // with no memory pressure, may instead have gone silent with its whole
 // region, as this client sees it (regionSilent: a network partition, #229).
 // Then nothing points at the run, and it is replayed outside that region,
-// once the helper there has certainly stopped the lost attempt; unless its
+// once the helper there has given up on the lost attempt; unless its
 // heartbeats never showed the VM's memory, so nothing shows the run didn't
 // use it up: REGION_UNREACHABLE, not replayed, and without blaming the run.
 func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay {
+	return whyNoReplayCtx(context.Background(), lease, noticed, at, exclusive)
+}
+
+// whyNoReplayCtx is whyNoReplay, its region check bounded by ctx (the run's:
+// an interrupted run isn't replayed, so it needn't wait for the probes).
+func whyNoReplayCtx(ctx context.Context, lease *Lease, noticed bool, at stage, exclusive bool) noReplay {
 	if noticed {
 		return noReplay{}
 	}
@@ -442,9 +448,9 @@ func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay 
 	if !at.dispatched || !instanceRunning(lease) {
 		return noReplay{}
 	}
-	if rl := regionSilentFn(lease); rl != nil {
+	if rl := regionSilentFn(ctx, lease); rl != nil {
 		// Not the VM stalling: its whole region went silent. Replayed
-		// (once the lost attempt has certainly stopped), unless nothing
+		// (once the helper there has given up on it), unless nothing
 		// showed the VM's memory: an older helper's heartbeats, or none.
 		if _, ok := lease.Sess.LastMemory(); !ok {
 			return noReplay{code: "REGION_UNREACHABLE", why: at.where() + ", although EC2 still reports it running: " + rl.String() + ". Its heartbeats never reported the VM's memory, so the run isn't replayed, and the attempt's outcome is unknown. Rerun it", region: rl}
@@ -549,8 +555,8 @@ func noteReclaimed(lease *Lease) {
 // replayVerdict is whyNoReplay for an attempt that lost its runner with
 // err: a shutdown the helper reported counts as the VM's notice, since EC2
 // still reports a VM running while its OS halts.
-func replayVerdict(lease *Lease, noticed bool, err error, at stage, exclusive bool) noReplay {
-	return whyNoReplay(lease, noticed || vmShutdown(err), at, exclusive)
+func replayVerdict(ctx context.Context, lease *Lease, noticed bool, err error, at stage, exclusive bool) noReplay {
+	return whyNoReplayCtx(ctx, lease, noticed || vmShutdown(err), at, exclusive)
 }
 
 // shutdownErr is what runOnce returns when the VM's shutdown killed the
@@ -722,7 +728,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if lost != "" {
 			res.lostAt, res.lostWhen = prog.get(), time.Now()
 			if lease.InstanceID != "" {
-				res.noReplay = replayVerdict(lease, noticed.Load(), err, res.lostAt, o.Exclusive)
+				res.noReplay = replayVerdict(ctx, lease, noticed.Load(), err, res.lostAt, o.Exclusive)
 			}
 		}
 	}()
