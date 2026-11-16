@@ -18,11 +18,13 @@ import (
 func TestRegistryForLifecyclePolicy(t *testing.T) {
 	for _, exists := range []bool{true, false} {
 		t.Run(map[bool]string{true: "reapplied to an existing repository", false: "set on a new repository"}[exists], func(t *testing.T) {
-			var policies []string
+			var policies, calls []string
 			rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				b, _ := io.ReadAll(r.Body)
 				st, body := 200, "{}"
-				switch strings.TrimPrefix(r.Header.Get("X-Amz-Target"), "AmazonEC2ContainerRegistry_V20150921.") {
+				action := strings.TrimPrefix(r.Header.Get("X-Amz-Target"), "AmazonEC2ContainerRegistry_V20150921.")
+				calls = append(calls, action)
+				switch action {
 				case "DescribeRepositories":
 					if exists {
 						body = `{"repositories":[{"repositoryUri":"1.dkr.ecr.us-east-2.amazonaws.com/spotexec/x"}]}`
@@ -42,6 +44,8 @@ func TestRegistryForLifecyclePolicy(t *testing.T) {
 					policies = append(policies, in.Policy)
 				case "GetAuthorizationToken":
 					body = `{"authorizationData":[{"authorizationToken":"QVdTOnB3","proxyEndpoint":"https://1.dkr.ecr.us-east-2.amazonaws.com"}]}`
+				default:
+					t.Errorf("unexpected request %q %s", action, b)
 				}
 				return &http.Response{StatusCode: st, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
 			})
@@ -54,8 +58,12 @@ func TestRegistryForLifecyclePolicy(t *testing.T) {
 			if _, err := a.RegistryFor(context.Background(), "x"); err != nil {
 				t.Fatal(err)
 			}
-			if len(policies) != 1 {
-				t.Fatalf("policies set: %q", policies)
+			want := "DescribeRepositories PutLifecyclePolicy GetAuthorizationToken"
+			if !exists {
+				want = "DescribeRepositories CreateRepository PutLifecyclePolicy GetAuthorizationToken"
+			}
+			if got := strings.Join(calls, " "); got != want || len(policies) != 1 {
+				t.Fatalf("calls %s, want %s", got, want)
 			}
 			var pol struct {
 				Rules []struct {
