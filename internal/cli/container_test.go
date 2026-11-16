@@ -67,6 +67,15 @@ func TestScaffoldDockerfileStacks(t *testing.T) {
 		if strings.Count(body, "\nFROM ") != 1 {
 			t.Errorf("%s: want exactly one FROM", stack)
 		}
+		// Every Debian or Ubuntu base gets a UTF-8 locale straight after FROM;
+		// eclipse-temurin sets its own.
+		want := 1
+		if strings.HasPrefix(c.from, "FROM eclipse-temurin:") {
+			want = 0
+		}
+		if n := strings.Count(body, "\n"+c.from+"\n"+utf8Locale); n != want || strings.Count(body, "ENV LANG=") != want {
+			t.Errorf("%s: want %d UTF-8 locale(s), right after FROM, in:\n%s", stack, want, body)
+		}
 	}
 }
 
