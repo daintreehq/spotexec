@@ -25,16 +25,16 @@ cache_dirs = ["node_modules", "packages/*/node_modules", "native/*/build"]
 
 A task that runs something close to CI's command, but not quite the same, is the commonest cause of "passes in CI, fails remotely". Use the same script, flags and environment: if CI runs the linter with a larger heap or a set concurrency, so should the task.
 
-### Rebuild source-derived output in every task
+### Rebuild source-derived output in a setup step
 
-Anything built from your sources rather than from the lockfile can't live in the dependency cache: workspace packages' `dist/`, generated code, compiled assets that tests import. CI rebuilds it after restoring the cache, and each task should too. Keep the step's output out of the way unless it fails:
+Anything built from your sources rather than from the lockfile can't live in the dependency cache: workspace packages' `dist/`, generated code, compiled assets that tests import. CI rebuilds it after restoring the cache. Put that build in [`[setup]`](configuration.md#setup), which runs before every task and ad-hoc command, after the dependency restore, and shows its output only when it fails:
 
 ```toml
-[tasks.test]
-run = "npm run build:packages >/tmp/build.log 2>&1 || { cat /tmp/build.log; exit 1; }; npx vitest run {args}"
+[setup]
+run = "npm run build:packages"
 ```
 
-Don't rely on output an earlier run left behind. A slot keeps ignored files between runs, so a task without this step can pass on a slot that a previous run happened to prepare, and fail on a fresh one.
+Don't rely on output an earlier run left behind. A slot keeps ignored files between runs, so without this step a task can pass on a slot that a previous run happened to prepare, and fail on a fresh one. A task that doesn't need the build can skip it with `setup = false`.
 
 ### Find missing system packages by running the code
 
@@ -83,13 +83,13 @@ exclusive = true
 timeout = "30m"
 ```
 
-Shard only a suite that runs many times longer than a cold start, with the test runner's own shard option in a [sharded task](configuration.md#tasks) (`shards = 4` and `--shard={shard}/{shards}`). Parts beyond the free slots launch VMs, each paying the cold start and the per-run setup, so more shards can be slower as well as costlier. [When sharding pays](scaling.md#when-sharding-pays) has the trade-off, and [the Daintree case study](case-study-daintree.md#one-vm-per-part-the-lesson) shows it on a real suite. Jobs your CI runs separately can still run side by side as the parts of a `parallel` task.
+Shard only a suite that runs many times longer than a cold start, with the test runner's own shard option in a [sharded task](configuration.md#tasks) (`shards = 4` and `--shard={shard}/{shards}`). Parts beyond the free slots launch VMs, each paying the cold start and the per-run setup, so more shards can be slower as well as costlier. [When sharding pays](scaling.md#when-sharding-pays) has the trade-off, and [the Daintree case study](case-study-daintree.md#one-vm-per-part-the-lesson) shows it on a real suite. Jobs your CI runs separately can still run side by side as the parts of a `parallel` task, which ends with a [summary of every part](agents.md#what-an-agent-sees); `--group` prints each part's output as one block when it finishes.
 
 ## Checking it
 
 - **Make every task say what it ran.** A loop over an empty list exits 0 without output, which looks like a pass. Print a line per unit of work, and fail when there's nothing to do.
 - **Test on a fresh slot before trusting a pass.** `spotexec down` and a rerun proves a task doesn't depend on files an earlier run left in its slot.
-- **Check for fixed ports and Docker.** Tests that bind fixed ports can collide with another slot's on the same VM (#79), and tests that start their own containers can't run inside a project container (#80). Until those are resolved, run such suites `exclusive` or keep them local.
+- **Check for fixed ports and Docker.** Tests that bind fixed ports can collide with another slot's on the same VM; [`network = "private"`](environments.md#settings) in `[container]` gives each run a network of its own. Tests that start their own containers need [`docker = true`](environments.md#docker-inside-the-container), which gives the command the runner's Docker daemon, and with it root on the runner.
 
 ## Debugging a runner
 

@@ -82,6 +82,12 @@ The packages install the `sx` link and bash, zsh and fish completions too.
 
 The release also has `.tar.gz` archives for macOS and Linux on amd64 and arm64. Each holds a single `spotexec` binary: put it on your `PATH` and link `sx` to it.
 
+```sh
+tar -xzf spotexec_*.tar.gz spotexec
+sudo install -m 755 spotexec /usr/local/bin/spotexec
+sudo ln -sf spotexec /usr/local/bin/sx
+```
+
 To build from source you need Go 1.26 or later:
 
 ```sh

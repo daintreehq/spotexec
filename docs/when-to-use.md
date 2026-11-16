@@ -7,14 +7,13 @@ spotexec moves a command off your machine for as long as it runs, onto a few VMs
 - **Whole-suite checks that are too heavy to run locally.** Daintree's unit suite takes 15 to 20 minutes on a laptop and locks the machine up. On spotexec it runs as one `exclusive` job on a warm 8-vCPU Spot VM, with the laptop free throughout. A full check before a pull request, instead of waiting for CI after the push, is where spotexec changes the most.
 - **Several heavy checks at once.** Typecheck, lint and the project's guard scripts ran side by side, each on a whole VM, in 5m43s, the time of the slowest one. On one machine they compete for the same cores and memory.
 - **Many worktrees on one machine.** With several coding agents each running tests and type checks, your laptop's CPU and memory become the bottleneck, and every check slows down. Each offloaded check gets its own slot on a small shared pool, and when the pool is full, checks wait their turn instead of slowing each other down. The pool shrinks to zero when the work stops.
-- **Catching Linux-only problems before you push.** Commands run on Linux in a pinned [project container](environments.md#project-containers), as in CI. Case-sensitive paths, missing system libraries and locale problems show up before the push instead of after it.
+- **Catching Linux-only problems before you push.** Commands run on Linux in a pinned [project container](environments.md#project-containers), as in CI. Case-sensitive paths, missing system libraries and locale problems show up before the push instead of after it. Suites that bind fixed ports or start containers of their own run there too, with [`network = "private"`](environments.md#settings) and [`docker = true`](environments.md#docker-inside-the-container).
 
 ## Where it doesn't help
 
 - **Small, quick runs.** A warm run of one quick test file took about 5 seconds end to end: scan, sync, image and dependency checks, the test itself and write-back. Add any per-run setup your project needs (Daintree's workspace build adds about 14 seconds). A test that takes 2 seconds locally is faster locally, unless your machine is already saturated.
 - **Cold starts, and many VMs at once.** A new VM takes a minute and a half or more before your command runs, about 3 minutes on Daintree once the image, dependency restore, sync and setup are counted, and the first run after your dependencies change installs them again (2 to 4 minutes for Daintree). After its last job a VM stays up, and bills, for `idle_timeout` (10 minutes by default). A few VMs that stay warm pay this once a session; spreading one job over many fresh VMs pays it on every VM, which is why [sharding a suite across VMs](scaling.md#when-sharding-pays) rarely beats one run on a warm one. [Baked images](environments.md#baked-images) shorten the boot.
 - **Interactive work.** Dev servers, watch modes and anything that needs a terminal stay local.
-- **Suites that need fixed ports or Docker.** Until #79 and #80 are resolved, tests that bind fixed ports can collide with another slot's on the same VM, and tests that start their own containers can't run inside a project container. Run such suites `exclusive`, or keep them local.
 
 ## With coding agents
 
@@ -55,12 +54,3 @@ Not yet exercised on a real project either:
 
 - **Runners:** SSH runners, macOS runners and Graviton (arm64) fleets.
 - **Concurrency:** several worktrees running heavy checks at the same time.
-
-Open issues worth knowing about:
-
-- **#68:** dependency install output appears in the command's output on a cache miss.
-- **#76:** parallel and sharded runs end without an overall summary.
-- **#77:** no option to group a parallel run's output by part.
-- **#78:** no shared setup step for tasks.
-- **#79:** tests that bind fixed ports can collide across slots.
-- **#80:** tests can't start Docker containers inside a project container.
