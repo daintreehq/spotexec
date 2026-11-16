@@ -108,7 +108,7 @@ That is why `vcpus` is an exact count rather than a range: one count means one s
 
 ## Pool manager (optional)
 
-`spotexec daemon` is a background process on **your** machine, not in the cloud. It works on the same local state as `sx`, so the two never double-launch, and `sx` behaves the same whether or not the daemon runs. It manages the fleets in `~/.config/spotexec/config.toml`, not project-defined ones. Restart it after editing that file.
+`spotexec daemon` is a background process on **your** machine, not in the cloud. It works on the same local state as `sx`, so the two never double-launch, and `sx` behaves the same whether or not the daemon runs. It manages the fleets in `~/.config/spotexec/config.toml`, not project-defined ones, and follows edits to that file without a restart. An edit that doesn't load is reported once, and the daemon carries on with the config it had; a fleet you remove is no longer managed, and its VMs idle out on their own.
 
 ```sh
 spotexec daemon start      # background; log at ~/.local/state/spotexec/daemon/daemon.log
