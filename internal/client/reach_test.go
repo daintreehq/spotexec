@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -81,13 +82,22 @@ func TestSilentRegionIsHeldUntilAVMAnswers(t *testing.T) {
 	if len(h.asked) != 0 {
 		t.Fatalf("one served VM going quiet held its region: %v", h.asked)
 	}
-	failTwice(p, a2)
+	p.Observe(a2.ID, OutUnreachable, a2.LaunchedAt)
+	if len(h.asked) != 0 {
+		t.Fatalf("held after the second VM's first failure: %v", h.asked)
+	}
+	p.Observe(a2.ID, OutUnreachable, a2.LaunchedAt)
 	if len(h.asked) != 1 || h.asked[0] != "r-a" || !strings.Contains(h.holds["r-a"], "2 VMs there don't answer SSH: i-a1, i-a2") {
 		t.Fatalf("asked %v, holds %v", h.asked, h.holds)
 	}
 	failTwice(p, a1)
 	if len(h.asked) != 1 {
 		t.Fatalf("renewed within a minute: %v", h.asked)
+	}
+	_ = p.with(func(st *poolState) error { st.Held["r-a"] = time.Now().Add(-holdRenew - time.Second); return nil })
+	p.Observe(a1.ID, OutUnreachable, a1.LaunchedAt)
+	if len(h.asked) != 2 {
+		t.Fatalf("not renewed after a minute: %v", h.asked)
 	}
 	// Another region answering says nothing about r-a.
 	p.Observe(b1.ID, OutAcquired, b1.LaunchedAt)
@@ -103,7 +113,7 @@ func TestSilentRegionIsHeldUntilAVMAnswers(t *testing.T) {
 	}
 	// Answered again, a later single failure holds nothing.
 	failTwice(p, a1)
-	if len(h.asked) != 1 {
+	if len(h.asked) != 2 {
 		t.Fatalf("held again though i-a2 just answered: %v", h.asked)
 	}
 }
@@ -119,7 +129,11 @@ func TestNeverReachedVMHoldsItsRegion(t *testing.T) {
 	}
 	old := vmIn("i-old", "r-b", 11*time.Minute)
 	p2, h2 := regionPool(t, 4, old)
-	failTwice(p2, old)
+	p2.Observe(old.ID, OutUnreachable, old.LaunchedAt)
+	if len(h2.asked) != 0 {
+		t.Fatalf("held after one failed probe: %v", h2.asked)
+	}
+	p2.Observe(old.ID, OutUnreachable, old.LaunchedAt)
 	if len(h2.asked) != 1 || !strings.Contains(h2.holds["r-b"], "i-old has never answered SSH") {
 		t.Fatalf("asked %v, holds %v", h2.asked, h2.holds)
 	}
@@ -151,22 +165,37 @@ func TestCapFullOfUnreachableVMsMakesRoom(t *testing.T) {
 	if d.Launch || len(d.Reap) != 1 || d.Reap[0] != "i-a2" || !strings.Contains(d.Reason, "can't reach") {
 		t.Fatalf("want the oldest unreachable VM reaped: %+v", d)
 	}
-
-	// i-a2 has a run in flight (as far as this client knows): only i-a1.
-	_ = p.with(func(st *poolState) error {
-		st.sched().Attempts["x"] = &claimRec{VM: "i-a2", State: "sent", At: time.Now(), SentAt: time.Now()}
-		return nil
-	})
-	if d := planOnce(t, p); len(d.Reap) != 1 || d.Reap[0] != "i-a1" {
-		t.Fatalf("reaped a VM with a run on it: %+v", d)
+	// While it is being ended no run goes there, and no other process
+	// picks it again; it still counts toward max_instances.
+	if _, err := p.reserveOn(a2, claim{Exact: true}); err != errNoRoom {
+		t.Fatalf("reserved a VM being reaped: %v", err)
+	}
+	if cands, usable, _ := p.Candidates(context.Background(), nil); usable != 2 || slices.ContainsFunc(cands, func(in provider.Instance) bool { return in.ID == "i-a2" }) {
+		t.Fatalf("candidates %v, usable %d", cands, usable)
+	}
+	if d := planOnce(t, p); d.Launch || len(d.Reap) != 1 || d.Reap[0] != "i-a1" {
+		t.Fatalf("second plan: %+v", d)
 	}
 
 	// Nowhere else to launch: keep them (they show when r-a answers again).
-	h.closed = true
-	if d := planOnce(t, p); len(d.Reap) != 0 {
+	p2, h2 := regionPool(t, 2, a1, a2)
+	failTwice(p2, a1)
+	failTwice(p2, a2)
+	h2.closed = true
+	if d := planOnce(t, p2); len(d.Reap) != 0 {
 		t.Fatalf("reaped with every region held: %+v", d)
 	}
-	h.closed = false
+	h2.closed = false
+
+	// i-a2 has a run on it (as far as this client knows): only i-a1.
+	_ = p2.with(func(st *poolState) error {
+		st.sched().Attempts["x"] = &claimRec{VM: "i-a2", State: "acquired", At: time.Now(), SentAt: time.Now()}
+		return nil
+	})
+	if d := planOnce(t, p2); len(d.Reap) != 1 || d.Reap[0] != "i-a1" {
+		t.Fatalf("reaped a VM with a run on it: %+v", d)
+	}
+	_ = h
 
 	// Ended: the next plan launches (elsewhere: the fleet skips r-a).
 	_ = p.Fleet.Terminate(context.Background(), "i-a1")
@@ -198,13 +227,16 @@ func TestNoRegionNoHold(t *testing.T) {
 	if d := planOnce(t, p); len(d.Reap) != 0 {
 		t.Fatalf("%+v", d)
 	}
+	if held := readState(t, p).Held; len(held) != 0 {
+		t.Fatalf("held %v", held)
+	}
 }
 
 // A launch whose VM never answered, in a held region, stops covering
 // waiting jobs at once (not a minute after boot_timeout), so the next
 // launch goes elsewhere.
 func TestLostLaunchStopsCoveringDemand(t *testing.T) {
-	old := vmIn("i-old", "r-a", 11*time.Minute)
+	old := vmIn("i-old", "r-a", 10*time.Minute+30*time.Second) // within boot_timeout + 1m
 	p, _ := regionPool(t, 4, old)
 	_ = p.with(func(st *poolState) error {
 		st.Launches = []launchRec{{ID: "l1", InstanceID: "i-old", Started: old.LaunchedAt, PID: os.Getpid()}}
@@ -216,5 +248,56 @@ func TestLostLaunchStopsCoveringDemand(t *testing.T) {
 	failTwice(p, old)
 	if d := planOnce(t, p); !d.Launch || d.Pending != 1 {
 		t.Fatalf("the lost launch still covers demand: %+v", d)
+	}
+}
+
+// Any answer is contact: a helper error, a draining reply, an exclusive
+// probe finding it busy, or `spotexec status` reaching it. None is silence.
+func TestAnswersEndHolds(t *testing.T) {
+	for _, o := range []Outcome{outRefused, outDrainReply, outContact} {
+		a1, a2 := vmIn("i-a1", "r-a", time.Hour), vmIn("i-a2", "r-a", time.Hour)
+		p, h := regionPool(t, 4, a1, a2)
+		failTwice(p, a1)
+		failTwice(p, a2)
+		p.Observe(a2.ID, o, a2.LaunchedAt)
+		if len(h.reached) != 1 || len(h.holds) != 0 {
+			t.Fatalf("outcome %d: reached %v, holds %v", o, h.reached, h.holds)
+		}
+	}
+	// Two VMs whose helpers keep refusing hold nothing.
+	a1, a2 := vmIn("i-a1", "r-a", time.Hour), vmIn("i-a2", "r-a", time.Hour)
+	p, h := regionPool(t, 4, a1, a2)
+	for i := 0; i < 3; i++ {
+		p.Observe(a1.ID, outRefused, a1.LaunchedAt)
+		p.Observe(a2.ID, outRefused, a2.LaunchedAt)
+	}
+	if len(h.asked) != 0 {
+		t.Fatalf("refusing helpers held their region: %v", h.asked)
+	}
+	if d := planOnce(t, p); len(d.Reap) != 0 {
+		t.Fatalf("%+v", d)
+	}
+	// Status reaching a VM ends a hold too.
+	failTwice(p, a1)
+	failTwice(p, a2)
+	p.Reached(a1.ID)
+	if len(h.reached) != 1 {
+		t.Fatalf("reached %v", h.reached)
+	}
+}
+
+// A teardown keeps the record of held regions, so an answer there still
+// ends the fleet's hold.
+func TestResetKeepsHeld(t *testing.T) {
+	old := vmIn("i-old", "r-a", 11*time.Minute)
+	p, h := regionPool(t, 4, old)
+	failTwice(p, old)
+	p.Reset()
+	if _, _, err := p.Candidates(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	p.Observe(old.ID, OutAcquired, old.LaunchedAt)
+	if len(h.reached) != 1 {
+		t.Fatalf("reached %v after a reset", h.reached)
 	}
 }

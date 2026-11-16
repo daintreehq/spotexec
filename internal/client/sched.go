@@ -553,6 +553,9 @@ func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 		now := time.Now()
 		s.reconcileOwners(now)
 		v := s.vm(in.ID, now)
+		if st.Notes[in.ID].reaping(now) {
+			return errNoRoom // being ended to make room: it can't be reached anyway
+		}
 		if !c.Force {
 			if f := s.Fences[in.ID]; f != nil && f.Owner != owner && !c.Exact {
 				return errNoRoom

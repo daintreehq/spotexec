@@ -414,7 +414,11 @@ func (g *AWSGlobal) withStateWait(wait time.Duration, fn func(st *placementState
 		}
 	}
 	for k, v := range st.Cooldown {
-		if now.After(v.Until.Add(coolMemory(k))) {
+		end := v.Until
+		if v.Trial.After(end) {
+			end = v.Trial // a trial still booting keeps its region's hold
+		}
+		if now.After(end.Add(coolMemory(k))) {
 			delete(st.Cooldown, k) // forget the backoff step too, eventually
 		}
 	}
@@ -1263,13 +1267,17 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		// (and an older IAM policy may not allow reading them): try the
 		// types in the listed order instead.
 		why := fmt.Sprintf("can't compare Spot prices (%s); trying instance_types in order", firstLineOfErr(err))
-		if held, lapsed := g.unreachRegions(); held[g.r.Region] || (lapsed[g.r.Region] && !g.claimTrial(g.r.Region)) {
+		held, lapsed := g.unreachRegions()
+		if held[g.r.Region] || (lapsed[g.r.Region] && !g.claimTrial(g.r.Region)) {
 			return Instance{}, fmt.Errorf("%s is %s", g.r.Region, g.unreachDetail(g.r.Region))
 		}
 		log("%s", why)
 		a := g.home()
 		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{beforeSend: g.mark(a.r.Region)})
 		if err != nil {
+			if lapsed[g.r.Region] && !errors.Is(err, ErrLaunchAmbiguous) {
+				g.dropTrial(g.r.Region) // nothing launched there to try it
+			}
 			return Instance{}, err
 		}
 		in := a.instance(inst)
@@ -1525,12 +1533,12 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 				in.Placement = &Placement{Order: "on_demand", Why: "on_demand_fallback: no Spot option could launch"}
 				return in, nil
 			}
+			if lapsed[rg] && !errors.Is(err, ErrLaunchAmbiguous) {
+				g.dropTrial(rg) // nothing launched there to try it
+			}
 			var ce *CredentialError
 			if errors.Is(err, ErrLaunchAmbiguous) || errors.As(err, &ce) || ctx.Err() != nil {
 				return Instance{}, fmt.Errorf("%s: %w", rg, err)
-			}
-			if lapsed[rg] {
-				g.dropTrial(rg)
 			}
 			var oq *QuotaError
 			if !errors.As(err, &oq) {

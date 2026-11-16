@@ -351,12 +351,8 @@ check "status says sim-a takes no launches, and why" "grep -q \"$RR: no launches
 for i in 1 2; do SPOTEXEC_POOL=$RR "$SX" --json "sleep 4; echo busy$i" >"$WORK/u2$i.out" 2>"$WORK/u2$i.err" & done; wait
 check "with sim-a still held, the next launch goes to sim-b too (regions: $(regions))" "[ \$(cat $WORK/u2*.out | grep -c '^busy') = 2 ] && [ \"\$(regions)\" = 'sim-a sim-b sim-b ' ]"
 "$SX" sim network "$RR" sim-a up >/dev/null
-sleep 32 # the sim-a VM's 30s suspect window: probed again from here
-SPOTEXEC_POOL=$RR "$SX" --json 'echo back' >"$WORK/u3.out" 2>"$WORK/u3.err"
-U3=$(placed "$WORK/u3.err")
-check "sim-a answers again: a job runs there (${U3:-none})" "grep -q back $WORK/u3.out && [ \"\$(region \"$U3\")\" = sim-a ]"
 "$SX" status "$RR" >"$WORK/u-status2.out" 2>&1
-check "and its hold is gone" "! grep -q 'no launches into sim-a' $WORK/u-status2.out"
+check "sim-a answers again (here, to status): its hold is gone" "! grep -q 'no launches into sim-a' $WORK/u-status2.out"
 for i in 1 2 3 4; do SPOTEXEC_POOL=$RR "$SX" --json "sleep 6; echo again$i" >"$WORK/u4$i.out" 2>"$WORK/u4$i.err" & done; wait
 check "with every VM busy, a new launch goes to sim-a again (regions: $(regions))" "[ \$(cat $WORK/u4*.out | grep -c '^again') = 4 ] && [ \"\$(regions)\" = 'sim-a sim-a sim-b sim-b ' ]"
 unset SPOTEXEC_SIM_REGIONS

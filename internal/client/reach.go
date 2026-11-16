@@ -56,7 +56,7 @@ func (p *Pool) judgeRegion(st *poolState, id string, o Outcome, now time.Time) r
 		return regionReach{} // not listed yet, or the fleet has no regions
 	}
 	switch o {
-	case OutAcquired, OutBusy, OutBooting, OutBootFailed:
+	case OutAcquired, OutBusy, OutBooting, OutBootFailed, outRefused, outDrainReply, outContact:
 		if _, held := st.Held[region]; held {
 			delete(st.Held, region)
 			return regionReach{reached: region}
@@ -75,8 +75,8 @@ func (p *Pool) judgeRegion(st *poolState, id string, o Outcome, now time.Time) r
 	return regionReach{}
 }
 
-// applyReach passes a probe's verdict on to the fleet (outside the pool
-// lock: the fleet keeps holds under its own).
+// applyReach passes a probe's verdict on to the fleet. Called under the
+// pool lock (the fleet keeps holds under its own, taken after it).
 func (p *Pool) applyReach(r regionReach) {
 	rh, ok := p.Fleet.(provider.RegionHolder)
 	if !ok {
@@ -105,11 +105,11 @@ func (p *Pool) silentRegion(st *poolState, region string, now time.Time) string 
 		if in.Region != region || n == nil || n.closed() {
 			continue // not probed yet, or out of service
 		}
-		if n.Failures == 0 && n.reached() {
+		if n.reached() && !n.Silent.After(n.Reached) {
 			return "" // it answered its last probe
 		}
 		age := now.Sub(in.LaunchedAt)
-		if n.Failures < 2 || age < p.R.BootTimeout.Duration {
+		if n.Failures < 2 || n.Silent.IsZero() || age < p.R.BootTimeout.Duration {
 			continue // may still be booting sshd
 		}
 		silent = append(silent, in.ID)
@@ -131,6 +131,16 @@ func (p *Pool) silentRegion(st *poolState, region string, now time.Time) string 
 	return ""
 }
 
+// reaping reports whether a process is ending the VM to make room
+// (marked by Plan; if the request fails the VM is back after a minute).
+func (n *note) reaping(now time.Time) bool {
+	return n != nil && !n.Reaping.IsZero() && now.Sub(n.Reaping) < time.Minute
+}
+
+// Reached records that a VM answered this client outside a job's probe
+// (`spotexec status`), ending its region's hold.
+func (p *Pool) Reached(id string) { p.Observe(id, outContact, time.Time{}) }
+
 // reached reports whether the VM ever answered this client (Ready: it
 // served, which notes from before Reached existed only say this way).
 func (n *note) reached() bool { return n != nil && (n.Ready || !n.Reached.IsZero()) }
@@ -144,7 +154,7 @@ func (p *Pool) lostVM(st *poolState, id string, now time.Time) bool {
 		}
 		n := st.Notes[id]
 		at, held := st.Held[in.Region]
-		return in.Region != "" && held && now.Sub(at) <= reapAfter && n != nil && !n.reached() && n.Failures >= 2 &&
+		return in.Region != "" && held && now.Sub(at) <= reapAfter && n != nil && !n.reached() && n.Failures >= 2 && !n.Silent.IsZero() &&
 			now.Sub(in.LaunchedAt) >= p.R.BootTimeout.Duration
 	}
 	return false
@@ -166,8 +176,8 @@ func (p *Pool) reapable(st *poolState, now time.Time) (string, string) {
 		n := st.Notes[in.ID]
 		at, held := st.Held[in.Region]
 		if in.Region == "" || !held || now.Sub(at) > reapAfter || in.State != provider.StateRunning ||
-			n == nil || n.closed() || n.Failures < 2 || now.Sub(in.LaunchedAt) < p.R.BootTimeout.Duration ||
-			st.sched().protected(in.ID) {
+			n == nil || n.closed() || n.reaping(now) || n.Failures < 2 || n.Silent.IsZero() || n.Reached.After(n.Silent) ||
+			now.Sub(in.LaunchedAt) < p.R.BootTimeout.Duration || st.sched().protected(in.ID) {
 			continue
 		}
 		cands = append(cands, in)

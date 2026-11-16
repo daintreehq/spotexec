@@ -89,6 +89,8 @@ type runnerStatus struct {
 	r           *config.Runner
 	// reclaimed records a Spot interruption notice the VM reports.
 	reclaimed func()
+	// answered: this status request reached the VM over SSH.
+	answered bool
 }
 
 const (
@@ -209,6 +211,13 @@ func fleetMismatches(ctx context.Context, f provider.Fleet, insts []provider.Ins
 func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []runnerStatus {
 	var rows []runnerStatus
 	var fleets []fleetInstances
+	// Fleets that keep region holds: their pool, and their first row.
+	type holder struct {
+		rh    provider.RegionHolder
+		pool  *client.Pool
+		first int
+	}
+	var holders []holder
 	for _, r := range rs {
 		p, err := provider.New(r)
 		if err != nil {
@@ -232,7 +241,8 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			}
 			fleets = append(fleets, fleetInstances{r, insts})
 			mismatch := fleetMismatches(ctx, f, insts)
-			roles := client.NewPool(r, f).Roles()
+			pool := client.NewPool(r, f)
+			roles := pool.Roles()
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
 				st := runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
@@ -246,9 +256,7 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				rows = append(rows, st)
 			}
 			if rh, ok := f.(provider.RegionHolder); ok && len(rows) > first {
-				if holds, _ := rh.RegionHolds(); len(holds) > 0 {
-					rows[first].LaunchHolds = holds
-				}
+				holders = append(holders, holder{rh, pool, first})
 			}
 			continue
 		}
@@ -283,6 +291,7 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				st.Error = err.Error()
 				return
 			}
+			st.answered = true // reached over SSH, whatever its helper says
 			b, err := c.HelperCmd(cctx, "status")
 			if err != nil {
 				st.Error = err.Error()
@@ -302,6 +311,17 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 		}()
 	}
 	wg.Wait()
+	// A VM that answered ends its region's hold; the holds left are shown.
+	for _, h := range holders {
+		for i := h.first; i < len(rows) && rows[i].Fleet == rows[h.first].Fleet; i++ {
+			if rows[i].answered {
+				h.pool.Reached(rows[i].Info.InstanceID)
+			}
+		}
+		if holds, _ := h.rh.RegionHolds(); len(holds) > 0 {
+			rows[h.first].LaunchHolds = holds
+		}
+	}
 	return rows
 }
 

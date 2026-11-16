@@ -63,12 +63,13 @@ func TestGlobalUnreachableRegionTakesNoLaunch(t *testing.T) {
 // With every region held nothing is sent, and the error says why.
 func TestGlobalEveryRegionUnreachable(t *testing.T) {
 	f := twoRegionPrices()
-	f.prices["r-two-1"] = nil
-	g := newGlobalEnv(t, f, "r-one-1")
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
 	g.HoldRegion("r-one-1", "i-1 has never answered SSH, 2m0s after its launch")
+	g.HoldRegion("r-two-1", "2 VMs there don't answer SSH: i-2, i-3")
 	_, err := g.Launch(context.Background(), t.Logf)
-	if err == nil || !strings.Contains(err.Error(), "r-one-1 is unreachable from this client") || !strings.Contains(err.Error(), "i-1 has never answered") {
-		t.Fatalf("want an error naming the held region, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "r-one-1 is unreachable from this client") || !strings.Contains(err.Error(), "i-1 has never answered") ||
+		!strings.Contains(err.Error(), "r-two-1 is unreachable from this client") {
+		t.Fatalf("want an error naming both held regions, got %v", err)
 	}
 	if runs := f.callsOf("RunInstances"); len(runs) != 0 {
 		t.Fatalf("launch requests sent: %v", runs)
@@ -128,34 +129,97 @@ func TestGlobalFailedTrialFreesTheRegion(t *testing.T) {
 	if in, err := g.Launch(context.Background(), t.Logf); err != nil || in.Region != "r-two-1" {
 		t.Fatalf("launched %+v, %v", in, err)
 	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 2 || !strings.HasPrefix(runs[0], "r-one-1") {
+		t.Fatalf("want the trial tried in r-one-1 first: %v", runs)
+	}
 	_ = g.withState(func(st *placementState) {
-		if c := st.Cooldown[unreachKey("r-one-1")]; !c.Trial.IsZero() {
-			t.Errorf("a failed trial still blocks the region: %+v", c)
+		if c := st.Cooldown[unreachKey("r-one-1")]; !c.Trial.IsZero() || c.Step == 0 {
+			t.Errorf("a failed trial still blocks the region (or the hold was lost): %+v", c)
 		}
 	})
+	// Capacity back (and its pool's capacity cooldown over): the next
+	// launch is r-one-1's trial.
+	f.runErr = nil
+	now = now.Add(poolCoolMin + time.Second)
+	if in, err := g.Launch(context.Background(), t.Logf); err != nil || in.Region != "r-one-1" {
+		t.Fatalf("launched %+v, %v; want r-one-1's trial", in, err)
+	}
+}
+
+// A trial still booting keeps its hold however long ago the hold lapsed.
+func TestGlobalPruningKeepsBootingTrial(t *testing.T) {
+	g := newGlobalEnv(t, twoRegionPrices(), "r-one-1", "r-two-1")
+	now := time.Now()
+	g.now = func() time.Time { return now }
+	g.HoldRegion("r-one-1", "x")
+	now = now.Add(unreachHoldMin + unreachHoldMax - time.Minute)
+	if !g.claimTrial("r-one-1") {
+		t.Fatal("no trial")
+	}
+	now = now.Add(time.Minute + time.Second) // past Until + coolMemory
+	if holds, _ := g.RegionHolds(); len(holds) != 1 {
+		t.Fatalf("the booting trial's hold was pruned: %v", holds)
+	}
 }
 
 func TestSimPickRegion(t *testing.T) {
 	now := time.Now()
 	m := map[string]cooldown{}
 	regions := []string{"sim-a", "sim-b"}
-	if rg, err := simPickRegion(m, regions, now, time.Minute); err != nil || rg != "sim-a" {
-		t.Fatalf("got %q, %v", rg, err)
+	if rg, trial, err := simPickRegion(m, regions, now, time.Minute); err != nil || rg != "sim-a" || trial {
+		t.Fatalf("got %q, %v, %v", rg, trial, err)
 	}
 	holdUnreachable(m, unreachKey("sim-a"), "cut off", now)
-	if rg, err := simPickRegion(m, regions, now, time.Minute); err != nil || rg != "sim-b" {
+	if rg, _, err := simPickRegion(m, regions, now, time.Minute); err != nil || rg != "sim-b" {
 		t.Fatalf("got %q, %v; want sim-b while sim-a is held", rg, err)
 	}
 	holdUnreachable(m, unreachKey("sim-b"), "cut off", now)
-	if _, err := simPickRegion(m, regions, now, time.Minute); err == nil || !strings.Contains(err.Error(), "held back") {
+	if _, _, err := simPickRegion(m, regions, now, time.Minute); err == nil || !strings.Contains(err.Error(), "held back") {
 		t.Fatalf("want every region held, got %v", err)
 	}
 	later := now.Add(unreachHoldMin + time.Second)
-	if rg, err := simPickRegion(m, regions, later, time.Minute); err != nil || rg != "sim-a" {
-		t.Fatalf("got %q, %v; want a trial in sim-a", rg, err)
+	if rg, trial, err := simPickRegion(m, regions, later, time.Minute); err != nil || rg != "sim-a" || !trial {
+		t.Fatalf("got %q, %v, %v; want a trial in sim-a", rg, trial, err)
 	}
-	if rg, err := simPickRegion(m, regions, later, time.Minute); err != nil || rg != "sim-b" {
-		t.Fatalf("got %q, %v; want sim-b's trial while sim-a's boots", rg, err)
+	if rg, trial, err := simPickRegion(m, regions, later, time.Minute); err != nil || rg != "sim-b" || !trial {
+		t.Fatalf("got %q, %v, %v; want sim-b's trial while sim-a's boots", rg, trial, err)
+	}
+	if _, _, err := simPickRegion(m, regions, later.Add(30*time.Second), time.Minute); err == nil {
+		t.Fatal("a third launch while both trials boot")
+	}
+	// A trial that never answered stops blocking once trialFor passes.
+	if rg, trial, err := simPickRegion(m, regions, later.Add(time.Minute+time.Second), time.Minute); err != nil || rg != "sim-a" || !trial {
+		t.Fatalf("got %q, %v, %v; want another trial in sim-a", rg, trial, err)
+	}
+}
+
+// While a trial VM boots, the hold's deadline is the trial's.
+func TestRegionHoldUntilCoversTrial(t *testing.T) {
+	now := time.Now()
+	m := map[string]cooldown{}
+	holdUnreachable(m, unreachKey("sim-a"), "cut off", now)
+	later := now.Add(unreachHoldMin + time.Second)
+	if ok, trial := claimTrial(m, unreachKey("sim-a"), later, time.Minute); !ok || !trial {
+		t.Fatal("no trial")
+	}
+	holds, open := regionHolds(m, []string{"sim-a", "sim-b"}, later, time.Minute)
+	if h := holds["sim-a"]; !h.Until.Equal(later.Add(time.Minute)) || !strings.Contains(h.Why, "one VM launched") || !open {
+		t.Fatalf("hold %+v, open %v", h, open)
+	}
+}
+
+// Holding doubles each time it lapses and comes back, up to an hour.
+func TestUnreachHoldDoublesToAnHour(t *testing.T) {
+	now := time.Now()
+	m := map[string]cooldown{}
+	k := unreachKey("r")
+	holdUnreachable(m, k, "x", now)
+	for _, want := range []time.Duration{20 * time.Minute, 40 * time.Minute, time.Hour, time.Hour} {
+		now = m[k].Until.Add(time.Second)
+		holdUnreachable(m, k, "x", now)
+		if m[k].Step != want {
+			t.Fatalf("step %s, want %s", m[k].Step, want)
+		}
 	}
 }
 
@@ -165,11 +229,19 @@ func TestSimRegionHoldsAndCutOff(t *testing.T) {
 	r := config.Runner{Name: "s", Type: config.TypeSim, BootTimeout: config.Duration{Duration: time.Minute}}
 	p, _ := NewSim(&r)
 	s := p.(*Sim)
+	if got := simRegions(); len(got) != 2 || got[0] != "sim-a" || got[1] != "sim-b" {
+		t.Fatalf("regions %q", got)
+	}
 	s.HoldRegion("sim-a", "cut off")
 	holds, open := s.RegionHolds()
 	if _, ok := holds["sim-a"]; !ok || !open {
 		t.Fatalf("holds %v, open %v", holds, open)
 	}
+	s.HoldRegion("sim-b", "cut off")
+	if _, open := s.RegionHolds(); open {
+		t.Fatal("open with every region held")
+	}
+	s.ReachedRegion("sim-b")
 	s.ReachedRegion("sim-a")
 	if holds, _ := s.RegionHolds(); len(holds) != 0 {
 		t.Fatalf("still held: %v", holds)

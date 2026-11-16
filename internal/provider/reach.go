@@ -129,7 +129,11 @@ func regionHolds(m map[string]cooldown, regions []string, now time.Time, trialFo
 			continue
 		}
 		if c, held := unreachHeld(m, k, now, trialFor); held {
-			out[region] = RegionHold{Why: unreachWhy(c, now), Since: c.Since, Until: c.Until}
+			until := c.Until
+			if t := c.Trial.Add(trialFor); !c.Trial.IsZero() && t.After(until) {
+				until = t // a trial VM is booting there
+			}
+			out[region] = RegionHold{Why: unreachWhy(c, now), Since: c.Since, Until: until}
 		}
 	}
 	open := len(regions) == 0
@@ -262,17 +266,17 @@ func simRegions() []string {
 }
 
 // simPickRegion is the first of regions a launch may go to now (claiming
-// its trial when its hold has lapsed), or why none may.
-func simPickRegion(m map[string]cooldown, regions []string, now time.Time, trialFor time.Duration) (string, error) {
+// its trial when its hold has lapsed: trial), or why none may.
+func simPickRegion(m map[string]cooldown, regions []string, now time.Time, trialFor time.Duration) (string, bool, error) {
 	var held []string
 	for _, rg := range regions {
-		if ok, _ := claimTrial(m, unreachKey(rg), now, trialFor); ok {
-			return rg, nil
+		if ok, trial := claimTrial(m, unreachKey(rg), now, trialFor); ok {
+			return rg, trial, nil
 		}
 		c, _ := unreachHeld(m, unreachKey(rg), now, trialFor)
 		held = append(held, rg+": "+unreachWhy(c, now))
 	}
-	return "", fmt.Errorf("every simulated region is held back (%s)", strings.Join(held, "; "))
+	return "", false, fmt.Errorf("every simulated region is held back (%s)", strings.Join(held, "; "))
 }
 
 // withHolds runs fn on the simulator's region holds (sim-holds.json in the
@@ -378,7 +382,11 @@ func (s *Sim) SetReachable(region string, reachable bool) error {
 	if err := os.MkdirAll(filepath.Dir(s.simCutOffFile()), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(s.simCutOffFile(), []byte(strings.Join(lines, "\n")), 0o600)
+	tmp := s.simCutOffFile() + ".tmp" + fmt.Sprint(os.Getpid())
+	if err := os.WriteFile(tmp, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.simCutOffFile()) // never half-written to a listing
 }
 
 // unreachableTarget is where a cut-off simulated VM's SSH goes: a port

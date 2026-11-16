@@ -273,11 +273,11 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 		return Instance{}, err
 	}
 	// Simulated regions: the first one this client hasn't been held out of.
-	region := ""
+	region, trial := "", false
 	if regions := simRegions(); len(regions) > 0 {
 		var perr error
 		if err := s.withHolds(func(m map[string]cooldown) {
-			region, perr = simPickRegion(m, regions, time.Now(), trialFor(s.r.BootTimeout.Duration))
+			region, trial, perr = simPickRegion(m, regions, time.Now(), trialFor(s.r.BootTimeout.Duration))
 		}); err != nil {
 			return Instance{}, err
 		}
@@ -297,6 +297,14 @@ func (s *Sim) Launch(ctx context.Context, log Logger) (Instance, error) {
 		"-v", "spotexec-simcache:/simcache",
 		"-p", "127.0.0.1::22", s.r.Image)
 	if err != nil {
+		if trial {
+			_ = s.withHolds(func(m map[string]cooldown) { // nothing there to try it
+				if c, ok := m[unreachKey(region)]; ok {
+					c.Trial = time.Time{}
+					m[unreachKey(region)] = c
+				}
+			})
+		}
 		return Instance{}, err
 	}
 	if log != nil {

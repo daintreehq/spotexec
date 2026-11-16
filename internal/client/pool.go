@@ -63,8 +63,13 @@ type note struct {
 	// not have agreed to drain yet.
 	Retiring bool `json:"retiring,omitempty"`
 	// Reached: when the VM last answered this client (any reply, even
-	// booting or draining). Ready says it once served.
+	// booting, draining or an error). Ready says it once served. Silent:
+	// when a probe last got no answer at all.
 	Reached time.Time `json:"reached,omitempty"`
+	Silent  time.Time `json:"silent,omitempty"`
+	// Reaping: when a process began ending the VM to make room (reach.go):
+	// no new runs go there meanwhile.
+	Reaping time.Time `json:"reaping,omitempty"`
 }
 
 // closed reports whether an instance takes no new runs and isn't capacity:
@@ -445,7 +450,7 @@ func (p *Pool) Candidates(ctx context.Context, exclude map[string]bool) (out []p
 			if !n.closed() {
 				usable++
 			}
-			if n != nil && (n.closed() || now.Before(n.SuspectUntil) || now.Before(n.BusyUntil)) {
+			if n != nil && (n.closed() || n.reaping(now) || now.Before(n.SuspectUntil) || now.Before(n.BusyUntil)) {
 				continue
 			}
 			out = append(out, in)
@@ -474,6 +479,15 @@ const (
 	// outSkipped: not contacted, the ledger shows no room (or the policy no
 	// longer places work there).
 	outSkipped
+	// outRefused: the helper answered with an error this side doesn't
+	// recognize: judged like OutUnreachable, but it is an answer.
+	outRefused
+	// outDrainReply: the VM answered that it is draining (OutDraining is
+	// also recorded with no contact at all, after a termination).
+	outDrainReply
+	// outContact: the VM answered, and nothing else is recorded (an
+	// exclusive probe finding it partly busy; `spotexec status`).
+	outContact
 )
 
 // Observe records a probe result, and holds launches out of the VM's
@@ -483,7 +497,6 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 	if o == outSkipped {
 		return
 	}
-	var reach regionReach
 	_ = p.with(func(st *poolState) error {
 		n := st.note(id)
 		now := time.Now()
@@ -497,6 +510,11 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 			n.BusyUntil, n.SuspectUntil, n.Failures, n.Reached = now.Add(busyHintFor), time.Time{}, 0, now
 		case OutDraining:
 			n.Draining = true
+		case outDrainReply:
+			n.Draining = true
+			n.Failures, n.Reached = 0, now
+		case outContact:
+			n.SuspectUntil, n.Failures, n.Reached = time.Time{}, 0, now
 		case OutBootFailed:
 			n.Draining, n.BootFailed = true, true
 			n.Failures, n.Reached = 0, now
@@ -506,7 +524,12 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 		case OutBooting:
 			n.BusyUntil = now.Add(2 * time.Second)
 			n.Failures, n.Reached = 0, now
-		case OutUnreachable:
+		case OutUnreachable, outRefused:
+			if o == OutUnreachable {
+				n.Silent = now
+			} else {
+				n.Reached = now
+			}
 			// A young instance is probably still booting sshd; an older one is
 			// suspect (but still counts toward capacity: unreachable is not
 			// absent).
@@ -517,10 +540,11 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 				n.SuspectUntil = now.Add(suspectFor)
 			}
 		}
-		reach = p.judgeRegion(st, id, o, now)
+		// The fleet's hold is set under this lock too, so a reply and a
+		// failure observed at once can't leave it out of step with Held.
+		p.applyReach(p.judgeRegion(st, id, o, now))
 		return nil
 	})
-	p.applyReach(reach)
 }
 
 // LaunchDecision is returned by Plan.
@@ -621,6 +645,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
 			if id, region := p.reapable(st, time.Now()); id != "" {
 				d.Reap = []string{id}
+				st.note(id).Reaping = time.Now()
 				d.Reason += fmt.Sprintf("; ending %s, in %s, which this client can't reach, to make room", id, region)
 			}
 		case p.R.Capped() && total >= 2*p.R.MaxInstances:
@@ -772,7 +797,9 @@ func (p *Pool) Cancel(id string) {
 // Reset forgets all local pool state (after `spotexec down`).
 func (p *Pool) Reset() {
 	_ = p.with(func(st *poolState) error {
-		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}}
+		// Held stays: the fleet's region holds outlive a teardown, and an
+		// answer from the region must still end them.
+		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}, Held: st.Held}
 		return nil
 	})
 }

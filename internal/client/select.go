@@ -330,9 +330,12 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 						out = outSkipped // a cancelled probe proves nothing about the VM
 					}
 					if !(out == OutBusy && req.Base.Exclusive) {
-						// An exclusive probe finding a partly busy instance must
-						// not hide its free slots from everyone else.
 						m.pool.Observe(in.ID, out, in.LaunchedAt)
+					} else {
+						// An exclusive probe finding a partly busy instance must
+						// not hide its free slots from everyone else; it still
+						// answered.
+						m.pool.Observe(in.ID, outContact, in.LaunchedAt)
 					}
 					if lease != nil {
 						if m.shadow != nil {
@@ -673,7 +676,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	case err == nil:
 		return nil, holders, OutBusy
 	case isDraining(err):
-		return nil, nil, OutDraining
+		return nil, nil, outDrainReply
 	case isCode(err, protocol.CodeBooting):
 		m.sawBooting(req.Rep, in, err)
 		return nil, nil, OutBooting
@@ -681,6 +684,8 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 		// The setup itself is broken: another VM would fail the same way.
 		m.fatal = err
 		return nil, nil, OutBootFailed
+	case isRefusal(err):
+		return nil, nil, outRefused // an answer, if not one this side knows
 	}
 	return nil, nil, OutUnreachable
 }
