@@ -493,13 +493,14 @@ func checkVersion(md toml.MetaData, v int) error {
 // decoder matches schema keys case-insensitively (TIMEOUT sets timeout),
 // while MetaData.IsDefined is exact, so a check built on it could be
 // sidestepped by spelling a key in capitals. The runner or task name under
-// [runners] or [tasks] still matches exactly.
+// [runners] or [tasks] still matches exactly. Like IsDefined, a table counts
+// as set when only keys inside it are (setup.timeout = "1m" sets [setup]).
 func defined(md toml.MetaData, key ...string) bool {
 	isName := func(i int) bool {
 		return i == 1 && (strings.EqualFold(key[0], "runners") || strings.EqualFold(key[0], "tasks"))
 	}
 	for _, k := range md.Keys() {
-		if len(k) != len(key) {
+		if len(k) < len(key) {
 			continue
 		}
 		match := true
@@ -954,7 +955,7 @@ func LoadProject(path string) (*Project, error) {
 		}
 		var und []toml.Key
 		for _, k := range md.Undecoded() {
-			if len(k) > 0 && k[0] == "runners" {
+			if len(k) > 0 && strings.EqualFold(k[0], "runners") {
 				continue // decoded later, by MergeProjectRunners
 			}
 			und = append(und, k)
@@ -1246,7 +1247,7 @@ func (c *Config) MergeProjectRunners() error {
 	if und := p.md.Undecoded(); len(und) > 0 {
 		var keys []string
 		for _, k := range und {
-			if len(k) > 0 && k[0] == "runners" {
+			if len(k) > 0 && strings.EqualFold(k[0], "runners") {
 				keys = append(keys, k.String())
 			}
 		}

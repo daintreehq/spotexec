@@ -1093,8 +1093,10 @@ max_price = "1.00"
 	}
 	// A same-name override may tighten too, and an SSH base has no fleet
 	// limits to keep.
-	if _, err := mergeProject(t, g, "[runners.aws]\nmax_price = \"0.3\"\nidle_timeout = \"5m\"\nmax_lifetime = \"1h\"\nmax_instances = 1\n"); err != nil {
+	if c, err := mergeProject(t, g, "[runners.aws]\nmax_price = \"0.3\"\nidle_timeout = \"5m\"\nmax_lifetime = \"1h\"\nmax_instances = 1\n"); err != nil {
 		t.Errorf("same-name tightening: %v", err)
+	} else if r := c.Global.Runners["aws"]; r.MaxPrice != "0.3" || r.IdleTimeout.Duration != 5*time.Minute || r.MaxLifetime.Duration != time.Hour || r.MaxInstances != 1 {
+		t.Errorf("same-name tightening: %+v", r)
 	}
 	gs, err := loadGlobalText(t, "[runners.box]\ntype = \"ssh\"\nhost = \"box\"\n")
 	if err != nil {
@@ -1185,10 +1187,21 @@ func TestProjectDurationsAndTaskPools(t *testing.T) {
 		"[tasks.a]\nrun = \"x\"\ntimeout = \"0s\"\n":            "tasks.a.timeout must be positive",
 		"[tasks.a]\nrun = \"x\"\ntimeout = \"-1m\"\n":           "tasks.a.timeout must be positive",
 		"[tasks.a]\nrun = \"x\"\nTIMEOUT = \"0s\"\n":            "tasks.a.timeout must be positive",
+		"deps.timeout = \"0s\"\n":                               "deps.timeout must be positive",
+		"setup.timeout = \"1m\"\n":                              "setup.run must be set",
+		"[deps]\nTimeout = \"0s\"\n":                            "deps.timeout must be positive",
 	} {
 		if _, err := load(body); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: want %q, got %v", body, want, err)
 		}
+	}
+	// A runner table spelled in capitals decodes like any other.
+	g0, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, err := mergeProject(t, g0, "[RUNNERS.big]\nEXTENDS = \"aws\"\nMAX_SLOTS = 1\n"); err != nil || c.Global.Runners["big"] == nil || c.Global.Runners["big"].MaxSlots != 1 {
+		t.Errorf("capitalised runner table: %v", err)
 	}
 	// Unset durations get their defaults (a task's inherits the command's).
 	for _, body := range []string{"", "[deps]\nhydrate = \"copy\"\n[container]\nimage = \"node:22\"\n[tasks.a]\nrun = \"x\"\n"} {
@@ -1199,8 +1212,8 @@ func TestProjectDurationsAndTaskPools(t *testing.T) {
 		if p.Timeout.Duration != 5*time.Minute || p.Grace.Duration != 5*time.Second || p.QueueTimeout.Duration != 10*time.Minute || p.Deps.Timeout.Duration != 20*time.Minute || p.Container.Timeout.Duration != 20*time.Minute {
 			t.Errorf("%q: defaults %+v", body, p)
 		}
-		if a := p.Tasks["a"]; a != nil && a.Timeout.Duration != 0 {
-			t.Errorf("unset task timeout: %s", a.Timeout.Duration)
+		if a := p.Tasks["a"]; body != "" && (a == nil || a.Timeout.Duration != 0) {
+			t.Errorf("unset task timeout: %+v", a)
 		}
 	}
 	p, err := load("timeout = \"30m\"\ngrace_period = \"2s\"\nqueue_timeout = \"1h\"\n[deps]\ntimeout = \"3m\"\n[container]\nimage = \"node:22\"\ntimeout = \"4m\"\n[tasks.a]\nrun = \"x\"\ntimeout = \"7m\"\n")
