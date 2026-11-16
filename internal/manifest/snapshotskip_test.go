@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -15,7 +16,8 @@ func TestSnapshotSkipAnchorsRootDirs(t *testing.T) {
 	}
 	hasRootTarget := false
 	for _, k := range got {
-		if k == "target" || k == ".spotexec" || k == "/.spotexec" {
+		name := strings.Trim(strings.TrimPrefix(k, "./"), "/")
+		if name == ".spotexec" || k == "target" || k == "target/" {
 			t.Fatalf("%q skipped: %v", k, got)
 		}
 		hasRootTarget = hasRootTarget || k == "/target"
