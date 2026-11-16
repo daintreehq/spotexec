@@ -30,7 +30,7 @@ var (
 
 func awsConfigPath() (string, error) {
 	if p := os.Getenv("AWS_CONFIG_FILE"); p != "" {
-		return p, nil
+		return expandAWSPath(p), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {

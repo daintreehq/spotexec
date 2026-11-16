@@ -257,15 +257,20 @@ func (c *awsClient) ssmGetParameter(ctx context.Context, name string) (string, e
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		if code := awsCode(err); isExpiredCreds(code) && attempt == 0 {
-			c.creds.invalidate()
-			continue
-		}
-		if awsCode(err) != "" && classifyAWSError(err) != errRetryable {
-			return "", err
-		}
 		var ce *CredentialError
 		if errors.As(err, &ce) {
+			return "", err // retrying can't fix credentials
+		}
+		if code := awsCode(err); isExpiredCreds(code) {
+			if attempt == 0 {
+				c.creds.invalidate()
+				continue
+			}
+			// Still rejected with fresh credentials, as in query: say so
+			// rather than let the caller blame the region.
+			return "", &CredentialError{err}
+		}
+		if awsCode(err) != "" && classifyAWSError(err) != errRetryable {
 			return "", err
 		}
 	}

@@ -634,7 +634,7 @@ func s3URL(endpoint, region, bucket, path string, q url.Values) string {
 		u = "https://" + bucket + ".s3." + region + ".amazonaws.com" + path
 	}
 	if len(q) > 0 {
-		u += "?" + q.Encode()
+		u += "?" + s3CanonicalQuery(q)
 	}
 	return u
 }

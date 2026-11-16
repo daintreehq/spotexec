@@ -28,7 +28,7 @@ func ProfileRegion(profile string) (region, from string) {
 	}
 	// As in the AWS CLI, a profile's settings in the credentials file win
 	// over those in the config file.
-	if r, src := iniRegion(expandAWSPath(sharedCredentialsPath()), []string{profile, `"` + profile + `"`}, profile); r != "" {
+	if r, src := iniRegion(sharedCredentialsPath(), []string{profile, `"` + profile + `"`}, profile); r != "" {
 		return r, src
 	}
 	cfg, err := awsConfigPath()
@@ -39,7 +39,7 @@ func ProfileRegion(profile string) (region, from string) {
 	if profile == "default" {
 		sections = append(sections, "profile default") // common spelling
 	}
-	return iniRegion(expandAWSPath(cfg), sections, profile)
+	return iniRegion(cfg, sections, profile)
 }
 
 // iniRegion reads region from the first of sections found in path.

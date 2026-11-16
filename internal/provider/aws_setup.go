@@ -667,7 +667,7 @@ func compactJSON(s string) string {
 
 func awsConfigFile() string {
 	if p := os.Getenv("AWS_CONFIG_FILE"); p != "" {
-		return p
+		return expandAWSPath(p)
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".aws", "config")
