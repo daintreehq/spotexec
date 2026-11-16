@@ -137,9 +137,9 @@ func TestGlobalFailedTrialFreesTheRegion(t *testing.T) {
 			t.Errorf("a failed trial still blocks the region (or the hold was lost): %+v", c)
 		}
 	})
-	// Capacity back (and its pool's capacity cooldown over): the next
-	// launch is r-one-1's trial.
-	f.runErr = nil
+	// Capacity back there (and its pool's capacity cooldown over), none in
+	// r-two-1: the launch is r-one-1's trial, not skipped.
+	f.runErr = map[string]string{"r-two-1/c7a.2xlarge": "InsufficientInstanceCapacity"}
 	now = now.Add(poolCoolMin + time.Second)
 	if in, err := g.Launch(context.Background(), t.Logf); err != nil || in.Region != "r-one-1" {
 		t.Fatalf("launched %+v, %v; want r-one-1's trial", in, err)

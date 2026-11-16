@@ -63,6 +63,7 @@ idle_timeout = "3m"
 boot_timeout = "15s"
 boot_delay = "1s"
 priority = 60
+scheduling = { early_drain = false } # VM counts are checked across idle spells
 EOF
 
 count() { docker ps -q --filter "label=spotexec-runner=$RUNNER" | wc -l | tr -d ' '; }
