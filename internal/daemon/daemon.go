@@ -413,7 +413,7 @@ func healthSettings(r *config.Runner) config.Runner {
 	c.Priority, c.MinInstances, c.MaxInstances, c.MaxSlots, c.HourlyCost = 0, 0, 0, 0, 0
 	c.RemotePathSetup = ""
 	c.IdleTimeout, c.MaxLifetime = config.Duration{}, config.Duration{}
-	c.LaunchOrder, c.MaxPrice, c.WaitCost = "", "", config.Dollars{}
+	c.LaunchOrder, c.MaxPrice, c.WaitCost = "", config.Dollars{}, config.Dollars{}
 	return c
 }
 
