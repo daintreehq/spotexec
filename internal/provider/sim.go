@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,8 +29,10 @@ import (
 // watchdog self-destructs, exactly where a real VM would terminate. Spot
 // interruptions and rebalance notices are injected with Interrupt/Rebalance.
 type Sim struct {
-	r     *config.Runner
-	owner string
+	r *config.Runner
+	// ownerMu guards owner, filled lazily by concurrent callers.
+	ownerMu sync.Mutex
+	owner   string
 }
 
 // NewSim constructs the simulator provider. The default image is tagged
@@ -76,6 +79,8 @@ done
 func (s *Sim) Runner() *config.Runner { return s.r }
 
 func (s *Sim) ownerTag() (string, error) {
+	s.ownerMu.Lock()
+	defer s.ownerMu.Unlock()
 	if s.owner == "" {
 		o, err := ownerID()
 		if err != nil {
