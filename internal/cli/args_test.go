@@ -24,6 +24,7 @@ func TestRunFlagsBeforeASubcommandExit125(t *testing.T) {
 		{"-s", "status"},
 		{"--exclusive", "doctor"},
 		{"--json=false", "status"},
+		{"--json", "--help=false", "status"},
 		{"-C", dir, "status"},
 		{"-C" + dir, "version"},
 		{"-C", dir, "--json", "help"},
@@ -37,9 +38,10 @@ func TestRunFlagsBeforeASubcommandExit125(t *testing.T) {
 }
 
 // -- still runs a command named like a subcommand, and not a task of that
-// name either: the unknown runner shows the run got as far as choosing one.
+// name either: the task's blank command would fail as empty, and the
+// unknown runner shows the command got as far as choosing one.
 func TestRunFlagsThenDashRunTheCommand(t *testing.T) {
-	dir := project(t, "[tasks.status]\nrun = \"true\"\n")
+	dir := project(t, "[tasks.status]\nrun = \" \"\n")
 	code, stderr := runMain(t, "spotexec", "-C", dir, "-r", "nope", "--", "status")
 	if code != client.ExitInfra || !strings.Contains(stderr, `unknown runner "nope"`) {
 		t.Errorf("exit %d, stderr %q", code, stderr)
@@ -59,6 +61,10 @@ func TestHelpAfterRunFlags(t *testing.T) {
 		if code != 0 || stderr != "" || out != want || !strings.Contains(out, "Usage:") {
 			t.Errorf("spotexec -C missing --json %s: exit %d, stdout %q, stderr %q", h, code, out, stderr)
 		}
+	}
+	// --help with a value isn't a request for help.
+	if code, stderr := runMain(t, "spotexec", "--json", "--help=nope", "status"); code != client.ExitInfra || !strings.Contains(stderr, "--help") {
+		t.Errorf("--help=nope: exit %d, stderr %q", code, stderr)
 	}
 }
 
@@ -103,12 +109,18 @@ func TestSubcommandArgCounts(t *testing.T) {
 		n    int
 		ok   bool
 	}{
+		{[]string{"sim", "interrupt"}, 0, true},
+		{[]string{"sim", "interrupt"}, 1, true},
 		{[]string{"sim", "interrupt"}, 2, true},
 		{[]string{"sim", "interrupt"}, 3, false},
+		{[]string{"sim", "rebalance"}, 0, true},
+		{[]string{"sim", "rebalance"}, 1, true},
 		{[]string{"sim", "rebalance"}, 2, true},
 		{[]string{"sim", "rebalance"}, 3, false},
+		{[]string{"sim", "build"}, 0, true},
 		{[]string{"sim", "build"}, 1, true},
 		{[]string{"sim", "build"}, 2, false},
+		{[]string{"status"}, 0, true},
 		{[]string{"status"}, 3, true},
 		{[]string{"monitor"}, 3, true},
 		{[]string{"down"}, 3, true},
