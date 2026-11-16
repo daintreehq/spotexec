@@ -79,12 +79,14 @@ type Options struct {
 	Exclude []string // [sync].exclude patterns
 	Source  string   // "", "git" or "directory"
 	Protect []string // cache dirs never synced (deps.cache_dirs)
-	// Include lists repo-relative files and directories synced even where
-	// a built-in exclude covers them, Git or not: the container's
-	// Dockerfile, its .dockerignore and its build context (.spotexec/ by
-	// default). Below a directory listed here only the built-in excludes
-	// that match inside it apply. [sync].exclude still applies, and
-	// NeverSync always does.
+	// Include lists the container's build inputs: repo-relative files
+	// (the Dockerfile, its .dockerignore files) synced even where Git
+	// ignores them or a built-in exclude covers them, and directories (its
+	// build context, .spotexec/ by default). Every file in a directory
+	// under .spotexec/ syncs, Git or not; any other directory follows the
+	// usual rules, .gitignore included. Below a directory listed here only
+	// the built-in excludes that match inside it apply. [sync].exclude
+	// still applies, and NeverSync always does.
 	Include []string
 }
 
@@ -146,7 +148,7 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		if err != nil {
 			return nil, err
 		}
-		trustIndex := !hasWorktreeFilters(o.Root, staged)
+		trustIndex := !hasWorktreeFilters(o.Root, staged, untracked)
 		// With autocrlf (true or input) git reports a CRLF worktree file as
 		// clean while its index ID describes the LF-normalised blob, so the
 		// ID would not match the bytes we sync: hash the worktree instead.
@@ -218,10 +220,14 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 			return nil, err
 		}
 	}
-	// The container's build inputs: the Dockerfile and .dockerignore, and
-	// every file in the build context, are needed to build the image. Sync
-	// them even when Git ignores them (git status doesn't list them) or
-	// they sit in a built-in excluded directory.
+	// The container's build inputs: the Dockerfile and its .dockerignore
+	// files sync even when Git ignores them (git status doesn't list them)
+	// or they sit in a built-in excluded directory, and so does every file
+	// in a build directory under .spotexec/, spotexec's own place for
+	// container support files. Any other directory (a Dockerfile or
+	// context in services/api) holds ordinary project source: the usual
+	// rules apply there, so what Git ignores (secrets, build outputs)
+	// stays local.
 	listed := make(map[string]bool, len(cands))
 	for _, c := range cands {
 		listed[c.path] = true
@@ -242,7 +248,7 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		case err != nil:
 		case fi.Mode().IsRegular() || fi.Mode()&fs.ModeSymlink != 0:
 			add(r)
-		case fi.IsDir():
+		case fi.IsDir() && inSpotexecDir(r):
 			err := filepath.WalkDir(full, func(p string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
@@ -426,8 +432,9 @@ func statusDirty(ctx context.Context, root string) (map[string]bool, []string, e
 
 // hasWorktreeFilters reports whether any .gitattributes declares content
 // transformations (filters, eol, encodings), in which case index blob IDs do
-// not describe worktree bytes and everything must be hashed from disk.
-func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
+// not describe worktree bytes and everything must be hashed from disk. Git
+// reads .gitattributes from the worktree, so an untracked one counts too.
+func hasWorktreeFilters(root string, staged map[string]stageEntry, untracked []string) bool {
 	check := func(p string) bool {
 		b, err := os.ReadFile(p)
 		if err != nil {
@@ -440,11 +447,15 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 			strings.Contains(s, "working-tree-encoding") || strings.Contains(s, "ident") ||
 			textAttr.MatchString(s)
 	}
+	isAttrs := func(p string) bool { return p == ".gitattributes" || strings.HasSuffix(p, "/.gitattributes") }
 	for p := range staged {
-		if p == ".gitattributes" || strings.HasSuffix(p, "/.gitattributes") {
-			if check(filepath.Join(root, filepath.FromSlash(p))) {
-				return true
-			}
+		if isAttrs(p) && check(filepath.Join(root, filepath.FromSlash(p))) {
+			return true
+		}
+	}
+	for _, p := range untracked {
+		if isAttrs(p) && check(filepath.Join(root, filepath.FromSlash(p))) {
+			return true
 		}
 	}
 	if gd, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output(); err == nil {
@@ -625,6 +636,14 @@ func (x *spotExcluder) Match(p string, isDir bool) bool {
 		return x.builtin.MatchBelow(p, isDir, strings.Count(best, "/")+1)
 	}
 	return x.builtin.Match(p, isDir)
+}
+
+// inSpotexecDir reports whether the cleaned relative path r is the
+// project's .spotexec directory or inside it (any case, as macOS and Windows
+// filesystems resolve it).
+func inSpotexecDir(r string) bool {
+	first, _, _ := strings.Cut(r, "/")
+	return strings.EqualFold(first, ".spotexec")
 }
 
 // isNestedRepo reports whether dir is another repository's worktree (a

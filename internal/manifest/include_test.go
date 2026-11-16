@@ -121,8 +121,9 @@ func TestSpotexecDirSyncsExceptState(t *testing.T) {
 }
 
 // In a Git worktree an untracked Dockerfile under .spotexec/ syncs without
-// `git add`, and gitignored build inputs are still sent (but nothing else
-// that Git ignores).
+// `git add`, and so does everything else there even when Git ignores it. A
+// Dockerfile elsewhere syncs even when gitignored, but its directory follows
+// the usual rules: what Git ignores beside it stays local.
 func TestIncludeUntrackedAndIgnoredInGit(t *testing.T) {
 	root := t.TempDir()
 	gitIn(t, root, "init", "-q")
@@ -141,7 +142,7 @@ func TestIncludeUntrackedAndIgnoredInGit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := paths(m), ".gitignore .spotexec/Dockerfile .spotexec/setup.sh docker/Dockerfile docker/files/x.conf src/a.txt"; got != want {
+	if got, want := paths(m), ".gitignore .spotexec/Dockerfile .spotexec/setup.sh docker/Dockerfile src/a.txt"; got != want {
 		t.Errorf("synced %q, want %q", got, want)
 	}
 	// .spotexec/ itself gitignored: its build inputs still sync.
