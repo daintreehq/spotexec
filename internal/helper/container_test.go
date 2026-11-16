@@ -101,3 +101,38 @@ func TestContainerScriptChecksOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A project container's docker run sizes /dev/shm once, before the user's
+// options and the image; a --shm-size or --ipc of the user's own replaces it.
+func TestContainerScriptSizesShm(t *testing.T) {
+	bin, _ := statefulDocker(t, false, "", "", "")
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	slot := t.TempDir()
+	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		options []string
+		want    string
+	}{
+		{nil, "'--shm-size' '"},
+		{[]string{"--label", "x"}, "'--shm-size' '"},
+		{[]string{"--shm-size=2g"}, "'--shm-size=2g'"},
+		{[]string{"--ipc=host"}, ""},
+	} {
+		host, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Options: c.options}, "true", s.workspace, map[string]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := strings.Count(host, "--shm-size"); c.want == "" && n != 0 || c.want != "" && n != 1 {
+			t.Errorf("%v: %d --shm-size in %s", c.options, n, host)
+		}
+		if c.want != "" && !(strings.Contains(host, c.want) && strings.Index(host, c.want) < strings.Index(host, "'node:22'")) {
+			t.Errorf("%v: no %s before the image in %s", c.options, c.want, host)
+		}
+		if err := cleanup(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

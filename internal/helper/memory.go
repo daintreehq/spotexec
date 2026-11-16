@@ -182,11 +182,7 @@ func readMemHost(info string) memHost {
 	if h.total <= 0 {
 		h.why = "the runner's memory size can't be read"
 	}
-	if m := dockerMemRe.FindStringSubmatch(info); m != nil {
-		v, _ := strconv.ParseFloat(m[1], 64)
-		unit := map[string]float64{"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}[m[2]]
-		h.docker = int64(v * unit)
-	}
+	h.docker = dockerMemory(info)
 	// Rootless Docker without cgroups accepts limits and ignores them.
 	h.noLimit = strings.Contains(info, "No memory limit support") || strings.Contains(info, "rootless-mode without cgroups")
 	h.remote = dockerRemote(info)
@@ -199,6 +195,64 @@ func readMemHost(info string) memHost {
 		h.total, h.why = 0, "the runner isn't Linux, so its memory isn't Docker's"
 	}
 	return h
+}
+
+// dockerMemory is the memory the docker daemon reports in its info, bytes;
+// 0 when unknown.
+func dockerMemory(info string) int64 {
+	m := dockerMemRe.FindStringSubmatch(info)
+	if m == nil {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(m[1], 64)
+	unit := map[string]float64{"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}[m[2]]
+	return int64(v * unit)
+}
+
+// Shared memory. Docker gives a container a /dev/shm of its own, 64 MiB by
+// default. Chromium, Electron and the browsers Playwright and Puppeteer
+// launch keep renderer memory there, and crash or hang once it fills
+// (SIGBUS, "Target closed"); on the VM itself, or a CI runner, /dev/shm is
+// half the machine's memory. So a project container gets one sized from
+// the job's memory instead. Its size is a ceiling, not a reservation: pages
+// are charged to the container's cgroup (the memory pool) only as they are
+// written. Half the job's fair share leaves the rest for its heaps, since
+// files left in /dev/shm aren't freed by the OOM killer, only when they are
+// deleted or the container is removed. Docker's own --ipc=host (Playwright's
+// advice) would share the VM's /dev/shm, and its IPC objects, across every
+// slot's job.
+
+// shmFallback is the /dev/shm size when the daemon's memory is unknown.
+const shmFallback = 1 << 30
+
+// shmSize is the /dev/shm size in bytes for a job given the daemon's memory
+// (0 when unknown): half its fair share, rounded down to a MiB, never less
+// than Docker's own 64 MiB.
+func shmSize(total int64, slots int, exclusive bool) int64 {
+	if total <= 0 {
+		return shmFallback
+	}
+	return max(memShare(total, slots, exclusive)/2, 64<<20) &^ (1<<20 - 1)
+}
+
+// shmArgs returns the docker run arguments that size this session's
+// container's /dev/shm. A --shm-size or --ipc in container.options wins:
+// the user decides (an --ipc other than private or shareable takes /dev/shm
+// from elsewhere, so a size would do nothing).
+func (s *Session) shmArgs(run *protocol.ContainerRun, d dockerRunner) []string {
+	for _, f := range dockerFlags(run.Options) {
+		if f == "--shm-size" || f == "--ipc" {
+			return nil
+		}
+	}
+	total := dockerMemory(d.info)
+	// The runner's own memory is Docker's only when the daemon runs here
+	// on Linux: Docker Desktop's VM, or a remote daemon, has its own.
+	if total <= 0 && runtime.GOOS == "linux" && dockerRemote(d.info) == "" {
+		total = hostMemTotal()
+	}
+	size := shmSize(total, s.maxSlots, s.acq.Exclusive || len(s.tokens) > 1)
+	return []string{"--shm-size", strconv.FormatInt(size, 10)}
 }
 
 func gib(b int64) string { return fmt.Sprintf("%.1f GiB", float64(b)/(1<<30)) }

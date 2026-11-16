@@ -645,6 +645,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	}
 	// Before procMu: these may send an event.
 	limits := append(s.cpusetArgs(run, d), s.memoryArgs(run, d)...)
+	limits = append(limits, s.shmArgs(run, d)...)
 	s.procMu.Lock()
 	if s.stopping.Load() {
 		s.procMu.Unlock()
