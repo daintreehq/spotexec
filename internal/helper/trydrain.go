@@ -166,18 +166,22 @@ func featuresFile(root string) string {
 }
 
 // watchdogReadsDrainAfter reports whether this VM's watchdog acts on
-// drain_after (one booted before it existed doesn't).
-func watchdogReadsDrainAfter(root string) bool {
+// drain_after (one booted before it existed has no features file). An
+// error other than the file's absence is returned: it proves nothing.
+func watchdogReadsDrainAfter(root string) (bool, error) {
 	b, err := os.ReadFile(featuresFile(root))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, f := range strings.Fields(string(b)) {
 		if f == "drain_after" {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // ScheduleDrain is `spotexec-helper schedule-drain`: it records that this
@@ -192,10 +196,9 @@ func scheduleDrain(root, op string, minIdle time.Duration, ephemeral bool) TryDr
 		res.Result = DrainUnsupported
 		return res
 	}
-	if !watchdogReadsDrainAfter(root) {
-		res.Result, res.Detail = DrainUnsupported, "this VM's watchdog predates scheduled drains"
-		return res
-	}
+	// What is already in place first: "unsupported" must never be the
+	// answer for a VM that has a drain scheduled (the client would put it
+	// back into service).
 	if draining(root) {
 		if b, err := os.ReadFile(drainOpFile(root)); err == nil && op != "" && strings.TrimSpace(string(b)) == op {
 			res.Result = DrainDone
@@ -208,6 +211,16 @@ func scheduleDrain(root, op string, minIdle time.Duration, ephemeral bool) TryDr
 		// Already scheduled (a retry whose answer was lost, or another
 		// operation): the first record stands.
 		res.Result = DrainScheduled
+		return res
+	} else if !errors.Is(err, os.ErrNotExist) {
+		res.Result, res.Detail = DrainBusy, "reading the drain schedule: "+err.Error()
+		return res
+	}
+	if ok, err := watchdogReadsDrainAfter(root); err != nil {
+		res.Result, res.Detail = DrainBusy, "reading the watchdog's features: "+err.Error()
+		return res
+	} else if !ok {
+		res.Result, res.Detail = DrainUnsupported, "this VM's watchdog predates scheduled drains"
 		return res
 	}
 	if minIdle < 0 {

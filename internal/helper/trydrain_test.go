@@ -79,8 +79,22 @@ func TestScheduleDrain(t *testing.T) {
 	if r := scheduleDrain(root, "op1", 2*time.Minute, true); r.Result != DrainUnsupported {
 		t.Fatalf("a watchdog from before scheduled drains: %+v", r)
 	}
+	// An unreadable features file proves nothing: asked again later.
+	if err := os.Mkdir(filepath.Join(root, "features"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if r := scheduleDrain(root, "op1", 2*time.Minute, true); r.Result != DrainBusy {
+		t.Fatalf("features unreadable: %+v", r)
+	}
+	os.Remove(filepath.Join(root, "features"))
 	if err := os.WriteFile(filepath.Join(root, "features"), []byte("drain_after\n"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if r := scheduleDrain(root, "op1", 2*time.Minute, false); r.Result != DrainUnsupported {
+		t.Fatalf("static runner with a features file: %+v", r)
+	}
+	if _, err := os.Stat(filepath.Join(root, "drain_after")); err == nil {
+		t.Fatal("a static runner got a drain scheduled")
 	}
 	if r := scheduleDrain(root, "op1", 90*time.Second+time.Millisecond, true); r.Result != DrainScheduled || r.Op != "op1" {
 		t.Fatalf("schedule: %+v", r)
@@ -98,6 +112,12 @@ func TestScheduleDrain(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(root, "drain_after")); string(b) != "91\n" {
 		t.Fatalf("drain_after rewritten: %q", b)
+	}
+	// Scheduled stays scheduled, even if the features file can't be read
+	// on a retry: unsupported would put the VM back into service.
+	os.Remove(filepath.Join(root, "features"))
+	if r := scheduleDrain(root, "op1", time.Second, true); r.Result != DrainScheduled {
+		t.Fatalf("retry without features: %+v", r)
 	}
 	// Once the watchdog has drained it, the operation reads as done.
 	if err := os.WriteFile(filepath.Join(root, "draining"), nil, 0o644); err != nil {

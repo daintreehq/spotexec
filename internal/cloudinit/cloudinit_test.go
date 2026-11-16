@@ -196,7 +196,7 @@ func TestRenderClaimsStateDirForRoot(t *testing.T) {
 		os.WriteFile(filepath.Join(bin, "stat"), []byte("#!/bin/sh\nexit 1\n"), 0o755)
 		script := strings.NewReplacer("/var/tmp/spotexec", d, "0:d", uid+":d", "sleep 120; poweroff -f", ":").Replace(block)
 		cmd := exec.Command("bash", "-c", "set -u\n"+script)
-		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+		cmd.Env = append(append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH")), env...)
 		out, err := cmd.CombinedOutput()
 		if err == nil || !strings.Contains(string(out), "DESTROYED") {
 			t.Fatalf("boot went on without knowing who owns the directory: %v: %s", err, out)
@@ -259,7 +259,9 @@ func TestWatchdogScheduledDrain(t *testing.T) {
 	wd := filepath.Join(dir, "watchdog")
 	shims := map[string]string{
 		"logger": "#!/bin/sh\nshift 2; echo \"$*\" >> \"" + d + "/log\"\n",
-		"flock":  "#!/bin/sh\nexit 0\n", // no session holds the lifecycle lock
+		// $FLOCK_HELD: a session holds the lifecycle lock; $FLOCK_TOUCH: one
+		// ends (touching activity) while the watchdog waits for it.
+		"flock": "#!/bin/sh\n[ -n \"$FLOCK_TOUCH\" ] && touch \"" + d + "/activity\"\n[ -z \"$FLOCK_HELD\" ]\n",
 	}
 	if exec.Command("stat", "-c", "%Y", dir).Run() != nil {
 		shims["stat"] = "#!/bin/sh\nexec /usr/bin/stat -f %m \"$3\"\n" // BSD stat
@@ -273,6 +275,7 @@ func TestWatchdogScheduledDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := strconv.FormatInt(time.Now().Add(-time.Hour).Unix(), 10)
+	var env []string
 	run := func(drainAfter string, idle time.Duration) (destroyed bool, log string) {
 		t.Helper()
 		for _, f := range []string{"destroyed", "draining", "log", "drain_after"} {
@@ -288,7 +291,7 @@ func TestWatchdogScheduledDrain(t *testing.T) {
 			os.WriteFile(filepath.Join(d, "drain_after"), []byte(drainAfter), 0o644)
 		}
 		cmd := exec.Command("bash", wd)
-		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+		cmd.Env = append(append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH")), env...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("watchdog: %v: %s", err, out)
 		}
@@ -318,5 +321,20 @@ func TestWatchdogScheduledDrain(t *testing.T) {
 	}
 	if gone, _ := run("1800\n", 3*time.Minute); gone {
 		t.Fatal("a drain_after past idle_timeout ended the VM early")
+	}
+	if gone, log := run("1800\n", 11*time.Minute); !gone || !strings.Contains(log, "limit 10m0s") {
+		t.Fatalf("a drain_after past idle_timeout kept the VM past it: %v %q", gone, log)
+	}
+	// Never under a session, nor right after one ended.
+	env = []string{"FLOCK_HELD=1"}
+	if gone, _ := run("120\n", 3*time.Minute); gone {
+		t.Fatal("ended under a session")
+	}
+	if _, err := os.Stat(filepath.Join(d, "draining")); err == nil {
+		t.Fatal("marked draining under a session")
+	}
+	env = []string{"FLOCK_TOUCH=1"}
+	if gone, _ := run("120\n", 3*time.Minute); gone {
+		t.Fatal("ended just after a session touched activity")
 	}
 }

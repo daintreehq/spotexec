@@ -182,9 +182,11 @@ What it costs:
 - **Results.** Once a drained VM ends, `exec`, `pull` and `--same-slot` can
   no longer reach its workspaces. `result_retention` is how long after its
   last job they still can.
-- **Relaunches.** A VM is never placed on again once its drain is handed
-  over, even while it is still up keeping its results. If demand comes back,
-  new jobs wait for room on the retained VMs or for a new VM to boot.
+- **Relaunches.** Once its drain is committed, no new job is placed on the
+  VM, even while it is still up keeping its results (`exec`, `pull` and
+  `--same-slot` still reach their exact slot until it ends). If demand comes
+  back, new jobs go to the retained VMs if they have room, and otherwise
+  wait for a new VM to boot.
 
 To keep surplus VMs until `idle_timeout` instead:
 
@@ -220,9 +222,9 @@ marker. Busy or still keeping results, it is asked again 30 seconds later,
 by the next `sx` to finish a job or the next pool manager pass, with the
 same operation ID; with neither, it ends at `idle_timeout`.
 
-Only VMs the placement policy has marked standby are drained: after the
-last `sx` exits nothing re-sorts the retained set, so VMs still retained
-then end at `idle_timeout`. A Spot interruption or `max_lifetime` still
+Only VMs the placement policy has marked standby are drained: without the
+pool manager, nothing re-sorts the retained set after the last `sx` exits,
+so VMs still retained then end at `idle_timeout`. A Spot interruption or `max_lifetime` still
 ends a VM whatever its role.
 
 ## Scale in

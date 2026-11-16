@@ -57,12 +57,14 @@ func (p *Pool) EarlyDrain(ctx context.Context, running []provider.Instance) []Dr
 		return nil
 	}
 	due := map[string]bool{}
-	_ = p.with(func(st *poolState) error {
+	if p.withCtx(ctx, func(st *poolState) error {
 		for id, v := range st.sched().VMs {
 			due[id] = v.Role == roleStandby || (v.Role == roleDrainRequested && !v.DrainScheduled)
 		}
 		return nil
-	})
+	}) != nil {
+		return nil
+	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var out []DrainResult
@@ -83,7 +85,7 @@ func (p *Pool) EarlyDrain(ctx context.Context, running []provider.Instance) []Dr
 			if !ok {
 				return // asked again later, with the same operation
 			}
-			p.FinishDrain(in.ID, op, res.Result, res.Detail)
+			p.finishDrain(ctx, in.ID, op, res.Result, res.Detail)
 			idle := time.Duration(-1)
 			if res.IdleS >= 0 {
 				idle = time.Duration(res.IdleS) * time.Second
@@ -117,8 +119,9 @@ func (p *Pool) drainAnswer(ctx context.Context, in provider.Instance, op string,
 	return res, true
 }
 
-// leaseDrainBudget bounds the early-drain pass at the end of a job: it
-// only sends what the VMs then carry out themselves.
+// leaseDrainBudget bounds the early-drain pass at the end of a job, lock
+// waits included: it only sends what the VMs then carry out themselves,
+// and whatever it doesn't finish is done by a later pass.
 const leaseDrainBudget = 5 * time.Second
 
 // DrainSurplus is the early-drain pass an sx process runs as its lease
@@ -129,16 +132,18 @@ func (p *Pool) DrainSurplus() {
 	if !p.R.EarlyDrain() || p.R.SchedPolicy() != config.PolicyConsolidate || !p.R.Ephemeral() {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), leaseDrainBudget)
+	defer cancel()
 	var listed []provider.Instance
-	_ = p.with(func(st *poolState) error {
+	if p.withCtx(ctx, func(st *poolState) error {
 		for _, in := range st.Instances {
 			if in.State == provider.StateRunning {
 				listed = append(listed, in)
 			}
 		}
 		return nil
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), leaseDrainBudget)
-	defer cancel()
+	}) != nil {
+		return
+	}
 	p.EarlyDrain(ctx, listed)
 }

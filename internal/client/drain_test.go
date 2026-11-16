@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ type fakeDrains struct {
 	installed map[string]bool
 	answer    map[string]string // "<vm> <command>" -> result
 	calls     []string
+	args      map[string][]string // "<vm> <command>" -> its last arguments
 }
 
 func (f *fakeDrains) install(t *testing.T) {
@@ -29,6 +31,10 @@ func (f *fakeDrains) install(t *testing.T) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.calls = append(f.calls, in.ID+" "+args[0])
+		if f.args == nil {
+			f.args = map[string][]string{}
+		}
+		f.args[in.ID+" "+args[0]] = args
 		op := ""
 		for i, a := range args {
 			if a == "--op" && i+1 < len(args) {
@@ -54,6 +60,7 @@ func (f *fakeDrains) took() []string {
 // drain at all goes back to standby and idles out.
 func TestDrainSurplusSchedulesStandbyVMs(t *testing.T) {
 	p, _ := schedPool(t, 4, 2)
+	p.R.Scheduling.ResultRetention.Duration = 45 * time.Second
 	now := time.Now()
 	p.loaded(t, func(st *poolState) {
 		s := st.sched()
@@ -85,6 +92,16 @@ func TestDrainSurplusSchedulesStandbyVMs(t *testing.T) {
 	st := p.state(t)
 	if v := st.VMs["i-0"]; v.Role != roleDrainRequested || !v.DrainScheduled {
 		t.Fatalf("i-0 after a scheduled answer: %+v", v)
+	}
+	// The VM keeps results for result_retention, whichever way it drains.
+	want := map[string]string{
+		"i-0 schedule-drain": "schedule-drain --op " + st.VMs["i-0"].DrainOp + " --min-idle 45s",
+		"i-1 try-drain":      "try-drain --op " + st.VMs["i-1"].DrainOp + " --min-idle 45s --reason surplus capacity",
+	}
+	for k, w := range want {
+		if got := strings.Join(f.args[k], " "); got != w {
+			t.Fatalf("%s: %q, want %q", k, got, w)
+		}
 	}
 	if v := st.VMs["i-1"]; v.Role != roleDrainRequested || v.DrainScheduled {
 		t.Fatalf("i-1 still keeping its results: %+v", v)
@@ -126,9 +143,16 @@ func TestDrainSurplusSchedulesStandbyVMs(t *testing.T) {
 	if v := p.state(t).VMs["i-3"]; v.Role != roleStandby || v.DrainOp != "" || closed {
 		t.Fatalf("i-3 after unsupported: %+v (closed %v)", v, closed)
 	}
+	// Settled again, but still within the hour: not asked; after it, asked.
+	p.loaded(t, func(st *poolState) { st.sched().VMs["i-3"].Since = now.Add(-time.Minute) })
 	p.DrainSurplus()
 	if c := f.took(); len(c) != 0 {
-		t.Fatalf("an unsupported VM was asked again at once: %v", c)
+		t.Fatalf("an unsupported VM was asked again within the hour: %v", c)
+	}
+	p.loaded(t, func(st *poolState) { st.sched().VMs["i-3"].DrainAt = now.Add(-time.Second) })
+	p.DrainSurplus()
+	if c := f.took(); len(c) != 2 {
+		t.Fatalf("an unsupported VM wasn't asked again after the hour: %v", c)
 	}
 
 	// early_drain = false: nothing is asked.
@@ -165,11 +189,28 @@ func TestLeaseCloseDrainsSurplus(t *testing.T) {
 	if c := fd.took(); len(c) != 1 || c[0] != "i-0 schedule-drain" {
 		t.Fatalf("calls %v", c)
 	}
-	if v := p.state(t).VMs["i-0"]; !v.DrainScheduled {
+	st := p.state(t)
+	if v := st.VMs["i-0"]; !v.DrainScheduled {
 		t.Fatalf("after close: %+v", v)
 	}
+	if st.Attempts[id] != nil || l.ledger.id != "" {
+		t.Fatal("the lease's attempt outlived Close")
+	}
+	// A second Close runs no second pass, even with another VM due.
+	p.loaded(t, func(st *poolState) {
+		s := st.sched()
+		v := s.VMs["i-1"]
+		v.Role, v.Since = roleStandby, now.Add(-time.Minute)
+		s.Demand = nil
+	})
+	fd.installed["i-1"] = true
+	fd.answer["i-1 schedule-drain"] = helper.DrainScheduled
 	l.Close()
 	if c := fd.took(); len(c) != 0 {
 		t.Fatalf("a second Close asked again: %v", c)
+	}
+	p.DrainSurplus() // i-1 was due all along
+	if c := fd.took(); len(c) != 1 || c[0] != "i-1 schedule-drain" {
+		t.Fatalf("i-1 not due: %v", c)
 	}
 }

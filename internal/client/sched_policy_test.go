@@ -418,7 +418,7 @@ func TestEarlyDrain(t *testing.T) {
 	}
 	p.FinishDrain("i-0", op, "drained", "")
 	var draining bool
-	p.loaded(t, func(st *poolState) { draining = st.Notes["i-0"].closed() })
+	p.loaded(t, func(st *poolState) { draining = st.Notes["i-0"].Draining })
 	if v := p.state(t).VMs["i-0"]; v.Role != roleDraining || !draining {
 		t.Fatalf("after drained: %+v, note closed %v", v, draining)
 	}

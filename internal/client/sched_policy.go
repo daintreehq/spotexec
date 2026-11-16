@@ -650,7 +650,13 @@ const drainRetry = 30 * time.Second
 // drain_requested whatever the answer, except unsupported: nothing was
 // changed on the VM, so it goes back to standby and idles out.
 func (p *Pool) FinishDrain(id, op, result, detail string) {
-	_ = p.with(func(st *poolState) error {
+	p.finishDrain(context.Background(), id, op, result, detail)
+}
+
+// finishDrain is FinishDrain, giving up when ctx ends (the drain stays
+// committed and is asked again later, with the same operation).
+func (p *Pool) finishDrain(ctx context.Context, id, op, result, detail string) {
+	_ = p.withCtx(ctx, func(st *poolState) error {
 		s := st.sched()
 		v := s.VMs[id]
 		if v == nil || v.DrainOp != op {

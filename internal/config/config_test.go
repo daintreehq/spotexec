@@ -1379,6 +1379,13 @@ func TestSchedulingSettings(t *testing.T) {
 	if b := g.Runners["b"]; b.ResultRetention() != 5*time.Minute || b.EarlyDrain() {
 		t.Fatalf("b: retention %s early drain %v", b.ResultRetention(), b.EarlyDrain())
 	}
+	g, err = loadGlobalText(t, "[runners.a]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nscheduling = { result_retention = \"30s\" }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := g.Runners["a"]; a.ResultRetention() != 30*time.Second {
+		t.Fatalf("a shorter result_retention: %s", a.ResultRetention())
+	}
 	for _, bad := range []string{"policy = \"newest\"", "mode = \"fast\"", "spare_slots = -1", "result_retention = \"-1m\""} {
 		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n[runners.aws.scheduling]\n"+bad+"\n"); err == nil || !strings.Contains(err.Error(), "scheduling.") {
 			t.Errorf("%s: %v", bad, err)
