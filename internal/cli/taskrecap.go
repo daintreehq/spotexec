@@ -52,17 +52,30 @@ func totalConflicts(outs []partOutcome) int {
 // taskExit is a parallel or sharded run's exit code: the first failed
 // part's, in the task's own order, except that a spotexec failure (125)
 // outranks a command's own failure, so agents can tell "tests failed" from
-// "couldn't run tests"; and 130 when the run was interrupted.
+// "couldn't run tests", and the project's Dockerfile failing to build (123)
+// outranks a command's failure but not a spotexec one; and 130 when the
+// run was interrupted.
 func taskExit(outs []partOutcome, interrupted bool) int {
 	if interrupted {
 		return client.ExitInterrupted
+	}
+	rank := func(code int) int {
+		switch code {
+		case 0:
+			return 0
+		case client.ExitInfra:
+			return 3
+		case client.ExitImageBuild:
+			return 2
+		}
+		return 1
 	}
 	exit := 0
 	for _, o := range outs {
 		if o.status == partStopped {
 			continue // the failure that stopped it is what counts
 		}
-		if o.code != 0 && (exit == 0 || o.code == client.ExitInfra) {
+		if rank(o.code) > rank(exit) {
 			exit = o.code
 		}
 	}

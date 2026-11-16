@@ -44,6 +44,9 @@ const (
 	// ExitWritebackConflict: with Options.FailOnConflict, the command
 	// succeeded but write-back kept a local edit over one of its changes.
 	ExitWritebackConflict = 122
+	// ExitImageBuild: the project's own Dockerfile failed to build
+	// (ImageBuildError), so the command never ran.
+	ExitImageBuild = 123
 )
 
 // Large-sync guardrails.
@@ -640,7 +643,8 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		prog.set(phaseImage)
 		ref, id, err := prepareImage(ctx, sess, p, o, label, ws, lease, m)
 		if err != nil {
-			return res, infra(err), lostRunner(lease, err)
+			err, lost := imageErr(lease, err)
+			return res, err, lost
 		}
 		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root", Network: p.Container.Network, Docker: p.Container.Docker}
 		imageID = id
@@ -2085,18 +2089,6 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 	r, shared, push, err := fetchImage(ctx, sessionRPC{s}, o, label, errW, log, newImageMemo(ws.RepoID), req, locate, c.Timeout.Duration+shareSlack)
 	log.Close()
 	if err != nil {
-		var be *ImageBuildError
-		if errors.As(err, &be) {
-			ev := map[string]any{"code": protocol.CodeImageFailed, "message": be.Message, "tag": be.Tag, "cached": be.Cached,
-				"built_by": be.Who, "failed_at": be.At.UTC().Format(time.RFC3339), "retry_after": be.Until.UTC().Format(time.RFC3339)}
-			if be.Tail != "" {
-				ev["output_tail"], ev["output_truncated"] = be.Tail, be.Truncated
-			}
-			if be.Log != "" {
-				ev["log"] = be.Log
-			}
-			o.Rep.Event("image_failed", ev)
-		}
 		return "", "", err
 	}
 	ev := map[string]any{"image": r.Image, "image_id": r.ImageID, "pulled": r.Pulled, "copied": r.Copied, "built": r.Built, "pushing": r.Pushing, "pushed": r.Pushed,
@@ -2124,6 +2116,16 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Writer, log *depsLog, memo imageMemo, req protocol.Image, locate func(context.Context) (*protocol.RegistryAuth, error), limit time.Duration) (r protocol.ImageResult, shared shareOutcome, push *protocol.ShareDone, err error) {
 	building := false // the helper said it is building: its output goes to log too
 	pushing := false  // the helper is pushing the image: it has it
+	start := time.Now()
+	defer func() {
+		// A failed build: the runner may have found the Dockerfile itself
+		// at fault (#193).
+		err = imageBuildError(err)
+		var be *ImageBuildError
+		if errors.As(err, &be) {
+			imageFailedEvent(o, be, req.Dockerfile, time.Since(start))
+		}
+	}()
 	ask := func(req protocol.Image) (protocol.ImageResult, error) {
 		if err := c.send(protocol.TypeImage, req); err != nil {
 			return protocol.ImageResult{}, err
@@ -2187,18 +2189,31 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 			memo.forget(req.Tag)
 		}
 		var re *transport.RemoteError
-		if err == nil || !memo.on(req.Tag) || ctx.Err() != nil || !errors.As(err, &re) || !re.BuildFailed {
+		if err == nil || !errors.As(err, &re) {
 			return err
 		}
-		f := imageFailure{Tag: req.Tag, Message: re.Message, Who: shareWho(o, label), At: memo.clock()}
+		// A broken Dockerfile (#193) is reported with its output even when
+		// it isn't remembered.
+		remember := memo.on(req.Tag) && ctx.Err() == nil && re.BuildFailed
+		if !remember && re.Code != protocol.CodeImageBuildFailed {
+			return err
+		}
+		f := imageFailure{Tag: req.Tag, Code: re.Code, Message: re.Message, Who: shareWho(o, label), At: memo.clock()}
 		if log != nil {
 			log.Close()
 			f.Tail, f.Truncated = log.Tail(depsTailLines)
 			f.Log = log.Path()
 		}
-		memo.remember(f)
-		f.Repo = memo.repo
-		return &ImageBuildError{Err: err, Until: f.At.Add(imageFailAge), imageFailure: f}
+		if f.Tail == "" {
+			f.Tail = re.Detail // the runner's own tail of the build
+		}
+		be := &ImageBuildError{Err: err, imageFailure: f}
+		if remember {
+			memo.remember(f)
+			be.Until = f.At.Add(imageFailAge)
+		}
+		be.Repo = memo.repo
+		return be
 	}
 	defer func() {
 		if pushing || err == nil && r.Image != "" {
