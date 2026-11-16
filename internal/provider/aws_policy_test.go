@@ -209,6 +209,10 @@ func checkPolicyScopes(t *testing.T, region string) {
 		{"ssm:GetParameter", pre + "ssm:" + region + ":" + acct + ":parameter/secret", false},
 		{"ecr:PutImage", pre + "ecr:" + region + ":" + acct + ":repository/spotexec/app", true},
 		{"ecr:PutImage", pre + "ecr:" + region + ":" + acct + ":repository/team/app", false},
+		// `container regions` lists a repository's images; reads stay in spotexec/*.
+		{"ecr:DescribeImages", pre + "ecr:" + region + ":" + acct + ":repository/spotexec/app", true},
+		{"ecr:DescribeRepositories", pre + "ecr:" + region + ":" + acct + ":repository/spotexec/app", true},
+		{"ecr:DescribeImages", pre + "ecr:" + region + ":" + acct + ":repository/team/app", false},
 	} {
 		if got := allowed(t, p.Statement, c.action, c.arn, nil); got != c.want {
 			t.Errorf("%s on %s: allowed = %v, want %v", c.action, c.arn, got, c.want)

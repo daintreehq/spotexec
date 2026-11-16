@@ -110,7 +110,7 @@ The policy is attached inline, and an IAM user's inline policies are limited to 
         "s3:GetObject", "s3:PutObject"
       ], "Resource": "arn:aws:s3:::spotexec-cache-*" },
     { "Effect": "Allow", "Action": [
-        "ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy",
+        "ecr:Describe*", "ecr:CreateRepository", "ecr:TagResource", "ecr:PutLifecyclePolicy",
         "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
         "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"
       ], "Resource": "arn:aws:ecr:*:*:repository/spotexec/*" }

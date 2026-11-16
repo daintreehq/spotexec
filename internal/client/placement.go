@@ -1,6 +1,8 @@
 package client
 
 import (
+	"fmt"
+
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/depskey"
 	"github.com/daintreehq/spotexec/internal/manifest"
@@ -17,9 +19,21 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 	if p == nil || ws == nil || r.Type != config.TypeAWSSpot || !r.MultiRegion() {
 		return nil
 	}
+	pj, _ := ProjectKeys(p, ws, m, noDeps, r)
+	return pj
+}
+
+// ProjectKeys is what a run of this checkout on aws-spot runner r keeps in
+// a region (see provider.Project): the content tag of the image it builds
+// from its Dockerfile and the key of its dependency archive, computed as
+// the run computes them, in one region or several. A key that can't be
+// computed is left unset, and the first such failure is returned with
+// what could be (m nil fails none: the keys are just unknown).
+func ProjectKeys(p *config.Project, ws *Workspace, m *manifest.Manifest, noDeps bool, r *config.Runner) (*provider.Project, error) {
 	// AWS VMs are Linux; the runner's arch is the Go name the helper reports.
 	goos, arch := "linux", r.Arch
 	pj := &provider.Project{RepoID: ws.RepoID}
+	var first error
 	c := p.Container
 	if c.Enabled() && c.Image == "" {
 		pj.Image = true
@@ -27,18 +41,26 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 			// unknown without the manifest
 		} else if tag, err := imageTag(m, c.Dockerfile, c.Context, goos+"/"+arch, readFrom(ws.Root)); err == nil {
 			pj.ImageTag = tag
+		} else {
+			first = fmt.Errorf("image tag: %w", err)
 		}
 	}
 	if p.Deps.Install == "" || noDeps || len(p.Deps.Lockfiles) == 0 {
-		return pj
+		return pj, first
 	}
 	pj.Deps = true
 	if m == nil {
-		return pj
+		return pj, first
 	}
 	lockfiles, _, err := DepsLockfiles(m, p.Deps.Lockfiles)
-	if err != nil || len(lockfiles) == 0 {
-		return pj
+	if err != nil {
+		if first == nil {
+			first = fmt.Errorf("dependency lockfiles: %w", err)
+		}
+		return pj, first
+	}
+	if len(lockfiles) == 0 {
+		return pj, first
 	}
 	spec := depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, OS: goos, Arch: arch}
 	switch {
@@ -46,6 +68,8 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 		spec.Toolchain = toolchainFor(r, nil)
 		if key, err := depskey.Key(ws.Root, spec); err == nil {
 			pj.DepsKey = key
+		} else if first == nil {
+			first = fmt.Errorf("dependency key: %w", err)
 		}
 	case pj.Image:
 		// Keyed by the image's ID, which differs from region to region
@@ -57,7 +81,7 @@ func PlacementProject(p *config.Project, ws *Workspace, m *manifest.Manifest, no
 			return depskey.Key(ws.Root, s)
 		}
 	}
-	return pj
+	return pj, first
 }
 
 // PlacementNeedsManifest reports whether PlacementProject needs the

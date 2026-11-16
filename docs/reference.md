@@ -24,6 +24,7 @@ spotexec daemon start|stop|run               optional pool manager
 spotexec daemon status [--json]              what the pool manager sees and has done
 spotexec container init [--path P] [--force] [--yes] scaffold a Dockerfile and wire it into .spotexec.toml
 spotexec container build [run flags]         build the project image on a runner now (ECR on AWS)
+spotexec container regions [runner] [--json] the image tag this checkout builds, and which of an AWS runner's regions hold it (pushed when) and its deps archive
 spotexec image bake [runner] [--pull IMG]    bake an AMI from the runner's bootstrap (--region R for multi-region runners)
 spotexec image list [runner]                 baked AMIs from every machine: base image, age, maker, which is in use (every region a runner uses, or --region R)
 spotexec image clear [runner] [--all]        delete this machine's and this bootstrap's bakes (--all: every machine's; every region a runner uses, or --region R)
