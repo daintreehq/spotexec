@@ -99,6 +99,52 @@ func TestRegistryForLifecyclePolicy(t *testing.T) {
 	}
 }
 
+// #218: a repository whose expiry rule can't be set still gives the login,
+// so the runner pulls (or pushes) the image rather than building it.
+func TestRegistryForSurvivesALifecyclePolicyFailure(t *testing.T) {
+	for _, exists := range []bool{true, false} {
+		t.Run(map[bool]string{true: "existing repository", false: "new repository"}[exists], func(t *testing.T) {
+			var calls []string
+			rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				st, body := 200, "{}"
+				action := strings.TrimPrefix(r.Header.Get("X-Amz-Target"), "AmazonEC2ContainerRegistry_V20150921.")
+				calls = append(calls, action)
+				switch action {
+				case "DescribeRepositories":
+					if exists {
+						body = `{"repositories":[{"repositoryUri":"1.dkr.ecr.ap-south-1.amazonaws.com/spotexec/x"}]}`
+					} else {
+						st, body = 400, `{"__type":"RepositoryNotFoundException","message":"none"}`
+					}
+				case "CreateRepository":
+					body = `{"repository":{"repositoryUri":"1.dkr.ecr.ap-south-1.amazonaws.com/spotexec/x"}}`
+				case "PutLifecyclePolicy":
+					st, body = 400, `{"__type":"AccessDeniedException","message":"not authorized to perform ecr:PutLifecyclePolicy"}`
+				case "GetAuthorizationToken":
+					body = `{"authorizationData":[{"authorizationToken":"QVdTOnB3","proxyEndpoint":"https://1.dkr.ecr.ap-south-1.amazonaws.com"}]}`
+				}
+				return &http.Response{StatusCode: st, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+			})
+			a := &AWSSpot{
+				r: &config.Runner{Name: "aws", Region: "ap-south-1", Profile: "p"},
+				api: &awsClient{region: "ap-south-1", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "s"}},
+					http: &http.Client{Transport: rt}},
+				dir: t.TempDir(),
+			}
+			auth, err := a.RegistryFor(context.Background(), "x")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if auth.Repo != "1.dkr.ecr.ap-south-1.amazonaws.com/spotexec/x" || auth.User != "AWS" || auth.Password != "pw" {
+				t.Fatalf("auth %+v", auth)
+			}
+			if !strings.Contains(strings.Join(calls, " "), "PutLifecyclePolicy GetAuthorizationToken") {
+				t.Fatalf("calls %v", calls)
+			}
+		})
+	}
+}
+
 // #192: a multi-region runner finds the project's image in another of its
 // regions, in the order it lists them, to copy rather than build it.
 func TestImageSource(t *testing.T) {

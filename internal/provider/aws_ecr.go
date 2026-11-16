@@ -65,9 +65,7 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 			uri = desc.Repositories[0].URI
 			// (Re)apply the expiry rule: a first run that created the
 			// repository may have failed before setting it.
-			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": ecrLifecyclePolicy}, nil); err != nil {
-				return nil, fmt.Errorf("ECR lifecycle policy for %s: %w", name, err)
-			}
+			a.ecrLifecycle(ctx, name)
 		case err == nil || strings.Contains(err.Error(), "RepositoryNotFoundException"):
 			var created struct {
 				Repository struct {
@@ -81,9 +79,7 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 				return nil, fmt.Errorf("creating ECR repository %s: %w", name, err)
 			}
 			uri = created.Repository.URI
-			if err := a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": ecrLifecyclePolicy}, nil); err != nil {
-				return nil, fmt.Errorf("ECR lifecycle policy for %s: %w", name, err)
-			}
+			a.ecrLifecycle(ctx, name)
 			if uri == "" {
 				return a.RegistryFor(ctx, repoID) // created concurrently: describe again
 			}
@@ -103,6 +99,13 @@ func (a *AWSSpot) RegistryFor(ctx context.Context, repoID string) (*protocol.Reg
 	}
 	auth.Repo = uri
 	return auth, nil
+}
+
+// ecrLifecycle sets the repository's expiry rule. It only bounds what the
+// repository keeps, so failing to set it never stops a pull or a push
+// (#218): it is applied again when the cached repository URI expires.
+func (a *AWSSpot) ecrLifecycle(ctx context.Context, name string) {
+	_ = a.ecr(ctx, "PutLifecyclePolicy", map[string]any{"repositoryName": name, "lifecyclePolicyText": ecrLifecyclePolicy}, nil)
 }
 
 // ecrLogin returns a short-lived login for the region's registry, without
