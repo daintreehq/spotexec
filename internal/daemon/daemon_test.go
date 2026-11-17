@@ -998,7 +998,9 @@ func shift(fl *fleet, dt time.Duration) {
 		fl.blind.at = fl.blind.at.Add(-dt)
 	}
 	for _, g := range fl.regionBlind {
-		g.at = g.at.Add(-dt)
+		if !g.at.IsZero() {
+			g.at = g.at.Add(-dt)
+		}
 	}
 }
 
@@ -1103,8 +1105,10 @@ func TestFleetWideSilencePacesAcrossRegions(t *testing.T) {
 	if got := c.ids("pool"); len(got) != 4 {
 		t.Fatalf("one pass with no answers ended VMs: left %v", got)
 	}
-	if fl.blind.at.IsZero() || fl.regionBlind["us-east-1"] == nil || fl.regionBlind["us-west-2"] == nil {
-		t.Fatalf("first silent round didn't arm the gates: fleet-wide %+v, regional %v", fl.blind, fl.regionBlind)
+	for _, rg := range []string{"us-east-1", "us-west-2"} {
+		if g := fl.regionBlind[rg]; fl.blind.at.IsZero() || g == nil || g.at.IsZero() {
+			t.Fatalf("first silent round didn't arm the gates: fleet-wide %+v, %s %+v", fl.blind, rg, g)
+		}
 	}
 	shift(fl, unhealthyAfter)
 	pass()
@@ -1181,16 +1185,18 @@ func TestSilentSingleVMRegionIsPaced(t *testing.T) {
 	}
 }
 
-// A region's pacing is kept while a listing misses some region (its VMs
-// may still be there) and dropped once any full listing, probe or not,
-// shows it has no VMs, before a new VM there could inherit it. A region
-// with only a pending VM still has one.
+// A region's pacing is kept while that region can't be listed (its VMs
+// may still be there) and dropped once a listing of it, probe or not,
+// shows it has no VMs, before a new VM there could inherit it, even while
+// another region can't be listed. A region with only a pending VM still
+// has one.
 func TestRegionPacingForgottenOnceTheRegionIsEmpty(t *testing.T) {
 	c, fl, _, _, pass, listOnly := regionFleet(t)
 	c.add("pool", provider.Instance{ID: "i-pend", Type: "a.large", Region: "eu-west-1", State: provider.StatePending, LaunchedAt: time.Now()})
 	pass() // a full listing first, as a running daemon has
 	fl.regionBlind["ap-south-1"] = &blindGate{at: time.Now()}
 	fl.regionBlind["eu-west-1"] = &blindGate{at: time.Now()}
+	fl.regionBlind["eu-central-1"] = &blindGate{at: time.Now()}
 	ff := fl.pool.Fleet.(*fakeFleet)
 	uf := &unlistedFleet{fakeFleet: ff}
 	fl.pool.Fleet, fl.f = uf, uf
@@ -1199,6 +1205,9 @@ func TestRegionPacingForgottenOnceTheRegionIsEmpty(t *testing.T) {
 	}
 	if fl.regionBlind["ap-south-1"] == nil {
 		t.Fatal("pacing of a region forgotten while it couldn't be listed")
+	}
+	if g := fl.regionBlind["eu-central-1"]; g != nil {
+		t.Fatalf("pacing of a region listed empty kept because another region couldn't be listed: %+v", g)
 	}
 	fl.pool.Fleet, fl.f = ff, ff
 	if st := listOnly(); st.LastError != "" {

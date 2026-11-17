@@ -511,17 +511,16 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			}
 		}
 	}
-	// A full listing: forget the pacing of regions with no VMs left, before
-	// any launch, so a new VM there doesn't inherit an old clock.
-	if len(view.Unlisted) == 0 {
-		present := map[string]bool{}
-		for _, in := range view.Instances {
-			present[in.Region] = true
-		}
-		for rg := range fl.regionBlind {
-			if !present[rg] {
-				delete(fl.regionBlind, rg)
-			}
+	// Forget the pacing of a region its listing shows empty, before any
+	// launch, so a new VM there doesn't inherit an old clock. A region that
+	// couldn't be listed (and "", while any couldn't) may still have VMs.
+	present := map[string]bool{}
+	for _, in := range view.Instances {
+		present[in.Region] = true
+	}
+	for rg := range fl.regionBlind {
+		if !present[rg] && !unlisted[rg] && (rg != "" || len(unlisted) == 0) {
+			delete(fl.regionBlind, rg)
 		}
 	}
 	// Launched or counted but never listed (a VM that ended before any
