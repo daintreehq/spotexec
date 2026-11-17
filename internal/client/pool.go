@@ -108,16 +108,16 @@ type launchRec struct {
 }
 
 type poolState struct {
-	Instances     []provider.Instance `json:"instances"`
-	ListedAt      time.Time           `json:"listed_at"`
+	Instances []provider.Instance `json:"instances"`
+	ListedAt  time.Time           `json:"listed_at"`
 	// Unlisted: the regions the last listing couldn't list. Their VMs are
 	// those last seen there, and nothing is forgotten for being absent
 	// until a listing covers every region again.
-	Unlisted []string `json:"unlisted,omitempty"`
-	Launches      []launchRec         `json:"launches"`
-	Notes         map[string]*note    `json:"notes"`
-	BackoffUntil  time.Time           `json:"backoff_until,omitempty"`
-	LastLaunchErr string              `json:"last_launch_error,omitempty"`
+	Unlisted      []string         `json:"unlisted,omitempty"`
+	Launches      []launchRec      `json:"launches"`
+	Notes         map[string]*note `json:"notes"`
+	BackoffUntil  time.Time        `json:"backoff_until,omitempty"`
+	LastLaunchErr string           `json:"last_launch_error,omitempty"`
 	// The account's vCPU quota refused the last launch: no launches until
 	// one of this fleet's VMs ends (freeing quota) or quotaRetry passes.
 	QuotaErr  string    `json:"quota_error,omitempty"`
