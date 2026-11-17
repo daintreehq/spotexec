@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -326,6 +328,46 @@ loop:
 	return res
 }
 
+// watchCancel returns a context that the client's cancel (or its going
+// away) ends, for work before a run's process starts, and stop, which ends
+// the watch and reports whether that happened. Other frames are dropped,
+// as runProc drops them; a cancel seen is never lost, since stop reports it
+// even when the work finished first.
+func (s *Session) watchCancel() (context.Context, func() bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	quit, exited := make(chan struct{}), make(chan struct{})
+	var canceled atomic.Bool
+	go func() {
+		defer close(exited)
+		liveness := time.NewTicker(time.Second)
+		defer liveness.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case f, ok := <-s.frames:
+				if env, err := protocol.Decode(f); !ok || err == nil && env.Type == protocol.TypeCancel {
+					canceled.Store(true)
+					cancel()
+					return
+				}
+			case <-liveness.C:
+				if s.clientGone() {
+					canceled.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() bool {
+		close(quit)
+		<-exited
+		cancel()
+		return canceled.Load()
+	}
+}
+
 // cancelQueued reports, without waiting, whether the client canceled the
 // run (or went away) since the last process ended.
 func (s *Session) cancelQueued() bool {
@@ -435,7 +477,19 @@ func (s *Session) exec(e protocol.Exec) error {
 		}
 		if e.Container != nil {
 			// Inside the project container: runner PATH setup doesn't apply.
-			host, hostEnv, c, err := s.containerScript(e.Container, shell, dir, env)
+			// Preparing the container can take minutes (reading the
+			// image's users): a cancel meanwhile ends it, and the run.
+			ctx, stop := s.watchCancel()
+			host, hostEnv, c, err := s.containerScript(ctx, e.Container, shell, dir, env)
+			if stop() {
+				if err == nil {
+					if err := c(); err != nil {
+						return pr, false, false, perr(protocol.CodeImageFailed, "%v", err)
+					}
+				}
+				pr.canceled, pr.code = true, 130
+				return pr, false, false, nil
+			}
 			if err != nil {
 				return pr, false, false, perr(protocol.CodeImageFailed, "%v", err)
 			}

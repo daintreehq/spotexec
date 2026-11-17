@@ -3,6 +3,7 @@ package helper
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -10,6 +11,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -146,7 +149,7 @@ func TestContainerScriptRunUser(t *testing.T) {
 	}
 	run := func(r *protocol.ContainerRun) string {
 		t.Helper()
-		host, _, cleanup, err := s.containerScript(r, "true", s.workspace, map[string]string{})
+		host, _, cleanup, err := s.containerScript(context.Background(), r, "true", s.workspace, map[string]string{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -209,7 +212,7 @@ func TestContainerScriptRunUser(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bin, "cp-fail"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, err := s.containerScript(&protocol.ContainerRun{Image: "python:3"}, "true", s.workspace, map[string]string{})
+	_, _, _, err := s.containerScript(context.Background(), &protocol.ContainerRun{Image: "python:3"}, "true", s.workspace, map[string]string{})
 	var pe *protoError
 	if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("got %v", err)
@@ -296,10 +299,6 @@ func TestRunUserFilesSharedAcrossSlots(t *testing.T) {
 	bin, calls := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	writeTar(t, filepath.Join(bin, "tar-passwd"), "passwd", "root:x:0:0:root:/root:/bin/bash\n")
-	// Slow enough that every first run asks before the read finishes.
-	if err := os.WriteFile(filepath.Join(bin, "create-sleep"), []byte("1"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	l := Layout{Root: t.TempDir()}
 	session := func(n int) *Session {
 		s := &Session{layout: l, slotDir: l.Slot("repo", n), repoID: "repo"}
@@ -311,7 +310,7 @@ func TestRunUserFilesSharedAcrossSlots(t *testing.T) {
 	}
 	mountRe := regexp.MustCompile(`type=bind,source=([^,]+),target=/etc/passwd,readonly`)
 	run := func(s *Session) (string, error) {
-		host, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "python:3"}, "true", s.workspace, map[string]string{})
+		host, _, cleanup, err := s.containerScript(context.Background(), &protocol.ContainerRun{Image: "python:3"}, "true", s.workspace, map[string]string{})
 		if err != nil {
 			return "", err
 		}
@@ -326,34 +325,42 @@ func TestRunUserFilesSharedAcrossSlots(t *testing.T) {
 	}
 
 	sessions := []*Session{session(0), session(1), session(2), session(3)}
-	sources := make([]string, len(sessions))
-	errs := make(chan error, len(sessions))
-	for i, s := range sessions {
-		go func() {
-			var err error
-			sources[i], err = run(s)
-			errs <- err
-		}()
-	}
-	for range sessions {
-		if err := <-errs; err != nil {
+	// Every run finds the files missing (none goes on before all have
+	// inspected the image), and the read is slow enough that all of them
+	// want it while it runs.
+	for f, v := range map[string]string{"inspect-barrier": strconv.Itoa(len(sessions)), "create-sleep": "1"} {
+		if err := os.WriteFile(filepath.Join(bin, f), []byte(v), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
+	sources := make([]string, len(sessions))
+	errs := make([]error, len(sessions))
+	var wg sync.WaitGroup
+	for i, s := range sessions {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sources[i], errs[i] = run(s)
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		t.Fatal(err)
+	}
 	if n := len(callsWith(t, calls, "create --pull never")); n != 1 {
-		t.Fatalf("image read %d times by %d first runs", n, len(sessions))
+		t.Fatalf("image read %d times by %d runs", n, len(sessions))
 	}
 	for i, src := range sources {
 		if src != sources[0] {
 			t.Fatalf("slot %d mounts %s, slot 0 %s", i, src, sources[0])
 		}
-		if strings.HasPrefix(src, sessions[i].slotDir+string(filepath.Separator)) {
-			t.Fatalf("users files kept in the slot: %s", src)
+		if !strings.HasPrefix(src, l.Users()+string(filepath.Separator)) {
+			t.Fatalf("users files not kept for the VM: %s", src)
 		}
 	}
 
 	// Later runs, on a slot acquired again (which clears its run directory)
-	// and on a slot new to the image, while the VM is busy: no read.
+	// and on a slot new to the image: no read.
 	if err := os.RemoveAll(filepath.Join(sessions[0].slotDir, "run")); err != nil {
 		t.Fatal(err)
 	}
@@ -372,22 +379,38 @@ func TestRunUserFilesSharedAcrossSlots(t *testing.T) {
 }
 
 // Getting the users files has one budget, from the image's inspection to
-// the end of the read, past which the run fails; teardown ends a read in
-// progress instead of waiting for it.
+// the end of the read, past which the run fails; the client's cancel and
+// teardown end a read in progress instead of waiting for it.
 func TestRunUserFilesBudget(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("runs as root: no run user to add")
 	}
 	if usersBudget < 2*time.Minute {
-		t.Fatalf("budget %v: a fresh VM's first runs need minutes", usersBudget)
+		t.Fatalf("budget %v: a busy VM's runs need minutes", usersBudget)
 	}
 	bin, calls := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	writeTar(t, filepath.Join(bin, "tar-passwd"), "passwd", "root:x:0:0:root:/root:/bin/bash\n")
 	setSleep := func(d string) {
 		t.Helper()
+		_ = os.Remove(filepath.Join(bin, "create-pid"))
 		if err := os.WriteFile(filepath.Join(bin, "create-sleep"), []byte(d), 0o644); err != nil {
 			t.Fatal(err)
+		}
+	}
+	// The fake docker's sleep is gone: the read was stopped, not abandoned.
+	stopped := func() {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(bin, "create-pid"))
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || pid <= 0 {
+			t.Fatalf("no read started: %v", err)
+		}
+		for t0 := time.Now(); syscall.Kill(pid, 0) == nil; time.Sleep(20 * time.Millisecond) {
+			if time.Since(t0) > 3*time.Second {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+				t.Fatal("docker create left running")
+			}
 		}
 	}
 	slot := t.TempDir()
@@ -395,68 +418,149 @@ func TestRunUserFilesBudget(t *testing.T) {
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	start := func() (time.Duration, error) {
-		t.Helper()
+	start := func(ctx context.Context) (time.Duration, error) {
 		t0 := time.Now()
-		_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "python:3"}, "true", s.workspace, map[string]string{})
+		_, _, cleanup, err := s.containerScript(ctx, &protocol.ContainerRun{Image: "python:3"}, "true", s.workspace, map[string]string{})
 		if err == nil {
 			err = cleanup()
 		}
 		return time.Since(t0), err
 	}
+	var bg sync.WaitGroup
+	// started runs start in the background once a read is under way.
+	started := func(ctx context.Context) <-chan error {
+		t.Helper()
+		n := len(callsWith(t, calls, "create --pull never"))
+		errs := make(chan error, 1)
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
+			_, err := start(ctx)
+			errs <- err
+		}()
+		for t0 := time.Now(); len(callsWith(t, calls, "create --pull never")) == n; time.Sleep(20 * time.Millisecond) {
+			if time.Since(t0) > 5*time.Second {
+				t.Fatal("no read started")
+			}
+		}
+		return errs
+	}
+	ended := func(errs <-chan error) {
+		t.Helper()
+		select {
+		case err := <-errs:
+			var pe *protoError
+			if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed {
+				t.Fatalf("stopped read: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the read was waited for")
+		}
+		stopped()
+	}
 	old := usersBudget
 	t.Cleanup(func() { usersBudget = old })
+	// Runs left in the background end before the budget and PATH return.
+	t.Cleanup(bg.Wait)
 
 	// Over budget: the read is stopped and the run fails, promptly.
 	usersBudget = 500 * time.Millisecond
-	setSleep("10")
-	took, err := start()
+	setSleep("30")
+	took, err := start(context.Background())
 	var pe *protoError
 	if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed || took > 8*time.Second {
 		t.Fatalf("over budget: %v after %v", err, took)
 	}
-	if _, err := os.Stat(s.layout.Users()); err == nil {
-		if left, _ := os.ReadDir(s.layout.Users()); len(left) != 1 { // the lock file
-			t.Fatalf("left behind: %v", left)
-		}
+	stopped()
+	if left, _ := os.ReadDir(s.layout.Users()); len(left) != 1 { // the lock file
+		t.Fatalf("left behind: %v", left)
 	}
 
 	// A slow read inside the budget passes.
 	usersBudget = 10 * time.Second
 	setSleep("1")
-	if _, err := start(); err != nil {
+	if _, err := start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.RemoveAll(s.layout.Users()); err != nil {
 		t.Fatal(err)
 	}
 
-	// Teardown cancels a read in progress.
-	setSleep("30")
-	n := len(callsWith(t, calls, "create --pull never"))
-	errs := make(chan error, 1)
-	t0 := time.Now()
-	go func() { _, err := start(); errs <- err }()
-	for len(callsWith(t, calls, "create --pull never")) == n {
-		if time.Since(t0) > 5*time.Second {
-			t.Fatal("no read started")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	s.stopping.Store(true)
-	s.cancelPrep()
-	select {
-	case err := <-errs:
-		if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed {
-			t.Fatalf("cancelled read: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("teardown waited for the read")
-	}
+	// The client's cancel ends a read in progress.
+	usersBudget = time.Hour
+	setSleep("60")
+	ctx, cancel := context.WithCancel(context.Background())
+	errs := started(ctx)
+	cancel()
+	ended(errs)
+
+	// So does teardown.
+	setSleep("60")
+	errs = started(context.Background())
+	s.teardown()
+	ended(errs)
 	// Once stopping, a new preparation starts cancelled.
-	ctx, done := s.startPrep(time.Minute)
+	pctx, done := s.startPrep(context.Background(), time.Hour)
 	defer done()
-	if ctx.Err() == nil {
+	if pctx.Err() == nil {
 		t.Fatal("preparation after teardown not cancelled")
+	}
+}
+
+// The watch on a run's preparation ends it on the client's cancel, its
+// input closing or its silence, and reports a cancel that came after the
+// preparation was done; other frames don't end it.
+func TestWatchCancel(t *testing.T) {
+	s := testSession(t, t.TempDir())
+	s.frames = make(chan protocol.Frame, 4)
+	ctx, stop := s.watchCancel()
+	s.frames <- protocol.Frame{Kind: protocol.KindStdout}
+	select {
+	case <-ctx.Done():
+		t.Fatal("ended by another frame")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if stop() {
+		t.Fatal("canceled without a cancel")
+	}
+
+	ctx, stop = s.watchCancel()
+	s.frames <- cancelFrame(t)
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel not seen")
+	}
+	if !stop() {
+		t.Fatal("cancel not reported")
+	}
+
+	// Done first, then the cancel: still reported.
+	s.frames <- cancelFrame(t)
+	_, stop = s.watchCancel()
+	for t0 := time.Now(); len(s.frames) > 0 && time.Since(t0) < 5*time.Second; {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !stop() {
+		t.Fatal("cancel taken but not reported")
+	}
+
+	close(s.frames)
+	ctx, stop = s.watchCancel()
+	<-ctx.Done()
+	if !stop() {
+		t.Fatal("closed input not reported")
+	}
+
+	s.frames = make(chan protocol.Frame)
+	s.lastSeen.Store(s.now() - int64(2*ClientTimeout))
+	ctx, stop = s.watchCancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("silent client not seen")
+	}
+	if !stop() {
+		t.Fatal("silent client not reported")
 	}
 }

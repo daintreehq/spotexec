@@ -139,13 +139,14 @@ func (s *Session) teardown() {
 	s.releaseLocks(true)
 }
 
-// startPrep returns a context, ending after budget, for preparation a
+// startPrep returns a context, ending after budget or with parent, for
+// preparation a
 // start does under procMu that can take minutes (reading an image's users),
 // and done, to call once it is over. Teardown cancels it rather than wait
 // for it: stopping is set before teardown takes prepMu, so a context made
 // after teardown looked is cancelled here.
-func (s *Session) startPrep(budget time.Duration) (ctx context.Context, done func()) {
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
+func (s *Session) startPrep(parent context.Context, budget time.Duration) (ctx context.Context, done func()) {
+	ctx, cancel := context.WithTimeout(parent, budget)
 	s.prepMu.Lock()
 	defer s.prepMu.Unlock()
 	if s.stopping.Load() {

@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -85,7 +86,7 @@ func TestContainerScriptChecksOptions(t *testing.T) {
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Options: []string{"-e", "A=1", "-iu", "0"}}, "true", s.workspace, map[string]string{})
+	_, _, _, err := s.containerScript(context.Background(), &protocol.ContainerRun{Image: "node:22", Options: []string{"-e", "A=1", "-iu", "0"}}, "true", s.workspace, map[string]string{})
 	var pe *protoError
 	if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed || !strings.Contains(err.Error(), "container.options may not set -u") {
 		t.Fatalf("got %v", err)
@@ -93,7 +94,7 @@ func TestContainerScriptChecksOptions(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(slot, "run")); !os.IsNotExist(err) {
 		t.Fatal("files written for a refused run")
 	}
-	_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Options: []string{"--label", "--name", "-e", "NODE_OPTIONS=-d"}}, "true", s.workspace, map[string]string{})
+	_, _, cleanup, err := s.containerScript(context.Background(), &protocol.ContainerRun{Image: "node:22", Options: []string{"--label", "--name", "-e", "NODE_OPTIONS=-d"}}, "true", s.workspace, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +128,7 @@ func TestContainerScriptSizesShm(t *testing.T) {
 		{[]string{"--shm-size=2g"}, "'--shm-size=2g'"},
 		{[]string{"--ipc=host"}, ""},
 	} {
-		host, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Options: c.options}, "true", s.workspace, map[string]string{})
+		host, _, cleanup, err := s.containerScript(context.Background(), &protocol.ContainerRun{Image: "node:22", Options: c.options}, "true", s.workspace, map[string]string{})
 		if err != nil {
 			t.Fatal(err)
 		}
