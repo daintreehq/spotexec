@@ -485,6 +485,10 @@ type Container struct {
 	// (Testcontainers, docker compose) through a Docker socket scoped to the
 	// run. It gives them root-equivalent access to the runner.
 	Docker bool `toml:"docker"`
+	// CPUPinning pins each shared slot's container to a block of the VM's
+	// CPUs of its own (--cpuset-cpus), for timing-sensitive work. By
+	// default jobs sharing a VM may use any of its CPUs.
+	CPUPinning bool `toml:"cpu_pinning"`
 }
 
 // Enabled reports whether a container is configured.
@@ -1174,6 +1178,9 @@ func (p *Project) validate() error {
 	}
 	if p.Container.Docker && !p.Container.Enabled() {
 		return errors.New("container.docker requires container.image or container.dockerfile")
+	}
+	if p.Container.CPUPinning && !p.Container.Enabled() {
+		return errors.New("container.cpu_pinning requires container.image or container.dockerfile")
 	}
 	if p.Deps.Install != "" && len(p.Deps.CacheDirs) == 0 {
 		return errors.New("deps.install requires deps.cache_dirs")

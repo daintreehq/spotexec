@@ -950,6 +950,25 @@ func TestContainerDockerNeedsContainer(t *testing.T) {
 	}
 }
 
+func TestContainerCPUPinning(t *testing.T) {
+	for body, ok := range map[string]bool{
+		"[container]\nimage = \"node:22\"\ncpu_pinning = true\n":    true,
+		"[container]\nimage = \"node:22\"\n":                        true,
+		"[container]\ncpu_pinning = true\n":                         false,
+		"[container]\nimage = \"node:22\"\ncpu_pinning = \"yes\"\n": false,
+	} {
+		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
+		os.WriteFile(pp, []byte(body), 0o644)
+		p, err := LoadProject(pp)
+		if (err == nil) != ok {
+			t.Errorf("%q: err = %v, want ok=%v", body, err, ok)
+		}
+		if err == nil && p.Container.CPUPinning != strings.Contains(body, "cpu_pinning = true") {
+			t.Errorf("%q: CPUPinning = %v", body, p.Container.CPUPinning)
+		}
+	}
+}
+
 func TestWritebackLimits(t *testing.T) {
 	load := func(body string) (*Project, error) {
 		pp := filepath.Join(t.TempDir(), ".spotexec.toml")

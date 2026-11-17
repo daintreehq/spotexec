@@ -287,6 +287,9 @@ type ContainerRun struct {
 	// Docker gives the command a Docker socket (scoped to the run) so it
 	// can start containers of its own.
 	Docker bool `json:"docker,omitempty"`
+	// CPUPinning pins a shared slot's container to a block of CPUs of its
+	// own; otherwise it may use any of the runner's CPUs.
+	CPUPinning bool `json:"cpu_pinning,omitempty"`
 }
 
 // RegistryAuth is a short-lived login for the image registry (ECR).
