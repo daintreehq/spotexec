@@ -825,24 +825,35 @@ type LaunchDecision struct {
 // slots on its running VMs aren't expected to free sooner than a new VM
 // would serve (a short burst waits for them; demand still waiting after a
 // launch's lead launches).
+//
+// A VM booting in a region some waiters can't use (replays kept out of a
+// silent region, #240) still counts toward max_instances, but its slots
+// cover only the demand of the waiters that can use it, so those replays
+// aren't left waiting on it.
 func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
 			return err
 		}
-		demand, whole := p.waiters()
+		demand, whole, away := p.waitersAway()
 		d.Demand = demand - covered
 		listed := map[string]bool{}
+		unusable := map[string]string{} // listed, in a region some waiters can't use: its region
 		usable, total := 0, 0
 		for _, in := range st.Instances {
 			listed[in.ID] = true
+			if in.Region != "" && away.avoided(in.Region) {
+				unusable[in.ID] = in.Region
+			}
 			total++
 			if !st.Notes[in.ID].closed() {
 				usable++
 			}
 		}
 		slots := p.SlotsPerInstance()
+		excludedCap := 0                 // pending slots in VMs some waiters can't use
+		awayRegions := map[string]bool{} // their regions
 		inLedger := map[string]bool{}
 		pendingVM := map[string]bool{} // instances whose slots count as pending
 		for _, l := range st.Launches {
@@ -859,6 +870,19 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 				if listed[l.InstanceID] && p.lostVM(st, l.InstanceID, time.Now()) {
 					// Never reached, in a region this client can't reach: it
 					// won't serve, so another launch (elsewhere) may.
+					continue
+				}
+				rg := unusable[l.InstanceID]
+				if rg == "" && !listed[l.InstanceID] && l.Region != "" && away.avoided(l.Region) {
+					rg = l.Region // launched there, not listed yet
+				}
+				if rg != "" {
+					if !listed[l.InstanceID] {
+						usable++
+						total++
+					}
+					excludedCap += slots // it won't serve every waiter
+					awayRegions[rg], pendingVM[l.InstanceID] = true, true
 					continue
 				}
 			}
@@ -879,12 +903,19 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			if inLedger[in.ID] || (n != nil && (n.Ready || n.closed())) {
 				continue
 			}
+			if unusable[in.ID] != "" && time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
+				excludedCap += slots // it won't serve every waiter
+				awayRegions[in.Region], pendingVM[in.ID] = true, true
+				continue
+			}
 			if time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
 				pendingVM[in.ID] = true
 				d.Pending++
 				d.Capacity += slots
 			}
 		}
+		// Booting VMs some waiters can't use serve only the others.
+		d.Capacity += min(excludedCap, max(0, d.Demand-away.weightAvoiding(awayRegions)))
 		d.Live = usable
 		now := time.Now()
 		d.Lead, d.LeadLearned = st.sched().launchLead(now)
@@ -893,7 +924,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		}
 		d.QuotaErr = st.quotaBlocked(p.since)
 		var wholeVM bool
-		d.Ready, wholeVM = p.readyRoom(st, d.Demand-d.Capacity, demand, covered, whole, pendingVM, d.Waited, d.Lead, now)
+		d.Ready, wholeVM = p.readyRoom(st, d.Demand-d.Capacity, demand, covered, whole, away, pendingVM, d.Waited, d.Lead, now)
 		bootFailed := ""
 		for id, n := range st.Notes {
 			if n.BootFailed && time.Since(n.BootFailedAt) < time.Hour {
@@ -1262,10 +1293,16 @@ func (p *Pool) RegisterExclusive(weight int) (*Waiter, error) {
 }
 
 func (p *Pool) registerAs(weight int, exclusive bool) (*Waiter, error) {
+	return p.RegisterAway(weight, exclusive, nil)
+}
+
+// RegisterAway adds a waiter (an exclusive one with exclusive) that can't
+// use VMs in the regions away: a VM booting there doesn't cover its demand.
+func (p *Pool) RegisterAway(weight int, exclusive bool, away []string) (*Waiter, error) {
 	var w *Waiter
 	err := p.with(func(*poolState) error {
 		var err error
-		w, err = p.register(weight, exclusive)
+		w, err = p.register(weight, exclusive, away)
 		return err
 	})
 	return w, err
@@ -1278,7 +1315,7 @@ const exclusiveWaiter = ".x.w"
 // register must run under pool.lock: waiterDemand (also under the lock)
 // unlinks unlocked waiter files, so creation and locking must be atomic
 // with respect to it.
-func (p *Pool) register(weight int, exclusive bool) (*Waiter, error) {
+func (p *Pool) register(weight int, exclusive bool, away []string) (*Waiter, error) {
 	dir := filepath.Join(p.dir, "waiters")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -1289,7 +1326,11 @@ func (p *Pool) register(weight int, exclusive bool) (*Waiter, error) {
 	if exclusive {
 		ext = exclusiveWaiter
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%d-%s%s", os.Getpid(), hex.EncodeToString(b[:]), ext))
+	tag := ""
+	if len(away) > 0 {
+		tag = awayMark + strings.Join(away, awaySep)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d-%s%s%s", os.Getpid(), hex.EncodeToString(b[:]), tag, ext))
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -1404,7 +1445,11 @@ func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendi
 // while this process has waited less than a launch's lead: the ledger
 // knows only this machine's jobs, so a VM another machine fills looks free
 // here, and demand still waiting past the lead launches as before.
-func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, pendingVM map[string]bool, waited, lead time.Duration, now time.Time) (covers int, wholeLeft bool) {
+//
+// Room on a VM in a region some waiters can't use (away: replays kept out
+// of a silent region, #240) takes only the shared demand of the others,
+// and no whole-VM waiter, so those replays don't wait out a lead for it.
+func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, away awayDemand, pendingVM map[string]bool, waited, lead time.Duration, now time.Time) (covers int, wholeLeft bool) {
 	shared := total
 	for _, wt := range whole {
 		shared -= wt
@@ -1426,12 +1471,16 @@ func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, p
 	}
 	s := st.sched()
 	var empty []int
-	free := 0
+	free, freeAway := 0, 0
 	for _, w := range p.views(st, now) {
 		if !w.eligible || !w.ready || pendingVM[w.in.ID] || s.Fences[w.in.ID] != nil {
 			continue
 		}
 		if n := st.Notes[w.in.ID]; n.reaping(now) || now.Before(n.BusyUntil) {
+			continue
+		}
+		if w.in.Region != "" && away.avoided(w.in.Region) {
+			freeAway += max(w.units-w.firm-w.unc, 0)
 			continue
 		}
 		if w.firm+w.unc == 0 {
@@ -1451,7 +1500,13 @@ func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, p
 	for _, u := range empty[placed:] {
 		free += u
 	}
-	covers += min(shared, free)
+	awayW := 0 // shared demand that can't use freeAway
+	for _, a := range away {
+		if !a.whole {
+			awayW += a.weight
+		}
+	}
+	covers += min(shared, free+min(freeAway, max(0, shared-awayW)))
 	return min(covers, need), placed < len(left)
 }
 
@@ -1462,6 +1517,57 @@ func plural(n int, what string) string {
 	return fmt.Sprintf("%d %ss", n, what)
 }
 
+// awayMark ends a waiter's file name with the regions it can't use (a
+// replay kept out of a silent region, #240), joined by awaySep, before its
+// extension. Older versions read only the weight inside.
+const awayMark, awaySep = "~", "+"
+
+// awayDemand is what the waiters that can't use some regions weigh.
+type awayDemand []struct {
+	weight  int
+	whole   bool // a whole-VM waiter
+	regions []string
+}
+
+// avoided reports whether a waiter can't use region.
+func (a awayDemand) avoided(region string) bool {
+	for _, w := range a {
+		if slices.Contains(w.regions, region) {
+			return true
+		}
+	}
+	return false
+}
+
+// weightAvoiding is the demand of the waiters that can't use one of
+// regions. A waiter that avoids any of those
+// regions counts whole, even if it could use a VM in another of them: with
+// several regions avoided at once that may cost a launch, never a wait.
+func (a awayDemand) weightAvoiding(regions map[string]bool) int {
+	n := 0
+	for _, w := range a {
+		for _, rg := range w.regions {
+			if regions[rg] {
+				n += w.weight
+				break
+			}
+		}
+	}
+	return n
+}
+
+// awayRegions are the regions exclude keeps a request out of (regionKey).
+func awayRegions(exclude map[string]bool) []string {
+	var out []string
+	for k := range exclude {
+		if rg, ok := strings.CutPrefix(k, regionKey("")); ok && rg != "" && !strings.ContainsAny(rg, awaySep+awayMark+"./") {
+			out = append(out, rg)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (p *Pool) waiterDemand() int {
 	total, _ := p.waiters()
 	return total
@@ -1470,6 +1576,12 @@ func (p *Pool) waiterDemand() int {
 // waiters is the waiting demand in slots, and the weights of the waiters
 // that need a whole VM (exclusive jobs on a fleet of several-slot VMs).
 func (p *Pool) waiters() (total int, whole []int) {
+	total, whole, _ = p.waitersAway()
+	return total, whole
+}
+
+// waitersAway is waiters, with the waiters that can't use some regions.
+func (p *Pool) waitersAway() (total int, whole []int, away awayDemand) {
 	dir := filepath.Join(p.dir, "waiters")
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
@@ -1500,8 +1612,16 @@ func (p *Pool) waiters() (total int, whole []int) {
 		if w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter) {
 			whole = append(whole, w)
 		}
+		if _, tail, ok := strings.Cut(e.Name(), awayMark); ok {
+			tail, _, _ = strings.Cut(tail, ".")
+			away = append(away, struct {
+				weight  int
+				whole   bool
+				regions []string
+			}{w, w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter), strings.Split(tail, awaySep)})
+		}
 	}
-	return total, whole
+	return total, whole, away
 }
 
 // Snapshot returns the cached state (for status displays).

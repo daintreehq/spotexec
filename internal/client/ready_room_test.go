@@ -335,3 +335,50 @@ func TestReadyCoverReachesLowerPriorityFleets(t *testing.T) {
 	_, reps := multipartRun(t, pool, fleets)
 	launched(t, reps, fleets)
 }
+
+// #240: room on ready VMs in a region a replay can't use (it was lost
+// there) covers the other waiters, not the replay: it launches elsewhere
+// at once instead of waiting out a launch's lead.
+func TestReadyRoomInAvoidedRegionCoversOnlyOthers(t *testing.T) {
+	for _, c := range []struct {
+		name             string
+		ordinary, replay int
+		launch           bool
+		ready            int
+	}{
+		{"an ordinary waiter", 1, 0, false, 1},
+		{"a replay", 0, 1, true, 0},
+		{"an ordinary waiter and a replay", 1, 1, true, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p, f := schedPool(t, 2, 4)
+			for i := range f.insts {
+				f.insts[i].Region = "ap-south-1"
+			}
+			now := time.Now()
+			p.loaded(t, func(st *poolState) {
+				allReady(st, now)
+				p.views(st, now)
+			})
+			for range c.ordinary {
+				w, err := p.Register(1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(w.Done)
+			}
+			for range c.replay {
+				w, err := p.RegisterAway(1, false, []string{"ap-south-1"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(w.Done)
+			}
+			p.since = now.Add(-time.Second)
+			d, err := p.Plan(context.Background(), 0)
+			if err != nil || d.Launch != c.launch || d.Ready != c.ready {
+				t.Fatalf("%+v, %v: want launch=%v, %d ready slots", d, err, c.launch, c.ready)
+			}
+		})
+	}
+}

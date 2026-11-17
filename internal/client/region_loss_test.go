@@ -406,3 +406,314 @@ func TestRankAndFenceExcludeRegion(t *testing.T) {
 		t.Fatalf("fence on %q, want i-0: i-1 is in the excluded region", id)
 	}
 }
+
+// answerFleet is a fakeFleet whose cloud API answers in region outside
+// whichever region it is asked about ("": nowhere).
+type answerFleet struct {
+	*fakeFleet
+	region string
+	mu     sync.Mutex
+	asked  []string // the regions AnswersOutside was asked to look outside
+}
+
+func (a *answerFleet) AnswersOutside(_ context.Context, region string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.asked = append(a.asked, region)
+	return a.region
+}
+
+// #240: with the whole fleet in the lost VM's region, no VM elsewhere can
+// answer a probe; another region's cloud API answering shows the client's
+// network is up instead. The region's own API doesn't count, nor does an
+// API answering while VMs elsewhere stay silent, and the peers' vetoes
+// stand.
+func TestRegionSilentWholeFleetThere(t *testing.T) {
+	up, unknown := transport.Reachable, transport.ReachUnknown
+	for _, c := range []struct {
+		name   string
+		keep   bool // keep the VMs outside ap-south-1
+		api    string
+		reach  map[string]transport.Reach
+		region bool
+		asked  bool
+	}{
+		{"another region's API answers", false, "us-east-2", nil, true, true},
+		{"no region's API answers", false, "", nil, false, true},
+		{"only the region's own API answers", false, "ap-south-1", nil, false, true},
+		{"a peer answers", false, "us-east-2", map[string]transport.Reach{"i-peer1": up}, false, true},
+		{"the lost VM fails for another reason", false, "us-east-2", map[string]transport.Reach{"i-lost": unknown}, false, true},
+		{"VMs elsewhere stay silent", true, "us-east-2", nil, false, false},
+		{"a VM elsewhere answers", true, "us-east-2", map[string]transport.Reach{"i-us1": up}, true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r, f := regionFleet()
+			stubKnownGood(t, f)
+			if !c.keep {
+				f.insts = f.insts[:3] // i-lost, i-peer1, i-peer2
+			}
+			a := &answerFleet{fakeFleet: f, region: c.api}
+			probed := stubProbes(t, c.reach)
+			got := regionSilent(context.Background(), lostLease(r, a))
+			if (got != nil) != c.region {
+				t.Fatalf("regional loss %+v, want %v (probed %v)", got, c.region, *probed)
+			}
+			if asked := len(a.asked) > 0; asked != c.asked || (asked && a.asked[0] != "ap-south-1") {
+				t.Fatalf("asked the API outside %v, want asked=%v", a.asked, c.asked)
+			}
+			if got == nil {
+				return
+			}
+			msg := got.String()
+			if c.keep {
+				if got.api || !strings.Contains(msg, "while one in us-east-1 did") {
+					t.Fatalf("%+v: %q", got, msg)
+				}
+				return
+			}
+			if !got.api || got.answered != "us-east-2" || got.peers != 2 || !strings.Contains(msg, "ap-south-1 looks unreachable from this client (its 2 other VMs there didn't answer either, while the cloud API in us-east-2 answered)") {
+				t.Fatalf("%+v: %q", got, msg)
+			}
+		})
+	}
+	// A fleet with no API to ask: alone in its region, as before.
+	r, f := regionFleet()
+	f.insts = f.insts[:3]
+	stubKnownGood(t, f)
+	probed := stubProbes(t, nil)
+	if got := regionSilent(context.Background(), lostLease(r, f)); got != nil || len(*probed) != 0 {
+		t.Fatalf("no API to ask: %+v, probed %v", got, *probed)
+	}
+}
+
+// #240: a region found silent is held (#225) through the runner's pool, so
+// launches go elsewhere; the replay may then launch while the hold stands
+// and another region is open, and only takes a running VM otherwise.
+func TestRegionLossHoldsAndLetsTheReplayLaunch(t *testing.T) {
+	old := regionReplayAfter
+	t.Cleanup(func() { regionReplayAfter = old })
+	regionReplayAfter = 0
+
+	ap1, ap2 := vmIn("i-ap1", "ap-south-1", time.Hour), vmIn("i-ap2", "ap-south-1", time.Hour)
+	setup := func(t *testing.T) (*Pool, *holdFleet, *regionLoss) {
+		p, h := regionPool(t, 4, ap1, ap2)
+		rl := &regionLoss{region: "ap-south-1", peers: 1, answered: "us-east-2", api: true}
+		holdSilent(context.Background(), &Lease{Runner: p.R, Provider: h, InstanceID: "i-ap1"}, rl)
+		if rl.pool == nil || len(h.asked) != 1 || h.asked[0] != "ap-south-1" || !strings.Contains(h.holds["ap-south-1"], "lost with its 1 other VM there") {
+			t.Fatalf("not held: pool %v, asked %v, holds %v", rl.pool, h.asked, h.holds)
+		}
+		return p, h, rl
+	}
+	replay := func(t *testing.T, rl *regionLoss) attempt {
+		att := attempt{runID: "r", n: 1, exclude: map[string]bool{}}
+		res := Result{noReplay: noReplay{region: rl}, lostAt: running, lostWhen: time.Now()}
+		if !replayAfterRegion(context.Background(), &warnRec{}, &att, res, "i-ap1") {
+			t.Fatal("not ready to replay")
+		}
+		if !excluded(att.exclude, ap2) {
+			t.Fatalf("the silent region isn't excluded: %v", att.exclude)
+		}
+		return att
+	}
+
+	t.Run("held, another region open: launches", func(t *testing.T) {
+		p, h, rl := setup(t)
+		if att := replay(t, rl); att.noBoot || att.bootOnly != p.R.Name {
+			t.Fatalf("the replay may not launch, or not only on its own runner: %+v", att)
+		}
+		if len(h.asked) != 2 {
+			t.Fatalf("hold not renewed before the replay: %v", h.asked)
+		}
+	})
+	t.Run("no region left open: no launch", func(t *testing.T) {
+		_, h, rl := setup(t)
+		h.closed = true
+		if att := replay(t, rl); !att.noBoot || att.bootOnly != "" {
+			t.Fatal("launches with every region held")
+		}
+	})
+	t.Run("the pool's hold ended, the fleet's stands: no launch", func(t *testing.T) {
+		p, h, rl := setup(t)
+		_ = p.with(func(st *poolState) error { delete(st.Held, "ap-south-1"); return nil })
+		if att := replay(t, rl); !att.noBoot || len(h.asked) != 1 {
+			t.Fatalf("noBoot %v, held again %v", att.noBoot, h.asked)
+		}
+	})
+	t.Run("the fleet's hold lapsed and isn't renewed: no launch", func(t *testing.T) {
+		_, h, rl := setup(t)
+		h.refuse = true
+		delete(h.holds, "ap-south-1")
+		if att := replay(t, rl); !att.noBoot || len(h.asked) != 2 {
+			t.Fatalf("noBoot %v, renewals %v", att.noBoot, h.asked)
+		}
+	})
+	t.Run("a VM there answered since: no launch", func(t *testing.T) {
+		p, h, rl := setup(t)
+		p.Observe(ap2.ID, OutAcquired, ap2.LaunchedAt)
+		if len(h.reached) != 1 {
+			t.Fatalf("the answer didn't end the hold: %v", h.reached)
+		}
+		if att := replay(t, rl); !att.noBoot || len(h.asked) != 1 {
+			t.Fatalf("noBoot %v, held again %v", att.noBoot, h.asked)
+		}
+	})
+	t.Run("a fleet without holds: no launch", func(t *testing.T) {
+		r, f := regionFleet()
+		rl := &regionLoss{region: "ap-south-1", peers: 2, answered: "us-east-1"}
+		holdSilent(context.Background(), &Lease{Runner: r, Provider: f, InstanceID: "i-lost"}, rl)
+		if rl.pool != nil {
+			t.Fatal("a fleet without holds got a pool")
+		}
+		if att := replay(t, rl); !att.noBoot {
+			t.Fatal("launches with nothing holding the region")
+		}
+	})
+}
+
+// The verdict holds the region whether or not the run is replayed: with no
+// memory reading (not replayed) and with a healthy one (replayed, and then
+// free to launch elsewhere).
+func TestRegionLossVerdictHoldsTheRegion(t *testing.T) {
+	rl := &regionLoss{region: "ap-south-1", peers: 1, answered: "us-east-2", api: true}
+	stubRegionSilent(t, rl)
+	p, h := regionPool(t, 4, vmIn("i-run", "ap-south-1", time.Hour))
+	got := whyNoReplay(&Lease{Runner: p.R, Provider: h, InstanceID: "i-run"}, false, running, false)
+	if got.code != "REGION_UNREACHABLE" || got.region != rl || !strings.Contains(got.why, "the cloud API in us-east-2 answered") {
+		t.Fatalf("%q (%q)", got.code, got.why)
+	}
+	if rl.pool == nil || len(h.asked) != 1 || h.asked[0] != "ap-south-1" {
+		t.Fatalf("not held: %v", h.asked)
+	}
+
+	rl2 := &regionLoss{region: "ap-south-1", peers: 1, answered: "us-east-2", api: true}
+	stubRegionSilent(t, rl2)
+	sr, tgt := liveRunner(t, "rpc-memory")
+	(&sshtest.Fake{State: os.Getenv("FAKE_SSH_STATE")}).Set("rpc-memory", "12000")
+	_, s, err := Connect(context.Background(), sr, tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Abort()
+	deadline := time.Now().Add(5 * time.Second)
+	for lastMemory(s) == "" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	got = whyNoReplay(&Lease{Runner: p.R, Provider: h, InstanceID: "i-run", Sess: s}, false, running, false)
+	if got.code != "" || got.region != rl2 || rl2.pool == nil || len(h.asked) != 2 {
+		t.Fatalf("healthy: %q (%q), pool %v, asked %v", got.code, got.why, rl2.pool, h.asked)
+	}
+	old := regionReplayAfter
+	t.Cleanup(func() { regionReplayAfter = old })
+	regionReplayAfter = 0
+	att := attempt{runID: "r", n: 1, exclude: map[string]bool{}}
+	if !replayAfterRegion(context.Background(), &warnRec{}, &att, Result{noReplay: got, lostAt: running, lostWhen: time.Now()}, "i-run") || att.noBoot || att.bootOnly != p.R.Name {
+		t.Fatalf("replay: %+v", att)
+	}
+}
+
+// A VM booting in a region some waiters can't use still counts toward
+// max_instances, but covers only the other waiters' demand: replays kept
+// out of a silent region launch elsewhere instead of waiting on it, and no
+// more than they need.
+func TestPlanCreditsExcludedPendingCapacityToOthers(t *testing.T) {
+	away := []string{"ap-south-1"}
+	booting := func(ledger bool, max int) *Pool {
+		p, f := testPool(t, max)
+		f.insts = []provider.Instance{vmIn("i-ap", "ap-south-1", time.Minute)} // 2 slots
+		if ledger {
+			_ = p.with(func(st *poolState) error {
+				st.Launches = append(st.Launches, launchRec{ID: "l1", InstanceID: "i-ap", Started: time.Now().Add(-time.Minute)})
+				return nil
+			})
+		}
+		return p
+	}
+	// launches registers the waiters (weight, and whether each avoids
+	// ap-south-1) and plans until nothing launches: how many did.
+	launches := func(t *testing.T, p *Pool, waiters ...[2]int) int {
+		t.Helper()
+		for _, w := range waiters {
+			var rg []string
+			if w[1] == 1 {
+				rg = away
+			}
+			wt, err := p.RegisterAway(w[0], false, rg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(wt.Done)
+		}
+		n := 0
+		for ; n < 5; n++ {
+			d, err := p.Plan(context.Background(), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d.Launch {
+				return n
+			}
+		}
+		return n
+	}
+	for _, ledger := range []bool{false, true} {
+		for _, c := range []struct {
+			name    string
+			waiters [][2]int
+			want    int
+		}{
+			{"one ordinary waiter: waits for it", [][2]int{{1, 0}}, 0},
+			{"one replay: launches", [][2]int{{1, 1}}, 1},
+			{"two ordinary waiters and a replay: one launch", [][2]int{{2, 0}, {1, 1}}, 1},
+			{"three replays: two launches", [][2]int{{1, 1}, {1, 1}, {1, 1}}, 2},
+		} {
+			t.Run(fmt.Sprintf("ledger=%v/%s", ledger, c.name), func(t *testing.T) {
+				if got := launches(t, booting(ledger, 4), c.waiters...); got != c.want {
+					t.Fatalf("%d launches, want %d", got, c.want)
+				}
+			})
+		}
+		t.Run(fmt.Sprintf("ledger=%v/at max_instances", ledger), func(t *testing.T) {
+			if got := launches(t, booting(ledger, 1), [2]int{1, 1}); got != 0 {
+				t.Fatalf("%d launches past max_instances", got)
+			}
+		})
+	}
+	if got := awayRegions(map[string]bool{"i-lost": true, regionKey("ap-south-1"): true, regionKey("bad+region"): true, regionKey("us-east-1"): true}); strings.Join(got, ",") != "ap-south-1,us-east-1" {
+		t.Fatalf("away regions %v", got)
+	}
+}
+
+// Only BootOnly's runner may launch; NoBoot rules every runner out.
+func TestAcquireBootOnly(t *testing.T) {
+	for _, c := range []struct {
+		req      AcquireRequest
+		aws, gcp bool
+	}{
+		{AcquireRequest{}, false, false},
+		{AcquireRequest{NoBoot: true}, true, true},
+		{AcquireRequest{BootOnly: "aws"}, false, true},
+		{AcquireRequest{NoBoot: true, BootOnly: "aws"}, true, true},
+	} {
+		if c.req.noBoot("aws") != c.aws || c.req.noBoot("gcp") != c.gcp {
+			t.Errorf("%+v: aws %v gcp %v", c.req, c.req.noBoot("aws"), c.req.noBoot("gcp"))
+		}
+	}
+}
+
+// A launch into an avoided region that isn't listed yet doesn't cover a
+// replay kept out of that region either.
+func TestPlanUnlistedLaunchInAvoidedRegion(t *testing.T) {
+	p, _ := testPool(t, 4)
+	_ = p.with(func(st *poolState) error {
+		st.Launches = append(st.Launches, launchRec{ID: "l1", InstanceID: "i-new", Region: "ap-south-1", Started: time.Now()})
+		return nil
+	})
+	w, err := p.RegisterAway(1, false, []string{"ap-south-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Done()
+	if d, err := p.Plan(context.Background(), 0); err != nil || !d.Launch {
+		t.Fatalf("%+v, %v: want a launch elsewhere", d, err)
+	}
+}
