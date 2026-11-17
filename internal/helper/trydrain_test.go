@@ -186,6 +186,15 @@ func TestCancelDrain(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(root, "drain_cancelled")); string(b) != "op1\n" {
 		t.Fatalf("cancelled list %q", b)
 	}
+	// A cancel cut short after recording the operation: the retry finishes it.
+	os.WriteFile(filepath.Join(root, "drain_after"), []byte("120\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "drain_op"), []byte("op1\n"), 0o644)
+	if err := CancelDrain(root, "op1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "drain_after")); !os.IsNotExist(err) {
+		t.Fatalf("a retry left the cancelled drain scheduled: %v", err)
+	}
 	// The cancelled operation's late requests drain nothing.
 	if r := scheduleDrain(root, "op1", 2*time.Minute, true); r.Result != DrainCancelled {
 		t.Fatalf("late schedule-drain: %+v", r)

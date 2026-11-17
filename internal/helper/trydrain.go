@@ -366,7 +366,14 @@ func CancelDrain(root, op string) error {
 	defer unlock()
 	if cancelledOp(root, op) {
 		// Cancelled already (a retry): a drain scheduled since is another
-		// operation's, and stands.
+		// operation's, and stands; this one's, left by a cancel cut short
+		// after recording it, is withdrawn now.
+		if b, err := os.ReadFile(drainOpFile(root)); err == nil && strings.TrimSpace(string(b)) == op {
+			if err := os.Remove(drainAfterFile(root)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			_ = os.Remove(drainOpFile(root))
+		}
 		touchActivity(root)
 		return nil
 	}
