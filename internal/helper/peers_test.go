@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -36,16 +38,37 @@ func (w workingSet) manifest() protocol.Manifest {
 	return m
 }
 
-// playSync plays the client's side of a forward sync of w against s: it
-// answers Need with the files asked for and returns what was asked.
+// client plays the CLI's side of a forward sync. hold, when set, is waited
+// on before the archive goes; onNeed sees what was asked first; events gets
+// every event's name.
+type client struct {
+	hold   chan struct{}
+	onNeed func([]string)
+	events chan string
+}
+
+type syncReply struct {
+	need []string
+	res  protocol.Synced
+	err  error
+}
+
+// playSync syncs w to s and returns what the helper asked for.
 func playSync(t *testing.T, s *Session, w workingSet) ([]string, protocol.Synced) {
 	t.Helper()
+	r := client{}.sync(s, w)
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	return r.need, r.res
+}
+
+func (c client) sync(s *Session, w workingSet) syncReply {
 	m := w.manifest()
 	byPath := map[string]protocol.Entry{}
 	content := map[string]string{}
 	for k, v := range w {
-		p := strings.TrimSuffix(strings.TrimSuffix(k, "@"), "*")
-		content[p] = v
+		content[strings.TrimSuffix(strings.TrimSuffix(k, "@"), "*")] = v
 	}
 	for _, e := range m.Entries {
 		byPath[e.Path] = e
@@ -53,35 +76,41 @@ func playSync(t *testing.T, s *Session, w workingSet) ([]string, protocol.Synced
 	pr, pw := io.Pipe()
 	s.c = protocol.NewConn(strings.NewReader(""), pw)
 	s.frames = make(chan protocol.Frame, 4096)
-	type reply struct {
-		need []string
-		res  protocol.Synced
-		err  error
-	}
-	done := make(chan reply, 1)
+	done := make(chan syncReply, 1)
 	go func() {
 		in := protocol.NewConn(pr, io.Discard)
-		var r reply
+		var r syncReply
+		defer func() { done <- r }()
 		for {
 			fr, err := in.ReadFrame()
 			if err != nil {
 				r.err = err
-				done <- r
 				return
 			}
 			env, err := protocol.Decode(fr)
 			if err != nil {
 				r.err = err
-				done <- r
 				return
 			}
 			switch env.Type {
+			case protocol.TypeEvent:
+				var ev protocol.Event
+				_ = env.Unmarshal(&ev)
+				if c.events != nil {
+					c.events <- ev.Name
+				}
 			case protocol.TypeNeed:
 				var need protocol.Need
 				_ = env.Unmarshal(&need)
 				r.need = need.Paths
+				if c.onNeed != nil {
+					c.onNeed(need.Paths)
+				}
 				if len(need.Paths) == 0 {
 					continue
+				}
+				if c.hold != nil {
+					<-c.hold
 				}
 				bpr, bpw := io.Pipe()
 				go func() {
@@ -118,24 +147,20 @@ func playSync(t *testing.T, s *Session, w workingSet) ([]string, protocol.Synced
 				}
 			case protocol.TypeSynced:
 				r.err = env.Unmarshal(&r.res)
-				done <- r
 				return
 			case protocol.TypeError:
 				r.err = errors.New(string(env.Body))
-				done <- r
 				return
 			}
 		}
 	}()
-	if err := s.syncManifest(m); err != nil {
-		t.Fatal(err)
-	}
-	r := <-done
+	err := s.syncManifest(m)
 	pw.Close()
-	if r.err != nil {
-		t.Fatal(r.err)
+	r := <-done
+	if err != nil {
+		r.err = err
 	}
-	return r.need, r.res
+	return r
 }
 
 // slotSession acquires a slot of repo r on root for a new session.
@@ -274,5 +299,215 @@ func TestSyncNeverCopiesFromAnotherRepo(t *testing.T) {
 	need, _ := playSync(t, b, ws)
 	if want := []string{"a.txt"}; !reflect.DeepEqual(need, want) {
 		t.Fatalf("asked for %v, want %v", need, want)
+	}
+}
+
+// A peer copy that isn't the wanted content never replaces the slot's file:
+// at the moment the client is asked, the old file is still there.
+func TestSyncRejectedPeerCopyLeavesTheFile(t *testing.T) {
+	root := t.TempDir()
+	a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	playSync(t, b, workingSet{"a.txt": "older\n"})
+
+	// a records alpha at a.txt, but holds other bytes at that signature.
+	writeFile(t, a.workspace, "a.txt", "omega\n")
+	fi, err := os.Lstat(filepath.Join(a.workspace, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sg, _ := sigOf(fi)
+	if err := writeJSON(a.manifestPath(), map[string]storedEntry{"a.txt": entryFrom(fsid.Bytes([]byte("alpha\n")), sg)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var atNeed string
+	r := client{onNeed: func([]string) {
+		bb, _ := os.ReadFile(filepath.Join(b.workspace, "a.txt"))
+		atNeed = string(bb)
+	}}.sync(b, workingSet{"a.txt": "alpha\n"})
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if want := []string{"a.txt"}; !reflect.DeepEqual(r.need, want) {
+		t.Fatalf("asked for %v, want %v", r.need, want)
+	}
+	if atNeed != "older\n" {
+		t.Fatalf("a.txt was %q when the client was asked, want the slot's own %q", atNeed, "older\n")
+	}
+	checkWorkspace(t, b.workspace, workingSet{"a.txt": "alpha\n"})
+}
+
+// bigSet is a working set large enough that slots share its upload.
+func bigSet(extra workingSet) workingSet {
+	w := workingSet{}
+	for i := range shareMinFiles + 10 {
+		w[fmt.Sprintf("src/f%03d.txt", i)] = fmt.Sprintf("file %d\n", i)
+	}
+	for k, v := range extra {
+		w[k] = v
+	}
+	return w
+}
+
+func waitEvent(t *testing.T, ch chan string, name string) {
+	t.Helper()
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case got := <-ch:
+			if got == name {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("no %s event", name)
+		}
+	}
+}
+
+// Slots of one repo filling at once on a fresh VM receive the working set
+// from the client once between them: one uploads while the others wait,
+// then copy it and ask only for what is theirs alone (#263).
+func TestSyncColdSlotsShareOneUpload(t *testing.T) {
+	root := t.TempDir()
+	const n = 4
+	var ss []*Session
+	for i := range n {
+		ss = append(ss, slotSession(t, root, protocol.Acquire{WorktreeKey: fmt.Sprintf("wt%d", i)}))
+	}
+	sets := make([]workingSet, n)
+	for i := range n {
+		sets[i] = bigSet(workingSet{fmt.Sprintf("own%d.txt", i): fmt.Sprintf("only in %d\n", i)})
+	}
+
+	// The first slot takes the upload and holds its archive until every
+	// other slot is waiting for it.
+	hold := make(chan struct{})
+	asked := make(chan struct{})
+	replies := make([]chan syncReply, n)
+	for i := range replies {
+		replies[i] = make(chan syncReply, 1)
+	}
+	go func() {
+		replies[0] <- client{hold: hold, onNeed: func([]string) { close(asked) }}.sync(ss[0], sets[0])
+	}()
+	select {
+	case <-asked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first slot never asked for its files")
+	}
+	for i := 1; i < n; i++ {
+		ev := make(chan string, 16)
+		go func() { replies[i] <- client{events: ev}.sync(ss[i], sets[i]) }()
+		waitEvent(t, ev, "sync_wait")
+	}
+	close(hold)
+
+	total := 0
+	for i := range n {
+		r := <-replies[i]
+		if r.err != nil {
+			t.Fatalf("slot %d: %v", i, r.err)
+		}
+		total += len(r.need)
+		if i == 0 {
+			if len(r.need) != len(sets[0]) {
+				t.Fatalf("the uploading slot asked for %d files, want %d", len(r.need), len(sets[0]))
+			}
+			continue
+		}
+		if want := []string{fmt.Sprintf("own%d.txt", i)}; !reflect.DeepEqual(r.need, want) {
+			t.Fatalf("slot %d asked for %v, want %v", i, r.need, want)
+		}
+		if r.res.Reused != len(sets[i])-1 {
+			t.Fatalf("slot %d reused %d files, want %d", i, r.res.Reused, len(sets[i])-1)
+		}
+		checkWorkspace(t, ss[i].workspace, sets[i])
+	}
+	if want := len(sets[0]) + n - 1; total != want {
+		t.Fatalf("the client sent %d files in all, want %d", total, want)
+	}
+}
+
+// A slot that found nothing to copy, and then got the upload lock only after
+// another slot had published its upload, copies that upload rather than
+// asking the client again.
+func TestSyncCopiesAnUploadPublishedBeforeItsTurn(t *testing.T) {
+	root := t.TempDir()
+	a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	ws := bigSet(nil)
+
+	scanned, resume := make(chan struct{}), make(chan struct{})
+	peerScanned = func(s *Session) {
+		if s == b {
+			close(scanned)
+			<-resume
+		}
+	}
+	t.Cleanup(func() { peerScanned = nil })
+
+	reply := make(chan syncReply, 1)
+	go func() { reply <- client{}.sync(b, ws) }()
+	<-scanned
+	if need, _ := playSync(t, a, ws); len(need) != len(ws) {
+		t.Fatalf("first slot asked for %d files, want %d", len(need), len(ws))
+	}
+	close(resume)
+	r := <-reply
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if len(r.need) != 0 {
+		t.Fatalf("asked for %d files the other slot had published", len(r.need))
+	}
+	checkWorkspace(t, b.workspace, ws)
+}
+
+// An upload that takes too long doesn't hold the other slots: past the wait
+// they ask the client themselves.
+func TestSyncStopsWaitingForAStalledUpload(t *testing.T) {
+	old := syncShareWait
+	syncShareWait = 300 * time.Millisecond
+	t.Cleanup(func() { syncShareWait = old })
+	root := t.TempDir()
+	a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	ws := bigSet(nil)
+
+	hold, asked := make(chan struct{}), make(chan struct{})
+	first := make(chan syncReply, 1)
+	go func() { first <- client{hold: hold, onNeed: func([]string) { close(asked) }}.sync(a, ws) }()
+	<-asked
+	need, _ := playSync(t, b, ws)
+	if len(need) != len(ws) {
+		t.Fatalf("asked for %d files, want all %d", len(need), len(ws))
+	}
+	checkWorkspace(t, b.workspace, ws)
+	close(hold)
+	if r := <-first; r.err != nil {
+		t.Fatal(r.err)
+	}
+}
+
+// A small remainder doesn't wait for another slot's upload.
+func TestSyncSmallRemainderDoesNotWait(t *testing.T) {
+	old := syncShareWait
+	syncShareWait = time.Hour
+	t.Cleanup(func() { syncShareWait = old })
+	root := t.TempDir()
+	a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+
+	hold, asked := make(chan struct{}), make(chan struct{})
+	first := make(chan syncReply, 1)
+	go func() { first <- client{hold: hold, onNeed: func([]string) { close(asked) }}.sync(a, bigSet(nil)) }()
+	<-asked
+	if need, _ := playSync(t, b, workingSet{"a.txt": "alpha\n"}); len(need) != 1 {
+		t.Fatalf("asked for %v", need)
+	}
+	close(hold)
+	if r := <-first; r.err != nil {
+		t.Fatal(r.err)
 	}
 }

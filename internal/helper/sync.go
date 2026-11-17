@@ -214,12 +214,21 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		need = append(need, e.Path)
 		needBytes += e.Size
 	}
-	need, needBytes, _ = s.fillFromPeers(need, want)
+	upload, need, reused, err := s.uploadTurn(need, want)
+	if err != nil {
+		_ = s.saveStored()
+		return err
+	}
+	defer upload.Unlock()
+	needBytes = 0
+	for _, p := range need {
+		needBytes += want[p].Size
+	}
 	sort.Strings(need)
 	if err := s.c.Send(protocol.TypeNeed, protocol.Need{Paths: need, Bytes: needBytes}); err != nil {
 		return err
 	}
-	res := protocol.Synced{Deleted: deleted}
+	res := protocol.Synced{Deleted: deleted, Reused: reused}
 	if len(need) > 0 {
 		needSet := make(map[string]bool, len(need))
 		for _, p := range need {
@@ -244,6 +253,7 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 	if err := s.saveStored(); err != nil {
 		return err
 	}
+	upload.Unlock() // recorded: other slots can copy what came
 	if len(res.Corrected) == 0 {
 		s.state.Fingerprint = m.Fingerprint
 	}
