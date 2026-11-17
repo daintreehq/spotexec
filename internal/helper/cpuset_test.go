@@ -56,8 +56,14 @@ func TestPlanCPUSetRanges(t *testing.T) {
 		{"8 vCPUs 4 slots, first", host(8), 1, 4, "0-1"},
 		{"8 vCPUs 4 slots, last", host(8), 4, 4, "6-7"},
 		{"8 vCPUs 2 slots", host(8), 2, 2, "4-7"},
-		{"uneven: 10 vCPUs 4 slots leaves 8-9 free", host(10), 4, 4, "6-7"},
-		{"uneven: 6 vCPUs 4 slots is one each", host(6), 4, 4, "3"},
+		{"uneven: 10 vCPUs 4 slots, first gets a leftover CPU", host(10), 1, 4, "0-2"},
+		{"uneven: 10 vCPUs 4 slots, last gets 8-9", host(10), 4, 4, "8-9"},
+		{"uneven: 6 vCPUs 4 slots, second gets 2-3", host(6), 2, 4, "2-3"},
+		{"uneven: 6 vCPUs 4 slots, last gets 5", host(6), 4, 4, "5"},
+		{"uneven: 8 vCPUs 6 slots, last gets 7", host(8), 6, 6, "7"},
+		{"uneven: 8 vCPUs 6 slots, token 7 wraps to the first", host(8), 7, 6, "0-1"},
+		{"uneven: 8 vCPUs 6 slots, token 12 wraps to the last", host(8), 12, 6, "7"},
+		{"uneven: 10 vCPUs 4 slots, token 6 wraps to the second", host(10), 6, 4, "3-5"},
 		{"more slots than CPUs: one CPU each", host(4), 3, 8, "2"},
 		{"more slots than CPUs wraps", host(4), 6, 8, "1"},
 		{"token beyond this client's max_slots wraps", host(8), 6, 4, "2-3"},
@@ -74,8 +80,9 @@ func TestPlanCPUSetRanges(t *testing.T) {
 }
 
 // Concurrent jobs on one machine never share a CPU while there are at least
-// as many CPUs as slots, and each sees exactly SPOTEXEC_CPUS of them.
-func TestPlanCPUSetDisjointAndMatchesShare(t *testing.T) {
+// as many CPUs as slots, each sees SPOTEXEC_CPUS of them or one more, and
+// together they cover every CPU, whatever the slot count.
+func TestPlanCPUSetDisjointAndCoversEveryCPU(t *testing.T) {
 	for n := 2; n <= 48; n++ {
 		for slots := 2; slots <= n; slots++ {
 			seen := map[int]int{}
@@ -86,7 +93,7 @@ func TestPlanCPUSetDisjointAndMatchesShare(t *testing.T) {
 				if err != nil {
 					t.Fatalf("n=%d slots=%d tok=%d: %q: %v", n, slots, tok, set, err)
 				}
-				if len(cpus) != share {
+				if len(cpus) != share && len(cpus) != share+1 {
 					t.Fatalf("n=%d slots=%d tok=%d: %d CPUs, SPOTEXEC_CPUS is %d", n, slots, tok, len(cpus), share)
 				}
 				for _, c := range cpus {
@@ -94,6 +101,35 @@ func TestPlanCPUSetDisjointAndMatchesShare(t *testing.T) {
 						t.Fatalf("n=%d slots=%d: CPU %d in tokens %d and %d", n, slots, c, prev, tok)
 					}
 					seen[c] = tok
+				}
+			}
+			if len(seen) != n {
+				t.Fatalf("n=%d slots=%d: %d of the CPUs used, want all", n, slots, len(seen))
+			}
+		}
+	}
+	// More slots than CPUs: still every CPU, one each.
+	for n := 2; n <= 8; n++ {
+		seen := map[string]bool{}
+		for tok := 1; tok <= n+3; tok++ {
+			set, _ := planCPUSet(host(n), tok, n+3, false, nil)
+			if want := strconv.Itoa((tok - 1) % n); set != want {
+				t.Fatalf("n=%d slots=%d tok=%d: %q, want CPU %s alone", n, n+3, tok, set, want)
+			}
+			seen[set] = true
+		}
+		if len(seen) != n {
+			t.Fatalf("n=%d slots=%d: blocks %v, want each CPU alone", n, n+3, seen)
+		}
+	}
+	// Tokens past the slot count wrap onto the same blocks.
+	for n := 2; n <= 24; n++ {
+		for slots := 2; slots <= n; slots++ {
+			for tok := 1; tok <= slots; tok++ {
+				a, _ := planCPUSet(host(n), tok, slots, false, nil)
+				b, _ := planCPUSet(host(n), tok+slots, slots, false, nil)
+				if a != b {
+					t.Fatalf("n=%d slots=%d: token %d got %q, token %d got %q", n, slots, tok, a, tok+slots, b)
 				}
 			}
 		}
@@ -209,26 +245,31 @@ func TestReadCPUHostParsesDockerInfo(t *testing.T) {
 	}
 }
 
-// Runs that get every CPU anyway, or set their own limit, are never pinned
-// and never noted, on any OS; a run that can't be pinned is noted once.
+// Runs that get every CPU anyway, set their own limit, or didn't ask for
+// pinning are never pinned and never noted, on any OS; a run that asked for
+// pinning and can't be pinned is noted once.
 func TestCpusetArgsQuiet(t *testing.T) {
 	out := &syncBuf{}
 	s := &Session{c: protocol.NewConn(strings.NewReader(""), out), maxSlots: 4, tokens: []*flock{nil}, tokenIdx: 2}
 	sent := func() string { out.mu.Lock(); defer out.mu.Unlock(); return out.b.String() }
 	none := dockerRunner{} // docker info said nothing: pinning can't be trusted
-	if got := s.cpusetArgs(&protocol.ContainerRun{Options: []string{"--cpus=1"}}, none); got != nil {
+	pin := func() *protocol.ContainerRun { return &protocol.ContainerRun{CPUPinning: true} }
+	if got := s.cpusetArgs(&protocol.ContainerRun{}, none); got != nil {
+		t.Fatalf("shared CPUs by default: got %v", got)
+	}
+	if got := s.cpusetArgs(&protocol.ContainerRun{CPUPinning: true, Options: []string{"--cpus=1"}}, none); got != nil {
 		t.Fatalf("user --cpus: got %v", got)
 	}
 	s.acq.Exclusive = true
-	if got := s.cpusetArgs(&protocol.ContainerRun{}, none); got != nil {
+	if got := s.cpusetArgs(pin(), none); got != nil {
 		t.Fatalf("exclusive: got %v", got)
 	}
 	s.acq.Exclusive, s.tokens = false, []*flock{nil, nil} // --exclusive holds every token
-	if got := s.cpusetArgs(&protocol.ContainerRun{}, none); got != nil {
+	if got := s.cpusetArgs(pin(), none); got != nil {
 		t.Fatalf("every token: got %v", got)
 	}
 	s.tokens, s.maxSlots = []*flock{nil}, 1
-	if got := s.cpusetArgs(&protocol.ContainerRun{}, none); got != nil {
+	if got := s.cpusetArgs(pin(), none); got != nil {
 		t.Fatalf("one slot: got %v", got)
 	}
 	if ev := sent(); ev != "" {
@@ -236,7 +277,7 @@ func TestCpusetArgsQuiet(t *testing.T) {
 	}
 	s.maxSlots = 4
 	for range 2 { // deps install, then the command
-		if got := s.cpusetArgs(&protocol.ContainerRun{}, none); got != nil {
+		if got := s.cpusetArgs(pin(), none); got != nil {
 			t.Fatalf("unknown daemon CPUs: got %v", got)
 		}
 	}
@@ -256,9 +297,39 @@ func TestCpusetArgsPinsOnLinux(t *testing.T) {
 	}
 	d := dockerRunner{info: " Context:    default\n CPUs: " + strconv.Itoa(len(h.cpus)) + "\n"}
 	s := &Session{maxSlots: len(h.cpus), tokens: []*flock{nil}, tokenIdx: 2}
-	got := s.cpusetArgs(&protocol.ContainerRun{Options: []string{"--shm-size=1g"}}, d)
+	got := s.cpusetArgs(&protocol.ContainerRun{CPUPinning: true, Options: []string{"--shm-size=1g"}}, d)
 	if want := []string{"--cpuset-cpus", formatCPUList(h.cpus[1:2])}; !slices.Equal(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
+	}
+	// Without cpu_pinning the same job may use every CPU.
+	if got := s.cpusetArgs(&protocol.ContainerRun{Options: []string{"--shm-size=1g"}}, d); got != nil {
+		t.Fatalf("not asked to pin: got %v", got)
+	}
+}
+
+// The dependency install gets SPOTEXEC_CPUS as commands do: the machine's
+// share, or every CPU for a job alone on the runner.
+func TestCPUShare(t *testing.T) {
+	n := runtime.NumCPU()
+	s := &Session{maxSlots: 4, tokens: []*flock{nil}}
+	if got := s.cpuShare(); got != max(1, n/4) {
+		t.Fatalf("4 slots: %d, want %d", got, max(1, n/4))
+	}
+	s.maxSlots = n * 2
+	if got := s.cpuShare(); got != 1 {
+		t.Fatalf("more slots than CPUs: %d, want 1", got)
+	}
+	s.maxSlots = 1
+	if got := s.cpuShare(); got != n {
+		t.Fatalf("one slot: %d, want %d", got, n)
+	}
+	s.maxSlots, s.acq.Exclusive = 4, true
+	if got := s.cpuShare(); got != n {
+		t.Fatalf("exclusive: %d, want %d", got, n)
+	}
+	s.acq.Exclusive, s.tokens = false, []*flock{nil, nil}
+	if got := s.cpuShare(); got != n {
+		t.Fatalf("every token: %d, want %d", got, n)
 	}
 }
 

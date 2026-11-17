@@ -298,6 +298,9 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 	if mb := s.memoryShareMB(); mb > 0 {
 		env["SPOTEXEC_MEMORY"] = strconv.FormatInt(mb, 10)
 	}
+	// The install may use every CPU, so it gets the share to size its
+	// worker pools from, as commands do.
+	env["SPOTEXEC_CPUS"] = strconv.Itoa(s.cpuShare())
 	for k, v := range d.Env {
 		env[k] = v
 	}

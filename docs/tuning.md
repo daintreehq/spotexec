@@ -68,9 +68,9 @@ A command that runs several heavy processes at once can outgrow even a whole VM.
 
 Compute-optimized instance types such as c6a and c7a have 2 GB of memory per vCPU. General-purpose types such as m6a and m7a, and GitHub's standard Linux runners, have 4 GB. A test suite tuned on CI can be memory-tight on compute-optimized VMs. Rather than naming types, a runner can [describe the VM it needs](aws.md#describe-the-vm-instead-of-naming-types) (`vcpus = 8`, `min_memory_gib = 32`), and spotexec launches whichever qualifying type is cheapest.
 
-### Leave worker counts to your tools
+### Size worker pools with `$SPOTEXEC_CPUS`
 
-A container sees only its slot's CPUs, so tools that size themselves by core count start the right number of workers on their own. Vitest (through Node's `os.availableParallelism()`), Go's `GOMAXPROCS` and `make -j$(nproc)` all see the slot's share. Hard-coded counts (`-j8`, `workers: 8`) still oversubscribe a slot; use `$SPOTEXEC_CPUS` for those.
+Jobs sharing a VM share its CPUs, so a job runs on every CPU the others leave idle, and a container sees all of the VM's CPUs. Tools that size themselves by core count (Vitest through Node's `os.availableParallelism()`, Go's `GOMAXPROCS`, `make -j$(nproc)`) start a worker per vCPU in every job, and with four jobs on a VM that is four times the workers, each holding its own memory. Give them `$SPOTEXEC_CPUS`, the job's fair share, instead: `--maxWorkers=$SPOTEXEC_CPUS`, `make -j$SPOTEXEC_CPUS`, `GOMAXPROCS=$SPOTEXEC_CPUS`. A job alone on the VM still borrows idle CPUs through a tool's own threads and the processes it spawns; for a run that should spread its workers across the whole VM, use `--exclusive`. Timing-sensitive work that needs a fixed block of CPUs can set [`cpu_pinning = true`](environments.md#settings).
 
 ### Run the whole suite on one warm VM, not sharded like CI
 
