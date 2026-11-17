@@ -3,10 +3,12 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -20,9 +22,20 @@ func launchAll(n int, launch func() error) <-chan error {
 	return out
 }
 
-// noMore fails if another RunInstances arrives within a short wait.
-func noMore(t *testing.T, h *held, why string) {
+// noMore fails if a launch could take another slot, or another
+// RunInstances arrives within a short wait.
+func noMore(t *testing.T, a *AWSSpot, h *held, why string) {
 	t.Helper()
+	for i := range launchSlots {
+		release, ok, err := tryLockFile(a.lockPath(fmt.Sprintf("up.slot.%d.lock", i)), syscall.LOCK_EX)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			release()
+			t.Fatalf("slot %d free while %d launches are sending", i, launchSlots)
+		}
+	}
 	select {
 	case r := <-h.started:
 		t.Fatalf("a launch reached %s %s", r, why)
@@ -49,7 +62,7 @@ func TestGlobalLaunchesOverlap(t *testing.T) {
 	for range launchSlots {
 		h.wait(t) // these are all sending at once
 	}
-	noMore(t, h, "past the launch slots")
+	noMore(t, g.home(), h, "past the launch slots")
 	h.free()
 	for range n {
 		if err := <-done; err != nil {
@@ -76,7 +89,7 @@ func TestRegionalLaunchesOverlap(t *testing.T) {
 	for range launchSlots {
 		h.wait(t)
 	}
-	noMore(t, h, "past the launch slots")
+	noMore(t, a, h, "past the launch slots")
 	h.free()
 	for range n {
 		if err := <-done; err != nil {
@@ -228,7 +241,9 @@ func TestLaunchLockHonorsContext(t *testing.T) {
 	unlock()
 	// Every slot taken.
 	for range launchSlots {
-		release, err := a.lockLaunch(context.Background())
+		sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+		release, err := a.lockLaunch(sctx)
+		scancel()
 		if err != nil {
 			t.Fatal(err)
 		}

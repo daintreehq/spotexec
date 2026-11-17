@@ -1416,10 +1416,6 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		in.Placement = &Placement{Order: config.LaunchListed, Why: why}
 		return in, nil
 	}
-	// Regions this client can't reach take no launch (cool has them); one
-	// whose hold lapsed takes one, to try it again. Read before cool, so a
-	// trial another launch claims in between shows in cool as a hold.
-	unreachHeldNow, lapsed := g.unreachRegions()
 	cool := g.cooldowns(t.Prices)
 	// An explicit max_price is AWS's cap on the Spot bid: options already
 	// above it would only be refused.
@@ -1429,7 +1425,11 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	skipZone := map[string]bool{}
 	atCap := g.refusedAtCap(t.Prices) // region/type refused at max_price (SpotMaxPriceTooLow)
 	broken := g.brokenRegions()       // regions whose setup failed (no on-demand there either)
-	var unreachSkipped []string       // held regions passed over, for the error
+	// Regions this client can't reach take no launch (cool has them); one
+	// whose hold lapsed takes one, to try it again (admitRegion decides as
+	// each attempt goes out: overlapping launches may change it meanwhile).
+	unreachHeldNow, _ := g.unreachRegions()
+	var unreachSkipped []string // held regions passed over, for the error
 	var tried []string
 	// When quota is all that stopped every option (others can't work as
 	// configured: no network there, or above max_price), the error is a
@@ -1493,23 +1493,19 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			otherFailure = true
 			break
 		}
-		trial := false
-		if lapsed[c.Region] {
-			// Its hold lapsed: this launch tries it again, unless another
-			// one already is.
-			if !g.claimTrial(c.Region) {
-				ahead.add("in a region this client can't reach")
-				otherFailure = true
-				continue
-			}
-			trial, lapsed[c.Region] = true, false
+		// A region whose hold lapsed takes this launch as its trial, unless
+		// another launch already is one.
+		ok, trial := g.admitRegion(c.Region)
+		if !ok {
+			ahead.add("in a region this client can't reach")
+			otherFailure = true
+			continue
 		}
 		a := g.Regional(c.Region)
 		attempts++
 		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{itype: c.Type, zone: c.Zone, beforeSend: g.mark(c.Region)})
 		if err != nil && trial && !errors.Is(err, ErrLaunchAmbiguous) {
 			g.dropTrial(c.Region) // nothing there to try it
-			lapsed[c.Region] = true
 		}
 		if err == nil {
 			g.clearCool(c)
@@ -1653,8 +1649,9 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			otherFailure = true // regions left untried: not a quota verdict
 		}
 		for _, rg := range regions[:min(len(regions), 2)] {
-			if lapsed[rg] && !g.claimTrial(rg) {
-				continue // another launch is trying it again
+			ok, trial := g.admitRegion(rg)
+			if !ok {
+				continue // held, or another launch is trying it again
 			}
 			log("no spot capacity; falling back to on-demand in %s", rg)
 			a := g.Regional(rg)
@@ -1665,7 +1662,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 				in.Placement = &Placement{Order: "on_demand", Why: "on_demand_fallback: no Spot option could launch"}
 				return in, nil
 			}
-			if lapsed[rg] && !errors.Is(err, ErrLaunchAmbiguous) {
+			if trial && !errors.Is(err, ErrLaunchAmbiguous) {
 				g.dropTrial(rg) // nothing launched there to try it
 			}
 			var ce *CredentialError
