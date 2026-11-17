@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -267,6 +268,17 @@ func TestRegionLossVerdict(t *testing.T) {
 			t.Fatalf("at %+v, interrupted: %v %q", at, ok, code)
 		}
 	}
+
+	// #266: a VM whose state EC2 couldn't report, lost with its region:
+	// the regional verdicts hold, without claiming EC2 still runs it.
+	f.listErr = errors.New("throttled")
+	if got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}, false, running, false); got.code != "REGION_UNREACHABLE" || got.region != rl || !strings.HasPrefix(got.why, "while running the command, and EC2 couldn't confirm whether it is still running (the lookup failed or timed out): ap-south-1 looks unreachable") {
+		t.Fatalf("failed lookup, no memory reading: %q (%q)", got.code, got.why)
+	}
+	if got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run", Sess: s}, false, running, false); got.code != "" || got.region != rl {
+		t.Fatalf("failed lookup with memory: %q (%q), want a regional replay", got.code, got.why)
+	}
+	f.listErr = nil
 
 	// Verdicts reached before the region is looked at.
 	*calls = 0

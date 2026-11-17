@@ -349,6 +349,11 @@ func TestWaitIfRunning(t *testing.T) {
 	if hook(SilentGrace) != 0 {
 		t.Error("grace without a fleet")
 	}
+	// Nor is there grace when the cloud can't say the VM still runs.
+	f.listErr = errors.New("throttled")
+	if got := waitIfRunning(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}, quietRep(t))(SilentGrace); got != 0 {
+		t.Errorf("grace %s after a failed lookup", got)
+	}
 }
 
 func TestOOMMessage(t *testing.T) {
@@ -388,7 +393,7 @@ func TestFailedLookupWithholdsReplay(t *testing.T) {
 			if got.code != "RUNNER_UNRESPONSIVE" || got.region != nil {
 				t.Errorf("%s at %+v: %q (%q), want RUNNER_UNRESPONSIVE", c.name, at, got.code, got.why)
 			}
-			if !strings.HasPrefix(got.why, at.where()+", and EC2 couldn't report whether it is still running") || strings.Contains(got.why, "still reports it running") || !strings.Contains(got.why, "outcome is unknown") {
+			if !strings.HasPrefix(got.why, at.where()+", and EC2 couldn't confirm whether it is still running") || strings.Contains(got.why, "still reports it running") || strings.Contains(got.why, "overloaded") || strings.Contains(got.why, "--exclusive") || !strings.Contains(got.why, "outcome is unknown") || !strings.Contains(got.why, "side effects") {
 				t.Errorf("%s at %+v: %q", c.name, at, got.why)
 			}
 			ok, code, why := replayable("i-run", Result{noReplay: got, lostAt: at}, retry, false, 1)
@@ -420,6 +425,12 @@ func TestInstanceState(t *testing.T) {
 		if got := instanceState(&Lease{Runner: r, Provider: f, InstanceID: id}); got != want {
 			t.Errorf("%s: %v, want %v", id, got, want)
 		}
+	}
+	if got := instanceState(&Lease{Runner: r, Provider: f}); got != vmGone {
+		t.Errorf("no VM: %v", got)
+	}
+	if got := instanceState(&Lease{Runner: r, InstanceID: "i-run"}); got != vmUnknown {
+		t.Errorf("no fleet to ask: %v", got)
 	}
 	f.listErr = errors.New("throttled")
 	if got := instanceState(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}); got != vmUnknown {

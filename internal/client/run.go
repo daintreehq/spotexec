@@ -476,6 +476,11 @@ func replayable(lost string, res Result, o Options, canceled bool, n int) (retry
 // hadn't been dispatched, and otherwise not (its outcome is unknown), with
 // a warning that says so instead of blaming the run or the VM.
 //
+// A VM whose state the cloud couldn't report (its listing failed or timed
+// out) is treated as still running, since only a listing shows it gone
+// (#266): not replayed after dispatch, unless its region went silent as
+// below, and the warning says EC2 couldn't tell rather than blaming the run.
+//
 // A VM the cloud still runs that was lost after the command was dispatched,
 // with no memory pressure, may instead have gone silent with its whole
 // region, as this client sees it (regionSilent: a network partition, #229).
@@ -509,14 +514,12 @@ func whyNoReplayCtx(ctx context.Context, lease *Lease, noticed bool, at stage, e
 	if vm == vmGone {
 		return noReplay{}
 	}
+	// EC2 not answering says nothing about whether the VM was reclaimed:
+	// it may still be running the command (#266). Only the region going
+	// silent with it, below, clears the run for a replay then.
+	ec2 := ", although EC2 still reports it running"
 	if vm == vmUnknown {
-		// The VM may still be running the command: EC2 not answering
-		// says nothing about whether it was reclaimed (#266).
-		why := at.where() + ", and EC2 couldn't report whether it is still running (the lookup failed or timed out), so the VM may still be running it and the attempt's outcome is unknown"
-		if m := lastMemory(lease.Sess); m != "" {
-			why += " (" + m + ")"
-		}
-		return noReplay{code: "RUNNER_UNRESPONSIVE", why: why + ". Rerun it"}
+		ec2 = ", and EC2 couldn't confirm whether it is still running (the lookup failed or timed out)"
 	}
 	if rl := regionSilentFn(ctx, lease); rl != nil {
 		holdSilent(ctx, lease, rl)
@@ -524,15 +527,22 @@ func whyNoReplayCtx(ctx context.Context, lease *Lease, noticed bool, at stage, e
 		// (once the helper there has given up on it), unless nothing
 		// showed the VM's memory: an older helper's heartbeats, or none.
 		if _, ok := lease.Sess.LastMemory(); !ok {
-			return noReplay{code: "REGION_UNREACHABLE", why: at.where() + ", although EC2 still reports it running: " + rl.String() + ". Its heartbeats never reported the VM's memory, so the run isn't replayed, and the attempt's outcome is unknown. Rerun it", region: rl}
+			return noReplay{code: "REGION_UNREACHABLE", why: at.where() + ec2 + ": " + rl.String() + ". Its heartbeats never reported the VM's memory, so the run isn't replayed, and the attempt's outcome is unknown. Rerun it", region: rl}
 		}
 		return noReplay{region: rl}
+	}
+	if vm == vmUnknown {
+		why := at.where() + ec2 + ", without a Spot notice: the VM may still be running it, so the attempt's outcome is unknown"
+		if m := lastMemory(lease.Sess); m != "" {
+			why += " (" + m + ")"
+		}
+		return noReplay{code: "RUNNER_UNRESPONSIVE", why: why + ". Check for its side effects before rerunning it"}
 	}
 	what := "the command"
 	if at.phase == phaseSetup || at.phase == phaseStartSetup {
 		what = "[setup] run"
 	}
-	why := at.where() + ", although EC2 still reports it running, without a Spot notice: "
+	why := at.where() + ec2 + ", without a Spot notice: "
 	if !at.started {
 		// Handed over, but not confirmed started: nothing says it ran,
 		// let alone overloaded the VM, but it may have.
@@ -2081,13 +2091,13 @@ type vmState int
 
 const (
 	// vmGone: the cloud listed the fleet and the VM isn't running in it
-	// (listed in another state, or not at all), or the lease has no VM
-	// the cloud could be asked about.
+	// (listed in another state, or not at all), or the lease has no VM.
 	vmGone vmState = iota
 	// vmRunning: the cloud lists the VM as running.
 	vmRunning
-	// vmUnknown: the cloud couldn't be asked (the listing failed or ran
-	// out of time), so the VM may well still be running (#266).
+	// vmUnknown: the cloud couldn't tell (the listing failed or ran out
+	// of time, or there is no fleet to ask), so the VM may well still be
+	// running (#266).
 	vmUnknown
 )
 
@@ -2106,17 +2116,21 @@ var instanceLookupTime = 10 * time.Second
 
 // instanceState asks the cloud (the instance's own region, for a
 // multi-region fleet) whether a lease's VM is running, within
-// instanceLookupTime: vmUnknown when it can't tell.
+// instanceLookupTime: vmUnknown when it can't tell. Only a listing that
+// succeeded shows the VM gone.
 func instanceState(lease *Lease) vmState {
-	if lease.InstanceID == "" || lease.Provider == nil {
+	if lease.InstanceID == "" {
 		return vmGone
+	}
+	if lease.Provider == nil {
+		return vmUnknown
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), instanceLookupTime)
 	defer cancel()
 	f, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.Fleet)
 	if !ok {
 		if f, ok = lease.Provider.(provider.Fleet); !ok {
-			return vmGone
+			return vmUnknown
 		}
 	}
 	list, err := f.List(ctx)
