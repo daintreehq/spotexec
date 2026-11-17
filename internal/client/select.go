@@ -524,9 +524,10 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				}
 				go m.provision(pctx, d.ID, req.Rep)
 			}
-			// Demand held for slots about to free is covered too: a
-			// lower-priority fleet mustn't launch for it instead.
-			covered += d.Capacity + d.Deferred
+			// Demand held for slots about to free, or that this fleet's
+			// ready VMs can take now, is covered too: a lower-priority
+			// fleet mustn't launch for it instead.
+			covered += d.Capacity + d.Deferred + d.Ready
 			if d.Pending > 0 || d.Launch {
 				if status != "" {
 					status += "; "
