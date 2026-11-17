@@ -369,22 +369,32 @@ func (s *Session) watchCancel() (context.Context, func() bool) {
 }
 
 // cancelQueued reports, without waiting, whether the client canceled the
-// run (or went away) since the last process ended.
+// run (or went away) since the last process ended. A withdraw read here
+// comes too late to honor and is dropped.
 func (s *Session) cancelQueued() bool {
+	canceled, _ := s.stopQueued()
+	return canceled
+}
+
+// stopQueued reports, without waiting, whether the client canceled the run
+// (or went away), and whether it withdrew the job (protocol.TypeWithdraw),
+// since the last look. Both are read: a cancel wins over a withdraw.
+func (s *Session) stopQueued() (canceled, withdrawn bool) {
 	if s.clientGone() {
-		return true
+		return true, false
 	}
 	for {
 		select {
 		case f, ok := <-s.frames:
 			if !ok {
-				return true
+				return true, withdrawn
 			}
-			if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeCancel {
-				return true
+			if env, err := protocol.Decode(f); err == nil {
+				canceled = canceled || env.Type == protocol.TypeCancel
+				withdrawn = withdrawn || env.Type == protocol.TypeWithdraw
 			}
 		default:
-			return false
+			return canceled, withdrawn
 		}
 	}
 }
@@ -408,7 +418,9 @@ func (s *Session) exec(e protocol.Exec) error {
 	}
 	// Before anything marks the slot dirty: a job that never gets to run
 	// leaves its workspace as it was.
-	if canceled, err := s.takeRun(); err != nil {
+	if canceled, err := s.takeRun(); errors.Is(err, errWithdrawn) {
+		return s.c.Send(protocol.TypeResult, protocol.Result{Withdrawn: true})
+	} else if err != nil {
 		return err
 	} else if canceled {
 		return s.c.Send(protocol.TypeResult, protocol.Result{ExitCode: 130, Canceled: true})

@@ -399,3 +399,100 @@ func TestPlainJobFallsBackToALaterWorkspace(t *testing.T) {
 		t.Fatalf("got workspace %s, want slot 3", s.slotDir)
 	}
 }
+
+func withdrawFrame(t *testing.T) protocol.Frame {
+	t.Helper()
+	var b bytes.Buffer
+	if err := protocol.NewConn(nil, &b).Send(protocol.TypeWithdraw, nil); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.NewConn(&b, io.Discard).ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// execResult runs e on s and returns the Result it sent.
+func execResult(t *testing.T, s *Session, e protocol.Exec) protocol.Result {
+	t.Helper()
+	out := &syncBuf{}
+	s.c = protocol.NewConn(strings.NewReader(""), out)
+	if err := s.exec(e); err != nil {
+		t.Fatal(err)
+	}
+	var res protocol.Result
+	got := false
+	in := protocol.NewConn(bytes.NewReader(out.b.Bytes()), io.Discard)
+	for {
+		f, err := in.ReadFrame()
+		if err != nil {
+			break
+		}
+		if env, err := protocol.Decode(f); err == nil && env.Type == protocol.TypeResult {
+			got = env.Unmarshal(&res) == nil
+		}
+	}
+	if !got {
+		t.Fatal("no result")
+	}
+	return res
+}
+
+// #256: a job waiting for a run permit is withdrawn when its client found
+// a free slot on another VM: nothing runs, the workspace is untouched, and
+// it stops counting as waiting, so the client can take it elsewhere.
+func TestWithdrawEndsRunWait(t *testing.T) {
+	root := t.TempDir()
+	a, b, c := admitted(t, root), admitted(t, root), admitted(t, root)
+	for _, s := range []*Session{a, b} {
+		if _, err := s.takeRun(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.frames <- withdrawFrame(t)
+	res := execResult(t, c, protocol.Exec{Shell: "touch late"})
+	if !res.Withdrawn || res.Canceled || res.ExitCode != 0 {
+		t.Fatalf("result of a withdrawn wait: %+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(c.workspace, "late")); err == nil {
+		t.Fatal("a withdrawn job ran its command")
+	}
+	if c.run != nil || holderOf(t, root, c.tokenIdx).Phase != "" {
+		t.Fatalf("withdrawn job still holds or waits for a permit: %+v", holderOf(t, root, c.tokenIdx))
+	}
+}
+
+// A withdraw that arrives once the job has its permit is too late: the
+// command runs as usual and its result says nothing of a withdraw.
+func TestWithdrawAfterPermitIsIgnored(t *testing.T) {
+	root := t.TempDir()
+	s := admitted(t, root)
+	s.frames <- withdrawFrame(t)
+	res := execResult(t, s, protocol.Exec{Shell: "touch ran"})
+	if res.Withdrawn || res.Canceled || res.ExitCode != 0 {
+		t.Fatalf("result of a run with a late withdraw: %+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(s.workspace, "ran")); err != nil {
+		t.Fatal("the command didn't run")
+	}
+}
+
+// A cancel queued beside a withdraw wins: the run was interrupted, not
+// moved.
+func TestCancelBeatsWithdraw(t *testing.T) {
+	root := t.TempDir()
+	a, b, c := admitted(t, root), admitted(t, root), admitted(t, root)
+	for _, s := range []*Session{a, b} {
+		if _, err := s.takeRun(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.frames = make(chan protocol.Frame, 2)
+	c.frames <- withdrawFrame(t)
+	c.frames <- cancelFrame(t)
+	res := execResult(t, c, protocol.Exec{Shell: "touch late"})
+	if res.Withdrawn || !res.Canceled || res.ExitCode != 130 {
+		t.Fatalf("result of a canceled and withdrawn wait: %+v", res)
+	}
+}
