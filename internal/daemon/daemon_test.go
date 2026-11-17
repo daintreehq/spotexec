@@ -655,10 +655,12 @@ func TestBreakerCountsAnsweringBatchOnce(t *testing.T) {
 			writeConfig(t, cfgPath, runnerConfig("a.large", 3))
 			var mu sync.Mutex
 			answers := map[string]int{} // probes each VM answered
-			probeFleet = func(d *Daemon, _ context.Context, fl *fleet, running []provider.Instance, _ map[string]bool) ([]string, int) {
+			probeFleet = func(d *Daemon, _ context.Context, fl *fleet, running []provider.Instance, _ map[string]bool) ([]string, map[string]int) {
 				mu.Lock()
 				defer mu.Unlock()
+				n := map[string]int{}
 				for _, in := range running {
+					n[in.Region]++
 					say := tc.steps[min(answers[in.ID], len(tc.steps)-1)]
 					answers[in.ID]++
 					fl.lastOK[in.ID] = time.Now()
@@ -667,7 +669,7 @@ func TestBreakerCountsAnsweringBatchOnce(t *testing.T) {
 						fl.bootFailed[in.ID] = true
 					}
 				}
-				return nil, len(running)
+				return nil, n
 			}
 			d, l := start(t)
 			ctx := context.Background()
@@ -728,14 +730,16 @@ func TestBatchDroppedOnceUsable(t *testing.T) {
 	writeConfig(t, cfgPath, runnerConfig("a.large", 3))
 	var mu sync.Mutex
 	ready := false
-	probeFleet = func(d *Daemon, _ context.Context, fl *fleet, running []provider.Instance, _ map[string]bool) ([]string, int) {
+	probeFleet = func(d *Daemon, _ context.Context, fl *fleet, running []provider.Instance, _ map[string]bool) ([]string, map[string]int) {
 		mu.Lock()
 		defer mu.Unlock()
+		n := map[string]int{}
 		for _, in := range running {
 			fl.lastOK[in.ID] = time.Now()
 			fl.booting[in.ID] = !ready
+			n[in.Region]++
 		}
-		return nil, len(running)
+		return nil, n
 	}
 	d, _ := start(t)
 	fl := fleetNamed(d, "pool")
