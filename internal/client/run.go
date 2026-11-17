@@ -649,6 +649,22 @@ func lostRunner(l *Lease, err error) string {
 	return "static"
 }
 
+// execFailure is the error of a run whose command the helper didn't see
+// through. Only a runner that went away (a lost connection or dead session,
+// or the VM shutting down) is a lost runner: an error the helper reported
+// itself, or a reply that couldn't be read while the session lives on, is
+// named as that failure (#250). dead is the session being gone.
+func execFailure(label, runner string, err error, dead bool) error {
+	var re *transport.RemoteError
+	switch {
+	case helperShutdown(err), transport.IsConnError(err), dead && !errors.As(err, &re):
+		return fmt.Errorf("lost runner %s during execution: %w", runner, err)
+	case errors.As(err, &re):
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	return fmt.Errorf("%s: unreadable reply from the runner during execution: %w", label, err)
+}
+
 func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, att attempt) (res Result, err error, lost string) {
 	start := time.Now()
 	p := cfg.Project
@@ -979,10 +995,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	outW.Flush()
 	errW.Flush()
 	if err != nil {
-		if re := (*transport.RemoteError)(nil); errors.As(err, &re) && re.Code == protocol.CodeQueueTimeout {
-			return res, infra(fmt.Errorf("%s: %w", label, err)), ""
-		}
-		return res, infra(fmt.Errorf("lost runner %s during execution: %w", r.Name, err)), lostRunner(lease, err)
+		return res, infra(execFailure(label, r.Name, err, sess != nil && sess.Dead())), lostRunner(lease, err)
 	}
 	res.ExitCode, res.TimedOut = result.ExitCode, result.TimedOut
 	// An interrupt (Ctrl-C, SIGTERM) at any point up to the final result

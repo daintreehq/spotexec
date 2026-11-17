@@ -303,7 +303,7 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 	if d.Container != nil {
 		host, hostEnv, c, err := s.containerScript(d.Container, d.Install, s.workspace, env)
 		if err != nil {
-			return perr(protocol.CodeDepsFailed, "%v", err)
+			return perr(protocol.CodeDepsFailed, "%s", uncoded(err))
 		}
 		script, env, cleanup = host, hostEnv, c
 	}

@@ -437,7 +437,7 @@ func (s *Session) exec(e protocol.Exec) error {
 			// Inside the project container: runner PATH setup doesn't apply.
 			host, hostEnv, c, err := s.containerScript(e.Container, shell, dir, env)
 			if err != nil {
-				return pr, false, false, perr(protocol.CodeImageFailed, "%v", err)
+				return pr, false, false, imageFailed(err)
 			}
 			script, runEnv, cleanup = host, hostEnv, c
 		}
