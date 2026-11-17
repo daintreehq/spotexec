@@ -461,6 +461,7 @@ func TestSyncCopiesAnUploadPublishedBeforeItsTurn(t *testing.T) {
 	ws := bigSet(nil)
 
 	scanned, resume := make(chan struct{}), make(chan struct{})
+	t.Cleanup(sync.OnceFunc(func() { close(resume) })) // never leave it paused
 	peerScanned = func(s *Session) {
 		if s == b {
 			close(scanned)
@@ -479,7 +480,7 @@ func TestSyncCopiesAnUploadPublishedBeforeItsTurn(t *testing.T) {
 	if need, _ := playSync(t, a, ws); len(need) != len(ws) {
 		t.Fatalf("first slot asked for %d files, want %d", len(need), len(ws))
 	}
-	close(resume)
+	resume <- struct{}{}
 	r := <-reply
 	if r.err != nil {
 		t.Fatal(r.err)
@@ -513,8 +514,8 @@ func TestSyncStopsWaitingForAStalledUpload(t *testing.T) {
 	if r.err != nil {
 		t.Fatal(r.err)
 	}
-	if took := time.Since(start); took < syncShareWait {
-		t.Fatalf("gave up after %s, before the %s wait", took, syncShareWait)
+	if took := time.Since(start); took < syncShareWait || took > 10*time.Second {
+		t.Fatalf("gave up after %s, want just past the %s wait", took, syncShareWait)
 	}
 	waitEvent(t, ev, "sync_wait")
 	if len(r.need) != len(ws) {
@@ -568,11 +569,11 @@ func TestShareWorthyThresholds(t *testing.T) {
 		size int64
 		want bool
 	}{
-		{shareMinFiles - 1, 1, false},
-		{shareMinFiles, 0, true},
-		{1, shareMinBytes - 1, false},
-		{1, shareMinBytes, true},
-		{2, shareMinBytes / 2, true},
+		{255, 1, false},
+		{256, 0, true},
+		{1, 1<<20 - 1, false},
+		{1, 1 << 20, true},
+		{2, 1 << 19, true},
 		{0, 0, false},
 	} {
 		need, want := files(c.n, c.size)
@@ -604,4 +605,59 @@ func TestSyncRecordsCopiesWhenTheClientIsGone(t *testing.T) {
 	if rec["a.txt"].ID != fsid.Bytes([]byte("alpha\n")) {
 		t.Fatalf("the copied a.txt isn't recorded: %v", rec)
 	}
+}
+
+// An entry whose mode isn't one a worktree can hold is never reused: the
+// client is asked for it.
+func TestSyncNeverReusesAnUnknownMode(t *testing.T) {
+	root := t.TempDir()
+	playSync(t, slotSession(t, root, protocol.Acquire{WorktreeKey: "one"}), workingSet{"a.txt": "alpha\n"})
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	b.loadStored()
+	m := workingSet{"a.txt": "alpha\n"}.manifest()
+	m.Entries[0].Mode = 0o100600
+	rest, copied, _ := b.fillFromPeers([]string{"a.txt"}, map[string]protocol.Entry{"a.txt": m.Entries[0]})
+	if copied != 0 || len(rest) != 1 {
+		t.Fatalf("copied %d, still needed %v; want it left to the client", copied, rest)
+	}
+}
+
+// Many needed files with one content (empty files) are all copied, from
+// a source found once.
+func TestSyncCopiesManyFilesOfOneContent(t *testing.T) {
+	root := t.TempDir()
+	ws := workingSet{}
+	for i := range 300 {
+		ws[fmt.Sprintf("pkg%03d/__init__.py", i)] = ""
+	}
+	playSync(t, slotSession(t, root, protocol.Acquire{WorktreeKey: "one"}), ws)
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	r := client{}.sync(b, ws)
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if len(r.need) != 0 || r.res.Reused != len(ws) {
+		t.Fatalf("asked for %d, reused %d; want 0 and %d", len(r.need), r.res.Reused, len(ws))
+	}
+	checkWorkspace(t, b.workspace, ws)
+}
+
+// A directory where the manifest wants a file is left to the client's copy.
+func TestSyncLeavesATypeChangeToTheClient(t *testing.T) {
+	root := t.TempDir()
+	playSync(t, slotSession(t, root, protocol.Acquire{WorktreeKey: "one"}), workingSet{"a": "alpha\n"})
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	writeFile(t, b.workspace, "a/inner.txt", "a run's\n")
+	var dirAtNeed bool
+	r := client{onNeed: func([]string) {
+		fi, err := os.Lstat(filepath.Join(b.workspace, "a"))
+		dirAtNeed = err == nil && fi.IsDir()
+	}}.sync(b, workingSet{"a": "alpha\n"})
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if !dirAtNeed || len(r.need) != 1 {
+		t.Fatalf("directory there when asked: %v, asked for %v", dirAtNeed, r.need)
+	}
+	checkWorkspace(t, b.workspace, workingSet{"a": "alpha\n"})
 }

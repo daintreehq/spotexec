@@ -124,10 +124,10 @@ func (s *Session) fillFromPeers(need []string, want map[string]protocol.Entry) (
 		ids[want[p].ID] = true
 	}
 	idx, v := s.peerIndex(ids)
-	good := map[string]string{} // content ID -> a source that just verified
+	c := peerCands{idx: idx, ranked: map[candKey][]string{}}
 	for _, p := range need {
 		e := want[p]
-		if validMode(e.Mode) && s.fromPeers(p, e, idx[e.ID], good) {
+		if validMode(e.Mode) && s.fromPeers(p, e, &c) {
 			copied++
 			continue
 		}
@@ -140,25 +140,30 @@ func validMode(m uint32) bool {
 	return m == fsid.ModeFile || m == fsid.ModeExec || m == fsid.ModeSymlink
 }
 
-// peerLooks bounds the candidates examined for one file: many files can
-// share one content ID (every empty file does), and each is a candidate.
-const peerLooks = 16
+type candKey struct {
+	id   string
+	link bool
+}
 
-// fromPeers puts e in place at p from the first candidate that verifies:
-// the source that last verified for this content, then those still
-// matching what their slot recorded, then any of the right type and size
-// (a file touched since can still hold the bytes).
-func (s *Session) fromPeers(p string, e protocol.Entry, srcs []peerFile, good map[string]string) bool {
-	if src, ok := good[e.ID]; ok && s.placeFromPeer(p, e, src) == nil {
-		return true
+// peerCands ranks the candidates for each content once per scan: many
+// needed files can share one ID (every empty file does), and each peer
+// file with it is a candidate for all of them.
+type peerCands struct {
+	idx    map[string][]peerFile
+	ranked map[candKey][]string
+}
+
+// rank lists the files holding e's content: those still matching what
+// their slot recorded first, then any of the right type and size (a file
+// touched since can still hold the bytes).
+func (c *peerCands) rank(e protocol.Entry) []string {
+	k := candKey{e.ID, e.Mode == fsid.ModeSymlink}
+	if r, ok := c.ranked[k]; ok {
+		return r
 	}
-	link := e.Mode == fsid.ModeSymlink
 	var fresh, other []string
-	for i, src := range srcs {
-		if i == peerLooks {
-			break
-		}
-		if (src.e.Mode == fsid.ModeSymlink) != link || src.e.Size != e.Size {
+	for _, src := range c.idx[e.ID] {
+		if (src.e.Mode == fsid.ModeSymlink) != k.link || src.e.Size != e.Size {
 			continue
 		}
 		if _, err := fsid.CleanRel(src.rel); err != nil {
@@ -166,7 +171,7 @@ func (s *Session) fromPeers(p string, e protocol.Entry, srcs []peerFile, good ma
 		}
 		full := filepath.Join(src.ws, filepath.FromSlash(src.rel))
 		fi, err := os.Lstat(full)
-		if err != nil || (fi.Mode()&os.ModeSymlink != 0) != link || fi.Size() != e.Size {
+		if err != nil || (fi.Mode()&os.ModeSymlink != 0) != k.link || fi.Size() != e.Size {
 			continue
 		}
 		if sg, ok := sigOf(fi); ok && sg == src.e.sig() {
@@ -175,14 +180,32 @@ func (s *Session) fromPeers(p string, e protocol.Entry, srcs []peerFile, good ma
 			other = append(other, full)
 		}
 	}
-	for i, full := range append(fresh, other...) {
-		if i == peerTries {
-			break
+	r := append(fresh, other...)
+	c.ranked[k] = r
+	return r
+}
+
+// fromPeers puts e in place at p from the first of a few ranked candidates
+// that verifies. One that fails is dropped for the rest of the scan; one
+// that verifies goes first for the next file with the same content.
+func (s *Session) fromPeers(p string, e protocol.Entry, c *peerCands) bool {
+	// A directory in the way is the destination's doing: no source is
+	// tried (or dropped) for it.
+	if full, err := fsid.SafeJoin(s.workspace, p); err == nil {
+		if fi, err := os.Lstat(full); err == nil && fi.IsDir() {
+			return false
 		}
-		if s.placeFromPeer(p, e, full) == nil {
-			good[e.ID] = full
+	}
+	k := candKey{e.ID, e.Mode == fsid.ModeSymlink}
+	for tries := 0; tries < peerTries; tries++ {
+		r := c.rank(e)
+		if len(r) == 0 {
+			return false
+		}
+		if s.placeFromPeer(p, e, r[0]) == nil {
 			return true
 		}
+		c.ranked[k] = r[1:]
 	}
 	return false
 }
@@ -201,6 +224,9 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 		full, err := fsid.PrepareParent(s.workspace, p)
 		if err != nil {
 			return err
+		}
+		if fi, err := os.Lstat(full); err == nil && fi.IsDir() {
+			return fmt.Errorf("%s: a directory is in the way", p)
 		}
 		if _, _, err := writeEntry(full, &tar.Header{Name: p, Typeflag: tar.TypeSymlink, Linkname: target, Mode: 0o777}, nil); err != nil {
 			return err
@@ -239,9 +265,10 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 		full, err = fsid.PrepareParent(s.workspace, p)
 	}
 	if err == nil {
-		// Replace a directory occupying the target path (type change).
+		// A directory in the way (a type change) is left to the client's
+		// copy: nothing is removed for a file that may never land.
 		if fi, lerr := os.Lstat(full); lerr == nil && fi.IsDir() {
-			err = os.RemoveAll(full)
+			err = fmt.Errorf("%s: a directory is in the way", p)
 		}
 	}
 	if err == nil {
@@ -286,6 +313,12 @@ func shareWorthy(need []string, want map[string]protocol.Entry) bool {
 // client sends is recorded (nil when the remainder is small, or the wait
 // ran out), what is still needed, and how many files were copied.
 func (s *Session) uploadTurn(need []string, want map[string]protocol.Entry) (*flock, []string, int, error) {
+	// Copies a helper killed mid-way left behind (the slot is ours).
+	if old, _ := filepath.Glob(filepath.Join(s.slotDir, ".peer-tmp-*")); len(old) > 0 {
+		for _, f := range old {
+			_ = os.Remove(f)
+		}
+	}
 	rest, copied, v := s.fillFromPeers(need, want)
 	if peerScanned != nil {
 		peerScanned(s)
