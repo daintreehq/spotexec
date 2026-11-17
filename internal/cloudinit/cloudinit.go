@@ -124,7 +124,7 @@ chmod 0644 "$D/features"
 {{- if .WorkVolumeBytes}}
 # Held until the work volume is set up (1b): the watchdog mustn't end the
 # VM while it waits for the disk. Taken before the watchdog is armed.
-exec 7<"$D/lifecycle.lock"; flock -s 7
+exec 7<"$D/lifecycle.lock"; L7=0; flock -w 30 -s 7 && L7=1
 {{- end}}
 
 # ---- 1. Idle watchdog (armed before anything else can fail) ----
@@ -253,7 +253,7 @@ sx_workvol() {
   { chown "$u:$g" "$w" && chmod 0755 "$w" && echo "UUID=$uuid $w xfs noatime,nofail 0 0" >> /etc/fstab; } || { umount "$w"; return 1; }
   echo "$w is on $dev"
 }
-sx_workvol >>/var/log/spotexec-bootstrap.log 2>&1 || echo "spotexec: no work volume: slots copy dependency caches" >>/var/log/spotexec-bootstrap.log
+{ [ "$L7" = 1 ] && sx_workvol; } >>/var/log/spotexec-bootstrap.log 2>&1 || echo "spotexec: no work volume: slots copy dependency caches" >>/var/log/spotexec-bootstrap.log
 touch "$D/activity"; exec 7<&-
 {{- end}}
 

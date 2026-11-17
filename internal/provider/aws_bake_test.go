@@ -616,11 +616,10 @@ func TestLaunchAttachesWorkVolume(t *testing.T) {
 func TestLaunchUserDataTooLarge(t *testing.T) {
 	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
 	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
-	f := &fakeBakeAPI{base: "ami-b2"}
+	f := &fakeBakeAPI{} // no base image: an AMI lookup would fail first
 	a := newBakeEnv(t, f)
 	a.r.SecurityGroupIDs = []string{"sg-1"}
 	a.r.BootstrapScript = strings.Repeat("#", 16*1024)
-	f.images = []*fakeImage{ubuntuImg("ami-b2", time.Now())}
 	if _, err := a.launchWith(context.Background(), t.Logf, launchSpec{}); err == nil || !strings.Contains(err.Error(), "16 KiB") || len(f.runs) != 0 {
 		t.Fatalf("err %v, %d RunInstances requests", err, len(f.runs))
 	}

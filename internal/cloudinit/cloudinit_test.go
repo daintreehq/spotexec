@@ -377,9 +377,9 @@ func TestRenderWorkVolume(t *testing.T) {
 	// Run (not just defined) after the watchdog is armed, under the
 	// lifecycle lock taken before it, and before the key that lets anyone
 	// write to the work root is authorized.
-	lock := strings.Index(s, "exec 7<\"$D/lifecycle.lock\"; flock -s 7\n")
+	lock := strings.Index(s, "exec 7<\"$D/lifecycle.lock\"; L7=0; flock -w 30 -s 7 && L7=1\n")
 	armed := strings.Index(s, "systemctl enable --now spotexec-watchdog.timer")
-	call := strings.Index(s, "\nsx_workvol >>")
+	call := strings.Index(s, "\n{ [ \"$L7\" = 1 ] && sx_workvol; } >>")
 	unlock := strings.Index(s, "exec 7<&-")
 	key := strings.Index(s, ".ssh/authorized_keys")
 	if lock < 0 || armed < lock || call < armed || unlock < call || key < unlock {
@@ -473,7 +473,8 @@ func TestWorkVolumeSetup(t *testing.T) {
 		}
 		occupy := ":;"
 		if e.occupy {
-			occupy = `mkdir -p "$w" && touch "$w/early";`
+			// Its log line can't be written either: the guard must hold.
+			occupy = `mkdir -p "$w" && touch "$w/early"; echo() { case "$*" in *"in use"*) return 1 ;; esac; builtin echo "$@"; };`
 		}
 		mountRC := 0
 		if e.mountE {
@@ -540,7 +541,7 @@ chown() { echo "chown $*" >> "$C"; }
 	})
 	t.Run("work root filled during setup", func(t *testing.T) {
 		log, calls, fstab, err := run(t, env{disks: []disk{root, {name: "/dev/nvme1n1", size: gib64}}, occupy: true})
-		if err == nil || !strings.Contains(log, "is in use") || strings.Contains(calls, "mount") || fstab != "" {
+		if err == nil || strings.Contains(calls, "mount") || fstab != "" {
 			t.Fatalf("%v\n%s\n%s", err, log, calls)
 		}
 	})
