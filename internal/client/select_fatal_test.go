@@ -293,3 +293,41 @@ func TestSpareForExclusiveRunWarmsWholeVM(t *testing.T) {
 		})
 	}
 }
+
+// #240: a replay only its own runner may launch for fails promptly when
+// that runner can't launch (quota) and the barred one has no VM to serve,
+// and the barred runner launches nothing meanwhile.
+func TestBootOnlyBesideQuotaFailsPromptly(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"broken": {}, "healthy": {}}, 2)
+	fleets["healthy"].fail = quotaErr()
+	scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) { return nil, nil })
+	start := time.Now()
+	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: nopRep{}, BootOnly: "healthy"})
+	took := time.Since(start)
+	WaitLaunches(5 * time.Second)
+	if err == nil || strings.Contains(err.Error(), protocol.CodeQueueTimeout) || !strings.Contains(err.Error(), "healthy") {
+		t.Fatalf("error = %v", err)
+	}
+	if took > 15*time.Second {
+		t.Fatalf("took %s to fail", took)
+	}
+	fleets["broken"].mu.Lock()
+	defer fleets["broken"].mu.Unlock()
+	if fleets["broken"].n != 0 || len(fleets["broken"].insts) != 0 {
+		t.Fatalf("the barred runner launched %d", fleets["broken"].n)
+	}
+}
+
+// A barred runner with a VM that may yet serve (busy now) isn't blocked:
+// the replay waits for it rather than failing on the permitted runner's
+// quota.
+func TestBootOnlyWaitsForBarredRunnersBusyVM(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"broken": {"b1"}, "healthy": {}}, 2)
+	fleets["healthy"].fail = quotaErr()
+	scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) { return nil, nil }) // busy
+	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: 3 * time.Second, Rep: nopRep{}, BootOnly: "healthy"})
+	WaitLaunches(5 * time.Second)
+	if err == nil || !strings.Contains(err.Error(), protocol.CodeQueueTimeout) {
+		t.Fatalf("error = %v, want a queue timeout", err)
+	}
+}

@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +49,24 @@ var (
 	_ RegionHolder = (*AWSSpot)(nil)
 	_ RegionHolder = (*Sim)(nil)
 )
+
+// RegionAnswerer is implemented by fleets that can show this client still
+// reaches the cloud outside one region (#240): when every VM of a region
+// goes silent and no VM elsewhere is running to answer a probe, another of
+// the fleet's regions answering its API shows the client's own network is
+// up, so the silence is the region's.
+type RegionAnswerer interface {
+	// AnswersOutside asks the cloud's API in up to answerRegions of the
+	// fleet's launch regions other than region, at once, and returns the
+	// first that answered: "" when none did before ctx ended, or the fleet
+	// has no other region.
+	AnswersOutside(ctx context.Context, region string) string
+}
+
+var _ RegionAnswerer = (*AWSGlobal)(nil)
+
+// answerRegions is how many other regions AnswersOutside asks at most.
+const answerRegions = 3
 
 // RegionHold is why and until when a region takes no launches.
 type RegionHold struct {
@@ -405,4 +424,51 @@ func (g *AWSGlobal) unreachDetail(region string) string {
 		}
 	})
 	return why
+}
+
+// AnswersOutside implements RegionAnswerer: a listing of the runner's VMs
+// (DescribeInstances) in another launch region that succeeds, empty or
+// not, is an answer; an error of any kind is not. Configured regions are
+// asked as they are, without looking up which are enabled first (one that
+// isn't fails, and doesn't count), so the lookup can't use up ctx.
+func (g *AWSGlobal) AnswersOutside(ctx context.Context, region string) string {
+	if ctx.Err() != nil {
+		return ""
+	}
+	var regions []string
+	switch {
+	case g.oneRegion():
+		// A runner moved to one region may still have VMs in another.
+		regions = []string{g.r.Region}
+	case !g.r.AnyRegion():
+		regions = g.r.Regions
+	default:
+		regions, _ = g.PlacementRegions(ctx)
+	}
+	var ask []string
+	for _, rg := range regions {
+		if rg != region && rg != "" && len(ask) < answerRegions {
+			ask = append(ask, rg)
+		}
+	}
+	if len(ask) == 0 {
+		return ""
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // the others stop once one answers
+	got := make(chan string, len(ask))
+	for _, rg := range ask {
+		go func() {
+			if _, err := g.Regional(rg).List(ctx); err != nil {
+				rg = ""
+			}
+			got <- rg
+		}()
+	}
+	for range ask {
+		if rg := <-got; rg != "" {
+			return rg
+		}
+	}
+	return ""
 }

@@ -15,12 +15,18 @@ import (
 
 // regionLoss says a lost VM's whole region went silent, as this client
 // sees it (#229): the VM and every other established VM of its fleet there
-// failed a fresh probe, while a VM in another region answered. The run
-// then wasn't lost to its own VM stalling, and nothing it did explains it.
+// failed a fresh probe, while a VM in another region answered, or, with no
+// VM running elsewhere to ask, the cloud's API in another region did
+// (#240). The run then wasn't lost to its own VM stalling, and nothing it
+// did explains it.
 type regionLoss struct {
 	region   string // where the VMs went silent
 	peers    int    // the region's other VMs that didn't answer either
-	answered string // a region whose VM did answer
+	answered string // a region whose VM (or, with api, whose API) did answer
+	api      bool   // answered is a region whose cloud API answered
+	// pool holds launches out of region (#225) while it is silent: nil
+	// when its fleet keeps no region holds, or the hold couldn't be set.
+	pool *Pool
 }
 
 func (r *regionLoss) String() string {
@@ -28,7 +34,20 @@ func (r *regionLoss) String() string {
 	if r.peers > 1 {
 		others = "VMs"
 	}
-	return fmt.Sprintf("%s looks unreachable from this client (its %d other %s there didn't answer either, while one in %s did), so the network to the region, not the run, is the likely cause", r.region, r.peers, others, r.answered)
+	answer := "one in " + r.answered + " did"
+	if r.api {
+		answer = "the cloud API in " + r.answered + " answered"
+	}
+	return fmt.Sprintf("%s looks unreachable from this client (its %d other %s there didn't answer either, while %s), so the network to the region, not the run, is the likely cause", r.region, r.peers, others, answer)
+}
+
+// why is how a hold on the region describes it.
+func (r *regionLoss) why() string {
+	others := "VM"
+	if r.peers > 1 {
+		others = "VMs"
+	}
+	return fmt.Sprintf("a VM lost with its %d other %s there", r.peers, others)
 }
 
 // Probing a region after a loss: how many of its VMs (besides the lost
@@ -72,10 +91,15 @@ var knownGood = func(ctx context.Context, r *config.Runner, f provider.Fleet) ma
 // VM and every other VM of the fleet there that this machine has reached
 // before and still uses (knownGood, up to regionPeerProbes of them; at
 // least one) fail a fresh SSH probe for want of a network path, while a VM
-// in another region answers one. A VM alone in its region proves nothing
-// either way, nor does a client that reaches no region at all, nor a probe
-// that failed for some other reason: nil then, as when the fleet can't be
-// listed, ctx ends, or the check runs out of time.
+// in another region answers one. With no VM running in another region to
+// ask, the cloud's API answering in another of the fleet's regions shows
+// the client's network is up instead (provider.RegionAnswerer, #240); the
+// lost region's own API proves nothing, since it reaches the API, not the
+// VMs. A VM elsewhere that doesn't answer isn't overruled by an API that
+// does. A VM alone in its region proves nothing either way, nor does a
+// client that reaches no region at all, nor a probe that failed for some
+// other reason: nil then, as when the fleet can't be listed, ctx ends, or
+// the check runs out of time.
 func regionSilent(ctx context.Context, lease *Lease) *regionLoss {
 	f, ok := lease.Provider.(provider.Fleet)
 	region := lease.Instance.Region
@@ -113,11 +137,12 @@ func regionSilent(ctx context.Context, lease *Lease) *regionLoss {
 			others = append(others, in)
 		}
 	}
-	if len(peers) == 0 || len(others) == 0 {
+	ans, _ := lease.Provider.(provider.RegionAnswerer)
+	if len(peers) == 0 || (len(others) == 0 && ans == nil) {
 		return nil
 	}
 	var mu sync.Mutex
-	vetoed, answered := false, ""
+	vetoed, answered, api := false, "", false
 	var wg sync.WaitGroup
 	probe := func(in provider.Instance, same bool) {
 		defer wg.Done()
@@ -139,11 +164,52 @@ func regionSilent(ctx context.Context, lease *Lease) *regionLoss {
 		wg.Add(1)
 		go probe(in, false)
 	}
+	var outside chan string
+	if len(others) == 0 {
+		// Not waited for past ctx: a fleet's API check may block on state
+		// another process holds.
+		outside = make(chan string, 1)
+		go func() {
+			actx, cancel := context.WithTimeout(ctx, regionProbeTime)
+			defer cancel()
+			outside <- ans.AnswersOutside(actx, region)
+		}()
+	}
 	wg.Wait()
+	if outside != nil {
+		select {
+		case rg := <-outside:
+			if rg != "" && rg != region {
+				answered, api = rg, true
+			}
+		case <-ctx.Done():
+		}
+	}
 	if vetoed || answered == "" || ctx.Err() != nil {
 		return nil
 	}
-	return &regionLoss{region: region, peers: len(peers), answered: answered}
+	return &regionLoss{region: region, peers: len(peers), answered: answered, api: api}
+}
+
+// holdSilent holds launches out of rl's region, found silent by the run
+// that lost lease's VM there (#225): through the runner's pool, as its own
+// probes would, so the hold ends as soon as a VM there answers again. It
+// records the pool in rl when the fleet keeps region holds and the hold
+// was set (tests replace it).
+var holdSilent = func(ctx context.Context, lease *Lease, rl *regionLoss) {
+	f, ok := lease.Provider.(provider.Fleet)
+	if !ok || lease.Runner == nil {
+		return
+	}
+	if _, ok := f.(provider.RegionHolder); !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, regionProbeTime)
+	defer cancel()
+	p := NewPool(lease.Runner, f)
+	if p.holdSilent(ctx, rl.region, rl.why()) {
+		rl.pool = p
+	}
 }
 
 // regionReplayAfter is how long after losing a VM to a silent region a run
@@ -188,10 +254,14 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // replayAfterRegion readies att to replay a run lost to its region going
-// silent (res.noReplay.region): on a VM outside that region that is already
-// there (a launch might well go to the silent region), once the helper
-// there has given up on the lost attempt (regionReplayAfter). It waits for that, and is false when ctx
-// ended first.
+// silent (res.noReplay.region): on a VM outside that region, once the
+// helper there has given up on the lost attempt (regionReplayAfter). It
+// waits for that, and is false when ctx ended first. The lost VM's runner
+// may launch a VM for the replay (no other runner may) when the region is
+// still held there (#225), renewed now, and the fleet has a region left
+// open, so the launch goes elsewhere (#240: the whole fleet may have been
+// in the silent region); otherwise the replay takes only a VM already
+// running outside the region, since a launch might well go there.
 func replayAfterRegion(ctx context.Context, rep ui.Reporter, att *attempt, res Result, lost string) bool {
 	rl := res.noReplay.region
 	wait := regionReplayWait(res.lostWhen)
@@ -199,5 +269,11 @@ func replayAfterRegion(ctx context.Context, rep ui.Reporter, att *attempt, res R
 	rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "lost": lost, "region_unreachable": rl.region})
 	att.exclude[regionKey(rl.region)] = true
 	att.noBoot = true
-	return sleepCtx(ctx, wait)
+	if !sleepCtx(ctx, wait) {
+		return false
+	}
+	if rl.pool.launchOutside(ctx, rl.region, rl.why()) {
+		att.noBoot, att.bootOnly = false, rl.pool.R.Name
+	}
+	return true
 }

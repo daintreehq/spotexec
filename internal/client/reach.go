@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -230,4 +231,78 @@ func (p *Pool) reapable(st *poolState, now time.Time) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+// holdSilent holds launches out of region, found silent by a run that lost
+// its VM there (regionSilent), as judgeRegion does when this pool's probes
+// find it silent: recorded in the pool, so the hold ends as soon as a VM
+// there answers. False when the fleet keeps no holds, or the pool's state
+// couldn't be read before ctx ended.
+func (p *Pool) holdSilent(ctx context.Context, region, why string) bool {
+	if _, ok := p.Fleet.(provider.RegionHolder); !ok || region == "" {
+		return false
+	}
+	return p.withCtx(ctx, func(st *poolState) error {
+		if st.Held == nil {
+			st.Held = map[string]time.Time{}
+		}
+		st.Held[region] = time.Now()
+		p.applyReach(regionReach{hold: region, why: why})
+		return nil
+	}) == nil
+}
+
+// launchOutside renews region's hold, set by holdSilent, and reports
+// whether a launch now goes outside it: the hold still stands (no VM there
+// has answered since; one that did ended it, and a launch might go there
+// again) and the fleet has another region open. False on a nil pool.
+func (p *Pool) launchOutside(ctx context.Context, region, why string) bool {
+	if p == nil {
+		return false
+	}
+	rh, ok := p.Fleet.(provider.RegionHolder)
+	if !ok {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, regionProbeTime)
+	defer cancel()
+	held := false
+	if err := p.withCtx(ctx, func(st *poolState) error {
+		if _, held = st.Held[region]; held {
+			st.Held[region] = time.Now()
+			p.applyReach(regionReach{hold: region, why: why})
+		}
+		return nil
+	}); err != nil || !held {
+		return false
+	}
+	holds, open := rh.RegionHolds()
+	_, stands := holds[region]
+	return stands && open
+}
+
+// mayServe reports whether a VM of the fleet, as last listed, may yet
+// serve a request kept off exclude's VMs and regions: one in service
+// (busy, booting or ready) outside them, or a launch not yet listed. True
+// when the pool's state can't be read.
+func (p *Pool) mayServe(ctx context.Context, exclude map[string]bool) bool {
+	may := false
+	if err := p.withCtx(ctx, func(st *poolState) error {
+		listed := map[string]bool{}
+		for _, in := range st.Instances {
+			listed[in.ID] = true
+			if n := st.Notes[in.ID]; (n == nil || !n.closed()) && !excluded(exclude, in) {
+				may = true
+			}
+		}
+		for _, l := range st.Launches {
+			if !l.Failed && (l.InstanceID == "" || !listed[l.InstanceID]) {
+				may = true
+			}
+		}
+		return nil
+	}); err != nil {
+		return true
+	}
+	return may
 }

@@ -72,16 +72,32 @@ takes part in scheduling, and every VM shuts itself down.
    a fair local queue (priority, then arrival; `queue.go`) and registers as
    demand on each fleet (a waiter file under `waiters/`). Under `pool.lock`,
    `Plan` launches only while waiting demand exceeds the capacity already
-   starting (the launch ledger in `pool.json`), up to `max_instances` when set.
+   starting (the launch ledger in `pool.json`) plus what the fleet's ready
+   VMs can take now, up to `max_instances` when set.
+   - A job that can't probe yet (behind an exclusive job in the queue) is
+     still demand, so ready VMs with room count against it: each waiting
+     exclusive job takes a VM with nothing on it, and shared jobs take the
+     free slots left. A VM counts only while a job would be placed on it
+     (ready, not draining, outdated, suspect, just found busy, fenced,
+     being ended or still starting), slots this machine's attempts hold
+     aren't free, and only while the job has waited less than a launch's
+     lead (below): the ledger knows only this machine's jobs, so demand
+     still waiting past it launches as before. Demand ready VMs cover
+     counts as covered for lower-priority fleets too.
    - A short burst waits for slots about to free rather than launch a VM
      that would serve only after it: while the jobs holding the fleet's
      ready VMs are predicted (by the lease model, below) to end within a
      launch's lead, and those releases cover the demand not already
      starting, `Plan` holds the launch. The lead is the median time recent
      launches took from being planned to their VM first serving (timed by
-     `spotexec up`, or by a run that saw the VM still booting within the
-     30s before it served), or two minutes until three launches have been
-     timed, and never more than ten. The hold lasts only while such
+     `spotexec up`, or by runs that saw the VM still booting within the
+     30s before it served, or that probed it at least twice before it
+     served and found it not serving yet, unanswered or booting: from
+     within a minute of its launch, never more than 30s apart, the last
+     within 30s of its serving, and with no unanswered probe past
+     `boot_timeout` or while its region is held as unreachable), or
+     two minutes until three launches have been timed, and never more than
+     ten. The hold lasts only while such
      releases are still predicted and the job has waited less than the
      lead: a prediction that turns out overdue frees nothing, so the next
      round launches, and a job that has waited longer than the lead is
@@ -89,9 +105,9 @@ takes part in scheduling, and every VM shuts itself down.
      frees nothing here either, nor does a VM that is draining, outdated,
      suspect, fenced or still starting. The first slots to free on a VM
      whose helper admitted jobs beyond its slots (step 3) are theirs, so
-     those releases free nothing for jobs still waiting to be admitted. While an exclusive job waits (it
-     needs a whole VM to empty, which freeing slots don't show), the fleet
-     doesn't hold at all. Held demand counts as covered, so lower-priority
+     those releases free nothing for jobs still waiting to be admitted. While an exclusive job no empty
+     ready VM covers waits (it needs a whole VM to empty, which freeing
+     slots don't show), the fleet doesn't hold at all. Held demand counts as covered, so lower-priority
      fleets don't launch for it either. The hold is a `scale_held` event
      (with the slots it waits for, `free_in_ms`, `lead_ms`, `lead_learned`
      and `waited_ms`) and the queue status gives its reason; `scale_out`

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -212,6 +213,7 @@ func (g *AWSGlobal) Regional(region string) *AWSSpot {
 	a := newAWSSpot(&rc, g.creds)
 	a.dir = g.dir // its caches live with the runner's placement state
 	a.placed = !g.oneRegion()
+	a.launching = g.mark(region)
 	if g.endpoints != nil {
 		a.api.endpoints = g.endpoints(region)
 	}
@@ -222,7 +224,7 @@ func (g *AWSGlobal) Regional(region string) *AWSSpot {
 // Use returns the provider for region and records that the region may now
 // hold this runner's instances (e.g. an image-bake builder).
 func (g *AWSGlobal) Use(region string) (*AWSSpot, error) {
-	return g.Regional(region), g.markActive(region, g.holdUntil(g.clock()))
+	return g.Regional(region), g.launching(region)
 }
 
 // home is the region used for account-wide lookups (DescribeRegions).
@@ -313,7 +315,11 @@ type placementState struct {
 	// Active: region -> may hold our instances until. An expired entry is
 	// only dropped once a listing of that region finds nothing, so a VM
 	// whose watchdog failed is never forgotten.
-	Active    map[string]time.Time `json:"active,omitempty"`
+	Active map[string]time.Time `json:"active,omitempty"`
+	// Busy: region -> when a launch was last sent there or an instance
+	// last seen there. A region the config no longer launches in is
+	// dropped from Active once it's confirmed empty and this has settled.
+	Busy      map[string]time.Time `json:"busy,omitempty"`
 	Where     map[string]placedAt  `json:"where,omitempty"`     // instance ID -> region (a routing cache)
 	Cooldown  map[string]cooldown  `json:"cooldown,omitempty"`  // "region", "zone:<zone>", "region/zone/type" or "reclaimed:region/zone/type"
 	Reclaimed map[string]time.Time `json:"reclaimed,omitempty"` // instance ID -> when its Spot interruption was recorded
@@ -399,6 +405,9 @@ func (g *AWSGlobal) withStateWait(wait time.Duration, fn func(st *placementState
 	if st.Active == nil {
 		st.Active = map[string]time.Time{}
 	}
+	if st.Busy == nil {
+		st.Busy = map[string]time.Time{}
+	}
 	if st.Where == nil {
 		st.Where = map[string]placedAt{}
 	}
@@ -449,6 +458,38 @@ func (g *AWSGlobal) markActive(region string, until time.Time) error {
 	})
 }
 
+// launching records that something is about to be launched in region now:
+// it may hold an instance until holdUntil, and is kept listed meanwhile.
+func (g *AWSGlobal) launching(region string) error {
+	return g.withState(func(st *placementState) {
+		now := g.clock()
+		if until := g.holdUntil(now); until.After(st.Active[region]) {
+			st.Active[region] = until
+		}
+		if now.After(st.Busy[region]) {
+			st.Busy[region] = now
+		}
+	})
+}
+
+// launchSettle is how long after a launch (or a sighting) an empty listing
+// of its region isn't believed: EC2's listings are eventually consistent,
+// and another process's view may be newer than this one's.
+var launchSettle = 10 * time.Minute
+
+// configured reports whether the runner's config launches in region.
+// Unlike PlacementRegions it never asks the cloud: a region the account
+// hasn't enabled still counts, as it holds nothing.
+func (g *AWSGlobal) configured(region string) bool {
+	switch {
+	case g.oneRegion():
+		return region == g.r.Region
+	case g.r.AnyRegion():
+		return !slices.Contains(g.r.ExcludeRegions, region)
+	}
+	return slices.Contains(g.r.Regions, region)
+}
+
 func (g *AWSGlobal) remember(ins []Instance) error {
 	if len(ins) == 0 {
 		return nil
@@ -469,6 +510,9 @@ func (g *AWSGlobal) remember(ins []Instance) error {
 			st.Where[in.ID] = placedAt{Region: in.Region, Until: until}
 			if until.After(st.Active[in.Region]) {
 				st.Active[in.Region] = until
+			}
+			if now := g.clock(); now.After(st.Busy[in.Region]) {
+				st.Busy[in.Region] = now // seen now, however old
 			}
 		}
 	})
@@ -1131,6 +1175,7 @@ func (g *AWSGlobal) list(ctx context.Context, each time.Duration) ([]Instance, m
 	}
 	var regions []string
 	discovered := false
+	start := g.clock()
 	if err := g.withState(func(st *placementState) {
 		discovered = st.Discovered
 		for r := range st.Active {
@@ -1185,11 +1230,34 @@ func (g *AWSGlobal) list(ctx context.Context, each time.Duration) ([]Instance, m
 	// region (or, while discovering, passing over one), make sure it holds
 	// nothing else that bills: stopped fleet VMs or bake builders.
 	now := g.clock()
+	// settled: the region's last launch (or sighting) came long enough
+	// before this listing began for the listing to show what it made.
+	settled := func(st *placementState, rg string) bool {
+		at, ok := st.Busy[rg]
+		return ok && !at.After(start.Add(-launchSettle))
+	}
+	// gone: a region forgettable once it's confirmed to hold nothing. It's
+	// past the time anything launched there could live, or no longer in
+	// the config with its last activity settled.
+	gone := func(st *placementState, rg string) bool {
+		until, ok := st.Active[rg]
+		if !ok {
+			return false
+		}
+		return now.After(until) || (!g.configured(rg) && settled(st, rg))
+	}
 	var check []string
 	if err := g.withState(func(st *placementState) {
 		for rg := range empty {
-			until, ok := st.Active[rg]
-			if (ok && now.After(until)) || (!ok && !discovered) {
+			_, ok := st.Active[rg]
+			if ok && !g.configured(rg) {
+				if _, known := st.Busy[rg]; !known {
+					// No record of its last activity (state from before
+					// one was kept): count from now.
+					st.Busy[rg] = now
+				}
+			}
+			if gone(st, rg) || (!ok && !discovered) {
 				check = append(check, rg)
 			}
 		}
@@ -1199,6 +1267,10 @@ func (g *AWSGlobal) list(ctx context.Context, each time.Duration) ([]Instance, m
 	// A region that holds something, or that couldn't be checked, stays
 	// listed until it's clear.
 	held := map[string]bool{}
+	cleared := map[string]bool{}
+	for _, rg := range check {
+		cleared[rg] = true
+	}
 	for rg := range eachRegion(ctx, check, func(ctx context.Context, rg string) error {
 		ctx, cancel := bound(ctx)
 		defer cancel()
@@ -1209,7 +1281,7 @@ func (g *AWSGlobal) list(ctx context.Context, each time.Duration) ([]Instance, m
 		}
 		return nil
 	}) {
-		delete(empty, rg)
+		delete(cleared, rg)
 		held[rg] = true
 	}
 	if err := g.withState(func(st *placementState) {
@@ -1219,11 +1291,12 @@ func (g *AWSGlobal) list(ctx context.Context, each time.Duration) ([]Instance, m
 			}
 		}
 		st.Discovered = true
-		for rg := range empty {
-			// Confirmed empty and past the time anything launched there
-			// could live: stop listing it.
-			if until, ok := st.Active[rg]; ok && now.After(until) {
+		for rg := range cleared {
+			// Confirmed empty, and nothing launched there since (a launch
+			// meanwhile moves its hold and last launch on): stop listing it.
+			if gone(st, rg) {
 				delete(st.Active, rg)
+				delete(st.Busy, rg)
 			}
 		}
 	}); err != nil {
@@ -1268,7 +1341,7 @@ func (g *AWSGlobal) mark(region string) func() error {
 	if g.single {
 		return nil
 	}
-	return func() error { return g.markActive(region, g.holdUntil(g.clock())) }
+	return func() error { return g.launching(region) }
 }
 
 // record remembers where a new instance is.

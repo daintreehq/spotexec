@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,6 +45,15 @@ const (
 	quotaRetry    = 5 * time.Minute  // after a quota refusal, unless one of our VMs ends first
 )
 
+// A refresh runs under the pool lock, so every process using the runner's
+// pool waits behind it. refreshBudget bounds the whole of it (listing and
+// judging the VMs against the config), and listBudget the listing within
+// it, so one region whose API doesn't answer delays them only that long.
+var (
+	refreshBudget = 15 * time.Second
+	listBudget    = 10 * time.Second
+)
+
 type note struct {
 	Failures     int       `json:"failures,omitempty"`
 	Draining     bool      `json:"draining,omitempty"`
@@ -56,7 +66,16 @@ type note struct {
 	// BootSeenAt: when a probe last found its helper still running
 	// first-boot setup, so its first ready probe times its launch. (Not a
 	// failure to answer: a VM that was ready unobserved can fail one too.)
-	BootSeenAt   time.Time `json:"boot_seen_at,omitempty"`
+	BootSeenAt time.Time `json:"boot_seen_at,omitempty"`
+	// A watch, which also times the launch when no booting answer was seen
+	// (a baked VM can finish first-boot setup before it first answers):
+	// WatchN probes before it first served found it not serving yet, the
+	// first within watchStart of its launch, the last (WatchAt) and each
+	// since within leadGap of the one before. It saturates at watchMin, and
+	// is -1 once broken: a late start, a gap, or a silent VM past
+	// boot_timeout or in a region this client can't reach.
+	WatchAt      time.Time `json:"watch_at,omitempty"`
+	WatchN       int       `json:"watch_n,omitempty"`
 	BootFailed   bool      `json:"boot_failed,omitempty"`
 	BootFailedAt time.Time `json:"boot_failed_at,omitempty"`
 	// Why the instance no longer satisfies the runner's requirements (""
@@ -93,15 +112,22 @@ type launchRec struct {
 	PID        int       `json:"pid"`
 	Failed     bool      `json:"failed,omitempty"`
 	Ambiguous  time.Time `json:"ambiguous,omitempty"` // when RunInstances' outcome became unknown
+	// Region the instance launched in ("" until known): while that region
+	// can't be listed, the instance's absence proves nothing.
+	Region string `json:"region,omitempty"`
 }
 
 type poolState struct {
-	Instances     []provider.Instance `json:"instances"`
-	ListedAt      time.Time           `json:"listed_at"`
-	Launches      []launchRec         `json:"launches"`
-	Notes         map[string]*note    `json:"notes"`
-	BackoffUntil  time.Time           `json:"backoff_until,omitempty"`
-	LastLaunchErr string              `json:"last_launch_error,omitempty"`
+	Instances []provider.Instance `json:"instances"`
+	ListedAt  time.Time           `json:"listed_at"`
+	// Unlisted: the regions the last listing couldn't list. Their VMs are
+	// those last seen there, and nothing is forgotten for being absent
+	// until a listing covers every region again.
+	Unlisted      []string         `json:"unlisted,omitempty"`
+	Launches      []launchRec      `json:"launches"`
+	Notes         map[string]*note `json:"notes"`
+	BackoffUntil  time.Time        `json:"backoff_until,omitempty"`
+	LastLaunchErr string           `json:"last_launch_error,omitempty"`
 	// The account's vCPU quota refused the last launch: no launches until
 	// one of this fleet's VMs ends (freeing quota) or quotaRetry passes.
 	QuotaErr  string    `json:"quota_error,omitempty"`
@@ -255,15 +281,84 @@ func (n *note) markReady(now time.Time) {
 	}
 }
 
+const (
+	// watchMin: probes a watch needs before it times a launch. One failure
+	// to answer just before serving proves little: a VM ready unobserved
+	// can fail one too.
+	watchMin = 2
+	// watchStart: how soon after its launch a watch's first probe must
+	// end. Looser than leadGap: listing a new VM (pending, then running,
+	// through an 8s cache) and an SSH connect timeout come first, and a
+	// probe that found the VM not serving yet bounds nothing it missed.
+	watchStart = time.Minute
+)
+
 // markReady records instance id as serving, and times its launch when it
-// was watched booting until now (leadGap), so the time isn't inflated by
-// a stretch nobody probed it.
+// was watched booting until now (leadGap), or watched from its launch
+// until now (note.WatchN), so the time isn't inflated by a stretch nobody
+// probed it.
 func (st *poolState) markReady(id string, now time.Time) {
 	n := st.note(id)
-	if !n.Ready && !n.BootSeenAt.IsZero() && now.Sub(n.BootSeenAt) <= leadGap {
+	booted := !n.BootSeenAt.IsZero() && now.Sub(n.BootSeenAt) <= leadGap
+	watched := n.WatchN >= watchMin && now.Sub(n.WatchAt) <= leadGap
+	if !n.Ready && (booted || watched) {
 		st.timeLaunch(id, now)
 	}
 	n.markReady(now)
+}
+
+// watch extends instance id's watch with a probe at now that found it not
+// serving yet (no answer, or still booting). launchedAt is the provider's
+// launch time (zero if unknown); late says a VM still not answering may
+// have been ready behind an unreachable network all along (it is past
+// boot_timeout, or its region is held).
+func (st *poolState) watch(id string, launchedAt time.Time, late bool, now time.Time) {
+	n := st.note(id)
+	if n.Ready || n.WatchN < 0 {
+		return
+	}
+	from, within := n.WatchAt, leadGap
+	if n.WatchN == 0 {
+		var ok bool
+		if from, ok = st.launchStart(id, launchedAt, now); !ok {
+			return // not this fleet's launch on record (yet): nothing to time
+		}
+		within = watchStart
+	}
+	if late || now.Sub(from) > within || now.Before(from) {
+		n.WatchN, n.WatchAt = -1, time.Time{}
+		return
+	}
+	n.WatchN, n.WatchAt = min(n.WatchN+1, watchMin), now
+}
+
+// launchStart is when instance id came to exist, as far as a watch goes:
+// its launch record's start, or the provider's launch time when later
+// (planning, pricing and capacity retries come first, and a VM can't be
+// probed before it exists) but not after now (the provider's clock may
+// run ahead of this one).
+func (st *poolState) launchStart(id string, launchedAt, now time.Time) (time.Time, bool) {
+	for _, l := range st.Launches {
+		if l.InstanceID == id && !l.Failed && !l.Started.IsZero() {
+			if launchedAt.After(l.Started) && !launchedAt.After(now) {
+				return launchedAt, true
+			}
+			return l.Started, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// regionHeld reports whether instance id is in a region this client holds
+// launches out of, as one it can't reach (reach.go).
+func (st *poolState) regionHeld(id string, now time.Time) bool {
+	for _, in := range st.Instances {
+		if in.ID == id {
+			at, held := st.Held[in.Region]
+			return in.Region != "" && held && now.Sub(at) <= heldFor
+		}
+	}
+	return false
 }
 
 // timeLaunch records how long instance id's launch took to serve, from
@@ -336,7 +431,8 @@ func (p *Pool) drainAging(st *poolState) {
 // the requirements differ from those last judged against (the config
 // changed, or another process runs with a different one). An instance the
 // fleet can't judge keeps its last verdict under the same requirements,
-// and matches under new ones: a failed lookup never retires VMs.
+// and matches under new ones: a failed lookup never retires VMs. ctx
+// bounds it (refresh's budget).
 func (p *Pool) matchConfig(ctx context.Context, st *poolState, relisted bool) {
 	m, ok := p.Fleet.(provider.Matcher)
 	if !ok {
@@ -346,9 +442,7 @@ func (p *Pool) matchConfig(ctx context.Context, st *poolState, relisted bool) {
 	if !relisted && key == st.MatchKey {
 		return
 	}
-	mctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	judged := m.Mismatches(mctx, st.Instances)
+	judged := m.Mismatches(ctx, st.Instances)
 	same := key == st.MatchKey
 	st.MatchKey = key
 	for _, in := range st.Instances {
@@ -367,16 +461,40 @@ func (p *Pool) matchConfig(ctx context.Context, st *poolState, relisted bool) {
 // refresh re-lists the fleet when the cached listing is stale (or force),
 // reconciling notes and the launch ledger, and drains instances near
 // max_lifetime. Called with the lock held, so one process refreshes while
-// the others wait and reuse its result.
+// the others wait and reuse its result; refreshBudget bounds how long.
+//
+// A fleet spread over regions lists the regions that answer: their VMs
+// replace the cached ones, while a region that doesn't answer keeps the
+// VMs last seen there, and nothing is forgotten for being absent (see
+// poolState.Unlisted). A forced refresh (status, the pool manager) gets
+// that view too: it is the truth for every region that answered.
 func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	defer p.drainAging(st)
+	rctx, cancel := context.WithTimeout(ctx, refreshBudget)
+	defer cancel()
 	if !force && time.Since(st.ListedAt) < listTTL {
-		p.matchConfig(ctx, st, false)
+		p.matchConfig(rctx, st, false)
 		return nil
 	}
-	lctx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	defer cancel()
-	insts, err := p.Fleet.List(lctx)
+	insts, unlisted, err := p.list(rctx)
+	if ctx.Err() != nil {
+		// The caller gave up: what was listed is cut short by that, not by
+		// the cloud, and it acts on nothing.
+		return ctx.Err()
+	}
+	if err == nil && len(unlisted) > 0 && st.ListedAt.IsZero() {
+		// Nothing known yet of the regions that didn't answer.
+		err = joinUnlisted(unlisted)
+	}
+	if err == nil {
+		for _, e := range unlisted {
+			var ce *provider.CredentialError
+			if errors.As(e, &ce) {
+				err = joinUnlisted(unlisted)
+				break
+			}
+		}
+	}
 	if err != nil && force {
 		// A forced refresh (status, the pool manager) wants the truth, not
 		// a cached view it might act on.
@@ -393,7 +511,7 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 			// Serve the cached view and back off, rather than letting every
 			// waiting agent retry the API (throttling) or give up.
 			st.ListedAt = time.Now().Add(-listTTL + 5*time.Second)
-			p.matchConfig(ctx, st, false)
+			p.matchConfig(rctx, st, false)
 			return nil
 		}
 		return err
@@ -407,20 +525,41 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 			seenBefore[id] = true
 		}
 	}
-	st.Instances = insts
-	p.matchConfig(ctx, st, true)
+	// Launch records from before they carried a region take it from the
+	// listings that show their instance.
+	regionOf := map[string]string{}
+	for _, in := range append(slices.Clone(st.Instances), insts...) {
+		if in.Region != "" {
+			regionOf[in.ID] = in.Region
+		}
+	}
+	for i, l := range st.Launches {
+		if l.Region == "" && l.InstanceID != "" {
+			st.Launches[i].Region = regionOf[l.InstanceID]
+		}
+	}
+	st.Instances = keepUnlisted(insts, st.Instances, unlisted)
+	st.Unlisted = nil
+	for rg := range unlisted {
+		st.Unlisted = append(st.Unlisted, rg)
+	}
+	sort.Strings(st.Unlisted)
+	partial := len(unlisted) > 0
+	p.matchConfig(rctx, st, true)
 	// Fresh from now: a slow type lookup in matchConfig mustn't leave the
 	// listing already stale, sending every waiting process to re-list.
 	st.ListedAt = time.Now()
 	live := map[string]bool{}
-	for _, in := range insts {
+	for _, in := range st.Instances {
 		live[in.ID] = true
 	}
-	for id, n := range st.Notes {
-		// A bootstrap failure is remembered for an hour after its VM is
-		// gone: it says the runner's setup is broken, not just that VM.
-		if !live[id] && !(n.BootFailed && time.Since(n.BootFailedAt) < time.Hour) {
-			delete(st.Notes, id)
+	if !partial {
+		for id, n := range st.Notes {
+			// A bootstrap failure is remembered for an hour after its VM is
+			// gone: it says the runner's setup is broken, not just that VM.
+			if !live[id] && !(n.BootFailed && time.Since(n.BootFailedAt) < time.Hour) {
+				delete(st.Notes, id)
+			}
 		}
 	}
 	var keep []launchRec
@@ -428,6 +567,10 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 		age := time.Since(l.Started)
 		switch {
 		case l.Failed:
+		case partial && !live[l.InstanceID] && (l.Region == "" || unlisted[l.Region] != nil):
+			// Not seen, and it may be in a region that didn't answer: still
+			// counted until a listing can tell.
+			keep = append(keep, l)
 		case age > p.R.BootTimeout.Duration+time.Minute:
 			// Never became usable: give up counting it as pending capacity.
 		case l.InstanceID != "" && !live[l.InstanceID] && (age > listLagGrace || seenBefore[l.InstanceID]):
@@ -450,8 +593,61 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 		}
 	}
 	st.Launches = keep
-	st.sched().forgetGone(live)
+	if !partial {
+		st.sched().forgetGone(live)
+	}
 	return nil
+}
+
+// list lists the fleet within listBudget: a fleet spread over regions
+// lists those that answer, and says which didn't.
+func (p *Pool) list(ctx context.Context) ([]provider.Instance, map[string]error, error) {
+	ctx, cancel := context.WithTimeout(ctx, listBudget)
+	defer cancel()
+	if rl, ok := p.Fleet.(provider.RegionLister); ok {
+		return rl.ListReachable(ctx)
+	}
+	insts, err := p.Fleet.List(ctx)
+	return insts, nil, err
+}
+
+// keepUnlisted is a listing with, for each region it couldn't list, the
+// instances last seen there (and those of no known region), since their
+// absence proves nothing.
+func keepUnlisted(listed, cached []provider.Instance, unlisted map[string]error) []provider.Instance {
+	if len(unlisted) == 0 {
+		return listed
+	}
+	out := append([]provider.Instance(nil), listed...)
+	seen := map[string]bool{}
+	for _, in := range listed {
+		seen[in.ID] = true
+	}
+	for _, in := range cached {
+		if seen[in.ID] {
+			continue
+		}
+		if _, gone := unlisted[in.Region]; gone || in.Region == "" {
+			seen[in.ID] = true
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
+// joinUnlisted is one error for the regions a listing couldn't list,
+// keeping a credential failure findable with errors.As.
+func joinUnlisted(unlisted map[string]error) error {
+	regions := make([]string, 0, len(unlisted))
+	for rg := range unlisted {
+		regions = append(regions, rg)
+	}
+	sort.Strings(regions)
+	errs := make([]error, 0, len(regions))
+	for _, rg := range regions {
+		errs = append(errs, fmt.Errorf("%s: %w", rg, unlisted[rg]))
+	}
+	return errors.Join(errs...)
 }
 
 func pidAlive(pid int) bool {
@@ -559,6 +755,7 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 			if !n.Ready {
 				n.BootSeenAt = now
 			}
+			st.watch(id, launchedAt, false, now)
 		case OutUnreachable, outRefused:
 			if o == OutUnreachable {
 				n.Silent = now
@@ -569,10 +766,14 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 			// suspect (but still counts toward capacity: unreachable is not
 			// absent).
 			n.Failures++
-			if time.Since(launchedAt) < p.R.BootTimeout.Duration || n.Failures < 2 {
+			young := time.Since(launchedAt) < p.R.BootTimeout.Duration
+			if young || n.Failures < 2 {
 				n.BusyUntil = now.Add(3 * time.Second)
 			} else {
 				n.SuspectUntil = now.Add(suspectFor)
+			}
+			if o == OutUnreachable {
+				st.watch(id, launchedAt, (!young && !launchedAt.IsZero()) || st.regionHeld(id, now), now)
 			}
 		}
 		// The fleet's hold is set under this lock too, so a reply and a
@@ -591,6 +792,10 @@ type LaunchDecision struct {
 	Live     int // usable instances (not draining)
 	Demand   int
 	Capacity int // pending slots
+	// Ready: slots of demand that VMs already serving can take now, by
+	// this machine's ledger (readyRoom): an empty VM for each whole-VM
+	// waiter, free slots for the rest.
+	Ready int
 	// QuotaErr is set while the account's vCPU quota (or max_price, below
 	// every Spot price) blocks launches: the fleet can only serve from the
 	// VMs it already has.
@@ -615,28 +820,40 @@ type LaunchDecision struct {
 // Plan decides, under the pool lock, whether this process should launch one
 // more instance: only if waiting demand (minus `covered`, the capacity that
 // higher-priority fleets are already launching or waiting for) exceeds the
-// capacity this fleet is launching, the fleet is below max_instances (when
-// it has one), and slots on its running VMs aren't expected to free sooner
-// than a new VM would serve (a short burst waits for them; demand still
-// waiting after a launch's lead launches).
+// capacity this fleet is launching plus what its ready VMs can take now
+// (readyRoom), the fleet is below max_instances (when it has one), and
+// slots on its running VMs aren't expected to free sooner than a new VM
+// would serve (a short burst waits for them; demand still waiting after a
+// launch's lead launches).
+//
+// A VM booting in a region some waiters can't use (replays kept out of a
+// silent region, #240) still counts toward max_instances, but its slots
+// cover only the demand of the waiters that can use it, so those replays
+// aren't left waiting on it.
 func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
 			return err
 		}
-		demand, wholeVM := p.waiters()
+		demand, whole, away := p.waitersAway()
 		d.Demand = demand - covered
 		listed := map[string]bool{}
+		unusable := map[string]string{} // listed, in a region some waiters can't use: its region
 		usable, total := 0, 0
 		for _, in := range st.Instances {
 			listed[in.ID] = true
+			if in.Region != "" && away.avoided(in.Region) {
+				unusable[in.ID] = in.Region
+			}
 			total++
 			if !st.Notes[in.ID].closed() {
 				usable++
 			}
 		}
 		slots := p.SlotsPerInstance()
+		excludedCap := 0                 // pending slots in VMs some waiters can't use
+		awayRegions := map[string]bool{} // their regions
 		inLedger := map[string]bool{}
 		pendingVM := map[string]bool{} // instances whose slots count as pending
 		for _, l := range st.Launches {
@@ -653,6 +870,19 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 				if listed[l.InstanceID] && p.lostVM(st, l.InstanceID, time.Now()) {
 					// Never reached, in a region this client can't reach: it
 					// won't serve, so another launch (elsewhere) may.
+					continue
+				}
+				rg := unusable[l.InstanceID]
+				if rg == "" && !listed[l.InstanceID] && l.Region != "" && away.avoided(l.Region) {
+					rg = l.Region // launched there, not listed yet
+				}
+				if rg != "" {
+					if !listed[l.InstanceID] {
+						usable++
+						total++
+					}
+					excludedCap += slots // it won't serve every waiter
+					awayRegions[rg], pendingVM[l.InstanceID] = true, true
 					continue
 				}
 			}
@@ -673,12 +903,19 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			if inLedger[in.ID] || (n != nil && (n.Ready || n.closed())) {
 				continue
 			}
+			if unusable[in.ID] != "" && time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
+				excludedCap += slots // it won't serve every waiter
+				awayRegions[in.Region], pendingVM[in.ID] = true, true
+				continue
+			}
 			if time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
 				pendingVM[in.ID] = true
 				d.Pending++
 				d.Capacity += slots
 			}
 		}
+		// Booting VMs some waiters can't use serve only the others.
+		d.Capacity += min(excludedCap, max(0, d.Demand-away.weightAvoiding(awayRegions)))
 		d.Live = usable
 		now := time.Now()
 		d.Lead, d.LeadLearned = st.sched().launchLead(now)
@@ -686,6 +923,8 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Waited = now.Sub(p.since)
 		}
 		d.QuotaErr = st.quotaBlocked(p.since)
+		var wholeVM bool
+		d.Ready, wholeVM = p.readyRoom(st, d.Demand-d.Capacity, demand, covered, whole, away, pendingVM, d.Waited, d.Lead, now)
 		bootFailed := ""
 		for id, n := range st.Notes {
 			if n.BootFailed && time.Since(n.BootFailedAt) < time.Hour {
@@ -700,6 +939,8 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = "demand covered by higher-priority runners"
 		case d.Demand <= d.Capacity:
 			d.Reason = "waiting for instances being launched"
+		case d.Demand <= d.Capacity+d.Ready:
+			d.Reason = fmt.Sprintf("%s free on ready VMs", plural(d.Ready, "slot"))
 		case !p.R.BelowMax(usable):
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
 			if id, region := p.reapable(st, time.Now()); id != "" {
@@ -715,7 +956,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		case time.Now().Before(st.BackoffUntil):
 			d.Reason = "backing off after a failed launch: " + st.LastLaunchErr
 		case p.releaseSoon(st, &d, wholeVM, pendingVM, now):
-			d.Held, d.Deferred = true, d.Demand-d.Capacity
+			d.Held, d.Deferred = true, d.Demand-d.Capacity-d.Ready
 			d.Reason = fmt.Sprintf("%s on running VMs expected to free within %s, sooner than a new VM (~%s)",
 				plural(d.Deferred, "slot"), ui.Dur(d.FreeIn), ui.Dur(d.Lead))
 		default:
@@ -970,6 +1211,7 @@ func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger
 		for i := range st.Launches {
 			if st.Launches[i].ID == id {
 				st.Launches[i].InstanceID = in.ID
+				st.Launches[i].Region = in.Region
 			}
 		}
 		// There was room after all.
@@ -1051,10 +1293,16 @@ func (p *Pool) RegisterExclusive(weight int) (*Waiter, error) {
 }
 
 func (p *Pool) registerAs(weight int, exclusive bool) (*Waiter, error) {
+	return p.RegisterAway(weight, exclusive, nil)
+}
+
+// RegisterAway adds a waiter (an exclusive one with exclusive) that can't
+// use VMs in the regions away: a VM booting there doesn't cover its demand.
+func (p *Pool) RegisterAway(weight int, exclusive bool, away []string) (*Waiter, error) {
 	var w *Waiter
 	err := p.with(func(*poolState) error {
 		var err error
-		w, err = p.register(weight, exclusive)
+		w, err = p.register(weight, exclusive, away)
 		return err
 	})
 	return w, err
@@ -1067,7 +1315,7 @@ const exclusiveWaiter = ".x.w"
 // register must run under pool.lock: waiterDemand (also under the lock)
 // unlinks unlocked waiter files, so creation and locking must be atomic
 // with respect to it.
-func (p *Pool) register(weight int, exclusive bool) (*Waiter, error) {
+func (p *Pool) register(weight int, exclusive bool, away []string) (*Waiter, error) {
 	dir := filepath.Join(p.dir, "waiters")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -1078,7 +1326,11 @@ func (p *Pool) register(weight int, exclusive bool) (*Waiter, error) {
 	if exclusive {
 		ext = exclusiveWaiter
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%d-%s%s", os.Getpid(), hex.EncodeToString(b[:]), ext))
+	tag := ""
+	if len(away) > 0 {
+		tag = awayMark + strings.Join(away, awaySep)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d-%s%s%s", os.Getpid(), hex.EncodeToString(b[:]), tag, ext))
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -1110,18 +1362,19 @@ func (w *Waiter) Done() {
 	w.f = nil
 }
 
-// releaseSoon reports whether the demand this fleet isn't launching for
-// (d.Demand - d.Capacity) can wait for slots on its running VMs, setting
+// releaseSoon reports whether the demand this fleet isn't launching for,
+// and its ready VMs can't take now (d.Demand - d.Capacity - d.Ready), can
+// wait for slots on its running VMs, setting
 // d.FreeIn: only while this process has waited less than a launch's lead
 // (past it, demand is sustained), and only for slots that jobs predicted
 // to end within the lead hold now. A job whose end is unknown, or already
 // overdue, frees nothing here: the prediction has no say then. A
-// whole-VM (exclusive) waiter needs a VM to empty, which freeing slots
-// don't show, so it never waits here. Jobs a VM's helper admitted
+// whole-VM (exclusive) waiter that no empty VM covers (wholeVM) needs a
+// VM to empty, which freeing slots don't show, so it never waits here. Jobs a VM's helper admitted
 // beyond its slots (overflow, preparing beside them) take the first slots
 // that free there: those releases free nothing for this demand.
 func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendingVM map[string]bool, now time.Time) bool {
-	need := d.Demand - d.Capacity
+	need := d.Demand - d.Capacity - d.Ready
 	if need <= 0 || wholeVM || p.since.IsZero() || d.Waited >= d.Lead {
 		return false
 	}
@@ -1172,6 +1425,91 @@ func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendi
 	return false
 }
 
+// readyRoom is how much of need (the demand this fleet isn't launching
+// for) its ready VMs can take now, by this machine's ledger, and whether a
+// whole-VM waiter is left without a VM. Each whole-VM waiter takes a VM
+// with nothing on it, the smallest first; the shared demand takes the free
+// slots left, on the empty VMs no whole-VM waiter took and beside the jobs
+// on the others. The demand higher-priority fleets cover (`covered`, not
+// saying whose) comes off the shared waiters first: what is left is the
+// hardest to place, so a whole-VM waiter no fleet has an empty VM for is
+// never taken as covered by slots that serve only shared ones. A waiter that can't probe yet (behind an exclusive job
+// in the queue) is demand all the same, so without this an idle fleet
+// launches for it moments before it takes a free slot (#239).
+//
+// A VM counts only while a job would be placed on it: ready, open, not
+// suspect or just found busy, not being ended to make room or held back
+// for an exclusive job (a fence), and not still counted as starting
+// capacity (pendingVM). Slots held by this machine's live or uncertain
+// attempts aren't free, an attempt still in flight included. And only
+// while this process has waited less than a launch's lead: the ledger
+// knows only this machine's jobs, so a VM another machine fills looks free
+// here, and demand still waiting past the lead launches as before.
+//
+// Room on a VM in a region some waiters can't use (away: replays kept out
+// of a silent region, #240) takes only the shared demand of the others,
+// and no whole-VM waiter, so those replays don't wait out a lead for it.
+func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, away awayDemand, pendingVM map[string]bool, waited, lead time.Duration, now time.Time) (covers int, wholeLeft bool) {
+	shared := total
+	for _, wt := range whole {
+		shared -= wt
+	}
+	shared = max(shared, 0)
+	upstream := min(max(covered, 0), shared)
+	shared -= upstream
+	upstream = max(covered, 0) - upstream
+	var left []int // whole-VM waiters not covered upstream
+	for _, wt := range whole {
+		if upstream >= wt {
+			upstream -= wt
+			continue
+		}
+		left = append(left, wt)
+	}
+	if need <= 0 || waited >= lead {
+		return 0, len(left) > 0
+	}
+	s := st.sched()
+	var empty []int
+	free, freeAway := 0, 0
+	for _, w := range p.views(st, now) {
+		if !w.eligible || !w.ready || pendingVM[w.in.ID] || s.Fences[w.in.ID] != nil {
+			continue
+		}
+		if n := st.Notes[w.in.ID]; n.reaping(now) || now.Before(n.BusyUntil) {
+			continue
+		}
+		if w.in.Region != "" && away.avoided(w.in.Region) {
+			freeAway += max(w.units-w.firm-w.unc, 0)
+			continue
+		}
+		if w.firm+w.unc == 0 {
+			empty = append(empty, w.units)
+			continue
+		}
+		free += max(w.units-w.firm-w.unc, 0)
+	}
+	sort.Ints(empty)
+	placed := 0
+	for _, wt := range left {
+		if placed < len(empty) {
+			covers += wt
+			placed++
+		}
+	}
+	for _, u := range empty[placed:] {
+		free += u
+	}
+	awayW := 0 // shared demand that can't use freeAway
+	for _, a := range away {
+		if !a.whole {
+			awayW += a.weight
+		}
+	}
+	covers += min(shared, free+min(freeAway, max(0, shared-awayW)))
+	return min(covers, need), placed < len(left)
+}
+
 func plural(n int, what string) string {
 	if n == 1 {
 		return "1 " + what
@@ -1179,14 +1517,71 @@ func plural(n int, what string) string {
 	return fmt.Sprintf("%d %ss", n, what)
 }
 
+// awayMark ends a waiter's file name with the regions it can't use (a
+// replay kept out of a silent region, #240), joined by awaySep, before its
+// extension. Older versions read only the weight inside.
+const awayMark, awaySep = "~", "+"
+
+// awayDemand is what the waiters that can't use some regions weigh.
+type awayDemand []struct {
+	weight  int
+	whole   bool // a whole-VM waiter
+	regions []string
+}
+
+// avoided reports whether a waiter can't use region.
+func (a awayDemand) avoided(region string) bool {
+	for _, w := range a {
+		if slices.Contains(w.regions, region) {
+			return true
+		}
+	}
+	return false
+}
+
+// weightAvoiding is the demand of the waiters that can't use one of
+// regions. A waiter that avoids any of those
+// regions counts whole, even if it could use a VM in another of them: with
+// several regions avoided at once that may cost a launch, never a wait.
+func (a awayDemand) weightAvoiding(regions map[string]bool) int {
+	n := 0
+	for _, w := range a {
+		for _, rg := range w.regions {
+			if regions[rg] {
+				n += w.weight
+				break
+			}
+		}
+	}
+	return n
+}
+
+// awayRegions are the regions exclude keeps a request out of (regionKey).
+func awayRegions(exclude map[string]bool) []string {
+	var out []string
+	for k := range exclude {
+		if rg, ok := strings.CutPrefix(k, regionKey("")); ok && rg != "" && !strings.ContainsAny(rg, awaySep+awayMark+"./") {
+			out = append(out, rg)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (p *Pool) waiterDemand() int {
 	total, _ := p.waiters()
 	return total
 }
 
-// waiters is the waiting demand in slots, and whether any waiter needs a
-// whole VM (an exclusive job on a fleet of several-slot VMs).
-func (p *Pool) waiters() (total int, wholeVM bool) {
+// waiters is the waiting demand in slots, and the weights of the waiters
+// that need a whole VM (exclusive jobs on a fleet of several-slot VMs).
+func (p *Pool) waiters() (total int, whole []int) {
+	total, whole, _ = p.waitersAway()
+	return total, whole
+}
+
+// waitersAway is waiters, with the waiters that can't use some regions.
+func (p *Pool) waitersAway() (total int, whole []int, away awayDemand) {
 	dir := filepath.Join(p.dir, "waiters")
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
@@ -1214,9 +1609,19 @@ func (p *Pool) waiters() (total int, wholeVM bool) {
 			w = 1
 		}
 		total += w
-		wholeVM = wholeVM || w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter)
+		if w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter) {
+			whole = append(whole, w)
+		}
+		if _, tail, ok := strings.Cut(e.Name(), awayMark); ok {
+			tail, _, _ = strings.Cut(tail, ".")
+			away = append(away, struct {
+				weight  int
+				whole   bool
+				regions []string
+			}{w, w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter), strings.Split(tail, awaySep)})
+		}
 	}
-	return total, wholeVM
+	return total, whole, away
 }
 
 // Snapshot returns the cached state (for status displays).
@@ -1226,7 +1631,7 @@ func (p *Pool) Snapshot(ctx context.Context, force bool) (poolView, error) {
 		if err := p.refresh(ctx, st, force); err != nil {
 			return err
 		}
-		v.Instances = st.Instances
+		v.Instances, v.Unlisted = st.Instances, st.Unlisted
 		v.Draining, v.BootFailed, v.Mismatch = map[string]bool{}, map[string]bool{}, map[string]string{}
 		for id, n := range st.Notes {
 			if n.Draining {
@@ -1265,6 +1670,10 @@ type poolView struct {
 	Launching     int
 	Demand        int
 	LastLaunchErr string
+	// Unlisted: regions the listing couldn't list (poolState.Unlisted).
+	// Their VMs are the ones last seen there, so absence from this view
+	// doesn't mean a VM there is gone.
+	Unlisted []string
 }
 
 // staleListing forces the next refresh to re-list while keeping the cached

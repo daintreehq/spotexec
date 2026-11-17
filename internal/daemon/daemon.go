@@ -445,14 +445,31 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	st.Demand, st.Launching = view.Demand, view.Launching
 	now := time.Now()
 	listed := map[string]bool{}
+	// gone: id is not listed, and the listing covered every region. While
+	// a region can't be listed, absence proves nothing: what is known
+	// about its VMs (counted launches, terminations in flight) is kept.
+	gone := func(id string) bool { return !listed[id] && len(view.Unlisted) == 0 }
+	// carried: id is a VM of a region that couldn't be listed, as last
+	// seen there. Its state may be old, and its region's API isn't
+	// answering: nothing is judged from that state or asked of that API
+	// until the region answers again.
+	unlisted := map[string]bool{}
+	for _, rg := range view.Unlisted {
+		unlisted[rg] = true
+	}
+	carriedIDs := map[string]bool{}
+	carried := func(id string) bool { return carriedIDs[id] }
 	for _, in := range view.Instances {
 		listed[in.ID] = true
+		if len(unlisted) > 0 && (in.Region == "" || unlisted[in.Region]) {
+			carriedIDs[in.ID] = true
+		}
 		if _, ok := fl.seen[in.ID]; !ok {
 			fl.seen[in.ID] = now
 		}
 	}
 	for id := range fl.seen {
-		if !listed[id] {
+		if gone(id) {
 			delete(fl.seen, id)
 			delete(fl.noticed, id)
 			delete(fl.bootFailed, id)
@@ -467,12 +484,12 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// listing showed it): forgotten once listings would show it.
 	d.mu.Lock()
 	for id, t := range fl.counted {
-		if !listed[id] && !view.BootFailed[id] && time.Since(t) > forgetAfter {
+		if gone(id) && !view.BootFailed[id] && time.Since(t) > forgetAfter {
 			delete(fl.counted, id)
 		}
 	}
 	for id, b := range fl.batchOf {
-		if !listed[id] && time.Since(b.at) > forgetAfter {
+		if gone(id) && time.Since(b.at) > forgetAfter {
 			delete(fl.batchOf, id)
 		}
 	}
@@ -480,8 +497,10 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 
 	// 1. Retry terminations that haven't taken effect yet.
 	for id, why := range fl.killing {
-		if !listed[id] {
-			delete(fl.killing, id)
+		if !listed[id] || carried(id) {
+			if gone(id) {
+				delete(fl.killing, id)
+			}
 			continue
 		}
 		d.terminate(ctx, fl, id, why, true)
@@ -645,6 +664,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			if fl.unprobed[in.ID] {
 				continue // left unprobed on purpose (a standby VM without our helper): silence proves nothing
 			}
+			if carried(in.ID) {
+				continue // its region's API isn't answering: judged once it does
+			}
 			stale := time.Since(since) > unhealthyAfter && age > r.BootTimeout.Duration
 			stuck := (fl.booting[in.ID] && age > 2*r.BootTimeout.Duration+2*time.Minute) || fl.bootFailed[in.ID]
 			if !stale && !stuck {
@@ -700,7 +722,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	}
 	for id := range view.BootFailed {
 		d.countFailure(fl, id, launchedAt[id]) // once per instance (counted)
-		if listed[id] && fl.killing[id] == "" {
+		if listed[id] && !carried(id) && fl.killing[id] == "" {
 			d.terminate(ctx, fl, id, "bootstrap_script failed", false)
 		}
 	}
@@ -708,7 +730,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// Instances that never got an address or never left pending are not
 	// usable and are invisible to the probes above.
 	for _, in := range view.Instances {
-		if fl.killing[in.ID] == "" && !in.LaunchedAt.IsZero() && time.Since(in.LaunchedAt) > r.BootTimeout.Duration+time.Minute &&
+		if fl.killing[in.ID] == "" && !carried(in.ID) && !in.LaunchedAt.IsZero() && time.Since(in.LaunchedAt) > r.BootTimeout.Duration+time.Minute &&
 			(in.State != provider.StateRunning || in.Target.Host == "") {
 			d.countFailure(fl, in.ID, in.LaunchedAt)
 			d.terminate(ctx, fl, in.ID, "never became reachable (no address, or stuck pending)", false)
@@ -746,7 +768,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 
 	// 6. Outside reaper: past max_lifetime means the VM's watchdog failed.
 	for _, in := range view.Instances {
-		if r.MaxLifetime.Duration > 0 && !in.LaunchedAt.IsZero() && fl.killing[in.ID] == "" &&
+		if r.MaxLifetime.Duration > 0 && !in.LaunchedAt.IsZero() && fl.killing[in.ID] == "" && !carried(in.ID) &&
 			time.Since(in.LaunchedAt) > r.MaxLifetime.Duration+10*time.Minute {
 			d.terminate(ctx, fl, in.ID, "past max_lifetime ("+r.MaxLifetime.Duration.String()+")", false)
 		}
