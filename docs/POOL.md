@@ -80,10 +80,11 @@ takes part in scheduling, and every VM shuts itself down.
      starting, `Plan` holds the launch. The lead is the median time recent
      launches took from being planned to their VM first serving (timed by
      `spotexec up`, or by runs that saw the VM still booting within the
-     30s before it served, or that probed it without an answer at least
-     twice before it served: from within a minute of its launch, never
-     more than 30s apart, the last within 30s of its serving, and never
-     past `boot_timeout` or while its region is held as unreachable), or
+     30s before it served, or that probed it at least twice before it
+     served and found it not serving yet, unanswered or booting: from
+     within a minute of its launch, never more than 30s apart, the last
+     within 30s of its serving, and with no unanswered probe past
+     `boot_timeout` or while its region is held as unreachable), or
      two minutes until three launches have been timed, and never more than
      ten. The hold lasts only while such
      releases are still predicted and the job has waited less than the
