@@ -285,6 +285,9 @@ type Synced struct {
 	Deleted   int     `json:"deleted"`
 	Bytes     int64   `json:"bytes"`
 	Corrected []Entry `json:"corrected,omitempty"`
+	// Reused: files copied from another slot of the repo on the runner
+	// rather than sent by the CLI (not in Written or Bytes).
+	Reused int `json:"reused,omitempty"`
 }
 
 // ContainerRun says how to run a command inside the project's container.

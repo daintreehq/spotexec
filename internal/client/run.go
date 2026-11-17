@@ -923,8 +923,14 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			// The sync removed whatever an earlier write-back held here.
 			clearHeld(ws, lastRun)
 			res.Synced, res.SyncBytes = syn.Written, syn.Bytes
-			o.Rep.Event("sync_in", map[string]any{"mode": "delta", "files": syn.Written, "deleted": syn.Deleted, "bytes": syn.Bytes, "duration_ms": time.Since(t).Milliseconds()})
-			o.Rep.Status("%s · synced %d files (%s) in %s", label, syn.Written, ui.Bytes(syn.Bytes), ui.Dur(time.Since(t)))
+			ev := map[string]any{"mode": "delta", "files": syn.Written, "deleted": syn.Deleted, "bytes": syn.Bytes, "duration_ms": time.Since(t).Milliseconds()}
+			reused := ""
+			if syn.Reused > 0 {
+				ev["reused"] = syn.Reused
+				reused = fmt.Sprintf(", %d copied from other slots", syn.Reused)
+			}
+			o.Rep.Event("sync_in", ev)
+			o.Rep.Status("%s · synced %d files (%s)%s in %s", label, syn.Written, ui.Bytes(syn.Bytes), reused, ui.Dur(time.Since(t)))
 		}
 		// Before the image and dependencies, so install scripts see it too.
 		prog.set(phaseGitSeed)
