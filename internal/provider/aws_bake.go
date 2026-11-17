@@ -95,17 +95,31 @@ func imageRefOK(s string) bool {
 }
 
 type ec2Image struct {
-	ID         string   `xml:"imageId"`
-	Name       string   `xml:"name"`
-	State      string   `xml:"imageState"`
-	Created    string   `xml:"creationDate"`
-	Arch       string   `xml:"architecture"`
-	RootDevice string   `xml:"rootDeviceName"`
-	Tags       []ec2Tag `xml:"tagSet>item"`
-	Devices    []struct {
-		Name string `xml:"deviceName"`
-		Size int    `xml:"ebs>volumeSize"`
-	} `xml:"blockDeviceMapping>item"`
+	ID         string           `xml:"imageId"`
+	Name       string           `xml:"name"`
+	State      string           `xml:"imageState"`
+	Created    string           `xml:"creationDate"`
+	Arch       string           `xml:"architecture"`
+	RootDevice string           `xml:"rootDeviceName"`
+	Tags       []ec2Tag         `xml:"tagSet>item"`
+	Devices    []ec2ImageDevice `xml:"blockDeviceMapping>item"`
+}
+
+// ec2ImageDevice is one of an image's block device mappings.
+type ec2ImageDevice struct {
+	Name string `xml:"deviceName"`
+	// EBS is nil for an instance store (virtualName) or NoDevice entry.
+	EBS *struct {
+		Size int `xml:"volumeSize"`
+	} `xml:"ebs"`
+}
+
+// size is the mapping's EBS volume size in GiB (0 if none or unknown).
+func (d ec2ImageDevice) size() int {
+	if d.EBS == nil {
+		return 0
+	}
+	return d.EBS.Size
 }
 
 func (i ec2Image) tag(k string) string {
@@ -126,7 +140,7 @@ func (i ec2Image) created() time.Time {
 func (i ec2Image) rootSize() int {
 	for _, d := range i.Devices {
 		if d.Name == i.RootDevice {
-			return d.Size
+			return d.size()
 		}
 	}
 	return 0

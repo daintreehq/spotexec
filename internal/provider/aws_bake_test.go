@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,7 @@ type fakeImage struct {
 	id, name, state, arch string
 	created               time.Time
 	tags                  map[string]string
+	devices               string // blockDeviceMapping items besides the root's
 }
 
 type fakeInstance struct {
@@ -114,8 +116,8 @@ func (f *fakeBakeAPI) handler(t *testing.T) http.HandlerFunc {
 				if !ok {
 					continue
 				}
-				fmt.Fprintf(&b, "<item><imageId>%s</imageId><name>%s</name><imageState>%s</imageState><creationDate>%s</creationDate><architecture>%s</architecture><rootDeviceName>/dev/sda1</rootDeviceName><blockDeviceMapping><item><deviceName>/dev/sda1</deviceName><ebs><volumeSize>8</volumeSize></ebs></item></blockDeviceMapping><tagSet>",
-					img.id, img.name, img.state, img.created.UTC().Format("2006-01-02T15:04:05.000Z"), img.arch)
+				fmt.Fprintf(&b, "<item><imageId>%s</imageId><name>%s</name><imageState>%s</imageState><creationDate>%s</creationDate><architecture>%s</architecture><rootDeviceName>/dev/sda1</rootDeviceName><blockDeviceMapping><item><deviceName>/dev/sda1</deviceName><ebs><volumeSize>8</volumeSize></ebs></item>%s</blockDeviceMapping><tagSet>",
+					img.id, img.name, img.state, img.created.UTC().Format("2006-01-02T15:04:05.000Z"), img.arch, img.devices)
 				keys := make([]string, 0, len(img.tags))
 				for k := range img.tags {
 					keys = append(keys, k)
@@ -526,5 +528,174 @@ func TestLaunchPinnedAMINoFallback(t *testing.T) {
 	f.gone = map[string]bool{"ami-pinned": true}
 	if _, err := a.launchOrUnbaked(context.Background(), t.Logf, launchSpec{}); err == nil || len(f.runs) != 1 {
 		t.Fatalf("a pinned AMI that is gone must fail, not fall back: %v (%d requests)", err, len(f.runs))
+	}
+}
+
+// Fleet VMs get the work volume (#264): a second, blank gp3 disk that
+// user-data formats XFS for the work root. The bake builder never does
+// (CreateImage would capture it), nor a pinned AMI unless asked, nor a
+// launch whose user-data would no longer fit with its setup.
+func TestLaunchAttachesWorkVolume(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	launch := func(t *testing.T, spec launchSpec, edit func(r *config.Runner)) (url.Values, string) {
+		t.Helper()
+		f := &fakeBakeAPI{base: "ami-b2"}
+		a := newBakeEnv(t, f)
+		a.r.SecurityGroupIDs = []string{"sg-1"}
+		eph := ubuntuImg("ami-eph", time.Now())
+		eph.devices = "<item><deviceName>/dev/sdf</deviceName><virtualName>ephemeral0</virtualName></item><item><deviceName>xvdg</deviceName><virtualName>ephemeral1</virtualName></item>"
+		data := ubuntuImg("ami-data", time.Now())
+		data.devices = "<item><deviceName>/dev/sdh</deviceName><ebs><volumeSize>64</volumeSize></ebs></item>"
+		f.images = []*fakeImage{ubuntuImg("ami-b2", time.Now().Add(-48*time.Hour)), ubuntuImg("ami-pinned", time.Now()), eph, data}
+		if edit != nil {
+			edit(a.r)
+		}
+		if _, err := a.launchWith(context.Background(), t.Logf, spec); err != nil {
+			t.Fatalf("launch: %v", err)
+		}
+		if len(f.runs) != 1 {
+			t.Fatalf("%d RunInstances requests", len(f.runs))
+		}
+		ud, _ := base64.StdEncoding.DecodeString(f.runs[0].Get("UserData"))
+		return f.runs[0], string(ud)
+	}
+	gb := func(n int) *int { return &n }
+	t.Run("fleet VM", func(t *testing.T) {
+		v, ud := launch(t, launchSpec{}, nil)
+		for k, want := range map[string]string{"BlockDeviceMapping.2.DeviceName": "/dev/sdf", "BlockDeviceMapping.2.Ebs.VolumeType": "gp3",
+			"BlockDeviceMapping.2.Ebs.VolumeSize": "64", "BlockDeviceMapping.2.Ebs.DeleteOnTermination": "true"} {
+			if got := v.Get(k); got != want {
+				t.Errorf("%s = %q, want %q", k, got, want)
+			}
+		}
+		if !strings.Contains(ud, "sx_workvol()") || !strings.Contains(ud, "w='~/.cache/spotexec'") {
+			t.Error("user-data doesn't set up the work volume")
+		}
+	})
+	t.Run("past the image's own device names", func(t *testing.T) {
+		v, _ := launch(t, launchSpec{}, func(r *config.Runner) { r.AMI, r.WorkVolumeGB = "ami-eph", gb(64) })
+		if got := v.Get("BlockDeviceMapping.2.DeviceName"); got != "/dev/sdh" {
+			t.Errorf("work volume at %q, want /dev/sdh (sdf and xvdg are the image's)", got)
+		}
+	})
+	t.Run("bootstrap kept when the setup doesn't fit", func(t *testing.T) {
+		script := "echo keep-me\n" + strings.Repeat("#", 16*1024-11*1024)
+		v, ud := launch(t, launchSpec{}, func(r *config.Runner) { r.BootstrapScript = script })
+		if v.Get("BlockDeviceMapping.2.DeviceName") != "" || strings.Contains(ud, "sx_workvol") || !strings.Contains(ud, "echo keep-me") {
+			t.Errorf("mapping %v, bootstrap kept %v", v, strings.Contains(ud, "echo keep-me"))
+		}
+	})
+	t.Run("sized", func(t *testing.T) {
+		v, ud := launch(t, launchSpec{}, func(r *config.Runner) { r.WorkVolumeGB, r.WorkRoot = gb(200), "/mnt/sx" })
+		if v.Get("BlockDeviceMapping.2.Ebs.VolumeSize") != "200" || !strings.Contains(ud, "w='/mnt/sx'") || !strings.Contains(ud, "$2 == 214748364800 ") {
+			t.Errorf("mapping %v", v)
+		}
+	})
+	for name, c := range map[string]struct {
+		spec launchSpec
+		edit func(r *config.Runner)
+	}{
+		"bake builder":             {launchSpec{bake: true}, nil},
+		"pinned AMI":               {launchSpec{}, func(r *config.Runner) { r.AMI = "ami-pinned" }},
+		"turned off":               {launchSpec{}, func(r *config.Runner) { r.WorkVolumeGB = gb(0) }},
+		"odd work root":            {launchSpec{}, func(r *config.Runner) { r.WorkRoot = "~/my work" }},
+		"image maps a data volume": {launchSpec{}, func(r *config.Runner) { r.AMI, r.WorkVolumeGB = "ami-data", gb(64) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			v, ud := launch(t, c.spec, c.edit)
+			if v.Get("BlockDeviceMapping.2.DeviceName") != "" || strings.Contains(ud, "sx_workvol") {
+				t.Errorf("work volume attached: %v", v)
+			}
+		})
+	}
+}
+
+// A bootstrap script too large even without the work volume's setup still
+// fails before anything is launched.
+func TestLaunchUserDataTooLarge(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	f := &fakeBakeAPI{} // no base image: an AMI lookup would fail first
+	a := newBakeEnv(t, f)
+	a.r.SecurityGroupIDs = []string{"sg-1"}
+	a.r.BootstrapScript = strings.Repeat("#", 16*1024)
+	if _, err := a.launchWith(context.Background(), t.Logf, launchSpec{}); err == nil || !strings.Contains(err.Error(), "16 KiB") || len(f.runs) != 0 {
+		t.Fatalf("err %v, %d RunInstances requests", err, len(f.runs))
+	}
+}
+
+func TestWorkDevice(t *testing.T) {
+	img := func(root string, devs ...string) ec2Image {
+		i := ec2Image{ID: "ami-x", RootDevice: root}
+		for _, d := range devs {
+			// "name:size" is an EBS mapping, "name:ebs" one with no size
+			// given (a snapshot's), a bare name an instance store.
+			name, size, ebs := strings.Cut(d, ":")
+			dev := ec2ImageDevice{Name: name}
+			if ebs {
+				n, _ := strconv.Atoi(size)
+				dev.EBS = &struct {
+					Size int `xml:"volumeSize"`
+				}{n}
+			}
+			i.Devices = append(i.Devices, dev)
+		}
+		return i
+	}
+	for _, c := range []struct {
+		img  ec2Image
+		want string
+	}{
+		{img("/dev/sda1", "/dev/sda1:8"), "/dev/sdf"},
+		{img("/dev/xvda", "/dev/xvda:8"), "/dev/sdf"},
+		{img("/dev/sdf", "/dev/sdf:8"), "/dev/sdg"},
+		{img("/dev/sda1", "/dev/sda1:8", "/dev/sdf", "xvdg"), "/dev/sdh"},
+		{img("/dev/sda1", "/dev/sda1:8", "/dev/sdb:100"), ""},
+		{img("/dev/sda1", "/dev/sda1:8", "/dev/sdb:ebs"), ""},
+		{img("/dev/sdf1", "/dev/sdf1:8"), "/dev/sdg"},
+	} {
+		if got, why := workDevice(c.img); got != c.want || (got == "") != (why != "") {
+			t.Errorf("%+v: %q (%s), want %q", c.img, got, why, c.want)
+		}
+	}
+}
+
+// The work volume adds to the region's EBS storage: running out of it
+// moves the launch to another region, as a vCPU quota does.
+func TestVolumeQuotaIsRegionWide(t *testing.T) {
+	if !regionWide("VolumeLimitExceeded") || spotOnly("VolumeLimitExceeded") {
+		t.Fatal("VolumeLimitExceeded should be region-wide for Spot and on-demand alike")
+	}
+}
+
+// A baked image is checked for data volumes like any other: its mappings
+// come from the bake lookup, not a second DescribeImages.
+func TestLaunchBakedImageWithDataVolume(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	for name, devices := range map[string]string{
+		"none":     "",
+		"snapshot": "<item><deviceName>/dev/sdf</deviceName><ebs><snapshotId>snap-1</snapshotId></ebs></item>",
+	} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now()
+			f := &fakeBakeAPI{base: "ami-b2"}
+			a := newBakeEnv(t, f)
+			a.r.SecurityGroupIDs = []string{"sg-1"}
+			bake := bakeImg("ami-bake", testOwner, a.BakeHash(), "ami-b2", now.Add(-time.Hour))
+			bake.devices = devices
+			f.images = []*fakeImage{ubuntuImg("ami-b2", now.Add(-48*time.Hour)), bake}
+			if _, err := a.launchWith(context.Background(), t.Logf, launchSpec{}); err != nil {
+				t.Fatal(err)
+			}
+			if len(f.runs) != 1 || f.runs[0].Get("ImageId") != "ami-bake" {
+				t.Fatalf("not launched from the bake: %d requests", len(f.runs))
+			}
+			got := f.runs[0].Get("BlockDeviceMapping.2.DeviceName")
+			if want := map[string]string{"none": "/dev/sdf", "snapshot": ""}[name]; got != want {
+				t.Fatalf("work volume at %q, want %q", got, want)
+			}
+		})
 	}
 }
