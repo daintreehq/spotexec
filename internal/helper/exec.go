@@ -482,6 +482,7 @@ func (s *Session) exec(e protocol.Exec) error {
 	// container) before this helper is signalled itself: that is a lost
 	// runner, not the script's result. One that finished on its own is
 	// never one.
+	var ranFor time.Duration // the last script's own process
 	runPhase := func(shell, dir string, timeout time.Duration, out io.Writer) (pr procResult, shutdown, oom bool, err error) {
 		script, runEnv, cleanup := shell, env, func() error { return nil }
 		if strings.TrimSpace(e.Setup) != "" {
@@ -507,7 +508,9 @@ func (s *Session) exec(e protocol.Exec) error {
 			}
 			script, runEnv, cleanup = host, hostEnv, c
 		}
+		ran := time.Now()
 		pr = s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch, out)
+		ranFor = time.Since(ran)
 		shutdown = pr.startErr == nil && !pr.timedOut && shutdownExit(pr.code, e.Container != nil) && systemStopping()
 		if err := cleanup(); err != nil {
 			if shutdown {
@@ -564,11 +567,15 @@ func (s *Session) exec(e protocol.Exec) error {
 			_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "setup_done", Message: fmt.Sprintf("%dms", setupMS)})
 		}
 	}
+	var commandMS int64
 	if !setupFailed {
 		pr, shutdown, oom, err = runPhase(e.Shell, dir, timeout, nil)
 		if err != nil {
 			stuck = true
 			return err
+		}
+		if pr.startErr == nil {
+			commandMS = max(ranFor.Milliseconds(), 1)
 		}
 	}
 	// The command and its container are gone: collecting and writing back
@@ -577,7 +584,7 @@ func (s *Session) exec(e protocol.Exec) error {
 	res := protocol.Result{
 		ExitCode: pr.code, Signal: pr.signal, TimedOut: pr.timedOut, Canceled: pr.canceled,
 		Interrupted: pr.spotIntr || s.interrupted.Load(), DurationMS: time.Since(start).Milliseconds(),
-		Shutdown: shutdown, SetupFailed: setupFailed, SetupMS: setupMS,
+		Shutdown: shutdown, SetupFailed: setupFailed, SetupMS: setupMS, CommandMS: commandMS,
 	}
 	if pr.startErr != nil {
 		res.StartError = pr.startErr.Error()

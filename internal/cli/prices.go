@@ -314,20 +314,32 @@ func speedFactor(m *provider.RunCostModel) string {
 	if len(m.MeasuredSpeeds) == 0 {
 		return "a slower type (SPEED, assumed: " + gen + "; measured instead once the same command has run 3 times on each of two types)"
 	}
-	types := make([]string, 0, len(m.MeasuredSpeeds))
-	for t := range m.MeasuredSpeeds {
-		types = append(types, t)
-	}
-	sort.Strings(types)
-	var parts []string
-	for _, t := range types {
-		s := m.MeasuredSpeeds[t]
-		if s.Against == t {
-			continue
+	// Each group of types measured against each other, against its
+	// newest generation.
+	byGroup := map[string][]string{}
+	var groups []string
+	for t, sp := range m.MeasuredSpeeds {
+		if byGroup[sp.Group] == nil {
+			groups = append(groups, sp.Group)
 		}
-		parts = append(parts, fmt.Sprintf("%s at %.0f%% of %s", t, s.Relative*100, s.Against))
+		byGroup[sp.Group] = append(byGroup[sp.Group], t)
 	}
-	return fmt.Sprintf("a slower type (SPEED, measured from the same commands' successful runs on each type lately: %s; assumed for other types: %s)", strings.Join(parts, ", "), gen)
+	sort.Strings(groups)
+	var parts []string
+	for _, g := range groups {
+		types := byGroup[g]
+		sort.Strings(types)
+		var ts []string
+		for _, t := range types {
+			ts = append(ts, fmt.Sprintf("%s %.0f%%", t, m.MeasuredSpeeds[t].Relative*100))
+		}
+		against := "the group's average"
+		if gen := m.MeasuredSpeeds[types[0]].Generation; gen > 0 {
+			against = fmt.Sprintf("generation %d", gen)
+		}
+		parts = append(parts, strings.Join(ts, ", ")+" of "+against)
+	}
+	return fmt.Sprintf("a slower type (SPEED, measured from the same commands' successful runs on each type lately: %s; assumed for other types: %s)", strings.Join(parts, "; "), gen)
 }
 
 // coldMinutes is one part of a cold start as the run-cost note shows it:

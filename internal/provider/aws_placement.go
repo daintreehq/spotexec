@@ -205,13 +205,13 @@ func (g *AWSGlobal) Rank(t PriceTable) Ranking {
 	ev := placementEvidence{now: g.clock(), warm: map[string]time.Time{}, rtt: map[string]time.Duration{}, found: t.warmth}
 	held := map[string]cooldown{}
 	var work *coldWork
-	var speeds map[string]TypeSpeed
+	var speed map[string]map[string][]speedSample
 	_ = g.withState(func(st *placementState) {
 		if t.repoID != "" {
 			work = st.ColdWork[t.repoID]
 		}
-		if g.r.ByRequirements() {
-			speeds = measuredSpeeds(st.Speed, ev.now)
+		if g.r.ByRequirements() && g.rankOrder() == config.LaunchRunCost {
+			speed = st.Speed // st is this call's own copy: fitted below, outside the lock
 		}
 		for _, p := range t.Prices {
 			if c, ok := st.Cooldown[reclaimKey(p)]; ok && ev.now.Before(c.Until) {
@@ -235,7 +235,7 @@ func (g *AWSGlobal) Rank(t PriceTable) Ranking {
 	if k.Order == config.LaunchRunCost {
 		k.Model = g.costModel(work, ev.now)
 		if k.Model.SpeedByGen {
-			k.Model.MeasuredSpeeds = speeds
+			k.Model.MeasuredSpeeds = measuredSpeeds(speed, ev.now)
 		}
 		k.Cost = runCosts(*k.Model, ps, ev)
 		idx := make([]int, len(ps))
@@ -302,20 +302,32 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 		return 1
 	}
 	// speedOf is a type's speed in the same units: a measured type is
-	// placed against the type it was measured against, which keeps its
-	// speed by generation (so a newer type never measured still ranks as
-	// the assumption has it).
-	speedOf := func(t string) (float64, bool) {
+	// placed against the newest generation it was measured with, which
+	// keeps its speed by generation (so a newer type never measured still
+	// ranks as the assumption has it).
+	speedOf := func(t string) float64 {
 		if s, ok := m.MeasuredSpeeds[t]; ok && s.Relative > 0 {
-			return byGen(s.Against) * s.Relative, true
+			if s.Generation > 0 {
+				return math.Pow(m.GenSpeedup, float64(s.Generation-maxGen)) * s.Relative
+			}
+			return s.Relative
 		}
-		return byGen(t), false
+		return byGen(t)
 	}
-	fastest := 0.0
+	// The fastest option (a measured one on a tie), which every option's
+	// speed is against: a ratio is measured only when both types were
+	// measured against each other.
+	fastest, fastGroup := 0.0, ""
 	if m.SpeedByGen {
 		for _, p := range ps {
-			s, _ := speedOf(p.Type)
-			fastest = max(fastest, s)
+			s := speedOf(p.Type)
+			ms, measured := m.MeasuredSpeeds[p.Type]
+			if s > fastest || s == fastest && measured && fastGroup == "" {
+				fastest, fastGroup = s, ""
+				if measured {
+					fastGroup = ms.Group
+				}
+			}
 		}
 	}
 	minRTT := time.Duration(-1)
@@ -332,9 +344,8 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 		price, wait := p.USD(), m.WaitCost
 		c := RunCost{RelSpeed: 1}
 		if m.SpeedByGen && fastest > 0 {
-			s, measured := speedOf(p.Type)
-			c.RelSpeed, c.SpeedFrom = s/fastest, SpeedByGeneration
-			if measured {
+			c.RelSpeed, c.SpeedFrom = speedOf(p.Type)/fastest, SpeedByGeneration
+			if ms, ok := m.MeasuredSpeeds[p.Type]; ok && fastGroup != "" && ms.Group == fastGroup {
 				c.SpeedFrom = SpeedMeasured
 			}
 		}
@@ -445,8 +456,8 @@ func (c RunCost) Factors() string {
 
 // Where a RunCost's speed came from (SpeedFrom).
 const (
-	SpeedMeasured     = "measured"   // the runner's own runs (see measuredSpeeds)
-	SpeedByGeneration = "generation" // assumed from the type's generation (genSpeedup)
+	SpeedMeasured     = "measured"   // the runner's own runs, against the fastest option (see measuredSpeeds)
+	SpeedByGeneration = "generation" // assumed, at least in part, from generations (genSpeedup)
 )
 
 // SpeedNote says how fast the option's type is against the fastest

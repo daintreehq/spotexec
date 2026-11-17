@@ -129,12 +129,32 @@ func mustEval(t *testing.T, p string) string {
 	return r
 }
 
+// The command's own time leaves the setup out (#279: placement compares
+// types by it).
+func TestExecCommandTimeLeavesSetupOut(t *testing.T) {
+	o, _ := runExec(t, protocol.Exec{SetupRun: `sleep 0.6`, Shell: `sleep 0.2`, Snapshot: true}, "")
+	if o.res.SetupFailed || o.res.ExitCode != 0 {
+		t.Fatalf("result %+v", o.res)
+	}
+	if o.res.CommandMS < 200 || o.res.CommandMS >= 600 || o.res.SetupMS < 600 || o.res.DurationMS < o.res.SetupMS+o.res.CommandMS {
+		t.Fatalf("command %d ms, setup %d ms, all %d ms", o.res.CommandMS, o.res.SetupMS, o.res.DurationMS)
+	}
+	// A command that never started has no time.
+	o, _ = runExec(t, protocol.Exec{Shell: `true`, Cwd: "missing-dir", Snapshot: true}, "")
+	if o.res.StartError != "" && o.res.CommandMS != 0 {
+		t.Fatalf("not started: %+v", o.res)
+	}
+}
+
 // A failed setup shows its output, reports its exit code and never starts
 // the command.
 func TestExecSetupFailureStopsTheCommand(t *testing.T) {
 	o, ws := runExec(t, protocol.Exec{SetupRun: `echo why-it-failed; exit 7`, Shell: `touch ran`, Snapshot: true}, "")
 	if !o.res.SetupFailed || o.res.ExitCode != 7 {
 		t.Fatalf("result %+v", o.res)
+	}
+	if o.res.CommandMS != 0 {
+		t.Errorf("the command never ran, but took %d ms", o.res.CommandMS)
 	}
 	if !strings.Contains(o.stderr, "why-it-failed") || o.stdout != "" {
 		t.Errorf("stdout %q, stderr %q", o.stdout, o.stderr)

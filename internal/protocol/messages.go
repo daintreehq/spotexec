@@ -468,6 +468,10 @@ type Result struct {
 	// TimedOut, Canceled, StartError and OOMKilled then describe the setup.
 	SetupFailed bool  `json:"setup_failed,omitempty"`
 	SetupMS     int64 `json:"setup_ms,omitempty"`
+	// CommandMS is how long the command's own process ran, without the
+	// setup, preparing its container or collecting results (0: it never
+	// ran, or an older helper).
+	CommandMS int64 `json:"command_ms,omitempty"`
 }
 
 // Heartbeat is the body of a helper heartbeat (empty from older helpers):

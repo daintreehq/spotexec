@@ -29,10 +29,10 @@ func TestMeasuredSpeedsOneWorkload(t *testing.T) {
 	runs(st, now, "typecheck", "m7a.2xlarge", 101, 105, 112, 73)
 	got := measuredSpeeds(st.Speed, now.Add(time.Minute))
 	m7a, r8a := got["m7a.2xlarge"], got["r8a.2xlarge"]
-	if m7a.Against != "r8a.2xlarge" || !approx(m7a.Relative, 72.0/103) || m7a.Runs != 4 || m7a.Workload != 1 {
+	if m7a.Generation != 8 || m7a.Group != "m7a.2xlarge" || !approx(m7a.Relative, 72.0/103) || m7a.Runs != 4 || m7a.Workload != 1 {
 		t.Fatalf("m7a %+v", m7a)
 	}
-	if r8a.Against != "r8a.2xlarge" || r8a.Relative != 1 || r8a.Runs != 5 {
+	if r8a.Generation != 8 || r8a.Group != "m7a.2xlarge" || !approx(r8a.Relative, 1) || r8a.Runs != 5 {
 		t.Fatalf("r8a %+v", r8a)
 	}
 	if len(got) != 2 {
@@ -78,36 +78,109 @@ func TestMeasuredSpeedsChainsAndGroups(t *testing.T) {
 	runs(st, now, "w3", "c7i.2xlarge", 40, 40, 40)
 	got := measuredSpeeds(st.Speed, now.Add(time.Minute))
 	want := map[string]TypeSpeed{
-		"m8a.2xlarge": {Relative: 1, Against: "m8a.2xlarge", Runs: 3, Workload: 1},
-		"m6a.2xlarge": {Relative: 0.5, Against: "m8a.2xlarge", Runs: 3 + speedSamples, Workload: 2},
-		"m7a.2xlarge": {Relative: 30.0 / 45, Against: "m8a.2xlarge", Runs: 3, Workload: 1},
-		"c7i.2xlarge": {Relative: 1, Against: "c7i.2xlarge", Runs: 3, Workload: 1},
-		"c6i.2xlarge": {Relative: 0.8, Against: "c7i.2xlarge", Runs: 3, Workload: 1},
+		"m8a.2xlarge": {Relative: 1, Generation: 8, Group: "m6a.2xlarge", Runs: 3, Workload: 1},
+		"m6a.2xlarge": {Relative: 0.5, Generation: 8, Group: "m6a.2xlarge", Runs: 3 + speedSamples, Workload: 2},
+		"m7a.2xlarge": {Relative: 30.0 / 45, Generation: 8, Group: "m6a.2xlarge", Runs: 3, Workload: 1},
+		"c7i.2xlarge": {Relative: 1, Generation: 7, Group: "c6i.2xlarge", Runs: 3, Workload: 1},
+		"c6i.2xlarge": {Relative: 0.8, Generation: 7, Group: "c6i.2xlarge", Runs: 3, Workload: 1},
 	}
+	checkSpeeds(t, got, want)
+}
+
+func checkSpeeds(t *testing.T, got, want map[string]TypeSpeed) {
+	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("got %+v", got)
 	}
 	for it, w := range want {
 		g := got[it]
-		if !approx(g.Relative, w.Relative) || g.Against != w.Against || g.Runs != w.Runs || g.Workload != w.Workload {
+		if !approx(g.Relative, w.Relative) || g.Generation != w.Generation || g.Group != w.Group || g.Runs != w.Runs || g.Workload != w.Workload {
 			t.Errorf("%s: %+v, want %+v", it, g, w)
 		}
 	}
 }
 
-// Within a generation, the type with the most runs is the reference, and
-// an older type may measure faster than a newer one.
+// A long chain of comparisons resolves exactly: eight types, with many
+// workloads at the ends and one per link between, A-D running twice as
+// fast as E-H.
+func TestMeasuredSpeedsLongChain(t *testing.T) {
+	now := time.Date(2026, 11, 17, 15, 0, 0, 0, time.UTC)
+	st := &placementState{}
+	types := []string{"a1.x", "b1.x", "c1.x", "d1.x", "e1.x", "f1.x", "g1.x", "h1.x"}
+	secs := func(i int) float64 { return float64(10 * (1 + i/4)) }
+	n := 0
+	link := func(i, times int) {
+		for k := 0; k < times; k++ {
+			w := fmt.Sprintf("w%02d", n)
+			n++
+			runs(st, now, w, types[i], secs(i), secs(i), secs(i))
+			runs(st, now, w, types[i+1], secs(i+1), secs(i+1), secs(i+1))
+		}
+	}
+	link(0, 29)
+	for i := 1; i < 6; i++ {
+		link(i, 1)
+	}
+	link(6, 29)
+	got := measuredSpeeds(st.Speed, now.Add(time.Minute))
+	// All generation 1: centred on all eight, which average sqrt(1*0.5).
+	for i, it := range types {
+		want := 1 / math.Sqrt(0.5)
+		if i >= 4 {
+			want /= 2
+		}
+		if g := got[it]; !approx(g.Relative, want) {
+			t.Errorf("%s: %+v, want %v", it, g, want)
+		}
+	}
+}
+
+// Each workload weighs the same, however often it ran: one comparing m7a
+// with m8a at 0.5 nine times a type, another at 0.8 three times a type,
+// meet at their geometric mean.
+func TestMeasuredSpeedsWorkloadsWeighTheSame(t *testing.T) {
+	now := time.Date(2026, 11, 17, 15, 0, 0, 0, time.UTC)
+	st := &placementState{}
+	nine := []float64{10, 10, 10, 10, 10, 10, 10, 10, 10}
+	runs(st, now, "often", "m8a.2xlarge", nine...)
+	runs(st, now, "often", "m7a.2xlarge", 20, 20, 20, 20, 20, 20, 20, 20, 20)
+	runs(st, now, "seldom", "m8a.2xlarge", 40, 40, 40)
+	runs(st, now, "seldom", "m7a.2xlarge", 50, 50, 50)
+	got := measuredSpeeds(st.Speed, now.Add(time.Minute))
+	if g := got["m7a.2xlarge"]; !approx(g.Relative, math.Sqrt(0.5*0.8)) || g.Workload != 2 || g.Runs != 12 {
+		t.Fatalf("m7a %+v, want %v", g, math.Sqrt(0.4))
+	}
+	// Within a workload, a type with more runs weighs more: m6a, linked
+	// through one workload where m8a ran 9 times and m7a 3, is placed
+	// against both as their weighted fit has it.
+	runs(st, now, "third", "m8a.2xlarge", nine...)
+	runs(st, now, "third", "m7a.2xlarge", 15, 15, 15)
+	runs(st, now, "third", "m6a.2xlarge", 40, 40, 40)
+	got = measuredSpeeds(st.Speed, now.Add(time.Minute))
+	if g := got["m6a.2xlarge"]; g.Group != "m6a.2xlarge" || !(g.Relative > 0.2 && g.Relative < 0.3) {
+		t.Fatalf("m6a %+v", g)
+	}
+}
+
+// The reference is the group's newest generation, centred on its types:
+// more runs of one of them don't move it, and an older type may measure
+// faster than a newer one.
 func TestMeasuredSpeedsReference(t *testing.T) {
 	now := time.Date(2026, 11, 17, 15, 0, 0, 0, time.UTC)
 	st := &placementState{}
 	runs(st, now, "w", "m7a.2xlarge", 100, 100, 100)
 	runs(st, now, "w", "r7a.2xlarge", 110, 110, 110, 110)
 	runs(st, now, "w", "m6i.2xlarge", 80, 80, 80, 80, 80)
-	got := measuredSpeeds(st.Speed, now.Add(time.Minute))
-	for it, rel := range map[string]float64{"r7a.2xlarge": 1, "m7a.2xlarge": 1.1, "m6i.2xlarge": 110.0 / 80} {
-		if g := got[it]; g.Against != "r7a.2xlarge" || !approx(g.Relative, rel) {
-			t.Errorf("%s: %+v, want %v against r7a", it, g, rel)
+	mean := math.Sqrt(100 * 110)
+	want := map[string]float64{"m7a.2xlarge": mean / 100, "r7a.2xlarge": mean / 110, "m6i.2xlarge": mean / 80}
+	for round := 0; round < 2; round++ {
+		got := measuredSpeeds(st.Speed, now.Add(time.Minute))
+		for it, rel := range want {
+			if g := got[it]; g.Generation != 7 || !approx(g.Relative, rel) {
+				t.Errorf("round %d, %s: %+v, want %v", round, it, g, rel)
+			}
 		}
+		runs(st, now, "w", "m7a.2xlarge", 100, 100, 100)
 	}
 }
 
@@ -126,11 +199,16 @@ func TestRecordSpeedBounds(t *testing.T) {
 	}
 	at := now.Add(time.Hour)
 	for i := 0; i < speedWorkloads+3; i++ {
+		if i == speedWorkloads {
+			// The first by name, run again: the least recently run go.
+			recordSpeed(st, "w000", "m7a.2xlarge", time.Second, at.Add(time.Duration(i)*time.Second))
+		}
 		recordSpeed(st, fmt.Sprintf("w%03d", i), "m7a.2xlarge", time.Second, at.Add(time.Duration(i)*time.Second))
 	}
-	if len(st.Speed) != speedWorkloads || st.Speed["w"] != nil || st.Speed["w000"] != nil || st.Speed["w002"] != nil || st.Speed["w003"] == nil {
-		t.Fatalf("%d workloads; w %v, w003 %v", len(st.Speed), st.Speed["w"] != nil, st.Speed["w003"] != nil)
+	if len(st.Speed) != speedWorkloads || st.Speed["w"] != nil || st.Speed["w000"] == nil || st.Speed["w001"] != nil || st.Speed["w003"] != nil || st.Speed["w004"] == nil {
+		t.Fatalf("%d workloads; w %v, w000 %v, w001 %v, w004 %v", len(st.Speed), st.Speed["w"] != nil, st.Speed["w000"] != nil, st.Speed["w001"] != nil, st.Speed["w004"] != nil)
 	}
+	delete(st.Speed, "w000")
 	at = at.Add(time.Hour)
 	types := []string{"m6a", "m7a", "m8a", "r7a", "r8a"}
 	for i := 0; i < speedWorkloads; i++ {
@@ -224,7 +302,7 @@ func TestRunCostMeasuredSpeedRanks(t *testing.T) {
 		t.Fatal(err)
 	}
 	k := g.Rank(tbl)
-	if s := k.Model.MeasuredSpeeds["m6i.2xlarge"]; !approx(s.Relative, 1) || s.Against != "m7a.2xlarge" || s.Runs != 3 {
+	if s := k.Model.MeasuredSpeeds["m6i.2xlarge"]; !approx(s.Relative, 1) || s.Generation != 7 || s.Group != "m6i.2xlarge" || s.Runs != 3 {
 		t.Fatalf("model %+v", k.Model.MeasuredSpeeds)
 	}
 	for _, p := range k.Prices {
@@ -260,5 +338,43 @@ func TestRunCostMeasuredSpeedRanks(t *testing.T) {
 	}
 	if m6i.SpeedFrom != SpeedMeasured || !strings.Contains(m6i.Factors(), "slower type (83% speed, measured)") {
 		t.Fatalf("m6i %+v: %s", m6i, m6i.Factors())
+	}
+}
+
+// A speed is marked measured only against a fastest option measured with
+// it: against a newer type never measured, the ratio is partly assumed.
+// On a tie for fastest, the measured type is the one compared against.
+func TestRunCostsMeasuredLabel(t *testing.T) {
+	m := RunCostModel{WaitCost: 1, HorizonMinutes: 60, GenSpeedup: genSpeedup, RoundTrips: runRoundTrips, SpeedByGen: true,
+		MeasuredSpeeds: map[string]TypeSpeed{
+			"m6a.2xlarge": {Relative: 0.69, Generation: 7, Group: "m6a.2xlarge"},
+			"m7a.2xlarge": {Relative: 1, Generation: 7, Group: "m6a.2xlarge"},
+		}}
+	opts := func(types ...string) []SpotPrice {
+		var ps []SpotPrice
+		for _, it := range types {
+			ps = append(ps, SpotPrice{Region: "r", Zone: "a", Type: it, Price: "0.10"})
+		}
+		return ps
+	}
+	c := runCosts(m, opts("m8a.2xlarge", "m7a.2xlarge", "m6a.2xlarge"), placementEvidence{now: time.Now()})
+	for it, want := range map[string]RunCost{
+		"m8a.2xlarge": {RelSpeed: 1, SpeedFrom: SpeedByGeneration},
+		"m7a.2xlarge": {RelSpeed: 1 / 1.1, SpeedFrom: SpeedByGeneration},
+		"m6a.2xlarge": {RelSpeed: 0.69 / 1.1, SpeedFrom: SpeedByGeneration},
+	} {
+		if got := c["r/a/"+it]; !approx(got.RelSpeed, want.RelSpeed) || got.SpeedFrom != want.SpeedFrom {
+			t.Errorf("against m8a, %s: %+v", it, got)
+		}
+	}
+	c = runCosts(m, opts("m7a.2xlarge", "m6a.2xlarge", "c7a.2xlarge"), placementEvidence{now: time.Now()})
+	for it, want := range map[string]RunCost{
+		"c7a.2xlarge": {RelSpeed: 1, SpeedFrom: SpeedByGeneration},
+		"m7a.2xlarge": {RelSpeed: 1, SpeedFrom: SpeedMeasured},
+		"m6a.2xlarge": {RelSpeed: 0.69, SpeedFrom: SpeedMeasured},
+	} {
+		if got := c["r/a/"+it]; !approx(got.RelSpeed, want.RelSpeed) || got.SpeedFrom != want.SpeedFrom {
+			t.Errorf("tie, %s: %+v", it, got)
+		}
 	}
 }

@@ -250,8 +250,10 @@ func TestPricesShowMeasuredSpeed(t *testing.T) {
 	v.k.Cost[optionKey(slowOpt)] = slow
 	m := *model
 	m.MeasuredSpeeds = map[string]provider.TypeSpeed{
-		"m6a.2xlarge": {Relative: 0.69, Against: "m7a.2xlarge", Runs: 27, Workload: 1},
-		"m7a.2xlarge": {Relative: 1, Against: "m7a.2xlarge", Runs: 66, Workload: 1},
+		"m6a.2xlarge": {Relative: 0.69, Generation: 7, Group: "m6a.2xlarge", Runs: 27, Workload: 1},
+		"m7a.2xlarge": {Relative: 1, Generation: 7, Group: "m6a.2xlarge", Runs: 66, Workload: 1},
+		"c6i.2xlarge": {Relative: 0.8, Generation: 7, Group: "c6i.2xlarge", Runs: 3, Workload: 1},
+		"c7i.2xlarge": {Relative: 1, Generation: 7, Group: "c6i.2xlarge", Runs: 3, Workload: 1},
 	}
 	v.k.Model = &m
 	var b bytes.Buffer
@@ -260,11 +262,41 @@ func TestPricesShowMeasuredSpeed(t *testing.T) {
 	if got := strings.Join(strings.Fields(row(strings.Split(out, "\n"), "ap-south-2a")), " "); !strings.Contains(got, "+0.103 69% measured +0.034") {
 		t.Errorf("row: %q", got)
 	}
-	want := "a slower type (SPEED, measured from the same commands' successful runs on each type lately: m6a.2xlarge at 69% of m7a.2xlarge; assumed for other types: each instance generation counts as 10% faster per vCPU)"
+	want := "a slower type (SPEED, measured from the same commands' successful runs on each type lately: c6i.2xlarge 80%, c7i.2xlarge 100% of generation 7; m6a.2xlarge 69%, m7a.2xlarge 100% of generation 7; assumed for other types: each instance generation counts as 10% faster per vCPU)"
 	if !strings.Contains(out, want) {
 		t.Errorf("missing %q in:\n%s", want, out)
 	}
 	if c := v.k.Cost[optionKey(slowOpt)]; !strings.Contains(c.Factors(), "+$0.103 slower type (69% speed, measured)") {
 		t.Errorf("factors: %s", c.Factors())
+	}
+	// In JSON, under the keys scripts read.
+	b.Reset()
+	if err := v.writeJSON(&b); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Model struct {
+			Measured map[string]map[string]any `json:"measured_speeds"`
+		} `json:"run_cost_model"`
+		Prices []struct {
+			Type    string         `json:"type"`
+			RunCost map[string]any `json:"run_cost"`
+		} `json:"prices"`
+	}
+	if err := json.Unmarshal(b.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if s := got.Model.Measured["m6a.2xlarge"]; s["relative"] != 0.69 || s["generation"] != 7.0 || s["group"] != "m6a.2xlarge" || s["runs"] != 27.0 || s["workloads"] != 1.0 {
+		t.Errorf("measured_speeds: %v", got.Model.Measured)
+	}
+	from := map[string]any{}
+	for _, p := range got.Prices {
+		if p.Type == "m6a.2xlarge" && p.RunCost["relative_speed"] != 0.69 {
+			t.Errorf("relative_speed: %v", p.RunCost)
+		}
+		from[p.Type] = p.RunCost["speed_from"]
+	}
+	if from["m6a.2xlarge"] != "measured" || from["m7a.2xlarge"] != "generation" {
+		t.Errorf("speed_from: %v", from)
 	}
 }

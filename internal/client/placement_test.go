@@ -163,22 +163,35 @@ func TestRecordColdWorkKeepsBuildTimes(t *testing.T) {
 	}
 }
 
-// A workload is the same in every worktree of a project, and differs by
-// what would change how long it runs: the command, its environment (a
-// shard), the directory and having the VM to itself.
+// A workload is the same in every worktree of a project and every slot,
+// and differs by what would change how long it runs: the command, its
+// environment (a shard, a forwarded variable, the CPU share), the
+// directory and having the VM to itself.
 func TestSpeedWorkload(t *testing.T) {
-	o := Options{Command: "npm run typecheck", Env: map[string]string{"SHARD": "1", "TOTAL": "4"}}
-	base := SpeedWorkload("app-1234", ".", o)
-	if len(base) != 16 || SpeedWorkload("app-1234", ".", Options{Command: o.Command, Env: map[string]string{"TOTAL": "4", "SHARD": "1"}}) != base {
-		t.Fatalf("not stable: %q", base)
+	o := Options{Command: "npm run typecheck"}
+	env := func(extra ...string) map[string]string {
+		e := map[string]string{"SHARD": "1", "SPOTEXEC_CPUS": "2", "SPOTEXEC_SLOT": "1", "SPOTEXEC_RUN_ID": "r1",
+			"SPOTEXEC_ATTEMPT": "1", "SPOTEXEC_WORKSPACE": "/w/1", "SPOTEXEC_PORT_BASE": "21000", "COMPOSE_PROJECT_NAME": "sx_app_s01"}
+		for i := 0; i+1 < len(extra); i += 2 {
+			e[extra[i]] = extra[i+1]
+		}
+		return e
+	}
+	base := SpeedWorkload("app-1234", ".", o, env())
+	same := SpeedWorkload("app-1234", ".", o, env("SPOTEXEC_SLOT", "3", "SPOTEXEC_RUN_ID", "r2", "SPOTEXEC_ATTEMPT", "2",
+		"SPOTEXEC_WORKSPACE", "/w/3", "SPOTEXEC_PORT_BASE", "23000", "COMPOSE_PROJECT_NAME", "sx_app_s03", "FORCE_COLOR", "1"))
+	if len(base) != 16 || same != base {
+		t.Fatalf("another slot or run: %q, want %q", same, base)
 	}
 	seen := map[string]string{base: "base"}
 	for name, w := range map[string]string{
-		"repo":      SpeedWorkload("other-1234", ".", o),
-		"cwd":       SpeedWorkload("app-1234", "web", o),
-		"command":   SpeedWorkload("app-1234", ".", Options{Command: "npm test", Env: o.Env}),
-		"env":       SpeedWorkload("app-1234", ".", Options{Command: o.Command, Env: map[string]string{"SHARD": "2", "TOTAL": "4"}}),
-		"exclusive": SpeedWorkload("app-1234", ".", Options{Command: o.Command, Env: o.Env, Exclusive: true}),
+		"repo":      SpeedWorkload("other-1234", ".", o, env()),
+		"cwd":       SpeedWorkload("app-1234", "web", o, env()),
+		"command":   SpeedWorkload("app-1234", ".", Options{Command: "npm test"}, env()),
+		"shard":     SpeedWorkload("app-1234", ".", o, env("SHARD", "2")),
+		"forwarded": SpeedWorkload("app-1234", ".", o, env("SUITE", "full")),
+		"cpus":      SpeedWorkload("app-1234", ".", o, env("SPOTEXEC_CPUS", "4")),
+		"exclusive": SpeedWorkload("app-1234", ".", Options{Command: o.Command, Exclusive: true}, env()),
 	} {
 		if prev, ok := seen[w]; ok {
 			t.Errorf("%s: same workload as %s", name, prev)
@@ -187,39 +200,53 @@ func TestSpeedWorkload(t *testing.T) {
 	}
 }
 
-// Only a clean exit 0 on a fleet VM of a known type is kept, as the
-// command's own time without [setup].
-func TestRecordRunSpeed(t *testing.T) {
+// Only a clean exit 0 on a fleet VM of a known type of a vcpus runner is
+// kept (one that finished after a Spot notice too), as the command's own
+// process time.
+func TestRunSpeed(t *testing.T) {
 	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
 	r := &config.Runner{Name: "fleet", Type: config.TypeAWSSpot, VCPUs: 8}
 	lease := &Lease{Runner: r, InstanceID: "i-1", Instance: provider.Instance{Type: "m7a.2xlarge"}}
 	ws := &Workspace{RepoID: "app-1234", Cwd: "."}
 	o := Options{Command: "npm run typecheck"}
-	ok := protocol.Result{DurationMS: 75000, SetupMS: 5000}
+	env := map[string]string{"SPOTEXEC_CPUS": "2"}
+	ok := protocol.Result{DurationMS: 95000, SetupMS: 5000, CommandMS: 70000}
 	for name, res := range map[string]protocol.Result{
-		"failed":       {ExitCode: 1, DurationMS: 1000},
-		"timed out":    {TimedOut: true, DurationMS: 1000},
-		"canceled":     {Canceled: true, DurationMS: 1000},
-		"shutdown":     {Shutdown: true, DurationMS: 1000},
-		"setup failed": {SetupFailed: true, DurationMS: 1000},
-		"oom":          {OOMKilled: true, DurationMS: 1000},
-		"not started":  {StartError: "no shell", DurationMS: 1000},
-		"no time":      {DurationMS: 5000, SetupMS: 5000},
+		"failed":       {ExitCode: 1, CommandMS: 1000},
+		"timed out":    {TimedOut: true, CommandMS: 1000},
+		"canceled":     {Canceled: true, CommandMS: 1000},
+		"shutdown":     {Shutdown: true, CommandMS: 1000},
+		"withdrawn":    {Withdrawn: true, CommandMS: 1000},
+		"setup failed": {SetupFailed: true, CommandMS: 1000},
+		"oom":          {OOMKilled: true, CommandMS: 1000},
+		"not started":  {StartError: "no shell", CommandMS: 1000},
+		"older helper": {DurationMS: 5000},
 	} {
-		recordRunSpeed(lease, ws, o, res, false)
-		if s := speedState(t, r); s != nil {
-			t.Fatalf("%s: recorded %v", name, s)
+		if s := runSpeed(lease, ws, o, res, env, false); s != nil {
+			t.Errorf("%s: kept %+v", name, s)
 		}
 	}
-	recordRunSpeed(lease, ws, o, ok, true) // interrupted
-	recordRunSpeed(&Lease{Runner: r, Instance: provider.Instance{Type: "m7a.2xlarge"}}, ws, o, ok, false)
-	recordRunSpeed(&Lease{Runner: r, InstanceID: "i-1"}, ws, o, ok, false)
+	for name, l := range map[string]*Lease{
+		"static":       {Runner: r, Instance: provider.Instance{Type: "m7a.2xlarge"}},
+		"unknown type": {Runner: r, InstanceID: "i-1"},
+		"listed types": {Runner: &config.Runner{Name: "l", Type: config.TypeAWSSpot, InstanceTypes: []string{"m7a.2xlarge"}}, InstanceID: "i-1", Instance: provider.Instance{Type: "m7a.2xlarge"}},
+	} {
+		if s := runSpeed(l, ws, o, ok, env, false); s != nil {
+			t.Errorf("%s: kept %+v", name, s)
+		}
+	}
+	if s := runSpeed(lease, ws, o, ok, env, true); s != nil {
+		t.Errorf("interrupted: kept %+v", s)
+	}
+	recordRunSpeed(nil)
 	if s := speedState(t, r); s != nil {
 		t.Fatalf("recorded %v", s)
 	}
-	recordRunSpeed(lease, ws, o, ok, false)
+	noticed := ok
+	noticed.Interrupted = true
+	recordRunSpeed(runSpeed(lease, ws, o, noticed, env, false))
 	s := speedState(t, r)
-	w := SpeedWorkload(ws.RepoID, ws.Cwd, o)
+	w := SpeedWorkload(ws.RepoID, ws.Cwd, o, env)
 	if len(s) != 1 || len(s[w]["m7a.2xlarge"]) != 1 || s[w]["m7a.2xlarge"][0].MS != 70000 {
 		t.Fatalf("speed %v", s)
 	}

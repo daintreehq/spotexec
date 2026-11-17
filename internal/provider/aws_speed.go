@@ -36,9 +36,7 @@ const (
 	speedCells     = 256
 	// speedLockWait bounds how long a run waits to record its time: it is
 	// skipped rather than holding the run up.
-	speedLockWait = 2 * time.Second
-	// speedFitRounds bounds the rounds of the fit in measuredSpeeds.
-	speedFitRounds = 500
+	speedLockWait = 500 * time.Millisecond
 )
 
 // speedSample is one run's command time.
@@ -49,13 +47,17 @@ type speedSample struct {
 
 // TypeSpeed is a type's speed as measured from the runner's own runs.
 type TypeSpeed struct {
-	// Relative is its speed against Against, the newest generation of
-	// the types it was measured with (1 for that one): Against's runs of
-	// the same workloads took Relative times as long as its own.
-	Relative float64 `json:"relative"`
-	Against  string  `json:"against"`
-	Runs     int     `json:"runs"`      // the runs behind it
-	Workload int     `json:"workloads"` // the workloads they were of
+	// Relative is its speed against the newest generation among the types
+	// it was measured with (Generation; 0: none known), whose measured
+	// types average 1.
+	Relative   float64 `json:"relative"`
+	Generation int     `json:"generation"`
+	// Group names the types measured against each other, through shared
+	// workloads: the first of them by name. Speeds in different groups
+	// meet only through their generations.
+	Group    string `json:"group"`
+	Runs     int    `json:"runs"`      // the runs behind it
+	Workload int    `json:"workloads"` // the workloads they were of
 }
 
 // RecordRunSpeed records how long a successful run's command took on a VM
@@ -99,7 +101,12 @@ func trimSpeed(st *placementState) {
 	latest := map[string]time.Time{}
 	for wk, w := range st.Speed {
 		for it, ss := range w {
-			at := ss[len(ss)-1].At
+			var at time.Time
+			for _, s := range ss {
+				if s.At.After(at) {
+					at = s.At
+				}
+			}
 			cells = append(cells, cell{wk, it, at})
 			if at.After(latest[wk]) {
 				latest[wk] = at
@@ -175,9 +182,9 @@ func forgetOldSpeed(st *placementState, now time.Time) {
 // often it ran, so types compared through different workloads still line
 // up, and a workload run on only one type says nothing. Types never linked
 // through a shared workload are measured only against each other, each
-// group against its newest generation (the most runs, then the name,
-// breaking a tie): a reference that two close, noisy measurements
-// swapping places doesn't move.
+// group against its newest generation, which keeps its speed by
+// generation in the ranking: a reference that doesn't move when two
+// close, noisy measurements swap places.
 func measuredSpeeds(speed map[string]map[string][]speedSample, now time.Time) map[string]TypeSpeed {
 	type cell struct {
 		w, t string
@@ -198,7 +205,7 @@ func measuredSpeeds(speed map[string]map[string][]speedSample, now time.Time) ma
 			if len(ms) < speedMinRuns {
 				continue
 			}
-			row = append(row, cell{w: wk, t: it, y: math.Log(float64(median(ms))), n: len(ms)})
+			row = append(row, cell{w: wk, t: it, y: math.Log(median(ms)), n: len(ms)})
 		}
 		if len(row) >= 2 {
 			total := 0
@@ -237,69 +244,136 @@ func measuredSpeeds(speed map[string]map[string][]speedSample, now time.Time) ma
 			first[c.w] = c.t
 		}
 	}
-	// log(median) = a[workload] + b[type]: alternating weighted means
-	// converge on the least-squares fit.
-	a, b := map[string]float64{}, map[string]float64{}
-	for r := 0; r < speedFitRounds; r++ {
-		sum, wt := map[string]float64{}, map[string]float64{}
-		for _, c := range cells {
-			sum[c.w] += c.wt * (c.y - b[c.t])
-			wt[c.w] += c.wt
-		}
-		for w := range sum {
-			a[w] = sum[w] / wt[w]
-		}
-		sum, wt = map[string]float64{}, map[string]float64{}
-		for _, c := range cells {
-			sum[c.t] += c.wt * (c.y - a[c.w])
-			wt[c.t] += c.wt
-		}
-		moved := 0.0
-		for t := range sum {
-			nb := sum[t] / wt[t]
-			moved = max(moved, math.Abs(nb-b[t]))
-			b[t] = nb
-		}
-		if r > 0 && moved < 1e-9 {
-			break
-		}
+	groups := map[string][]string{}
+	for _, t := range sortedTypes(cells, func(c cell) string { return c.t }) {
+		groups[find(t)] = append(groups[find(t)], t)
 	}
 	runs, works := map[string]int{}, map[string]int{}
 	for _, c := range cells {
 		runs[c.t] += c.n
 		works[c.t]++
 	}
-	// Each group's reference: its newest generation (unknown: oldest),
-	// then the most runs, then the name.
-	ref := map[string]string{}
-	for _, t := range sortedKeys(b) {
-		g := find(t)
-		f, ok := ref[g]
-		if !ok {
-			ref[g] = t
-			continue
+	out := map[string]TypeSpeed{}
+	for _, ts := range groups {
+		idx := make(map[string]int, len(ts))
+		for i, t := range ts {
+			idx[t] = i
 		}
-		gt, gf := typeGeneration(t), typeGeneration(f)
-		if gt > gf || gt == gf && runs[t] > runs[f] {
-			ref[g] = t
+		// log(median) = a[workload] + b[type], fitted by weighted least
+		// squares. With each workload's a eliminated, b solves L b = r
+		// (L a weighted Laplacian of the types; see fitTypes).
+		n := len(ts)
+		L := make([][]float64, n)
+		for i := range L {
+			L[i] = make([]float64, n)
 		}
-	}
-	out := make(map[string]TypeSpeed, len(b))
-	for t, bt := range b {
-		f := ref[find(t)]
-		out[t] = TypeSpeed{Relative: math.Exp(b[f] - bt), Against: f, Runs: runs[t], Workload: works[t]}
+		r := make([]float64, n)
+		byW := map[string][]cell{}
+		for _, c := range cells {
+			if _, ok := idx[c.t]; ok {
+				byW[c.w] = append(byW[c.w], c)
+			}
+		}
+		for _, wk := range sortedKeys(byW) {
+			row := byW[wk]
+			W, Y := 0.0, 0.0
+			for _, c := range row {
+				W += c.wt
+				Y += c.wt * c.y
+			}
+			for _, c := range row {
+				i := idx[c.t]
+				r[i] += c.wt*c.y - c.wt*Y/W
+				for _, d := range row {
+					L[i][idx[d.t]] -= c.wt * d.wt / W
+				}
+				L[i][i] += c.wt
+			}
+		}
+		b := fitTypes(L, r)
+		// Centred on the newest generation's types (all of them when none
+		// has a known generation).
+		newest := 0
+		for _, t := range ts {
+			newest = max(newest, typeGeneration(t))
+		}
+		mean, k := 0.0, 0
+		for i, t := range ts {
+			if typeGeneration(t) == newest {
+				mean += b[i]
+				k++
+			}
+		}
+		mean /= float64(k)
+		for i, t := range ts {
+			out[t] = TypeSpeed{Relative: math.Exp(mean - b[i]), Generation: newest, Group: ts[0], Runs: runs[t], Workload: works[t]}
+		}
 	}
 	return out
 }
 
-func median(ms []int64) int64 {
+// fitTypes solves L b = r for a connected group's types, with the first
+// held at 0 (b is only fixed up to a constant): L less its first row and
+// column is then positive definite, so Gaussian elimination with partial
+// pivoting solves it.
+func fitTypes(L [][]float64, r []float64) []float64 {
+	n := len(r)
+	b := make([]float64, n)
+	m := n - 1
+	if m <= 0 {
+		return b
+	}
+	a := make([][]float64, m)
+	for i := range a {
+		a[i] = append(append([]float64(nil), L[i+1][1:]...), r[i+1])
+	}
+	for col := 0; col < m; col++ {
+		p := col
+		for i := col + 1; i < m; i++ {
+			if math.Abs(a[i][col]) > math.Abs(a[p][col]) {
+				p = i
+			}
+		}
+		a[col], a[p] = a[p], a[col]
+		if a[col][col] == 0 {
+			continue
+		}
+		for i := col + 1; i < m; i++ {
+			f := a[i][col] / a[col][col]
+			for j := col; j <= m; j++ {
+				a[i][j] -= f * a[col][j]
+			}
+		}
+	}
+	for i := m - 1; i >= 0; i-- {
+		v := a[i][m]
+		for j := i + 1; j < m; j++ {
+			v -= a[i][j] * b[j+1]
+		}
+		if a[i][i] != 0 {
+			b[i+1] = v / a[i][i]
+		}
+	}
+	return b
+}
+
+// sortedTypes is the distinct keys of cells, sorted.
+func sortedTypes[C any](cells []C, key func(C) string) []string {
+	seen := map[string]bool{}
+	for _, c := range cells {
+		seen[key(c)] = true
+	}
+	return sortedKeys(seen)
+}
+
+func median(ms []int64) float64 {
 	s := append([]int64(nil), ms...)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
 	n := len(s)
 	if n%2 == 1 {
-		return s[n/2]
+		return float64(s[n/2])
 	}
-	return (s[n/2-1] + s[n/2]) / 2
+	return (float64(s[n/2-1]) + float64(s[n/2])) / 2
 }
 
 func sortedKeys[V any](m map[string]V) []string {
