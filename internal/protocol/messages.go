@@ -38,6 +38,12 @@ const (
 	TypeGitDrop     = "git_drop" // no body, no reply: remove a .git an earlier seed left in the slot
 	TypeShareWait   = "share_wait"
 	TypeShareDone   = "share_done"
+	// TypeWithdraw (no body, no reply of its own): take the job back if it
+	// still waits for a run permit, because the client found a free slot
+	// on another VM. Honored only while the job waits (the exec's Result
+	// then has Withdrawn set); ignored once its [setup] run or command has
+	// a permit.
+	TypeWithdraw = "withdraw"
 )
 
 // MaxSlots caps slots per machine, explicit (max_slots) or automatic
@@ -432,6 +438,10 @@ type Result struct {
 	TimedOut    bool   `json:"timed_out"`
 	Canceled    bool   `json:"canceled"`
 	Interrupted bool   `json:"spot_interrupted"`
+	// Withdrawn: the client withdrew the job (TypeWithdraw) while it
+	// waited for a run permit. Nothing ran, and the workspace is as the
+	// client's sync left it.
+	Withdrawn bool `json:"withdrawn,omitempty"`
 	// Shutdown: the command was killed by the VM shutting down (a Spot
 	// reclaim): a lost runner, not the command's result.
 	Shutdown   bool     `json:"shutdown,omitempty"`
