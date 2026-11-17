@@ -669,7 +669,12 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		probed = true
 		d.mu.Lock()
 		for id := range fl.lastOK {
-			delete(fl.batchOf, id) // it answered: no longer a failed launch
+			// Usable now: no longer a failed launch. One that answers while
+			// still booting, or with a failed bootstrap, keeps its batch, so
+			// VMs launched together that fail together still count once.
+			if !fl.booting[id] {
+				delete(fl.batchOf, id)
+			}
 		}
 		d.mu.Unlock()
 		for _, id := range notified {

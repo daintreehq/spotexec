@@ -638,6 +638,81 @@ func TestBreakerIgnoresBurstFailures(t *testing.T) {
 	}
 }
 
+// VMs launched together whose helpers answer that their bootstrap failed
+// count once, whether they first reported still booting or failed on their
+// first answer: an answer that isn't usable keeps the launch batch. It takes
+// three such batches to pause.
+func TestBreakerCountsAnsweringBatchOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		steps []string // what each VM's helper says on successive probes
+	}{
+		{"booting then failed", []string{"booting", "failed"}},
+		{"failed on first answer", []string{"failed"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, cfgPath := setup(t)
+			writeConfig(t, cfgPath, runnerConfig("a.large", 3))
+			var mu sync.Mutex
+			answers := map[string]int{} // probes each VM answered
+			probeFleet = func(d *Daemon, _ context.Context, fl *fleet, running []provider.Instance, _ map[string]bool) ([]string, int) {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, in := range running {
+					say := tc.steps[min(answers[in.ID], len(tc.steps)-1)]
+					answers[in.ID]++
+					fl.lastOK[in.ID] = time.Now()
+					fl.booting[in.ID] = true // booting or failed: not usable
+					if say == "failed" {
+						fl.bootFailed[in.ID] = true
+					}
+				}
+				return nil, len(running)
+			}
+			d, l := start(t)
+			ctx := context.Background()
+			fl := fleetNamed(d, "pool")
+			pass := func() FleetStatus {
+				t.Helper()
+				fl.lastPrb = time.Time{} // probe every pass
+				d.pass(ctx)
+				settle(t, d)
+				st, err := ReadStatus()
+				if err != nil || len(st.Fleets) != 1 {
+					t.Fatalf("status: %v", err)
+				}
+				return st.Fleets[0]
+			}
+
+			pass() // launches the first batch
+			d.mu.Lock()
+			batches := len(fl.batchOf)
+			d.mu.Unlock()
+			if n := len(c.launches()); n != 3 || batches != 3 {
+				t.Fatalf("first pass: %d launches, %d batch records; want 3 and 3", n, batches)
+			}
+			// Each failed batch is replaced by a fresh one, until the third.
+			var st FleetStatus
+			for batch := 1; batch <= 3; batch++ {
+				for range tc.steps {
+					if st = pass(); batch < 3 && st.LastError != "" {
+						t.Fatalf("batch %d: paused: %q (%d failures)", batch, st.LastError, recent(d, fl))
+					}
+				}
+				if n := recent(d, fl); n != batch {
+					t.Fatalf("after %d failed batches of 3 VMs: %d failures", batch, n)
+				}
+				if want := 3 * min(batch+1, 3); len(c.launches()) != want {
+					t.Fatalf("after %d failed batches: %d launches, want %d", batch, len(c.launches()), want)
+				}
+			}
+			if !strings.Contains(st.LastError, "paused") || l.count("pausing warm launches") != 1 {
+				t.Fatalf("3 failed batches didn't pause: %q", st.LastError)
+			}
+		})
+	}
+}
+
 // Each instance counts once whichever path reports it; launch batches count
 // once each, older ones not at all; instances and launches from before the
 // breaker restarted don't count.
