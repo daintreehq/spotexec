@@ -664,6 +664,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			if fl.unprobed[in.ID] {
 				continue // left unprobed on purpose (a standby VM without our helper): silence proves nothing
 			}
+			if carried(in.ID) {
+				continue // its region's API isn't answering: judged once it does
+			}
 			stale := time.Since(since) > unhealthyAfter && age > r.BootTimeout.Duration
 			stuck := (fl.booting[in.ID] && age > 2*r.BootTimeout.Duration+2*time.Minute) || fl.bootFailed[in.ID]
 			if !stale && !stuck {
@@ -765,7 +768,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 
 	// 6. Outside reaper: past max_lifetime means the VM's watchdog failed.
 	for _, in := range view.Instances {
-		if r.MaxLifetime.Duration > 0 && !in.LaunchedAt.IsZero() && fl.killing[in.ID] == "" &&
+		if r.MaxLifetime.Duration > 0 && !in.LaunchedAt.IsZero() && fl.killing[in.ID] == "" && !carried(in.ID) &&
 			time.Since(in.LaunchedAt) > r.MaxLifetime.Duration+10*time.Minute {
 			d.terminate(ctx, fl, in.ID, "past max_lifetime ("+r.MaxLifetime.Duration.String()+")", false)
 		}

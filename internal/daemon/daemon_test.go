@@ -926,8 +926,10 @@ func TestManageLeavesUnlistedRegionsVMsAlone(t *testing.T) {
 
 	// The region stops answering; the VM booted meanwhile, but is now old
 	// enough that a VM still pending would be ended.
+	// And both VMs are past max_lifetime, which the reaper would end.
 	uf := &unlistedFleet{fakeFleet: fl.pool.Fleet.(*fakeFleet)}
 	fl.pool.Fleet, fl.f = uf, uf
+	fl.r.MaxLifetime.Duration = time.Hour
 	fl.killing["i-kill"] = "test"
 	d.manage(context.Background(), fl)
 	if len(uf.terminated) != 0 {
