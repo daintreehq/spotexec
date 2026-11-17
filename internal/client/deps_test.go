@@ -86,6 +86,34 @@ func TestConsumeDepsCapturesInstallOutput(t *testing.T) {
 	}
 }
 
+// #253: while the helper waits for the dependencies it just copied in to
+// reach the disk, the status says so (and how much), rather than the run
+// sitting silent in its container's start.
+func TestConsumeDepsShowsTheFlush(t *testing.T) {
+	next := replies(t, func(c *protocol.Conn) {
+		_ = c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_cache", Message: "checking shared cache"})
+		_ = c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_flush", Message: "8.5 GB"})
+		_ = c.Send(protocol.TypeDepsResult, protocol.DepsResult{Key: "k", Hydrated: true, MS: 70000, FlushMS: 65000})
+	})
+	rep := &statusRep{}
+	var events []string
+	log := newDepsLog(t.TempDir(), "aws#2")
+	dr, err := consumeDeps(context.Background(), next, func(ev protocol.Event) { events = append(events, ev.Name) }, rep, "aws#2", log)
+	log.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dr.FlushMS != 65000 {
+		t.Fatalf("result = %+v", dr)
+	}
+	if len(events) != 2 || events[1] != "deps_flush" {
+		t.Fatalf("events = %v", events)
+	}
+	if last := rep.last(); last != "aws#2 · writing 8.5 GB to disk before the container starts" {
+		t.Fatalf("status = %q", last)
+	}
+}
+
 func TestConsumeDepsFailureIsARemoteError(t *testing.T) {
 	next := replies(t, func(c *protocol.Conn) {
 		_ = c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: "npm ci"})

@@ -274,6 +274,14 @@ func (s *Session) deps(d protocol.Deps) error {
 	if err := saveSlotState(s.slotDir, s.state); err != nil {
 		return err
 	}
+	if d.Container != nil {
+		// The run's container start would otherwise wait for these writes.
+		waited, err := s.flushDeps()
+		if err != nil {
+			return err
+		}
+		res.FlushMS = waited.Milliseconds()
+	}
 	res.MS = time.Since(start).Milliseconds()
 	return s.c.Send(protocol.TypeDepsResult, res)
 }
