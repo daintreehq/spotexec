@@ -116,8 +116,13 @@ func TestPartialListingKeepsWhatItCantSee(t *testing.T) {
 			{ID: "l-south", InstanceID: "i-booting", Region: "ap-south-1", Started: old, PID: 1},
 			{ID: "l-east", InstanceID: "i-vanished", Region: "us-east-1", Started: old, PID: 1},
 			{ID: "l-orphan", Started: old, PID: -1},
+			// From before launch records carried a region: its VM was
+			// listed in us-east-1, so its absence there now is telling.
+			{ID: "l-legacy", InstanceID: "i-east", Started: old, PID: 1},
 		}
 		st.Notes = map[string]*note{"i-gone-earlier": {Ready: true}}
+		st.sched().VMs["i-gone-earlier"] = &vmSched{}
+		st.sched().Warm = []string{"i-gone-earlier"}
 		return nil
 	})
 
@@ -138,6 +143,9 @@ func TestPartialListingKeepsWhatItCantSee(t *testing.T) {
 		if st.Notes["i-gone-earlier"] == nil {
 			t.Error("a note was forgotten while a region couldn't be listed")
 		}
+		if st.sched().VMs["i-gone-earlier"] == nil || !slices.Equal(st.sched().Warm, []string{"i-gone-earlier"}) {
+			t.Error("scheduling records were forgotten while a region couldn't be listed")
+		}
 		return nil
 	})
 	if !slices.Equal(launches, []string{"l-south", "l-orphan"}) {
@@ -156,8 +164,10 @@ func TestPartialListingKeepsWhatItCantSee(t *testing.T) {
 		t.Fatalf("recovered listing: %v", got)
 	}
 	_ = p.with(func(st *poolState) error {
-		if len(st.Launches) != 0 || len(st.Unlisted) != 0 || st.Notes["i-gone-earlier"] != nil {
-			t.Errorf("not reconciled after a full listing: launches %v unlisted %v notes %v", st.Launches, st.Unlisted, st.Notes)
+		if len(st.Launches) != 0 || len(st.Unlisted) != 0 || st.Notes["i-gone-earlier"] != nil ||
+			st.sched().VMs["i-gone-earlier"] != nil || len(st.sched().Warm) != 0 {
+			t.Errorf("not reconciled after a full listing: launches %v unlisted %v notes %v sched %v %v",
+				st.Launches, st.Unlisted, st.Notes, st.sched().VMs, st.sched().Warm)
 		}
 		return nil
 	})
@@ -182,13 +192,19 @@ func TestRefreshIsBoundedWhenARegionHangs(t *testing.T) {
 	f.insts = append(f.insts, provider.Instance{ID: "i-new", Region: "us-east-1", State: provider.StateRunning,
 		Target: host, LaunchedAt: time.Now()})
 	staleList(p)
+	m.called, m.deadline = false, time.Time{}
 	start := time.Now()
 	got := listedIDs(t, p, false)
-	if took := time.Since(start); took > refreshBudget+300*time.Millisecond {
-		t.Fatalf("refresh took %s, past its budget of %s", took, refreshBudget)
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("refresh took %s: not bounded", took)
 	}
 	if !m.called {
 		t.Fatal("the VMs weren't judged against the config")
+	}
+	// Judging shares the refresh's deadline, after a listing that used up
+	// its own: it gets no budget of its own on top.
+	if limit := start.Add(refreshBudget + 100*time.Millisecond); m.deadline.IsZero() || m.deadline.After(limit) {
+		t.Fatalf("judging's deadline %v is past the refresh's %v", m.deadline, limit)
 	}
 	if !slices.Equal(got, []string{"i-new", "i-south"}) {
 		t.Fatalf("bounded partial listing: %v", got)
@@ -197,10 +213,14 @@ func TestRefreshIsBoundedWhenARegionHangs(t *testing.T) {
 
 // hangMatcher judges VMs only once its context ends, like a type lookup
 // in a region that doesn't answer.
-type hangMatcher struct{ called bool }
+type hangMatcher struct {
+	called   bool
+	deadline time.Time
+}
 
 func (m *hangMatcher) Mismatches(ctx context.Context, _ []provider.Instance) map[string]string {
 	m.called = true
+	m.deadline, _ = ctx.Deadline()
 	<-ctx.Done()
 	return nil
 }
@@ -241,4 +261,28 @@ func (f *credStallFleet) ListReachable(ctx context.Context) ([]provider.Instance
 		unlisted[rg] = &provider.CredentialError{Err: errors.New("token expired")}
 	}
 	return insts, unlisted, err
+}
+
+// A caller that gives up while the fleet is being listed gets its error,
+// not a refreshed view to act on.
+func TestRefreshReturnsCallerCancellation(t *testing.T) {
+	p, f := testPool(t, 4)
+	rf := &stallFleet{fakeFleet: f, stalled: map[string]bool{}, hang: true}
+	p.Fleet = rf
+	listedIDs(t, p, false)
+	var listed time.Time
+	_ = p.with(func(st *poolState) error { listed = st.ListedAt.Add(-listTTL - time.Second); st.ListedAt = listed; return nil })
+
+	rf.stalled["ap-south-1"] = true
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := p.Snapshot(ctx, false); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a cancelled caller got %v", err)
+	}
+	_ = p.with(func(st *poolState) error {
+		if !st.ListedAt.Equal(listed) {
+			t.Errorf("a cancelled refresh moved the listing time: %v", st.ListedAt)
+		}
+		return nil
+	})
 }

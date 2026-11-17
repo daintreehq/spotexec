@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -398,10 +399,10 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 		return nil
 	}
 	insts, unlisted, err := p.list(rctx)
-	if err == nil && ctx.Err() != nil {
+	if ctx.Err() != nil {
 		// The caller gave up: what was listed is cut short by that, not by
-		// the cloud.
-		err = ctx.Err()
+		// the cloud, and it acts on nothing.
+		return ctx.Err()
 	}
 	if err == nil && len(unlisted) > 0 && st.ListedAt.IsZero() {
 		// Nothing known yet of the regions that didn't answer.
@@ -444,6 +445,19 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	for id, n := range st.Notes {
 		if n.Ready {
 			seenBefore[id] = true
+		}
+	}
+	// Launch records from before they carried a region take it from the
+	// listings that show their instance.
+	regionOf := map[string]string{}
+	for _, in := range append(slices.Clone(st.Instances), insts...) {
+		if in.Region != "" {
+			regionOf[in.ID] = in.Region
+		}
+	}
+	for i, l := range st.Launches {
+		if l.Region == "" && l.InstanceID != "" {
+			st.Launches[i].Region = regionOf[l.InstanceID]
 		}
 	}
 	st.Instances = keepUnlisted(insts, st.Instances, unlisted)

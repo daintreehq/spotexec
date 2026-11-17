@@ -847,13 +847,22 @@ func TestRetirementWaitsForReplacement(t *testing.T) {
 	}
 }
 
-// unlistedFleet is a fleet one of whose regions doesn't answer: it lists
-// the others, and names that one.
-type unlistedFleet struct{ *fakeFleet }
+// unlistedFleet is a fleet whose ap-south-1 doesn't answer: it lists the
+// other regions, names that one, and records what it was asked to end.
+type unlistedFleet struct {
+	*fakeFleet
+	terminated []string
+}
 
 func (f *unlistedFleet) ListReachable(ctx context.Context) ([]provider.Instance, map[string]error, error) {
 	insts, err := f.List(ctx)
+	insts = slices.DeleteFunc(insts, func(in provider.Instance) bool { return in.Region == "ap-south-1" })
 	return insts, map[string]error{"ap-south-1": errors.New("no answer")}, err
+}
+
+func (f *unlistedFleet) Terminate(ctx context.Context, id string) error {
+	f.terminated = append(f.terminated, id)
+	return f.fakeFleet.Terminate(ctx, id)
 }
 
 // Issue #241: while a region can't be listed, a VM's absence from the
@@ -868,7 +877,7 @@ func TestManageForgetsNothingWhileARegionIsUnlisted(t *testing.T) {
 	d.manage(context.Background(), fl)
 
 	ff := fl.pool.Fleet.(*fakeFleet)
-	fl.pool.Fleet = &unlistedFleet{ff}
+	fl.pool.Fleet = &unlistedFleet{fakeFleet: ff}
 	old := time.Now().Add(-2 * forgetAfter)
 	fl.counted["i-old"] = old
 	fl.batchOf["i-old"] = launchBatch{at: old}
@@ -891,5 +900,40 @@ func TestManageForgetsNothingWhileARegionIsUnlisted(t *testing.T) {
 	_, seen = fl.seen["i-old"]
 	if counted || batch || killing || seen {
 		t.Fatalf("kept after a full listing: counted %v batch %v killing %v seen %v", counted, batch, killing, seen)
+	}
+}
+
+// A VM of a region that can't be listed is known only as it was last
+// seen: the manager neither judges it from that state (a VM seen pending
+// may have booted since) nor asks that region's API to end it, until the
+// region answers again.
+func TestManageLeavesUnlistedRegionsVMsAlone(t *testing.T) {
+	c, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 0))
+	c.add("pool", provider.Instance{ID: "i-south", Type: "a.large", Region: "ap-south-1", State: provider.StatePending,
+		LaunchedAt: time.Now()})
+	c.add("pool", provider.Instance{ID: "i-kill", Type: "a.large", Region: "ap-south-1", State: provider.StateRunning,
+		LaunchedAt: time.Now(), Target: provider.Target{Host: "192.0.2.1"}})
+	c.born("pool", time.Now().Add(-2*time.Hour))
+	d, _ := start(t)
+	fl := fleetNamed(d, "pool")
+	fl.lastPrb = time.Now()
+	// Listed pending while it could still be booting.
+	boot := fl.r.BootTimeout.Duration
+	fl.r.BootTimeout.Duration = 3 * time.Hour
+	d.manage(context.Background(), fl)
+	fl.r.BootTimeout.Duration = boot
+
+	// The region stops answering; the VM booted meanwhile, but is now old
+	// enough that a VM still pending would be ended.
+	uf := &unlistedFleet{fakeFleet: fl.pool.Fleet.(*fakeFleet)}
+	fl.pool.Fleet, fl.f = uf, uf
+	fl.killing["i-kill"] = "test"
+	d.manage(context.Background(), fl)
+	if len(uf.terminated) != 0 {
+		t.Fatalf("ended VMs of a region that couldn't be listed: %v", uf.terminated)
+	}
+	if fl.killing["i-kill"] == "" {
+		t.Fatal("a termination in flight was forgotten")
 	}
 }
