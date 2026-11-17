@@ -219,8 +219,9 @@ func TestFleetRoles(t *testing.T) {
 }
 
 // The slots column counts the jobs running commands; jobs a helper
-// admitted to prepare or write back meanwhile are shown beside it, and
-// each holder line says what its job is doing.
+// admitted to wait for a run permit, or to prepare or write back
+// meanwhile, are shown beside it, and each holder line says what its job
+// is doing.
 func TestStatusSlotsCountRunningJobs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "out")
 	f, err := os.Create(path)
@@ -239,7 +240,7 @@ func TestStatusSlotsCountRunningJobs(t *testing.T) {
 	f.Close()
 	b, _ := os.ReadFile(path)
 	out := string(b)
-	if !strings.Contains(out, "2/2 (+2)") {
+	if !strings.Contains(out, " 1/2 (+1 waiting, +2 preparing) ") {
 		t.Fatalf("slots column:\n%s", out)
 	}
 	for _, want := range []string{"slot 1: sx test a  (", "slot 2: sx test b [preparing or writing back]", "slot 3: sx test c [waiting for a free slot to run]"} {
@@ -266,6 +267,33 @@ func TestStatusCountsExclusiveRunOnce(t *testing.T) {
 	f.Close()
 	b, _ := os.ReadFile(path)
 	if out := string(b); !strings.Contains(out, " 2/2 ") || strings.Contains(out, "(+") || strings.Contains(out, "4/2") {
+		t.Fatalf("slots column:\n%s", out)
+	}
+}
+
+// Jobs waiting for a run permit aren't running yet: with every permit
+// taken, the slots column stays at the slot count and shows the waiting
+// job beside it, apart from the jobs still preparing (#276).
+func TestStatusSlotsShowPermitWaitersApart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hs []protocol.Holder
+	for i := 1; i <= 6; i++ {
+		hs = append(hs, protocol.Holder{Token: i, HelperPID: 100 + i, Phased: true, Phase: protocol.PhaseRun, Run: i})
+	}
+	hs = append(hs,
+		protocol.Holder{Token: 7, HelperPID: 107, Phased: true, Phase: protocol.PhaseRunWait},
+		protocol.Holder{Token: 8, HelperPID: 108, Phased: true, Phase: protocol.PhaseRunWait},
+		protocol.Holder{Token: 9, HelperPID: 109, Phased: true})
+	printStatus(f, []runnerStatus{{Name: "spot/i-1", Type: "aws-spot", r: &config.Runner{MaxSlots: 6},
+		Info:   provider.Info{State: provider.StateRunning, InstanceID: "i-1"},
+		Helper: &helper.Status{Holders: hs, SlotCount: 6, IdleS: -1}}}, nil)
+	f.Close()
+	b, _ := os.ReadFile(path)
+	if out := string(b); !strings.Contains(out, " 6/6 (+2 waiting, +1 preparing) ") {
 		t.Fatalf("slots column:\n%s", out)
 	}
 }
