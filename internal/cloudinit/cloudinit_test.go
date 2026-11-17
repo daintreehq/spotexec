@@ -483,7 +483,10 @@ chown() { echo "chown $*" >> "$C"; }
 		"two such disks":        {[]disk{root, {name: "/dev/nvme1n1", size: gib64}, {name: "/dev/nvme2n1", size: gib64}}, nil, "found 2 blank disks"},
 		"only a used disk":      {[]disk{root, {name: "/dev/nvme1n1", size: gib64, fs: true}}, nil, "found 0 blank disks"},
 		"work root has content": {[]disk{root, {name: "/dev/nvme1n1", size: gib64}}, func(h string) { os.MkdirAll(filepath.Join(h, ".cache/spotexec/bin"), 0o755) }, "is in use"},
-		"work root is a link":   {[]disk{root, {name: "/dev/nvme1n1", size: gib64}}, func(h string) { os.MkdirAll(filepath.Join(h, ".cache"), 0o755); os.Symlink("/tmp", filepath.Join(h, ".cache/spotexec")) }, "is in use"},
+		"work root is a link": {[]disk{root, {name: "/dev/nvme1n1", size: gib64}}, func(h string) {
+			os.MkdirAll(filepath.Join(h, ".cache"), 0o755)
+			os.Symlink("/tmp", filepath.Join(h, ".cache/spotexec"))
+		}, "is in use"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			log, calls, fstab, err := run(t, "", c.disks, c.prep)
