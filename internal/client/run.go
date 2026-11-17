@@ -243,6 +243,17 @@ func (p *progress) timings() map[string]time.Duration {
 	return out
 }
 
+// event records a phase the helper's event named starts: installing the
+// dependencies, or writing them to disk (#253).
+func (p *progress) event(name string) {
+	switch name {
+	case "deps_install":
+		p.set(phaseDeps)
+	case "deps_flush":
+		p.set(phaseDepsFlush)
+	}
+}
+
 // dispatch records that the command is being handed to the helper, from
 // just before the request is sent: a send that fails part way may still
 // have reached it. setup: the helper runs [setup] run first.
@@ -520,6 +531,7 @@ const (
 	phaseImage        = "preparing the container image"
 	phaseDepsCheck    = "checking the dependency cache"
 	phaseDeps         = "installing dependencies"
+	phaseDepsFlush    = "writing dependencies to disk"
 	phaseRunWait      = "waiting for a free slot to run the command"
 	phaseStartSetup   = "starting [setup] run"
 	phaseSetup        = "running [setup] run"
@@ -545,7 +557,7 @@ const (
 var phaseKind = map[string]string{
 	phaseSync: PhaseSync, phaseGitSeed: PhaseSync,
 	phaseImage:     PhaseImage,
-	phaseDepsCheck: PhaseDeps, phaseDeps: PhaseDeps,
+	phaseDepsCheck: PhaseDeps, phaseDeps: PhaseDeps, phaseDepsFlush: PhaseDeps,
 	phaseRunWait:    PhaseQueued,
 	phaseStartSetup: PhaseSetup, phaseSetup: PhaseSetup,
 	phaseStartCommand: PhaseCommand, phaseCommand: PhaseCommand,
@@ -799,9 +811,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	sess := lease.Sess
 	sess.OnEvent = func(ev protocol.Event) {
 		o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
-		if ev.Name == "deps_install" {
-			prog.set(phaseDeps)
-		}
+		prog.event(ev.Name)
 		if ev.Name == "spot_interruption" {
 			noticed.Store(true)
 			reclaimed()
@@ -1692,6 +1702,9 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	}
 	if upload != nil {
 		ev["uploaded"], ev["upload_ms"] = upload.OK, upload.MS
+	}
+	if dr.FlushMS > 0 {
+		ev["flush_ms"] = dr.FlushMS
 	}
 	o.Rep.Event("deps", ev)
 	return dr, nil

@@ -367,6 +367,9 @@ type DepsResult struct {
 	Missing  bool   `json:"missing,omitempty"` // Probe: nothing to restore, an install is needed
 	Method   string `json:"method"`
 	MS       int64  `json:"ms"`
+	// FlushMS is the part of MS spent waiting for what the dependencies
+	// wrote to reach the disk, before a containerised run (#253).
+	FlushMS int64 `json:"flush_ms,omitempty"`
 }
 
 // ShareWait asks the helper to wait for the background transfer this
