@@ -1099,6 +1099,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 	group := f.grouped(t, os.Getenv("SPOTEXEC_AGENT") == "1" && !ui.IsTerminal(os.Stdout))
 	ctx, intr, stop := signals()
 	defer stop()
+	// The parts that sync start from one scan of the worktree, taken by the
+	// first of them to need it (#275).
+	scan := client.NewSharedScan(ctx, l.ws, l.cfg.Project)
+	defer scan.Close()
 	// mu guards the parts' bookkeeping and everything they print, so a
 	// grouped part's block, error and summary go out with nothing between.
 	var mu sync.Mutex
@@ -1151,6 +1155,7 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 				stdout, stderr = ui.NewPrefixWriter(os.Stdout, prefix, &mu), ui.NewPrefixWriter(os.Stderr, prefix, &mu)
 			}
 			o := f.options(l, part.spec(l), sr, intrs[i], stdout, stderr)
+			o.Scan = scan
 			// Parts race to sync: which one saves the last-run record is
 			// decided below, once they are all done.
 			o.DeferLastRun = true
