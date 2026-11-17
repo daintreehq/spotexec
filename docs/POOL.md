@@ -269,8 +269,10 @@ early_drain = false
 
 For a standby VM that has been standby for 30 seconds, isn't warm, holds
 nothing of this machine's (no job, reservation, uncertain attempt or
-exclusive fence), with no job queued and the retained VMs covering recent
-demand without it, `sx` (as a job's lease ends) or the pool manager (each
+exclusive fence), with no job queued or looking for a slot (from before it
+scans its files until it holds one, so a standby VM a starting run may need
+isn't drained under it) and the retained VMs covering recent demand without
+it, `sx` (as a job's lease ends) or the pool manager (each
 probe pass):
 
 1. records the drain in the ledger (`drain_requested`). From then on the VM

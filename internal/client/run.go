@@ -707,6 +707,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if err != nil && (!o.PreferLast && !o.SameSlot || len(o.LastWithin) > 0) {
 		return res, infra(err), ""
 	}
+	// Seeking a slot from before the scan until one is held: no surplus VM
+	// this run may need is drained early meanwhile (#257).
+	var seek *Seeking
+	if !o.PreferLast && !o.SameSlot && att.lease == nil {
+		seek = Seek(pool)
+	}
+	defer seek.Done()
 
 	// 1. Local manifest (what the remote workspace must contain).
 	// A slot this attempt moved to is its own from the start: given back
@@ -744,7 +751,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// Without a sync the slot's files are not ours: don't claim ownership.
 	base.KeepOwner = o.Sync == "none"
 	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot || att.noBoot, BootOnly: att.bootOnly, Exclude: att.exclude, Priority: o.Priority,
-		Task: TaskKey(ws.RepoID, o.Display)}
+		Task: TaskKey(ws.RepoID, o.Display), seeking: seek}
 	if o.Sync != "none" {
 		// A launch for this run prefers regions that hold its caches.
 		req.Project = func(r *config.Runner) *provider.Project { return PlacementProject(p, ws, m, o.NoDeps, r) }

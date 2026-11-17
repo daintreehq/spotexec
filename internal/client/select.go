@@ -76,6 +76,9 @@ type AcquireRequest struct {
 	// onSend, when set, runs just before the acquire request is sent; an
 	// error stops it going out.
 	onSend func() error
+	// seeking: the run's mark, made before it scanned its files; Acquire
+	// makes its own without one. Withdrawn as Acquire returns.
+	seeking *Seeking
 }
 
 // noBoot reports whether runner's fleet may not launch for the request.
@@ -149,6 +152,14 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		}
 		members = append(members, m)
 	}
+	// Seeking a slot from here (or the run's scan) until Acquire returns:
+	// no surplus VM is drained early meanwhile (#257).
+	seek := req.seeking
+	if seek == nil {
+		seek = Seek(req.Pool)
+	}
+	defer seek.Done()
+	seek.Touch()
 	q := QueueFor(req.Pool)
 	var ticket *Ticket
 	defer func() { ticket.Leave() }()
@@ -175,6 +186,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			case <-beat:
 				return
 			case <-t.C:
+				seek.Touch()
 				wmu.Lock()
 				ticket.Touch()
 				for _, w := range waiters {

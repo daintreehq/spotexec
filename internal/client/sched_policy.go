@@ -633,13 +633,14 @@ const standbySettle = 30 * time.Second
 // BeginDrain commits an early drain of a standby VM locally, before the VM
 // is asked (scheduling.early_drain): it re-checks, under the lock, that
 // the VM is standby, settled, not warm, holds nothing for this machine
-// (no attempt, uncertain or not, and no fence), that no job is queued, and
-// that the retained VMs cover recent demand without it. From then on the
-// VM is drain_requested and never placed on again, even if the request to
-// it times out. A VM already drain_requested returns its operation, to be
-// retried. ok is false when it may not be drained now.
+// (no attempt, uncertain or not, and no fence), that no job is queued or
+// seeking a slot (Seeking), and that the retained VMs cover recent demand
+// without it. From then on the VM is drain_requested and never placed on
+// again, even if the request to it times out. A VM already drain_requested
+// returns its operation, to be retried. ok is false when it may not be
+// drained now.
 func (p *Pool) BeginDrain(ctx context.Context, id string) (op string, ok bool, err error) {
-	if !p.R.EarlyDrain() || p.R.SchedPolicy() != config.PolicyConsolidate || !p.R.Ephemeral() {
+	if !drainsEarly(p.R) {
 		return "", false, nil
 	}
 	err = p.withCtx(ctx, func(st *poolState) error {
@@ -655,7 +656,7 @@ func (p *Pool) BeginDrain(ctx context.Context, id string) (op string, ok bool, e
 			op, ok = v.DrainOp, !v.DrainScheduled && now.Sub(v.DrainAt) >= drainRetry
 			return nil
 		}
-		if v.Role != roleStandby || now.Sub(v.Since) < standbySettle || now.Before(v.DrainAt) || s.protected(id) || p.waiterDemand() > 0 {
+		if v.Role != roleStandby || now.Sub(v.Since) < standbySettle || now.Before(v.DrainAt) || s.protected(id) || p.waiterDemand() > 0 || p.seeking() {
 			return nil
 		}
 		for _, w := range s.Warm {
