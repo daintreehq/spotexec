@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -109,9 +110,32 @@ func TestSeekingMarkLifecycle(t *testing.T) {
 	if err := os.Chtimes(tmp, old, old); err != nil {
 		t.Fatal(err)
 	}
+	// One being made right now, or by a run stopped while making it
+	// (locked), is left alone.
+	fresh := filepath.Join(dir, "1-fresh.s.tmp")
+	if err := os.WriteFile(fresh, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	making := filepath.Join(dir, "1-making.s.tmp")
+	mf, err := os.OpenFile(making, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Close()
+	if err := syscall.Flock(int(mf.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(making, old, old); err != nil {
+		t.Fatal(err)
+	}
 	seek.Done()
 	if p.seeking() {
-		t.Fatal("a dead run's mark counts")
+		t.Fatal("a dead run's mark, or one still being made, counts")
+	}
+	for _, f := range []string{fresh, making} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("%s swept while being made: %v", f, err)
+		}
 	}
 	for _, f := range []string{dead, tmp, own} {
 		if _, err := os.Stat(f); !os.IsNotExist(err) {
@@ -154,5 +178,66 @@ func TestPlanCountsEmptyStandbyForExclusive(t *testing.T) {
 	})
 	if d, err := p.Plan(context.Background(), 0); err != nil || d.Launch || d.Ready != 4 {
 		t.Fatalf("plan %+v %v: want no launch, the empty standby VM covering the exclusive part", d, err)
+	}
+}
+
+// A mark stays live through a scan longer than staleAfter: it refreshes
+// itself until withdrawn, and not after.
+func TestSeekingRefreshesItself(t *testing.T) {
+	p, _ := schedPool(t, 1, 2)
+	old := seekBeat
+	seekBeat = 10 * time.Millisecond
+	t.Cleanup(func() { seekBeat = old })
+	seek := Seek([]*config.Runner{p.R})
+	path := seek.paths[0]
+	stale := time.Now().Add(-staleAfter - time.Second)
+	if err := os.Chtimes(path, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !p.seeking() {
+		if time.Now().After(deadline) {
+			t.Fatal("a mark left stale by a long scan was never refreshed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	seek.Done()
+	time.Sleep(50 * time.Millisecond) // a refresh after Done would recreate nothing, but must not run
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("mark still there after Done: %v", err)
+	}
+}
+
+// The run's mark, handed to Acquire, is withdrawn as Acquire returns (not
+// held through the command); a request carrying a mark already withdrawn
+// (a spare warmed for a replay copies its run's) gets a fresh one.
+func TestAcquireWithdrawsHandedMark(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"healthy": {"b1"}}, 0)
+	p := NewPool(pool[0], fleets["healthy"])
+	var during []bool
+	scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) {
+		during = append(during, p.seeking())
+		return &Lease{}, nil
+	})
+	seek := Seek(pool)
+	req := AcquireRequest{Pool: pool, QueueTimeout: 3 * time.Second, Rep: nopRep{}, NoBoot: true, seeking: seek}
+	l, err := Acquire(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	if !seek.withdrawn() || p.seeking() {
+		t.Fatal("the run's mark outlived its acquire")
+	}
+	l, err = Acquire(context.Background(), spareRequest(req, "i-other", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	if len(during) != 2 || !during[0] || !during[1] {
+		t.Fatalf("seeking while probing: %v, want both acquires marked", during)
+	}
+	if p.seeking() {
+		t.Fatal("the spare's mark outlived its acquire")
 	}
 }

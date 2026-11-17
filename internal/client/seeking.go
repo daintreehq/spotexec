@@ -21,14 +21,21 @@ import (
 // Waiters say the same, but only once a job has found every slot taken,
 // after its scan and first probes: a standby VM drained in that gap is room
 // the job may have needed (#257). It weighs nothing: Plan never launches
-// for it. One flock'd file per fleet, under the fleet's `seeking/`; a run
-// that dies releases its flock, and one that stops refreshing it (a
+// for it. One flock'd file per fleet, under the fleet's `seeking/`,
+// refreshed every seekBeat until withdrawn, however long the scan takes; a
+// run that dies releases its flock, and one that stops refreshing it (a
 // stopped process) stops counting after staleAfter.
 type Seeking struct {
 	mu    sync.Mutex
 	files []*os.File
 	paths []string
+	done  bool
+	stop  chan struct{}
+	beat  sync.WaitGroup
 }
+
+// seekBeat: how often a mark is refreshed, well within staleAfter.
+var seekBeat = 5 * time.Second
 
 // drainsEarly reports whether a runner's surplus VMs end early
 // (scheduling.early_drain), the only fleets Seeking marks.
@@ -69,7 +76,32 @@ func Seek(pool []*config.Runner) *Seeking {
 		}
 		s.files, s.paths = append(s.files, f), append(s.paths, path)
 	}
+	if len(s.files) > 0 {
+		s.stop = make(chan struct{})
+		s.beat.Add(1)
+		go func() {
+			defer s.beat.Done()
+			t := time.NewTicker(seekBeat)
+			defer t.Stop()
+			for {
+				select {
+				case <-s.stop:
+					return
+				case <-t.C:
+					s.Touch()
+				}
+			}
+		}()
+	}
 	return s
+}
+
+// withdrawn reports whether Done has been called (a request copied from
+// one that already acquired carries a spent mark).
+func (s *Seeking) withdrawn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.done
 }
 
 // Touch refreshes the marks (a stopped process stops counting).
@@ -91,6 +123,17 @@ func (s *Seeking) Done() {
 		return
 	}
 	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return
+	}
+	s.done = true
+	s.mu.Unlock()
+	if s.stop != nil {
+		close(s.stop)
+		s.beat.Wait() // its last refresh can't touch a removed path's successor
+	}
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, f := range s.files {
 		_ = os.Remove(s.paths[i])
@@ -108,13 +151,14 @@ func (p *Pool) seeking() bool {
 	live := false
 	for _, e := range ents {
 		path := filepath.Join(dir, e.Name())
-		if strings.HasSuffix(e.Name(), ".tmp") {
+		tmp := strings.HasSuffix(e.Name(), ".tmp")
+		if tmp {
 			// Being made (locked a moment from now), or left by a process
-			// that died making it.
-			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > staleAfter {
-				_ = os.Remove(path)
+			// that died making it: only an old, unlocked one is swept, so
+			// a run stopped while making its mark still gets it.
+			if fi, err := e.Info(); err != nil || time.Since(fi.ModTime()) <= staleAfter {
+				continue
 			}
-			continue
 		}
 		f, err := os.OpenFile(path, os.O_RDWR, 0)
 		if err != nil {
@@ -128,7 +172,7 @@ func (p *Pool) seeking() bool {
 		}
 		fi, err := f.Stat()
 		_ = f.Close()
-		if err == nil && time.Since(fi.ModTime()) <= staleAfter {
+		if !tmp && err == nil && time.Since(fi.ModTime()) <= staleAfter {
 			live = true
 		}
 	}

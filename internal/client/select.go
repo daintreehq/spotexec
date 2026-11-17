@@ -77,7 +77,8 @@ type AcquireRequest struct {
 	// error stops it going out.
 	onSend func() error
 	// seeking: the run's mark, made before it scanned its files; Acquire
-	// makes its own without one. Withdrawn as Acquire returns.
+	// makes its own without one (or with one already withdrawn). Withdrawn
+	// as Acquire returns.
 	seeking *Seeking
 }
 
@@ -155,8 +156,8 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 	// Seeking a slot from here (or the run's scan) until Acquire returns:
 	// no surplus VM is drained early meanwhile (#257).
 	seek := req.seeking
-	if seek == nil {
-		seek = Seek(req.Pool)
+	if seek == nil || seek.withdrawn() {
+		seek = Seek(req.Pool) // a spare's request copies its run's spent mark
 	}
 	defer seek.Done()
 	seek.Touch()
@@ -186,7 +187,6 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			case <-beat:
 				return
 			case <-t.C:
-				seek.Touch()
 				wmu.Lock()
 				ticket.Touch()
 				for _, w := range waiters {
