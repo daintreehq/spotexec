@@ -119,6 +119,9 @@ type procResult struct {
 	canceled bool
 	spotIntr bool
 	startErr error
+	// ran is how long the process ran, from its start until it exited
+	// (0: it never started), without reaping what it left behind.
+	ran time.Duration
 }
 
 // teeOut, passed to runProc as out, sees the output as it goes to the
@@ -202,6 +205,7 @@ func (s *Session) runProc1(script, dir string, env map[string]string, timeout, g
 		ew.Close()
 		return procResult{code: 127, startErr: err}
 	}
+	started := time.Now()
 	ow.Close()
 	ew.Close()
 	pgid := cmd.Process.Pid
@@ -258,6 +262,7 @@ loop:
 	for {
 		select {
 		case waitErr = <-exited:
+			res.ran = time.Since(started)
 			break loop
 		case <-timer:
 			res.timedOut = true
@@ -564,11 +569,15 @@ func (s *Session) exec(e protocol.Exec) error {
 			_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "setup_done", Message: fmt.Sprintf("%dms", setupMS)})
 		}
 	}
+	var commandMS int64
 	if !setupFailed {
 		pr, shutdown, oom, err = runPhase(e.Shell, dir, timeout, nil)
 		if err != nil {
 			stuck = true
 			return err
+		}
+		if pr.ran > 0 {
+			commandMS = max(pr.ran.Milliseconds(), 1)
 		}
 	}
 	// The command and its container are gone: collecting and writing back
@@ -577,7 +586,7 @@ func (s *Session) exec(e protocol.Exec) error {
 	res := protocol.Result{
 		ExitCode: pr.code, Signal: pr.signal, TimedOut: pr.timedOut, Canceled: pr.canceled,
 		Interrupted: pr.spotIntr || s.interrupted.Load(), DurationMS: time.Since(start).Milliseconds(),
-		Shutdown: shutdown, SetupFailed: setupFailed, SetupMS: setupMS,
+		Shutdown: shutdown, SetupFailed: setupFailed, SetupMS: setupMS, CommandMS: commandMS,
 	}
 	if pr.startErr != nil {
 		res.StartError = pr.startErr.Error()

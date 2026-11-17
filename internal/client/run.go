@@ -165,6 +165,9 @@ type Result struct {
 	// lostWhen is when the attempt gave up on its runner (no earlier than
 	// the last word it sent the helper).
 	lostWhen time.Time
+	// speed: this attempt's command time, kept once its lease is released
+	// (see recordRunSpeed).
+	speed *speedSample
 	// moveTo: the attempt withdrew from a VM where it waited for a run
 	// permit, nothing having run, and carries on in this slot elsewhere.
 	moveTo *Lease
@@ -392,6 +395,7 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 	spent := map[string]time.Duration{}
 	for {
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
+		recordRunSpeed(res.speed) // the attempt's lease is released by now
 		reached = reached || res.Runner != ""
 		res.Reached = reached
 		for k, d := range res.Phases {
@@ -1117,6 +1121,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		res.OOMKilled = true
 		o.Rep.Warn("OOM_KILLED", "%s", oomMessage(result.MemoryLimitMB))
 	}
+	res.speed = runSpeed(lease, ws, o, result, ex.Env, res.Canceled)
 
 	// 6. Write-back of mutations.
 	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, res.ExitCode) &&

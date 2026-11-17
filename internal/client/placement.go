@@ -1,6 +1,9 @@
 package client
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -116,4 +119,69 @@ func recordColdWork(lease *Lease, ws *Workspace, part provider.ColdWorkPart, ms 
 		return
 	}
 	_ = provider.RecordColdWork(lease.Runner, ws.RepoID, part, time.Duration(ms)*time.Millisecond)
+}
+
+// speedSample is one attempt's command time on a fleet VM, for
+// recordRunSpeed.
+type speedSample struct {
+	runner   *config.Runner
+	workload string
+	itype    string
+	took     time.Duration
+}
+
+// runSpeed is what a run's command time says of the leased VM's instance
+// type, for the runner's next launches to weigh its speed by (#279), or
+// nil. Only a command that ran to a clean exit 0 counts (one that finished
+// after a Spot notice too): a failure, timeout or interrupt may have
+// stopped it early. The time is the helper's own of the command's process,
+// so queueing, [setup], preparing the container and the network don't
+// count. env is what the command ran with.
+func runSpeed(lease *Lease, ws *Workspace, o Options, r protocol.Result, env map[string]string, canceled bool) *speedSample {
+	if lease == nil || ws == nil || lease.InstanceID == "" || lease.Instance.Type == "" || canceled || !lease.Runner.ByRequirements() {
+		return nil
+	}
+	if r.ExitCode != 0 || r.TimedOut || r.Canceled || r.Shutdown || r.Withdrawn || r.SetupFailed || r.OOMKilled || r.StartError != "" || r.CommandMS <= 0 {
+		return nil
+	}
+	return &speedSample{runner: lease.Runner, workload: SpeedWorkload(ws.RepoID, ws.Cwd, o, env), itype: lease.Instance.Type, took: time.Duration(r.CommandMS) * time.Millisecond}
+}
+
+// recordRunSpeed keeps s, if any. Best effort: a failure to save it never
+// fails the run.
+func recordRunSpeed(s *speedSample) {
+	if s != nil {
+		_ = provider.RecordRunSpeed(s.runner, s.workload, s.itype, s.took)
+	}
+}
+
+// speedEnvSkip is what of a command's environment SpeedWorkload leaves out:
+// what differs from one run or slot to the next.
+var speedEnvSkip = map[string]bool{"SPOTEXEC_SLOT": true, "SPOTEXEC_PORT_BASE": true, "SPOTEXEC_RUN_ID": true,
+	"SPOTEXEC_ATTEMPT": true, "SPOTEXEC_WORKSPACE": true, "COMPOSE_PROJECT_NAME": true, "FORCE_COLOR": true, "CLICOLOR_FORCE": true}
+
+// SpeedWorkload names what a run runs, for comparing its speed on one
+// instance type with another (provider.RecordRunSpeed): the project (the
+// same in every worktree of it), the directory it runs from, the command
+// line, the environment it runs with (a shard's number, forwarded
+// variables, its CPU share) but for what differs from run to run or slot
+// to slot, and whether it had the VM to itself. Hashed: the runner's state
+// keeps no command lines.
+func SpeedWorkload(repoID, cwd string, o Options, env map[string]string) string {
+	keep := make(map[string]string, len(env))
+	for k, v := range env {
+		if !speedEnvSkip[k] {
+			keep[k] = v
+		}
+	}
+	b, _ := json.Marshal(struct {
+		V         int               `json:"v"`
+		Repo      string            `json:"repo"`
+		Cwd       string            `json:"cwd"`
+		Command   string            `json:"command"`
+		Env       map[string]string `json:"env,omitempty"` // encoding/json sorts the keys
+		Exclusive bool              `json:"exclusive,omitempty"`
+	}{1, repoID, cwd, o.Command, keep, o.Exclusive})
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])[:16]
 }
