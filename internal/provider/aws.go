@@ -340,12 +340,12 @@ func (a *AWSSpot) Up(ctx context.Context, log Logger) (Info, error) {
 	// Stopped leftovers (e.g. an on-demand fallback stopped from the console)
 	// still bill for their volume: terminate them.
 	if stopped, err := a.describe(ctx, "stopped"); err == nil && len(stopped) > 0 {
-		p := url.Values{}
+		ids := make([]string, len(stopped))
 		for i, s := range stopped {
-			p.Set("InstanceId."+strconv.Itoa(i+1), s.InstanceID)
+			ids[i] = s.InstanceID
 		}
-		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err == nil {
-			log("terminated %d stopped instance(s) left over for %s", len(stopped), a.r.Name)
+		if done, _ := a.terminate(ctx, ids); len(done) > 0 {
+			log("terminated %d stopped instance(s) left over for %s", len(done), a.r.Name)
 		}
 	}
 	in, err := a.ranker().launch(ctx, log)
@@ -1280,25 +1280,57 @@ func (a *AWSSpot) downLocked(ctx context.Context, log Logger) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(insts) > 0 {
+	if len(insts) == 0 {
+		log("no running instances for %s", a.r.Name)
+		return 0, nil
+	}
+	ids := make([]string, len(insts))
+	types := make(map[string]string, len(insts))
+	for i, inst := range insts {
+		ids[i] = inst.InstanceID
+		types[inst.InstanceID] = inst.InstanceType
+	}
+	done, err := a.terminate(ctx, ids)
+	for _, id := range done {
+		log("terminating %s (%s)", id, types[id])
+		_ = os.Remove(a.knownHosts(id))
+	}
+	if len(done) > 0 {
+		a.releaseClaims(done)
+	}
+	return len(done), err
+}
+
+// maxTerminateIDs is the most instance IDs EC2 takes in one
+// TerminateInstances request.
+const maxTerminateIDs = 1000
+
+// terminate ends the given instances in batches EC2 accepts. It sends every
+// batch even after one is refused, and returns the IDs of the batches EC2
+// accepted, with an error naming those it refused. A refused batch's
+// instances are left as they were, so running it again is safe.
+func (a *AWSSpot) terminate(ctx context.Context, ids []string) ([]string, error) {
+	var done []string
+	var errs []error
+	failed := 0
+	batches := (len(ids) + maxTerminateIDs - 1) / maxTerminateIDs
+	for b := 0; b < batches; b++ {
+		batch := ids[b*maxTerminateIDs : min((b+1)*maxTerminateIDs, len(ids))]
 		p := url.Values{}
-		for i, inst := range insts {
-			p.Set("InstanceId."+strconv.Itoa(i+1), inst.InstanceID)
+		for i, id := range batch {
+			p.Set("InstanceId."+strconv.Itoa(i+1), id)
 		}
 		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err != nil {
-			return 0, fmt.Errorf("terminate: %w", err)
+			failed += len(batch)
+			errs = append(errs, fmt.Errorf("batch %d of %d (%d instances): %w", b+1, batches, len(batch), err))
+			continue
 		}
-		ids := make([]string, 0, len(insts))
-		for _, inst := range insts {
-			log("terminating %s (%s)", inst.InstanceID, inst.InstanceType)
-			_ = os.Remove(a.knownHosts(inst.InstanceID))
-			ids = append(ids, inst.InstanceID)
-		}
-		a.releaseClaims(ids)
-	} else {
-		log("no running instances for %s", a.r.Name)
+		done = append(done, batch...)
 	}
-	return len(insts), nil
+	if len(errs) > 0 {
+		return done, fmt.Errorf("terminate: %d of %d instances not terminated: %w", failed, len(ids), errors.Join(errs...))
+	}
+	return done, nil
 }
 
 // Doctor checks credentials, identity, AMI and networking.
