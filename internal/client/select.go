@@ -463,20 +463,20 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				continue
 			}
 			if req.noBoot(m.r.Name) {
-				if cands, listed := fleetCands[m]; listed && len(cands) == 0 && req.BootOnly != "" {
-					// Barred from launching, with no VM to serve: as
-					// blocked as a fleet that can't launch.
+				if req.BootOnly != "" && !m.pool.mayServe(ctx, req.Exclude) {
+					// Barred from launching, with no VM, even a busy or
+					// booting one, that may serve: as blocked as a fleet
+					// that can't launch.
 					blocked++
 				}
 				continue // can't grow: don't signal demand others would launch for
 			}
 			if waiters[m.r.Name] == nil {
-				register := m.pool.Register
 				weight := 1
 				if req.Base.Exclusive {
-					register, weight = m.pool.RegisterExclusive, m.pool.SlotsPerInstance()
+					weight = m.pool.SlotsPerInstance()
 				}
-				w, err := register(weight)
+				w, err := m.pool.RegisterAway(weight, req.Base.Exclusive, awayRegions(req.Exclude))
 				if err != nil {
 					return nil, err
 				}
@@ -487,11 +487,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			if req.noBoot(m.r.Name) {
 				continue
 			}
-			own := 1
-			if req.Base.Exclusive {
-				own = m.pool.SlotsPerInstance()
-			}
-			d, err := m.pool.PlanFor(ctx, covered, req.Exclude, own)
+			d, err := m.pool.Plan(ctx, covered)
 			if err != nil {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue

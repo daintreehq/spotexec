@@ -317,3 +317,17 @@ func TestBootOnlyBesideQuotaFailsPromptly(t *testing.T) {
 		t.Fatalf("the barred runner launched %d", fleets["broken"].n)
 	}
 }
+
+// A barred runner with a VM that may yet serve (busy now) isn't blocked:
+// the replay waits for it rather than failing on the permitted runner's
+// quota.
+func TestBootOnlyWaitsForBarredRunnersBusyVM(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"broken": {"b1"}, "healthy": {}}, 2)
+	fleets["healthy"].fail = quotaErr()
+	scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) { return nil, nil }) // busy
+	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: 3 * time.Second, Rep: nopRep{}, BootOnly: "healthy"})
+	WaitLaunches(5 * time.Second)
+	if err == nil || !strings.Contains(err.Error(), protocol.CodeQueueTimeout) {
+		t.Fatalf("error = %v, want a queue timeout", err)
+	}
+}

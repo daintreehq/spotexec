@@ -611,13 +611,15 @@ func TestRegionLossVerdictHoldsTheRegion(t *testing.T) {
 	}
 }
 
-// A VM booting in a region a request excludes still counts toward
-// max_instances, but doesn't cover that request's demand: a replay kept
-// out of a silent region launches elsewhere instead of waiting on it.
-func TestPlanForSkipsExcludedPendingCapacity(t *testing.T) {
+// A VM booting in a region some waiters can't use still counts toward
+// max_instances, but covers only the other waiters' demand: replays kept
+// out of a silent region launch elsewhere instead of waiting on it, and no
+// more than they need.
+func TestPlanCreditsExcludedPendingCapacityToOthers(t *testing.T) {
+	away := []string{"ap-south-1"}
 	booting := func(ledger bool, max int) *Pool {
 		p, f := testPool(t, max)
-		f.insts = []provider.Instance{vmIn("i-ap", "ap-south-1", time.Minute)}
+		f.insts = []provider.Instance{vmIn("i-ap", "ap-south-1", time.Minute)} // 2 slots
 		if ledger {
 			_ = p.with(func(st *poolState) error {
 				st.Launches = append(st.Launches, launchRec{ID: "l1", InstanceID: "i-ap", Started: time.Now().Add(-time.Minute)})
@@ -626,43 +628,58 @@ func TestPlanForSkipsExcludedPendingCapacity(t *testing.T) {
 		}
 		return p
 	}
+	// launches registers the waiters (weight, and whether each avoids
+	// ap-south-1) and plans until nothing launches: how many did.
+	launches := func(t *testing.T, p *Pool, waiters ...[2]int) int {
+		t.Helper()
+		for _, w := range waiters {
+			var rg []string
+			if w[1] == 1 {
+				rg = away
+			}
+			wt, err := p.RegisterAway(w[0], false, rg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(wt.Done)
+		}
+		n := 0
+		for ; n < 5; n++ {
+			d, err := p.Plan(context.Background(), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d.Launch {
+				return n
+			}
+		}
+		return n
+	}
 	for _, ledger := range []bool{false, true} {
-		p := booting(ledger, 4)
-		w, err := p.Register(1)
-		if err != nil {
-			t.Fatal(err)
+		for _, c := range []struct {
+			name    string
+			waiters [][2]int
+			want    int
+		}{
+			{"one ordinary waiter: waits for it", [][2]int{{1, 0}}, 0},
+			{"one replay: launches", [][2]int{{1, 1}}, 1},
+			{"two ordinary waiters and a replay: one launch", [][2]int{{2, 0}, {1, 1}}, 1},
+			{"three replays: two launches", [][2]int{{1, 1}, {1, 1}, {1, 1}}, 2},
+		} {
+			t.Run(fmt.Sprintf("ledger=%v/%s", ledger, c.name), func(t *testing.T) {
+				if got := launches(t, booting(ledger, 4), c.waiters...); got != c.want {
+					t.Fatalf("%d launches, want %d", got, c.want)
+				}
+			})
 		}
-		if d, err := p.Plan(context.Background(), 0); err != nil || d.Launch || !strings.Contains(d.Reason, "being launched") {
-			t.Fatalf("ledger=%v: unexcluded plan %+v, %v", ledger, d, err)
-		}
-		d, err := p.PlanFor(context.Background(), 0, map[string]bool{regionKey("ap-south-1"): true}, 1)
-		if err != nil || !d.Launch || d.Live != 1 {
-			t.Fatalf("ledger=%v: excluded plan %+v, %v", ledger, d, err)
-		}
-		w.Done()
-
-		// At max_instances it still counts.
-		p = booting(ledger, 1)
-		w, _ = p.Register(1)
-		if d, _ := p.PlanFor(context.Background(), 0, map[string]bool{regionKey("ap-south-1"): true}, 1); d.Launch || !strings.Contains(d.Reason, "max_instances") {
-			t.Fatalf("ledger=%v: at max: %+v", ledger, d)
-		}
-		w.Done()
-
-		// Other waiters can still use it: with two of theirs and one of
-		// the request's, one launch covers the request, not two.
-		p = booting(ledger, 4)
-		others, _ := p.Register(2)
-		w, _ = p.Register(1)
-		away := map[string]bool{regionKey("ap-south-1"): true}
-		if d, _ := p.PlanFor(context.Background(), 0, away, 1); !d.Launch {
-			t.Fatalf("ledger=%v: mixed waiters, first plan: %+v", ledger, d)
-		}
-		if d, _ := p.PlanFor(context.Background(), 0, away, 1); d.Launch {
-			t.Fatalf("ledger=%v: mixed waiters, launched a second VM: %+v", ledger, d)
-		}
-		others.Done()
-		w.Done()
+		t.Run(fmt.Sprintf("ledger=%v/at max_instances", ledger), func(t *testing.T) {
+			if got := launches(t, booting(ledger, 1), [2]int{1, 1}); got != 0 {
+				t.Fatalf("%d launches past max_instances", got)
+			}
+		})
+	}
+	if got := awayRegions(map[string]bool{"i-lost": true, regionKey("ap-south-1"): true, regionKey("bad+region"): true, regionKey("us-east-1"): true}); strings.Join(got, ",") != "ap-south-1,us-east-1" {
+		t.Fatalf("away regions %v", got)
 	}
 }
 

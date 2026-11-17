@@ -280,3 +280,29 @@ func (p *Pool) launchOutside(ctx context.Context, region, why string) bool {
 	_, stands := holds[region]
 	return stands && open
 }
+
+// mayServe reports whether a VM of the fleet, as last listed, may yet
+// serve a request kept off exclude's VMs and regions: one in service
+// (busy, booting or ready) outside them, or a launch not yet listed. True
+// when the pool's state can't be read.
+func (p *Pool) mayServe(ctx context.Context, exclude map[string]bool) bool {
+	may := false
+	if err := p.withCtx(ctx, func(st *poolState) error {
+		listed := map[string]bool{}
+		for _, in := range st.Instances {
+			listed[in.ID] = true
+			if n := st.Notes[in.ID]; (n == nil || !n.closed()) && !excluded(exclude, in) {
+				may = true
+			}
+		}
+		for _, l := range st.Launches {
+			if !l.Failed && (l.InstanceID == "" || !listed[l.InstanceID]) {
+				may = true
+			}
+		}
+		return nil
+	}); err != nil {
+		return true
+	}
+	return may
+}
