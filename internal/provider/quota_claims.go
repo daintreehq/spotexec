@@ -36,9 +36,10 @@ const (
 )
 
 // withClaims runs fn on the runner's live quota claims under their lock
-// and saves them. It does nothing without a state directory.
+// and saves them. Without a state directory there are none to keep.
 func (a *AWSSpot) withClaims(fn func(cs map[string]quotaClaim)) error {
 	if a.dir == "" {
+		fn(map[string]quotaClaim{})
 		return nil
 	}
 	release, err := waitLockFile(context.Background(), a.lockPath(quotaClaimsLock), syscall.LOCK_EX, nil)
