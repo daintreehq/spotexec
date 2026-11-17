@@ -591,6 +591,10 @@ type LaunchDecision struct {
 	Live     int // usable instances (not draining)
 	Demand   int
 	Capacity int // pending slots
+	// Ready: slots of demand that VMs already serving can take now, by
+	// this machine's ledger (readyRoom): an empty VM for each whole-VM
+	// waiter, free slots for the rest.
+	Ready int
 	// QuotaErr is set while the account's vCPU quota (or max_price, below
 	// every Spot price) blocks launches: the fleet can only serve from the
 	// VMs it already has.
