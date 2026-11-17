@@ -125,8 +125,8 @@ type fleet struct {
 	lastPrb time.Time
 	lastSwp time.Time
 	// Replacement pacing while silence may be our own route rather than
-	// dead VMs: blind when no instance answered at all, regionBlind (by
-	// region) when a region went silent while others answered.
+	// dead VMs: regionBlind (by region) when none of a region's instances
+	// answered, and blind as well when no instance answered at all.
 	blind       blindGate
 	regionBlind map[string]*blindGate
 	busy        map[string]bool // launch ids being provisioned by this daemon
@@ -158,14 +158,15 @@ type fleet struct {
 // blindGate paces replacements of silent instances when silence may be a
 // lost route rather than dead VMs: the first silent round arms it, the
 // first replacement waits another unhealthy period, then at most one per
-// 30 minutes. The clock advances before the request is sent, so a failed
-// request still uses up its turn.
+// 30 minutes. The clock advances (spend) before the request is sent, so a
+// failed request still uses up its turn.
 type blindGate struct {
 	at    time.Time // armed, or last replacement allowed
 	kills int
 }
 
-func (g *blindGate) allow() bool {
+// ready arms an unarmed gate and reports whether a replacement may go now.
+func (g *blindGate) ready() bool {
 	if g.at.IsZero() {
 		g.at, g.kills = time.Now(), 0
 		return false
@@ -174,12 +175,12 @@ func (g *blindGate) allow() bool {
 	if g.kills > 0 {
 		wait = 30 * time.Minute
 	}
-	if time.Since(g.at) < wait {
-		return false
-	}
+	return time.Since(g.at) >= wait
+}
+
+func (g *blindGate) spend() {
 	g.at = time.Now()
 	g.kills++
-	return true
 }
 
 type launchBatch struct {
@@ -510,6 +511,19 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			}
 		}
 	}
+	// A full listing: forget the pacing of regions with no VMs left, before
+	// any launch, so a new VM there doesn't inherit an old clock.
+	if len(view.Unlisted) == 0 {
+		present := map[string]bool{}
+		for _, in := range view.Instances {
+			present[in.Region] = true
+		}
+		for rg := range fl.regionBlind {
+			if !present[rg] {
+				delete(fl.regionBlind, rg)
+			}
+		}
+	}
 	// Launched or counted but never listed (a VM that ended before any
 	// listing showed it): forgotten once listings would show it.
 	d.mu.Lock()
@@ -694,17 +708,6 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		if total > 0 {
 			fl.blind = blindGate{}
 		}
-		if len(view.Unlisted) == 0 { // a full listing: forget regions with no VMs left
-			present := map[string]bool{}
-			for _, in := range view.Instances {
-				present[in.Region] = true
-			}
-			for rg := range fl.regionBlind {
-				if !present[rg] {
-					delete(fl.regionBlind, rg)
-				}
-			}
-		}
 		for _, in := range running {
 			age := time.Since(in.LaunchedAt)
 			// Silence counts from the last answer, or from when this daemon
@@ -724,20 +727,28 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			if !stale && !stuck {
 				continue
 			}
-			// Nothing answers (in its region, or at all): possibly our own
-			// network, though the cloud API answered this pass.
-			var gate *blindGate
-			switch {
-			case total == 0:
-				gate = &fl.blind
-			case answered[in.Region] == 0:
-				if gate = fl.regionBlind[in.Region]; gate == nil {
+			// Nothing answers in its region: possibly our own network,
+			// though the cloud API answered this pass. Paced by its region,
+			// and when nothing answers at all, across the fleet too (both
+			// gates armed, both spent), so switching between the two
+			// never allows a burst.
+			if answered[in.Region] == 0 {
+				gate := fl.regionBlind[in.Region]
+				if gate == nil {
 					gate = &blindGate{}
 					fl.regionBlind[in.Region] = gate
 				}
-			}
-			if gate != nil && !gate.allow() {
-				continue
+				ok := gate.ready()
+				if total == 0 {
+					ok = fl.blind.ready() && ok
+				}
+				if !ok {
+					continue
+				}
+				gate.spend()
+				if total == 0 {
+					fl.blind.spend()
+				}
 			}
 			why := fmt.Sprintf("unresponsive for %s", time.Since(since).Round(time.Second))
 			switch {

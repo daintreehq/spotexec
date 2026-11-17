@@ -947,8 +947,8 @@ func TestManageLeavesUnlistedRegionsVMsAlone(t *testing.T) {
 // regionFleet is three running VMs in us-east-1 and one in us-west-2, all
 // launched an hour ago and last heard from 15 minutes ago. The probe hears
 // only from the VMs whose region is up (and not in down). pass runs one
-// management round with a probe.
-func regionFleet(t *testing.T) (c *cloud, fl *fleet, up map[string]bool, down map[string]bool, pass func()) {
+// management round with a probe; listOnly runs one without.
+func regionFleet(t *testing.T) (c *cloud, fl *fleet, up map[string]bool, down map[string]bool, pass, listOnly func() FleetStatus) {
 	c, cfgPath := setup(t)
 	writeConfig(t, cfgPath, runnerConfig("a.large", 0))
 	for _, in := range []struct{ id, region string }{{"i-e1", "us-east-1"}, {"i-e2", "us-east-1"}, {"i-e3", "us-east-1"}, {"i-w1", "us-west-2"}} {
@@ -975,13 +975,31 @@ func regionFleet(t *testing.T) (c *cloud, fl *fleet, up map[string]bool, down ma
 	for _, id := range []string{"i-e1", "i-e2", "i-e3", "i-w1"} {
 		fl.lastOK[id] = time.Now().Add(-15 * time.Minute)
 	}
-	pass = func() {
+	pass = func() FleetStatus {
 		t.Helper()
 		fl.lastPrb = time.Time{} // probe every pass
-		d.manage(context.Background(), fl)
+		st := d.manage(context.Background(), fl)
 		settle(t, d)
+		return st
 	}
-	return c, fl, up, down, pass
+	listOnly = func() FleetStatus {
+		t.Helper()
+		fl.lastPrb = time.Now()
+		st := d.manage(context.Background(), fl)
+		settle(t, d)
+		return st
+	}
+	return c, fl, up, down, pass, listOnly
+}
+
+// shift moves every pacing clock of fl back by dt, as time would.
+func shift(fl *fleet, dt time.Duration) {
+	if !fl.blind.at.IsZero() {
+		fl.blind.at = fl.blind.at.Add(-dt)
+	}
+	for _, g := range fl.regionBlind {
+		g.at = g.at.Add(-dt)
+	}
 }
 
 func (c *cloud) ids(runner string) []string {
@@ -1000,7 +1018,7 @@ func (c *cloud) ids(runner string) []string {
 // an unhealthy period after the silence was noticed, then one per 30
 // minutes, and the answering region is never touched.
 func TestSilentRegionIsNotEmptiedByAnotherRegionsAnswers(t *testing.T) {
-	c, fl, up, _, pass := regionFleet(t)
+	c, fl, up, _, pass, _ := regionFleet(t)
 	up["us-east-1"] = false
 	pass()
 	if got := c.ids("pool"); len(got) != 4 {
@@ -1035,7 +1053,7 @@ func TestSilentRegionIsNotEmptiedByAnotherRegionsAnswers(t *testing.T) {
 // When the silent region's route comes back its pacing ends, and a later
 // silence starts a fresh grace period instead of resuming the old cadence.
 func TestSilentRegionRecoveryResetsItsPacing(t *testing.T) {
-	c, fl, up, _, pass := regionFleet(t)
+	c, fl, up, _, pass, _ := regionFleet(t)
 	up["us-east-1"] = false
 	pass()
 	fl.regionBlind["us-east-1"].at = time.Now().Add(-time.Hour)
@@ -1061,14 +1079,14 @@ func TestSilentRegionRecoveryResetsItsPacing(t *testing.T) {
 	}
 }
 
-// A VM that stops answering while its region's other VMs answer is dead,
-// not cut off: it is replaced in the same pass.
+// VMs that stop answering while a peer in their region answers are dead,
+// not cut off: they are replaced in the same pass.
 func TestSilentVMWithAnsweringRegionPeersIsReplacedAtOnce(t *testing.T) {
-	c, fl, _, down, pass := regionFleet(t)
-	down["i-e2"] = true
+	c, fl, _, down, pass, _ := regionFleet(t)
+	down["i-e2"], down["i-e3"] = true, true
 	pass()
-	if got := c.ids("pool"); len(got) != 3 || slices.Contains(got, "i-e2") {
-		t.Fatalf("left %v, want only i-e2 ended", got)
+	if got := c.ids("pool"); !slices.Equal(got, []string{"i-e1", "i-w1"}) {
+		t.Fatalf("left %v, want i-e2 and i-e3 ended", got)
 	}
 	if len(fl.regionBlind) != 0 || !fl.blind.at.IsZero() {
 		t.Fatalf("paced a VM with answering peers: regional %v, fleet-wide %+v", fl.regionBlind, fl.blind)
@@ -1077,38 +1095,119 @@ func TestSilentVMWithAnsweringRegionPeersIsReplacedAtOnce(t *testing.T) {
 
 // With no answers from any region the fleet-wide pacing holds as before:
 // one replacement per period across the whole fleet, not one per region.
+// An answer anywhere ends it; a later total silence starts afresh.
 func TestFleetWideSilencePacesAcrossRegions(t *testing.T) {
-	c, fl, up, _, pass := regionFleet(t)
+	c, fl, up, _, pass, _ := regionFleet(t)
 	up["us-east-1"], up["us-west-2"] = false, false
 	pass()
 	if got := c.ids("pool"); len(got) != 4 {
 		t.Fatalf("one pass with no answers ended VMs: left %v", got)
 	}
-	fl.blind.at = fl.blind.at.Add(-unhealthyAfter)
+	if fl.blind.at.IsZero() || fl.regionBlind["us-east-1"] == nil || fl.regionBlind["us-west-2"] == nil {
+		t.Fatalf("first silent round didn't arm the gates: fleet-wide %+v, regional %v", fl.blind, fl.regionBlind)
+	}
+	shift(fl, unhealthyAfter)
 	pass()
 	if got := c.ids("pool"); len(got) != 3 {
 		t.Fatalf("after the grace period with no answers: left %v, want 3", got)
 	}
-	if len(fl.regionBlind) != 0 {
-		t.Fatalf("regional pacing used while no region answered: %v", fl.regionBlind)
+	shift(fl, 29*time.Minute)
+	pass()
+	if got := c.ids("pool"); len(got) != 3 {
+		t.Fatalf("a second replacement within 30 minutes of silence: left %v", got)
+	}
+	shift(fl, time.Minute)
+	pass()
+	if got := c.ids("pool"); len(got) != 2 {
+		t.Fatalf("after 30 more minutes: left %v, want 2 (one per period, not per region)", got)
+	}
+
+	up["us-west-2"] = true
+	for _, id := range c.ids("pool") {
+		fl.lastOK[id] = time.Now().Add(-15 * time.Minute)
+	}
+	pass()
+	if !fl.blind.at.IsZero() {
+		t.Fatalf("fleet-wide pacing kept after an answer: %+v", fl.blind)
+	}
+	up["us-west-2"] = false
+	pass()
+	if fl.blind.at.IsZero() || fl.blind.kills != 0 || time.Since(fl.blind.at) > time.Minute {
+		t.Fatalf("a new total silence didn't arm a fresh grace period: %+v", fl.blind)
+	}
+}
+
+// A region paced on its own stays paced when the whole fleet goes silent
+// and when other regions answer again: switching between the two never
+// allows a second replacement inside its 30 minutes.
+func TestPacingHoldsAcrossTotalAndRegionalSilence(t *testing.T) {
+	c, fl, up, _, pass, _ := regionFleet(t)
+	up["us-east-1"] = false
+	pass()
+	shift(fl, unhealthyAfter)
+	pass()
+	if got := c.ids("pool"); len(got) != 3 {
+		t.Fatalf("after east's grace period: left %v, want one east VM ended", got)
+	}
+	up["us-west-2"] = false
+	pass()
+	shift(fl, 10*time.Minute) // the fleet-wide grace is over, east's 30 minutes aren't
+	pass()
+	up["us-west-2"] = true
+	pass()
+	if got := c.ids("pool"); len(got) != 3 {
+		t.Fatalf("switching between total and regional silence ended another VM: left %v", got)
+	}
+	shift(fl, 20*time.Minute)
+	pass()
+	if got := c.ids("pool"); len(got) != 2 || !slices.Contains(got, "i-w1") {
+		t.Fatalf("after east's 30 minutes: left %v, want a second east VM ended", got)
+	}
+}
+
+// A region's single VM going silent while other regions answer is paced
+// too: one VM gives no evidence from its own region either way.
+func TestSilentSingleVMRegionIsPaced(t *testing.T) {
+	c, fl, up, _, pass, _ := regionFleet(t)
+	up["us-west-2"] = false
+	pass()
+	if got := c.ids("pool"); len(got) != 4 || fl.regionBlind["us-west-2"] == nil || fl.regionBlind["us-east-1"] != nil {
+		t.Fatalf("first silent round: left %v, gates %v; want nothing ended and west's gate armed", got, fl.regionBlind)
+	}
+	shift(fl, unhealthyAfter)
+	pass()
+	if got := c.ids("pool"); slices.Contains(got, "i-w1") || len(got) != 3 {
+		t.Fatalf("after the grace period: left %v, want i-w1 ended", got)
 	}
 }
 
 // A region's pacing is kept while a listing misses some region (its VMs
-// may still be there) and dropped once a full listing shows it has none.
+// may still be there) and dropped once any full listing, probe or not,
+// shows it has no VMs, before a new VM there could inherit it. A region
+// with only a pending VM still has one.
 func TestRegionPacingForgottenOnceTheRegionIsEmpty(t *testing.T) {
-	_, fl, _, _, pass := regionFleet(t)
+	c, fl, _, _, pass, listOnly := regionFleet(t)
+	c.add("pool", provider.Instance{ID: "i-pend", Type: "a.large", Region: "eu-west-1", State: provider.StatePending, LaunchedAt: time.Now()})
+	pass() // a full listing first, as a running daemon has
 	fl.regionBlind["ap-south-1"] = &blindGate{at: time.Now()}
+	fl.regionBlind["eu-west-1"] = &blindGate{at: time.Now()}
 	ff := fl.pool.Fleet.(*fakeFleet)
 	uf := &unlistedFleet{fakeFleet: ff}
 	fl.pool.Fleet, fl.f = uf, uf
-	pass()
+	if st := pass(); st.LastError != "" {
+		t.Fatalf("partial listing failed: %s", st.LastError)
+	}
 	if fl.regionBlind["ap-south-1"] == nil {
 		t.Fatal("pacing of a region forgotten while it couldn't be listed")
 	}
 	fl.pool.Fleet, fl.f = ff, ff
-	pass()
+	if st := listOnly(); st.LastError != "" {
+		t.Fatalf("full listing failed: %s", st.LastError)
+	}
 	if g := fl.regionBlind["ap-south-1"]; g != nil {
 		t.Fatalf("pacing of an empty region kept after a full listing: %+v", g)
+	}
+	if fl.regionBlind["eu-west-1"] == nil {
+		t.Fatal("pacing of a region with a pending VM forgotten")
 	}
 }
