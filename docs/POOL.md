@@ -121,8 +121,10 @@ takes part in scheduling, and every VM shuts itself down.
    - Lower-priority fleets only launch for demand the higher-priority ones
      can't cover.
    - Draining and outdated VMs don't count toward `max_instances`, but
-     with one set, launches pause while twice `max_instances` VMs are
-     alive, until some end; the wait reason counts the draining and outdated VMs holding them.
+     with one set, launches (warm-pool and `spotexec up` ones too) pause
+     while twice `max_instances` VMs are alive, until some end; the wait
+     reason, or `spotexec up`'s warning, counts the draining and outdated
+     VMs holding them.
    - A fleet at `max_instances` with jobs waiting ends one VM at a time in
      a region held as unreachable (one that failed its last probes and
      has none of this machine's runs on it), so the launch can go to a

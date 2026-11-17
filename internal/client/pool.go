@@ -1011,17 +1011,29 @@ func liveCapReason(st *poolState, maxInstances int) string {
 }
 
 // Reserve records up to n launches regardless of waiting demand (spotexec
-// up), still respecting max_instances (when set). It returns the launch IDs.
+// up), still respecting max_instances and the cap on live VMs (when set).
+// It returns the launch IDs.
 func (p *Pool) Reserve(ctx context.Context, n int) ([]string, error) {
+	ids, _, err := p.ReserveWhy(ctx, n)
+	return ids, err
+}
+
+// ReserveWhy is Reserve, also saying why fewer than n launches were
+// recorded: at max_instances, or held by the cap on live VMs (twice
+// max_instances, counting draining and outdated VMs and launches not yet
+// listed). The reason is empty when all n were.
+func (p *Pool) ReserveWhy(ctx context.Context, n int) ([]string, string, error) {
 	var ids []string
+	why := ""
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, true); err != nil {
 			return err
 		}
 		listed := map[string]bool{}
-		usable := 0
+		usable, total := 0, 0
 		for _, in := range st.Instances {
 			listed[in.ID] = true
+			total++
 			if !st.Notes[in.ID].closed() {
 				usable++
 			}
@@ -1029,19 +1041,29 @@ func (p *Pool) Reserve(ctx context.Context, n int) ([]string, error) {
 		for _, l := range st.Launches {
 			if !l.Failed && (l.InstanceID == "" || !listed[l.InstanceID]) {
 				usable++
+				total++
 			}
 		}
-		for i := 0; i < n && p.R.BelowMax(usable); i++ {
+		for len(ids) < n {
+			if !p.R.BelowMax(usable) {
+				why = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
+				break
+			}
+			if p.R.Capped() && total >= 2*p.R.MaxInstances {
+				why = liveCapReason(st, p.R.MaxInstances)
+				break
+			}
 			var b [6]byte
 			_, _ = rand.Read(b[:])
 			id := hex.EncodeToString(b[:])
 			st.Launches = append(st.Launches, launchRec{ID: id, Started: time.Now(), PID: os.Getpid()})
 			ids = append(ids, id)
 			usable++
+			total++
 		}
 		return nil
 	})
-	return ids, err
+	return ids, why, err
 }
 
 // EnsureMin reserves launches to bring the fleet up to min usable instances
