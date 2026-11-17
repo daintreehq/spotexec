@@ -110,7 +110,7 @@ func (q *Queue) Join(priority int, exclusive bool, command string) (*Ticket, err
 var errJoinRace = errors.New("queue ticket swept while being written")
 
 func (q *Queue) join(tk ticketData) (*Ticket, error) {
-	var b [4]byte
+	var b [8]byte
 	_, _ = rand.Read(b[:])
 	base := filepath.Join(q.dir, fmt.Sprintf("%d-%s", os.Getpid(), hex.EncodeToString(b[:])))
 	tmp, path := base+joiningExt, base+ticketExt
@@ -238,6 +238,7 @@ func (q *Queue) State(t *Ticket) QueueState {
 // has changed since.
 type snapshot struct {
 	Start int64       `json:"start"` // unix nanoseconds, when the scan began
+	Done  int64       `json:"done"`  // and when it finished
 	Live  []snapEntry `json:"live"`
 	Stale []string    `json:"stale,omitempty"` // held, but not refreshed lately
 	Other []string    `json:"other,omitempty"` // unreadable
@@ -277,15 +278,15 @@ func (q *Queue) cached(name string, asked time.Time) (QueueState, bool) {
 	if json.Unmarshal(b, &s) != nil {
 		return QueueState{}, false
 	}
-	start, now := time.Unix(0, s.Start), time.Now()
-	if start.After(now) {
+	start, done, now := time.Unix(0, s.Start), time.Unix(0, s.Done), time.Now()
+	if start.After(done) || done.After(now) {
 		return QueueState{}, false // the clock went back: can't tell its age
 	}
 	st, ok := s.position(name)
 	if !ok {
 		return QueueState{}, false // not seen yet (or no longer live): scan
 	}
-	if now.Sub(start) > snapshotTTL {
+	if now.Sub(done) > snapshotTTL {
 		return QueueState{}, false
 	}
 	if !start.Before(asked) {
@@ -368,7 +369,7 @@ var beforeInspect func(name string)
 
 // scanPasses bounds how many times a scan lists the queue again to look
 // at tickets that joined while it ran.
-const scanPasses = 8
+const scanPasses = 32
 
 // scan lists tickets held by running processes, in admission order, and
 // sweeps dead ones (and tickets abandoned while being written). It looks
@@ -438,6 +439,7 @@ func (q *Queue) scan() (s snapshot, ok bool) {
 	for i, x := range live {
 		s.Live[i] = snapEntry{Name: x.name, Exclusive: x.tk.Exclusive}
 	}
+	s.Done = time.Now().UnixNano()
 	return s, true
 }
 

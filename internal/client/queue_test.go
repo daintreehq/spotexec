@@ -353,6 +353,16 @@ func TestQueueCachedRules(t *testing.T) {
 	if st, ok := q.cached(name, before); !ok || st.Position != 0 {
 		t.Fatalf("a scan begun after the lookup: %+v %v", st, ok)
 	}
+	// A scan slower than the TTL is still fresh when it lands: its age
+	// counts from when it finished.
+	shorten(t, &snapshotTTL, time.Second)
+	slow := snap
+	slow.Start = time.Now().Add(-time.Minute).UnixNano()
+	slow.Done = time.Now().UnixNano()
+	q.publish(slow)
+	if _, ok := q.cached(name, time.Unix(0, slow.Start).Add(-time.Millisecond)); !ok {
+		t.Fatal("a slow scan expired before its first reader")
+	}
 	shorten(t, &snapshotTTL, 0)
 	if _, ok := q.cached(name, before); ok {
 		t.Fatal("an expired scan answered")
@@ -415,8 +425,9 @@ func TestQueueIgnoresBadSnapshot(t *testing.T) {
 	a := join(t, q, 0, false)
 	name := filepath.Base(a.path)
 	// Each would put a phantom exclusive ticket ahead of a, if believed.
-	future := fmt.Sprintf(`{"start":%d,"live":[{"n":"x.ticket","x":true},{"n":%q}]}`, time.Now().Add(time.Hour).UnixNano(), name)
-	badType := fmt.Sprintf(`{"start":%d,"live":[{"n":"x.ticket","x":true},{"n":%q}],"stale":7}`, time.Now().UnixNano(), name)
+	now, later := time.Now().UnixNano(), time.Now().Add(time.Hour).UnixNano()
+	future := fmt.Sprintf(`{"start":%d,"done":%d,"live":[{"n":"x.ticket","x":true},{"n":%q}]}`, later, later, name)
+	badType := fmt.Sprintf(`{"start":%d,"done":%d,"live":[{"n":"x.ticket","x":true},{"n":%q}],"stale":7}`, now, now, name)
 	for _, body := range []string{"{not json", future, badType} {
 		if err := os.WriteFile(filepath.Join(q.dir, snapshotName), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
