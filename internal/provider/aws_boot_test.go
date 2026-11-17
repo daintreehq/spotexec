@@ -145,3 +145,44 @@ func TestWaitRunningFatalReadError(t *testing.T) {
 		t.Fatalf("err = %v after %d reads", err, n.Load())
 	}
 }
+
+// A deadline that cuts the first Query call's retries short still names
+// what the reads were failing with.
+func TestWaitRunningDeadlineCutsFirstReadShort(t *testing.T) {
+	a, n := newBootEnv(t, 100*time.Millisecond, func(int) (int, string) {
+		return http.StatusBadRequest, bootThrottled
+	})
+	queryRetryBase = time.Second // the second attempt would wait 2s
+	_, err := a.WaitRunning(context.Background(), "i-boot", nil)
+	if awsCode(err) != "RequestLimitExceeded" || n.Load() != 1 {
+		t.Fatalf("err = %v after %d reads", err, n.Load())
+	}
+}
+
+// An explicit cancellation mid-outage is the caller's, not a read failure.
+func TestWaitRunningCancelled(t *testing.T) {
+	a, n := newBootEnv(t, time.Minute, func(int) (int, string) {
+		return http.StatusServiceUnavailable, bootThrottled
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for n.Load() < 3 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+	if _, err := a.WaitRunning(ctx, "i-boot", nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// Rejected credentials aren't an outage: the wait ends with them.
+func TestWaitRunningCredentialRejected(t *testing.T) {
+	a, n := newBootEnv(t, time.Minute, func(int) (int, string) {
+		return http.StatusUnauthorized, `<Response><Errors><Error><Code>AuthFailure</Code><Message>AWS was not able to validate the provided access credentials</Message></Error></Errors></Response>`
+	})
+	var ce *CredentialError
+	if _, err := a.WaitRunning(context.Background(), "i-boot", nil); !errors.As(err, &ce) || n.Load() > 2 {
+		t.Fatalf("err = %T %v after %d reads", err, err, n.Load())
+	}
+}

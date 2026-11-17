@@ -111,6 +111,21 @@ var queryAttemptTimeout = 20 * time.Second
 // queryRetryBase scales the backoff between a Query call's attempts.
 var queryRetryBase = 300 * time.Millisecond
 
+type queryErrSinkKey struct{}
+
+// withQueryErrSink has Query calls made with the returned context store
+// each failed attempt's error in *sink, so a caller whose own deadline cuts
+// the retries short can still say what the attempts were failing with.
+func withQueryErrSink(ctx context.Context, sink *error) context.Context {
+	return context.WithValue(ctx, queryErrSinkKey{}, sink)
+}
+
+func noteQueryErr(ctx context.Context, err error) {
+	if sink, ok := ctx.Value(queryErrSinkKey{}).(*error); ok {
+		*sink = err
+	}
+}
+
 func readOnlyAction(action string) bool {
 	return strings.HasPrefix(action, "Describe") || strings.HasPrefix(action, "Get")
 }
@@ -218,6 +233,7 @@ func (c *awsClient) query(ctx context.Context, service, version, action string, 
 				return nil, ctx.Err()
 			}
 			lastErr = fmt.Errorf("%s %s: %w", service, action, err)
+			noteQueryErr(ctx, lastErr)
 			var ce *CredentialError
 			if errors.As(err, &ce) {
 				return nil, err // retrying can't fix credentials
@@ -229,6 +245,7 @@ func (c *awsClient) query(ctx context.Context, service, version, action string, 
 		}
 		ae := parseAWSXMLError(status, b)
 		lastErr = ae
+		noteQueryErr(ctx, ae)
 		if isExpiredCreds(ae.Code) && attempt == 0 {
 			c.creds.invalidate()
 			continue

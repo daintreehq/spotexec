@@ -395,58 +395,96 @@ func (a *AWSSpot) Up(ctx context.Context, log Logger) (Info, error) {
 var bootPollInterval = 3 * time.Second
 
 // waitRunning polls until the instance is running with a public IP.
+//
+// A status read that fails transiently (throttling, a 5xx, the network)
+// says nothing about the instance, so the wait rides it out until the boot
+// deadline instead of giving up a VM that may be booting fine: a burst of
+// launches can throttle DescribeInstances for longer than one Query call's
+// retries. Only a fresh read decides the instance is gone or unusable.
 func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger) (Info, error) {
-	deadline := time.Now().Add(a.r.BootTimeout.Duration)
-	if a.r.BootTimeout.Duration <= 0 {
-		deadline = time.Now().Add(10 * time.Minute)
+	timeout := a.r.BootTimeout.Duration
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
 	}
+	bctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	logged := ""
 	var runningNoIP time.Time
+	var readErr error // the latest failure of an ongoing status-read outage
+	delay := bootPollInterval
 	for {
-		switch inst.State {
-		case "running":
-			if inst.IPAddress != "" {
-				a.pruneKnownHosts()
-				return a.info(inst), nil
+		if readErr == nil {
+			switch inst.State {
+			case "running":
+				if inst.IPAddress != "" {
+					a.pruneKnownHosts()
+					return a.info(inst), nil
+				}
+				if runningNoIP.IsZero() {
+					runningNoIP = time.Now()
+				} else if time.Since(runningNoIP) > 45*time.Second {
+					_ = a.Terminate(ctx, inst.InstanceID)
+					return Info{}, fmt.Errorf("instance %s is running without a public IPv4 address (terminated it); use a subnet that can assign public IPs (subnet_id)", inst.InstanceID)
+				}
+			case "shutting-down", "terminated", "stopping", "stopped":
+				return Info{}, fmt.Errorf("instance %s entered state %q while booting (spot capacity reclaimed?)", inst.InstanceID, inst.State)
 			}
-			if runningNoIP.IsZero() {
-				runningNoIP = time.Now()
-			} else if time.Since(runningNoIP) > 45*time.Second {
-				_ = a.Terminate(ctx, inst.InstanceID)
-				return Info{}, fmt.Errorf("instance %s is running without a public IPv4 address (terminated it); use a subnet that can assign public IPs (subnet_id)", inst.InstanceID)
+			if logged != inst.State {
+				if inst.InstanceType != "" {
+					log("waiting for %s (%s, %s)", inst.InstanceID, inst.InstanceType, inst.State)
+				} else {
+					log("waiting for %s (%s)", inst.InstanceID, inst.State)
+				}
+				logged = inst.State
 			}
-		case "shutting-down", "terminated", "stopping", "stopped":
-			return Info{}, fmt.Errorf("instance %s entered state %q while booting (spot capacity reclaimed?)", inst.InstanceID, inst.State)
-		}
-		if logged != inst.State {
-			if inst.InstanceType != "" {
-				log("waiting for %s (%s, %s)", inst.InstanceID, inst.InstanceType, inst.State)
-			} else {
-				log("waiting for %s (%s)", inst.InstanceID, inst.State)
-			}
-			logged = inst.State
-		}
-		if time.Now().After(deadline) {
-			return Info{}, fmt.Errorf("instance %s not running with a public IP after %s (state %s)", inst.InstanceID, a.r.BootTimeout.Duration, inst.State)
 		}
 		select {
-		case <-ctx.Done():
-			return Info{}, ctx.Err()
-		case <-time.After(bootPollInterval):
+		case <-bctx.Done():
+			if ctx.Err() != nil {
+				return Info{}, ctx.Err()
+			}
+			if readErr != nil {
+				return Info{}, fmt.Errorf("instance %s not running with a public IP after %s: its status could not be read: %w", inst.InstanceID, timeout, readErr)
+			}
+			return Info{}, fmt.Errorf("instance %s not running with a public IP after %s (state %s)", inst.InstanceID, timeout, inst.State)
+		case <-time.After(delay):
 		}
 		p := url.Values{}
 		p.Set("InstanceId.1", inst.InstanceID)
-		b, err := a.api.ec2(ctx, "DescribeInstances", p)
+		var tried error
+		b, err := a.api.ec2(withQueryErrSink(bctx, &tried), "DescribeInstances", p)
 		if err != nil {
+			if ctx.Err() != nil {
+				return Info{}, ctx.Err()
+			}
+			if bctx.Err() != nil {
+				// The deadline cut the read short: report what its
+				// attempts were failing with, if anything.
+				if tried != nil {
+					readErr = tried
+				}
+				continue
+			}
 			if awsCode(err) == "InvalidInstanceID.NotFound" {
 				continue // eventual consistency right after launch
 			}
-			return Info{}, err
+			var ce *CredentialError
+			if errors.As(err, &ce) || classifyAWSError(err) != errRetryable {
+				return Info{}, err
+			}
+			if readErr == nil {
+				log("reading %s's status failed (%v); retrying until its boot deadline", inst.InstanceID, err)
+			} else {
+				delay = min(2*delay, 4*bootPollInterval) // Query backs off within a call; this eases off between them
+			}
+			readErr = err
+			continue
 		}
 		got, _, err := parseDescribeInstances(b)
 		if err != nil {
 			return Info{}, err
 		}
+		readErr, delay = nil, bootPollInterval
 		if len(got) > 0 {
 			inst = got[0]
 		}
