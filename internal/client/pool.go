@@ -792,6 +792,10 @@ type LaunchDecision struct {
 	Live     int // usable instances (not draining)
 	Demand   int
 	Capacity int // pending slots
+	// Ready: slots of demand that VMs already serving can take now, by
+	// this machine's ledger (readyRoom): an empty VM for each whole-VM
+	// waiter, free slots for the rest.
+	Ready int
 	// QuotaErr is set while the account's vCPU quota (or max_price, below
 	// every Spot price) blocks launches: the fleet can only serve from the
 	// VMs it already has.
@@ -816,17 +820,18 @@ type LaunchDecision struct {
 // Plan decides, under the pool lock, whether this process should launch one
 // more instance: only if waiting demand (minus `covered`, the capacity that
 // higher-priority fleets are already launching or waiting for) exceeds the
-// capacity this fleet is launching, the fleet is below max_instances (when
-// it has one), and slots on its running VMs aren't expected to free sooner
-// than a new VM would serve (a short burst waits for them; demand still
-// waiting after a launch's lead launches).
+// capacity this fleet is launching plus what its ready VMs can take now
+// (readyRoom), the fleet is below max_instances (when it has one), and
+// slots on its running VMs aren't expected to free sooner than a new VM
+// would serve (a short burst waits for them; demand still waiting after a
+// launch's lead launches).
 func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
 			return err
 		}
-		demand, wholeVM := p.waiters()
+		demand, whole := p.waiters()
 		d.Demand = demand - covered
 		listed := map[string]bool{}
 		usable, total := 0, 0
@@ -887,6 +892,8 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Waited = now.Sub(p.since)
 		}
 		d.QuotaErr = st.quotaBlocked(p.since)
+		var wholeVM bool
+		d.Ready, wholeVM = p.readyRoom(st, d.Demand-d.Capacity, demand, covered, whole, pendingVM, d.Waited, d.Lead, now)
 		bootFailed := ""
 		for id, n := range st.Notes {
 			if n.BootFailed && time.Since(n.BootFailedAt) < time.Hour {
@@ -901,6 +908,8 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = "demand covered by higher-priority runners"
 		case d.Demand <= d.Capacity:
 			d.Reason = "waiting for instances being launched"
+		case d.Demand <= d.Capacity+d.Ready:
+			d.Reason = fmt.Sprintf("%s free on ready VMs", plural(d.Ready, "slot"))
 		case !p.R.BelowMax(usable):
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
 			if id, region := p.reapable(st, time.Now()); id != "" {
@@ -916,7 +925,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		case time.Now().Before(st.BackoffUntil):
 			d.Reason = "backing off after a failed launch: " + st.LastLaunchErr
 		case p.releaseSoon(st, &d, wholeVM, pendingVM, now):
-			d.Held, d.Deferred = true, d.Demand-d.Capacity
+			d.Held, d.Deferred = true, d.Demand-d.Capacity-d.Ready
 			d.Reason = fmt.Sprintf("%s on running VMs expected to free within %s, sooner than a new VM (~%s)",
 				plural(d.Deferred, "slot"), ui.Dur(d.FreeIn), ui.Dur(d.Lead))
 		default:
@@ -1312,18 +1321,19 @@ func (w *Waiter) Done() {
 	w.f = nil
 }
 
-// releaseSoon reports whether the demand this fleet isn't launching for
-// (d.Demand - d.Capacity) can wait for slots on its running VMs, setting
+// releaseSoon reports whether the demand this fleet isn't launching for,
+// and its ready VMs can't take now (d.Demand - d.Capacity - d.Ready), can
+// wait for slots on its running VMs, setting
 // d.FreeIn: only while this process has waited less than a launch's lead
 // (past it, demand is sustained), and only for slots that jobs predicted
 // to end within the lead hold now. A job whose end is unknown, or already
 // overdue, frees nothing here: the prediction has no say then. A
-// whole-VM (exclusive) waiter needs a VM to empty, which freeing slots
-// don't show, so it never waits here. Jobs a VM's helper admitted
+// whole-VM (exclusive) waiter that no empty VM covers (wholeVM) needs a
+// VM to empty, which freeing slots don't show, so it never waits here. Jobs a VM's helper admitted
 // beyond its slots (overflow, preparing beside them) take the first slots
 // that free there: those releases free nothing for this demand.
 func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendingVM map[string]bool, now time.Time) bool {
-	need := d.Demand - d.Capacity
+	need := d.Demand - d.Capacity - d.Ready
 	if need <= 0 || wholeVM || p.since.IsZero() || d.Waited >= d.Lead {
 		return false
 	}
@@ -1374,6 +1384,77 @@ func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendi
 	return false
 }
 
+// readyRoom is how much of need (the demand this fleet isn't launching
+// for) its ready VMs can take now, by this machine's ledger, and whether a
+// whole-VM waiter is left without a VM. Each whole-VM waiter takes a VM
+// with nothing on it, the smallest first; the shared demand takes the free
+// slots left, on the empty VMs no whole-VM waiter took and beside the jobs
+// on the others. The demand higher-priority fleets cover (`covered`, not
+// saying whose) comes off the shared waiters first: what is left is the
+// hardest to place, so a whole-VM waiter no fleet has an empty VM for is
+// never taken as covered by slots that serve only shared ones. A waiter that can't probe yet (behind an exclusive job
+// in the queue) is demand all the same, so without this an idle fleet
+// launches for it moments before it takes a free slot (#239).
+//
+// A VM counts only while a job would be placed on it: ready, open, not
+// suspect or just found busy, not being ended to make room or held back
+// for an exclusive job (a fence), and not still counted as starting
+// capacity (pendingVM). Slots held by this machine's live or uncertain
+// attempts aren't free, an attempt still in flight included. And only
+// while this process has waited less than a launch's lead: the ledger
+// knows only this machine's jobs, so a VM another machine fills looks free
+// here, and demand still waiting past the lead launches as before.
+func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, pendingVM map[string]bool, waited, lead time.Duration, now time.Time) (covers int, wholeLeft bool) {
+	shared := total
+	for _, wt := range whole {
+		shared -= wt
+	}
+	shared = max(shared, 0)
+	upstream := min(max(covered, 0), shared)
+	shared -= upstream
+	upstream = max(covered, 0) - upstream
+	var left []int // whole-VM waiters not covered upstream
+	for _, wt := range whole {
+		if upstream >= wt {
+			upstream -= wt
+			continue
+		}
+		left = append(left, wt)
+	}
+	if need <= 0 || waited >= lead {
+		return 0, len(left) > 0
+	}
+	s := st.sched()
+	var empty []int
+	free := 0
+	for _, w := range p.views(st, now) {
+		if !w.eligible || !w.ready || pendingVM[w.in.ID] || s.Fences[w.in.ID] != nil {
+			continue
+		}
+		if n := st.Notes[w.in.ID]; n.reaping(now) || now.Before(n.BusyUntil) {
+			continue
+		}
+		if w.firm+w.unc == 0 {
+			empty = append(empty, w.units)
+			continue
+		}
+		free += max(w.units-w.firm-w.unc, 0)
+	}
+	sort.Ints(empty)
+	placed := 0
+	for _, wt := range left {
+		if placed < len(empty) {
+			covers += wt
+			placed++
+		}
+	}
+	for _, u := range empty[placed:] {
+		free += u
+	}
+	covers += min(shared, free)
+	return min(covers, need), placed < len(left)
+}
+
 func plural(n int, what string) string {
 	if n == 1 {
 		return "1 " + what
@@ -1386,9 +1467,9 @@ func (p *Pool) waiterDemand() int {
 	return total
 }
 
-// waiters is the waiting demand in slots, and whether any waiter needs a
-// whole VM (an exclusive job on a fleet of several-slot VMs).
-func (p *Pool) waiters() (total int, wholeVM bool) {
+// waiters is the waiting demand in slots, and the weights of the waiters
+// that need a whole VM (exclusive jobs on a fleet of several-slot VMs).
+func (p *Pool) waiters() (total int, whole []int) {
 	dir := filepath.Join(p.dir, "waiters")
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
@@ -1416,9 +1497,11 @@ func (p *Pool) waiters() (total int, wholeVM bool) {
 			w = 1
 		}
 		total += w
-		wholeVM = wholeVM || w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter)
+		if w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter) {
+			whole = append(whole, w)
+		}
 	}
-	return total, wholeVM
+	return total, whole
 }
 
 // Snapshot returns the cached state (for status displays).
