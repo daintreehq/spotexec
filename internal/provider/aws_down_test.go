@@ -36,11 +36,13 @@ type fakeBulkEC2 struct {
 	// request's response is withheld (EC2 took it, the answer was lost).
 	cancelOnAccept context.CancelFunc
 
-	termCalls int
-	throttled int
-	attempts  []int      // size of every TerminateInstances request
-	terms     [][]string // IDs of each accepted request
-	pages     int
+	termCalls    int
+	throttled    int
+	lastThrottle time.Time     // when the last throttled request was answered
+	refillGap    time.Duration // from the last throttle to the next accepted request
+	attempts     []int         // size of every TerminateInstances request
+	terms        [][]string    // IDs of each accepted request
+	pages        int
 }
 
 func newFakeBulkEC2(t *testing.T, n int) *fakeBulkEC2 {
@@ -97,7 +99,11 @@ func (f *fakeBulkEC2) terminate(w http.ResponseWriter, r *http.Request, p url.Va
 	if len(f.terms) > 0 && f.throttled < f.throttle {
 		f.throttled++
 		ec2Err(w, 503, "RequestLimitExceeded")
+		f.lastThrottle = time.Now()
 		return
+	}
+	if !f.lastThrottle.IsZero() && f.refillGap == 0 {
+		f.refillGap = time.Since(f.lastThrottle)
 	}
 	for _, id := range ids {
 		if !f.live[id] {
@@ -156,6 +162,13 @@ func (f *fakeBulkEC2) describe(w http.ResponseWriter, p url.Values) {
 		fmt.Fprintf(w, `<nextToken>%d</nextToken>`, end)
 	}
 	fmt.Fprint(w, `</DescribeInstancesResponse>`)
+}
+
+// settle waits for any handler still holding the fake, so a test reads its
+// state after every request it made has been recorded.
+func (f *fakeBulkEC2) settle() {
+	f.mu.Lock()
+	f.mu.Unlock()
 }
 
 func newBulkEnv(t *testing.T, f *fakeBulkEC2) *AWSSpot {
@@ -224,6 +237,7 @@ func TestDownBatchesTerminations(t *testing.T) {
 			a := newBulkEnv(t, f)
 			var d downLog
 			n, err := a.downLocked(context.Background(), d.log)
+			f.settle()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -264,6 +278,7 @@ func TestDownReportsRefusedBatchesAndRetries(t *testing.T) {
 	}
 	var d downLog
 	n, err := a.downLocked(context.Background(), d.log)
+	f.settle()
 	if err == nil {
 		t.Fatal("want an error for the refused batches")
 	}
@@ -292,6 +307,7 @@ func TestDownReportsRefusedBatchesAndRetries(t *testing.T) {
 	before := len(f.terms)
 	d = downLog{}
 	n, err = a.downLocked(context.Background(), d.log)
+	f.settle()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,6 +350,7 @@ func TestUpTerminatesStoppedLeftoversInBatches(t *testing.T) {
 					cancel() // stop Up at its launch, which follows the cleanup
 				}
 			})
+			f.settle()
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("Up: %v (want it to go on to launch)", err)
 			}
@@ -359,23 +376,22 @@ func TestTerminateWaitsOutThrottle(t *testing.T) {
 		min, max time.Duration // the refill wait for the throttled second batch
 	}{
 		{2000, time.Second, 0},
-		{1500, 500 * time.Millisecond, 900 * time.Millisecond},
+		{1500, 500 * time.Millisecond, 950 * time.Millisecond}, // sized for its 500, not a full 1000
 	} {
 		t.Run(strconv.Itoa(tc.n), func(t *testing.T) {
 			f := newFakeBulkEC2(t, tc.n)
 			f.throttle = 5 // as many as query retries itself
 			a := newBulkEnv(t, f)
-			start := time.Now()
 			done, err := a.terminate(context.Background(), f.ids)
-			took := time.Since(start)
+			f.settle()
 			if err != nil {
 				t.Fatal(err)
 			}
 			if len(done) != tc.n || len(f.live) != 0 || f.throttled != 5 || len(f.terms) != 2 {
 				t.Fatalf("terminated %d, %d left, throttled %d, accepted %d", len(done), len(f.live), f.throttled, len(f.terms))
 			}
-			if took < tc.min || tc.max > 0 && took > tc.max {
-				t.Fatalf("took %v, want the refill wait (%v to %v)", took, tc.min, tc.max)
+			if gap := f.refillGap; gap < tc.min || tc.max > 0 && gap > tc.max {
+				t.Fatalf("waited %v after the throttle, want the refill wait (%v to %v)", gap, tc.min, tc.max)
 			}
 		})
 	}
@@ -387,6 +403,7 @@ func TestTerminateGivesUpOnPersistentThrottle(t *testing.T) {
 	f.throttle = 10 // the second batch, through query's retries twice
 	a := newBulkEnv(t, f)
 	done, err := a.terminate(context.Background(), f.ids)
+	f.settle()
 	if len(done) != 1500 || f.throttled != 10 || fmt.Sprint(batchSizes(f.terms)) != "[1000 500]" {
 		t.Fatalf("terminated %d, throttled %d, accepted %v", len(done), f.throttled, batchSizes(f.terms))
 	}
@@ -404,13 +421,16 @@ func TestTerminateCancelledDuringRefill(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	done, err := a.terminate(ctx, f.ids)
+	f.settle()
 	if time.Since(start) > 5*time.Second {
 		t.Fatalf("took %v to notice the deadline", time.Since(start))
 	}
 	if len(done) != 1000 || f.throttled != 5 {
 		t.Fatalf("terminated %d, throttled %d", len(done), f.throttled)
 	}
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "batch 2 of 2") {
+	// Both: the batch was throttled, then the deadline ended the wait.
+	if !errors.Is(err, context.DeadlineExceeded) || awsCode(err) != "RequestLimitExceeded" ||
+		!strings.Contains(err.Error(), "batch 2 of 2") {
 		t.Fatalf("error %v", err)
 	}
 }
@@ -424,6 +444,7 @@ func TestTerminateStopsWhenCancelled(t *testing.T) {
 	f.cancelOnAccept = cancel
 	a := newBulkEnv(t, f)
 	done, err := a.terminate(ctx, f.ids)
+	f.settle()
 	if len(done) != 0 || fmt.Sprint(f.attempts) != "[1000]" || len(f.terms) != 1 {
 		t.Fatalf("reported %d; requests %v, accepted %d", len(done), f.attempts, len(f.terms))
 	}

@@ -1340,8 +1340,11 @@ func (a *AWSSpot) terminate(ctx context.Context, ids []string) ([]string, error)
 			// once more.
 			select {
 			case <-ctx.Done():
-				err = errors.Join(err, ctx.Err())
 			case <-time.After(time.Duration(len(batch)) * terminateRefill):
+			}
+			if ctx.Err() != nil {
+				err = errors.Join(err, ctx.Err())
+			} else {
 				err = a.terminateBatch(ctx, batch)
 			}
 		}
