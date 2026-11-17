@@ -118,25 +118,28 @@ type Status struct {
 }
 
 type fleet struct {
-	r          *config.Runner
-	f          provider.Fleet
-	pool       *client.Pool
-	lastOK     map[string]time.Time
-	lastPrb    time.Time
-	lastSwp    time.Time
-	blind      time.Time // last replacement made while no instance answered
-	blindKills int
-	busy       map[string]bool // launch ids being provisioned by this daemon
-	noticed    map[string]bool
-	seen       map[string]time.Time         // when this daemon first saw each instance
-	booting    map[string]bool              // answered, but first-boot setup unfinished
-	bootFailed map[string]bool              // its bootstrap_script failed
-	counted    map[string]time.Time         // already counted by the circuit breaker (when)
-	killing    map[string]string            // terminations to retry until gone (id -> reason)
-	retire     map[string]provider.Instance // warm VMs to drain remotely, until confirmed
-	roles      map[string]string            // placement role of each VM (client.Pool.WarmSet)
-	warmPlan   []string                     // the last warm set WarmSet chose (nil: legacy)
-	unprobed   map[string]bool              // skipped by the last probe round on purpose
+	r       *config.Runner
+	f       provider.Fleet
+	pool    *client.Pool
+	lastOK  map[string]time.Time
+	lastPrb time.Time
+	lastSwp time.Time
+	// Replacement pacing while silence may be our own route rather than
+	// dead VMs: regionBlind (by region) when none of a region's instances
+	// answered, and blind as well when no instance answered at all.
+	blind       blindGate
+	regionBlind map[string]*blindGate
+	busy        map[string]bool // launch ids being provisioned by this daemon
+	noticed     map[string]bool
+	seen        map[string]time.Time         // when this daemon first saw each instance
+	booting     map[string]bool              // answered, but first-boot setup unfinished
+	bootFailed  map[string]bool              // its bootstrap_script failed
+	counted     map[string]time.Time         // already counted by the circuit breaker (when)
+	killing     map[string]string            // terminations to retry until gone (id -> reason)
+	retire      map[string]provider.Instance // warm VMs to drain remotely, until confirmed
+	roles       map[string]string            // placement role of each VM (client.Pool.WarmSet)
+	warmPlan    []string                     // the last warm set WarmSet chose (nil: legacy)
+	unprobed    map[string]bool              // skipped by the last probe round on purpose
 	// Circuit breaker: replacements of instances that never became healthy.
 	failures []time.Time
 	paused   time.Time
@@ -152,13 +155,41 @@ type fleet struct {
 	since time.Time
 }
 
+// blindGate paces replacements of silent instances when silence may be a
+// lost route rather than dead VMs: the first silent round arms it, the
+// first replacement waits another unhealthy period, then at most one per
+// 30 minutes. The clock advances (spend) before the request is sent, so a
+// failed request still uses up its turn.
+type blindGate struct {
+	at    time.Time // armed, or last replacement allowed
+	kills int
+}
+
+// ready arms an unarmed gate and reports whether a replacement may go now.
+func (g *blindGate) ready() bool {
+	if g.at.IsZero() {
+		g.at, g.kills = time.Now(), 0
+		return false
+	}
+	wait := unhealthyAfter
+	if g.kills > 0 {
+		wait = 30 * time.Minute
+	}
+	return time.Since(g.at) >= wait
+}
+
+func (g *blindGate) spend() {
+	g.at = time.Now()
+	g.kills++
+}
+
 type launchBatch struct {
 	pass, epoch int
 	at          time.Time
 }
 
 func newFleetState(r *config.Runner, f provider.Fleet) *fleet {
-	return &fleet{r: r, f: f, pool: client.NewPool(r, f), lastOK: map[string]time.Time{}, busy: map[string]bool{}, noticed: map[string]bool{}, seen: map[string]time.Time{}, booting: map[string]bool{}, bootFailed: map[string]bool{}, counted: map[string]time.Time{}, batchOf: map[string]launchBatch{}, killing: map[string]string{}, retire: map[string]provider.Instance{}}
+	return &fleet{r: r, f: f, pool: client.NewPool(r, f), lastOK: map[string]time.Time{}, busy: map[string]bool{}, noticed: map[string]bool{}, seen: map[string]time.Time{}, booting: map[string]bool{}, bootFailed: map[string]bool{}, counted: map[string]time.Time{}, batchOf: map[string]launchBatch{}, killing: map[string]string{}, retire: map[string]provider.Instance{}, regionBlind: map[string]*blindGate{}}
 }
 
 // Daemon manages every fleet runner in the global config.
@@ -480,6 +511,18 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			}
 		}
 	}
+	// Forget the pacing of a region its listing shows empty, before any
+	// launch, so a new VM there doesn't inherit an old clock. A region that
+	// couldn't be listed (and "", while any couldn't) may still have VMs.
+	present := map[string]bool{}
+	for _, in := range view.Instances {
+		present[in.Region] = true
+	}
+	for rg := range fl.regionBlind {
+		if !present[rg] && !unlisted[rg] && (rg != "" || len(unlisted) == 0) {
+			delete(fl.regionBlind, rg)
+		}
+	}
 	// Launched or counted but never listed (a VM that ended before any
 	// listing showed it): forgotten once listings would show it.
 	d.mu.Lock()
@@ -618,7 +661,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 
 	// 3. Health probes (and keepalive for warm instances). An instance with
 	// a spot interruption notice is drained here.
-	probed, answered := false, 0
+	probed, answered := false, map[string]int{}
 	if time.Since(fl.lastPrb) > probeEvery {
 		fl.lastPrb = time.Now()
 		var notified []string
@@ -648,10 +691,21 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// 4. Replace instances that stopped answering, judged only right after
 	// a probe round. When no instance answered that round it may be our own
 	// network (a firewall blocking SSH, say), so then replace at most one
-	// instance per 30 minutes instead of churning the fleet.
+	// instance per 30 minutes instead of churning the fleet. Likewise for a
+	// region none of whose instances answered while others did: a route to
+	// one region can fail on its own (#229), and an answer from elsewhere
+	// says nothing about it. Only a silent instance with answering peers in
+	// its own region is replaced at once.
 	if probed {
-		if answered > 0 {
-			fl.blind, fl.blindKills = time.Time{}, 0
+		total := 0
+		for rg, n := range answered {
+			total += n
+			if n > 0 {
+				delete(fl.regionBlind, rg)
+			}
+		}
+		if total > 0 {
+			fl.blind = blindGate{}
 		}
 		for _, in := range running {
 			age := time.Since(in.LaunchedAt)
@@ -672,27 +726,28 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 			if !stale && !stuck {
 				continue
 			}
-			if answered == 0 {
-				// Nothing answers: possibly our own network (though the cloud
-				// API answered this pass). The first such round arms a clock;
-				// the first replacement waits another unhealthy period, then
-				// at most one per 30 minutes.
-				if fl.blind.IsZero() {
-					fl.blind = time.Now()
-					fl.blindKills = 0
+			// Nothing answers in its region: possibly our own network,
+			// though the cloud API answered this pass. Paced by its region,
+			// and when nothing answers at all, across the fleet too (both
+			// gates armed, both spent), so switching between the two
+			// never allows a burst.
+			if answered[in.Region] == 0 {
+				gate := fl.regionBlind[in.Region]
+				if gate == nil {
+					gate = &blindGate{}
+					fl.regionBlind[in.Region] = gate
+				}
+				ok := gate.ready()
+				if total == 0 {
+					ok = fl.blind.ready() && ok
+				}
+				if !ok {
 					continue
 				}
-				wait := unhealthyAfter
-				if fl.blindKills > 0 {
-					wait = 30 * time.Minute
+				gate.spend()
+				if total == 0 {
+					fl.blind.spend()
 				}
-				if time.Since(fl.blind) < wait {
-					continue
-				}
-				fl.blind = time.Now()
-				fl.blindKills++
-			} else {
-				fl.blind = time.Time{}
 			}
 			why := fmt.Sprintf("unresponsive for %s", time.Since(since).Round(time.Second))
 			switch {
@@ -906,8 +961,10 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int)
 }
 
 // probe checks every running instance's helper (and refreshes the idle
-// clock of warm ones) in parallel.
-func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instance, warm map[string]bool) (notified []string, answered int) {
+// clock of warm ones) in parallel. answered counts the instances that
+// answered, by region.
+func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instance, warm map[string]bool) (notified []string, answered map[string]int) {
+	answered = map[string]int{}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	fl.unprobed = map[string]bool{}
@@ -967,7 +1024,7 @@ func (d *Daemon) probe(ctx context.Context, fl *fleet, running []provider.Instan
 			if hs.BootFailed != "" {
 				fl.bootFailed[in.ID] = true
 			}
-			answered++
+			answered[in.Region]++
 			mu.Unlock()
 			if rc, ok := fl.f.(provider.Reclaimer); ok && hs.SpotNotice != "" {
 				rc.Reclaimed(in) // its replacement goes elsewhere
