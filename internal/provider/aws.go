@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/cloudinit"
@@ -808,7 +809,15 @@ func (a *AWSSpot) runOne(ctx context.Context, base url.Values, itype string, spo
 	for attempt := 0; attempt < 4; attempt++ {
 		b, err := a.api.ec2(ctx, "RunInstances", p)
 		if err == nil {
-			return parseRunInstances(b)
+			inst, perr := parseRunInstances(b)
+			if perr == nil && inst.InstanceID == "" {
+				perr = errors.New("no instance ID in the response")
+			}
+			if perr != nil {
+				// EC2 accepted the request: it may have made an instance.
+				return ec2Instance{}, fmt.Errorf("%w: unreadable RunInstances response: %v", ErrLaunchAmbiguous, perr)
+			}
+			return inst, nil
 		}
 		lastErr = err
 		if c := awsCode(err); c == "IdempotentInstanceTerminated" || c == "IdempotentParameterMismatch" {
@@ -904,6 +913,22 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 	// Existing group that already allows SSH from our CIDR: no mutating call.
 	if id != "" && hasSSHIngress([]byte(body), a.r.SSHCIDR) {
 		return []string{id}, nil
+	}
+	// Overlapping launches on this machine create or open it one at a
+	// time, so the second finds the first's group rather than racing its
+	// creation (a fresh group may not be listed yet).
+	if a.dir != "" {
+		unlock, err := waitLockFile(ctx, a.lockPath("sg-"+a.r.Region+".lock"), syscall.LOCK_EX, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+		if id, err = find(); err != nil {
+			return nil, err
+		}
+		if id != "" && hasSSHIngress([]byte(body), a.r.SSHCIDR) {
+			return []string{id}, nil
+		}
 	}
 	if id == "" {
 		owner, err := a.ownerTag()

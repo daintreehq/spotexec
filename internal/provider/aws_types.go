@@ -213,10 +213,7 @@ func (a *AWSSpot) EligibleTypes(ctx context.Context, refresh bool) ([]InstanceTy
 	// An empty answer is cached too: it is as definite as a full one.
 	if err := os.MkdirAll(a.dir, 0o700); err == nil {
 		b, _ := json.MarshalIndent(typesCache{Key: key, At: now, Types: out}, "", "  ")
-		tmp := a.typesCachePath() + ".tmp" + strconv.Itoa(os.Getpid())
-		if os.WriteFile(tmp, b, 0o600) == nil {
-			_ = os.Rename(tmp, a.typesCachePath())
-		}
+		_ = writeFileAtomic(a.typesCachePath(), b) // overlapping launches may write it at once
 	}
 	if len(out) == 0 {
 		return nil, &noEligibleError{a.r}
