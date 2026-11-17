@@ -32,6 +32,7 @@ type fakeFleet struct {
 	// context ends.
 	listErr  error
 	slowList bool
+	lists    int // List calls
 }
 
 func (f *fakeFleet) Runner() *config.Runner                        { return f.r }
@@ -45,6 +46,7 @@ func (f *fakeFleet) Forget()                                     {}
 
 func (f *fakeFleet) List(ctx context.Context) ([]provider.Instance, error) {
 	f.mu.Lock()
+	f.lists++
 	slow, err := f.slowList, f.listErr
 	f.mu.Unlock()
 	if slow {

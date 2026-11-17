@@ -401,14 +401,20 @@ func TestFailedLookupWithholdsReplay(t *testing.T) {
 				t.Errorf("%s at %+v replayed: %v %q %q", c.name, at, ok, code, why)
 			}
 		}
+		// A Spot notice, or a loss before dispatch, is replayed without
+		// asking EC2 at all.
+		f.lists = 0
 		for _, cc := range []struct {
 			noticed bool
 			at      stage
 		}{{true, running}, {false, depsCheck}, {false, stage{phase: phaseSync}}} {
 			got := whyNoReplay(lease, cc.noticed, cc.at, false)
-			if got.code != "" || got.region != nil {
-				t.Errorf("%s noticed=%v at %+v: %q (%q), want a replay", c.name, cc.noticed, cc.at, got.code, got.why)
+			if ok, code, why := replayable("i-run", Result{noReplay: got, lostAt: cc.at}, retry, false, 1); !ok || code != "" || why != "" || got.region != nil {
+				t.Errorf("%s noticed=%v at %+v: %v %q (%q), want a replay", c.name, cc.noticed, cc.at, ok, code, why)
 			}
+		}
+		if f.lists != 0 {
+			t.Errorf("%s: listed the fleet %d times for verdicts that don't need it", c.name, f.lists)
 		}
 	}
 }
@@ -436,9 +442,18 @@ func TestInstanceState(t *testing.T) {
 	if got := instanceState(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}); got != vmUnknown {
 		t.Errorf("list error: %v", got)
 	}
+	// A listing that never answers is given up on at the deadline (no
+	// sooner: the fake returns only once its context ends).
 	f.listErr, f.slowList = nil, true
+	done := make(chan vmState, 1)
 	start := time.Now()
-	if got := instanceState(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}); got != vmUnknown || time.Since(start) > 2*time.Second {
-		t.Errorf("list deadline: %v after %s", got, time.Since(start))
+	go func() { done <- instanceState(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}) }()
+	select {
+	case got := <-done:
+		if el := time.Since(start); got != vmUnknown || el < instanceLookupTime {
+			t.Errorf("list deadline: %v after %s", got, el)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the listing had no deadline")
 	}
 }

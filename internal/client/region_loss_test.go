@@ -300,6 +300,16 @@ func TestRegionLossVerdict(t *testing.T) {
 	if *calls != 0 {
 		t.Fatalf("probed the region %d times for verdicts that don't need it", *calls)
 	}
+
+	// #266: a failed lookup with no regional loss: not replayed, and the
+	// warning carries the last memory reading and says to check for side
+	// effects, without blaming the run.
+	stubRegionSilent(t, nil)
+	f.listErr = errors.New("throttled")
+	got = whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run", Sess: s}, false, running, false)
+	if got.code != "RUNNER_UNRESPONSIVE" || got.region != nil || !strings.Contains(got.why, "couldn't confirm whether it is still running") || !strings.Contains(got.why, "memory available") || !strings.Contains(got.why, "side effects") || strings.Contains(got.why, "overloaded") {
+		t.Fatalf("failed lookup, no regional loss: %q (%q)", got.code, got.why)
+	}
 }
 
 // Memory pressure outranks a silent region: the run may still be what
