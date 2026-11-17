@@ -237,7 +237,7 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 		if _, _, err := writeEntry(full, &tar.Header{Name: p, Typeflag: tar.TypeSymlink, Linkname: target, Mode: 0o777}, nil); err != nil {
 			return destErr{err}
 		}
-		return s.record(p, full, e.ID)
+		return asDest(s.record(p, full, e.ID))
 	}
 	// Never a symlink in its place, and never stuck on a FIFO put there.
 	f, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
@@ -288,12 +288,19 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 		}
 		return err
 	}
-	return s.record(p, full, id)
+	return asDest(s.record(p, full, id))
 }
 
 // destErr: a peer copy failed at the destination, not because of its
 // source, which stays a candidate for other files.
 type destErr struct{ error }
+
+func asDest(err error) error {
+	if err != nil {
+		return destErr{err}
+	}
+	return nil
+}
 
 // record stores what is now at full as p's synced entry.
 func (s *Session) record(p, full, id string) error {
