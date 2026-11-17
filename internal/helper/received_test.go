@@ -28,7 +28,8 @@ func TestHeartbeatReportsReceivedAndHeld(t *testing.T) {
 		written += 5 + int64(len(frame))
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for s.holding.Load() == 0 && time.Now().Before(deadline) {
+	holding := func() bool { s.heldMu.Lock(); defer s.heldMu.Unlock(); return s.holding != 0 }
+	for !holding() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	time.Sleep(30 * time.Millisecond)
@@ -41,8 +42,11 @@ func TestHeartbeatReportsReceivedAndHeld(t *testing.T) {
 		t.Fatalf("held %dms while the queue was full, want the wait so far", hb.HeldMS)
 	}
 	<-s.frames // dispatch takes one: the read loop goes on
-	for s.holding.Load() != 0 && time.Now().Before(deadline) {
+	for holding() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
+	}
+	if holding() {
+		t.Fatal("still holding after dispatch took a frame")
 	}
 	var after protocol.Heartbeat
 	s.beat(&after)

@@ -108,13 +108,24 @@ func (u *uploadWatch) arm(on bool) {
 	u.armed, u.watching, u.fresh = on, false, false
 }
 
-// judge takes in the latest heartbeat's reading and says why the upload has
-// stalled, or "". Only readings judge: a helper that went quiet altogether
-// is the silence watchdog's to judge. Time the helper held what we sent
-// unread doesn't count.
-func (u *uploadWatch) judge() string {
+// judge takes in the latest heartbeat's reading and, if the upload has
+// stalled, hands why to commit while still holding the watch (so the upload
+// can't be declared over meanwhile), and reports whether commit took it.
+// Only readings judge: a helper that went quiet altogether is the silence
+// watchdog's to judge. Time the helper held what we sent unread doesn't
+// count.
+func (u *uploadWatch) judge(commit func(why string) bool) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if why := u.verdict(); why != "" && commit(why) {
+		u.armed = false
+		return true
+	}
+	return false
+}
+
+// verdict is judge's reading of the latest heartbeat, with mu held.
+func (u *uploadWatch) verdict() string {
 	if !u.fresh || !u.armed {
 		u.fresh = false
 		return ""
@@ -145,10 +156,32 @@ func kib(n int64) string {
 
 // WatchUploads starts (on) or ends watching that what is sent to the helper
 // arrives: on around an upload spotexec drives, such as a sync, off before
-// anything else.
+// anything else. An upload judged stalled before it is turned off stays so
+// (UploadStalled).
 func (s *Session) WatchUploads(on bool) { s.up.arm(on) }
 
 // UploadStalled reports whether the session ended because what was sent to
 // the helper stopped arriving while the helper itself kept answering: the
-// connection, not the runner, failed.
-func (s *Session) UploadStalled() bool { return s != nil && s.stalled.Load() }
+// connection, not the runner, failed. Once it does, the master the session
+// ran on has been retired (or found replaced) before it returns, so a retry
+// can't open its session there: it waits up to retireWait for that.
+func (s *Session) UploadStalled() bool {
+	if s == nil {
+		return false
+	}
+	s.errMu.Lock()
+	err := s.err
+	s.errMu.Unlock()
+	if !errors.Is(err, errUploadStalled) {
+		return false
+	}
+	select {
+	case <-s.retired:
+	case <-time.After(retireWait):
+	}
+	return true
+}
+
+// retireWait bounds how long UploadStalled waits for the master to be
+// retired: the lock and two control commands, each within muxTimeout.
+const retireWait = 2*muxTimeout + time.Second

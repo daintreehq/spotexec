@@ -60,7 +60,9 @@ type Session struct {
 	sent     atomic.Int64                  // bytes written to the helper so far
 	writing  atomic.Bool                   // a write to the helper is under way
 	up       uploadWatch                   // whether what we send is getting through
-	stalled  atomic.Bool                   // the watchdog gave up on an upload that stopped arriving
+	// retired is closed once the master a stalled upload ran on has been
+	// dealt with (see UploadStalled).
+	retired chan struct{}
 	// client and master are the connection the session runs on: the
 	// master's pid (0 if unknown), retired when an upload stalls on it.
 	client *Client
@@ -163,7 +165,7 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration,
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now(), client: c}
+	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now(), client: c, retired: make(chan struct{})}
 	s.master.Store(int64(master))
 	cmd.Stderr = s.stderr
 	// A master holding a stuck channel keeps the stderr pipe open after the
@@ -377,18 +379,19 @@ func (s *Session) watchdog() {
 				asked = false
 			}
 			s.recovered(seen, base/2)
-			if why := s.up.judge(); why != "" {
-				if !s.firstErr(fmt.Errorf("%w: %s", errUploadStalled, why)) {
-					return // the session ended otherwise meanwhile
-				}
-				s.stalled.Store(true)
+			// The verdict is the session's error, set while the watch is
+			// still armed: a caller that ends the upload either sees it or
+			// heads off any later one.
+			if s.up.judge(func(why string) bool {
+				return s.firstErr(fmt.Errorf("%w: %s", errUploadStalled, why))
+			}) {
 				s.silent.Store(true)
 				// The master carrying it most likely carries nothing else
-				// either: retired before anyone hears of the stall, so a
-				// retry can't open its session there.
+				// either: no new session may go onto it, a retry's included.
 				if s.client != nil {
 					s.client.retireMaster(int(s.master.Load()))
 				}
+				close(s.retired)
 				s.lostMu.Do(func() { close(s.lost) })
 				s.Abort()
 				return

@@ -931,7 +931,12 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			}
 			return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, err)), lostRunner(lease, err)
 		}
+		// A stall judged as the upload ended still ends the attempt as one.
 		sess.WatchUploads(false)
+		if serr := uploadStall(lease); serr != nil {
+			res.stalled = true
+			return res, infra(fmt.Errorf("uploading to %s: %w", r.Name, serr)), ""
+		}
 	}
 
 	// 4. Project container image.

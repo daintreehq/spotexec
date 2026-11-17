@@ -43,8 +43,10 @@ type Session struct {
 	received atomic.Int64
 	// held is how long readLoop has waited on a full frame queue, not
 	// counting a wait under way, which began at holding (on the session
-	// clock; 0 for none). Heartbeat.HeldMS.
-	held, holding atomic.Int64
+	// clock; 0 for none). Heartbeat.HeldMS. Both under heldMu, so a
+	// heartbeat counts a wait once.
+	heldMu        sync.Mutex
+	held, holding int64
 	// stalledAt is when the helper last found itself unscheduled for
 	// seconds (see watchStalls); 0 (never) until then.
 	stalledAt atomic.Int64
@@ -391,11 +393,14 @@ func (s *Session) readLoop() {
 		}
 		// The queue is full: until dispatch takes a frame nothing more is
 		// read from the client, which must not judge its connection by it.
-		from := s.now()
-		s.holding.Store(from)
+		s.heldMu.Lock()
+		s.holding = s.now()
+		s.heldMu.Unlock()
 		s.frames <- f
-		s.held.Add(s.now() - from)
-		s.holding.Store(0)
+		s.heldMu.Lock()
+		s.held += s.now() - s.holding
+		s.holding = 0
+		s.heldMu.Unlock()
 	}
 }
 
@@ -403,10 +408,12 @@ func (s *Session) readLoop() {
 // and how long the helper left it unread.
 func (s *Session) beat(hb *protocol.Heartbeat) {
 	hb.Received = s.received.Load()
-	held := s.held.Load()
-	if from := s.holding.Load(); from != 0 {
-		held += s.now() - from
+	s.heldMu.Lock()
+	held := s.held
+	if s.holding != 0 {
+		held += s.now() - s.holding
 	}
+	s.heldMu.Unlock()
 	hb.HeldMS = held / int64(time.Millisecond)
 }
 

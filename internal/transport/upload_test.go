@@ -139,6 +139,7 @@ func TestUploadWatchJudge(t *testing.T) {
 		stall   bool // the verdict on this reading
 	}
 	const M = 1 << 20
+	commit := func(string) bool { return true }
 	for _, tc := range []struct {
 		name  string
 		reads []reading
@@ -179,10 +180,10 @@ func TestUploadWatchJudge(t *testing.T) {
 					u.reset()
 				}
 				u.note(int64(time.Duration(r.at)*time.Second), r.recv, time.Duration(r.held)*time.Second, r.sent, r.writing)
-				if got := u.judge() != ""; got != r.stall {
+				if got := u.judge(commit); got != r.stall {
 					t.Fatalf("at %ds: stalled %v, want %v", r.at, got, r.stall)
 				}
-				if u.judge() != "" {
+				if u.judge(commit) {
 					t.Fatal("a reading judged twice")
 				}
 			}
@@ -192,8 +193,23 @@ func TestUploadWatchJudge(t *testing.T) {
 	u := uploadWatch{window: time.Minute, floor: 128 << 10}
 	for _, at := range []int{0, 60, 120} {
 		u.note(int64(time.Duration(at)*time.Second), 1<<20, 0, 3<<20, true)
-		if u.judge() != "" {
+		if u.judge(commit) {
 			t.Fatal("an unarmed watch judged a stall")
 		}
+	}
+	// A verdict the session didn't take (it ended otherwise first) leaves
+	// the watch armed; one it took disarms it.
+	u = uploadWatch{window: time.Minute, floor: 128 << 10}
+	u.arm(true)
+	u.note(0, 1<<20, 0, 3<<20, true)
+	u.judge(commit)
+	u.note(int64(time.Minute), 1<<20, 0, 3<<20, true)
+	var why string
+	if u.judge(func(w string) bool { why = w; return false }) || !u.armed || !strings.Contains(why, "arrived in 1m0s") {
+		t.Fatalf("a verdict not taken: armed %v, why %q", u.armed, why)
+	}
+	u.note(int64(2*time.Minute), 1<<20, 0, 3<<20, true)
+	if !u.judge(commit) || u.armed {
+		t.Fatalf("a verdict taken left the watch armed")
 	}
 }
