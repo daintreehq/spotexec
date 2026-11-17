@@ -770,8 +770,11 @@ func TestPendingBatchOutlivesForgetting(t *testing.T) {
 	c, cfgPath := setup(t)
 	writeConfig(t, cfgPath, runnerConfig("a.large", 2))
 	hold := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(hold) }) }
 	c.set(func(c *cloud) { c.hold = hold })
 	d, _ := start(t)
+	t.Cleanup(release) // runs before start's settle
 	fl := fleetNamed(d, "pool")
 	ctx := context.Background()
 	d.pass(ctx) // two launches, both waiting
@@ -798,10 +801,18 @@ func TestPendingBatchOutlivesForgetting(t *testing.T) {
 	c.set(func(c *cloud) { c.insts["pool"], c.waitErr = nil, errors.New("instance reclaimed while booting") })
 	fl.lastPrb = time.Now()
 	d.manage(ctx, fl)
-	close(hold)
+	release()
 	settle(t, d)
 	if n := recent(d, fl); n != 1 {
 		t.Fatalf("a batch that vanished while launching counted %d failures, want 1", n)
+	}
+	// Done launching: forgettable again, from now.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, b := range fl.batchOf {
+		if b.pending || time.Since(b.at) > forgetAfter {
+			t.Errorf("%s after its launch: pending %v, recorded %s ago", id, b.pending, time.Since(b.at))
+		}
 	}
 }
 

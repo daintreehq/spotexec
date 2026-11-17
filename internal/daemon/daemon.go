@@ -948,20 +948,25 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int)
 		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.BootTimeout.Duration+2*time.Minute)
 		defer cancel()
 		created := ""
+		// Once the launch is done (and any failure of it counted), its
+		// batch record may be forgotten like any other.
+		defer func() {
+			d.mu.Lock()
+			if b, ok := fl.batchOf[created]; ok && created != "" {
+				b.at, b.pending = time.Now(), false
+				fl.batchOf[created] = b
+			}
+			d.mu.Unlock()
+		}()
 		in, err := pool.ProvisionHeldThen(pctx, id, nil, func(in provider.Instance) {
+			if in.ID == "" {
+				return
+			}
 			created = in.ID
 			d.mu.Lock()
 			fl.batchOf[in.ID] = launchBatch{pass: batch, epoch: epoch, at: time.Now(), pending: true}
 			d.mu.Unlock()
 		})
-		if created != "" {
-			d.mu.Lock()
-			if b, ok := fl.batchOf[created]; ok {
-				b.at, b.pending = time.Now(), false
-				fl.batchOf[created] = b
-			}
-			d.mu.Unlock()
-		}
 		if err != nil {
 			d.action("%s: launch failed: %v", r.Name, err)
 			// A refused launch request (network, credentials, capacity,
