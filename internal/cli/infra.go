@@ -404,20 +404,22 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 				n = min(max(h.CPUs/4, 1), protocol.MaxSlots)
 			}
 			// Jobs running commands fill the slots; the helper admits more
-			// to prepare (sync, image, dependencies) or write back meanwhile.
-			running := protocol.RunningJobs(h.Holders)
+			// to wait for a run permit, to prepare (sync, image,
+			// dependencies) or to write back meanwhile.
+			running, waiting, preparing := jobPhases(h.Holders)
 			if exclusiveHeld(h.Holders) {
 				running = n // one job, the whole VM
 			}
 			slots = fmt.Sprintf("%d/%d", running, n)
-			more := 0
-			for _, x := range h.Holders {
-				if !x.Running() {
-					more++
-				}
+			var more []string
+			if waiting > 0 {
+				more = append(more, fmt.Sprintf("+%d waiting", waiting))
 			}
-			if more > 0 {
-				slots += fmt.Sprintf(" (+%d)", more)
+			if preparing > 0 {
+				more = append(more, fmt.Sprintf("+%d preparing", preparing))
+			}
+			if len(more) > 0 {
+				slots += " (" + strings.Join(more, ", ") + ")"
 			}
 			if h.CPUs > 0 && h.Load1 > 0 {
 				load = fmt.Sprintf("%.1f/%d", h.Load1, h.CPUs)
@@ -489,6 +491,43 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 			fmt.Fprintf(w, "  %s waiting for workspace slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Slot, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
 		}
 	}
+}
+
+// jobPhases counts a VM's jobs by what they do: run a command (or hold
+// command capacity for the whole lease, as an older helper's or an
+// exclusive run's do), wait for a run permit, or prepare and write back.
+// A run holding several tokens (exclusive) counts once, and so does a run
+// permit: a job releasing one unlocks it before clearing its record, so
+// for a moment its successor may show the same permit; one of the two
+// runs, the other writes back.
+func jobPhases(hs []protocol.Holder) (running, waiting, preparing int) {
+	seen, permits := map[int]bool{}, map[int]bool{}
+	for i, h := range hs {
+		id := h.HelperPID
+		if id == 0 {
+			id = -1 - i
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		switch {
+		case h.Phased && h.Phase == protocol.PhaseRun && h.Run > 0:
+			if permits[h.Run] {
+				preparing++
+			} else {
+				permits[h.Run] = true
+				running++
+			}
+		case !h.Phased || h.Phase == protocol.PhaseRun:
+			running++
+		case h.Phase == protocol.PhaseRunWait:
+			waiting++
+		default:
+			preparing++
+		}
+	}
+	return running, waiting, preparing
 }
 
 // exclusiveHeld reports whether one run holds several tokens: an
