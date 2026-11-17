@@ -476,11 +476,21 @@ type Result struct {
 
 // Heartbeat is the body of a helper heartbeat (empty from older helpers):
 // the runner's memory, so a client that loses the runner can tell whether
-// it was out of memory at the time. Zero fields are unknown.
+// it was out of memory at the time, and how much of what the client sent
+// has arrived, so it can tell an upload stuck on the way. Zero fields are
+// unknown.
 type Heartbeat struct {
 	MemTotalMB int64   `json:"mem_total_mb,omitempty"`
 	MemAvailMB int64   `json:"mem_avail_mb,omitempty"`
 	PSIFull10  float64 `json:"psi_full10,omitempty"` // /proc/pressure/memory "full" avg10, percent
+	// Received is every byte the helper has read from the client so far
+	// on this session, frames still arriving included.
+	Received int64 `json:"received,omitempty"`
+	// HeldMS is how long, in all, the helper has left what the client sent
+	// unread because it was still busy with what came before (its queue
+	// full), the current wait included: time that says nothing about the
+	// connection.
+	HeldMS int64 `json:"held_ms,omitempty"`
 }
 
 // Pressure says whether a heartbeat shows a runner running out of memory:

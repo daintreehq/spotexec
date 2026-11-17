@@ -39,6 +39,14 @@ type Session struct {
 	// silent, or alive.
 	born     time.Time
 	lastSeen atomic.Int64
+	// received counts the bytes read from the client (Heartbeat.Received).
+	received atomic.Int64
+	// held is how long readLoop has waited on a full frame queue, not
+	// counting a wait under way, which began at holding (on the session
+	// clock; 0 for none). Heartbeat.HeldMS. Both under heldMu, so a
+	// heartbeat counts a wait once.
+	heldMu        sync.Mutex
+	held, holding int64
 	// stalledAt is when the helper last found itself unscheduled for
 	// seconds (see watchStalls); 0 (never) until then.
 	stalledAt atomic.Int64
@@ -209,9 +217,7 @@ func (s *Session) heard() { s.lastSeen.Store(s.now()) }
 func Serve(in io.Reader, out io.Writer) error {
 	startProtection()
 	s := newSession()
-	// Liveness counts bytes arriving, so a large manifest still streaming
-	// over a slow link is not mistaken for a silent client.
-	s.c = protocol.NewConn(protocol.ProgressReader{R: in, OnRead: s.heard}, out)
+	s.connect(in, out)
 	current.Store(s)
 	go s.readLoop()
 	defer s.release()
@@ -257,6 +263,7 @@ func Serve(in io.Reader, out io.Writer) error {
 					}
 				}
 				lastSent = time.Now()
+				s.beat(&hb)
 				_ = s.c.Send(protocol.TypeHeartbeat, hb)
 			}
 		}
@@ -289,6 +296,26 @@ func Serve(in io.Reader, out io.Writer) error {
 			return err
 		}
 	}
+}
+
+// connect sets the session up to talk to the client over in and out.
+// Liveness counts bytes arriving, so a large manifest still streaming over
+// a slow link is not mistaken for a silent client, and every byte is
+// counted for Heartbeat.Received.
+func (s *Session) connect(in io.Reader, out io.Writer) {
+	s.c = protocol.NewConn(protocol.ProgressReader{R: countReader{in, &s.received}, OnRead: s.heard}, out)
+}
+
+// countReader adds every byte read through it to n.
+type countReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c countReader) Read(b []byte) (int, error) {
+	k, err := c.r.Read(b)
+	c.n.Add(int64(k))
+	return k, err
 }
 
 var errBye = errors.New("bye")
@@ -359,8 +386,35 @@ func (s *Session) readLoop() {
 				continue
 			}
 		}
+		select {
+		case s.frames <- f:
+			continue
+		default:
+		}
+		// The queue is full: until dispatch takes a frame nothing more is
+		// read from the client, which must not judge its connection by it.
+		s.heldMu.Lock()
+		s.holding = s.now()
+		s.heldMu.Unlock()
 		s.frames <- f
+		s.heldMu.Lock()
+		s.held += s.now() - s.holding
+		s.holding = 0
+		s.heldMu.Unlock()
 	}
+}
+
+// beat adds what a heartbeat says about reading the client: what arrived,
+// and how long the helper left it unread.
+func (s *Session) beat(hb *protocol.Heartbeat) {
+	hb.Received = s.received.Load()
+	s.heldMu.Lock()
+	held := s.held
+	if s.holding != 0 {
+		held += s.now() - s.holding
+	}
+	s.heldMu.Unlock()
+	hb.HeldMS = held / int64(time.Millisecond)
 }
 
 // next returns the next non-heartbeat frame, enforcing client liveness.
