@@ -396,7 +396,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					}
 					in := c.Instance
 					lease, holders, out := m.probeInstance(actx, req, c, deadline)
-					if out == OutUnreachable && actx.Err() != nil {
+					if out == OutUnreachable && stop() != nil {
 						out = outSkipped // a probe cut short (the caller or the deadline) proves nothing about the VM
 					}
 					// One whose jobs only prepare is asked again below.
@@ -545,14 +545,6 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
 			}
-			if err := stop(); err != nil {
-				// Out of time while planning: no launch for a run that has
-				// already given up.
-				if d.Launch && !provisioning[d.ID] {
-					m.pool.Cancel(d.ID)
-				}
-				return nil, err
-			}
 			for _, id := range d.Reap {
 				if !m.pool.commitReap(id) {
 					continue // a run reserved it meanwhile
@@ -585,6 +577,14 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					"waited_ms": d.Waited.Milliseconds(), "reason": d.Reason})
 			}
 			held[m.r.Name] = d.Held
+			if err := stop(); err != nil {
+				// Out of time while planning: no launch for a run that has
+				// already given up.
+				if d.Launch && !provisioning[d.ID] {
+					m.pool.Cancel(d.ID)
+				}
+				return nil, err
+			}
 			if d.Launch && !provisioning[d.ID] {
 				provisioning[d.ID] = true
 				req.Rep.Event("scale_out", map[string]any{"runner": m.r.Name, "launch_id": d.ID, "demand": d.Demand, "instances": d.Live,
@@ -639,8 +639,8 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			req.Rep.Status("queued %s%s · %s", pos, ui.Dur(time.Since(start)), status)
 		}
 		if err := stop(); err != nil {
-			if ctx.Err() != nil {
-				return nil, err
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
 			}
 			return nil, fmt.Errorf("%s: no free slot within %s (%s)", protocol.CodeQueueTimeout, queue, status)
 		}
@@ -686,7 +686,7 @@ func probeOverflow(ctx context.Context, req AcquireRequest, members []*member, o
 				return nil
 			}
 			lease, _, out := m.probeInstance(ctx, req, c, deadline)
-			if out == OutUnreachable && ctx.Err() != nil {
+			if out == OutUnreachable && (ctx.Err() != nil || !time.Now().Before(deadline)) {
 				out = outSkipped // a cancelled probe proves nothing about the VM
 			}
 			m.pool.Observe(c.Instance.ID, out, c.Instance.LaunchedAt)
@@ -804,6 +804,9 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 			}
 			if err := ctx.Err(); err != nil {
 				return err // out of time while waiting for the ledger: not sent
+			}
+			if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+				return context.DeadlineExceeded // ahead of ctx's timer
 			}
 			sent = true
 			return nil
@@ -1076,7 +1079,11 @@ func tryAcquire(ctx context.Context, req AcquireRequest, r *config.Runner, p pro
 	a.SpotWatch = r.Ephemeral()
 	if req.onSend != nil {
 		if err := req.onSend(); err != nil {
-			s.Close()
+			if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+				s.Abort() // out of time: nothing was sent to say goodbye to
+			} else {
+				s.Close()
+			}
 			return nil, nil, fmt.Errorf("recording the acquire in the fleet ledger: %w", err)
 		}
 	}
