@@ -764,9 +764,9 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	// Under procMu, so teardown waits for the container it creates.
 	var users []string
 	if uid, gid := os.Getuid(), os.Getgid(); !run.Root && uid != 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, done := s.startPrep(usersBudget)
 		passwd, group, err := s.runUserFiles(ctx, d, run.Image, uid, gid)
-		cancel()
+		done()
 		if err != nil {
 			return "", nil, nil, perr(protocol.CodeImageFailed, "%v", err)
 		}

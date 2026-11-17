@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -141,32 +142,64 @@ var imageIDRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // maxAccountFile bounds the passwd or group file read from an image.
 const maxAccountFile = 4 << 20
 
+// usersBudget bounds getting a run's users files: inspecting the image,
+// waiting for another run reading the same image, and the read itself.
+// A fresh VM's first runs start together while dependency archives are
+// still extracting, so creating the reading container can take tens of
+// seconds there.
+var usersBudget = 5 * time.Minute
+
 // runUserFiles returns passwd and group files, for bind mounts over the
 // image's own, in which uid and gid resolve (withRunUser). They are made
-// from the image's files once per image, uid and gid, under the slot's run
-// directory (cleared when the slot is next acquired), and read from a
-// container that is created but never started, so the image needs no tools.
+// from the image's files once per image, uid and gid on this VM, under the
+// work root (Layout.Users), where every slot of the runner user finds
+// them, and read from a container that is created but never started, so
+// the image needs no tools. Runs that need the same files together wait
+// for one read rather than each creating a container.
 func (s *Session) runUserFiles(ctx context.Context, d dockerRunner, image string, uid, gid int) (passwd, group string, err error) {
+	if s.layout.Root == "" {
+		return "", "", errors.New("no work root") // never: hello sets it
+	}
 	out, err := runShell(ctx, d.cmd("image inspect --format '{{.Id}}' "+shq(image)))
 	id := strings.TrimSpace(string(out))
 	if err != nil || !imageIDRe.MatchString(id) {
 		return "", "", fmt.Errorf("can't inspect image %s: %s", image, firstLines(id, 3))
 	}
 	sum := sha256.Sum256([]byte("v1 " + id + " " + strconv.Itoa(uid) + ":" + strconv.Itoa(gid)))
-	dir := filepath.Join(s.slotDir, "run", "users", hex.EncodeToString(sum[:12]))
+	key := hex.EncodeToString(sum[:12])
+	users := s.layout.Users()
+	dir := filepath.Join(users, key)
 	passwd, group = filepath.Join(dir, "passwd"), filepath.Join(dir, "group")
-	if _, err := os.Stat(dir); err == nil {
-		return passwd, group, nil // published whole (below)
+	published := func() (bool, error) {
+		_, err := os.Stat(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return err == nil, err
+	}
+	if ok, err := published(); ok || err != nil {
+		return passwd, group, err // published whole (below)
+	}
+	// Never removed, so every waiter locks the same file.
+	l, err := lockExclusiveCtx(ctx, filepath.Join(users, key+".lock"))
+	if err != nil {
+		return "", "", fmt.Errorf("can't read the users of image %s: waiting for another run reading them: %v", image, err)
+	}
+	defer l.Unlock()
+	if ok, err := published(); ok || err != nil {
+		return passwd, group, err // the run we waited for made them
+	}
+	// Left by a helper that died while making them.
+	stale, _ := filepath.Glob(filepath.Join(users, ".tmp-"+key+"-*"))
+	for _, p := range stale {
+		_ = os.RemoveAll(p)
 	}
 	files, err := s.readImageFiles(ctx, d, id, "/etc/passwd", "/etc/group")
 	if err != nil {
 		return "", "", fmt.Errorf("can't read the users of image %s: %v", image, err)
 	}
 	p, g := withRunUser(files[0], files[1], uid, gid)
-	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
-		return "", "", err
-	}
-	tmp, err := os.MkdirTemp(filepath.Dir(dir), ".tmp-")
+	tmp, err := os.MkdirTemp(users, ".tmp-"+key+"-")
 	if err != nil {
 		return "", "", err
 	}
@@ -180,10 +213,7 @@ func (s *Session) runUserFiles(ctx context.Context, d dockerRunner, image string
 		}
 	}
 	if err := os.Rename(tmp, dir); err != nil {
-		// Another run of this slot published the same files first.
-		if _, serr := os.Stat(group); serr != nil {
-			return "", "", err
-		}
+		return "", "", err
 	}
 	return passwd, group, nil
 }

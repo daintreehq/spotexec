@@ -594,7 +594,7 @@ func TestContainerScriptDocker(t *testing.T) {
 	bin, calls := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	slot := t.TempDir()
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +698,7 @@ func TestContainerScriptDockerCleanupFails(t *testing.T) {
 	bin, _ := statefulDocker(t, true, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	slot := t.TempDir()
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
 	os.MkdirAll(s.workspace, 0o755)
 	_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Docker: true}, "true", s.workspace, map[string]string{})
 	if err != nil {
@@ -729,7 +729,7 @@ func TestContainerScriptGiveBackFails(t *testing.T) {
 	bin, _ := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	slot := t.TempDir()
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
 	locked := filepath.Join(s.workspace, "out")
 	if err := os.MkdirAll(locked, 0o755); err != nil {
 		t.Fatal(err)

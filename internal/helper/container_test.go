@@ -81,7 +81,7 @@ func TestContainerScriptChecksOptions(t *testing.T) {
 	bin, _ := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	slot := t.TempDir()
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestContainerScriptSizesShm(t *testing.T) {
 	}
 	slot := t.TempDir()
 	// One slot: no cpuset or memory pool, and half of all but the reserve.
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo", maxSlots: 1}
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo", maxSlots: 1}
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}

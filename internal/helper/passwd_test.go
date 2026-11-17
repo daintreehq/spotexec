@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/protocol"
 )
@@ -139,7 +140,7 @@ func TestContainerScriptRunUser(t *testing.T) {
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	writeTar(t, filepath.Join(bin, "tar-passwd"), "passwd", "root:x:0:0:root:/root:/bin/bash\n")
 	slot := t.TempDir()
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +203,7 @@ func TestContainerScriptRunUser(t *testing.T) {
 	}
 
 	// Files that can't be read fail the run.
-	if err := os.RemoveAll(filepath.Join(slot, "run", "users")); err != nil {
+	if err := os.RemoveAll(s.layout.Users()); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(bin, "cp-fail"), nil, 0o644); err != nil {
@@ -364,5 +365,95 @@ func TestRunUserFilesSharedAcrossSlots(t *testing.T) {
 	}
 	if n := len(callsWith(t, calls, "create --pull never")); n != 1 {
 		t.Fatalf("image read %d times", n)
+	}
+}
+
+// Getting the users files has one budget, from the image's inspection to
+// the end of the read, past which the run fails; teardown ends a read in
+// progress instead of waiting for it.
+func TestRunUserFilesBudget(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("runs as root: no run user to add")
+	}
+	if usersBudget < 2*time.Minute {
+		t.Fatalf("budget %v: a fresh VM's first runs need minutes", usersBudget)
+	}
+	bin, calls := statefulDocker(t, false, "", "", "")
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	writeTar(t, filepath.Join(bin, "tar-passwd"), "passwd", "root:x:0:0:root:/root:/bin/bash\n")
+	setSleep := func(d string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(bin, "create-sleep"), []byte(d), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	slot := t.TempDir()
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	start := func() (time.Duration, error) {
+		t.Helper()
+		t0 := time.Now()
+		_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "python:3"}, "true", s.workspace, map[string]string{})
+		if err == nil {
+			err = cleanup()
+		}
+		return time.Since(t0), err
+	}
+	old := usersBudget
+	t.Cleanup(func() { usersBudget = old })
+
+	// Over budget: the read is stopped and the run fails, promptly.
+	usersBudget = 500 * time.Millisecond
+	setSleep("10")
+	took, err := start()
+	var pe *protoError
+	if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed || took > 8*time.Second {
+		t.Fatalf("over budget: %v after %v", err, took)
+	}
+	if _, err := os.Stat(s.layout.Users()); err == nil {
+		if left, _ := os.ReadDir(s.layout.Users()); len(left) != 1 { // the lock file
+			t.Fatalf("left behind: %v", left)
+		}
+	}
+
+	// A slow read inside the budget passes.
+	usersBudget = 10 * time.Second
+	setSleep("1")
+	if _, err := start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(s.layout.Users()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Teardown cancels a read in progress.
+	setSleep("30")
+	n := len(callsWith(t, calls, "create --pull never"))
+	errs := make(chan error, 1)
+	t0 := time.Now()
+	go func() { _, err := start(); errs <- err }()
+	for len(callsWith(t, calls, "create --pull never")) == n {
+		if time.Since(t0) > 5*time.Second {
+			t.Fatal("no read started")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	s.stopping.Store(true)
+	s.cancelPrep()
+	select {
+	case err := <-errs:
+		if !errors.As(err, &pe) || pe.code != protocol.CodeImageFailed {
+			t.Fatalf("cancelled read: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("teardown waited for the read")
+	}
+	// Once stopping, a new preparation starts cancelled.
+	ctx, done := s.startPrep(time.Minute)
+	defer done()
+	if ctx.Err() == nil {
+		t.Fatal("preparation after teardown not cancelled")
 	}
 }

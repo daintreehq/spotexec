@@ -131,6 +131,10 @@ func (l Layout) Slot(id string, n int) string {
 }
 func (l Layout) Deps(id string) string { return filepath.Join(l.Repo(id), "deps") }
 
+// Users holds the passwd and group files containerised runs mount, made
+// once per image, uid and gid and shared by every slot (runUserFiles).
+func (l Layout) Users() string { return filepath.Join(l.Root, "users") }
+
 // SlotState persists per-slot metadata.
 type SlotState struct {
 	Fingerprint string `json:"fingerprint"`
