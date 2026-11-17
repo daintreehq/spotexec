@@ -412,8 +412,10 @@ func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger)
 	var runningNoIP time.Time
 	var readErr error // the latest failure of an ongoing status-read outage
 	delay := bootPollInterval
+	fresh := true // inst is an observation not yet acted on
 	for {
-		if readErr == nil {
+		if fresh {
+			fresh = false
 			switch inst.State {
 			case "running":
 				if inst.IPAddress != "" {
@@ -457,11 +459,14 @@ func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger)
 			if ctx.Err() != nil {
 				return Info{}, ctx.Err()
 			}
-			if bctx.Err() != nil {
-				// The deadline cut the read short: report what its
-				// attempts were failing with, if anything.
-				if tried != nil {
+			if bctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+				// The boot deadline cut the read short: report what its
+				// attempts were failing with.
+				switch {
+				case tried != nil:
 					readErr = tried
+				case readErr == nil:
+					readErr = errors.New("DescribeInstances did not answer")
 				}
 				continue
 			}
@@ -478,15 +483,18 @@ func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger)
 				delay = min(2*delay, 4*bootPollInterval) // Query backs off within a call; this eases off between them
 			}
 			readErr = err
+			// How long it has really lacked an IP is unknown until reads
+			// work again.
+			runningNoIP = time.Time{}
 			continue
 		}
 		got, _, err := parseDescribeInstances(b)
 		if err != nil {
 			return Info{}, err
 		}
-		readErr, delay = nil, bootPollInterval
 		if len(got) > 0 {
-			inst = got[0]
+			inst, fresh = got[0], true
+			readErr, delay = nil, bootPollInterval
 		}
 	}
 }

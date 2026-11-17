@@ -4,185 +4,326 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
 )
 
-// bootRead is what the fake EC2 endpoint answers to the nth status read.
-type bootRead func(n int) (status int, body string)
+// bootReply is the fake EC2 endpoint's answer to one status read: an HTTP
+// status and body, a transport error, or a read that hangs until its
+// context ends.
+type bootReply struct {
+	status int
+	body   string
+	err    error
+	hang   bool
+}
 
-const (
-	bootThrottled = `<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>Request limit exceeded.</Message></Error></Errors></Response>`
-	bootDenied    = `<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation.</Message></Error></Errors></Response>`
+func bootErr(status int, code string) bootReply {
+	return bootReply{status: status, body: fmt.Sprintf(`<Response><Errors><Error><Code>%s</Code><Message>%s.</Message></Error></Errors></Response>`, code, code)}
+}
+
+func bootInstance(state, ip string) bootReply {
+	return bootReply{status: http.StatusOK, body: fmt.Sprintf(`<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-boot</instanceId><instanceType>c7a.xlarge</instanceType><instanceState><name>%s</name></instanceState><ipAddress>%s</ipAddress></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`, state, ip)}
+}
+
+var (
+	throttled = bootErr(http.StatusServiceUnavailable, "RequestLimitExceeded")
+	up        = bootInstance("running", "203.0.113.7")
 )
 
-func bootInstance(state, ip string) string {
-	return fmt.Sprintf(`<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-boot</instanceId><instanceType>c7a.xlarge</instanceType><instanceState><name>%s</name></instanceState><ipAddress>%s</ipAddress></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`, state, ip)
+type bootEnv struct {
+	a     *AWSSpot
+	reads atomic.Int32 // DescribeInstances calls answered by the script
+	mu    sync.Mutex
+	other []string // any other action called
 }
 
-// newBootEnv serves DescribeInstances from read, with the boot poll and
-// the Query client's retry backoff shrunk so a test runs in milliseconds.
-func newBootEnv(t *testing.T, bootTimeout time.Duration, read bootRead) (*AWSSpot, *atomic.Int32) {
+func (e *bootEnv) others() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.other...)
+}
+
+// newBootEnv answers the nth DescribeInstances call with script(n), in
+// memory, so a test run in a synctest bubble uses the real poll interval,
+// Query backoff and boot timeout on a fake clock.
+func newBootEnv(t *testing.T, bootTimeout time.Duration, script func(n int) bootReply) *bootEnv {
 	t.Helper()
-	oldPoll, oldBase := bootPollInterval, queryRetryBase
-	bootPollInterval, queryRetryBase = 5*time.Millisecond, time.Millisecond
-	t.Cleanup(func() { bootPollInterval, queryRetryBase = oldPoll, oldBase })
-	var n atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		if a := r.Form.Get("Action"); a != "DescribeInstances" {
-			t.Errorf("unexpected call %s", a)
-			w.WriteHeader(400)
-			return
+	e := &bootEnv{}
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(r.Body)
+		v, _ := url.ParseQuery(string(b))
+		if a := v.Get("Action"); a != "DescribeInstances" {
+			e.mu.Lock()
+			e.other = append(e.other, a)
+			e.mu.Unlock()
+			return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(bootErr(400, "UnexpectedAction").body)), Request: r}, nil
 		}
-		status, body := read(int(n.Add(1)))
-		w.WriteHeader(status)
-		fmt.Fprint(w, body)
-	}))
-	t.Cleanup(srv.Close)
+		rep := script(int(e.reads.Add(1)))
+		switch {
+		case rep.hang:
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		case rep.err != nil:
+			return nil, rep.err
+		}
+		return &http.Response{StatusCode: rep.status, Body: io.NopCloser(strings.NewReader(rep.body)), Request: r}, nil
+	})
 	r := &config.Runner{Name: "aws", Type: "aws-spot", Region: "us-east-2", User: "ubuntu"}
 	r.BootTimeout.Duration = bootTimeout
-	return &AWSSpot{r: r, dir: t.TempDir(), owner: testOwner, api: &awsClient{
+	e.a = &AWSSpot{r: r, dir: t.TempDir(), owner: testOwner, api: &awsClient{
 		region: r.Region, creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AK", SecretAccessKey: "s"}},
-		http: srv.Client(), endpoints: map[string]string{"ec2": srv.URL},
-	}}, &n
+		http: &http.Client{Transport: rt}, endpoints: map[string]string{"ec2": "https://ec2.test/"},
+	}}
+	return e
 }
 
-// A burst of throttling longer than one Query call's retry budget doesn't
-// end the wait: the VM comes up within its boot deadline and is used.
+// A burst of throttling longer than one Query call's retries doesn't end
+// the wait: the VM comes up within its boot deadline and is used. EC2
+// throttles with a 503; a 400 carrying the same code is retried alike.
 func TestWaitRunningRidesOutThrottleBurst(t *testing.T) {
-	a, n := newBootEnv(t, time.Minute, func(n int) (int, string) {
-		if n <= 12 { // more than two Query calls' worth of attempts
-			return http.StatusServiceUnavailable, bootThrottled
-		}
-		return http.StatusOK, bootInstance("running", "203.0.113.7")
-	})
-	in, err := a.WaitRunning(context.Background(), "i-boot", nil)
-	if err != nil {
-		t.Fatalf("err = %v after %d reads", err, n.Load())
-	}
-	if in.ID != "i-boot" || in.Target.Host != "203.0.113.7" || in.State != StateRunning {
-		t.Fatalf("instance = %+v", in)
+	for _, c := range []struct {
+		status, reads int
+	}{{503, 5}, {400, 5}, {503, 12}} {
+		t.Run(fmt.Sprintf("%dx%d", c.status, c.reads), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := newBootEnv(t, time.Minute, func(n int) bootReply {
+					if n <= c.reads {
+						return bootErr(c.status, "RequestLimitExceeded")
+					}
+					return up
+				})
+				start := time.Now()
+				in, err := e.a.WaitRunning(context.Background(), "i-boot", nil)
+				if err != nil {
+					t.Fatalf("err = %v after %d reads", err, e.reads.Load())
+				}
+				if in.ID != "i-boot" || in.Target.Host != "203.0.113.7" || in.State != StateRunning {
+					t.Fatalf("instance = %+v", in)
+				}
+				if el := time.Since(start); el >= time.Minute {
+					t.Fatalf("took %s", el)
+				}
+			})
+		})
 	}
 }
 
-// A network failure on the status read is ridden out the same way.
-func TestWaitRunningRidesOutNetworkErrors(t *testing.T) {
-	a, n := newBootEnv(t, time.Minute, func(n int) (int, string) {
-		if n <= 6 {
-			return http.StatusBadGateway, "<html>bad gateway</html>"
+// Transport failures (a reset connection) are ridden out the same way.
+func TestWaitRunningRidesOutTransportErrors(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newBootEnv(t, time.Minute, func(n int) bootReply {
+			if n <= 6 {
+				return bootReply{err: errors.New("connection reset by peer")}
+			}
+			return up
+		})
+		if in, err := e.a.WaitRunning(context.Background(), "i-boot", nil); err != nil || in.Target.Host != "203.0.113.7" {
+			t.Fatalf("instance = %+v, err = %v after %d reads", in, err, e.reads.Load())
 		}
-		return http.StatusOK, bootInstance("running", "203.0.113.8")
 	})
-	if in, err := a.WaitRunning(context.Background(), "i-boot", nil); err != nil || in.Target.Host != "203.0.113.8" {
-		t.Fatalf("instance = %+v, err = %v after %d reads", in, err, n.Load())
-	}
 }
 
-// A terminal state read after an outage still ends the wait at once:
-// the VM is gone, and waiting out the deadline would gain nothing.
+// A terminal state read after an outage still ends the wait at once: the
+// VM is gone, and waiting out the deadline would gain nothing.
 func TestWaitRunningTerminalStateAfterOutage(t *testing.T) {
-	a, n := newBootEnv(t, time.Minute, func(n int) (int, string) {
-		if n <= 7 {
-			return http.StatusServiceUnavailable, bootThrottled
+	synctest.Test(t, func(t *testing.T) {
+		e := newBootEnv(t, time.Minute, func(n int) bootReply {
+			if n <= 7 {
+				return throttled
+			}
+			return bootInstance("shutting-down", "")
+		})
+		_, err := e.a.WaitRunning(context.Background(), "i-boot", nil)
+		if err == nil || !strings.Contains(err.Error(), `"shutting-down"`) || e.reads.Load() != 8 {
+			t.Fatalf("err = %v after %d reads", err, e.reads.Load())
 		}
-		return http.StatusOK, bootInstance("shutting-down", "")
 	})
-	start := time.Now()
-	_, err := a.WaitRunning(context.Background(), "i-boot", nil)
-	if err == nil || !strings.Contains(err.Error(), `"shutting-down"`) {
-		t.Fatalf("err = %v after %d reads", err, n.Load())
-	}
-	if time.Since(start) > 10*time.Second {
-		t.Fatalf("took %s", time.Since(start))
-	}
+}
+
+// A no-IP observation from before an outage doesn't count the outage as
+// time without an IP: after it, the VM gets the full 45 seconds again.
+func TestWaitRunningNoIPTimerSkipsOutage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newBootEnv(t, 10*time.Minute, func(n int) bootReply {
+			switch {
+			case n == 1:
+				return bootInstance("running", "")
+			case n <= 31: // six exhausted Query calls: well over 45s
+				return throttled
+			case n == 32:
+				return bootInstance("running", "")
+			}
+			return up
+		})
+		in, err := e.a.WaitRunning(context.Background(), "i-boot", nil)
+		if err != nil || in.Target.Host != "203.0.113.7" {
+			t.Fatalf("instance = %+v, err = %v after %d reads", in, err, e.reads.Load())
+		}
+		if o := e.others(); len(o) > 0 {
+			t.Fatalf("also called %v", o)
+		}
+	})
 }
 
 // An outage that lasts through the boot deadline ends the wait at the
 // deadline, naming the read failure that left the VM's state unknown.
 func TestWaitRunningOutageThroughDeadline(t *testing.T) {
-	a, n := newBootEnv(t, 300*time.Millisecond, func(int) (int, string) {
-		return http.StatusServiceUnavailable, bootThrottled
-	})
-	start := time.Now()
-	_, err := a.WaitRunning(context.Background(), "i-boot", nil)
-	if err == nil || awsCode(err) != "RequestLimitExceeded" || !strings.Contains(err.Error(), "i-boot") {
-		t.Fatalf("err = %v after %d reads", err, n.Load())
-	}
-	if el := time.Since(start); el < 300*time.Millisecond || el > 5*time.Second {
-		t.Fatalf("gave up after %s, want at the 300ms deadline", el)
-	}
-	if n.Load() <= 5 {
-		t.Fatalf("only %d reads: gave up with one Query call's retries", n.Load())
-	}
-}
-
-// Cancelling the caller ends the wait with the context's error, not the
-// read failure, so the caller knows nothing was learnt about the VM.
-func TestWaitRunningCancelledDuringOutage(t *testing.T) {
-	a, _ := newBootEnv(t, time.Minute, func(int) (int, string) {
-		return http.StatusServiceUnavailable, bootThrottled
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	if _, err := a.WaitRunning(ctx, "i-boot", nil); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want the context's", err)
-	}
-}
-
-// A read error that retrying can't fix still ends the wait at once.
-func TestWaitRunningFatalReadError(t *testing.T) {
-	a, n := newBootEnv(t, time.Minute, func(int) (int, string) {
-		return http.StatusForbidden, bootDenied
-	})
-	if _, err := a.WaitRunning(context.Background(), "i-boot", nil); awsCode(err) != "UnauthorizedOperation" || n.Load() != 1 {
-		t.Fatalf("err = %v after %d reads", err, n.Load())
-	}
-}
-
-// A deadline that cuts the first Query call's retries short still names
-// what the reads were failing with.
-func TestWaitRunningDeadlineCutsFirstReadShort(t *testing.T) {
-	a, n := newBootEnv(t, 100*time.Millisecond, func(int) (int, string) {
-		return http.StatusBadRequest, bootThrottled
-	})
-	queryRetryBase = time.Second // the second attempt would wait 2s
-	_, err := a.WaitRunning(context.Background(), "i-boot", nil)
-	if awsCode(err) != "RequestLimitExceeded" || n.Load() != 1 {
-		t.Fatalf("err = %v after %d reads", err, n.Load())
-	}
-}
-
-// An explicit cancellation mid-outage is the caller's, not a read failure.
-func TestWaitRunningCancelled(t *testing.T) {
-	a, n := newBootEnv(t, time.Minute, func(int) (int, string) {
-		return http.StatusServiceUnavailable, bootThrottled
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		for n.Load() < 3 {
-			time.Sleep(time.Millisecond)
+	synctest.Test(t, func(t *testing.T) {
+		e := newBootEnv(t, time.Minute, func(int) bootReply { return throttled })
+		start := time.Now()
+		_, err := e.a.WaitRunning(context.Background(), "i-boot", nil)
+		if awsCode(err) != "RequestLimitExceeded" || !strings.Contains(err.Error(), "i-boot") {
+			t.Fatalf("err = %v after %d reads", err, e.reads.Load())
 		}
-		cancel()
-	}()
-	if _, err := a.WaitRunning(ctx, "i-boot", nil); !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
+		if el := time.Since(start); el != time.Minute {
+			t.Fatalf("gave up after %s, want at the one-minute deadline", el)
+		}
+		if e.reads.Load() <= 5 {
+			t.Fatalf("only %d reads: gave up with one Query call's retries", e.reads.Load())
+		}
+	})
+}
+
+// When the boot deadline cuts a read short, the error names the latest
+// failure, not the first, and not the deadline itself.
+func TestWaitRunningDeadlineNamesLatestFailure(t *testing.T) {
+	errB, errC := errors.New("connection reset B"), errors.New("connection reset C")
+	for _, c := range []struct {
+		name    string
+		timeout time.Duration
+		script  func(n int) bootReply
+		check   func(error) bool
+	}{
+		{"first read's retries cut short", 3300 * time.Millisecond, func(int) bootReply {
+			return bootErr(400, "RequestLimitExceeded") // the second attempt would start after the deadline
+		}, func(err error) bool { return awsCode(err) == "RequestLimitExceeded" }},
+		{"latest of several", 30 * time.Second, func(n int) bootReply {
+			switch {
+			case n <= 5:
+				return throttled
+			case n == 6:
+				return bootReply{err: errB}
+			case n == 7:
+				return bootReply{err: errC}
+			}
+			return bootReply{hang: true}
+		}, func(err error) bool { return errors.Is(err, errC) && !errors.Is(err, errB) && awsCode(err) == "" }},
+		{"not found after an outage", 30 * time.Second, func(n int) bootReply {
+			switch {
+			case n <= 5:
+				return throttled
+			case n == 6:
+				return bootErr(400, "InvalidInstanceID.NotFound")
+			}
+			return bootReply{hang: true}
+		}, func(err error) bool { return awsCode(err) == "RequestLimitExceeded" }},
+		{"first read hangs", 10 * time.Second, func(int) bootReply {
+			return bootReply{hang: true}
+		}, func(err error) bool { return strings.Contains(err.Error(), "did not answer") }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := newBootEnv(t, c.timeout, c.script)
+				start := time.Now()
+				_, err := e.a.WaitRunning(context.Background(), "i-boot", nil)
+				if err == nil || !c.check(err) || errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("err = %v after %d reads", err, e.reads.Load())
+				}
+				if el := time.Since(start); el != c.timeout {
+					t.Fatalf("gave up after %s, want at the %s deadline", el, c.timeout)
+				}
+			})
+		})
 	}
 }
 
-// Rejected credentials aren't an outage: the wait ends with them.
-func TestWaitRunningCredentialRejected(t *testing.T) {
-	a, n := newBootEnv(t, time.Minute, func(int) (int, string) {
-		return http.StatusUnauthorized, `<Response><Errors><Error><Code>AuthFailure</Code><Message>AWS was not able to validate the provided access credentials</Message></Error></Errors></Response>`
+// The caller ending the wait mid-outage, by cancelling or by its own
+// earlier deadline, gets the context's error, not the read failure, so it
+// knows nothing was learnt about the VM.
+func TestWaitRunningCallerEndsDuringOutage(t *testing.T) {
+	t.Run("cancelled", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			e := newBootEnv(t, time.Minute, func(n int) bootReply {
+				if n == 7 { // after one exhausted Query call
+					cancel()
+				}
+				return throttled
+			})
+			if _, err := e.a.WaitRunning(ctx, "i-boot", nil); !errors.Is(err, context.Canceled) || awsCode(err) != "" {
+				t.Fatalf("err = %v after %d reads", err, e.reads.Load())
+			}
+		})
 	})
-	var ce *CredentialError
-	if _, err := a.WaitRunning(context.Background(), "i-boot", nil); !errors.As(err, &ce) || n.Load() > 2 {
-		t.Fatalf("err = %T %v after %d reads", err, err, n.Load())
+	t.Run("caller deadline", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			e := newBootEnv(t, time.Minute, func(int) bootReply { return throttled })
+			if _, err := e.a.WaitRunning(ctx, "i-boot", nil); !errors.Is(err, context.DeadlineExceeded) || awsCode(err) != "" || e.reads.Load() <= 5 {
+				t.Fatalf("err = %v after %d reads", err, e.reads.Load())
+			}
+		})
+	})
+}
+
+// A read error that retrying can't fix ends the wait at once.
+func TestWaitRunningFatalReadError(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		code   string
+	}{{403, "UnauthorizedOperation"}, {400, "UnsupportedOperation"}} {
+		t.Run(c.code, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := newBootEnv(t, time.Minute, func(n int) bootReply {
+					if n == 1 {
+						return bootErr(c.status, c.code)
+					}
+					return up // a retry would succeed, so one fails the test
+				})
+				if _, err := e.a.WaitRunning(context.Background(), "i-boot", nil); awsCode(err) != c.code || e.reads.Load() != 1 {
+					t.Fatalf("err = %v after %d reads", err, e.reads.Load())
+				}
+			})
+		})
 	}
+}
+
+// Credentials that can't be had or are rejected aren't an outage: the wait
+// ends with the credential error itself.
+func TestWaitRunningCredentialFailure(t *testing.T) {
+	t.Run("none to sign with", func(t *testing.T) {
+		t.Setenv("AWS_ACCESS_KEY_ID", "")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+		synctest.Test(t, func(t *testing.T) {
+			e := newBootEnv(t, time.Minute, func(int) bootReply { return up })
+			e.a.api.creds = &awsCredResolver{envOnly: true}
+			start := time.Now()
+			_, err := e.a.WaitRunning(context.Background(), "i-boot", nil)
+			ce, ok := err.(*CredentialError) // itself, not wrapped in a boot timeout
+			if !ok || ce.Err != errNoPassedSession || e.reads.Load() != 0 || time.Since(start) > 5*time.Second {
+				t.Fatalf("err = %T %v after %d reads", err, err, e.reads.Load())
+			}
+		})
+	})
+	t.Run("rejected", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newBootEnv(t, time.Minute, func(int) bootReply { return bootErr(401, "AuthFailure") })
+			_, err := e.a.WaitRunning(context.Background(), "i-boot", nil)
+			if _, ok := err.(*CredentialError); !ok || e.reads.Load() > 2 {
+				t.Fatalf("err = %T %v after %d reads", err, err, e.reads.Load())
+			}
+		})
+	})
 }
