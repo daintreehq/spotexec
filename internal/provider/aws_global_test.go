@@ -31,6 +31,7 @@ type fakeRegionsEC2 struct {
 	prices      map[string][][3]string       // region -> {zone, type, price}
 	runErr      map[string]string            // "region/type" -> AWS error code for RunInstances
 	listErr     map[string]string            // region -> error code for tag-filtered DescribeInstances
+	termErr     map[string]string            // region -> error code for TerminateInstances
 	noSubnet    map[string]bool              // zones without a default subnet
 	hang        bool                         // RunInstances never answers (until the client gives up)
 	fullSubnet  map[string]bool              // zones whose subnet has no free addresses
@@ -452,11 +453,16 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 		case "TerminateInstances":
 			ids := []string{}
 			for i := 1; p.Get(fmt.Sprintf("InstanceId.%d", i)) != ""; i++ {
-				id := p.Get(fmt.Sprintf("InstanceId.%d", i))
-				ids = append(ids, id)
-				delete(f.instances[region], id)
+				ids = append(ids, p.Get(fmt.Sprintf("InstanceId.%d", i)))
 			}
 			f.log(region, act+" "+strings.Join(ids, " "))
+			if code := f.termErr[region]; code != "" {
+				ec2Err(w, 400, code)
+				return
+			}
+			for _, id := range ids {
+				delete(f.instances[region], id)
+			}
 			fmt.Fprint(w, `<TerminateInstancesResponse/>`)
 		default:
 			t.Errorf("unexpected %s %s", region, act)
@@ -1067,6 +1073,20 @@ func TestGlobalDownCoversRemovedRegion(t *testing.T) {
 	}
 	if got := f.callsOf("TerminateInstances"); len(got) != 1 || !strings.HasPrefix(got[0], "r-old-1 ") {
 		t.Fatalf("terminate calls %v", got)
+	}
+}
+
+// A failure to read where the fleet runs must not hide the home region's
+// own termination failure.
+func TestGlobalDownKeepsHomeRegionError(t *testing.T) {
+	f := &fakeRegionsEC2{instances: map[string]map[string]string{"r-one-1": {"i-a": "c7a.2xlarge"}},
+		termErr: map[string]string{"r-one-1": "UnauthorizedOperation"}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	os.MkdirAll(g.dir, 0o700)
+	os.WriteFile(filepath.Join(g.dir, "placement.json"), []byte("{not json"), 0o600)
+	err := g.Down(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "UnauthorizedOperation") || !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("error %v, want both the termination and the state failure", err)
 	}
 }
 

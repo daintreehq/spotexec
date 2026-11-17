@@ -340,12 +340,16 @@ func (a *AWSSpot) Up(ctx context.Context, log Logger) (Info, error) {
 	// Stopped leftovers (e.g. an on-demand fallback stopped from the console)
 	// still bill for their volume: terminate them.
 	if stopped, err := a.describe(ctx, "stopped"); err == nil && len(stopped) > 0 {
-		p := url.Values{}
+		ids := make([]string, len(stopped))
 		for i, s := range stopped {
-			p.Set("InstanceId."+strconv.Itoa(i+1), s.InstanceID)
+			ids[i] = s.InstanceID
 		}
-		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err == nil {
-			log("terminated %d stopped instance(s) left over for %s", len(stopped), a.r.Name)
+		done, err := a.terminate(ctx, ids)
+		if len(done) > 0 {
+			log("terminated %d stopped instance(s) left over for %s", len(done), a.r.Name)
+		}
+		if err != nil {
+			log("stopped leftovers for %s: %v", a.r.Name, err)
 		}
 	}
 	in, err := a.ranker().launch(ctx, log)
@@ -1280,25 +1284,90 @@ func (a *AWSSpot) downLocked(ctx context.Context, log Logger) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(insts) > 0 {
-		p := url.Values{}
-		for i, inst := range insts {
-			p.Set("InstanceId."+strconv.Itoa(i+1), inst.InstanceID)
-		}
-		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err != nil {
-			return 0, fmt.Errorf("terminate: %w", err)
-		}
-		ids := make([]string, 0, len(insts))
-		for _, inst := range insts {
-			log("terminating %s (%s)", inst.InstanceID, inst.InstanceType)
-			_ = os.Remove(a.knownHosts(inst.InstanceID))
-			ids = append(ids, inst.InstanceID)
-		}
-		a.releaseClaims(ids)
-	} else {
+	if len(insts) == 0 {
 		log("no running instances for %s", a.r.Name)
+		return 0, nil
 	}
-	return len(insts), nil
+	ids := make([]string, len(insts))
+	types := make(map[string]string, len(insts))
+	for i, inst := range insts {
+		ids[i] = inst.InstanceID
+		types[inst.InstanceID] = inst.InstanceType
+	}
+	done, err := a.terminate(ctx, ids)
+	for _, id := range done {
+		log("terminating %s (%s)", id, types[id])
+		_ = os.Remove(a.knownHosts(id))
+	}
+	if len(done) > 0 {
+		a.releaseClaims(done)
+	}
+	return len(done), err
+}
+
+// maxTerminateIDs is the most instance IDs EC2 takes in one
+// TerminateInstances request.
+const maxTerminateIDs = 1000
+
+// terminateRefill is how long EC2's TerminateInstances resource bucket takes
+// to regain one instance (20 a second by default). A full batch empties the
+// default bucket, so the next one can be throttled for longer than query's
+// own retries cover.
+var terminateRefill = 50 * time.Millisecond
+
+// terminate ends the given instances in batches EC2 accepts. It sends every
+// batch even after one is refused, and returns the IDs of the batches EC2
+// accepted, with an error naming those it refused or never sent. A refused
+// batch's outcome isn't known (EC2 can end part of it, and a lost response
+// hides an accepted one), but listing and terminating again is safe:
+// instances already shutting down drop out of the listing.
+func (a *AWSSpot) terminate(ctx context.Context, ids []string) ([]string, error) {
+	var done []string
+	var errs []error
+	failed := 0
+	batches := (len(ids) + maxTerminateIDs - 1) / maxTerminateIDs
+	for b := 0; b < batches; b++ {
+		lo := b * maxTerminateIDs
+		if err := ctx.Err(); err != nil {
+			failed += len(ids) - lo
+			errs = append(errs, fmt.Errorf("batches %d to %d of %d (%d instances) not sent: %w", b+1, batches, batches, len(ids)-lo, err))
+			break
+		}
+		batch := ids[lo:min(lo+maxTerminateIDs, len(ids))]
+		err := a.terminateBatch(ctx, batch)
+		if awsCode(err) == "RequestLimitExceeded" {
+			// Wait for the bucket to refill enough for this batch, then try
+			// once more.
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Duration(len(batch)) * terminateRefill):
+			}
+			if ctx.Err() != nil {
+				err = errors.Join(err, ctx.Err())
+			} else {
+				err = a.terminateBatch(ctx, batch)
+			}
+		}
+		if err != nil {
+			failed += len(batch)
+			errs = append(errs, fmt.Errorf("batch %d of %d (%d instances): %w", b+1, batches, len(batch), err))
+			continue
+		}
+		done = append(done, batch...)
+	}
+	if len(errs) > 0 {
+		return done, fmt.Errorf("terminate: %d of %d instances not confirmed: %w", failed, len(ids), errors.Join(errs...))
+	}
+	return done, nil
+}
+
+func (a *AWSSpot) terminateBatch(ctx context.Context, ids []string) error {
+	p := url.Values{}
+	for i, id := range ids {
+		p.Set("InstanceId."+strconv.Itoa(i+1), id)
+	}
+	_, err := a.api.ec2(ctx, "TerminateInstances", p)
+	return err
 }
 
 // Doctor checks credentials, identity, AMI and networking.
