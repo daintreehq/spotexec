@@ -402,14 +402,16 @@ func TestGlobalBakeLaunchRecordsActivity(t *testing.T) {
 	}
 	later := c.now().Add(launchSettle * 2)
 	c.set(later)
-	sent := false
+	// Read in the fake's handler goroutine, asserted back here.
+	var sent, held bool
+	var busy time.Time
 	f.onRun = func(region string) {
 		sent = true
-		if got := active(t, g); got != "r-two-1" {
-			t.Errorf("builder sent with its region unlisted: %q", got)
-		}
-		if got := busyAt(t, g, region); !got.Equal(later) {
-			t.Errorf("activity when sent = %v, want %v", got, later)
+		if err := g.withState(func(st *placementState) {
+			_, held = st.Active[region]
+			busy = st.Busy[region]
+		}); err != nil {
+			t.Error(err)
 		}
 	}
 	if _, err := a.BakeLaunch(context.Background(), t.Logf, nil); err != nil {
@@ -417,5 +419,11 @@ func TestGlobalBakeLaunchRecordsActivity(t *testing.T) {
 	}
 	if !sent {
 		t.Fatal("no builder sent")
+	}
+	if !held {
+		t.Error("builder sent with its region unlisted")
+	}
+	if !busy.Equal(later) {
+		t.Errorf("activity when sent = %v, want %v", busy, later)
 	}
 }
