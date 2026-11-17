@@ -698,15 +698,20 @@ func cmdUp() *cobra.Command {
 				count = 1
 			}
 			// Prewarming goes through the pool ledger, so it respects
-			// max_instances (when set) and concurrent sx processes see the
-			// launches.
+			// max_instances and the cap on live VMs (when set), and
+			// concurrent sx processes see the launches.
 			pool := client.NewPool(r, f)
-			ids, err := pool.Reserve(ctx, count)
+			rsv, err := pool.ReserveWhy(ctx, count)
 			if err != nil {
 				return err
 			}
+			ids := rsv.IDs
 			if len(ids) < count {
-				rep.Warn("MAX_INSTANCES", "%s: launching %d of %d requested (max_instances = %d)", r.Name, len(ids), count, r.MaxInstances)
+				code := "MAX_INSTANCES"
+				if rsv.LiveCap {
+					code = "LIVE_INSTANCE_CAP"
+				}
+				rep.Warn(code, "%s: launching %d of %d requested: %s", r.Name, len(ids), count, rsv.Reason)
 			}
 			if len(ids) == 0 {
 				return nil
