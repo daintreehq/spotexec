@@ -1112,7 +1112,8 @@ func (g *AWSGlobal) clearCool(p SpotPrice) {
 func regionWide(code string) bool {
 	switch code {
 	case "VcpuLimitExceeded", "MaxSpotInstanceCountExceeded", "InstanceLimitExceeded",
-		"OptInRequired", "UnauthorizedOperation", "PendingVerification", "Blocked":
+		"OptInRequired", "UnauthorizedOperation", "PendingVerification", "Blocked",
+		"VolumeLimitExceeded": // the region's EBS storage quota (a VM's volumes)
 		return true
 	}
 	return false

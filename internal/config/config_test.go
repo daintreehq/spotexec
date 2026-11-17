@@ -1441,17 +1441,20 @@ func TestWorkVolume(t *testing.T) {
 		"[runners.pinned]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nami = \"ami-0123456789abcdef0\"\n"+
 		"[runners.pinnedon]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nami = \"ami-0123456789abcdef0\"\nwork_volume_gb = 100\n"+
 		"[runners.off]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwork_volume_gb = 0\n"+
+		"[runners.auto]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nami = \"auto\"\n"+
+		"[runners.min]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwork_volume_gb = 8\n"+
+		"[runners.max]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwork_volume_gb = 16384\n"+
 		"[runners.box]\ntype = \"ssh\"\nhost = \"box\"\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, want := range map[string]int{"aws": DefaultWorkVolumeGB, "base": DefaultWorkVolumeGB, "pinned": 0, "pinnedon": 100, "off": 0, "box": 0} {
+	for name, want := range map[string]int{"aws": 64, "auto": 64, "base": 64, "min": 8, "max": 16384, "pinned": 0, "pinnedon": 100, "off": 0, "box": 0} {
 		if got := g.Runners[name].WorkVolume(); got != want {
 			t.Errorf("%s: work volume %d GiB, want %d", name, got, want)
 		}
 	}
-	for _, bad := range []string{"-1", "4", "16385"} {
-		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwork_volume_gb = "+bad+"\n"); err == nil || !strings.Contains(err.Error(), "work_volume_gb") {
+	for _, bad := range []string{"-1", "7", "16385"} {
+		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwork_volume_gb = "+bad+"\n"); err == nil || !strings.Contains(err.Error(), "work_volume_gb must be 0 (none) or between 8 and 16384 (got "+bad+")") {
 			t.Errorf("work_volume_gb = %s: %v", bad, err)
 		}
 	}
@@ -1467,5 +1470,8 @@ func TestWorkVolume(t *testing.T) {
 	}
 	if got := g.Runners["pinnedon"].WorkVolume(); got != 100 {
 		t.Errorf("the project's value wrote through to the base: %d GiB", got)
+	}
+	if _, err := mergeProject(t, g, "[runners.bad]\nextends = \"aws\"\nwork_volume_gb = 7\n"); err == nil || !strings.Contains(err.Error(), "work_volume_gb") {
+		t.Errorf("project work_volume_gb = 7: %v", err)
 	}
 }

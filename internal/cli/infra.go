@@ -1381,7 +1381,17 @@ func cmdCloudInit() *cobra.Command {
 			if user == "" {
 				user = "ubuntu"
 			}
-			s, err := cloudinit.Render(cloudinit.Options{User: user, PublicKey: pub, IdleTimeout: r.IdleTimeout.Duration, MaxLifetime: r.MaxLifetime.Duration, BootstrapScript: r.BootstrapScript, UserBootstrap: r.UserBootstrap})
+			o := cloudinit.Options{User: user, PublicKey: pub, IdleTimeout: r.IdleTimeout.Duration, MaxLifetime: r.MaxLifetime.Duration, BootstrapScript: r.BootstrapScript, UserBootstrap: r.UserBootstrap}
+			// As launched: with the work volume's setup when it fits (the
+			// image's own mappings can still rule it out at launch).
+			if gb := r.WorkVolume(); gb > 0 && cloudinit.WorkRootOK(r.WorkRoot) {
+				o.WorkVolumeGB, o.WorkRoot = gb, r.WorkRoot
+			}
+			s, err := cloudinit.Render(o)
+			if err != nil && o.WorkVolumeGB > 0 {
+				o.WorkVolumeGB, o.WorkRoot = 0, ""
+				s, err = cloudinit.Render(o)
+			}
 			if err != nil {
 				return err
 			}

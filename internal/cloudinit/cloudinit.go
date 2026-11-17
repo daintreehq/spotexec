@@ -57,7 +57,15 @@ var workRootRe = regexp.MustCompile(`^[A-Za-z0-9_./~+-]+$`)
 // a path made of characters that need no quoting in the script or in
 // /etc/fstab.
 func WorkRootOK(p string) bool {
-	return workRootRe.MatchString(p) && !strings.Contains(p, "..") && (p == "~" || strings.HasPrefix(p, "~/") || !strings.Contains(p, "~"))
+	if !workRootRe.MatchString(p) || (p != "~" && !strings.HasPrefix(p, "~/") && strings.Contains(p, "~")) {
+		return false
+	}
+	for _, c := range strings.Split(p, "/") {
+		if c == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // Background apt jobs (unattended-upgrades, apt-daily) are stopped at boot:
@@ -201,41 +209,48 @@ systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependenc
   its own, formatted XFS: cp --reflink then shares a cached dependency
   tree's data with each slot instead of copying all of it, which ext4 (the
   root filesystem) can't. Done before the SSH key is authorized, so nothing
-  has written to the work root yet. The disk is the one blank disk (no
-  partitions, no filesystem: never the root disk) of the requested size;
-  Nitro numbers NVMe disks in no fixed order, so no device name is
-  trusted. Anything unexpected leaves the work root on the root disk,
-  where slots copy their caches as before. Kept short: these comments
-  aren't rendered, and user-data is capped at 16 KiB.
+  has written to the work root yet, and under the lifecycle lock, so the
+  idle watchdog can't end the VM while it waits for the disk. The disk is
+  the one blank EBS disk (no partitions, no filesystem: never the root
+  disk; not instance storage) of the requested size. Nitro numbers NVMe
+  disks in no fixed order, so no device name is trusted; the launch adds
+  the volume only to an image that maps no other EBS volume, so no data
+  disk of the image can pass for it. Anything unexpected leaves the work
+  root on the root disk, where slots copy their caches as before. Kept
+  short: these comments aren't rendered, and user-data is capped at 16 KiB.
 */}}
 
 # ---- 1b. Work volume (XFS, for reflinked dependency caches) ----
 sx_workvol() {
-  local u={{.User}} g h w d dev= n=0 uuid
+  local u={{.User}} g h w d dev= n=0 uuid end=$((SECONDS + 60))
   command -v mkfs.xfs >/dev/null || { echo "no mkfs.xfs"; return 1; }
   h=$(getent passwd "$u" | cut -d: -f6); g=$(id -gn "$u") || return 1
   [ -n "$h" ] || return 1
   w='{{.WorkRoot}}'
   case "$w" in '~') w=$h ;; '~/'*) w=$h/${w#'~/'} ;; /*) ;; *) w=$h/$w ;; esac
-  if [ -L "$w" ] || { [ -e "$w" ] && [ -n "$(ls -A "$w" 2>&1)" ]; }; then echo "$w is in use"; return 1; fi
-  for _ in $(seq 60); do
+  inuse() { [ -L "$w" ] || { [ -e "$w" ] && [ -n "$(ls -A "$w" 2>&1)" ]; } && echo "$w is in use"; }
+  inuse && return 1
+  while :; do
     n=0
-    for d in $(lsblk -dbnpo NAME,SIZE,TYPE 2>/dev/null | awk '$2 == {{.WorkVolumeBytes}} && $3 == "disk" { print $1 }'); do
+    for d in $(lsblk -dbnpo NAME,SIZE,TYPE,MODEL 2>/dev/null | awk '$2 == {{.WorkVolumeBytes}} && $3 == "disk" && !/Instance Storage/ { print $1 }'); do
       [ "$(lsblk -npo NAME "$d" 2>/dev/null | wc -l)" -eq 1 ] || continue
       blkid -p "$d" >/dev/null 2>&1; [ $? -eq 2 ] && dev=$d n=$((n + 1))
     done
-    [ "$n" -eq 0 ] || break
+    [ "$n" -eq 0 ] && [ $SECONDS -lt $end ] || break
     sleep 1
   done
   [ "$n" -eq 1 ] || { echo "found $n blank disks of {{.WorkVolumeGB}} GiB"; return 1; }
   mkfs.xfs -q -K -m reflink=1 -L spotexecwork "$dev" && uuid=$(blkid -s UUID -o value "$dev") && [ -n "$uuid" ] || return 1
   runuser -u "$u" -- mkdir -p "$w" 2>/dev/null || { mkdir -p "$w" && chown "$u:$g" "$w"; } || return 1
+  inuse && return 1
   mount -t xfs -o noatime "$dev" "$w" || return 1
-  chown "$u:$g" "$w" && chmod 0755 "$w" || { umount "$w"; return 1; }
-  echo "UUID=$uuid $w xfs noatime,nofail 0 0" >> /etc/fstab
+  { chown "$u:$g" "$w" && chmod 0755 "$w" && echo "UUID=$uuid $w xfs noatime,nofail 0 0" >> /etc/fstab; } || { umount "$w"; return 1; }
   echo "$w is on $dev"
 }
+# Under the lifecycle lock: the watchdog mustn't end the VM while it waits.
+exec 7<"$D/lifecycle.lock"; flock -s 7
 sx_workvol >>/var/log/spotexec-bootstrap.log 2>&1 || echo "spotexec: no work volume: slots copy dependency caches" >>/var/log/spotexec-bootstrap.log
+touch "$D/activity"; exec 7<&-
 {{- end}}
 
 # ---- 2. SSH access for the spotexec-managed key ----

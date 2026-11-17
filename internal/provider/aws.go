@@ -516,6 +516,7 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 		UserBootstrap: a.r.UserBootstrap, BootstrapTimeout: a.r.BootTimeout.Duration,
 	}
 	var ami, rootDev string
+	var img ec2Image
 	volume := a.r.VolumeGB
 	if spec.bake {
 		opts.IdleTimeout, opts.MaxLifetime = 60*time.Minute, 60*time.Minute
@@ -532,7 +533,7 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 				// and run the bootstrap instead.
 				log("not using baked image %s: %s; booting the current Ubuntu image (run `spotexec image bake %s`)", b.ID, b.Stale, a.r.Name)
 			default:
-				ami, rootDev = b.ID, b.img.RootDevice
+				ami, rootDev, img = b.ID, b.img.RootDevice, b.img
 				opts.BootstrapScript, opts.UserBootstrap = "", ""
 				if size := b.img.rootSize(); size > volume {
 					volume = size // can't launch with a volume smaller than the image's snapshot
@@ -548,16 +549,33 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 			}
 		}
 	}
+	if ami == "" {
+		if ami, err = a.resolveAMI(ctx); err != nil {
+			return ec2Instance{}, asRegionError(ctx, err)
+		}
+	}
+	if rootDev == "" {
+		if img, err = a.describeImage(ctx, ami); err != nil {
+			return ec2Instance{}, asRegionError(ctx, err)
+		}
+		rootDev = img.RootDevice
+	}
+	workDev := ""
 	// The bake builder gets no work volume: CreateImage would capture it.
 	if gb := a.r.WorkVolume(); gb > 0 && !spec.bake {
 		root := a.r.WorkRoot
 		if root == "" {
 			root = "~/.cache/spotexec"
 		}
-		if cloudinit.WorkRootOK(root) {
-			opts.WorkVolumeGB, opts.WorkRoot = gb, root
-		} else {
+		var why string
+		workDev, why = workDevice(img)
+		switch {
+		case !cloudinit.WorkRootOK(root):
 			log("no work volume: work_root %q isn't a plain path (dependency caches are copied into each slot)", root)
+		case workDev == "":
+			log("no work volume: %s (dependency caches are copied into each slot)", why)
+		default:
+			opts.WorkVolumeGB, opts.WorkRoot = gb, root
 		}
 	}
 	ud, err := cloudinit.Render(opts)
@@ -573,16 +591,6 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	}
 	if err != nil {
 		return ec2Instance{}, err
-	}
-	if ami == "" {
-		if ami, err = a.resolveAMI(ctx); err != nil {
-			return ec2Instance{}, asRegionError(ctx, err)
-		}
-	}
-	if rootDev == "" {
-		if rootDev, err = a.rootDevice(ctx, ami); err != nil {
-			return ec2Instance{}, asRegionError(ctx, err)
-		}
 	}
 	sgs, err := a.securityGroups(ctx, log)
 	if err != nil {
@@ -612,12 +620,8 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.Itoa(volume))
 	base.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
 	if opts.WorkVolumeGB > 0 {
-		// Blank: user-data finds it by size, whatever the device is called.
-		dev := "/dev/sdf"
-		if rootDev == dev {
-			dev = "/dev/sdg"
-		}
-		base.Set("BlockDeviceMapping.2.DeviceName", dev)
+		// Blank: user-data finds it by size, whatever the guest calls it.
+		base.Set("BlockDeviceMapping.2.DeviceName", workDev)
 		base.Set("BlockDeviceMapping.2.Ebs.VolumeType", "gp3")
 		base.Set("BlockDeviceMapping.2.Ebs.VolumeSize", strconv.Itoa(opts.WorkVolumeGB))
 		base.Set("BlockDeviceMapping.2.Ebs.DeleteOnTermination", "true")
@@ -918,17 +922,47 @@ func (a *AWSSpot) resolveAMI(ctx context.Context) (string, error) {
 // rootDevice reads the AMI's root device name (Ubuntu uses /dev/sda1,
 // Amazon Linux /dev/xvda); a wrong name would attach a second disk instead
 // of growing the root volume.
-func (a *AWSSpot) rootDevice(ctx context.Context, ami string) (string, error) {
+func (a *AWSSpot) describeImage(ctx context.Context, ami string) (ec2Image, error) {
 	p := url.Values{}
 	p.Set("ImageId.1", ami)
 	b, err := a.api.ec2(ctx, "DescribeImages", p)
 	if err != nil {
-		return "", fmt.Errorf("describe AMI %s: %w", ami, err)
+		return ec2Image{}, fmt.Errorf("describe AMI %s: %w", ami, err)
 	}
-	if dev := xmlFirst(b, "imagesSet>item>rootDeviceName"); dev != "" {
-		return dev, nil
+	var out struct {
+		Images []ec2Image `xml:"imagesSet>item"`
 	}
-	return "", fmt.Errorf("AMI %s not found in %s", ami, a.r.Region)
+	if err := xml.Unmarshal(b, &out); err == nil && len(out.Images) > 0 && out.Images[0].RootDevice != "" {
+		return out.Images[0], nil
+	}
+	return ec2Image{}, fmt.Errorf("AMI %s not found in %s", ami, a.r.Region)
+}
+
+// workDevice names the work volume's mapping: the first of /dev/sdf to
+// /dev/sdp the image doesn't map (as sdX or xvdX). None when the image maps
+// an EBS volume besides its root: user-data tells the work volume by its
+// size and blankness, which a data volume of the image could share.
+func workDevice(img ec2Image) (dev, why string) {
+	used := map[string]bool{}
+	norm := func(n string) string {
+		n = strings.TrimPrefix(n, "/dev/")
+		n = strings.TrimPrefix(n, "xv")
+		n = strings.TrimPrefix(n, "s")
+		return strings.TrimRight(n, "0123456789") // "da1" -> "da"
+	}
+	for _, d := range img.Devices {
+		used[norm(d.Name)] = true
+		if d.Size > 0 && norm(d.Name) != norm(img.RootDevice) {
+			return "", fmt.Sprintf("image %s maps an EBS volume at %s besides its root", img.ID, d.Name)
+		}
+	}
+	used[norm(img.RootDevice)] = true
+	for c := 'f'; c <= 'p'; c++ {
+		if !used["d"+string(c)] {
+			return "/dev/sd" + string(c), ""
+		}
+	}
+	return "", fmt.Sprintf("image %s maps every device from /dev/sdf to /dev/sdp", img.ID)
 }
 
 // securityGroups returns configured SGs or finds/creates spotexec-ssh.

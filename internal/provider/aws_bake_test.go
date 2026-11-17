@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,7 @@ type fakeImage struct {
 	id, name, state, arch string
 	created               time.Time
 	tags                  map[string]string
+	devices               string // blockDeviceMapping items besides the root's
 }
 
 type fakeInstance struct {
@@ -114,8 +116,8 @@ func (f *fakeBakeAPI) handler(t *testing.T) http.HandlerFunc {
 				if !ok {
 					continue
 				}
-				fmt.Fprintf(&b, "<item><imageId>%s</imageId><name>%s</name><imageState>%s</imageState><creationDate>%s</creationDate><architecture>%s</architecture><rootDeviceName>/dev/sda1</rootDeviceName><blockDeviceMapping><item><deviceName>/dev/sda1</deviceName><ebs><volumeSize>8</volumeSize></ebs></item></blockDeviceMapping><tagSet>",
-					img.id, img.name, img.state, img.created.UTC().Format("2006-01-02T15:04:05.000Z"), img.arch)
+				fmt.Fprintf(&b, "<item><imageId>%s</imageId><name>%s</name><imageState>%s</imageState><creationDate>%s</creationDate><architecture>%s</architecture><rootDeviceName>/dev/sda1</rootDeviceName><blockDeviceMapping><item><deviceName>/dev/sda1</deviceName><ebs><volumeSize>8</volumeSize></ebs></item>%s</blockDeviceMapping><tagSet>",
+					img.id, img.name, img.state, img.created.UTC().Format("2006-01-02T15:04:05.000Z"), img.arch, img.devices)
 				keys := make([]string, 0, len(img.tags))
 				for k := range img.tags {
 					keys = append(keys, k)
@@ -541,7 +543,11 @@ func TestLaunchAttachesWorkVolume(t *testing.T) {
 		f := &fakeBakeAPI{base: "ami-b2"}
 		a := newBakeEnv(t, f)
 		a.r.SecurityGroupIDs = []string{"sg-1"}
-		f.images = []*fakeImage{ubuntuImg("ami-b2", time.Now().Add(-48*time.Hour)), ubuntuImg("ami-pinned", time.Now())}
+		eph := ubuntuImg("ami-eph", time.Now())
+		eph.devices = "<item><deviceName>/dev/sdf</deviceName><virtualName>ephemeral0</virtualName></item><item><deviceName>xvdg</deviceName><virtualName>ephemeral1</virtualName></item>"
+		data := ubuntuImg("ami-data", time.Now())
+		data.devices = "<item><deviceName>/dev/sdh</deviceName><ebs><volumeSize>64</volumeSize></ebs></item>"
+		f.images = []*fakeImage{ubuntuImg("ami-b2", time.Now().Add(-48*time.Hour)), ubuntuImg("ami-pinned", time.Now()), eph, data}
 		if edit != nil {
 			edit(a.r)
 		}
@@ -567,6 +573,19 @@ func TestLaunchAttachesWorkVolume(t *testing.T) {
 			t.Error("user-data doesn't set up the work volume")
 		}
 	})
+	t.Run("past the image's own device names", func(t *testing.T) {
+		v, _ := launch(t, launchSpec{}, func(r *config.Runner) { r.AMI, r.WorkVolumeGB = "ami-eph", gb(64) })
+		if got := v.Get("BlockDeviceMapping.2.DeviceName"); got != "/dev/sdh" {
+			t.Errorf("work volume at %q, want /dev/sdh (sdf and xvdg are the image's)", got)
+		}
+	})
+	t.Run("bootstrap kept when the setup doesn't fit", func(t *testing.T) {
+		script := "echo keep-me\n" + strings.Repeat("#", 16*1024-11*1024)
+		v, ud := launch(t, launchSpec{}, func(r *config.Runner) { r.BootstrapScript = script })
+		if v.Get("BlockDeviceMapping.2.DeviceName") != "" || strings.Contains(ud, "sx_workvol") || !strings.Contains(ud, "echo keep-me") {
+			t.Errorf("mapping %v, bootstrap kept %v", v, strings.Contains(ud, "echo keep-me"))
+		}
+	})
 	t.Run("sized", func(t *testing.T) {
 		v, ud := launch(t, launchSpec{}, func(r *config.Runner) { r.WorkVolumeGB, r.WorkRoot = gb(200), "/mnt/sx" })
 		if v.Get("BlockDeviceMapping.2.Ebs.VolumeSize") != "200" || !strings.Contains(ud, "w='/mnt/sx'") || !strings.Contains(ud, "$2 == 214748364800 ") {
@@ -577,11 +596,11 @@ func TestLaunchAttachesWorkVolume(t *testing.T) {
 		spec launchSpec
 		edit func(r *config.Runner)
 	}{
-		"bake builder":   {launchSpec{bake: true}, nil},
-		"pinned AMI":     {launchSpec{}, func(r *config.Runner) { r.AMI = "ami-pinned" }},
-		"turned off":     {launchSpec{}, func(r *config.Runner) { r.WorkVolumeGB = gb(0) }},
-		"odd work root":  {launchSpec{}, func(r *config.Runner) { r.WorkRoot = "~/my work" }},
-		"user-data full": {launchSpec{}, func(r *config.Runner) { r.BootstrapScript = strings.Repeat("#", 16*1024-11*1024) }},
+		"bake builder":             {launchSpec{bake: true}, nil},
+		"pinned AMI":               {launchSpec{}, func(r *config.Runner) { r.AMI = "ami-pinned" }},
+		"turned off":               {launchSpec{}, func(r *config.Runner) { r.WorkVolumeGB = gb(0) }},
+		"odd work root":            {launchSpec{}, func(r *config.Runner) { r.WorkRoot = "~/my work" }},
+		"image maps a data volume": {launchSpec{}, func(r *config.Runner) { r.AMI, r.WorkVolumeGB = "ami-data", gb(64) }},
 	} {
 		t.Run(name, func(t *testing.T) {
 			v, ud := launch(t, c.spec, c.edit)
@@ -589,5 +608,57 @@ func TestLaunchAttachesWorkVolume(t *testing.T) {
 				t.Errorf("work volume attached: %v", v)
 			}
 		})
+	}
+}
+
+// A bootstrap script too large even without the work volume's setup still
+// fails before anything is launched.
+func TestLaunchUserDataTooLarge(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	f := &fakeBakeAPI{base: "ami-b2"}
+	a := newBakeEnv(t, f)
+	a.r.SecurityGroupIDs = []string{"sg-1"}
+	a.r.BootstrapScript = strings.Repeat("#", 16*1024)
+	f.images = []*fakeImage{ubuntuImg("ami-b2", time.Now())}
+	if _, err := a.launchWith(context.Background(), t.Logf, launchSpec{}); err == nil || !strings.Contains(err.Error(), "16 KiB") || len(f.runs) != 0 {
+		t.Fatalf("err %v, %d RunInstances requests", err, len(f.runs))
+	}
+}
+
+func TestWorkDevice(t *testing.T) {
+	img := func(root string, devs ...string) ec2Image {
+		i := ec2Image{ID: "ami-x", RootDevice: root}
+		for _, d := range devs {
+			name, size, _ := strings.Cut(d, ":")
+			n, _ := strconv.Atoi(size)
+			i.Devices = append(i.Devices, struct {
+				Name string `xml:"deviceName"`
+				Size int    `xml:"ebs>volumeSize"`
+			}{name, n})
+		}
+		return i
+	}
+	for _, c := range []struct {
+		img  ec2Image
+		want string
+	}{
+		{img("/dev/sda1", "/dev/sda1:8"), "/dev/sdf"},
+		{img("/dev/xvda", "/dev/xvda:8"), "/dev/sdf"},
+		{img("/dev/sdf", "/dev/sdf:8"), "/dev/sdg"},
+		{img("/dev/sda1", "/dev/sda1:8", "/dev/sdf", "xvdg"), "/dev/sdh"},
+		{img("/dev/sda1", "/dev/sda1:8", "/dev/sdb:100"), ""},
+	} {
+		if got, why := workDevice(c.img); got != c.want || (got == "") != (why != "") {
+			t.Errorf("%+v: %q (%s), want %q", c.img, got, why, c.want)
+		}
+	}
+}
+
+// The work volume adds to the region's EBS storage: running out of it
+// moves the launch to another region, as a vCPU quota does.
+func TestVolumeQuotaIsRegionWide(t *testing.T) {
+	if !regionWide("VolumeLimitExceeded") || spotOnly("VolumeLimitExceeded") {
+		t.Fatal("VolumeLimitExceeded should be region-wide for Spot and on-demand alike")
 	}
 }
