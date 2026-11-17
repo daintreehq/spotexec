@@ -59,23 +59,14 @@ func hostMemTotal() int64 {
 	return 0
 }
 
-// pendingWrites is the page cache waiting to be written to disk (Dirty
-// plus Writeback), in bytes, or 0.
+// pendingWrites is the page cache waiting to be written to disk, in
+// bytes, or 0.
 func pendingWrites() int64 {
 	b, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return 0
 	}
-	var n int64
-	for _, l := range strings.Split(string(b), "\n") {
-		for _, k := range []string{"Dirty:", "Writeback:"} {
-			if v, ok := strings.CutPrefix(l, k); ok {
-				kb, _ := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(v), " kB"), 10, 64)
-				n += kb << 10
-			}
-		}
-	}
-	return n
+	return meminfoPending(string(b))
 }
 
 func inoCtime(fi fs.FileInfo) (uint64, int64) {

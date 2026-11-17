@@ -243,6 +243,17 @@ func (p *progress) timings() map[string]time.Duration {
 	return out
 }
 
+// event records a phase the helper's event named starts: installing the
+// dependencies, or writing them to disk (#253).
+func (p *progress) event(name string) {
+	switch name {
+	case "deps_install":
+		p.set(phaseDeps)
+	case "deps_flush":
+		p.set(phaseDepsFlush)
+	}
+}
+
 // dispatch records that the command is being handed to the helper, from
 // just before the request is sent: a send that fails part way may still
 // have reached it. setup: the helper runs [setup] run first.
@@ -800,12 +811,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	sess := lease.Sess
 	sess.OnEvent = func(ev protocol.Event) {
 		o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
-		switch ev.Name {
-		case "deps_install":
-			prog.set(phaseDeps)
-		case "deps_flush":
-			prog.set(phaseDepsFlush)
-		}
+		prog.event(ev.Name)
 		if ev.Name == "spot_interruption" {
 			noticed.Store(true)
 			reclaimed()

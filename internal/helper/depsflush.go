@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -61,7 +62,19 @@ var dockerSharesFS = func(dir string) bool {
 	if err != nil {
 		return true
 	}
-	root := dockerRootDir(d.info)
+	return sharesContainerFS(d.info, dir)
+}
+
+// sharesContainerFS decides dockerSharesFS from what `docker info`
+// printed. With the containerd snapshotter, containers' overlays live
+// under containerd's root, which Docker doesn't report (moving Docker's
+// data-root doesn't move them): that counts as shared. Otherwise they live
+// under Docker Root Dir.
+func sharesContainerFS(info, dir string) bool {
+	if strings.Contains(info, "io.containerd.snapshotter") {
+		return true
+	}
+	root := dockerRootDir(info)
 	if root == "" {
 		return true
 	}
@@ -77,6 +90,21 @@ func dockerRootDir(info string) string {
 		}
 	}
 	return ""
+}
+
+// meminfoPending is the page cache waiting to be written (Dirty plus
+// Writeback) in /proc/meminfo's text, in bytes.
+func meminfoPending(meminfo string) int64 {
+	var n int64
+	for _, l := range strings.Split(meminfo, "\n") {
+		for _, k := range []string{"Dirty:", "Writeback:"} {
+			if v, ok := strings.CutPrefix(l, k); ok {
+				kb, _ := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(v), " kB"), 10, 64)
+				n += kb << 10
+			}
+		}
+	}
+	return n
 }
 
 // sameDevice reports whether a and b are on the same filesystem; ok is
@@ -105,17 +133,17 @@ func sameDevice(a, b string) (same, ok bool) {
 // runner shutting down, ends it with an error: a flush that fails or runs
 // past its budget leaves the rest to the container's start.
 func (s *Session) flushDeps() (time.Duration, error) {
+	start := time.Now()
 	pending := pendingBytes()
 	if pending < flushMin || !dockerSharesFS(s.layout.Root) {
 		return 0, nil
 	}
-	start := time.Now()
 	done, err := startSync(s.layout.Root)
 	if err != nil {
 		return 0, nil
 	}
 	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_flush", Message: sizeText(pending)})
-	deadline := time.NewTimer(flushBudget)
+	deadline := time.NewTimer(flushBudget - time.Since(start))
 	defer deadline.Stop()
 	tick := time.NewTicker(flushTick)
 	defer tick.Stop()
