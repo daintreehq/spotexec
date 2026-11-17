@@ -721,6 +721,90 @@ func TestBreakerCountsAnsweringBatchOnce(t *testing.T) {
 	}
 }
 
+// A VM that answers booting keeps its launch batch until it answers usable,
+// and loses it then.
+func TestBatchDroppedOnceUsable(t *testing.T) {
+	c, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 3))
+	var mu sync.Mutex
+	ready := false
+	probeFleet = func(d *Daemon, _ context.Context, fl *fleet, running []provider.Instance, _ map[string]bool) ([]string, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, in := range running {
+			fl.lastOK[in.ID] = time.Now()
+			fl.booting[in.ID] = !ready
+		}
+		return nil, len(running)
+	}
+	d, _ := start(t)
+	fl := fleetNamed(d, "pool")
+	pass := func() {
+		fl.lastPrb = time.Time{} // probe every pass
+		d.pass(context.Background())
+		settle(t, d)
+	}
+	batches := func() int {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return len(fl.batchOf)
+	}
+	pass() // launches
+	pass() // booting
+	if n := batches(); n != 3 {
+		t.Fatalf("booting VMs: %d batch records, want 3", n)
+	}
+	mu.Lock()
+	ready = true
+	mu.Unlock()
+	pass()
+	if n := batches(); n != 0 || recent(d, fl) != 0 || len(c.launches()) != 3 {
+		t.Fatalf("usable VMs: %d batch records, %d failures, %d launches; want 0, 0, 3", n, recent(d, fl), len(c.launches()))
+	}
+}
+
+// A batch whose launches are still waiting for their VMs keeps its records
+// however long the wait, so VMs that vanish meanwhile and then fail their
+// launches count once.
+func TestPendingBatchOutlivesForgetting(t *testing.T) {
+	c, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 2))
+	hold := make(chan struct{})
+	c.set(func(c *cloud) { c.hold = hold })
+	d, _ := start(t)
+	fl := fleetNamed(d, "pool")
+	ctx := context.Background()
+	d.pass(ctx) // two launches, both waiting
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		d.mu.Lock()
+		n := len(fl.batchOf)
+		d.mu.Unlock()
+		if n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("launches never recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Long recorded, and gone from listings (reclaimed while pending).
+	d.mu.Lock()
+	for id, b := range fl.batchOf {
+		b.at = b.at.Add(-2 * forgetAfter)
+		fl.batchOf[id] = b
+	}
+	d.mu.Unlock()
+	c.set(func(c *cloud) { c.insts["pool"], c.waitErr = nil, errors.New("instance reclaimed while booting") })
+	fl.lastPrb = time.Now()
+	d.manage(ctx, fl)
+	close(hold)
+	settle(t, d)
+	if n := recent(d, fl); n != 1 {
+		t.Fatalf("a batch that vanished while launching counted %d failures, want 1", n)
+	}
+}
+
 // Each instance counts once whichever path reports it; launch batches count
 // once each, older ones not at all; instances and launches from before the
 // breaker restarted don't count.

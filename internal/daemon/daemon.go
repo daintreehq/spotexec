@@ -185,7 +185,8 @@ func (g *blindGate) spend() {
 
 type launchBatch struct {
 	pass, epoch int
-	at          time.Time
+	at          time.Time // recorded, or when its launch finished waiting
+	pending     bool      // its launch is still waiting for the VM to run
 }
 
 func newFleetState(r *config.Runner, f provider.Fleet) *fleet {
@@ -532,9 +533,10 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		}
 	}
 	for id, b := range fl.batchOf {
-		// Kept while an sx client's bootstrap failure report for it is still
-		// to be counted below, so its batch still counts once.
-		if gone(id) && !view.BootFailed[id] && time.Since(b.at) > forgetAfter {
+		// Kept while its launch may still report it failed, or an sx
+		// client's bootstrap failure report for it is still to be counted
+		// below, so its batch still counts once.
+		if gone(id) && !b.pending && !view.BootFailed[id] && time.Since(b.at) > forgetAfter {
 			delete(fl.batchOf, id)
 		}
 	}
@@ -949,9 +951,17 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int)
 		in, err := pool.ProvisionHeldThen(pctx, id, nil, func(in provider.Instance) {
 			created = in.ID
 			d.mu.Lock()
-			fl.batchOf[in.ID] = launchBatch{pass: batch, epoch: epoch, at: time.Now()}
+			fl.batchOf[in.ID] = launchBatch{pass: batch, epoch: epoch, at: time.Now(), pending: true}
 			d.mu.Unlock()
 		})
+		if created != "" {
+			d.mu.Lock()
+			if b, ok := fl.batchOf[created]; ok {
+				b.at, b.pending = time.Now(), false
+				fl.batchOf[created] = b
+			}
+			d.mu.Unlock()
+		}
 		if err != nil {
 			d.action("%s: launch failed: %v", r.Name, err)
 			// A refused launch request (network, credentials, capacity,
