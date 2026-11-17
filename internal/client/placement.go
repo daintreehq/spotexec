@@ -3,8 +3,8 @@ package client
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -138,23 +138,23 @@ func recordRunSpeed(lease *Lease, ws *Workspace, o Options, r protocol.Result, c
 	if ms <= 0 {
 		return
 	}
-	_ = provider.RecordRunSpeed(lease.Runner, SpeedWorkload(ws.RepoID, o), lease.Instance.Type, time.Duration(ms)*time.Millisecond)
+	_ = provider.RecordRunSpeed(lease.Runner, SpeedWorkload(ws.RepoID, ws.Cwd, o), lease.Instance.Type, time.Duration(ms)*time.Millisecond)
 }
 
 // SpeedWorkload names what a run runs, for comparing its speed on one
-// instance type with another (provider.RecordRunSpeed): the project, the
-// command line and its environment (a shard's number), and whether it had
-// the VM to itself. Hashed: the runner's state keeps no command lines.
-func SpeedWorkload(repoID string, o Options) string {
-	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00%t", repoID, o.Command, o.Exclusive)
-	keys := make([]string, 0, len(o.Env))
-	for k := range o.Env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		fmt.Fprintf(h, "\x00%s=%s", k, o.Env[k])
-	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
+// instance type with another (provider.RecordRunSpeed): the project (the
+// same in every worktree of it), the directory it runs from, the command
+// line and its environment (a shard's number), and whether it had the VM
+// to itself. Hashed: the runner's state keeps no command lines.
+func SpeedWorkload(repoID, cwd string, o Options) string {
+	b, _ := json.Marshal(struct {
+		V         int               `json:"v"`
+		Repo      string            `json:"repo"`
+		Cwd       string            `json:"cwd"`
+		Command   string            `json:"command"`
+		Env       map[string]string `json:"env,omitempty"` // encoding/json sorts the keys
+		Exclusive bool              `json:"exclusive,omitempty"`
+	}{1, repoID, cwd, o.Command, o.Env, o.Exclusive})
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])[:16]
 }

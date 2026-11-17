@@ -162,3 +162,87 @@ func TestRecordColdWorkKeepsBuildTimes(t *testing.T) {
 		t.Fatalf("state %s", b)
 	}
 }
+
+// A workload is the same in every worktree of a project, and differs by
+// what would change how long it runs: the command, its environment (a
+// shard), the directory and having the VM to itself.
+func TestSpeedWorkload(t *testing.T) {
+	o := Options{Command: "npm run typecheck", Env: map[string]string{"SHARD": "1", "TOTAL": "4"}}
+	base := SpeedWorkload("app-1234", ".", o)
+	if len(base) != 16 || SpeedWorkload("app-1234", ".", Options{Command: o.Command, Env: map[string]string{"TOTAL": "4", "SHARD": "1"}}) != base {
+		t.Fatalf("not stable: %q", base)
+	}
+	seen := map[string]string{base: "base"}
+	for name, w := range map[string]string{
+		"repo":      SpeedWorkload("other-1234", ".", o),
+		"cwd":       SpeedWorkload("app-1234", "web", o),
+		"command":   SpeedWorkload("app-1234", ".", Options{Command: "npm test", Env: o.Env}),
+		"env":       SpeedWorkload("app-1234", ".", Options{Command: o.Command, Env: map[string]string{"SHARD": "2", "TOTAL": "4"}}),
+		"exclusive": SpeedWorkload("app-1234", ".", Options{Command: o.Command, Env: o.Env, Exclusive: true}),
+	} {
+		if prev, ok := seen[w]; ok {
+			t.Errorf("%s: same workload as %s", name, prev)
+		}
+		seen[w] = name
+	}
+}
+
+// Only a clean exit 0 on a fleet VM of a known type is kept, as the
+// command's own time without [setup].
+func TestRecordRunSpeed(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	r := &config.Runner{Name: "fleet", Type: config.TypeAWSSpot, VCPUs: 8}
+	lease := &Lease{Runner: r, InstanceID: "i-1", Instance: provider.Instance{Type: "m7a.2xlarge"}}
+	ws := &Workspace{RepoID: "app-1234", Cwd: "."}
+	o := Options{Command: "npm run typecheck"}
+	ok := protocol.Result{DurationMS: 75000, SetupMS: 5000}
+	for name, res := range map[string]protocol.Result{
+		"failed":       {ExitCode: 1, DurationMS: 1000},
+		"timed out":    {TimedOut: true, DurationMS: 1000},
+		"canceled":     {Canceled: true, DurationMS: 1000},
+		"shutdown":     {Shutdown: true, DurationMS: 1000},
+		"setup failed": {SetupFailed: true, DurationMS: 1000},
+		"oom":          {OOMKilled: true, DurationMS: 1000},
+		"not started":  {StartError: "no shell", DurationMS: 1000},
+		"no time":      {DurationMS: 5000, SetupMS: 5000},
+	} {
+		recordRunSpeed(lease, ws, o, res, false)
+		if s := speedState(t, r); s != nil {
+			t.Fatalf("%s: recorded %v", name, s)
+		}
+	}
+	recordRunSpeed(lease, ws, o, ok, true) // interrupted
+	recordRunSpeed(&Lease{Runner: r, Instance: provider.Instance{Type: "m7a.2xlarge"}}, ws, o, ok, false)
+	recordRunSpeed(&Lease{Runner: r, InstanceID: "i-1"}, ws, o, ok, false)
+	if s := speedState(t, r); s != nil {
+		t.Fatalf("recorded %v", s)
+	}
+	recordRunSpeed(lease, ws, o, ok, false)
+	s := speedState(t, r)
+	w := SpeedWorkload(ws.RepoID, ws.Cwd, o)
+	if len(s) != 1 || len(s[w]["m7a.2xlarge"]) != 1 || s[w]["m7a.2xlarge"][0].MS != 70000 {
+		t.Fatalf("speed %v", s)
+	}
+}
+
+type speedRun struct {
+	MS int64 `json:"ms"`
+}
+
+func speedState(t *testing.T, r *config.Runner) map[string]map[string][]speedRun {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(provider.RunnerStateDir(r.Name), "placement.json"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st struct {
+		Speed map[string]map[string][]speedRun `json:"speed"`
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		t.Fatal(err)
+	}
+	return st.Speed
+}

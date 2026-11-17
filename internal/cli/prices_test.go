@@ -18,12 +18,12 @@ var (
 	slowOpt = provider.SpotPrice{Region: "ap-south-2", Zone: "ap-south-2a", Type: "m6a.2xlarge", Price: "0.030"}
 	seen    = time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
 	costs   = map[string]provider.RunCost{
-		optionKey(warmOpt): {Score: 0.1, Compute: 0.1, RelSpeed: 1, Warm: true, WarmSeen: seen, RTTMS: 150},
-		optionKey(coldOpt): {Score: 0.1691, Compute: 0.096, Cold: 0.0731, RelSpeed: 1, RTTMS: 150, ColdParts: &provider.ColdParts{
+		optionKey(warmOpt): {Score: 0.1, Compute: 0.1, RelSpeed: 1, SpeedFrom: provider.SpeedByGeneration, Warm: true, WarmSeen: seen, RTTMS: 150},
+		optionKey(coldOpt): {Score: 0.1691, Compute: 0.096, Cold: 0.0731, RelSpeed: 1, SpeedFrom: provider.SpeedByGeneration, RTTMS: 150, ColdParts: &provider.ColdParts{
 			Boot:  provider.ColdPart{Cost: 0.0183, Why: "no bake of the runner"},
 			Deps:  provider.ColdPart{Cost: 0.0365, Why: "no dependency archive for the project"},
 			Image: provider.ColdPart{Cost: 0.0183, Why: "no image of the project"}}},
-		optionKey(slowOpt): {Score: 0.2518, Compute: 0.03, Speed: 0.103, Cold: 0.0343, Distance: 0.0845, RelSpeed: 0.9091, RTTMS: 440, ColdParts: &provider.ColdParts{
+		optionKey(slowOpt): {Score: 0.2518, Compute: 0.03, Speed: 0.103, Cold: 0.0343, Distance: 0.0845, RelSpeed: 0.9091, SpeedFrom: provider.SpeedByGeneration, RTTMS: 440, ColdParts: &provider.ColdParts{
 			Boot:  provider.ColdPart{Warm: true, Why: "a bake of the runner"},
 			Deps:  provider.ColdPart{Cost: 0.0343, Why: "no dependency archive for the project"},
 			Image: provider.ColdPart{Warm: true, Why: "the project's image"}}},
@@ -62,15 +62,15 @@ func TestPricesShowRunCostBreakdown(t *testing.T) {
 		t.Fatalf("header: %q", lines[1])
 	}
 	for i, want := range []string{
-		"→ us-east-1 us-east-1a m7a.2xlarge 0.100 0.100 - warm - - next launch",
-		"eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.169 - +0.073 boot,deps,image - -",
-		"ap-south-2 ap-south-2a m6a.2xlarge 0.030 0.252 +0.103 +0.034 deps +0.085 -",
+		"→ us-east-1 us-east-1a m7a.2xlarge 0.100 0.100 - 100% assumed warm - - next launch",
+		"eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.169 - 100% assumed +0.073 boot,deps,image - -",
+		"ap-south-2 ap-south-2a m6a.2xlarge 0.030 0.252 +0.103 91% assumed +0.034 deps +0.085 -",
 	} {
 		if got := strings.Join(strings.Fields(lines[2+i]), " "); got != want {
 			t.Errorf("row %d: %q, want %q", i+1, got, want)
 		}
 	}
-	for _, want := range []string{`launch_order = "run_cost"`, "with waiting valued at $1/h (wait_cost)", "a slower type (each instance generation counts as 10% faster per vCPU)",
+	for _, want := range []string{`launch_order = "run_cost"`, "with waiting valued at $1/h (wait_cost)", "a slower type (SPEED, assumed: each instance generation counts as 10% faster per vCPU; measured instead once the same command has run 3 times on each of two types)",
 		"A zone and type that failed lately (refused for capacity, or a VM reclaimed within an hour of launch) adds 3 minutes of that for each failure (FAILURES), counting half as much every 2 hours.",
 		"a cold region (COLD, in minutes: boot 1 without a bake of aws there, deps 2 (a default) without the project's archive in the region's cache, image 1 (a default) without the project's image in its registry; outside a project, deps and image count as warm where a VM of aws was up 10 minutes or more in the last 7 days)", `"cheapest" ranks by price alone`} {
 		if !strings.Contains(out, want) {
@@ -132,7 +132,7 @@ func TestPricesShowFailureHistory(t *testing.T) {
 	v.cool = map[string]string{optionKey(coldOpt): "InsufficientInstanceCapacity"}
 	var b bytes.Buffer
 	v.writeText(&b, 20)
-	want := "eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.276 - +0.073 boot,deps,image - +0.107 skipped for now: InsufficientInstanceCapacity; " +
+	want := "eu-north-1 eu-north-1b m7a.2xlarge 0.096 0.276 - 100% assumed +0.073 boot,deps,image - +0.107 skipped for now: InsufficientInstanceCapacity; " +
 		"failed here lately: 1.8 capacity refusals, last 14:05; 0.5 VMs reclaimed within 1 hour of launch, last 14:05"
 	if got := strings.Join(strings.Fields(row(strings.Split(b.String(), "\n"), "eu-north-1b")), " "); got != want {
 		t.Fatalf("row:\n%s\nwant:\n%s", got, want)
@@ -234,5 +234,37 @@ func TestPricesCheapestHasNoBreakdown(t *testing.T) {
 	if err := v.writeJSON(&b); err != nil || strings.Contains(b.String(), "run_cost\"") || strings.Contains(b.String(), "run_cost_model") ||
 		!strings.Contains(b.String(), `"launch_order": "cheapest"`) {
 		t.Fatalf("json: %s (%v)", b.String(), err)
+	}
+}
+
+// Speeds the runner's runs measured are marked as such, row by row, and
+// the note names them, with the generation assumption for the rest.
+func TestPricesShowMeasuredSpeed(t *testing.T) {
+	v := runCostView()
+	v.k.Cost = map[string]provider.RunCost{}
+	for k, c := range costs {
+		v.k.Cost[k] = c
+	}
+	slow := v.k.Cost[optionKey(slowOpt)]
+	slow.RelSpeed, slow.SpeedFrom = 0.69, provider.SpeedMeasured
+	v.k.Cost[optionKey(slowOpt)] = slow
+	m := *model
+	m.MeasuredSpeeds = map[string]provider.TypeSpeed{
+		"m6a.2xlarge": {Relative: 0.69, Against: "m7a.2xlarge", Runs: 27, Workload: 1},
+		"m7a.2xlarge": {Relative: 1, Against: "m7a.2xlarge", Runs: 66, Workload: 1},
+	}
+	v.k.Model = &m
+	var b bytes.Buffer
+	v.writeText(&b, 20)
+	out := b.String()
+	if got := strings.Join(strings.Fields(row(strings.Split(out, "\n"), "ap-south-2a")), " "); !strings.Contains(got, "+0.103 69% measured +0.034") {
+		t.Errorf("row: %q", got)
+	}
+	want := "a slower type (SPEED, measured from the same commands' successful runs on each type lately: m6a.2xlarge at 69% of m7a.2xlarge; assumed for other types: each instance generation counts as 10% faster per vCPU)"
+	if !strings.Contains(out, want) {
+		t.Errorf("missing %q in:\n%s", want, out)
+	}
+	if c := v.k.Cost[optionKey(slowOpt)]; !strings.Contains(c.Factors(), "+$0.103 slower type (69% speed, measured)") {
+		t.Errorf("factors: %s", c.Factors())
 	}
 }

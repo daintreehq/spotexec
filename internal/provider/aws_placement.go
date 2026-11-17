@@ -79,13 +79,14 @@ type RunCost struct {
 	// (several regions only).
 	ColdParts *ColdParts `json:"cold_parts,omitempty"`
 	// RelSpeed is the type's speed per vCPU against the fastest option's
-	// (1: as fast): measured from the runner's runs (SpeedMeasured), else
+	// (1: as fast): measured from the runner's runs, else
 	// from its instance generation.
-	RelSpeed      float64   `json:"relative_speed"`
-	SpeedMeasured bool      `json:"speed_measured,omitempty"`
-	Warm          bool      `json:"warm"`                // no part of a cold start is paid
-	WarmSeen      time.Time `json:"warm_seen,omitempty"` // last time a VM of this runner ran in the region, when that decided a part
-	RTTMS         int       `json:"rtt_ms,omitempty"`    // TCP connect to the region's EC2 endpoint (0: not measured)
+	RelSpeed float64 `json:"relative_speed"`
+	// SpeedFrom: SpeedMeasured or SpeedByGeneration (vcpus runners only).
+	SpeedFrom string    `json:"speed_from,omitempty"`
+	Warm      bool      `json:"warm"`                // no part of a cold start is paid
+	WarmSeen  time.Time `json:"warm_seen,omitempty"` // last time a VM of this runner ran in the region, when that decided a part
+	RTTMS     int       `json:"rtt_ms,omitempty"`    // TCP connect to the region's EC2 endpoint (0: not measured)
 }
 
 // ColdParts is what a cold start in a region is made of: booting without a
@@ -301,9 +302,9 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 		return 1
 	}
 	// speedOf is a type's speed in the same units: a measured type is
-	// placed against the fastest type it was measured with, which keeps
-	// its speed by generation (so a newer type never measured still ranks
-	// as the assumption has it).
+	// placed against the type it was measured against, which keeps its
+	// speed by generation (so a newer type never measured still ranks as
+	// the assumption has it).
 	speedOf := func(t string) (float64, bool) {
 		if s, ok := m.MeasuredSpeeds[t]; ok && s.Relative > 0 {
 			return byGen(s.Against) * s.Relative, true
@@ -332,7 +333,10 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 		c := RunCost{RelSpeed: 1}
 		if m.SpeedByGen && fastest > 0 {
 			s, measured := speedOf(p.Type)
-			c.RelSpeed, c.SpeedMeasured = s/fastest, measured
+			c.RelSpeed, c.SpeedFrom = s/fastest, SpeedByGeneration
+			if measured {
+				c.SpeedFrom = SpeedMeasured
+			}
 		}
 		// An hour of the fastest option's work takes 1/RelSpeed hours here:
 		// the extra time costs the VM and the wait.
@@ -424,11 +428,7 @@ func (c RunCost) Factors() string {
 			parts = append(parts, fmt.Sprintf("+$%.3f %s", v, what))
 		}
 	}
-	how := "assumed"
-	if c.SpeedMeasured {
-		how = "measured"
-	}
-	add(c.Speed, fmt.Sprintf("slower type (%.0f%% speed, %s)", c.RelSpeed*100, how))
+	add(c.Speed, fmt.Sprintf("slower type (%s)", c.SpeedNote()))
 	cold := "cold region"
 	if c.ColdParts != nil {
 		if paid := c.ColdParts.Paid(); paid != "" {
@@ -441,6 +441,23 @@ func (c RunCost) Factors() string {
 		add(c.Failures, "failed here lately ("+c.FailedHere.String()+")")
 	}
 	return strings.Join(parts, ", ")
+}
+
+// Where a RunCost's speed came from (SpeedFrom).
+const (
+	SpeedMeasured     = "measured"   // the runner's own runs (see measuredSpeeds)
+	SpeedByGeneration = "generation" // assumed from the type's generation (genSpeedup)
+)
+
+// SpeedNote says how fast the option's type is against the fastest
+// option's, and whether that was measured or assumed: "69% speed,
+// measured".
+func (c RunCost) SpeedNote() string {
+	how := "assumed"
+	if c.SpeedFrom == SpeedMeasured {
+		how = "measured"
+	}
+	return fmt.Sprintf("%.0f%% speed, %s", c.RelSpeed*100, how)
 }
 
 // Summary is one line on c: its score and what made it up.

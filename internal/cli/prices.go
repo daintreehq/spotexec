@@ -230,7 +230,16 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 			case c.ColdParts != nil && c.ColdParts.Paid() != "":
 				cold += " " + c.ColdParts.Paid()
 			}
-			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t%s\t", c.Score, added(c.Speed), cold, added(c.Distance), added(c.Failures))
+			speed := added(c.Speed)
+			if c.SpeedFrom != "" {
+				// How fast against the fastest option, and how it is known.
+				how := "assumed"
+				if c.SpeedFrom == provider.SpeedMeasured {
+					how = "measured"
+				}
+				speed += fmt.Sprintf(" %.0f%% %s", c.RelSpeed*100, how)
+			}
+			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t%s\t", c.Score, speed, cold, added(c.Distance), added(c.Failures))
 			if c.FailedHere != nil { // even when too little to show in USD
 				failed := "failed here lately: " + c.FailedHere.String()
 				if note != "" {
@@ -269,7 +278,7 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 		m := k.Model
 		var factors []string
 		if m.SpeedByGen {
-			factors = append(factors, fmt.Sprintf("a slower type (each instance generation counts as %.0f%% faster per vCPU)", (m.GenSpeedup-1)*100))
+			factors = append(factors, speedFactor(m))
 		}
 		if m.Regions {
 			project := fmt.Sprintf("outside a project, deps and image count as warm where a VM of %s was up %g minutes or more in the last %g days", r.Name, m.WarmAfterMin, m.WarmDays)
@@ -296,6 +305,29 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 		fmt.Fprintf(w, "\n%s uses only %s. To launch in whichever region costs least, set regions = [\"all\"] (or a list) instead of region.\n", r.Name, r.Region)
 	}
 	fmt.Fprintln(w, "\nPrices are Spot compute only; the disk and public IPv4 address add a little per hour, about the same everywhere.")
+}
+
+// speedFactor is the run-cost note's account of speed: the types the
+// runner's runs measured, and the generation assumption for the rest.
+func speedFactor(m *provider.RunCostModel) string {
+	gen := fmt.Sprintf("each instance generation counts as %.0f%% faster per vCPU", (m.GenSpeedup-1)*100)
+	if len(m.MeasuredSpeeds) == 0 {
+		return "a slower type (SPEED, assumed: " + gen + "; measured instead once the same command has run 3 times on each of two types)"
+	}
+	types := make([]string, 0, len(m.MeasuredSpeeds))
+	for t := range m.MeasuredSpeeds {
+		types = append(types, t)
+	}
+	sort.Strings(types)
+	var parts []string
+	for _, t := range types {
+		s := m.MeasuredSpeeds[t]
+		if s.Against == t {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s at %.0f%% of %s", t, s.Relative*100, s.Against))
+	}
+	return fmt.Sprintf("a slower type (SPEED, measured from the same commands' successful runs on each type lately: %s; assumed for other types: %s)", strings.Join(parts, ", "), gen)
 }
 
 // coldMinutes is one part of a cold start as the run-cost note shows it:
