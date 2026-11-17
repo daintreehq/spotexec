@@ -255,19 +255,22 @@ func (g *AWSGlobal) claimTrial(region string) bool {
 // when it was claimed (else zero; see dropTrialAt). One placement.lock
 // step, so overlapping launches can't both take the trial.
 func (g *AWSGlobal) admitRegion(region string) (ok bool, trial time.Time) {
-	now := g.clock()
+	now := g.clock().UTC() // round-trips through placement.json exactly
 	ran := false
-	_ = g.withState(func(st *placementState) {
+	err := g.withState(func(st *placementState) {
 		ran = true
 		var claimed bool
 		if ok, claimed = claimTrial(st.Cooldown, unreachKey(region), now, g.trialFor()); claimed {
 			trial = now
 		}
 	})
-	if !ran {
+	switch {
+	case !ran:
 		// Unreadable state: the attempt's own record of the launch
 		// (beforeSend) fails with the reason.
 		return true, time.Time{}
+	case err != nil && !trial.IsZero():
+		return false, time.Time{} // a trial not saved isn't this attempt's
 	}
 	return ok, trial
 }
