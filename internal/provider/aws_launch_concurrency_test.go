@@ -344,3 +344,28 @@ func TestDownReleasesClaims(t *testing.T) {
 		t.Fatalf("launch after down: %v", err)
 	}
 }
+
+// A failed trial only clears its own claim: a later launch's trial in the
+// region stays.
+func TestDropTrialAtKeepsANewerTrial(t *testing.T) {
+	g := newGlobalEnv(t, &fakeRegionsEC2{}, "r-one-1", "r-two-1")
+	c := fixClock(g)
+	older, newer := c.now(), c.now().Add(time.Hour)
+	if err := g.withState(func(st *placementState) {
+		st.Cooldown[unreachKey("r-two-1")] = cooldown{Trial: newer}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	trialAt := func() (at time.Time) {
+		_ = g.withState(func(st *placementState) { at = st.Cooldown[unreachKey("r-two-1")].Trial })
+		return at
+	}
+	g.dropTrialAt("r-two-1", older)
+	if got := trialAt(); !got.Equal(newer) {
+		t.Fatalf("trial = %v, want the newer one kept", got)
+	}
+	g.dropTrialAt("r-two-1", newer)
+	if got := trialAt(); !got.IsZero() {
+		t.Fatalf("trial = %v, want it dropped", got)
+	}
+}

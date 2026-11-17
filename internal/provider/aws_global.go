@@ -1499,13 +1499,16 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		if !ok {
 			ahead.add("in a region this client can't reach")
 			otherFailure = true
+			if !contains(unreachSkipped, c.Region) {
+				unreachSkipped = append(unreachSkipped, c.Region)
+			}
 			continue
 		}
 		a := g.Regional(c.Region)
 		attempts++
 		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{itype: c.Type, zone: c.Zone, beforeSend: g.mark(c.Region)})
-		if err != nil && trial && !errors.Is(err, ErrLaunchAmbiguous) {
-			g.dropTrial(c.Region) // nothing there to try it
+		if err != nil && !trial.IsZero() && !errors.Is(err, ErrLaunchAmbiguous) {
+			g.dropTrialAt(c.Region, trial) // nothing there to try it
 		}
 		if err == nil {
 			g.clearCool(c)
@@ -1651,7 +1654,8 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		for _, rg := range regions[:min(len(regions), 2)] {
 			ok, trial := g.admitRegion(rg)
 			if !ok {
-				continue // held, or another launch is trying it again
+				otherFailure = true // held, or another launch is trying it again: not a quota verdict
+				continue
 			}
 			log("no spot capacity; falling back to on-demand in %s", rg)
 			a := g.Regional(rg)
@@ -1662,8 +1666,8 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 				in.Placement = &Placement{Order: "on_demand", Why: "on_demand_fallback: no Spot option could launch"}
 				return in, nil
 			}
-			if trial && !errors.Is(err, ErrLaunchAmbiguous) {
-				g.dropTrial(rg) // nothing launched there to try it
+			if !trial.IsZero() && !errors.Is(err, ErrLaunchAmbiguous) {
+				g.dropTrialAt(rg, trial) // nothing launched there to try it
 			}
 			var ce *CredentialError
 			if errors.Is(err, ErrLaunchAmbiguous) || errors.As(err, &ce) || ctx.Err() != nil {
