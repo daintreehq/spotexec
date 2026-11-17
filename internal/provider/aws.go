@@ -549,6 +549,12 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 			}
 		}
 	}
+	// User-data that doesn't fit even without the work volume fails here,
+	// before any AWS call can turn it into a regional error.
+	plain, err := cloudinit.Render(opts)
+	if err != nil {
+		return ec2Instance{}, err
+	}
 	if ami == "" {
 		if ami, err = a.resolveAMI(ctx); err != nil {
 			return ec2Instance{}, asRegionError(ctx, err)
@@ -578,19 +584,16 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 			opts.WorkVolumeGB, opts.WorkRoot = gb, root
 		}
 	}
-	ud, err := cloudinit.Render(opts)
-	if err != nil && opts.WorkVolumeGB > 0 {
+	ud := plain
+	if opts.WorkVolumeGB > 0 {
 		// The work volume's setup must not cost a bootstrap script that
 		// fitted the 16 KiB of user-data without it.
-		o := opts
-		o.WorkVolumeGB, o.WorkRoot = 0, ""
-		if ud2, err2 := cloudinit.Render(o); err2 == nil {
+		if withVol, err := cloudinit.Render(opts); err == nil {
+			ud = withVol
+		} else {
 			log("no work volume: %v (dependency caches are copied into each slot)", err)
-			ud, err, opts = ud2, nil, o
+			opts.WorkVolumeGB, opts.WorkRoot = 0, ""
 		}
-	}
-	if err != nil {
-		return ec2Instance{}, err
 	}
 	sgs, err := a.securityGroups(ctx, log)
 	if err != nil {
@@ -952,7 +955,7 @@ func workDevice(img ec2Image) (dev, why string) {
 	}
 	for _, d := range img.Devices {
 		used[norm(d.Name)] = true
-		if d.Size > 0 && norm(d.Name) != norm(img.RootDevice) {
+		if d.EBS != nil && norm(d.Name) != norm(img.RootDevice) {
 			return "", fmt.Sprintf("image %s maps an EBS volume at %s besides its root", img.ID, d.Name)
 		}
 	}

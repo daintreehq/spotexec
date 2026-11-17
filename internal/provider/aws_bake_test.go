@@ -630,12 +630,17 @@ func TestWorkDevice(t *testing.T) {
 	img := func(root string, devs ...string) ec2Image {
 		i := ec2Image{ID: "ami-x", RootDevice: root}
 		for _, d := range devs {
-			name, size, _ := strings.Cut(d, ":")
-			n, _ := strconv.Atoi(size)
-			i.Devices = append(i.Devices, struct {
-				Name string `xml:"deviceName"`
-				Size int    `xml:"ebs>volumeSize"`
-			}{name, n})
+			// "name:size" is an EBS mapping, "name:ebs" one with no size
+			// given (a snapshot's), a bare name an instance store.
+			name, size, ebs := strings.Cut(d, ":")
+			dev := ec2ImageDevice{Name: name}
+			if ebs {
+				n, _ := strconv.Atoi(size)
+				dev.EBS = &struct {
+					Size int `xml:"volumeSize"`
+				}{n}
+			}
+			i.Devices = append(i.Devices, dev)
 		}
 		return i
 	}
@@ -648,6 +653,8 @@ func TestWorkDevice(t *testing.T) {
 		{img("/dev/sdf", "/dev/sdf:8"), "/dev/sdg"},
 		{img("/dev/sda1", "/dev/sda1:8", "/dev/sdf", "xvdg"), "/dev/sdh"},
 		{img("/dev/sda1", "/dev/sda1:8", "/dev/sdb:100"), ""},
+		{img("/dev/sda1", "/dev/sda1:8", "/dev/sdb:ebs"), ""},
+		{img("/dev/sdf1", "/dev/sdf1:8"), "/dev/sdg"},
 	} {
 		if got, why := workDevice(c.img); got != c.want || (got == "") != (why != "") {
 			t.Errorf("%+v: %q (%s), want %q", c.img, got, why, c.want)
@@ -660,5 +667,36 @@ func TestWorkDevice(t *testing.T) {
 func TestVolumeQuotaIsRegionWide(t *testing.T) {
 	if !regionWide("VolumeLimitExceeded") || spotOnly("VolumeLimitExceeded") {
 		t.Fatal("VolumeLimitExceeded should be region-wide for Spot and on-demand alike")
+	}
+}
+
+// A baked image is checked for data volumes like any other: its mappings
+// come from the bake lookup, not a second DescribeImages.
+func TestLaunchBakedImageWithDataVolume(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
+	for name, devices := range map[string]string{
+		"none":     "",
+		"snapshot": "<item><deviceName>/dev/sdf</deviceName><ebs><snapshotId>snap-1</snapshotId></ebs></item>",
+	} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now()
+			f := &fakeBakeAPI{base: "ami-b2"}
+			a := newBakeEnv(t, f)
+			a.r.SecurityGroupIDs = []string{"sg-1"}
+			bake := bakeImg("ami-bake", testOwner, a.BakeHash(), "ami-b2", now.Add(-time.Hour))
+			bake.devices = devices
+			f.images = []*fakeImage{ubuntuImg("ami-b2", now.Add(-48*time.Hour)), bake}
+			if _, err := a.launchWith(context.Background(), t.Logf, launchSpec{}); err != nil {
+				t.Fatal(err)
+			}
+			if len(f.runs) != 1 || f.runs[0].Get("ImageId") != "ami-bake" {
+				t.Fatalf("not launched from the bake: %d requests", len(f.runs))
+			}
+			got := f.runs[0].Get("BlockDeviceMapping.2.DeviceName")
+			if want := map[string]string{"none": "/dev/sdf", "snapshot": ""}[name]; got != want {
+				t.Fatalf("work volume at %q, want %q", got, want)
+			}
+		})
 	}
 }

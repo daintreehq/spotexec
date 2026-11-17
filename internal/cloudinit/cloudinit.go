@@ -121,6 +121,11 @@ echo "{{.MaxSecs}}" > "$D/max_lifetime"   # the helper stops taking new runs sho
 rm -f "$D/draining" "$D/ready" "$D/drain_after" "$D/drain_op"
 echo "drain_after" > "$D/features"   # what this watchdog understands (the helper checks)
 chmod 0644 "$D/features"
+{{- if .WorkVolumeBytes}}
+# Held until the work volume is set up (1b): the watchdog mustn't end the
+# VM while it waits for the disk. Taken before the watchdog is armed.
+exec 7<"$D/lifecycle.lock"; flock -s 7
+{{- end}}
 
 # ---- 1. Idle watchdog (armed before anything else can fail) ----
 cat > /usr/local/sbin/spotexec-watchdog <<'WATCHDOG'
@@ -209,8 +214,9 @@ systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependenc
   its own, formatted XFS: cp --reflink then shares a cached dependency
   tree's data with each slot instead of copying all of it, which ext4 (the
   root filesystem) can't. Done before the SSH key is authorized, so nothing
-  has written to the work root yet, and under the lifecycle lock, so the
-  idle watchdog can't end the VM while it waits for the disk. The disk is
+  has written to the work root yet, and under the lifecycle lock (fd 7,
+  taken before the watchdog is armed), so the idle watchdog can't end the
+  VM while it waits for the disk. The disk is
   the one blank EBS disk (no partitions, no filesystem: never the root
   disk; not instance storage) of the requested size. Nitro numbers NVMe
   disks in no fixed order, so no device name is trusted; the launch adds
@@ -228,7 +234,7 @@ sx_workvol() {
   [ -n "$h" ] || return 1
   w='{{.WorkRoot}}'
   case "$w" in '~') w=$h ;; '~/'*) w=$h/${w#'~/'} ;; /*) ;; *) w=$h/$w ;; esac
-  inuse() { [ -L "$w" ] || { [ -e "$w" ] && [ -n "$(ls -A "$w" 2>&1)" ]; } && echo "$w is in use"; }
+  inuse() { if [ -L "$w" ] || { [ -e "$w" ] && [ -n "$(ls -A "$w" 2>&1)" ]; }; then echo "$w is in use"; return 0; fi; return 1; }
   inuse && return 1
   while :; do
     n=0
@@ -247,8 +253,6 @@ sx_workvol() {
   { chown "$u:$g" "$w" && chmod 0755 "$w" && echo "UUID=$uuid $w xfs noatime,nofail 0 0" >> /etc/fstab; } || { umount "$w"; return 1; }
   echo "$w is on $dev"
 }
-# Under the lifecycle lock: the watchdog mustn't end the VM while it waits.
-exec 7<"$D/lifecycle.lock"; flock -s 7
 sx_workvol >>/var/log/spotexec-bootstrap.log 2>&1 || echo "spotexec: no work volume: slots copy dependency caches" >>/var/log/spotexec-bootstrap.log
 touch "$D/activity"; exec 7<&-
 {{- end}}

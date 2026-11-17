@@ -1381,7 +1381,7 @@ func cmdCloudInit() *cobra.Command {
 			if user == "" {
 				user = "ubuntu"
 			}
-			o := cloudinit.Options{User: user, PublicKey: pub, IdleTimeout: r.IdleTimeout.Duration, MaxLifetime: r.MaxLifetime.Duration, BootstrapScript: r.BootstrapScript, UserBootstrap: r.UserBootstrap}
+			o := cloudinit.Options{User: user, PublicKey: pub, IdleTimeout: r.IdleTimeout.Duration, MaxLifetime: r.MaxLifetime.Duration, BootstrapScript: r.BootstrapScript, UserBootstrap: r.UserBootstrap, BootstrapTimeout: r.BootTimeout.Duration}
 			// As launched: with the work volume's setup when it fits (the
 			// image's own mappings can still rule it out at launch).
 			if gb := r.WorkVolume(); gb > 0 && cloudinit.WorkRootOK(r.WorkRoot) {

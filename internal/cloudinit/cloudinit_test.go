@@ -375,14 +375,14 @@ func TestRenderWorkVolume(t *testing.T) {
 		}
 	}
 	// Run (not just defined) after the watchdog is armed, under the
-	// lifecycle lock, and before the key that lets anyone write to the work
-	// root is authorized.
-	armed := strings.Index(s, "systemctl enable --now spotexec-watchdog.timer")
+	// lifecycle lock taken before it, and before the key that lets anyone
+	// write to the work root is authorized.
 	lock := strings.Index(s, "exec 7<\"$D/lifecycle.lock\"; flock -s 7\n")
+	armed := strings.Index(s, "systemctl enable --now spotexec-watchdog.timer")
 	call := strings.Index(s, "\nsx_workvol >>")
 	unlock := strings.Index(s, "exec 7<&-")
 	key := strings.Index(s, ".ssh/authorized_keys")
-	if armed < 0 || lock < armed || call < lock || unlock < call || key < unlock {
+	if lock < 0 || armed < lock || call < armed || unlock < call || key < unlock {
 		t.Fatalf("work volume set up out of order: armed %d lock %d call %d unlock %d key %d", armed, lock, call, unlock, key)
 	}
 	for _, bad := range []string{"", "~/a b", "/srv/$(id)", "/srv/x'y", "/srv/../etc", "../x", "/srv/~x", "~user/x"} {
@@ -421,6 +421,8 @@ func TestWorkVolumeSetup(t *testing.T) {
 		prep   func(home string)
 		fstab  bool // /etc/fstab can't be appended to
 		mountE bool // mount fails
+		after  int  // the disks show up from this scan on
+		occupy bool // something writes to the work root while mkfs runs
 	}
 	run := func(t *testing.T, e env) (log, calls, fstab string, err error) {
 		t.Helper()
@@ -469,6 +471,10 @@ func TestWorkVolumeSetup(t *testing.T) {
 			}
 			fmt.Fprintf(&probes, "%s) return %d ;; ", d.name, d.probe)
 		}
+		occupy := ":;"
+		if e.occupy {
+			occupy = `mkdir -p "$w" && touch "$w/early";`
+		}
 		mountRC := 0
 		if e.mountE {
 			mountRC = 32
@@ -478,9 +484,9 @@ C=` + filepath.Join(dir, "calls") + `
 getent() { echo "ubuntu:x:1000:1000::` + home + `:/bin/bash"; }
 id() { echo ubuntu; }
 sleep() { SECONDS=$((SECONDS + 1)); }
-lsblk() { case "$1" in -dbnpo) ` + list.String() + `;; -npo) case "$3" in ` + parts.String() + `*) echo "$3" ;; esac ;; esac; }
+lsblk() { case "$1" in -dbnpo) echo >> "$C.scans"; [ "$(wc -l < "$C.scans")" -ge ` + strconv.Itoa(e.after) + ` ] || return 0; ` + list.String() + `;; -npo) case "$3" in ` + parts.String() + `*) echo "$3" ;; esac ;; esac; }
 blkid() { if [ "$1" = -p ]; then case "$2" in ` + probes.String() + `esac; fi; echo uuid-1; }
-mkfs.xfs() { echo "mkfs $*" >> "$C"; }
+mkfs.xfs() { echo "mkfs $*" >> "$C"; ` + occupy + ` }
 runuser() { while [ "$1" != -- ]; do shift; done; shift; "$@"; }
 mount() { echo "mount $*" >> "$C"; return ` + strconv.Itoa(mountRC) + `; }
 umount() { echo "umount $*" >> "$C"; }
@@ -526,6 +532,18 @@ chown() { echo "chown $*" >> "$C"; }
 			}
 		})
 	}
+	t.Run("a disk that shows up late", func(t *testing.T) {
+		_, calls, _, err := run(t, env{disks: []disk{root, {name: "/dev/nvme1n1", size: gib64}}, after: 5})
+		if err != nil || !strings.HasPrefix(calls, "mkfs -q -K -m reflink=1 -L spotexecwork /dev/nvme1n1\n") {
+			t.Fatalf("%v\n%s", err, calls)
+		}
+	})
+	t.Run("work root filled during setup", func(t *testing.T) {
+		log, calls, fstab, err := run(t, env{disks: []disk{root, {name: "/dev/nvme1n1", size: gib64}}, occupy: true})
+		if err == nil || !strings.Contains(log, "is in use") || strings.Contains(calls, "mount") || fstab != "" {
+			t.Fatalf("%v\n%s\n%s", err, log, calls)
+		}
+	})
 	t.Run("fstab can't be written", func(t *testing.T) {
 		_, calls, _, err := run(t, env{disks: []disk{root, {name: "/dev/nvme1n1", size: gib64}}, fstab: true})
 		if err == nil || !strings.HasSuffix(calls, "umount $HOME/.cache/spotexec\n") {
