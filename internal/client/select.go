@@ -138,6 +138,31 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 	}
 	deadline := time.Now().Add(queue)
 	start := time.Now()
+	// One absolute deadline bounds every wait for a slot: cloud listings,
+	// ledger locks, probes, planning and the poll between rounds (#269).
+	// Launches and cleanup keep the caller's ctx.
+	actx, cancelQueue := context.WithDeadline(ctx, deadline)
+	defer cancelQueue()
+	// stop says why Acquire must stop now: the caller gave up, or the queue
+	// deadline passed (read off the clock too, ahead of actx's timer).
+	stop := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if actx.Err() != nil || !time.Now().Before(deadline) {
+			return fmt.Errorf("%s: no free slot within %s", protocol.CodeQueueTimeout, queue)
+		}
+		return nil
+	}
+	// accept hands over a lease won within the deadline; a later one is given
+	// back unused rather than placing a run that has already timed out.
+	accept := func(l *Lease) (*Lease, error) {
+		if err := stop(); err != nil {
+			l.abandon()
+			return nil, err
+		}
+		return l, nil
+	}
 	var members []*member
 	var errs []string
 	for _, r := range req.Pool {
@@ -227,7 +252,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 	lastPos := -1
 	queued := false
 	for round := 0; ; round++ {
-		if err := ctx.Err(); err != nil {
+		if err := stop(); err != nil {
 			return nil, err
 		}
 		// May this process probe now? Without a ticket (nobody waiting): yes.
@@ -240,6 +265,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		staticUp := 0 // static runners not known to be down (busy counts as up)
 		roundErrs := []string{}
 		for _, m := range members {
+			if err := stop(); err != nil {
+				return nil, err // a slow listing used up the queue time
+			}
 			if m.fatal != nil {
 				// Its setup is broken: no VM of it can serve (#162).
 				roundErrs = append(roundErrs, m.fatalErr().Error())
@@ -255,7 +283,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					// minutes for the whole machine, in the background.
 					go m.pool.RefreshPrices(context.WithoutCancel(ctx))
 				}
-				cands, usable, slots, err := m.pool.Rank(ctx, req.Exclude, claimFor(req))
+				cands, usable, slots, err := m.pool.Rank(actx, req.Exclude, claimFor(req))
 				if err != nil {
 					roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
 					continue
@@ -267,7 +295,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				window += slots
 				continue
 			}
-			cands, usable, err := m.pool.Candidates(ctx, req.Exclude)
+			cands, usable, err := m.pool.Candidates(actx, req.Exclude)
 			if err != nil {
 				roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
 				continue
@@ -288,7 +316,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			if m.r.SchedPolicy() == config.PolicyShadow && len(cands) > 0 {
 				// What the consolidating policy would try first, reported
 				// beside where the job actually goes.
-				if would, _, _, err := m.pool.Rank(ctx, req.Exclude, claimFor(req)); err == nil && len(would) > 0 {
+				if would, _, _, err := m.pool.Rank(actx, req.Exclude, claimFor(req)); err == nil && len(would) > 0 {
 					m.shadow = &would[0]
 				} else {
 					m.shadow = nil
@@ -318,6 +346,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			// (protocol.Acquire.Overflow), once no runner has a free slot.
 			overflow := map[*member][]candidate{}
 			for _, m := range members {
+				if err := stop(); err != nil {
+					return nil, err
+				}
 				if m.fatal != nil {
 					continue
 				}
@@ -328,18 +359,18 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					rq := req
 					rq.QueueTimeout = time.Until(deadline)
 					if rq.QueueTimeout > 0 {
-						lease, _, err := tryAcquire(ctx, rq, m.r, m.p, m.t, true)
+						lease, _, err := tryAcquire(actx, rq, m.r, m.p, m.t, true)
 						if err == nil {
-							return lease, nil
+							return accept(lease)
 						}
 						roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
 						continue
 					}
 				}
 				if m.pool == nil {
-					lease, holders, err := m.probeStatic(ctx, req)
+					lease, holders, err := m.probeStatic(actx, req)
 					if lease != nil {
-						return lease, nil
+						return accept(lease)
 					}
 					m.down = err != nil
 					if err != nil {
@@ -358,10 +389,15 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 						overflow[m] = append(overflow[m], c)
 						continue
 					}
+					// Each VM is probed only within the deadline: a fleet of
+					// silent VMs mustn't each get a fresh probe budget (#269).
+					if err := stop(); err != nil {
+						return nil, err
+					}
 					in := c.Instance
-					lease, holders, out := m.probeInstance(ctx, req, c, deadline)
-					if out == OutUnreachable && ctx.Err() != nil {
-						out = outSkipped // a cancelled probe proves nothing about the VM
+					lease, holders, out := m.probeInstance(actx, req, c, deadline)
+					if out == OutUnreachable && stop() != nil {
+						out = outSkipped // a probe cut short (the caller or the deadline) proves nothing about the VM
 					}
 					// One whose jobs only prepare is asked again below.
 					over := out == OutBusy && !req.Base.Exclusive && protocol.Overflowable(holders, slotsOf(m.r))
@@ -378,7 +414,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 							req.Rep.Event("placement_shadow", map[string]any{"runner": m.r.Name, "instance_id": in.ID,
 								"would_instance_id": m.shadow.ID, "would_reason": m.shadow.reason, "would_promote": m.shadow.claim.Promote})
 						}
-						return lease, nil
+						return accept(lease)
 					}
 					if m.fatal != nil {
 						if onlyFatal(members) {
@@ -410,8 +446,8 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					}
 				}
 			}
-			if lease := probeOverflow(ctx, req, members, overflow, deadline); lease != nil {
-				return lease, nil
+			if lease := probeOverflow(actx, req, members, overflow, deadline); lease != nil {
+				return accept(lease)
 			}
 		} else {
 			for _, m := range members {
@@ -426,12 +462,17 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		if mayProbe && req.Base.Exclusive {
 			for _, m := range members {
 				if m.pool != nil && m.fatal == nil && m.r.SchedPolicy() == config.PolicyConsolidate {
-					if id := m.pool.Fence(ctx, req.Exclude); id != "" && !m.fenced {
+					if id := m.pool.Fence(actx, req.Exclude); id != "" && !m.fenced {
 						m.fenced = true
 						req.Rep.Event("exclusive_fence", map[string]any{"runner": m.r.Name, "instance_id": id})
 					}
 				}
 			}
+		}
+		// A listing or probe the deadline cut short proves nothing: out of
+		// time, not out of runners.
+		if err := stop(); err != nil {
+			return nil, err
 		}
 		// Only actual probe failures prove unavailability; a round where we
 		// were not admitted to probe says nothing.
@@ -447,8 +488,8 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			return nil, err
 		}
 		// Out of time: give up before planning a launch nobody will use.
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("%s: no free slot within %s", protocol.CodeQueueTimeout, queue)
+		if err := stop(); err != nil {
+			return nil, err
 		}
 		// Everything is full: signal demand and grow fleets in priority order,
 		// each covering only what the fleets before it are not launching.
@@ -475,7 +516,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				continue
 			}
 			if req.noBoot(m.r.Name) {
-				if req.BootOnly != "" && !m.pool.mayServe(ctx, req.Exclude) {
+				if req.BootOnly != "" && !m.pool.mayServe(actx, req.Exclude) {
 					// Barred from launching, with no VM, even a busy or
 					// booting one, that may serve: as blocked as a fleet
 					// that can't launch.
@@ -499,7 +540,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			if req.noBoot(m.r.Name) {
 				continue
 			}
-			d, err := m.pool.Plan(ctx, covered)
+			d, err := m.pool.Plan(actx, covered)
 			if err != nil {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
@@ -536,6 +577,14 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					"waited_ms": d.Waited.Milliseconds(), "reason": d.Reason})
 			}
 			held[m.r.Name] = d.Held
+			if err := stop(); err != nil {
+				// Out of time while planning: no launch for a run that has
+				// already given up.
+				if d.Launch && !provisioning[d.ID] {
+					m.pool.Cancel(d.ID)
+				}
+				return nil, err
+			}
 			if d.Launch && !provisioning[d.ID] {
 				provisioning[d.ID] = true
 				req.Rep.Event("scale_out", map[string]any{"runner": m.r.Name, "launch_id": d.ID, "demand": d.Demand, "instances": d.Live,
@@ -589,7 +638,10 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		} else {
 			req.Rep.Status("queued %s%s · %s", pos, ui.Dur(time.Since(start)), status)
 		}
-		if time.Now().After(deadline) {
+		if err := stop(); err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
+			}
 			return nil, fmt.Errorf("%s: no free slot within %s (%s)", protocol.CodeQueueTimeout, queue, status)
 		}
 		// Poll interval grows with queue position: the head probes most
@@ -598,8 +650,8 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		sleep := 500*time.Millisecond + time.Duration(min(qs.Position, 10))*200*time.Millisecond +
 			time.Duration(rand.IntN(400))*time.Millisecond
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-actx.Done():
+			return nil, stop() // the caller gave up, or the deadline came mid-sleep
 		case <-time.After(sleep):
 		}
 	}
@@ -620,6 +672,9 @@ func probeOverflow(ctx context.Context, req AcquireRequest, members []*member, o
 		if !ok || m.fatal != nil {
 			continue
 		}
+		if ctx.Err() != nil {
+			return nil
+		}
 		if m.pool == nil {
 			if lease, _, _ := m.probeStatic(ctx, req); lease != nil {
 				return lease
@@ -627,8 +682,11 @@ func probeOverflow(ctx context.Context, req AcquireRequest, members []*member, o
 			continue
 		}
 		for _, c := range cands {
+			if ctx.Err() != nil {
+				return nil
+			}
 			lease, _, out := m.probeInstance(ctx, req, c, deadline)
-			if out == OutUnreachable && ctx.Err() != nil {
+			if out == OutUnreachable && (ctx.Err() != nil || !time.Now().Before(deadline)) {
 				out = outSkipped // a cancelled probe proves nothing about the VM
 			}
 			m.pool.Observe(c.Instance.ID, out, c.Instance.LaunchedAt)
@@ -690,7 +748,7 @@ func (m *member) probeStatic(ctx context.Context, req AcquireRequest) (*Lease, [
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	lease, holders, err := tryAcquireFn(cctx, req, m.r, m.p, m.t, false)
-	if err != nil && transport.IsConnError(err) {
+	if err != nil && transport.IsConnError(err) && ctx.Err() == nil { // a probe cut short proves nothing
 		m.ready = false
 		m.p.Forget()
 	}
@@ -728,7 +786,10 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	}
 	// Recorded in the fleet's ledger before any contact, so concurrent sx
 	// processes see the slot as taken while this acquire is in flight.
-	aid, rerr := m.pool.reserveOn(in, c.claim)
+	aid, rerr := m.pool.reserveOnCtx(ctx, in, c.claim)
+	if rerr != nil && ctx.Err() != nil {
+		return nil, nil, outSkipped // gave up waiting for the ledger: not contacted
+	}
 	if errors.Is(rerr, errNoRoom) || errors.Is(rerr, errReaping) || (rerr != nil && c.claim.Reclaim != "") {
 		// A drain is cancelled only after the ledger re-checked the VM.
 		return nil, nil, outSkipped
@@ -738,8 +799,14 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	if rerr == nil {
 		req.Base.Client.Attempt = aid
 		req.onSend = func() error {
-			if err := m.pool.markSent(aid); err != nil {
+			if err := m.pool.markSentCtx(ctx, aid); err != nil {
 				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return err // out of time while waiting for the ledger: not sent
+			}
+			if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+				return context.DeadlineExceeded // ahead of ctx's timer
 			}
 			sent = true
 			return nil
@@ -751,6 +818,18 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	defer cancel()
 	probed := time.Now()
 	lease, holders, err := tryAcquireFn(cctx, req, m.r, m.p, in.Target, false)
+	// A slot granted once the caller gave up (out of queue time, #269) is
+	// given back unused: the VM answered, but nothing is placed on it.
+	late := lease != nil && ctx.Err() != nil
+	if late {
+		if lease.Sess != nil {
+			lease.Sess.Close()
+		}
+		lease = nil
+		if c.claim.Reclaim != "" {
+			m.pool.reclaimed(in.ID, c.claim.Reclaim) // the helper cancelled its drain all the same
+		}
+	}
 	if m.boot != nil && m.boot.id == in.ID && !isCode(err, protocol.CodeBooting) {
 		m.boot = nil // that VM is past its first boot (or gone)
 	}
@@ -769,11 +848,13 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 		default:
 			m.pool.dropAttempt(aid)
 		}
-		if lease == nil && err == nil {
+		if lease == nil && err == nil && !late {
 			m.pool.settleHolders(in.ID, holders, probed)
 		}
 	}
 	switch {
+	case late:
+		return nil, nil, outContact
 	case lease != nil:
 		lease.InstanceID, lease.Instance = in.ID, in
 		ev := map[string]any{"runner": m.r.Name, "instance_id": in.ID, "slot": lease.Acq.Token}
@@ -998,7 +1079,11 @@ func tryAcquire(ctx context.Context, req AcquireRequest, r *config.Runner, p pro
 	a.SpotWatch = r.Ephemeral()
 	if req.onSend != nil {
 		if err := req.onSend(); err != nil {
-			s.Close()
+			if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+				s.Abort() // out of time: nothing was sent to say goodbye to
+			} else {
+				s.Close()
+			}
 			return nil, nil, fmt.Errorf("recording the acquire in the fleet ledger: %w", err)
 		}
 	}
@@ -1022,7 +1107,11 @@ func tryAcquire(ctx context.Context, req AcquireRequest, r *config.Runner, p pro
 				Message: fmt.Sprintf("no slot on %s within %s (the runner never answered)", r.Name, req.QueueTimeout.Round(time.Second))}}}
 		}
 		if err != nil {
-			s.Close()
+			if ctx.Err() != nil {
+				s.Abort() // the caller gave up: no polite goodbye to a helper that may be silent
+			} else {
+				s.Close()
+			}
 			return nil, nil, err
 		}
 		switch env.Type {

@@ -29,10 +29,12 @@ type fakeFleet struct {
 	// like a cloud listing, doesn't know).
 	placement *provider.Placement
 	// listErr: List fails with it; slowList: List blocks until its
-	// context ends, which must carry a deadline.
-	listErr  error
-	slowList bool
-	lists    int // List calls
+	// context ends, which must carry a deadline, recording that deadline
+	// in listDeadline.
+	listErr      error
+	slowList     bool
+	listDeadline time.Time
+	lists        int // List calls
 }
 
 func (f *fakeFleet) Runner() *config.Runner                        { return f.r }
@@ -53,6 +55,9 @@ func (f *fakeFleet) List(ctx context.Context) ([]provider.Instance, error) {
 		if _, ok := ctx.Deadline(); !ok {
 			panic("fakeFleet: a slow List with no deadline would never return")
 		}
+		f.mu.Lock()
+		f.listDeadline, _ = ctx.Deadline()
+		f.mu.Unlock()
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
