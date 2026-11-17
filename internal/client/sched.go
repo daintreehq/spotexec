@@ -104,6 +104,9 @@ type schedState struct {
 	Model map[string]*durStat `json:"model,omitempty"`
 	// PricesAt: when the VMs' prices were last looked up.
 	PricesAt time.Time `json:"prices_at,omitempty"`
+	// Leads: how long recent launches took to serve (sched_model.go), so
+	// Plan can tell a slot freeing soon from one a new VM would beat.
+	Leads []leadSample `json:"launch_leads,omitempty"`
 }
 
 // vmSched is what scheduling knows about one VM.
@@ -117,6 +120,10 @@ type vmSched struct {
 	Hold time.Time `json:"hold,omitempty"`
 	// Slots: the helper-reported slot count (0 until a job reaches it).
 	Slots int `json:"slots,omitempty"`
+	// Admit: how many jobs its helper admits at once (Acquired.Admit):
+	// jobs still preparing leave room for more, and the helper refuses
+	// work once Slots of them run commands. 0: Slots (an older helper).
+	Admit int `json:"admit,omitempty"`
 	// LastStart/LastEnd: the latest job acquired/released here by this
 	// machine (useful work, unlike keepalive activity).
 	LastStart time.Time `json:"last_start,omitempty"`
@@ -129,6 +136,9 @@ type vmSched struct {
 	// DrainOp names the committed early drain (roleDrainRequested).
 	DrainOp string    `json:"drain_op,omitempty"`
 	DrainAt time.Time `json:"drain_at,omitempty"`
+	// DrainScheduled: the VM took the drain over (schedule-drain): its
+	// watchdog ends it once idle result_retention, so it isn't asked again.
+	DrainScheduled bool `json:"drain_scheduled,omitempty"`
 	// Price: the VM's hourly price in USD when known, and when it was seen.
 	Price   float64   `json:"price,omitempty"`
 	PriceAt time.Time `json:"price_at,omitempty"`
@@ -286,6 +296,16 @@ func (s *schedState) units(r *config.Runner, id string) int {
 		return v.Slots
 	}
 	return slotsOf(r)
+}
+
+// admits is how many ordinary jobs an instance may hold at once: its
+// helper's admission limit once a job has reached it, otherwise units.
+// Within it the helper decides (it is full once units jobs run commands).
+func (s *schedState) admits(r *config.Runner, id string) int {
+	if v := s.VMs[id]; v != nil && v.Slots > 0 && v.Admit > v.Slots {
+		return v.Admit
+	}
+	return s.units(r, id)
 }
 
 // held is the capacity live attempts take on a VM: firm (attempts of live
@@ -528,11 +548,19 @@ type claim struct {
 	// Force: reserve whatever the ledger says (legacy placement, exact
 	// slots): the helper decides.
 	Force bool
+	// Overflow: the VM's slots are taken but its helper admits more jobs
+	// to prepare beside them (schedState.admits); the acquire asks for
+	// that (protocol.Acquire.Overflow).
+	Overflow bool
 }
 
 // errNoRoom: the ledger shows the VM full, or it may no longer take
 // ordinary work; skip it without contacting it.
 var errNoRoom = errors.New("no room on this instance")
+
+// errReaping: the VM is being terminated to make room (reach.go): not even
+// an exact slot may reserve it.
+var errReaping = errors.New("being terminated: this client couldn't reach it, and the fleet needed the room")
 
 // ReserveOn records an attempt on instance in for this process, before any
 // contact with it. Ordinary jobs are refused (errNoRoom) on a VM the ledger
@@ -550,6 +578,15 @@ func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 		now := time.Now()
 		s.reconcileOwners(now)
 		v := s.vm(in.ID, now)
+		if n := st.Notes[in.ID]; n.reaping(now) {
+			switch {
+			case n.ReapCommitted:
+				return errReaping
+			case !c.Force:
+				return errNoRoom // being ended to make room: it can't be reached anyway
+			}
+			n.Reaping = time.Time{} // an exact slot wins: the reaper sees its claim and stands down
+		}
 		if !c.Force {
 			if f := s.Fences[in.ID]; f != nil && f.Owner != owner && !c.Exact {
 				return errNoRoom
@@ -569,11 +606,13 @@ func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 				s.promote(in.ID, now, why)
 			}
 			firm, _ := s.held(p.R, in.ID)
-			need := 1
+			need, room := 1, s.units(p.R, in.ID)
 			if c.Exclusive {
-				need = s.units(p.R, in.ID)
+				need = room
+			} else if c.Overflow {
+				room = s.admits(p.R, in.ID)
 			}
-			if firm+need > s.units(p.R, in.ID) {
+			if firm+need > room {
 				return errNoRoom
 			}
 		}
@@ -646,7 +685,7 @@ func (p *Pool) commitAttempt(id string, acq protocol.Acquired, expect time.Time)
 		}
 		v := s.vm(a.VM, now)
 		if acq.MaxSlots > 0 {
-			v.Slots = acq.MaxSlots
+			v.Slots, v.Admit = acq.MaxSlots, acq.Admit
 			if a.Exclusive {
 				a.Units = acq.MaxSlots
 			}
@@ -821,11 +860,14 @@ type ledgerRef struct {
 	id   string
 }
 
-func (l *ledgerRef) release() {
+// release releases the attempt, once; it returns its pool the first time.
+func (l *ledgerRef) release() *Pool {
 	if l != nil && l.pool != nil && l.id != "" {
 		l.pool.releaseAttempt(l.id)
 		l.id = ""
+		return l.pool
 	}
+	return nil
 }
 
 // forgetGone drops the records of VMs no longer listed (their attempts
@@ -896,7 +938,7 @@ func (p *Pool) retainedRoom(st *poolState, now time.Time, c claim) bool {
 	s := st.sched()
 	owner := processOwner()
 	for _, w := range p.views(st, now) {
-		if !w.eligible || w.v.Role != roleRetained || c.Exclude[w.in.ID] {
+		if !w.eligible || w.v.Role != roleRetained || excluded(c.Exclude, w.in) {
 			continue
 		}
 		if f := s.Fences[w.in.ID]; f != nil && f.Owner != owner {

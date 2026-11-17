@@ -33,7 +33,8 @@ type Lease struct {
 	ledger *ledgerRef
 }
 
-// Close releases the slot.
+// Close releases the slot, then hands the fleet's surplus VMs their early
+// drains (Pool.DrainSurplus).
 func (l *Lease) Close() {
 	if l == nil {
 		return
@@ -41,7 +42,9 @@ func (l *Lease) Close() {
 	if l.Sess != nil {
 		l.Sess.Close()
 	}
-	l.ledger.release()
+	if pool := l.ledger.release(); pool != nil {
+		pool.DrainSurplus()
+	}
 }
 
 // AcquireRequest bundles what selection needs.
@@ -56,9 +59,11 @@ type AcquireRequest struct {
 	// build caches.
 	PreferInstance string
 	Rep            ui.Reporter
-	NoBoot         bool            // never launch fleet instances
-	Priority       int             // queue priority (higher first)
-	Exclude        map[string]bool // fleet instance IDs to avoid (e.g. one being reclaimed)
+	NoBoot         bool // never launch fleet instances
+	Priority       int  // queue priority (higher first)
+	// Exclude: fleet instance IDs to avoid (e.g. one being reclaimed), and
+	// whole regions to avoid as regionKey(region).
+	Exclude map[string]bool
 	// Project: what a launch of a runner for this request looks for in
 	// each region (nil, or a nil result: nothing in particular).
 	Project func(r *config.Runner) *provider.Project
@@ -197,6 +202,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		}
 	}()
 	provisioning := map[string]bool{}
+	held := map[string]bool{} // fleets holding launches for slots about to free
 	var lastHolders []protocol.Holder
 	lastPos := -1
 	queued := false
@@ -287,6 +293,10 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			}
 		}
 		if mayProbe {
+			// Runners whose slots are all taken but some by jobs only
+			// preparing: tried again, asking to prepare beside them
+			// (protocol.Acquire.Overflow), once no runner has a free slot.
+			overflow := map[*member][]candidate{}
 			for _, m := range members {
 				if m.fatal != nil {
 					continue
@@ -318,15 +328,30 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					}
 					reachable++
 					lastHolders = holders
+					if !req.Base.Exclusive && protocol.Overflowable(holders, slotsOf(m.r)) {
+						overflow[m] = nil
+					}
 					continue
 				}
 				for _, c := range fleetCands[m] {
+					if c.claim.Overflow {
+						overflow[m] = append(overflow[m], c)
+						continue
+					}
 					in := c.Instance
 					lease, holders, out := m.probeInstance(ctx, req, c, deadline)
+					if out == OutUnreachable && ctx.Err() != nil {
+						out = outSkipped // a cancelled probe proves nothing about the VM
+					}
+					// One whose jobs only prepare is asked again below.
+					over := out == OutBusy && !req.Base.Exclusive && protocol.Overflowable(holders, slotsOf(m.r))
 					if !(out == OutBusy && req.Base.Exclusive) {
-						// An exclusive probe finding a partly busy instance must
-						// not hide its free slots from everyone else.
 						m.pool.Observe(in.ID, out, in.LaunchedAt)
+					} else {
+						// An exclusive probe finding a partly busy instance must
+						// not hide its free slots from everyone else; it still
+						// answered.
+						m.pool.Observe(in.ID, outContact, in.LaunchedAt)
 					}
 					if lease != nil {
 						if m.shadow != nil {
@@ -345,6 +370,10 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					}
 					if out == OutBusy {
 						lastHolders = holders
+						if over {
+							c.claim.Overflow = true
+							overflow[m] = append(overflow[m], c)
+						}
 					}
 					// Root and user bootstrap each get boot_timeout.
 					if out == OutBooting && !in.LaunchedAt.IsZero() && time.Since(in.LaunchedAt) > 2*m.r.BootTimeout.Duration+2*time.Minute {
@@ -360,6 +389,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 						cancel()
 					}
 				}
+			}
+			if lease := probeOverflow(ctx, req, members, overflow, deadline); lease != nil {
+				return lease, nil
 			}
 		} else {
 			for _, m := range members {
@@ -426,11 +458,12 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				continue // can't grow: don't signal demand others would launch for
 			}
 			if waiters[m.r.Name] == nil {
+				register := m.pool.Register
 				weight := 1
 				if req.Base.Exclusive {
-					weight = m.pool.SlotsPerInstance()
+					register, weight = m.pool.RegisterExclusive, m.pool.SlotsPerInstance()
 				}
-				w, err := m.pool.Register(weight)
+				w, err := register(weight)
 				if err != nil {
 					return nil, err
 				}
@@ -446,6 +479,21 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
 			}
+			for _, id := range d.Reap {
+				if !m.pool.commitReap(id) {
+					continue // a run reserved it meanwhile
+				}
+				// At max_instances with VMs this client can't reach: end one,
+				// so the next round launches where it can. Marked draining
+				// only once the request succeeded, so a failed attempt is
+				// retried by the next round.
+				req.Rep.Warn("VM_UNREACHABLE", "%s: %s", m.r.Name, d.Reason)
+				tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				if err := m.pool.Fleet.Terminate(tctx, id); err == nil {
+					m.pool.Observe(id, OutDraining, time.Time{})
+				}
+				cancel()
+			}
 			if d.Live == 0 && d.Pending == 0 {
 				// No VM to wait for, and none will be launched.
 				if id := m.pool.BootFailure(); id != "" {
@@ -456,9 +504,17 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					blockErr = fmt.Errorf("%s: %s", m.r.Name, d.QuotaErr)
 				}
 			}
+			if d.Held && !held[m.r.Name] {
+				// Once per hold, so a run can say why it didn't launch.
+				req.Rep.Event("scale_held", map[string]any{"runner": m.r.Name, "demand": d.Demand, "deferred": d.Deferred,
+					"free_in_ms": d.FreeIn.Milliseconds(), "lead_ms": d.Lead.Milliseconds(), "lead_learned": d.LeadLearned,
+					"waited_ms": d.Waited.Milliseconds(), "reason": d.Reason})
+			}
+			held[m.r.Name] = d.Held
 			if d.Launch && !provisioning[d.ID] {
 				provisioning[d.ID] = true
-				req.Rep.Event("scale_out", map[string]any{"runner": m.r.Name, "launch_id": d.ID, "demand": d.Demand, "instances": d.Live})
+				req.Rep.Event("scale_out", map[string]any{"runner": m.r.Name, "launch_id": d.ID, "demand": d.Demand, "instances": d.Live,
+					"lead_ms": d.Lead.Milliseconds(), "lead_learned": d.LeadLearned, "waited_ms": d.Waited.Milliseconds()})
 				// Registered before the goroutine starts, so a process exiting
 				// right now still waits for it (WaitLaunches).
 				HoldLaunch()
@@ -468,12 +524,17 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				}
 				go m.provision(pctx, d.ID, req.Rep)
 			}
-			covered += d.Capacity
+			// Demand held for slots about to free is covered too: a
+			// lower-priority fleet mustn't launch for it instead.
+			covered += d.Capacity + d.Deferred
 			if d.Pending > 0 || d.Launch {
 				if status != "" {
 					status += "; "
 				}
 				status += fmt.Sprintf("%d instance(s) starting on %s", d.Pending, m.r.Name)
+				if d.Held {
+					status += "; " + d.Reason
+				}
 			} else if status == "" && d.Demand > 0 {
 				status = fmt.Sprintf("%s: %s", m.r.Name, d.Reason)
 			}
@@ -516,6 +577,44 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		case <-time.After(sleep):
 		}
 	}
+}
+
+// probeOverflow tries, once no runner had a free slot, the runners whose
+// slots are taken but some by jobs only preparing: asking to prepare
+// beside them (protocol.Acquire.Overflow) and wait there for a free slot
+// to run the command, which beats queueing or launching a VM. Static
+// runners are listed with no candidates.
+func probeOverflow(ctx context.Context, req AcquireRequest, members []*member, over map[*member][]candidate, deadline time.Time) *Lease {
+	if len(over) == 0 || req.Base.Exclusive {
+		return nil
+	}
+	req.Base.Overflow = true
+	for _, m := range members {
+		cands, ok := over[m]
+		if !ok || m.fatal != nil {
+			continue
+		}
+		if m.pool == nil {
+			if lease, _, _ := m.probeStatic(ctx, req); lease != nil {
+				return lease
+			}
+			continue
+		}
+		for _, c := range cands {
+			lease, _, out := m.probeInstance(ctx, req, c, deadline)
+			if out == OutUnreachable && ctx.Err() != nil {
+				out = outSkipped // a cancelled probe proves nothing about the VM
+			}
+			m.pool.Observe(c.Instance.ID, out, c.Instance.LaunchedAt)
+			if lease != nil {
+				return lease
+			}
+			if m.fatal != nil {
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // fatalErr is why m can't serve, with how to fix it.
@@ -604,7 +703,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	// Recorded in the fleet's ledger before any contact, so concurrent sx
 	// processes see the slot as taken while this acquire is in flight.
 	aid, rerr := m.pool.reserveOn(in, c.claim)
-	if errors.Is(rerr, errNoRoom) {
+	if errors.Is(rerr, errNoRoom) || errors.Is(rerr, errReaping) {
 		return nil, nil, outSkipped
 	}
 	sent := false
@@ -655,7 +754,7 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	case err == nil:
 		return nil, holders, OutBusy
 	case isDraining(err):
-		return nil, nil, OutDraining
+		return nil, nil, outDrainReply
 	case isCode(err, protocol.CodeBooting):
 		m.sawBooting(req.Rep, in, err)
 		return nil, nil, OutBooting
@@ -663,6 +762,8 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 		// The setup itself is broken: another VM would fail the same way.
 		m.fatal = err
 		return nil, nil, OutBootFailed
+	case isRefusal(err):
+		return nil, nil, outRefused // an answer, if not one this side knows
 	}
 	return nil, nil, OutUnreachable
 }
@@ -753,9 +854,19 @@ func (m *member) provision(ctx context.Context, id string, rep ui.Reporter) {
 		// known (the scale_out event comes before the choice).
 		rep.Event("instance_launched", placed(map[string]any{"runner": m.r.Name, "launch_id": id, "instance_id": in.ID}, in))
 	}
-	in, err := m.pool.ProvisionHeldThen(pctx, id, logf, launched)
-	if err != nil {
+	reported := false
+	failed := func(err error) {
+		reported = true
+		rep.Event("launch_failed", map[string]any{"runner": m.r.Name, "launch_id": id, "message": firstLine(err.Error())})
 		rep.Warn("LAUNCH_FAILED", "%s: %v", m.r.Name, firstLine(err.Error()))
+	}
+	// A failed launch request is reported before its hold ends; a VM
+	// lost while booting, after it.
+	in, err := m.pool.provisionHeld(pctx, id, logf, launched, failed)
+	if err != nil {
+		if !reported {
+			failed(err)
+		}
 		return
 	}
 	rep.Event("instance_running", placed(map[string]any{"runner": m.r.Name, "launch_id": id, "instance_id": in.ID, "host": in.Target.String()}, in))
@@ -986,6 +1097,9 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 	req := AcquireRequest{
 		Base: protocol.Acquire{RepoID: ws.RepoID, WorktreeKey: ws.WorktreeKey, Fingerprint: fingerprint, Exclusive: exclusive, KeepOwner: !syncing,
 			ReadOnly: display == PullDisplay, // still allowed on a VM near max_lifetime
+			// Only this VM will do: prepare beside jobs still preparing
+			// there rather than wait for one to finish.
+			Overflow: !exclusive,
 			Client:   protocol.ClientInfo{Host: host, PID: os.Getpid(), Worktree: ws.Root, Command: display}},
 		QueueTimeout: queue, PreferSlot: lr.Slot, OnlySlot: true, Rep: rep,
 	}
@@ -1003,7 +1117,11 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 		if syncing {
 			c.Worktree = ws.WorktreeKey
 		}
-		if id, err := pool.reserveOn(in, c); err == nil {
+		id, err := pool.reserveOn(in, c)
+		if errors.Is(err, errReaping) {
+			return nil, fmt.Errorf("%w: %s, which held it, is %v", ErrSlotGone, lr.InstanceID, err)
+		}
+		if err == nil {
 			aid = id
 			req.Base.Client.Attempt = aid
 			req.onSend = func() error {

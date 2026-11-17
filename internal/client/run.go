@@ -140,11 +140,31 @@ type Result struct {
 	// SetupFailed: [setup] failed, timed out or couldn't start, so the
 	// command never ran (ExitCode is 1, or 124 for a timeout).
 	SetupFailed bool `json:"setup_failed,omitempty"`
+	// Phases is where the run's time went (PhaseQueued, PhaseSync, …),
+	// summed over its attempts. A phase the run never reached is absent.
+	Phases map[string]time.Duration `json:"-"`
+	// Attempts is how many attempts the run made: 2 when it was replayed
+	// after losing its runner, 0 when it failed before its first.
+	Attempts int `json:"-"`
+	// Where the last attempt ran, when it got a fleet VM: its instance,
+	// region, zone and type (empty for a static runner).
+	InstanceID   string `json:"-"`
+	Region       string `json:"-"`
+	Zone         string `json:"-"`
+	InstanceType string `json:"-"`
+	// LostCode, when the run lost its runner and wasn't replayed, is why
+	// (RUNNER_UNRESPONSIVE, MEMORY_PRESSURE, CLIENT_SUSPENDED,
+	// REGION_UNREACHABLE): the code of
+	// the warning that explained it.
+	LostCode string `json:"-"`
 	// noReplay, when the runner was lost, is why the run must not be
 	// replayed elsewhere (see replayable).
 	noReplay noReplay
 	// lostAt, when the runner was lost, is how far the attempt had got.
 	lostAt stage
+	// lostWhen is when the attempt gave up on its runner (no earlier than
+	// the last word it sent the helper).
+	lostWhen time.Time
 }
 
 // stage is how far an attempt had got: the phase it was in, whether the
@@ -166,16 +186,61 @@ func (s stage) where() string {
 }
 
 // progress tracks an attempt's stage as it goes. It is read when the
-// runner is lost; helper events may update it from another goroutine.
+// runner is lost; helper events may update it from another goroutine. It
+// also times each phase, for the run's record.
 type progress struct {
-	mu sync.Mutex
-	at stage
+	mu    sync.Mutex
+	at    stage
+	since time.Time                // when the current phase began
+	spent map[string]time.Duration // by phaseKind
+	now   func() time.Time         // nil: time.Now
+	// waited: the start phase a run-permit wait (phaseRunWait) returns to.
+	waited string
+}
+
+func newProgress(phase string) *progress {
+	p := &progress{at: stage{phase: phase}}
+	p.since = p.clock()
+	return p
+}
+
+func (p *progress) clock() time.Time {
+	if p.now != nil {
+		return p.now()
+	}
+	return time.Now()
+}
+
+// enter ends the current phase's timing and starts phase's (p.mu held).
+func (p *progress) enter(phase string) {
+	now := p.clock()
+	if k := phaseKind[p.at.phase]; k != "" && !p.since.IsZero() && !now.Before(p.since) {
+		if p.spent == nil {
+			p.spent = map[string]time.Duration{}
+		}
+		p.spent[k] += now.Sub(p.since) // reached, even for no measurable time
+	}
+	p.since = now
+	p.at.phase = phase
 }
 
 func (p *progress) set(phase string) {
 	p.mu.Lock()
-	p.at.phase = phase
+	p.enter(phase)
 	p.mu.Unlock()
+}
+
+// timings ends the current phase's timing and returns the time spent in
+// each kind of phase so far.
+func (p *progress) timings() map[string]time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.enter(p.at.phase)
+	out := make(map[string]time.Duration, len(p.spent))
+	for k, d := range p.spent {
+		out[k] = d
+	}
+	return out
 }
 
 // dispatch records that the command is being handed to the helper, from
@@ -187,6 +252,7 @@ func (p *progress) dispatch(setup bool) {
 		phase = phaseStartSetup
 	}
 	p.mu.Lock()
+	p.enter(phase)
 	p.at = stage{phase: phase, dispatched: true}
 	p.mu.Unlock()
 }
@@ -196,18 +262,45 @@ func (p *progress) dispatch(setup bool) {
 func (p *progress) started() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.at.phase == phaseRunWait { // run_slot not seen
+		p.enter(p.waited)
+	}
 	switch p.at.phase {
 	case phaseStartSetup:
-		p.at.phase, p.at.started = phaseSetup, true
+		p.enter(phaseSetup)
+		p.at.started = true
 	case phaseStartCommand:
-		p.at.phase, p.at.started = phaseCommand, true
+		p.enter(phaseCommand)
+		p.at.started = true
+	}
+}
+
+// runWait records the helper waiting for a free slot to run the
+// dispatched [setup] run or command (all max_slots are running commands).
+func (p *progress) runWait() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.at.phase == phaseStartSetup || p.at.phase == phaseStartCommand {
+		p.waited = p.at.phase
+		p.enter(phaseRunWait)
+	}
+}
+
+// runSlot records the helper getting its slot after runWait: the process
+// is being started.
+func (p *progress) runSlot() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.at.phase == phaseRunWait {
+		p.enter(p.waited)
 	}
 }
 
 // setupDone records that [setup] run finished and the command is next.
 func (p *progress) setupDone() {
 	p.mu.Lock()
-	p.at.phase, p.at.started = phaseStartCommand, false
+	p.enter(phaseStartCommand)
+	p.at.started = false
 	p.mu.Unlock()
 }
 
@@ -217,8 +310,14 @@ func (p *progress) get() stage {
 	return p.at
 }
 
-// noReplay is a warning code and the reason behind it.
-type noReplay struct{ code, why string }
+// noReplay is a warning code and the reason behind it. region is set when
+// the VM's whole region went silent (regionSilent): with no code, the run
+// is replayed, outside that region and only once the helper there has given
+// up on the lost attempt (regionReplayAfter).
+type noReplay struct {
+	code, why string
+	region    *regionLoss
+}
 
 // InfraError marks failures of spotexec itself (exit 125).
 type InfraError struct{ Err error }
@@ -242,7 +341,8 @@ func infra(err error) error {
 type attempt struct {
 	runID   string
 	n       int
-	exclude map[string]bool // fleet instances lost in earlier attempts
+	exclude map[string]bool // fleet instances lost in earlier attempts (and regions: regionKey)
+	noBoot  bool            // replaying after a regional loss: only on VMs there are
 	fresh   *bool           // an earlier attempt already showed CONTAINER_FRESH
 }
 
@@ -264,19 +364,31 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 	defer KeepAwake()()
 	att := attempt{runID: newRunID(), n: 1, exclude: map[string]bool{}, fresh: new(bool)}
 	reached := false
+	spent := map[string]time.Duration{}
 	for {
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
 		reached = reached || res.Runner != ""
 		res.Reached = reached
+		for k, d := range res.Phases {
+			spent[k] += d
+		}
+		res.Phases, res.Attempts = spent, att.n
 		retry, code, why := replayable(lost, res, o, ctx.Err() != nil, att.n)
 		if why != "" {
 			o.Rep.Warn(code, "%s", why)
+			res.LostCode = code
 		}
 		if !retry {
 			return res, err
 		}
-		o.Rep.Warn("RUNNER_LOST", "lost %s %s (%v); replaying the run on another slot", lost, res.lostAt.where(), err)
-		o.Rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "lost": lost})
+		if res.noReplay.region != nil {
+			if !replayAfterRegion(ctx, o.Rep, &att, res, lost) {
+				return res, err
+			}
+		} else {
+			o.Rep.Warn("RUNNER_LOST", "lost %s %s (%v); replaying the run on another slot", lost, res.lostAt.where(), err)
+			o.Rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "lost": lost})
+		}
 		if lost != "static" {
 			att.exclude[lost] = true
 			markLost(cfg, res.Runner, lost)
@@ -291,13 +403,19 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 // no notice it was going away after the command was dispatched): that run
 // is never replayed, since a run that used up its VM's memory would most
 // likely do the same on the next one, and take that VM's other jobs with
-// it.
+// it. A run lost to its whole region going silent (noReplay.region, with
+// no code) is replayed like a reclaimed one; when the options rule the
+// replay out, the warning still says the region went silent.
 func replayable(lost string, res Result, o Options, canceled bool, n int) (retry bool, code, why string) {
 	if lost == "" {
 		return false, "", ""
 	}
 	eligible := o.RetryPreempt && !canceled && o.Sync != "none" && !o.PreferLast && !o.SameSlot && n < 2
 	if res.noReplay.why == "" {
+		if rl := res.noReplay.region; rl != nil && !eligible && !canceled {
+			// Safe to replay, but this run isn't: still say why it was lost.
+			return false, "REGION_UNREACHABLE", "lost " + lost + " " + res.lostAt.where() + ": " + rl.String() + ". The attempt's outcome is unknown"
+		}
 		return eligible, "", ""
 	}
 	why = "lost " + lost + " " + res.noReplay.why
@@ -326,7 +444,21 @@ func replayable(lost string, res Result, o Options, canceled bool, n int) (retry
 // likely lost to that, not to the VM or the run: replayed if the command
 // hadn't been dispatched, and otherwise not (its outcome is unknown), with
 // a warning that says so instead of blaming the run or the VM.
+//
+// A VM the cloud still runs that was lost after the command was dispatched,
+// with no memory pressure, may instead have gone silent with its whole
+// region, as this client sees it (regionSilent: a network partition, #229).
+// Then nothing points at the run, and it is replayed outside that region,
+// once the helper there has given up on the lost attempt; unless its
+// heartbeats never showed the VM's memory, so nothing shows the run didn't
+// use it up: REGION_UNREACHABLE, not replayed, and without blaming the run.
 func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay {
+	return whyNoReplayCtx(context.Background(), lease, noticed, at, exclusive)
+}
+
+// whyNoReplayCtx is whyNoReplay, its region check bounded by ctx (the run's:
+// an interrupted run isn't replayed, so it needn't wait for the probes).
+func whyNoReplayCtx(ctx context.Context, lease *Lease, noticed bool, at stage, exclusive bool) noReplay {
 	if noticed {
 		return noReplay{}
 	}
@@ -334,13 +466,22 @@ func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay 
 		if !at.dispatched {
 			return noReplay{}
 		}
-		return noReplay{"CLIENT_SUSPENDED", fmt.Sprintf("%s, after this machine was asleep or sx was stopped for %s: a runner may end a run after %s without word from sx, and the attempt's outcome is unknown. Rerun it, and keep this machine awake while it runs", at.where(), ui.Dur(d), transport.HelperPatience.Round(time.Second))}
+		return noReplay{code: "CLIENT_SUSPENDED", why: fmt.Sprintf("%s, after this machine was asleep or sx was stopped for %s: a runner may end a run after %s without word from sx, and the attempt's outcome is unknown. Rerun it, and keep this machine awake while it runs", at.where(), ui.Dur(d), transport.HelperPatience.Round(time.Second))}
 	}
 	if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
-		return noReplay{"MEMORY_PRESSURE", at.where() + ": it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
+		return noReplay{code: "MEMORY_PRESSURE", why: at.where() + ": it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
 	}
 	if !at.dispatched || !instanceRunning(lease) {
 		return noReplay{}
+	}
+	if rl := regionSilentFn(ctx, lease); rl != nil {
+		// Not the VM stalling: its whole region went silent. Replayed
+		// (once the helper there has given up on it), unless nothing
+		// showed the VM's memory: an older helper's heartbeats, or none.
+		if _, ok := lease.Sess.LastMemory(); !ok {
+			return noReplay{code: "REGION_UNREACHABLE", why: at.where() + ", although EC2 still reports it running: " + rl.String() + ". Its heartbeats never reported the VM's memory, so the run isn't replayed, and the attempt's outcome is unknown. Rerun it", region: rl}
+		}
+		return noReplay{region: rl}
 	}
 	what := "the command"
 	if at.phase == phaseSetup || at.phase == phaseStartSetup {
@@ -354,7 +495,7 @@ func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay 
 		if m := lastMemory(lease.Sess); m != "" {
 			why += " (" + m + ")"
 		}
-		return noReplay{"RUNNER_UNRESPONSIVE", why + ". Rerun it"}
+		return noReplay{code: "RUNNER_UNRESPONSIVE", why: why + ". Rerun it"}
 	}
 	why += what + " may be what overloaded it (memory, most often)"
 	if m := lastMemory(lease.Sess); m != "" {
@@ -364,7 +505,7 @@ func whyNoReplay(lease *Lease, noticed bool, at stage, exclusive bool) noReplay 
 	if !exclusive {
 		why += ", with --exclusive if it may need the whole VM"
 	}
-	return noReplay{"RUNNER_UNRESPONSIVE", why}
+	return noReplay{code: "RUNNER_UNRESPONSIVE", why: why}
 }
 
 // Phases of an attempt (stage.phase), as warnings name them.
@@ -375,11 +516,45 @@ const (
 	phaseImage        = "preparing the container image"
 	phaseDepsCheck    = "checking the dependency cache"
 	phaseDeps         = "installing dependencies"
+	phaseRunWait      = "waiting for a free slot to run the command"
 	phaseStartSetup   = "starting [setup] run"
 	phaseSetup        = "running [setup] run"
 	phaseStartCommand = "starting the command"
 	phaseCommand      = "running the command"
+	phaseWriteback    = "writing back the command's changes"
 )
+
+// Kinds of time a run spends, as its record names them (Result.Phases).
+const (
+	PhaseScan      = "scan"         // listing the worktree's files
+	PhaseQueued    = "queued"       // getting a runner and slot: probing, waiting, a VM booting
+	PhaseSync      = "sync"         // uploading files and seeding .git
+	PhaseImage     = "image"        // preparing the project container image
+	PhaseDeps      = "dependencies" // checking and installing dependencies
+	PhaseSetup     = "setup"        // [setup] run
+	PhaseCommand   = "command"      // the command itself
+	PhaseWriteback = "writeback"    // writing back its changes and pulling artifacts
+)
+
+// phaseKind is the kind of time each phase of an attempt counts as (none
+// for setting up the slot, which is brief).
+var phaseKind = map[string]string{
+	phaseSync: PhaseSync, phaseGitSeed: PhaseSync,
+	phaseImage:     PhaseImage,
+	phaseDepsCheck: PhaseDeps, phaseDeps: PhaseDeps,
+	phaseRunWait:    PhaseQueued,
+	phaseStartSetup: PhaseSetup, phaseSetup: PhaseSetup,
+	phaseStartCommand: PhaseCommand, phaseCommand: PhaseCommand,
+	phaseWriteback: PhaseWriteback,
+}
+
+// spend adds d to the run's time in phase kind k.
+func (r *Result) spend(k string, d time.Duration) {
+	if r.Phases == nil {
+		r.Phases = map[string]time.Duration{}
+	}
+	r.Phases[k] += d
+}
 
 // lastMemory describes the memory reading of s's latest heartbeat, "" when
 // none carried one.
@@ -408,8 +583,8 @@ func noteReclaimed(lease *Lease) {
 // replayVerdict is whyNoReplay for an attempt that lost its runner with
 // err: a shutdown the helper reported counts as the VM's notice, since EC2
 // still reports a VM running while its OS halts.
-func replayVerdict(lease *Lease, noticed bool, err error, at stage, exclusive bool) noReplay {
-	return whyNoReplay(lease, noticed || vmShutdown(err), at, exclusive)
+func replayVerdict(ctx context.Context, lease *Lease, noticed bool, err error, at stage, exclusive bool) noReplay {
+	return whyNoReplayCtx(ctx, lease, noticed || vmShutdown(err), at, exclusive)
 }
 
 // shutdownErr is what runOnce returns when the VM's shutdown killed the
@@ -490,6 +665,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		o.Rep.Status("scanning %s", ws.Root)
 		t := time.Now()
 		m, err = manifest.Build(ctx, ManifestOptions(ws.Root, p))
+		res.spend(PhaseScan, time.Since(t))
 		if err != nil {
 			return res, infra(fmt.Errorf("enumerating files: %w", err)), ""
 		}
@@ -513,7 +689,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	// Without a sync the slot's files are not ours: don't claim ownership.
 	base.KeepOwner = o.Sync == "none"
-	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot, Exclude: att.exclude, Priority: o.Priority,
+	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot || att.noBoot, Exclude: att.exclude, Priority: o.Priority,
 		Task: TaskKey(ws.RepoID, o.Display)}
 	if o.Sync != "none" {
 		// A launch for this run prefers regions that hold its caches.
@@ -549,29 +725,38 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if o.SameSlot {
 			fp = base.Fingerprint
 		}
+		t := time.Now()
 		lease, err = AcquireSlot(ctx, cfg, ws, r, lr, o.Rep, host, o.Display, o.Exclusive, o.QueueTimeout, o.SameSlot && o.Sync != "none", fp)
+		res.spend(PhaseQueued, time.Since(t))
 		if err != nil {
 			return res, infra(fmt.Errorf("can't return to this worktree's last slot (%s slot %d%s): %w", lr.Runner, lr.Slot, instanceSuffix(lr.InstanceID), err)), ""
 		}
 	} else {
+		t := time.Now()
 		lease, err = Acquire(ctx, req)
+		res.spend(PhaseQueued, time.Since(t))
 		if err != nil {
 			return res, infra(err), ""
 		}
 	}
 	defer lease.Close()
+	res.InstanceID = lease.InstanceID
+	res.Region, res.Zone, res.InstanceType = lease.Instance.Region, lease.Instance.Zone, lease.Instance.Type
 	if lease.InstanceID != "" {
 		lease.Sess.SetOnSilent(waitIfRunning(lease, o.Rep))
 	}
 	var noticed atomic.Bool // a reclamation notice arrived
 	// Before any replacement launches: steer it away from this VM's pool.
 	reclaimed := sync.OnceFunc(func() { noteReclaimed(lease) })
-	prog := &progress{at: stage{phase: phaseSlot}}
+	prog := newProgress(phaseSlot)
 	defer func() {
+		for k, d := range prog.timings() {
+			res.spend(k, d)
+		}
 		if lost != "" {
-			res.lostAt = prog.get()
+			res.lostAt, res.lostWhen = prog.get(), time.Now()
 			if lease.InstanceID != "" {
-				res.noReplay = replayVerdict(lease, noticed.Load(), err, res.lostAt, o.Exclusive)
+				res.noReplay = replayVerdict(ctx, lease, noticed.Load(), err, res.lostAt, o.Exclusive)
 			}
 		}
 	}()
@@ -713,13 +898,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		Snapshot: true, Skip: skip, SpotWatch: r.Type == config.TypeAWSSpot,
 		Container: crun,
 	}
+	running := fmt.Sprintf("%s · running %s", label, o.Display)
 	if run, timeout := SetupFor(p, o); run != "" {
 		ex.SetupRun, ex.SetupTimeoutMS = run, timeout.Milliseconds()
-		o.Rep.Status("%s · running setup ([setup] run)", label)
+		running = fmt.Sprintf("%s · running setup ([setup] run)", label)
 		o.Rep.Event("setup", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": run})
-	} else {
-		o.Rep.Status("%s · running %s", label, o.Display)
 	}
+	o.Rep.Status("%s", running)
 	o.Rep.Event("exec", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": o.Display, "cwd": ws.Cwd})
 	stopWatch.Do(func() { close(execStarted) })
 	if ctx.Err() != nil {
@@ -775,10 +960,24 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		prog.setupDone()
 		o.Rep.Status("%s · running %s", label, o.Display)
 	}
-	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup, prog.started)
+	// Every slot on the VM is running a command: the helper holds this one
+	// back, its files prepared, until one finishes.
+	onRunWait := func(waiting bool, msg string) {
+		if waiting {
+			prog.runWait()
+			o.Rep.Status("%s · %s", label, msg)
+			return
+		}
+		prog.runSlot()
+		o.Rep.Status("%s", running)
+	}
+	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup, prog.started, onRunWait)
 	outW.Flush()
 	errW.Flush()
 	if err != nil {
+		if re := (*transport.RemoteError)(nil); errors.As(err, &re) && re.Code == protocol.CodeQueueTimeout {
+			return res, infra(fmt.Errorf("%s: %w", label, err)), ""
+		}
 		return res, infra(fmt.Errorf("lost runner %s during execution: %w", r.Name, err)), lostRunner(lease, err)
 	}
 	res.ExitCode, res.TimedOut = result.ExitCode, result.TimedOut
@@ -805,6 +1004,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		// the CLI exits 130).
 		return res, shutdownErr(label, result.ExitCode), shutdownRunner(lease)
 	}
+	prog.set(phaseWriteback)
 	checkCanceled()
 	// Post-exec work uses its own bounded context: an interrupt that already
 	// canceled ctx must not prevent writing back what the command changed.
@@ -1406,14 +1606,16 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 		image = crun.Image
 	}
 	// Shared cache: sign URLs for the key the runner will compute. Any
-	// failure just means installing without the cache.
+	// failure just means installing without the cache, and says why.
 	// The cache lives in the instance's own region (multi-region fleets).
 	var resign func(context.Context) (string, string, error)
-	if dc, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.DepsCache); ok {
+	if dc := depsCacheFor(ctx, o, r, lease.Provider, lease.InstanceID); dc != nil {
 		key, err := depskey.Key(ws.Root, depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Image: image, Toolchain: req.Toolchain, OS: s.Hello.OS, Arch: s.Hello.Arch})
-		if err == nil {
+		if err != nil {
+			o.Rep.Warn("DEPS_CACHE", "shared dependency cache unavailable: computing its key: %v", err)
+		} else {
 			sign := func(ctx context.Context) (string, string, error) {
-				cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				cctx, cancel := context.WithTimeout(ctx, depsCacheTimeout)
 				defer cancel()
 				return dc.CacheURLs(cctx, ws.RepoID, key)
 			}
@@ -1426,7 +1628,9 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 			}
 		}
 	}
+	cacheErr := depsCacheErrors(o)
 	onEvent := func(ev protocol.Event) {
+		cacheErr(ev)
 		if s.OnEvent != nil {
 			s.OnEvent(ev) // records interruption notices for the pre-exec check
 		} else {
@@ -1476,6 +1680,51 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	return dr, nil
 }
 
+// depsCacheTimeout bounds finding the VM's region and signing the shared
+// dependency cache's URLs.
+const depsCacheTimeout = 20 * time.Second
+
+// depsCacheFor is the shared dependency cache in the instance's own region
+// (nil: none, or turned off with cache_bucket). A multi-region fleet that
+// can't tell the instance's region offers none, and the run says why
+// (#228) instead of installing without the cache unannounced.
+func depsCacheFor(ctx context.Context, o Options, r *config.Runner, p provider.Provider, instanceID string) provider.DepsCache {
+	switch r.CacheBucket {
+	case "off", "none", "false":
+		return nil
+	}
+	if pl, ok := p.(provider.Placed); ok && instanceID != "" {
+		cctx, cancel := context.WithTimeout(ctx, depsCacheTimeout)
+		q, err := pl.For(cctx, instanceID)
+		cancel()
+		if err != nil || q == nil {
+			if err == nil {
+				err = errors.New("no provider serves it")
+			}
+			o.Rep.Warn("DEPS_CACHE", "shared dependency cache unavailable: finding the region of %s: %v", instanceID, err)
+			return nil
+		}
+		p = q
+	}
+	dc, _ := p.(provider.DepsCache)
+	return dc
+}
+
+// depsCacheErrors turns the first deps_cache_error the helper reports (the
+// VM couldn't download or upload the shared cache's archive) into a
+// DEPS_CACHE warning, which the run's record keeps (#217): the event alone
+// is only shown.
+func depsCacheErrors(o Options) func(protocol.Event) {
+	warned := false
+	return func(ev protocol.Event) {
+		if ev.Name != "deps_cache_error" || warned {
+			return
+		}
+		warned = true
+		o.Rep.Warn("DEPS_CACHE", "the VM couldn't use the shared dependency cache: %s", ev.Message)
+	}
+}
+
 // fetchDeps sends the deps request. With a shared cache, which may lack
 // this key, of the runs on this machine needing it now (the parts of a
 // task, concurrent commands) one installs it and uploads it, and the rest
@@ -1512,7 +1761,13 @@ func fetchDeps(ctx context.Context, c rpc, onEvent func(protocol.Event), o Optio
 		},
 		build: func(ctx context.Context) error {
 			if resign != nil && time.Since(signed) > resignAfter {
-				if get, put, err := resign(ctx); err == nil && get != "" {
+				get, put, err := resign(ctx)
+				switch {
+				case err != nil:
+					// The URLs signed before may have expired: a restore then
+					// misses, and an upload fails.
+					o.Rep.Warn("DEPS_CACHE", "signing fresh shared dependency cache URLs failed (using those signed %s ago): %v", ui.Dur(time.Since(signed)), err)
+				case get != "":
 					req.CacheGet, req.CachePut = get, put
 				}
 			}
@@ -1582,7 +1837,7 @@ func setupFailure(p *config.Project, o Options, r protocol.Result) (int, string)
 }
 
 // pumpExec streams output until the result arrives, forwarding interrupts.
-func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot, afterSetup, onStarted func()) (protocol.Result, error) {
+func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot, afterSetup, onStarted func(), onRunWait func(waiting bool, msg string)) (protocol.Result, error) {
 	var res protocol.Result
 	type fr struct {
 		f   protocol.Frame
@@ -1651,6 +1906,9 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot,
 				o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
 				if ev.Name == "setup_done" && afterSetup != nil {
 					afterSetup()
+				}
+				if (ev.Name == "run_wait" || ev.Name == "run_slot") && onRunWait != nil {
+					onRunWait(ev.Name == "run_wait", ev.Message)
 				}
 				if ev.Name == "spot_interruption" {
 					o.Rep.Warn("SPOT_INTERRUPTION", "%s; warming a replacement", ev.Message)
@@ -2065,26 +2323,7 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 			return "", "", err
 		}
 		req.Dockerfile, req.Context, req.Tag = c.Dockerfile, c.Context, tag
-		if reg, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.ImageRegistry); ok {
-			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			auth, err := reg.RegistryFor(cctx, ws.RepoID)
-			cancel()
-			if err != nil {
-				o.Rep.Warn("IMAGE_REGISTRY", "image registry unavailable (building on this runner only): %v", err)
-			} else {
-				req.Registry = auth
-			}
-		}
-		// A multi-region runner copies an image another region holds
-		// rather than building it again (#192).
-		if src, ok := lease.Provider.(provider.ImageSource); ok && req.Registry != nil {
-			inst, repoID := lease.InstanceID, ws.RepoID
-			locate = func(ctx context.Context) (*protocol.RegistryAuth, error) {
-				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				defer cancel()
-				return src.ImageSource(cctx, inst, repoID, tag)
-			}
-		}
+		req.Registry, locate = imageRegistries(ctx, o, lease.Provider, lease.InstanceID, ws.RepoID, tag)
 	}
 	o.Rep.Status("%s · preparing container image", label)
 	t := time.Now()
@@ -2108,6 +2347,42 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 	return r.Image, r.ImageID, nil
 }
 
+// registryTimeout bounds each lookup of an image registry.
+var registryTimeout = 30 * time.Second
+
+// imageRegistries returns the registry of the instance's region for the
+// project's images (nil when the provider has none or it can't be had,
+// which only warns) and, for a runner in several regions, a lookup of the
+// others for tag, to copy it from one holding it rather than build it again
+// (#192). That lookup is offered even without the region's own registry: a
+// VM whose region can't be reached still copies the image (#218).
+func imageRegistries(ctx context.Context, o Options, p provider.Provider, instanceID, repoID, tag string) (*protocol.RegistryAuth, func(context.Context) (*protocol.RegistryAuth, error)) {
+	var locate func(context.Context) (*protocol.RegistryAuth, error)
+	if src, ok := p.(provider.ImageSource); ok {
+		locate = func(ctx context.Context) (*protocol.RegistryAuth, error) {
+			cctx, cancel := context.WithTimeout(ctx, registryTimeout)
+			defer cancel()
+			return src.ImageSource(cctx, instanceID, repoID, tag)
+		}
+	}
+	reg, ok := provider.ForInstance(ctx, p, instanceID).(provider.ImageRegistry)
+	if !ok {
+		return nil, locate
+	}
+	cctx, cancel := context.WithTimeout(ctx, registryTimeout)
+	auth, err := reg.RegistryFor(cctx, repoID)
+	cancel()
+	if err != nil {
+		then := "building on this runner only"
+		if locate != nil {
+			then = "copying the image from another of the runner's regions, else building it on this runner"
+		}
+		o.Rep.Warn("IMAGE_REGISTRY", "image registry unavailable (%s): %v", then, err)
+		return nil, locate
+	}
+	return auth, locate
+}
+
 // fetchImage sends the image request. With a registry, which may lack this
 // image, of the runs on this machine needing it now one builds and pushes
 // it, and the rest wait for it and pull it (#139), as fetchDeps does. A
@@ -2117,7 +2392,9 @@ func prepareImage(ctx context.Context, s *transport.Session, p *config.Project, 
 // log keeps the build's output. locate (nil: none) finds the image in
 // another region of the runner when its own registry lacks it, to copy from
 // there instead (#192): runs that landed in different regions then share
-// one build too.
+// one build too. Without a registry of its own (it couldn't be had), the
+// run still copies the image from another region before building it
+// (#218), but shares nothing with other runs.
 func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Writer, log *depsLog, memo imageMemo, req protocol.Image, locate func(context.Context) (*protocol.RegistryAuth, error), limit time.Duration) (r protocol.ImageResult, shared shareOutcome, push *protocol.ShareDone, err error) {
 	building := false // the helper said it is building: its output goes to log too
 	pushing := false  // the helper is pushing the image: it has it
@@ -2227,6 +2504,42 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 	}()
 	probe := req
 	probe.Probe = true
+	// find looks for another region holding the image, for the requests
+	// that follow to copy it from. A failed lookup only warns: the image is
+	// then built here, as before.
+	find := func(ctx context.Context) {
+		src, err := locate(ctx)
+		if err != nil {
+			o.Rep.Warn("IMAGE_REGISTRY", "could not look for the image in the runner's other regions (building it here if needed): %v", err)
+			return
+		}
+		if src != nil {
+			probe.Source, req.Source = src, src
+		}
+	}
+	if req.Registry == nil && req.Tag != "" && locate != nil {
+		// The region's registry couldn't be had (#218): the image may be on
+		// the runner already, or be copied from another region. Neither
+		// builds it, so a remembered failure rules out only the build.
+		got, err := ask(probe)
+		installed := got.InstalledDocker
+		if err == nil && got.Missing {
+			if find(ctx); probe.Source != nil {
+				got, err = ask(probe)
+				installed = installed || got.InstalledDocker
+			}
+		}
+		if err != nil || !got.Missing {
+			got.InstalledDocker = got.InstalledDocker || installed
+			return got, shared, nil, err
+		}
+		if failed := recall(); failed != nil {
+			return protocol.ImageResult{InstalledDocker: installed}, shared, nil, failed
+		}
+		r, err = ask(req)
+		r.InstalledDocker = r.InstalledDocker || installed
+		return r, shared, nil, built(err)
+	}
 	if req.Registry == nil || req.Tag == "" {
 		if failed := recall(); failed != nil {
 			// The runner may have the image already: only building it is
@@ -2241,19 +2554,6 @@ func fetchImage(ctx context.Context, c rpc, o Options, label string, errW io.Wri
 	}
 	holder := ""
 	installed := false // a probe installed Docker
-	// find looks for another region holding the image, for the requests
-	// that follow to copy it from. A failed lookup only warns: the image is
-	// then built here, as before.
-	find := func(ctx context.Context) {
-		src, err := locate(ctx)
-		if err != nil {
-			o.Rep.Warn("IMAGE_REGISTRY", "could not look for the image in the runner's other regions (building it here if needed): %v", err)
-			return
-		}
-		if src != nil {
-			probe.Source, req.Source = src, src
-		}
-	}
 	sh := sharer{
 		lock:  shareLockFor("image", imageLockID(req.Registry, req.Tag, locate != nil)),
 		who:   shareWho(o, label),

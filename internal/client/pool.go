@@ -20,6 +20,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/config"
 	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // Pool is the local view of one autoscaled fleet runner, shared by every sx
@@ -52,6 +53,10 @@ type note struct {
 	Ready        bool      `json:"ready,omitempty"`
 	ReadyAt      time.Time `json:"ready_at,omitempty"`
 	SawFull      bool      `json:"saw_full,omitempty"` // observed with every slot taken
+	// BootSeenAt: when a probe last found its helper still running
+	// first-boot setup, so its first ready probe times its launch. (Not a
+	// failure to answer: a VM that was ready unobserved can fail one too.)
+	BootSeenAt   time.Time `json:"boot_seen_at,omitempty"`
 	BootFailed   bool      `json:"boot_failed,omitempty"`
 	BootFailedAt time.Time `json:"boot_failed_at,omitempty"`
 	// Why the instance no longer satisfies the runner's requirements (""
@@ -62,6 +67,17 @@ type note struct {
 	// never placed on again, and not capacity, though the VM itself may
 	// not have agreed to drain yet.
 	Retiring bool `json:"retiring,omitempty"`
+	// Reached: when the VM last answered this client (any reply, even
+	// booting, draining or an error). Ready says it once served. Silent:
+	// when a probe last got no answer at all.
+	Reached time.Time `json:"reached,omitempty"`
+	Silent  time.Time `json:"silent,omitempty"`
+	// Reaping: when a process began ending the VM to make room (reach.go):
+	// no new runs go there meanwhile.
+	Reaping time.Time `json:"reaping,omitempty"`
+	// ReapCommitted: its termination request is going out: no claim at
+	// all, an exact slot's included, reserves it now.
+	ReapCommitted bool `json:"reap_committed,omitempty"`
 }
 
 // closed reports whether an instance takes no new runs and isn't capacity:
@@ -97,6 +113,9 @@ type poolState struct {
 	// The requirements (provider.MatchKey) the notes' Mismatch reasons
 	// were judged against.
 	MatchKey string `json:"match_key,omitempty"`
+	// Held: regions this client found it can't reach, and when it last
+	// asked the fleet to hold launches out of them (reach.go).
+	Held map[string]time.Time `json:"held,omitempty"`
 	// Sched: the reservation ledger and placement policy (sched.go). Kept
 	// in its own file, sched.json, under the same lock: a binary from
 	// before it would otherwise drop it whenever it rewrote pool.json.
@@ -233,6 +252,28 @@ const readyGrace = 20 * time.Second
 func (n *note) markReady(now time.Time) {
 	if !n.Ready {
 		n.Ready, n.ReadyAt = true, now
+	}
+}
+
+// markReady records instance id as serving, and times its launch when it
+// was watched booting until now (leadGap), so the time isn't inflated by
+// a stretch nobody probed it.
+func (st *poolState) markReady(id string, now time.Time) {
+	n := st.note(id)
+	if !n.Ready && !n.BootSeenAt.IsZero() && now.Sub(n.BootSeenAt) <= leadGap {
+		st.timeLaunch(id, now)
+	}
+	n.markReady(now)
+}
+
+// timeLaunch records how long instance id's launch took to serve, from
+// its launch record.
+func (st *poolState) timeLaunch(id string, now time.Time) {
+	for _, l := range st.Launches {
+		if l.InstanceID == id && !l.Failed && !l.Started.IsZero() {
+			st.sched().observeLaunch(id, now.Sub(l.Started), now)
+			return
+		}
 	}
 }
 
@@ -433,13 +474,13 @@ func (p *Pool) Candidates(ctx context.Context, exclude map[string]bool) (out []p
 		now := time.Now()
 		for _, in := range st.Instances {
 			n := st.Notes[in.ID]
-			if in.State != provider.StateRunning || in.Target.Host == "" || exclude[in.ID] {
+			if in.State != provider.StateRunning || in.Target.Host == "" || excluded(exclude, in) {
 				continue
 			}
 			if !n.closed() {
 				usable++
 			}
-			if n != nil && (n.closed() || now.Before(n.SuspectUntil) || now.Before(n.BusyUntil)) {
+			if n != nil && (n.closed() || n.reaping(now) || now.Before(n.SuspectUntil) || now.Before(n.BusyUntil)) {
 				continue
 			}
 			out = append(out, in)
@@ -468,9 +509,20 @@ const (
 	// outSkipped: not contacted, the ledger shows no room (or the policy no
 	// longer places work there).
 	outSkipped
+	// outRefused: the helper answered with an error this side doesn't
+	// recognize: judged like OutUnreachable, but it is an answer.
+	outRefused
+	// outDrainReply: the VM answered that it is draining (OutDraining is
+	// also recorded with no contact at all, after a termination).
+	outDrainReply
+	// outContact: the VM answered, and nothing else is recorded (an
+	// exclusive probe finding it partly busy; `spotexec status`).
+	outContact
 )
 
-// Observe records a probe result.
+// Observe records a probe result, and holds launches out of the VM's
+// region when it shows the client can't reach the region (or ends that
+// hold when the VM answered).
 func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 	if o == outSkipped {
 		return
@@ -480,22 +532,39 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 		now := time.Now()
 		switch o {
 		case OutAcquired:
-			n.markReady(now)
-			n.LastUsed, n.SuspectUntil, n.Failures = now, time.Time{}, 0
+			st.markReady(id, now)
+			// It just took a job: a busy hint from before (one an overflow
+			// request then got past) no longer holds.
+			n.LastUsed, n.SuspectUntil, n.Failures, n.Reached, n.BusyUntil = now, time.Time{}, 0, now, time.Time{}
 		case OutBusy:
-			n.markReady(now)
+			st.markReady(id, now)
 			n.SawFull = true
-			n.BusyUntil, n.SuspectUntil, n.Failures = now.Add(busyHintFor), time.Time{}, 0
+			n.BusyUntil, n.SuspectUntil, n.Failures, n.Reached = now.Add(busyHintFor), time.Time{}, 0, now
 		case OutDraining:
 			n.Draining = true
+		case outDrainReply:
+			n.Draining = true
+			n.Failures, n.Reached = 0, now
+		case outContact:
+			n.SuspectUntil, n.Failures, n.Reached = time.Time{}, 0, now
 		case OutBootFailed:
 			n.Draining, n.BootFailed = true, true
+			n.Failures, n.Reached = 0, now
 			if n.BootFailedAt.IsZero() {
 				n.BootFailedAt = now
 			}
 		case OutBooting:
 			n.BusyUntil = now.Add(2 * time.Second)
-		case OutUnreachable:
+			n.Failures, n.Reached = 0, now
+			if !n.Ready {
+				n.BootSeenAt = now
+			}
+		case OutUnreachable, outRefused:
+			if o == OutUnreachable {
+				n.Silent = now
+			} else {
+				n.Reached = now
+			}
 			// A young instance is probably still booting sshd; an older one is
 			// suspect (but still counts toward capacity: unreachable is not
 			// absent).
@@ -506,6 +575,9 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 				n.SuspectUntil = now.Add(suspectFor)
 			}
 		}
+		// The fleet's hold is set under this lock too, so a reply and a
+		// failure observed at once can't leave it out of step with Held.
+		p.applyReach(p.judgeRegion(st, id, o, now))
 		return nil
 	})
 }
@@ -523,19 +595,38 @@ type LaunchDecision struct {
 	// every Spot price) blocks launches: the fleet can only serve from the
 	// VMs it already has.
 	QuotaErr string
+	// Reap: VMs to terminate before a launch can make room under
+	// max_instances: they are in a region this client can't reach.
+	Reap []string
+	// Held is set when slots on running VMs are expected to free sooner
+	// than a launch would serve (Reason says so): Deferred slots of demand
+	// wait for them, FreeIn after which the last of them frees.
+	Held     bool
+	Deferred int
+	FreeIn   time.Duration
+	// Lead is how long a launch is expected to take to serve (LeadLearned:
+	// from timed launches, not the default), and Waited how long this
+	// process has waited: past Lead, demand is sustained and launches.
+	Lead        time.Duration
+	LeadLearned bool
+	Waited      time.Duration
 }
 
 // Plan decides, under the pool lock, whether this process should launch one
 // more instance: only if waiting demand (minus `covered`, the capacity that
-// higher-priority fleets are already launching) exceeds the capacity this
-// fleet is launching, and the fleet is below max_instances (when it has one).
+// higher-priority fleets are already launching or waiting for) exceeds the
+// capacity this fleet is launching, the fleet is below max_instances (when
+// it has one), and slots on its running VMs aren't expected to free sooner
+// than a new VM would serve (a short burst waits for them; demand still
+// waiting after a launch's lead launches).
 func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
 			return err
 		}
-		d.Demand = p.waiterDemand() - covered
+		demand, wholeVM := p.waiters()
+		d.Demand = demand - covered
 		listed := map[string]bool{}
 		usable, total := 0, 0
 		for _, in := range st.Instances {
@@ -547,6 +638,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		}
 		slots := p.SlotsPerInstance()
 		inLedger := map[string]bool{}
+		pendingVM := map[string]bool{} // instances whose slots count as pending
 		for _, l := range st.Launches {
 			if l.Failed {
 				continue
@@ -558,11 +650,17 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 					// not capacity a waiting agent can count on.
 					continue
 				}
+				if listed[l.InstanceID] && p.lostVM(st, l.InstanceID, time.Now()) {
+					// Never reached, in a region this client can't reach: it
+					// won't serve, so another launch (elsewhere) may.
+					continue
+				}
 			}
 			if l.InstanceID == "" || !listed[l.InstanceID] {
 				usable++
 				total++
 			}
+			pendingVM[l.InstanceID] = true
 			d.Pending++
 			d.Capacity += slots
 		}
@@ -576,11 +674,17 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 				continue
 			}
 			if time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
+				pendingVM[in.ID] = true
 				d.Pending++
 				d.Capacity += slots
 			}
 		}
 		d.Live = usable
+		now := time.Now()
+		d.Lead, d.LeadLearned = st.sched().launchLead(now)
+		if !p.since.IsZero() {
+			d.Waited = now.Sub(p.since)
+		}
 		d.QuotaErr = st.quotaBlocked(p.since)
 		bootFailed := ""
 		for id, n := range st.Notes {
@@ -598,12 +702,22 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = "waiting for instances being launched"
 		case !p.R.BelowMax(usable):
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
+			if id, region := p.reapable(st, time.Now()); id != "" {
+				d.Reap = []string{id}
+				n := st.note(id)
+				n.Reaping, n.ReapCommitted = time.Now(), false
+				d.Reason += fmt.Sprintf("; ending %s, in %s, which this client can't reach, to make room", id, region)
+			}
 		case p.R.Capped() && total >= 2*p.R.MaxInstances:
 			d.Reason = liveCapReason(st, p.R.MaxInstances)
 		case d.QuotaErr != "":
 			d.Reason = blockedReason(st.QuotaPrice)
 		case time.Now().Before(st.BackoffUntil):
 			d.Reason = "backing off after a failed launch: " + st.LastLaunchErr
+		case p.releaseSoon(st, &d, wholeVM, pendingVM, now):
+			d.Held, d.Deferred = true, d.Demand-d.Capacity
+			d.Reason = fmt.Sprintf("%s on running VMs expected to free within %s, sooner than a new VM (~%s)",
+				plural(d.Deferred, "slot"), ui.Dur(d.FreeIn), ui.Dur(d.Lead))
 		default:
 			var b [6]byte
 			_, _ = rand.Read(b[:])
@@ -747,7 +861,9 @@ func (p *Pool) Cancel(id string) {
 // Reset forgets all local pool state (after `spotexec down`).
 func (p *Pool) Reset() {
 	_ = p.with(func(st *poolState) error {
-		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}}
+		// Held stays: the fleet's region holds outlive a teardown, and an
+		// answer from the region must still end them.
+		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}, Held: st.Held}
 		return nil
 	})
 }
@@ -801,6 +917,13 @@ func (p *Pool) ProvisionHeld(ctx context.Context, id string, log provider.Logger
 // ProvisionHeldThen is ProvisionHeld, calling launched (if set) as soon as
 // the launch request succeeds, before waiting for the VM to run.
 func (p *Pool) ProvisionHeldThen(ctx context.Context, id string, log provider.Logger, launched func(provider.Instance)) (provider.Instance, error) {
+	return p.provisionHeld(ctx, id, log, launched, nil)
+}
+
+// provisionHeld is ProvisionHeldThen, also calling failed (if set) when the
+// launch request fails. Both callbacks run before the launch's hold ends,
+// so a process exiting (WaitLaunches) still hears how its launch went.
+func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger, launched func(provider.Instance), failed func(error)) (provider.Instance, error) {
 	recorded := false
 	defer func() {
 		if !recorded {
@@ -838,6 +961,9 @@ func (p *Pool) ProvisionHeldThen(ctx context.Context, id string, log provider.Lo
 			st.ListedAt = staleListing(st.ListedAt)
 			return nil
 		})
+		if failed != nil {
+			failed(err)
+		}
 		return in, err
 	}
 	_ = p.with(func(st *poolState) error {
@@ -913,26 +1039,46 @@ type Waiter struct {
 
 // Register adds a waiter with weight (1, or a whole instance for --exclusive).
 func (p *Pool) Register(weight int) (*Waiter, error) {
+	return p.registerAs(weight, false)
+}
+
+// RegisterExclusive adds a waiter for a whole VM (--exclusive), weighing
+// one instance: freeing slots don't serve it, so Plan never holds a launch
+// for them while it waits (even when its weight, the planning slot count,
+// is 1 on a fleet of mixed sizes).
+func (p *Pool) RegisterExclusive(weight int) (*Waiter, error) {
+	return p.registerAs(weight, true)
+}
+
+func (p *Pool) registerAs(weight int, exclusive bool) (*Waiter, error) {
 	var w *Waiter
 	err := p.with(func(*poolState) error {
 		var err error
-		w, err = p.register(weight)
+		w, err = p.register(weight, exclusive)
 		return err
 	})
 	return w, err
 }
 
+// exclusiveWaiter marks a whole-VM waiter's file name (older versions
+// count it by its weight alone).
+const exclusiveWaiter = ".x.w"
+
 // register must run under pool.lock: waiterDemand (also under the lock)
 // unlinks unlocked waiter files, so creation and locking must be atomic
 // with respect to it.
-func (p *Pool) register(weight int) (*Waiter, error) {
+func (p *Pool) register(weight int, exclusive bool) (*Waiter, error) {
 	dir := filepath.Join(p.dir, "waiters")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	var b [4]byte
 	_, _ = rand.Read(b[:])
-	path := filepath.Join(dir, fmt.Sprintf("%d-%s.w", os.Getpid(), hex.EncodeToString(b[:])))
+	ext := ".w"
+	if exclusive {
+		ext = exclusiveWaiter
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d-%s%s", os.Getpid(), hex.EncodeToString(b[:]), ext))
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -964,10 +1110,85 @@ func (w *Waiter) Done() {
 	w.f = nil
 }
 
+// releaseSoon reports whether the demand this fleet isn't launching for
+// (d.Demand - d.Capacity) can wait for slots on its running VMs, setting
+// d.FreeIn: only while this process has waited less than a launch's lead
+// (past it, demand is sustained), and only for slots that jobs predicted
+// to end within the lead hold now. A job whose end is unknown, or already
+// overdue, frees nothing here: the prediction has no say then. A
+// whole-VM (exclusive) waiter needs a VM to empty, which freeing slots
+// don't show, so it never waits here. Jobs a VM's helper admitted
+// beyond its slots (overflow, preparing beside them) take the first slots
+// that free there: those releases free nothing for this demand.
+func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendingVM map[string]bool, now time.Time) bool {
+	need := d.Demand - d.Capacity
+	if need <= 0 || wholeVM || p.since.IsZero() || d.Waited >= d.Lead {
+		return false
+	}
+	s := st.sched()
+	queued := map[string]int{} // eligible VMs: units held beyond their slots
+	for _, in := range st.Instances {
+		n := st.Notes[in.ID]
+		if n == nil || !n.Ready || n.closed() || now.Before(n.SuspectUntil) || pendingVM[in.ID] || s.Fences[in.ID] != nil {
+			continue
+		}
+		firm, _ := s.held(p.R, in.ID)
+		queued[in.ID] = max(firm-s.units(p.R, in.ID), 0)
+	}
+	type release struct {
+		at    time.Time
+		units int
+	}
+	byVM := map[string][]release{}
+	for _, a := range s.Attempts {
+		if _, ok := queued[a.VM]; !ok || a.State != attAcquired || !a.Expect.After(now) || !a.Expect.Before(now.Add(d.Lead)) {
+			continue
+		}
+		byVM[a.VM] = append(byVM[a.VM], release{a.Expect, max(a.Units, 1)})
+	}
+	var rs []release
+	for vm, vrs := range byVM {
+		sort.Slice(vrs, func(i, j int) bool { return vrs[i].at.Before(vrs[j].at) })
+		skip := queued[vm]
+		for _, r := range vrs {
+			if skip > 0 {
+				taken := min(skip, r.units)
+				skip -= taken
+				if r.units -= taken; r.units == 0 {
+					continue
+				}
+			}
+			rs = append(rs, r)
+		}
+	}
+	sort.Slice(rs, func(i, j int) bool { return rs[i].at.Before(rs[j].at) })
+	freed := 0
+	for _, r := range rs {
+		if freed += r.units; freed >= need {
+			d.FreeIn = r.at.Sub(now)
+			return true
+		}
+	}
+	return false
+}
+
+func plural(n int, what string) string {
+	if n == 1 {
+		return "1 " + what
+	}
+	return fmt.Sprintf("%d %ss", n, what)
+}
+
 func (p *Pool) waiterDemand() int {
+	total, _ := p.waiters()
+	return total
+}
+
+// waiters is the waiting demand in slots, and whether any waiter needs a
+// whole VM (an exclusive job on a fleet of several-slot VMs).
+func (p *Pool) waiters() (total int, wholeVM bool) {
 	dir := filepath.Join(p.dir, "waiters")
 	ents, _ := os.ReadDir(dir)
-	total := 0
 	for _, e := range ents {
 		path := filepath.Join(dir, e.Name())
 		f, err := os.OpenFile(path, os.O_RDWR, 0)
@@ -993,8 +1214,9 @@ func (p *Pool) waiterDemand() int {
 			w = 1
 		}
 		total += w
+		wholeVM = wholeVM || w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter)
 	}
-	return total
+	return total, wholeVM
 }
 
 // Snapshot returns the cached state (for status displays).

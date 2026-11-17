@@ -83,9 +83,17 @@ type runnerStatus struct {
 	// and why.
 	Role       string `json:"role,omitempty"`
 	RoleReason string `json:"role_reason,omitempty"`
-	r          *config.Runner
+	// LaunchHolds: the regions a fleet launches nothing into for now, and
+	// why (on the fleet's first row).
+	LaunchHolds map[string]provider.RegionHold `json:"launch_holds,omitempty"`
+	r           *config.Runner
+	// unlisted marks a row standing for a region whose instances
+	// couldn't be listed.
+	unlisted bool
 	// reclaimed records a Spot interruption notice the VM reports.
 	reclaimed func()
+	// answered: this status request reached the VM over SSH.
+	answered bool
 }
 
 const (
@@ -203,22 +211,78 @@ func fleetMismatches(ctx context.Context, f provider.Fleet, insts []provider.Ins
 	return m.Mismatches(ctx, insts)
 }
 
+// listFleet lists a fleet's instances for showing them: a fleet spread
+// over regions lists the ones it reaches and names the others, so one
+// region's stalled API doesn't hide the rest.
+func listFleet(ctx context.Context, f provider.Fleet) ([]provider.Instance, map[string]error, error) {
+	if rl, ok := f.(provider.RegionLister); ok {
+		return rl.ListReachable(ctx)
+	}
+	insts, err := f.List(ctx)
+	return insts, nil, err
+}
+
+// unlistedRows are one unknown row per region a fleet couldn't list, in
+// region order. They carry the fleet's name, so its launch holds still
+// show when no instance was listed.
+func unlistedRows(r *config.Runner, unlisted map[string]error) []runnerStatus {
+	regions := make([]string, 0, len(unlisted))
+	for rg := range unlisted {
+		regions = append(regions, rg)
+	}
+	sort.Strings(regions)
+	var rows []runnerStatus
+	for _, rg := range regions {
+		rows = append(rows, runnerStatus{Name: r.Name + "/" + rg, Type: r.Type, r: r, Fleet: r.Name, unlisted: true,
+			Error: fmt.Sprintf("couldn't list %s: %v", rg, unlisted[rg]),
+			Info:  provider.Info{State: provider.StateUnknown, Region: rg, Detail: "instances not listed"}})
+	}
+	return rows
+}
+
+// rolesTimeout bounds the wait for the pool's lock when status reads VM
+// roles: the pool manager holds it while its own listing runs.
+var rolesTimeout = 5 * time.Second
+
+// fleetRoles are a consolidating fleet's VM roles (none for other
+// policies, whose roles are hypothetical, or when the pool is busy).
+func fleetRoles(ctx context.Context, r *config.Runner, pool *client.Pool) map[string]client.Role {
+	if r.SchedPolicy() != config.PolicyConsolidate {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, rolesTimeout)
+	defer cancel()
+	return pool.Roles(ctx)
+}
+
+// newProvider builds a runner's provider for status (tests replace it).
+var newProvider = provider.New
+
 func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []runnerStatus {
 	var rows []runnerStatus
 	var fleets []fleetInstances
+	// Fleets that keep region holds: their pool, and their first row.
+	type holder struct {
+		rh    provider.RegionHolder
+		pool  *client.Pool
+		first int
+	}
+	var holders []holder
 	for _, r := range rs {
-		p, err := provider.New(r)
+		p, err := newProvider(r)
 		if err != nil {
 			rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, Error: err.Error(), r: r})
 			continue
 		}
 		if f, ok := p.(provider.Fleet); ok {
-			insts, err := f.List(ctx)
+			insts, unlisted, err := listFleet(ctx, f)
 			if err != nil {
 				rows = append(rows, runnerStatus{Name: r.Name, Type: r.Type, Error: err.Error(), r: r, Info: provider.Info{State: provider.StateUnknown}})
 				continue
 			}
-			if len(insts) == 0 {
+			first := len(rows)
+			rows = append(rows, unlistedRows(r, unlisted)...)
+			if len(insts) == 0 && len(unlisted) == 0 {
 				detail := "0 instances; scales on demand"
 				if r.Capped() {
 					detail = fmt.Sprintf("0 of max %d instances; scales on demand", r.MaxInstances)
@@ -228,18 +292,22 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 			}
 			fleets = append(fleets, fleetInstances{r, insts})
 			mismatch := fleetMismatches(ctx, f, insts)
-			roles := client.NewPool(r, f).Roles()
+			pool := client.NewPool(r, f)
+			roles := fleetRoles(ctx, r, pool)
 			for _, in := range insts {
 				cost, from := fallbackCost(r)
 				st := runnerStatus{Name: r.Name + "/" + in.ID, Type: r.Type, Cost: cost, CostFrom: from, r: r, Fleet: r.Name, Mismatch: mismatch[in.ID],
 					Info: provider.Info{State: in.State, Target: in.Target, InstanceID: in.ID, InstanceType: in.Type, LaunchedAt: in.LaunchedAt, Spot: in.Spot, Region: in.Region}}
-				if r.SchedPolicy() == config.PolicyConsolidate { // shadow roles are hypothetical
-					st.Role, st.RoleReason = roles[in.ID].Role, roles[in.ID].Reason
+				if ro, ok := roles[in.ID]; ok {
+					st.Role, st.RoleReason = ro.Role, ro.Reason
 				}
 				if rc, ok := f.(provider.Reclaimer); ok {
 					st.reclaimed = func() { rc.Reclaimed(in) }
 				}
 				rows = append(rows, st)
+			}
+			if rh, ok := f.(provider.RegionHolder); ok && len(rows) > first {
+				holders = append(holders, holder{rh, pool, first})
 			}
 			continue
 		}
@@ -275,6 +343,10 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 				return
 			}
 			b, err := c.HelperCmd(cctx, "status")
+			// Reached it, even if its helper failed (an existing SSH master
+			// may answer for a connection that is gone: only the command
+			// says, and one cut short by the deadline says nothing).
+			st.answered = err == nil || (!transport.IsConnError(err) && cctx.Err() == nil)
 			if err != nil {
 				st.Error = err.Error()
 				return
@@ -293,6 +365,17 @@ func gatherStatus(ctx context.Context, rs []*config.Runner, fp *fleetPricer) []r
 		}()
 	}
 	wg.Wait()
+	// A VM that answered ends its region's hold; the holds left are shown.
+	for _, h := range holders {
+		for i := h.first; i < len(rows) && rows[i].Fleet == rows[h.first].Fleet; i++ {
+			if rows[i].answered {
+				h.pool.Reached(provider.Instance{ID: rows[i].Info.InstanceID, Region: rows[i].Info.Region})
+			}
+		}
+		if holds, _ := h.rh.RegionHolds(); len(holds) > 0 {
+			rows[h.first].LaunchHolds = holds
+		}
+	}
 	return rows
 }
 
@@ -313,11 +396,29 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		}
 		slots, load, mem, idle := "-", "-", "-", "-"
 		if h := s.Helper; h != nil {
-			n := s.r.MaxSlots
+			n := h.SlotCount // what the VM's running jobs agreed on
+			if n == 0 {
+				n = s.r.MaxSlots // idle: the next job's count, likely this one
+			}
 			if n == 0 {
 				n = min(max(h.CPUs/4, 1), protocol.MaxSlots)
 			}
-			slots = fmt.Sprintf("%d/%d", len(h.Holders), n)
+			// Jobs running commands fill the slots; the helper admits more
+			// to prepare (sync, image, dependencies) or write back meanwhile.
+			running := protocol.RunningJobs(h.Holders)
+			if exclusiveHeld(h.Holders) {
+				running = n // one job, the whole VM
+			}
+			slots = fmt.Sprintf("%d/%d", running, n)
+			more := 0
+			for _, x := range h.Holders {
+				if !x.Running() {
+					more++
+				}
+			}
+			if more > 0 {
+				slots += fmt.Sprintf(" (+%d)", more)
+			}
 			if h.CPUs > 0 && h.Load1 > 0 {
 				load = fmt.Sprintf("%.1f/%d", h.Load1, h.CPUs)
 			}
@@ -353,6 +454,14 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 	}
 	tw.Flush()
 	for _, s := range sts {
+		var held []string
+		for rg := range s.LaunchHolds {
+			held = append(held, rg)
+		}
+		sort.Strings(held)
+		for _, rg := range held {
+			fmt.Fprintf(w, "  %s: no launches into %s: %s\n", s.Fleet, rg, s.LaunchHolds[rg].Why)
+		}
 		if s.Error != "" {
 			fmt.Fprintf(w, "  %s: %s\n", s.Name, s.Error)
 		}
@@ -366,13 +475,33 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 		}
 		for _, h := range s.Helper.Holders {
 			age := time.Since(time.UnixMilli(h.StartedAt)).Round(time.Second)
-			fmt.Fprintf(w, "  %s slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Token, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
+			doing := ""
+			switch {
+			case !h.Running():
+				doing = " [preparing or writing back]"
+			case h.Phase == protocol.PhaseRunWait:
+				doing = " [waiting for a free slot to run]"
+			}
+			fmt.Fprintf(w, "  %s slot %d: %s%s  (%s, %s pid %d, %s)\n", s.Name, h.Token, h.Client.Command, doing, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
 		}
 		for _, h := range s.Helper.Waiters {
 			age := time.Since(time.UnixMilli(h.StartedAt)).Round(time.Second)
 			fmt.Fprintf(w, "  %s waiting for workspace slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Slot, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
 		}
 	}
+}
+
+// exclusiveHeld reports whether one run holds several tokens: an
+// exclusive run, which takes the whole VM.
+func exclusiveHeld(hs []protocol.Holder) bool {
+	seen := map[int]bool{}
+	for _, h := range hs {
+		if h.HelperPID != 0 && seen[h.HelperPID] {
+			return true
+		}
+		seen[h.HelperPID] = true
+	}
+	return false
 }
 
 func cmdStatus() *cobra.Command {
@@ -466,7 +595,12 @@ func cmdMonitor() *cobra.Command {
 func burnLine(sts []runnerStatus) string {
 	burn, unpriced := 0.0, 0
 	from := map[string]bool{}
+	var unlisted []string
 	for _, s := range sts {
+		if s.unlisted && s.r != nil && s.r.Ephemeral() {
+			unlisted = append(unlisted, s.Info.Region)
+			continue
+		}
 		if s.Info.State != provider.StateRunning || s.r == nil || !s.r.Ephemeral() {
 			continue
 		}
@@ -490,6 +624,9 @@ func burnLine(sts []runnerStatus) string {
 	line := fmt.Sprintf("estimated burn: $%.3f/hour (from %s)", burn, src)
 	if unpriced > 0 {
 		line += fmt.Sprintf(", not counting %d running VM(s) with no known price", unpriced)
+	}
+	if len(unlisted) > 0 {
+		line += ", not counting VMs in " + strings.Join(unlisted, ", ") + " (not listed)"
 	}
 	return line
 }

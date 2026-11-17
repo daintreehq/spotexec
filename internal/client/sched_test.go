@@ -307,3 +307,48 @@ func TestRefusalClassification(t *testing.T) {
 		t.Fatal("a connection error counted as a refusal")
 	}
 }
+
+// A helper that admits more jobs than it has slots (they prepare while
+// others run commands) lets this machine place that many on the VM as
+// overflow, once its slots are taken; the helper itself refuses work once
+// its slots run commands. An exclusive job still needs the VM empty.
+func TestLedgerAdmitsPreparingJobs(t *testing.T) {
+	p, f := schedPool(t, 1, 2)
+	in := f.insts[0]
+	id, err := p.reserveOn(in, claim{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.commitAttempt(id, protocol.Acquired{MaxSlots: 2, Admit: 4}, time.Time{})
+	if _, err := p.reserveOn(in, claim{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.reserveOn(in, claim{}); err != errNoRoom {
+		t.Fatalf("third reservation without overflow: %v, want errNoRoom", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := p.reserveOn(in, claim{Overflow: true}); err != nil {
+			t.Fatalf("overflow reservation %d of 2: %v", i+1, err)
+		}
+	}
+	if _, err := p.reserveOn(in, claim{Overflow: true}); err != errNoRoom {
+		t.Fatalf("fifth reservation: %v, want errNoRoom", err)
+	}
+	if _, err := p.reserveOn(in, claim{Exclusive: true}); err != errNoRoom {
+		t.Fatalf("exclusive on a busy VM: %v, want errNoRoom", err)
+	}
+
+	// An older helper (no Admit) admits only its slots.
+	p2, f2 := schedPool(t, 1, 2)
+	id, err = p2.reserveOn(f2.insts[0], claim{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2.commitAttempt(id, protocol.Acquired{MaxSlots: 2}, time.Time{})
+	if _, err := p2.reserveOn(f2.insts[0], claim{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p2.reserveOn(f2.insts[0], claim{Overflow: true}); err != errNoRoom {
+		t.Fatalf("third job on an older helper's two slots: %v, want errNoRoom", err)
+	}
+}

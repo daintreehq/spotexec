@@ -45,6 +45,16 @@ const (
 // 20000 + slot*1000, which must stay a valid port.
 const MaxSlots = 44
 
+// AdmitLimit is how many jobs a machine with slots slots admits at once:
+// twice its slots (at most MaxSlots), since a job holds a slot's command
+// capacity only while its [setup] run and command run. The rest of the
+// time (syncing, the image, the dependency install, the write-back) it
+// holds only its own token and workspace, so jobs preparing don't keep
+// others out.
+func AdmitLimit(slots int) int {
+	return max(min(2*slots, MaxSlots), slots)
+}
+
 // Error codes carried by ErrorMsg.Code.
 const (
 	CodeDraining     = "RUNNER_DRAINING"
@@ -63,6 +73,10 @@ const (
 	CodeImageBuildFailed = "IMAGE_BUILD_FAILED"
 	CodeShutdown         = "RUNNER_SHUTTING_DOWN" // the VM began shutting down under the request
 )
+
+// BootTailMark ends a BOOTSTRAP_FAILED message's own words: the last lines
+// of the bootstrap log follow it.
+const BootTailMark = "last lines of /var/log/spotexec-bootstrap.log:"
 
 // ErrorMsg is sent by the helper for any failed request.
 type ErrorMsg struct {
@@ -125,6 +139,12 @@ type Acquire struct {
 	// ReadOnly: nothing will run, only files are copied (pull), so a VM near
 	// its max_lifetime may still serve it.
 	ReadOnly bool `json:"read_only,omitempty"`
+	// Overflow: admit this job past MaxSlots jobs (up to AdmitLimit) while
+	// fewer than MaxSlots of them run commands: it prepares beside them and
+	// waits for a free slot to run its command. Without it a runner admits
+	// MaxSlots jobs, whatever they are doing. Clients ask for it once no
+	// runner has a free slot, before queueing or launching a VM.
+	Overflow bool `json:"overflow,omitempty"`
 }
 
 // LifetimeDrainAhead is how long before an ephemeral VM's max_lifetime it
@@ -143,6 +163,54 @@ type Holder struct {
 	StartedAt int64      `json:"started_at"` // unix ms
 	HelperPID int        `json:"helper_pid"`
 	ChildPGID int        `json:"child_pgid,omitempty"`
+	// Phased: a helper that takes command capacity separately (a run
+	// permit, Run) only while the job's [setup] run and command run. A
+	// holder without it (an older helper, an exclusive run, or a token
+	// whose record isn't written yet) takes command capacity for its
+	// whole lease.
+	Phased bool   `json:"phased,omitempty"`
+	Phase  string `json:"phase,omitempty"` // a phased job's PhaseRunWait or PhaseRun; "" otherwise
+	Run    int    `json:"run,omitempty"`   // the run permit a PhaseRun job holds, 1-based
+}
+
+// Phases of a phased holder (Holder.Phase): waiting for a run permit, and
+// running its [setup] run and command with one.
+const (
+	PhaseRunWait = "run_wait"
+	PhaseRun     = "run"
+)
+
+// Running reports whether h takes command capacity: it runs (or waits to
+// run) its command, or it holds its slot's capacity for its whole lease.
+func (h Holder) Running() bool { return !h.Phased || h.Phase != "" }
+
+// Overflowable reports whether a busy runner with slots slots and these
+// holders may admit an Overflow request: some of its jobs only prepare or
+// write back, and fewer than slots run (or wait to run) commands. A run
+// holding several tokens (exclusive) counts once.
+func Overflowable(holders []Holder, slots int) bool {
+	for _, h := range holders {
+		if !h.Running() {
+			return RunningJobs(holders) < slots
+		}
+	}
+	return false
+}
+
+// RunningJobs counts the jobs among holders taking command capacity; a
+// run holding several tokens (exclusive) counts once.
+func RunningJobs(holders []Holder) int {
+	runs := map[int]bool{}
+	for i, h := range holders {
+		if h.Running() {
+			id := h.HelperPID
+			if id == 0 {
+				id = -1 - i
+			}
+			runs[id] = true
+		}
+	}
+	return len(runs)
 }
 
 // Waiting is sent periodically while blocked on a full runner.
@@ -159,6 +227,9 @@ type Acquired struct {
 	PrevWorktreeKey  string `json:"prev_worktree_key"` // who last synced this slot
 	WaitedMS         int64  `json:"waited_ms"`
 	MaxSlots         int    `json:"max_slots"`
+	// Admit is how many jobs the runner admits at once (AdmitLimit of
+	// MaxSlots); 0 from a helper that admits only MaxSlots.
+	Admit int `json:"admit,omitempty"`
 	// Pending lists files earlier runs created in this slot that were never
 	// written back (nor found to be ignored): the next sync removes the ones
 	// the client doesn't ignore (Manifest.Remove).

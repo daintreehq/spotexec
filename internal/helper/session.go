@@ -55,6 +55,8 @@ type Session struct {
 	lifecycle *flock
 	tokens    []*flock
 	tokenIdx  int
+	run       *flock // the run permit, while the command runs (see takeRun)
+	runIdx    int
 	slotLock  *flock
 	slotDir   string
 	workspace string
@@ -327,6 +329,19 @@ func (s *Session) next() (protocol.Frame, error) {
 	}
 }
 
+// lastResortAfter is the client silence after which lastResort ends the
+// session.
+const lastResortAfter = ClientTimeout + 30*time.Second
+
+// OrphanLimit bounds how long a helper outlives the last word from its
+// client: by then lastResort has seen the silence (it polls every 5s), even
+// past the longest excuse a stall of the helper's own earns (stallCap), and
+// has begun tearing the session's processes and containers down before it
+// exits. A client that stopped talking to a runner this long ago can count
+// on the run it handed over having been torn down there (teardown itself
+// may still be finishing).
+const OrphanLimit = lastResortAfter + stallCap + 5*time.Second
+
 // lastResort exits the process if the client has been silent well past the
 // heartbeat timeout. Normal paths notice earlier; this covers a helper wedged
 // in a blocking write to a client that stopped reading (laptop asleep) so the
@@ -340,7 +355,7 @@ func (s *Session) lastResort(done <-chan struct{}) {
 			return
 		case <-t.C:
 		}
-		if s.silentFor(ClientTimeout + 30*time.Second) {
+		if s.silentFor(lastResortAfter) {
 			s.teardown()
 			os.Exit(4)
 		}
@@ -558,12 +573,17 @@ func (s *Session) releaseLocks(teardown bool) {
 		}
 	}
 	s.tokens = nil
+	// The idle clock starts when work ends: touched before the lifecycle
+	// lock goes, so the watchdog never sees the VM free with the clock
+	// still at the last heartbeat.
+	if held {
+		touchActivity(s.layout.Root)
+	}
+	s.run.Unlock()
+	s.run, s.runIdx = nil, 0
 	s.gate.Unlock()
 	s.slotLock.Unlock()
 	s.lifecycle.Unlock()
-	if held {
-		touchActivity(s.layout.Root) // the idle clock starts when work ends
-	}
 }
 
 func (s *Session) tokenIdxAt(i int) int {

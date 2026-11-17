@@ -82,7 +82,7 @@ remote_path_setup = 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `type` | (required) | `ssh` or `aws-spot` (`sim` is the local simulator; see [Development](development.md)). |
-| `max_slots` | vCPUs ÷ 4, between 1 and 44 | Concurrent jobs per machine (1–44: each slot gets its own range of 1000 ports). |
+| `max_slots` | vCPUs ÷ 4, between 1 and 44 | Commands running at once per machine (1–44). A machine may hold up to twice as many jobs (at most 44), the others syncing, preparing their image and dependencies, or writing back while those commands run; a job that is ready waits there for a free slot. Each job gets its own range of 1000 ports. A machine running jobs from configs that disagree uses the count of the first job that found it idle until it is idle again ([CPUs](environments.md)). |
 | `priority` | `0` | Lower runs first. Later runners in the pool only take overflow. |
 | `work_root` | `~/.cache/spotexec` | Where slots, caches and the helper live on the runner. |
 | `remote_path_setup` | (none) | Shell run before each command, after the login profile (for example `PATH` for mise or nvm). Not used inside a [project container](environments.md#project-containers). |
@@ -120,8 +120,8 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `scheduling.policy` | `consolidate` | How jobs are placed on running VMs. `consolidate`: inside a retained set sized to the last minute's demand; surplus VMs go standby and idle out. `shadow`: as `legacy`, reporting what `consolidate` would do (`placement_shadow` events). `legacy`: the oldest VM with a free slot, or the worktree's last VM within 10 minutes. See [Placement](POOL.md#placement-the-retained-set). |
 | `scheduling.mode` | `balanced` | `latency` lets a worktree return to its own standby VM before a retained VM without its files: fewer cold syncs, more VMs kept. |
 | `scheduling.spare_slots` | `0` | Slots kept retained on top of recent demand, for bursts. |
-| `scheduling.early_drain` | `false` | Let the pool manager shut a standby VM down once it is idle and `result_retention` has passed, instead of at `idle_timeout`. See [Early drain](POOL.md#early-drain). |
-| `scheduling.result_retention` | `idle_timeout` | With `early_drain`: how long after its last job a VM stays up so `exec`, `pull` and `--same-slot` can still reach its workspaces. |
+| `scheduling.early_drain` | `true` | End a standby (surplus) VM once it has been idle for `result_retention`, instead of at `idle_timeout`; retained VMs keep `idle_timeout`. Needs no pool manager. The cost: `exec`, `pull` and `--same-slot` lose a drained VM's workspaces once it ends, and if demand comes back while the retained VMs are full, a new VM boots rather than the drained one taking work again. `false` keeps surplus VMs until `idle_timeout`. See [Early drain](POOL.md#early-drain). |
+| `scheduling.result_retention` | `2m` | With `early_drain`: how long after its last job a standby VM stays up so `exec`, `pull` and `--same-slot` can still reach its workspaces. Never longer than `idle_timeout`. |
 | `idle_timeout` | `10m` | The VM powers off after this long with no work, and bills until then. |
 | `max_lifetime` | `12h` | Hard cap, regardless of activity. Must exceed `boot_timeout`. New runs stop going to a VM 15 minutes before it (a quarter of a shorter lifetime). |
 | `boot_timeout` | `15m` | Longest wait for first-boot setup; a VM that takes longer is terminated. |

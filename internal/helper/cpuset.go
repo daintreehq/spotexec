@@ -229,7 +229,16 @@ func (s *Session) cpusetArgs(run *protocol.ContainerRun, d dockerRunner) []strin
 		return nil // skip reading the host: nothing would be pinned
 	}
 	h := readCPUHost(d.info)
-	set, note := planCPUSet(h, s.tokenIdxAt(0), s.maxSlots, exclusive, run.Options)
+	// A command's CPUs follow its run permit: at most max_slots run at
+	// once, while tokens go up to twice that. Anything else (a dependency
+	// install) goes by its token.
+	s.relMu.Lock()
+	idx := s.runIdx
+	s.relMu.Unlock()
+	if idx == 0 {
+		idx = s.tokenIdxAt(0)
+	}
+	set, note := planCPUSet(h, idx, s.maxSlots, exclusive, run.Options)
 	if set != "" {
 		return []string{"--cpuset-cpus", set}
 	}

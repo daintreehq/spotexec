@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/helper"
 	"github.com/daintreehq/spotexec/internal/provider"
 )
 
@@ -32,6 +33,7 @@ type vmView struct {
 	in       provider.Instance
 	v        *vmSched
 	units    int
+	admits   int  // ordinary jobs it may hold at once (schedState.admits)
 	firm     int  // slots taken by live attempts
 	unc      int  // slots taken by uncertain attempts
 	eligible bool // running, reachable, matching, not draining
@@ -61,7 +63,7 @@ func (p *Pool) views(st *poolState, now time.Time) []vmView {
 		}
 		f, u := s.held(p.R, in.ID)
 		out = append(out, vmView{
-			in: in, v: v, units: s.units(p.R, in.ID), firm: f, unc: u,
+			in: in, v: v, units: s.units(p.R, in.ID), admits: s.admits(p.R, in.ID), firm: f, unc: u,
 			eligible: !n.closed() && (v.Role == roleRetained || v.Role == roleStandby) && (n == nil || !now.Before(n.SuspectUntil)),
 			ready:    n != nil && n.Ready,
 		})
@@ -315,10 +317,10 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			ready bool // this machine installed the helper there (no upload first)
 		}
 		var keep, latency []ranked
-		var standby []vmView
+		var standby, over []vmView
 		for _, w := range p.views(st, now) {
 			n := st.Notes[w.in.ID]
-			if exclude[w.in.ID] {
+			if excluded(exclude, w.in) {
 				continue
 			}
 			if !n.closed() && (w.v.Role == roleRetained || w.v.Role == roleStandby) {
@@ -337,6 +339,12 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 				// capacity stops counting as launch capacity in Plan).
 				if w.firm >= w.units && n != nil && n.Ready && !n.SawFull {
 					n.SawFull = true
+				}
+				// Its helper admits jobs to prepare beside those: tried
+				// once no VM has a free slot (the helper refuses it if
+				// they're running commands rather than preparing).
+				if !c.Exclusive && w.v.Role == roleRetained && w.firm+1 <= w.admits {
+					over = append(over, w)
 				}
 				continue
 			}
@@ -447,6 +455,12 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			cl.Promote = true
 			add(*w, cl, "retained VMs full: bringing back a standby VM")
 		}
+		sort.SliceStable(over, func(i, j int) bool { return over[i].firm < over[j].firm })
+		for _, w := range over {
+			cl := base
+			cl.Overflow = true
+			add(w, cl, "slots taken: preparing beside them until one is free")
+		}
 		return nil
 	})
 	return out, usable, window, err
@@ -485,7 +499,7 @@ func (p *Pool) Fence(ctx context.Context, exclude map[string]bool) string {
 		vs := p.views(st, now)
 		usable := map[string]bool{}
 		for _, w := range vs {
-			usable[w.in.ID] = w.eligible && w.v.Role == roleRetained && !exclude[w.in.ID]
+			usable[w.in.ID] = w.eligible && w.v.Role == roleRetained && !excluded(exclude, w.in)
 		}
 		for vm, f := range s.Fences {
 			if f.Owner != owner {
@@ -567,9 +581,9 @@ type Role struct {
 }
 
 // Roles reports every known VM's role without changing anything.
-func (p *Pool) Roles() map[string]Role {
+func (p *Pool) Roles(ctx context.Context) map[string]Role {
 	out := map[string]Role{}
-	_ = p.with(func(st *poolState) error {
+	_ = p.withCtx(ctx, func(st *poolState) error {
 		if st.Sched == nil {
 			return nil
 		}
@@ -594,7 +608,7 @@ const standbySettle = 30 * time.Second
 // it times out. A VM already drain_requested returns its operation, to be
 // retried. ok is false when it may not be drained now.
 func (p *Pool) BeginDrain(ctx context.Context, id string) (op string, ok bool, err error) {
-	if !p.R.Scheduling.EarlyDrain || p.R.SchedPolicy() != config.PolicyConsolidate || !p.R.Ephemeral() {
+	if !p.R.EarlyDrain() || p.R.SchedPolicy() != config.PolicyConsolidate || !p.R.Ephemeral() {
 		return "", false, nil
 	}
 	err = p.withCtx(ctx, func(st *poolState) error {
@@ -607,10 +621,10 @@ func (p *Pool) BeginDrain(ctx context.Context, id string) (op string, ok bool, e
 		}
 		if v.Role == roleDrainRequested {
 			st.note(id).Retiring = true
-			op, ok = v.DrainOp, now.Sub(v.DrainAt) >= drainRetry
+			op, ok = v.DrainOp, !v.DrainScheduled && now.Sub(v.DrainAt) >= drainRetry
 			return nil
 		}
-		if v.Role != roleStandby || now.Sub(v.Since) < standbySettle || s.protected(id) || p.waiterDemand() > 0 {
+		if v.Role != roleStandby || now.Sub(v.Since) < standbySettle || now.Before(v.DrainAt) || s.protected(id) || p.waiterDemand() > 0 {
 			return nil
 		}
 		for _, w := range s.Warm {
@@ -629,6 +643,7 @@ func (p *Pool) BeginDrain(ctx context.Context, id string) (op string, ok bool, e
 		}
 		op, ok = newAttemptID(), true
 		v.Role, v.Since, v.Reason, v.DrainOp, v.DrainAt = roleDrainRequested, now, "early drain requested", op, now
+		v.DrainScheduled = false
 		st.note(id).Retiring = true // no longer capacity: replacements may launch
 		s.Generation++
 		return nil
@@ -642,10 +657,19 @@ const drainRetry = 30 * time.Second
 
 // FinishDrain records the VM's answer to an early drain (a helper
 // TryDrain result): drained ends the VM's placement for good (it powers
-// off at its watchdog's next pass); busy or protected is asked again
-// later; the VM stays drain_requested whatever the answer.
+// off at its watchdog's next pass); scheduled leaves the wait to the VM
+// (its watchdog ends it once idle result_retention), so it isn't asked
+// again; busy or protected is asked again later. The VM stays
+// drain_requested whatever the answer, except unsupported: nothing was
+// changed on the VM, so it goes back to standby and idles out.
 func (p *Pool) FinishDrain(id, op, result, detail string) {
-	_ = p.with(func(st *poolState) error {
+	p.finishDrain(context.Background(), id, op, result, detail)
+}
+
+// finishDrain is FinishDrain, giving up when ctx ends (the drain stays
+// committed and is asked again later, with the same operation).
+func (p *Pool) finishDrain(ctx context.Context, id, op, result, detail string) {
+	_ = p.withCtx(ctx, func(st *poolState) error {
 		s := st.sched()
 		v := s.VMs[id]
 		if v == nil || v.DrainOp != op {
@@ -658,9 +682,14 @@ func (p *Pool) FinishDrain(id, op, result, detail string) {
 			v.Role, v.Since, v.Reason = roleDraining, now, "early drain: idle, its results kept long enough"
 			st.note(id).Draining = true
 			s.Generation++
+		case helper.DrainScheduled:
+			v.DrainScheduled = true
+			v.Reason = "early drain scheduled: ends once idle " + p.R.ResultRetention().String()
 		case "unsupported":
-			v.Reason = "early drain unsupported; idles out"
+			v.Role, v.Since, v.Reason, v.DrainOp = roleStandby, now, "surplus; early drain unsupported on this VM, so it idles out", ""
 			v.DrainAt = now.Add(time.Hour) // don't keep asking
+			st.note(id).Retiring = false
+			s.Generation++
 		default:
 			v.Reason = "early drain requested: " + result
 			if detail != "" {

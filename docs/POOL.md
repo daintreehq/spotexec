@@ -15,7 +15,7 @@ takes part in scheduling, and every VM shuts itself down.
                                                                   ▼
    ┌─ i-a  [slot1 ●][slot2 ●]   retained, busy       ◀── pack: retained VMs, the
    ├─ i-b  [slot1 ●][slot2 ○]   retained, busy           worktree's own or a busy one first
-   ├─ i-c  [slot1 ○][slot2 ○]   standby, idle 3m ── watchdog ─▶ terminates at idle_timeout (10m)
+   ├─ i-c  [slot1 ○][slot2 ○]   standby, idle 3m ── watchdog ─▶ terminates (early drain: 2m idle)
    └─ (launching)               claimed by agent 3
 ```
 
@@ -48,16 +48,64 @@ takes part in scheduling, and every VM shuts itself down.
    - An instance that cannot be reached stays in the cache and still counts
      as capacity, but isn't probed again for 3s, or for 30s once it is
      older than `boot_timeout` and has failed to answer twice in a row.
-3. **Queue and scale out.** If every slot is busy, the job takes a ticket in
+   - When none of a region's VMs answered its last probe, and either two or
+     more past `boot_timeout` have failed twice in a row or one has never
+     answered since its launch, the region is held as **unreachable from
+     this client** (the cloud's own health checks may still pass: it is
+     this machine's network path that failed). New launches skip it until
+     any VM there answers again. A hold with no answer lapses after 10
+     minutes; one VM may then launch there to try it, and if that one never
+     answers either the region is held again, twice as long (up to an
+     hour). A never-reached VM in a held region stops covering waiting
+     jobs at once, so their launch goes elsewhere. `spotexec status` and
+     `spotexec prices` say which regions are held and why.
+3. **Prepare beside preparing jobs.** A job holds its slot's command
+   capacity only while its `[setup] run` and command run; syncing, the
+   image, the dependency install and the write-back take only its own
+   token and workspace. So when every slot is taken but some by jobs still
+   preparing (or writing back), the job asks those VMs to admit it beside
+   them (`Acquire.Overflow`, up to twice `max_slots` jobs per VM): it
+   prepares there and waits for a free slot to run its command. A VM
+   whose slots all run commands (or whose admitted jobs wait to) refuses.
+   Plain requests (older clients) still see a VM full at `max_slots` jobs.
+4. **Queue and scale out.** If every slot is busy, the job takes a ticket in
    a fair local queue (priority, then arrival; `queue.go`) and registers as
    demand on each fleet (a waiter file under `waiters/`). Under `pool.lock`,
    `Plan` launches only while waiting demand exceeds the capacity already
    starting (the launch ledger in `pool.json`), up to `max_instances` when set.
+   - A short burst waits for slots about to free rather than launch a VM
+     that would serve only after it: while the jobs holding the fleet's
+     ready VMs are predicted (by the lease model, below) to end within a
+     launch's lead, and those releases cover the demand not already
+     starting, `Plan` holds the launch. The lead is the median time recent
+     launches took from being planned to their VM first serving (timed by
+     `spotexec up`, or by a run that saw the VM still booting within the
+     30s before it served), or two minutes until three launches have been
+     timed, and never more than ten. The hold lasts only while such
+     releases are still predicted and the job has waited less than the
+     lead: a prediction that turns out overdue frees nothing, so the next
+     round launches, and a job that has waited longer than the lead is
+     sustained demand, and launches as before. A job whose end is unknown
+     frees nothing here either, nor does a VM that is draining, outdated,
+     suspect, fenced or still starting. The first slots to free on a VM
+     whose helper admitted jobs beyond its slots (step 3) are theirs, so
+     those releases free nothing for jobs still waiting to be admitted. While an exclusive job waits (it
+     needs a whole VM to empty, which freeing slots don't show), the fleet
+     doesn't hold at all. Held demand counts as covered, so lower-priority
+     fleets don't launch for it either. The hold is a `scale_held` event
+     (with the slots it waits for, `free_in_ms`, `lead_ms`, `lead_learned`
+     and `waited_ms`) and the queue status gives its reason; `scale_out`
+     carries the same `lead_ms`, `lead_learned` and `waited_ms`.
    - Lower-priority fleets only launch for demand the higher-priority ones
      can't cover.
    - Draining and outdated VMs don't count toward `max_instances`, but
      with one set, launches pause while twice `max_instances` VMs are
      alive, until some end; the wait reason counts the draining and outdated VMs holding them.
+   - A fleet at `max_instances` with jobs waiting ends one VM at a time in
+     a region held as unreachable (one that failed its last probes and
+     has none of this machine's runs on it), so the launch can go to a
+     region it can reach. It doesn't when every region is held: those VMs
+     are how the region is seen to answer again.
    - Ledger entries record the launching PID, so a dead `sx` frees its
      reservation; an ambiguous launch (the request may have created an
      instance) keeps its reservation until listings can show it.
@@ -75,7 +123,7 @@ takes part in scheduling, and every VM shuts itself down.
      launches for the jobs already waiting the same way, and with no VM
      running the job fails at once, naming the cap and the cheapest
      current price. A job that starts later checks the prices again.
-4. **Wait.** Tickets near the head of the queue probe instances about every
+5. **Wait.** Tickets near the head of the queue probe instances about every
    0.5-2.5s (the head most often) until a slot frees or `queue_timeout`
    expires.
 
@@ -102,10 +150,12 @@ more every 10 seconds while the surplus lasts:
 - nothing shrinks while jobs are queued, or an exclusive job waits.
 
 A standby VM's running jobs finish, new jobs go elsewhere, and nothing renews
-its idle clock, so its watchdog ends it after `idle_timeout`. Standby is
-reversible: when the retained VMs are full, the standby VM that left most
-recently comes back before anything launches (and stays for at least a
-minute). New VMs join the retained set.
+its idle clock. Once this machine has nothing left on it, it is handed an
+[early drain](#early-drain) and ends after `result_retention` (2m) idle;
+otherwise its watchdog ends it after `idle_timeout`. Until that drain is
+handed over, standby is reversible: when the retained VMs are full, the
+standby VM that left most recently comes back before anything launches (and
+stays for at least a minute). New VMs join the retained set.
 
 **Where does this job go?** Among retained VMs with room: the one holding
 this worktree's files (recently synced there), else this repository's
@@ -168,42 +218,70 @@ while its last run is under 10 minutes old.
 
 ## Early drain
 
-By default a standby VM ends at its watchdog's `idle_timeout`, like any idle
-VM. With `scheduling.early_drain = true` and the [pool manager](scaling.md#pool-manager-optional)
-running, a standby VM can end sooner: once it has been idle for
-`scheduling.result_retention` (default `idle_timeout`, so set it lower, such
-as `"2m"`, for this to change anything). Until then `exec`, `pull` and
-`--same-slot` can still reach its workspaces.
+A standby VM ends once it has been idle for `scheduling.result_retention`
+(default `2m`, never longer than `idle_timeout`), rather than at
+`idle_timeout`. Retained VMs keep the full `idle_timeout`. This is on by
+default and needs no [pool manager](scaling.md#pool-manager-optional): each
+`sx` hands out the drains due as its job ends, and each VM carries its own
+out.
 
-Each pass, for a standby VM that has been standby for 30 seconds, isn't
-warm, holds nothing of this machine's (no job, reservation, uncertain
-attempt or exclusive fence), with no job queued and the retained VMs
-covering recent demand without it, the manager:
+What it costs:
+
+- **Results.** Once a drained VM ends, `exec`, `pull` and `--same-slot` can
+  no longer reach its workspaces. `result_retention` is how long after its
+  last job they still can.
+- **Relaunches.** Once its drain is committed, no new job is placed on the
+  VM, even while it is still up keeping its results (`exec`, `pull` and
+  `--same-slot` still reach their exact slot until it ends). If demand comes
+  back, new jobs go to the retained VMs if they have room, and otherwise
+  wait for a new VM to boot.
+
+To keep surplus VMs until `idle_timeout` instead:
+
+```toml
+[runners.aws.scheduling]
+early_drain = false
+```
+
+For a standby VM that has been standby for 30 seconds, isn't warm, holds
+nothing of this machine's (no job, reservation, uncertain attempt or
+exclusive fence), with no job queued and the retained VMs covering recent
+demand without it, `sx` (as a job's lease ends) or the pool manager (each
+probe pass):
 
 1. records the drain in the ledger (`drain_requested`). From then on the VM
    is never placed on again, even if the request below times out, so a
    delayed request can't drain a VM that just took new work;
-2. asks the VM (`spotexec-helper try-drain`, over the helper this machine
-   already installed: installing one would touch its idle clock). The
-   helper takes its lifecycle lock exclusively without waiting, and only
-   with no session holding it, no run waiting for a workspace slot, and its
-   activity at least `result_retention` old (by the VM's own clock) writes
-   its drain marker. Every acquire takes that lock shared and checks the
-   marker once it holds it, so nothing can start after;
-3. records the answer: drained (the watchdog powers the VM off at its next
-   pass, within a minute), or busy / still keeping results, asked again
-   30 seconds later with the same operation ID (a retry whose earlier
-   answer was lost reads as drained).
+2. hands it to the VM (`spotexec-helper schedule-drain`, over the helper
+   this machine already installed: installing one would touch its idle
+   clock). The helper writes `drain_after` beside the watchdog's other
+   files, and from then on the watchdog ends the VM once it has been idle
+   for `result_retention` with no session holding its lifecycle lock, as it
+   would at `idle_timeout`: it writes the drain marker first, so nothing can
+   start after. Nothing on this machine has to keep running for it;
+3. records the answer (`drain_scheduled`), and the VM isn't asked again.
 
-`sx` processes don't drain VMs early; without the pool manager, standby VMs
-end at `idle_timeout`. A Spot interruption or `max_lifetime` still ends a VM
-whatever its role.
+A VM booted by an older spotexec has a watchdog that doesn't read
+`drain_after`. It is asked to drain now instead (`try-drain`): the helper
+takes its lifecycle lock exclusively without waiting, and only with no
+session holding it, no run waiting for a workspace slot, and its activity
+at least `result_retention` old (by the VM's own clock) writes its drain
+marker. Busy or still keeping results, it is asked again 30 seconds later,
+by the next `sx` to finish a job or the next pool manager pass, with the
+same operation ID; with neither, it ends at `idle_timeout`.
+
+Only VMs the placement policy has marked standby are drained: without the
+pool manager, nothing re-sorts the retained set after the last `sx` exits,
+so VMs still retained then end at `idle_timeout`. A Spot interruption or `max_lifetime` still
+ends a VM whatever its role.
 
 ## Scale in
 
 Each VM's watchdog (a systemd timer installed by cloud-init) powers it off
-after `idle_timeout` (default 10m) without activity. Standby VMs get no new
-work, so this is how the surplus the controller found ends. It only does so when no
+after `idle_timeout` (default 10m) without activity, or a standby VM after
+`result_retention` (default 2m) once it has an [early drain](#early-drain).
+Standby VMs get no new work, so this is how the surplus the controller found
+ends. It only does so when no
 session holds the lifecycle lock. Because instances launch with
 `InstanceInitiatedShutdownBehavior=terminate`, powering off terminates the
 instance.
@@ -254,6 +332,23 @@ was going away (a Spot notice, or the helper reporting its shutdown, as at
 `max_lifetime`) is replayed either way. Before giving up on a
 silent helper whose VM is still running, the CLI waits 3 more minutes, so a
 VM that recovers keeps its runs.
+
+A VM that goes silent with its whole region is not the run's doing. When the
+CLI gives up on a running VM after handing it the command, it probes over SSH,
+each on a connection of its own: the lost VM, the fleet's other VMs in that
+region that this machine has reached before and still uses (up to 6), and one
+VM in each of up to 3 other regions. If the lost VM and those peers (at least
+one) all fail for want of a network path (a timeout, no route), and a VM in
+another region answers, the region is taken to be unreachable from this
+client (a network partition), and the run is replayed instead: on a VM already
+up outside that region (it launches nothing, since a launch could go to the
+silent region), and only after the longest a helper outlives the last word
+from its client before it tears the run down and exits (about 6 minutes after
+the loss), so the lost attempt isn't still running alongside the replay.
+Memory pressure still rules a replay out, and so does a VM whose heartbeats
+never reported its memory (`REGION_UNREACHABLE`; exit 125). A VM alone in its
+region, a client that reaches no region, or a probe that fails for another
+reason (authentication, say) proves nothing and keeps `RUNNER_UNRESPONSIVE`.
 
 ## Simulation (`type = "sim"`)
 

@@ -420,6 +420,69 @@ func (c *Client) runWithin(ctx context.Context, d time.Duration, remoteCmd strin
 	return out, err
 }
 
+// Reach is what a reachability probe found (Client.Reachable).
+type Reach int
+
+const (
+	// ReachUnknown: the probe failed in a way that says nothing about the
+	// network (authentication, the remote shell, ssh itself).
+	ReachUnknown Reach = iota
+	// Reachable: the target answered.
+	Reachable
+	// Unreachable: no answer, or the network said there is no way to it.
+	Unreachable
+)
+
+// Reachable probes the target with a trivial command over a connection of
+// its own (never the runner's ControlMaster, whose state proves nothing
+// about the network now), within d. Only a timeout, or ssh reporting that
+// the network can't get there, counts as Unreachable.
+func (c *Client) Reachable(ctx context.Context, d time.Duration) Reach {
+	rctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	own := *c
+	own.ctlPath = "none"
+	cmd := exec.CommandContext(rctx, "ssh", own.Args("true")...)
+	cmd.WaitDelay = 2 * time.Second
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	err := cmd.Run()
+	switch {
+	case err == nil:
+		return Reachable
+	case ctx.Err() != nil:
+		return ReachUnknown // given up on, not timed out
+	case errors.Is(rctx.Err(), context.DeadlineExceeded):
+		return Unreachable
+	}
+	return probeResult(err, errb.String())
+}
+
+// probeResult classifies a probe that failed in time: ssh's own failure
+// (exit 255) by what it printed, the remote shell failing as an answer,
+// and anything else (ssh couldn't start, or was killed) as unknown.
+func probeResult(err error, stderr string) Reach {
+	var ee *exec.ExitError
+	switch {
+	case !errors.As(err, &ee) || ee.ExitCode() < 0:
+		return ReachUnknown
+	case ee.ExitCode() != 255:
+		return Reachable // the remote shell ran, and failed
+	}
+	return networkFailure(stderr)
+}
+
+// networkFailure classifies the error ssh printed when it couldn't connect.
+func networkFailure(stderr string) Reach {
+	s := strings.ToLower(stderr)
+	for _, m := range []string{"timed out", "no route to host", "network is unreachable", "host is down"} {
+		if strings.Contains(s, m) {
+			return Unreachable
+		}
+	}
+	return ReachUnknown
+}
+
 // EnsureHelper makes sure the right helper is installed and returns the
 // remote command prefix that invokes it.
 // HelperUploadBudget is the extra time a first contact gets to upload the

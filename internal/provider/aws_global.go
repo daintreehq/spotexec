@@ -266,6 +266,12 @@ type cooldown struct {
 	// Transient: preparing a launch there failed for a reason that may
 	// clear (throttling, a network error), not how the region is set up.
 	Transient bool `json:"transient,omitempty"`
+	// A region the client can't reach (see reach.go): when that began,
+	// and when a VM last launched there to try it again.
+	Since time.Time `json:"since,omitempty"`
+	Trial time.Time `json:"trial,omitempty"`
+	// unreach: a coolingDown result that is such a hold (not saved).
+	unreach bool
 }
 
 // quotaSkip is a quota refusal seen during one launch: the region has no
@@ -311,6 +317,9 @@ type placementState struct {
 	Where     map[string]placedAt  `json:"where,omitempty"`     // instance ID -> region (a routing cache)
 	Cooldown  map[string]cooldown  `json:"cooldown,omitempty"`  // "region", "zone:<zone>", "region/zone/type" or "reclaimed:region/zone/type"
 	Reclaimed map[string]time.Time `json:"reclaimed,omitempty"` // instance ID -> when its Spot interruption was recorded
+	// Failures: "region/zone/type" -> its recent capacity refusals and
+	// early reclaims, decaying (see recordFailure).
+	Failures map[string]poolFailures `json:"failures,omitempty"`
 	// Warm: region -> when a VM of this runner was last seen there, running
 	// for warmAfter or more (under profile WarmProfile), so its caches are
 	// likely there too.
@@ -405,7 +414,14 @@ func (g *AWSGlobal) withStateWait(wait time.Duration, fn func(st *placementState
 		}
 	}
 	for k, v := range st.Cooldown {
-		if now.After(v.Until.Add(coolMemory(k))) {
+		if !v.Trial.IsZero() && now.Before(v.Trial.Add(g.trialFor())) {
+			continue // a trial still booting keeps its region's hold
+		}
+		end := v.Until
+		if v.Trial.After(end) {
+			end = v.Trial
+		}
+		if now.After(end.Add(coolMemory(k))) {
 			delete(st.Cooldown, k) // forget the backoff step too, eventually
 		}
 	}
@@ -922,6 +938,10 @@ func (g *AWSGlobal) coolingDown(st *placementState, p SpotPrice, now time.Time) 
 	if c, ok := st.Cooldown[p.Region]; ok && now.Before(c.Until) {
 		return c, true
 	}
+	if c, ok := unreachHeld(st.Cooldown, unreachKey(p.Region), now, g.trialFor()); ok {
+		c.Why, c.unreach = unreachWhy(c, now), true
+		return c, true
+	}
 	if c, ok := st.Cooldown[g.zoneKey(p.Zone)]; ok && now.Before(c.Until) {
 		return c, true
 	}
@@ -970,14 +990,20 @@ func (g *AWSGlobal) refusedAtCap(ps []SpotPrice) map[string]bool {
 	return out
 }
 
+// coolPool skips p's zone and type for a while after a refusal (why: its
+// code); a refusal for capacity also counts in its failure history.
 func (g *AWSGlobal) coolPool(p SpotPrice, why string) {
 	_ = g.withState(func(st *placementState) {
+		now := g.clock()
 		c := st.Cooldown[poolKey(p)]
 		step := poolCoolMin
 		if c.Step > 0 {
 			step = min(2*c.Step, poolCoolMax)
 		}
-		st.Cooldown[poolKey(p)] = cooldown{Until: g.clock().Add(step), Step: step, Why: why}
+		st.Cooldown[poolKey(p)] = cooldown{Until: now.Add(step), Step: step, Why: why}
+		if shortOfCapacity(why) {
+			recordFailure(st, p, true, now)
+		}
 	})
 }
 
@@ -1065,6 +1091,44 @@ func zoneWide(code string) bool {
 // such region can't be listed the whole listing fails, so the pool keeps
 // its last view instead of believing those instances gone.
 func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
+	out, unlisted, err := g.list(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(unlisted) > 0 {
+		return nil, joinRegionErrors(unlisted)
+	}
+	return out, nil
+}
+
+// regionListTimeout bounds how long ListReachable waits on one region.
+var regionListTimeout = 15 * time.Second
+
+// ListReachable lists every region List would, giving each at most
+// regionListTimeout, and returns what it found with the regions it
+// couldn't list. A region that failed is never forgotten: while any did,
+// the listing only records the instances it saw.
+func (g *AWSGlobal) ListReachable(ctx context.Context) ([]Instance, map[string]error, error) {
+	return g.list(ctx, regionListTimeout)
+}
+
+// list lists the regions that may hold instances. With each zero, it stops
+// at the first sign of a region it couldn't list and returns those
+// regions' errors with nothing else. With each set, it bounds every
+// region's queries by it and goes on with the regions it listed.
+func (g *AWSGlobal) list(ctx context.Context, each time.Duration) ([]Instance, map[string]error, error) {
+	bound := func(ctx context.Context) (context.Context, context.CancelFunc) {
+		if each <= 0 {
+			return ctx, func() {}
+		}
+		return context.WithTimeout(ctx, each)
+	}
+	slow := func(ctx context.Context, err error) error {
+		if each > 0 && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return fmt.Errorf("no answer within %s: %w", each, err)
+		}
+		return err
+	}
 	var regions []string
 	discovered := false
 	if err := g.withState(func(st *placementState) {
@@ -1073,26 +1137,30 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 			regions = append(regions, r)
 		}
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if g.legacy {
 		regions = union(regions, []string{g.r.Region})
 	}
 	if !discovered {
 		// No record yet of where instances may be: look everywhere once.
-		all, err := g.managedRegions(ctx)
+		dctx, cancel := bound(ctx)
+		all, err := g.managedRegions(dctx)
+		cancel()
 		if err != nil {
-			return nil, err
+			return nil, nil, slow(ctx, err)
 		}
 		regions = union(regions, all)
 	}
 	var mu sync.Mutex
 	var out []Instance
 	empty := map[string]bool{}
-	errs := eachRegion(ctx, regions, func(ctx context.Context, rg string) error {
+	unlisted := eachRegion(ctx, regions, func(pctx context.Context, rg string) error {
+		ctx, cancel := bound(pctx)
+		defer cancel()
 		ins, err := g.Regional(rg).List(ctx)
 		if err != nil {
-			return err
+			return slow(pctx, err)
 		}
 		mu.Lock()
 		out = append(out, ins...)
@@ -1102,11 +1170,16 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 		mu.Unlock()
 		return nil
 	})
-	if len(errs) > 0 {
-		return nil, joinRegionErrors(errs)
+	if len(unlisted) > 0 && each <= 0 {
+		return nil, unlisted, nil
 	}
 	if err := g.remember(out); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if len(unlisted) > 0 {
+		// Forgetting or discovering regions needs every region's answer.
+		sortInstances(out)
+		return out, unlisted, nil
 	}
 	// The listing above has only schedulable VMs. Before forgetting a
 	// region (or, while discovering, passing over one), make sure it holds
@@ -1121,12 +1194,14 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 			}
 		}
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// A region that holds something, or that couldn't be checked, stays
 	// listed until it's clear.
 	held := map[string]bool{}
 	for rg := range eachRegion(ctx, check, func(ctx context.Context, rg string) error {
+		ctx, cancel := bound(ctx)
+		defer cancel()
 		if n, err := g.Regional(rg).leftovers(ctx); err != nil {
 			return err
 		} else if n > 0 {
@@ -1152,8 +1227,14 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 			}
 		}
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	sortInstances(out)
+	return out, nil, nil
+}
+
+// sortInstances orders a listing by state, then newest first.
+func sortInstances(out []Instance) {
 	sort.SliceStable(out, func(i, j int) bool {
 		ri, rj := stateRank(string(out[i].State)), stateRank(string(out[j].State))
 		if ri != rj {
@@ -1161,7 +1242,6 @@ func (g *AWSGlobal) List(ctx context.Context) ([]Instance, error) {
 		}
 		return out[i].LaunchedAt.After(out[j].LaunchedAt)
 	})
-	return out, nil
 }
 
 // Launch starts one instance at the first option in launch order (see Rank)
@@ -1244,10 +1324,17 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		// (and an older IAM policy may not allow reading them): try the
 		// types in the listed order instead.
 		why := fmt.Sprintf("can't compare Spot prices (%s); trying instance_types in order", firstLineOfErr(err))
+		held, lapsed := g.unreachRegions()
+		if held[g.r.Region] || (lapsed[g.r.Region] && !g.claimTrial(g.r.Region)) {
+			return Instance{}, fmt.Errorf("%s is %s", g.r.Region, g.unreachDetail(g.r.Region))
+		}
 		log("%s", why)
 		a := g.home()
 		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{beforeSend: g.mark(a.r.Region)})
 		if err != nil {
+			if lapsed[g.r.Region] && !errors.Is(err, ErrLaunchAmbiguous) {
+				g.dropTrial(g.r.Region) // nothing launched there to try it
+			}
 			return Instance{}, err
 		}
 		in := a.instance(inst)
@@ -1264,6 +1351,10 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	skipZone := map[string]bool{}
 	atCap := g.refusedAtCap(t.Prices) // region/type refused at max_price (SpotMaxPriceTooLow)
 	broken := g.brokenRegions()       // regions whose setup failed (no on-demand there either)
+	// Regions this client can't reach take no launch (cool has them); one
+	// whose hold lapsed takes one, to try it again.
+	unreachHeldNow, lapsed := g.unreachRegions()
+	var unreachSkipped []string // held regions passed over, for the error
 	var tried []string
 	// When quota is all that stopped every option (others can't work as
 	// configured: no network there, or above max_price), the error is a
@@ -1301,6 +1392,14 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			ahead.add("above max_price")
 			continue
 		}
+		if cd, ok := cool[poolKey(c)]; ok && cd.unreach {
+			ahead.add("in a region this client can't reach")
+			otherFailure = true // ends when a VM there answers
+			if !contains(unreachSkipped, c.Region) {
+				unreachSkipped = append(unreachSkipped, c.Region)
+			}
+			continue
+		}
 		if cd, ok := cool[poolKey(c)]; ok {
 			ahead.add("cooling down")
 			switch {
@@ -1319,9 +1418,24 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			otherFailure = true
 			break
 		}
+		trial := false
+		if lapsed[c.Region] {
+			// Its hold lapsed: this launch tries it again, unless another
+			// one already is.
+			if !g.claimTrial(c.Region) {
+				ahead.add("in a region this client can't reach")
+				otherFailure = true
+				continue
+			}
+			trial, lapsed[c.Region] = true, false
+		}
 		a := g.Regional(c.Region)
 		attempts++
 		inst, err := a.launchOrUnbaked(ctx, log, launchSpec{itype: c.Type, zone: c.Zone, beforeSend: g.mark(c.Region)})
+		if err != nil && trial && !errors.Is(err, ErrLaunchAmbiguous) {
+			g.dropTrial(c.Region) // nothing there to try it
+			lapsed[c.Region] = true
+		}
 		if err == nil {
 			g.clearCool(c)
 			in := a.instance(inst)
@@ -1456,7 +1570,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		// (Capped, onDemandTypes reads only the price table.)
 		var regions []string
 		for _, c := range t.Prices {
-			if !broken[c.Region] && !contains(regions, c.Region) && (maxPrice == 0 || len(g.onDemandTypes(ctx, t, c.Region, atCap)) > 0) {
+			if !broken[c.Region] && !unreachHeldNow[c.Region] && !contains(regions, c.Region) && (maxPrice == 0 || len(g.onDemandTypes(ctx, t, c.Region, atCap)) > 0) {
 				regions = append(regions, c.Region)
 			}
 		}
@@ -1464,6 +1578,9 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			otherFailure = true // regions left untried: not a quota verdict
 		}
 		for _, rg := range regions[:min(len(regions), 2)] {
+			if lapsed[rg] && !g.claimTrial(rg) {
+				continue // another launch is trying it again
+			}
 			log("no spot capacity; falling back to on-demand in %s", rg)
 			a := g.Regional(rg)
 			inst, err := a.launchOrUnbaked(ctx, log, launchSpec{onDemand: true, types: g.onDemandTypes(ctx, t, rg, atCap), beforeSend: g.mark(rg)})
@@ -1472,6 +1589,9 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 				g.record(in)
 				in.Placement = &Placement{Order: "on_demand", Why: "on_demand_fallback: no Spot option could launch"}
 				return in, nil
+			}
+			if lapsed[rg] && !errors.Is(err, ErrLaunchAmbiguous) {
+				g.dropTrial(rg) // nothing launched there to try it
 			}
 			var ce *CredentialError
 			if errors.Is(err, ErrLaunchAmbiguous) || errors.As(err, &ce) || ctx.Err() != nil {
@@ -1509,6 +1629,17 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 			return Instance{}, errors.New(pe.Error())
 		}
 		return Instance{}, pe
+	}
+	if len(tried) == 0 && len(unreachSkipped) > 0 {
+		var why []string
+		for _, rg := range unreachSkipped {
+			why = append(why, rg+" is "+g.unreachDetail(rg))
+		}
+		rest := ""
+		if len(unreachSkipped) < len(t.Regions)-len(t.Unpriced) {
+			rest = "; the other regions' options are cooling down or above max_price"
+		}
+		return Instance{}, fmt.Errorf("no option in %s can launch: %s%s (`spotexec prices %s` shows them)", g.Where(), strings.Join(why, "; "), rest, g.r.Name)
 	}
 	if len(tried) == 0 {
 		return Instance{}, fmt.Errorf("every Spot option in %s is cooling down after recent capacity or quota failures; retry in a few minutes (`spotexec prices %s` shows them)", g.Where(), g.r.Name)

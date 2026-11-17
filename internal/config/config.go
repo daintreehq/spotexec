@@ -245,16 +245,18 @@ type Scheduling struct {
 	Mode   string `toml:"mode"`   // balanced (default) | latency
 	// SpareSlots: warm headroom kept on top of recent demand, in slots.
 	SpareSlots int `toml:"spare_slots"`
-	// EarlyDrain lets the pool manager shut a surplus VM down as soon as it
-	// is idle and its results have been kept for ResultRetention, instead
-	// of waiting out idle_timeout.
-	EarlyDrain bool `toml:"early_drain"`
+	// EarlyDrain lets a surplus (standby) VM end once it has been idle for
+	// ResultRetention, instead of waiting out idle_timeout. nil means on
+	// (the default); see Runner.EarlyDrain.
+	EarlyDrain *bool `toml:"early_drain"`
 	// ResultRetention: how long a VM's workspaces stay reachable (exec,
 	// pull, --same-slot) after its last job before an early drain may end
-	// it. Default: idle_timeout (so early drain only ever ends VMs that the
-	// watchdog was about to end anyway).
+	// it. Default: DefaultResultRetention, capped at idle_timeout.
 	ResultRetention Duration `toml:"result_retention"`
 }
+
+// DefaultResultRetention is scheduling.result_retention when unset.
+const DefaultResultRetention = 2 * time.Minute
 
 // SchedPolicy is the runner's scheduling policy, defaulted.
 func (r *Runner) SchedPolicy() string {
@@ -272,13 +274,24 @@ func (r *Runner) SchedMode() string {
 	return r.Scheduling.Mode
 }
 
+// EarlyDrain reports whether surplus VMs end early (scheduling.early_drain,
+// on unless set to false).
+func (r *Runner) EarlyDrain() bool {
+	return r.Scheduling.EarlyDrain == nil || *r.Scheduling.EarlyDrain
+}
+
 // ResultRetention is how long an early drain leaves an idle VM's results
-// reachable: result_retention, or idle_timeout.
+// reachable: result_retention, or DefaultResultRetention, never longer than
+// idle_timeout (the watchdog ends any idle VM then anyway).
 func (r *Runner) ResultRetention() time.Duration {
-	if d := r.Scheduling.ResultRetention.Duration; d > 0 {
-		return d
+	d := r.Scheduling.ResultRetention.Duration
+	if d <= 0 {
+		d = DefaultResultRetention
 	}
-	return r.IdleTimeout.Duration
+	if idle := r.IdleTimeout.Duration; idle > 0 && d > idle {
+		d = idle
+	}
+	return d
 }
 
 // AllRegions is the regions value meaning every enabled region.
@@ -1327,6 +1340,10 @@ func (c *Config) MergeProjectRunners() error {
 		base.Regions = append([]string(nil), g.Regions...)
 		base.ExcludeRegions = append([]string(nil), g.ExcludeRegions...)
 		base.ExcludeInstanceTypes = append([]string(nil), g.ExcludeInstanceTypes...)
+		if d := g.Scheduling.EarlyDrain; d != nil {
+			v := *d // decoding the project's value must not write through to the base
+			base.Scheduling.EarlyDrain = &v
+		}
 		// The project's way of choosing types replaces the inherited one: new
 		// instance_types alone drop inherited requirements, and requirements
 		// alone drop inherited instance_types (which would otherwise narrow

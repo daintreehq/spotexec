@@ -65,6 +65,7 @@ func cmdPrices() *cobra.Command {
 			}
 			k := g.Rank(t)
 			v := pricesView{r: r, t: t, k: k, cool: g.Cooldowns(t.Prices), held: g.HeldBack(t.Prices), project: project}
+			v.unreach, _ = g.RegionHolds()
 			v.next, v.hasNext = g.NextLaunch(t)
 			if asJSON {
 				return v.writeJSON(os.Stdout)
@@ -114,7 +115,8 @@ type pricesView struct {
 	t       provider.PriceTable
 	k       provider.Ranking // the options in launch order
 	cool    map[string]string
-	held    map[string]string // held back after a Spot interruption
+	held    map[string]string              // held back after a Spot interruption
+	unreach map[string]provider.RegionHold // regions this client can't reach: no launches there for now
 	next    provider.SpotPrice
 	hasNext bool
 }
@@ -149,6 +151,9 @@ func (v pricesView) writeJSON(w io.Writer) error {
 		"launch_order": v.k.Order, "prices": rows}
 	if v.k.Model != nil {
 		out["run_cost_model"] = v.k.Model
+	}
+	if len(v.unreach) > 0 {
+		out["launch_holds"] = v.unreach
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
@@ -189,7 +194,7 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 	}
 	head += "USD/HOUR\t"
 	if runCost {
-		head += "RUN COST\tSPEED\tCOLD\tDISTANCE\t"
+		head += "RUN COST\tSPEED\tCOLD\tDISTANCE\tFAILURES\t"
 	}
 	fmt.Fprintln(tw, head)
 	for i, sp := range k.Prices {
@@ -198,7 +203,9 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 			break
 		}
 		mark, note := " ", ""
-		if why := v.cool[optionKey(sp)]; why != "" {
+		if _, ok := v.unreach[sp.Region]; ok {
+			note = "skipped for now: this client can't reach " + sp.Region + " (below)"
+		} else if why := v.cool[optionKey(sp)]; why != "" {
 			note = "skipped for now: " + why
 		} else if maxPrice > 0 && sp.USD() > maxPrice {
 			note = "above max_price " + r.MaxPrice.String()
@@ -223,11 +230,29 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 			case c.ColdParts != nil && c.ColdParts.Paid() != "":
 				cold += " " + c.ColdParts.Paid()
 			}
-			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t", c.Score, added(c.Speed), cold, added(c.Distance))
+			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t%s\t", c.Score, added(c.Speed), cold, added(c.Distance), added(c.Failures))
+			if c.FailedHere != nil { // even when too little to show in USD
+				failed := "failed here lately: " + c.FailedHere.String()
+				if note != "" {
+					failed = "; " + failed
+				}
+				note += failed
+			}
 		}
 		fmt.Fprintln(tw, row+note)
 	}
 	tw.Flush()
+	if len(v.unreach) > 0 {
+		var keys []string
+		for rg := range v.unreach {
+			keys = append(keys, rg)
+		}
+		sort.Strings(keys)
+		fmt.Fprintf(w, "\nNo launches for now:\n")
+		for _, rg := range keys {
+			fmt.Fprintf(w, "  %s: %s\n", rg, v.unreach[rg].Why)
+		}
+	}
 	if len(t.Unpriced) > 0 {
 		var keys []string
 		for rg := range t.Unpriced {
@@ -262,8 +287,8 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 		case n > 1:
 			added = "the VM time and waiting that " + strings.Join(factors[:n-1], ", ") + " or " + factors[n-1] + " adds"
 		}
-		fmt.Fprintf(w, "\nlaunch_order = \"run_cost\": ranked by the expected cost of an hour of work (RUN COST, USD): its Spot bill, plus %s, with waiting valued at $%g/h (wait_cost). VMs reclaimed in a zone rank last for a while. launch_order = \"cheapest\" ranks by price alone.\n",
-			added, m.WaitCost)
+		fmt.Fprintf(w, "\nlaunch_order = \"run_cost\": ranked by the expected cost of an hour of work (RUN COST, USD): its Spot bill, plus %s, with waiting valued at $%g/h (wait_cost). A zone and type that failed lately (refused for capacity, or a VM reclaimed within an hour of launch) adds %g minutes of that for each failure (FAILURES), counting half as much every %g hours. VMs reclaimed in a zone rank last for a while. launch_order = \"cheapest\" ranks by price alone.\n",
+			added, m.WaitCost, m.FailureMinutes, m.FailureHalfLifeHours)
 	case r.LaunchOrder == config.LaunchListed:
 		fmt.Fprintf(w, "\nlaunch_order = \"listed\": instance_types are tried in the listed order, each in its cheapest zone first.\n")
 	}
