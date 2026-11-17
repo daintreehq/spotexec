@@ -143,9 +143,9 @@ type fleet struct {
 	// Circuit breaker: replacements of instances that never became healthy.
 	failures []time.Time
 	paused   time.Time
-	// VMs this daemon launched that haven't answered yet, by the pass that
-	// sent them, and the latest such pass that already counted a failure:
-	// VMs launched together that fail together count once.
+	// VMs this daemon launched that haven't become usable yet, by the pass
+	// that sent them, and the latest such pass that already counted a
+	// failure: VMs launched together that fail together count once.
 	batchOf     map[string]launchBatch
 	failedBatch int
 	// The breaker restarts when the runner's config changes in a way that
@@ -185,7 +185,8 @@ func (g *blindGate) spend() {
 
 type launchBatch struct {
 	pass, epoch int
-	at          time.Time
+	at          time.Time // recorded, or when its launch finished waiting
+	pending     bool      // its launch is still waiting for the VM to run
 }
 
 func newFleetState(r *config.Runner, f provider.Fleet) *fleet {
@@ -532,7 +533,10 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		}
 	}
 	for id, b := range fl.batchOf {
-		if gone(id) && time.Since(b.at) > forgetAfter {
+		// Kept while its launch may still report it failed, or an sx
+		// client's bootstrap failure report for it is still to be counted
+		// below, so its batch still counts once.
+		if gone(id) && !b.pending && !view.BootFailed[id] && time.Since(b.at) > forgetAfter {
 			delete(fl.batchOf, id)
 		}
 	}
@@ -669,7 +673,12 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		probed = true
 		d.mu.Lock()
 		for id := range fl.lastOK {
-			delete(fl.batchOf, id) // it answered: no longer a failed launch
+			// Usable now: no longer a failed launch. One that answers while
+			// still booting, or with a failed bootstrap, keeps its batch, so
+			// VMs launched together that fail together still count once.
+			if !fl.booting[id] {
+				delete(fl.batchOf, id)
+			}
 		}
 		d.mu.Unlock()
 		for _, id := range notified {
@@ -939,10 +948,23 @@ func (d *Daemon) provision(ctx context.Context, fl *fleet, id string, batch int)
 		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.BootTimeout.Duration+2*time.Minute)
 		defer cancel()
 		created := ""
+		// Once the launch is done (and any failure of it counted), its
+		// batch record may be forgotten like any other.
+		defer func() {
+			d.mu.Lock()
+			if b, ok := fl.batchOf[created]; ok && created != "" {
+				b.at, b.pending = time.Now(), false
+				fl.batchOf[created] = b
+			}
+			d.mu.Unlock()
+		}()
 		in, err := pool.ProvisionHeldThen(pctx, id, nil, func(in provider.Instance) {
+			if in.ID == "" {
+				return
+			}
 			created = in.ID
 			d.mu.Lock()
-			fl.batchOf[in.ID] = launchBatch{pass: batch, epoch: epoch, at: time.Now()}
+			fl.batchOf[in.ID] = launchBatch{pass: batch, epoch: epoch, at: time.Now(), pending: true}
 			d.mu.Unlock()
 		})
 		if err != nil {

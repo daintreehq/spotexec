@@ -638,6 +638,188 @@ func TestBreakerIgnoresBurstFailures(t *testing.T) {
 	}
 }
 
+// VMs launched together whose helpers answer that their bootstrap failed
+// count once, whether they first reported still booting or failed on their
+// first answer: an answer that isn't usable keeps the launch batch. It takes
+// three such batches to pause.
+func TestBreakerCountsAnsweringBatchOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		steps []string // what each VM's helper says on successive probes
+	}{
+		{"booting then failed", []string{"booting", "failed"}},
+		{"failed on first answer", []string{"failed"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, cfgPath := setup(t)
+			writeConfig(t, cfgPath, runnerConfig("a.large", 3))
+			var mu sync.Mutex
+			answers := map[string]int{} // probes each VM answered
+			probeFleet = func(d *Daemon, _ context.Context, fl *fleet, running []provider.Instance, _ map[string]bool) ([]string, map[string]int) {
+				mu.Lock()
+				defer mu.Unlock()
+				n := map[string]int{}
+				for _, in := range running {
+					n[in.Region]++
+					say := tc.steps[min(answers[in.ID], len(tc.steps)-1)]
+					answers[in.ID]++
+					fl.lastOK[in.ID] = time.Now()
+					fl.booting[in.ID] = true // booting or failed: not usable
+					if say == "failed" {
+						fl.bootFailed[in.ID] = true
+					}
+				}
+				return nil, n
+			}
+			d, l := start(t)
+			ctx := context.Background()
+			fl := fleetNamed(d, "pool")
+			pass := func() FleetStatus {
+				t.Helper()
+				fl.lastPrb = time.Time{} // probe every pass
+				d.pass(ctx)
+				settle(t, d)
+				st, err := ReadStatus()
+				if err != nil || len(st.Fleets) != 1 {
+					t.Fatalf("status: %v", err)
+				}
+				return st.Fleets[0]
+			}
+
+			pass() // launches the first batch
+			d.mu.Lock()
+			batches := len(fl.batchOf)
+			d.mu.Unlock()
+			if n := len(c.launches()); n != 3 || batches != 3 {
+				t.Fatalf("first pass: %d launches, %d batch records; want 3 and 3", n, batches)
+			}
+			// Each failed batch is replaced by a fresh one, until the third.
+			var st FleetStatus
+			for batch := 1; batch <= 3; batch++ {
+				for i := range tc.steps {
+					if st = pass(); batch < 3 && st.LastError != "" {
+						t.Fatalf("batch %d: paused: %q (%d failures)", batch, st.LastError, recent(d, fl))
+					}
+					if i < len(tc.steps)-1 { // still booting: nothing counted, batch kept
+						d.mu.Lock()
+						batches := len(fl.batchOf)
+						d.mu.Unlock()
+						if n := recent(d, fl); n != batch-1 || batches != 3*batch {
+							t.Fatalf("batch %d booting: %d failures, %d batch records; want %d and %d", batch, n, batches, batch-1, 3*batch)
+						}
+					}
+				}
+				if n := recent(d, fl); n != batch {
+					t.Fatalf("after %d failed batches of 3 VMs: %d failures", batch, n)
+				}
+				if want := 3 * min(batch+1, 3); len(c.launches()) != want {
+					t.Fatalf("after %d failed batches: %d launches, want %d", batch, len(c.launches()), want)
+				}
+			}
+			if !strings.Contains(st.LastError, "paused") || l.count("pausing warm launches") != 1 {
+				t.Fatalf("3 failed batches didn't pause: %q", st.LastError)
+			}
+		})
+	}
+}
+
+// A VM that answers booting keeps its launch batch until it answers usable,
+// and loses it then.
+func TestBatchDroppedOnceUsable(t *testing.T) {
+	c, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 3))
+	var mu sync.Mutex
+	ready := false
+	probeFleet = func(d *Daemon, _ context.Context, fl *fleet, running []provider.Instance, _ map[string]bool) ([]string, map[string]int) {
+		mu.Lock()
+		defer mu.Unlock()
+		n := map[string]int{}
+		for _, in := range running {
+			fl.lastOK[in.ID] = time.Now()
+			fl.booting[in.ID] = !ready
+			n[in.Region]++
+		}
+		return nil, n
+	}
+	d, _ := start(t)
+	fl := fleetNamed(d, "pool")
+	pass := func() {
+		fl.lastPrb = time.Time{} // probe every pass
+		d.pass(context.Background())
+		settle(t, d)
+	}
+	batches := func() int {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return len(fl.batchOf)
+	}
+	pass() // launches
+	pass() // booting
+	if n := batches(); n != 3 {
+		t.Fatalf("booting VMs: %d batch records, want 3", n)
+	}
+	mu.Lock()
+	ready = true
+	mu.Unlock()
+	pass()
+	if n := batches(); n != 0 || recent(d, fl) != 0 || len(c.launches()) != 3 {
+		t.Fatalf("usable VMs: %d batch records, %d failures, %d launches; want 0, 0, 3", n, recent(d, fl), len(c.launches()))
+	}
+}
+
+// A batch whose launches are still waiting for their VMs keeps its records
+// however long the wait, so VMs that vanish meanwhile and then fail their
+// launches count once.
+func TestPendingBatchOutlivesForgetting(t *testing.T) {
+	c, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 2))
+	hold := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(hold) }) }
+	c.set(func(c *cloud) { c.hold = hold })
+	d, _ := start(t)
+	t.Cleanup(release) // runs before start's settle
+	fl := fleetNamed(d, "pool")
+	ctx := context.Background()
+	d.pass(ctx) // two launches, both waiting
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		d.mu.Lock()
+		n := len(fl.batchOf)
+		d.mu.Unlock()
+		if n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("launches never recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Long recorded, and gone from listings (reclaimed while pending).
+	d.mu.Lock()
+	for id, b := range fl.batchOf {
+		b.at = b.at.Add(-2 * forgetAfter)
+		fl.batchOf[id] = b
+	}
+	d.mu.Unlock()
+	c.set(func(c *cloud) { c.insts["pool"], c.waitErr = nil, errors.New("instance reclaimed while booting") })
+	fl.lastPrb = time.Now()
+	d.manage(ctx, fl)
+	release()
+	settle(t, d)
+	if n := recent(d, fl); n != 1 {
+		t.Fatalf("a batch that vanished while launching counted %d failures, want 1", n)
+	}
+	// Done launching: forgettable again, from now.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, b := range fl.batchOf {
+		if b.pending || time.Since(b.at) > forgetAfter {
+			t.Errorf("%s after its launch: pending %v, recorded %s ago", id, b.pending, time.Since(b.at))
+		}
+	}
+}
+
 // Each instance counts once whichever path reports it; launch batches count
 // once each, older ones not at all; instances and launches from before the
 // breaker restarted don't count.
@@ -702,6 +884,19 @@ func TestBreakerAccounting(t *testing.T) {
 	}
 	if _, ok := fl.counted["i-9"]; !ok {
 		t.Error("a recent counted entry was dropped")
+	}
+
+	// A batch long gone from listings whose bootstrap failures an sx client
+	// reported keeps its batch until they are counted: once, not per VM.
+	n := recent(d, fl)
+	for _, id := range []string{"i-x", "i-y"} {
+		fl.batchOf[id] = launchBatch{pass: 30, epoch: 1, at: now.Add(-2 * forgetAfter)}
+		fl.pool.Observe(id, client.OutBootFailed, time.Time{})
+	}
+	fl.lastPrb = time.Now()
+	d.manage(context.Background(), fl)
+	if got := recent(d, fl); got != n+1 {
+		t.Errorf("a client-reported failed batch counted %d failures, want 1", got-n)
 	}
 }
 
