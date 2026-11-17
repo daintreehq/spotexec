@@ -49,7 +49,9 @@ const (
 	warmAfter = 10 * time.Minute
 	// genSpeedup is the speed per vCPU each instance generation adds
 	// (m7a.2xlarge ran the same shards about 10% faster than m6a.2xlarge).
-	// Only weighed for vcpus runners, whose types span generations.
+	// Only weighed for vcpus runners, whose types span generations, and
+	// only for types the runner's own runs haven't measured (see
+	// measuredSpeeds).
 	genSpeedup = 1.10
 	// runRoundTrips is the round trips from this machine to the VM in an
 	// hour of work: some 30 runs of ~10 SSH round trips each.
@@ -77,11 +79,13 @@ type RunCost struct {
 	// (several regions only).
 	ColdParts *ColdParts `json:"cold_parts,omitempty"`
 	// RelSpeed is the type's speed per vCPU against the fastest option's
-	// (1: as fast), from its instance generation.
-	RelSpeed float64   `json:"relative_speed"`
-	Warm     bool      `json:"warm"`                // no part of a cold start is paid
-	WarmSeen time.Time `json:"warm_seen,omitempty"` // last time a VM of this runner ran in the region, when that decided a part
-	RTTMS    int       `json:"rtt_ms,omitempty"`    // TCP connect to the region's EC2 endpoint (0: not measured)
+	// (1: as fast): measured from the runner's runs (SpeedMeasured), else
+	// from its instance generation.
+	RelSpeed      float64   `json:"relative_speed"`
+	SpeedMeasured bool      `json:"speed_measured,omitempty"`
+	Warm          bool      `json:"warm"`                // no part of a cold start is paid
+	WarmSeen      time.Time `json:"warm_seen,omitempty"` // last time a VM of this runner ran in the region, when that decided a part
+	RTTMS         int       `json:"rtt_ms,omitempty"`    // TCP connect to the region's EC2 endpoint (0: not measured)
 }
 
 // ColdParts is what a cold start in a region is made of: booting without a
@@ -124,7 +128,7 @@ type RunCostModel struct {
 	ImageMinutes   float64 `json:"cold_image_minutes"` // building the container image
 	WarmDays       float64 `json:"warm_days"`          // how long a region stays warm after a VM ran there (parts not checked)
 	WarmAfterMin   float64 `json:"warm_after_minutes"` // how long that VM must have been up
-	GenSpeedup     float64 `json:"gen_speedup"`        // speed per vCPU each generation adds (vcpus runners)
+	GenSpeedup     float64 `json:"gen_speedup"`        // speed per vCPU each generation adds (vcpus runners; types not measured)
 	RoundTrips     int     `json:"round_trips"`        // client round trips in that work
 	// FailureMinutes is what each recent failure of a zone and type adds,
 	// as minutes of the VM and waiting; FailureHalfLifeHours is how long a
@@ -132,7 +136,10 @@ type RunCostModel struct {
 	FailureMinutes       float64 `json:"failure_minutes"`
 	FailureHalfLifeHours float64 `json:"failure_half_life_hours"`
 	SpeedByGen           bool    `json:"speed_by_generation"`
-	Regions              bool    `json:"regions"` // warmth and distance weighed (several regions)
+	// MeasuredSpeeds: instance type -> its speed as the runner's own runs
+	// measured it (SpeedByGen runners), used in place of GenSpeedup.
+	MeasuredSpeeds map[string]TypeSpeed `json:"measured_speeds,omitempty"`
+	Regions        bool                 `json:"regions"` // warmth and distance weighed (several regions)
 	// DepsFrom and ImageFrom say where DepsMinutes and ImageMinutes came
 	// from: the project's measured installs and builds, or the defaults.
 	DepsFrom  ColdEstimate `json:"cold_deps_estimate"`
@@ -197,9 +204,13 @@ func (g *AWSGlobal) Rank(t PriceTable) Ranking {
 	ev := placementEvidence{now: g.clock(), warm: map[string]time.Time{}, rtt: map[string]time.Duration{}, found: t.warmth}
 	held := map[string]cooldown{}
 	var work *coldWork
+	var speeds map[string]TypeSpeed
 	_ = g.withState(func(st *placementState) {
 		if t.repoID != "" {
 			work = st.ColdWork[t.repoID]
+		}
+		if g.r.ByRequirements() {
+			speeds = measuredSpeeds(st.Speed, ev.now)
 		}
 		for _, p := range t.Prices {
 			if c, ok := st.Cooldown[reclaimKey(p)]; ok && ev.now.Before(c.Until) {
@@ -222,6 +233,9 @@ func (g *AWSGlobal) Rank(t PriceTable) Ranking {
 	ps := append([]SpotPrice(nil), t.Prices...)
 	if k.Order == config.LaunchRunCost {
 		k.Model = g.costModel(work, ev.now)
+		if k.Model.SpeedByGen {
+			k.Model.MeasuredSpeeds = speeds
+		}
 		k.Cost = runCosts(*k.Model, ps, ev)
 		idx := make([]int, len(ps))
 		for i := range idx {
@@ -278,6 +292,31 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 			maxGen = max(maxGen, typeGeneration(p.Type))
 		}
 	}
+	// byGen is a type's speed by its generation, against the newest
+	// option's. Unknown generations count as newest rather than guessing.
+	byGen := func(t string) float64 {
+		if gen := typeGeneration(t); gen > 0 {
+			return math.Pow(m.GenSpeedup, float64(gen-maxGen))
+		}
+		return 1
+	}
+	// speedOf is a type's speed in the same units: a measured type is
+	// placed against the fastest type it was measured with, which keeps
+	// its speed by generation (so a newer type never measured still ranks
+	// as the assumption has it).
+	speedOf := func(t string) (float64, bool) {
+		if s, ok := m.MeasuredSpeeds[t]; ok && s.Relative > 0 {
+			return byGen(s.Against) * s.Relative, true
+		}
+		return byGen(t), false
+	}
+	fastest := 0.0
+	if m.SpeedByGen {
+		for _, p := range ps {
+			s, _ := speedOf(p.Type)
+			fastest = max(fastest, s)
+		}
+	}
 	minRTT := time.Duration(-1)
 	if m.Regions {
 		for _, p := range ps {
@@ -291,9 +330,9 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 	for _, p := range ps {
 		price, wait := p.USD(), m.WaitCost
 		c := RunCost{RelSpeed: 1}
-		if gen := typeGeneration(p.Type); m.SpeedByGen && gen > 0 {
-			// Unknown generations count as fastest rather than guessing.
-			c.RelSpeed = math.Pow(m.GenSpeedup, float64(gen-maxGen))
+		if m.SpeedByGen && fastest > 0 {
+			s, measured := speedOf(p.Type)
+			c.RelSpeed, c.SpeedMeasured = s/fastest, measured
 		}
 		// An hour of the fastest option's work takes 1/RelSpeed hours here:
 		// the extra time costs the VM and the wait.
@@ -385,7 +424,11 @@ func (c RunCost) Factors() string {
 			parts = append(parts, fmt.Sprintf("+$%.3f %s", v, what))
 		}
 	}
-	add(c.Speed, fmt.Sprintf("slower type (%.0f%% speed)", c.RelSpeed*100))
+	how := "assumed"
+	if c.SpeedMeasured {
+		how = "measured"
+	}
+	add(c.Speed, fmt.Sprintf("slower type (%.0f%% speed, %s)", c.RelSpeed*100, how))
 	cold := "cold region"
 	if c.ColdParts != nil {
 		if paid := c.ColdParts.Paid(); paid != "" {
@@ -620,5 +663,6 @@ func forgetOld(st *placementState, now time.Time) {
 		}
 	}
 	forgetOldColdWork(st, now)
+	forgetOldSpeed(st, now)
 	forgetOldFailures(st, now)
 }

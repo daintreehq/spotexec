@@ -1117,6 +1117,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		res.OOMKilled = true
 		o.Rep.Warn("OOM_KILLED", "%s", oomMessage(result.MemoryLimitMB))
 	}
+	recordRunSpeed(lease, ws, o, result, res.Canceled)
 
 	// 6. Write-back of mutations.
 	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, res.ExitCode) &&

@@ -342,6 +342,9 @@ type placementState struct {
 	// ColdWork: repository ID -> how long the project's image builds and
 	// dependency installs took on VMs of this runner (see RecordColdWork).
 	ColdWork map[string]*coldWork `json:"cold_work,omitempty"`
+	// Speed: workload -> instance type -> how long its successful runs'
+	// commands took on VMs of that type, oldest first (see RecordRunSpeed).
+	Speed map[string]map[string][]speedSample `json:"speed,omitempty"`
 	// Discovered: every managed region has been listed once. Until then
 	// (first use, an upgrade from single-region, a lost state file) listings
 	// cover them all rather than trusting Active.

@@ -1,7 +1,10 @@
 package client
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -116,4 +119,42 @@ func recordColdWork(lease *Lease, ws *Workspace, part provider.ColdWorkPart, ms 
 		return
 	}
 	_ = provider.RecordColdWork(lease.Runner, ws.RepoID, part, time.Duration(ms)*time.Millisecond)
+}
+
+// recordRunSpeed keeps how long a successful run's command took on the
+// leased VM's instance type, for the runner's next launches to weigh that
+// type's speed by (#279). Only a command that ran to a clean exit 0 counts:
+// a failure, timeout or interrupt may have stopped it early. The time is
+// the helper's own, without [setup], so queueing and the network don't
+// count. Best effort: a failure to save it never fails the run.
+func recordRunSpeed(lease *Lease, ws *Workspace, o Options, r protocol.Result, canceled bool) {
+	if lease == nil || ws == nil || lease.InstanceID == "" || lease.Instance.Type == "" || canceled {
+		return
+	}
+	if r.ExitCode != 0 || r.TimedOut || r.Canceled || r.Interrupted || r.Shutdown || r.Withdrawn || r.SetupFailed || r.OOMKilled || r.StartError != "" {
+		return
+	}
+	ms := r.DurationMS - r.SetupMS
+	if ms <= 0 {
+		return
+	}
+	_ = provider.RecordRunSpeed(lease.Runner, SpeedWorkload(ws.RepoID, o), lease.Instance.Type, time.Duration(ms)*time.Millisecond)
+}
+
+// SpeedWorkload names what a run runs, for comparing its speed on one
+// instance type with another (provider.RecordRunSpeed): the project, the
+// command line and its environment (a shard's number), and whether it had
+// the VM to itself. Hashed: the runner's state keeps no command lines.
+func SpeedWorkload(repoID string, o Options) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00%t", repoID, o.Command, o.Exclusive)
+	keys := make([]string, 0, len(o.Env))
+	for k := range o.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(h, "\x00%s=%s", k, o.Env[k])
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
