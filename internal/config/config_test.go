@@ -1431,3 +1431,47 @@ func TestProjectEarlyDrainInherits(t *testing.T) {
 		t.Fatal("a project runner dropped its base's early_drain = false")
 	}
 }
+
+// The work volume (#264) is on by default on spotexec's own images, off on a
+// pinned AMI, sized or turned off by work_volume_gb, and a project's value
+// never writes through to the runner it extends.
+func TestWorkVolume(t *testing.T) {
+	g, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\n"+
+		"[runners.base]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nami = \"base\"\n"+
+		"[runners.pinned]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nami = \"ami-0123456789abcdef0\"\n"+
+		"[runners.pinnedon]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nami = \"ami-0123456789abcdef0\"\nwork_volume_gb = 100\n"+
+		"[runners.off]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwork_volume_gb = 0\n"+
+		"[runners.auto]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nami = \"auto\"\n"+
+		"[runners.min]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwork_volume_gb = 8\n"+
+		"[runners.max]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwork_volume_gb = 16384\n"+
+		"[runners.box]\ntype = \"ssh\"\nhost = \"box\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int{"aws": 64, "auto": 64, "base": 64, "min": 8, "max": 16384, "pinned": 0, "pinnedon": 100, "off": 0, "box": 0} {
+		if got := g.Runners[name].WorkVolume(); got != want {
+			t.Errorf("%s: work volume %d GiB, want %d", name, got, want)
+		}
+	}
+	for _, bad := range []string{"-1", "7", "16385"} {
+		if _, err := loadGlobalText(t, "[runners.aws]\ntype = \"aws-spot\"\nregion = \"us-east-1\"\nwork_volume_gb = "+bad+"\n"); err == nil || !strings.Contains(err.Error(), "work_volume_gb must be 0 (none) or between 8 and 16384 (got "+bad+")") {
+			t.Errorf("work_volume_gb = %s: %v", bad, err)
+		}
+	}
+	c, err := mergeProject(t, g, "[runners.small]\nextends = \"pinnedon\"\nwork_volume_gb = 0\n[runners.same]\nextends = \"pinnedon\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Global.Runners["small"].WorkVolume(); got != 0 {
+		t.Errorf("project override: %d GiB", got)
+	}
+	if got := c.Global.Runners["same"].WorkVolume(); got != 100 {
+		t.Errorf("inherited: %d GiB", got)
+	}
+	if got := g.Runners["pinnedon"].WorkVolume(); got != 100 {
+		t.Errorf("the project's value wrote through to the base: %d GiB", got)
+	}
+	if _, err := mergeProject(t, g, "[runners.bad]\nextends = \"aws\"\nwork_volume_gb = 7\n"); err == nil || !strings.Contains(err.Error(), "work_volume_gb") {
+		t.Errorf("project work_volume_gb = 7: %v", err)
+	}
+}

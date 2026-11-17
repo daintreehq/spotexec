@@ -285,6 +285,9 @@ type Synced struct {
 	Deleted   int     `json:"deleted"`
 	Bytes     int64   `json:"bytes"`
 	Corrected []Entry `json:"corrected,omitempty"`
+	// Reused: files copied from another slot of the repo on the runner
+	// rather than sent by the CLI (not in Written or Bytes).
+	Reused int `json:"reused,omitempty"`
 }
 
 // ContainerRun says how to run a command inside the project's container.
@@ -468,15 +471,29 @@ type Result struct {
 	// TimedOut, Canceled, StartError and OOMKilled then describe the setup.
 	SetupFailed bool  `json:"setup_failed,omitempty"`
 	SetupMS     int64 `json:"setup_ms,omitempty"`
+	// CommandMS is how long the command's own process ran, without the
+	// setup, preparing its container or collecting results (0: it never
+	// ran, or an older helper).
+	CommandMS int64 `json:"command_ms,omitempty"`
 }
 
 // Heartbeat is the body of a helper heartbeat (empty from older helpers):
 // the runner's memory, so a client that loses the runner can tell whether
-// it was out of memory at the time. Zero fields are unknown.
+// it was out of memory at the time, and how much of what the client sent
+// has arrived, so it can tell an upload stuck on the way. Zero fields are
+// unknown.
 type Heartbeat struct {
 	MemTotalMB int64   `json:"mem_total_mb,omitempty"`
 	MemAvailMB int64   `json:"mem_avail_mb,omitempty"`
 	PSIFull10  float64 `json:"psi_full10,omitempty"` // /proc/pressure/memory "full" avg10, percent
+	// Received is every byte the helper has read from the client so far
+	// on this session, frames still arriving included.
+	Received int64 `json:"received,omitempty"`
+	// HeldMS is how long, in all, the helper has left what the client sent
+	// unread because it was still busy with what came before (its queue
+	// full), the current wait included: time that says nothing about the
+	// connection.
+	HeldMS int64 `json:"held_ms,omitempty"`
 }
 
 // Pressure says whether a heartbeat shows a runner running out of memory:

@@ -121,8 +121,10 @@ takes part in scheduling, and every VM shuts itself down.
    - Lower-priority fleets only launch for demand the higher-priority ones
      can't cover.
    - Draining and outdated VMs don't count toward `max_instances`, but
-     with one set, launches pause while twice `max_instances` VMs are
-     alive, until some end; the wait reason counts the draining and outdated VMs holding them.
+     with one set, launches (warm-pool and `spotexec up` ones too) pause
+     while twice `max_instances` VMs are alive, until some end; the wait
+     reason, or `spotexec up`'s warning, counts the draining and outdated
+     VMs holding them.
    - A fleet at `max_instances` with jobs waiting ends one VM at a time in
      a region held as unreachable (one that failed its last probes and
      has none of this machine's runs on it), so the launch can go to a
@@ -364,7 +366,10 @@ VM yet (it was still syncing, building the image or installing dependencies).
 A VM whose last heartbeats showed it out of memory is not, and nor is one that
 EC2 still reports running after the command was handed over: the command may
 be what overloaded it, and replayed it could take another VM's jobs down with
-it (`MEMORY_PRESSURE`, `RUNNER_UNRESPONSIVE`; exit 125). A VM that announced it
+it (`MEMORY_PRESSURE`, `RUNNER_UNRESPONSIVE`; exit 125). Nor is one whose state
+EC2 couldn't report (the lookup failed or timed out): only a listing shows a VM
+gone, so it may still be running the command (`RUNNER_UNRESPONSIVE`), unless its
+whole region went silent, as below. A VM that announced it
 was going away (a Spot notice, or the helper reporting its shutdown, as at
 `max_lifetime`) is replayed either way. Before giving up on a
 silent helper whose VM is still running, the CLI waits 3 more minutes, so a

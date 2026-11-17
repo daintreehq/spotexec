@@ -199,10 +199,16 @@ type Runner struct {
 	SecurityGroupIDs     []string `toml:"security_group_ids"`
 	SSHCIDR              string   `toml:"ssh_cidr"`
 	VolumeGB             int      `toml:"volume_gb"`
-	User                 string   `toml:"user"`
-	OnDemandFallback     bool     `toml:"on_demand_fallback"`
-	CacheBucket          string   `toml:"cache_bucket"` // shared dependency cache: "auto" (default), a bucket name, or "off"
-	WaitCost             Dollars  `toml:"wait_cost"`    // USD an hour of waiting is worth against the Spot bill (run_cost); default DefaultWaitCost
+	// WorkVolumeGB is a second gp3 volume, formatted XFS on first boot,
+	// that holds the work root (slots and dependency caches): XFS shares a
+	// cached dependency tree's data with each slot (cp --reflink) where the
+	// ext4 root would copy all of it. Unset: DefaultWorkVolumeGB on
+	// spotexec's own images (ami auto or base), none on a pinned AMI; 0: none.
+	WorkVolumeGB     *int    `toml:"work_volume_gb"`
+	User             string  `toml:"user"`
+	OnDemandFallback bool    `toml:"on_demand_fallback"`
+	CacheBucket      string  `toml:"cache_bucket"` // shared dependency cache: "auto" (default), a bucket name, or "off"
+	WaitCost         Dollars `toml:"wait_cost"`    // USD an hour of waiting is worth against the Spot bill (run_cost); default DefaultWaitCost
 
 	// fleets (aws-spot, sim)
 	MaxInstances int `toml:"max_instances"` // fleet ceiling; 0 (the default): none, the Spot quota is the only limit
@@ -272,6 +278,25 @@ func (r *Runner) SchedMode() string {
 		return ModeBalanced
 	}
 	return r.Scheduling.Mode
+}
+
+// DefaultWorkVolumeGB is the work volume an aws-spot runner on spotexec's
+// own images gets when work_volume_gb is unset.
+const DefaultWorkVolumeGB = 64
+
+// WorkVolume is the size in GiB of the VM's work volume (see
+// WorkVolumeGB), or 0 for none: the work root stays on the root volume.
+func (r *Runner) WorkVolume() int {
+	if r.Type != TypeAWSSpot {
+		return 0
+	}
+	if r.WorkVolumeGB != nil {
+		return *r.WorkVolumeGB
+	}
+	if r.AMI == "" || r.AMI == "auto" || r.AMI == "base" {
+		return DefaultWorkVolumeGB
+	}
+	return 0
 }
 
 // EarlyDrain reports whether surplus VMs end early (scheduling.early_drain,
@@ -854,6 +879,9 @@ func (r *Runner) validate() error {
 		if r.VolumeGB < 8 || r.VolumeGB > MaxVolumeGB {
 			return fmt.Errorf("volume_gb must be between 8 and %d (got %d)", MaxVolumeGB, r.VolumeGB)
 		}
+		if w := r.WorkVolume(); w != 0 && (w < 8 || w > MaxVolumeGB) {
+			return fmt.Errorf("work_volume_gb must be 0 (none) or between 8 and %d (got %d)", MaxVolumeGB, w)
+		}
 	}
 	return nil
 }
@@ -1350,6 +1378,10 @@ func (c *Config) MergeProjectRunners() error {
 		if d := g.Scheduling.EarlyDrain; d != nil {
 			v := *d // decoding the project's value must not write through to the base
 			base.Scheduling.EarlyDrain = &v
+		}
+		if w := g.WorkVolumeGB; w != nil {
+			v := *w // as above
+			base.WorkVolumeGB = &v
 		}
 		// The project's way of choosing types replaces the inherited one: new
 		// instance_types alone drop inherited requirements, and requirements

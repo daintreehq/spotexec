@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path"
@@ -341,6 +342,15 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 // Update replaces entries (used when the helper reports corrected baselines
 // or after write-back).
 func (m *Manifest) Update(e protocol.Entry) { m.ByPath[e.Path] = e }
+
+// Clone is a copy of m that one run can Update (upload corrections,
+// write-back) without m or any other copy seeing it: ByPath is its own.
+// Everything else is shared, and read-only once Build returns.
+func (m *Manifest) Clone() *Manifest {
+	c := *m
+	c.ByPath = maps.Clone(m.ByPath)
+	return &c
+}
 
 type stageEntry struct{ mode, id string }
 

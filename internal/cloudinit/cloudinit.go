@@ -41,6 +41,31 @@ type Options struct {
 	BootstrapScript  string        // runs as root after the watchdog is armed
 	BootstrapTimeout time.Duration // per bootstrap script (default 15m)
 	UserBootstrap    string        // runs as User (login shell) after BootstrapScript
+
+	// WorkVolumeGB, when set, is the size of a blank EBS volume launched
+	// with the VM: it is formatted XFS and mounted at WorkRoot (the runner's
+	// work_root, "~/" for the user's home), so dependency caches reach a
+	// slot by reflink rather than a full copy (ext4, the root filesystem,
+	// has none). WorkRoot must pass WorkRootOK.
+	WorkVolumeGB int
+	WorkRoot     string
+}
+
+var workRootRe = regexp.MustCompile(`^[A-Za-z0-9_./~+-]+$`)
+
+// WorkRootOK reports whether the work volume can be mounted at work root p:
+// a path made of characters that need no quoting in the script or in
+// /etc/fstab.
+func WorkRootOK(p string) bool {
+	if !workRootRe.MatchString(p) || (p != "~" && !strings.HasPrefix(p, "~/") && strings.Contains(p, "~")) {
+		return false
+	}
+	for _, c := range strings.Split(p, "/") {
+		if c == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // Background apt jobs (unattended-upgrades, apt-daily) are stopped at boot:
@@ -96,6 +121,11 @@ echo "{{.MaxSecs}}" > "$D/max_lifetime"   # the helper stops taking new runs sho
 rm -f "$D/draining" "$D/ready" "$D/drain_after" "$D/drain_op"
 echo "drain_after" > "$D/features"   # what this watchdog understands (the helper checks)
 chmod 0644 "$D/features"
+{{- if .WorkVolumeBytes}}
+# Held until the work volume is set up (1b): the watchdog mustn't end the
+# VM while it waits for the disk. Taken before the watchdog is armed.
+exec 7<"$D/lifecycle.lock"; L7=0; flock -w 30 -s 7 && L7=1
+{{- end}}
 
 # ---- 1. Idle watchdog (armed before anything else can fail) ----
 cat > /usr/local/sbin/spotexec-watchdog <<'WATCHDOG'
@@ -177,6 +207,55 @@ systemctl enable --now spotexec-watchdog.timer
 # No default dependencies, and SIGTERM ignored: shutdown must not stop the
 # timer before it fires, nor kill the forced poweroff that backs it up.
 systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependencies=no --timer-property=DefaultDependencies=no /bin/sh -c 'trap "" TERM HUP; touch /var/tmp/spotexec/draining; {{.SelfDestruct}}; sleep 120; poweroff -f' >/dev/null 2>&1 || true
+
+{{- if .WorkVolumeBytes}}
+{{- /*
+  The runner's work root (slots and dependency caches) goes on a volume of
+  its own, formatted XFS: cp --reflink then shares a cached dependency
+  tree's data with each slot instead of copying all of it, which ext4 (the
+  root filesystem) can't. Done before the SSH key is authorized, so nothing
+  has written to the work root yet, and under the lifecycle lock (fd 7,
+  taken before the watchdog is armed), so the idle watchdog can't end the
+  VM while it waits for the disk. The disk is
+  the one blank EBS disk (no partitions, no filesystem: never the root
+  disk; not instance storage) of the requested size. Nitro numbers NVMe
+  disks in no fixed order, so no device name is trusted; the launch adds
+  the volume only to an image that maps no other EBS volume, so no data
+  disk of the image can pass for it. Anything unexpected leaves the work
+  root on the root disk, where slots copy their caches as before. Kept
+  short: these comments aren't rendered, and user-data is capped at 16 KiB.
+*/}}
+
+# ---- 1b. Work volume (XFS, for reflinked dependency caches) ----
+sx_workvol() {
+  local u={{.User}} g h w d dev= n=0 uuid end=$((SECONDS + 60))
+  command -v mkfs.xfs >/dev/null || { echo "no mkfs.xfs"; return 1; }
+  h=$(getent passwd "$u" | cut -d: -f6); g=$(id -gn "$u") || return 1
+  [ -n "$h" ] || return 1
+  w='{{.WorkRoot}}'
+  case "$w" in '~') w=$h ;; '~/'*) w=$h/${w#'~/'} ;; /*) ;; *) w=$h/$w ;; esac
+  inuse() { if [ -L "$w" ] || { [ -e "$w" ] && [ -n "$(ls -A "$w" 2>&1)" ]; }; then echo "$w is in use"; return 0; fi; return 1; }
+  inuse && return 1
+  while :; do
+    n=0
+    for d in $(lsblk -dbnpo NAME,SIZE,TYPE,MODEL 2>/dev/null | awk '$2 == {{.WorkVolumeBytes}} && $3 == "disk" && !/Instance Storage/ { print $1 }'); do
+      [ "$(lsblk -npo NAME "$d" 2>/dev/null | wc -l)" -eq 1 ] || continue
+      blkid -p "$d" >/dev/null 2>&1; [ $? -eq 2 ] && dev=$d n=$((n + 1))
+    done
+    [ "$n" -eq 0 ] && [ $SECONDS -lt $end ] || break
+    sleep 1
+  done
+  [ "$n" -eq 1 ] || { echo "found $n blank disks of {{.WorkVolumeGB}} GiB"; return 1; }
+  mkfs.xfs -q -K -m reflink=1 -L spotexecwork "$dev" && uuid=$(blkid -s UUID -o value "$dev") && [ -n "$uuid" ] || return 1
+  runuser -u "$u" -- mkdir -p "$w" 2>/dev/null || { mkdir -p "$w" && chown "$u:$g" "$w"; } || return 1
+  inuse && return 1
+  mount -t xfs -o noatime "$dev" "$w" || return 1
+  { chown "$u:$g" "$w" && chmod 0755 "$w" && echo "UUID=$uuid $w xfs noatime,nofail 0 0" >> /etc/fstab; } || { umount "$w"; return 1; }
+  echo "$w is on $dev"
+}
+{ [ "$L7" = 1 ] && sx_workvol; } >>/var/log/spotexec-bootstrap.log 2>&1 || echo "spotexec: no work volume: slots copy dependency caches" >>/var/log/spotexec-bootstrap.log
+touch "$D/activity"; exec 7<&-
+{{- end}}
 
 # ---- 2. SSH access for the spotexec-managed key ----
 U={{.User}}
@@ -319,7 +398,15 @@ func Render(o Options) (string, error) {
 	if o.BootstrapTimeout <= 0 {
 		o.BootstrapTimeout = 15 * time.Minute
 	}
+	var workBytes int64
+	if o.WorkVolumeGB > 0 {
+		if !WorkRootOK(o.WorkRoot) {
+			return "", fmt.Errorf("work root %q can't take the work volume", o.WorkRoot)
+		}
+		workBytes = int64(o.WorkVolumeGB) << 30
+	}
 	data := map[string]any{
+		"WorkVolumeBytes": workBytes, "WorkVolumeGB": o.WorkVolumeGB, "WorkRoot": o.WorkRoot,
 		"BootSecs": int(o.BootstrapTimeout.Seconds()),
 		"User":     o.User, "PublicKey": o.PublicKey, "SelfDestruct": o.SelfDestruct,
 		"IdleSecs": int(o.IdleTimeout.Seconds()), "MaxSecs": int(o.MaxLifetime.Seconds()),

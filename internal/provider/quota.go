@@ -113,6 +113,9 @@ type QuotaUsage struct {
 	// Machines are the other spotexec machines' vCPUs, by machine name.
 	Machines map[string]int `json:"machines,omitempty"`
 	Other    int            `json:"other"` // Spot instances spotexec didn't launch
+	// ids: the instances counted in Used, so a quota claim (see
+	// quotaClaim) for one of them isn't counted twice.
+	ids map[string]bool
 }
 
 // Admit decides whether this machine may launch need more vCPUs, sharing
@@ -183,7 +186,7 @@ func (u QuotaUsage) desired(need, fleet int) int {
 // (DescribeInstances), attributed to this machine, other spotexec machines
 // (by their host tag) or neither.
 func (a *AWSSpot) QuotaUsage(ctx context.Context) (QuotaUsage, error) {
-	u := QuotaUsage{Region: a.r.Region, Quota: -1, Machines: map[string]int{}}
+	u := QuotaUsage{Region: a.r.Region, Quota: -1, Machines: map[string]int{}, ids: map[string]bool{}}
 	me, _ := ownerID()
 	labels := map[string]string{} // owner -> machine name, unique per owner
 	taken := map[string]bool{}
@@ -221,6 +224,7 @@ func (a *AWSSpot) QuotaUsage(ctx context.Context) (QuotaUsage, error) {
 			}
 			n := vcpusOf(in.InstanceType) // quotas count a type's default vCPUs, whatever its CPU options
 			u.Used += n
+			u.ids[in.InstanceID] = true
 			switch owner := in.tag(tagOwner); {
 			case owner == "" || (in.tag(tagRunner) == "" && in.tag(tagBake) == ""):
 				u.Other += n
@@ -267,15 +271,20 @@ func (a *AWSSpot) admitSpot(u QuotaUsage, need int) *QuotaError {
 
 // admitting wraps a launch attempt with the pre-launch check: Spot
 // candidates in the standard families must fit the live usage (nil: not
-// known, so EC2 decides).
+// known, so EC2 decides) together with the runner's other launches still
+// claiming quota (see quotaClaim).
 func (a *AWSSpot) admitting(usage *QuotaUsage, run func(itype string, spot bool) (ec2Instance, error)) func(string, bool) (ec2Instance, error) {
 	return func(itype string, spot bool) (ec2Instance, error) {
-		if spot && usage != nil && standardFamily(itype) {
-			if qe := a.admitSpot(*usage, vcpusOf(itype)); qe != nil {
-				return ec2Instance{}, qe
-			}
+		if !spot || usage == nil || !standardFamily(itype) {
+			return run(itype, spot)
 		}
-		return run(itype, spot)
+		qe, settle := a.admitClaimed(*usage, vcpusOf(itype))
+		if qe != nil {
+			return ec2Instance{}, qe
+		}
+		inst, err := run(itype, spot)
+		settle(inst, err)
+		return inst, err
 	}
 }
 

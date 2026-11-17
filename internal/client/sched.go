@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -579,12 +580,18 @@ var errReaping = errors.New("being terminated: this client couldn't reach it, an
 // on one the policy no longer places on (unless c.Promote brings a standby
 // VM back). It returns the attempt ID.
 func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
+	return p.reserveOnCtx(context.Background(), in, c)
+}
+
+// reserveOnCtx is reserveOn, but gives up waiting for the ledger's lock
+// when ctx ends (an acquire out of queue time, #269).
+func (p *Pool) reserveOnCtx(ctx context.Context, in provider.Instance, c claim) (string, error) {
 	id := newAttemptID()
 	owner := processOwner()
 	if owner == "" {
 		return "", errNoOwner
 	}
-	err := p.with(func(st *poolState) error {
+	err := p.withCtx(ctx, func(st *poolState) error {
 		s := st.sched()
 		now := time.Now()
 		s.reconcileOwners(now)
@@ -673,7 +680,13 @@ func (s *schedState) promote(id string, now time.Time, why string) {
 // "reserved" when its process dies provably never reached the VM.
 // It fails (and the request must not go out) if that can't be recorded.
 func (p *Pool) markSent(id string) error {
-	return p.with(func(st *poolState) error {
+	return p.markSentCtx(context.Background(), id)
+}
+
+// markSentCtx is markSent, but gives up waiting for the ledger's lock when
+// ctx ends.
+func (p *Pool) markSentCtx(ctx context.Context, id string) error {
+	return p.withCtx(ctx, func(st *poolState) error {
 		a := st.sched().Attempts[id]
 		if a == nil {
 			return errors.New("reservation lost")

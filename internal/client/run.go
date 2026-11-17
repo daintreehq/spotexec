@@ -96,6 +96,10 @@ type Options struct {
 	// Env is set for the command over the project's env (a shard's
 	// SPOTEXEC_SHARD and SPOTEXEC_SHARDS).
 	Env map[string]string
+	// Scan, for a part of a fan-out, is the worktree scan its parts share:
+	// a synced run's first attempt starts from a copy of it instead of
+	// scanning the worktree itself.
+	Scan *SharedScan
 }
 
 // Result of a run.
@@ -165,10 +169,16 @@ type Result struct {
 	// lostWhen is when the attempt gave up on its runner (no earlier than
 	// the last word it sent the helper).
 	lostWhen time.Time
+	// speed: this attempt's command time, kept once its lease is released
+	// (see recordRunSpeed).
+	speed *speedSample
 	// moveTo: the attempt withdrew from a VM where it waited for a run
 	// permit, nothing having run, and carries on in this slot elsewhere.
 	moveTo *Lease
 	moveFP string
+	// stalled: the attempt's upload stopped arriving on a connection whose
+	// helper kept answering (#265), before anything ran.
+	stalled bool
 }
 
 // stage is how far an attempt had got: the phase it was in, whether the
@@ -392,6 +402,7 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 	spent := map[string]time.Duration{}
 	for {
 		res, err, lost := runOnce(ctx, cfg, ws, o, att)
+		recordRunSpeed(res.speed) // the attempt's lease is released by now
 		reached = reached || res.Runner != ""
 		res.Reached = reached
 		for k, d := range res.Phases {
@@ -402,6 +413,18 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		if att.lease != nil {
 			// Not a replay: nothing ran, and the slot is already held.
 			att.moves++
+			continue
+		}
+		if res.stalled {
+			if !stallRetry(o, ctx.Err() != nil, att.n) {
+				return res, err
+			}
+			// Nothing ran, and the VM isn't to blame: the connection to it
+			// is, and its master is retired. The VM stays eligible (it may
+			// be the only one), and is never marked lost for anyone else.
+			o.Rep.Warn("UPLOAD_STALLED", "%v; retrying the run on a fresh connection", err)
+			o.Rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "reason": "upload_stalled"})
+			att.n++
 			continue
 		}
 		retry, code, why := replayable(lost, res, o, ctx.Err() != nil, att.n)
@@ -426,6 +449,25 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		}
 		att.n++
 	}
+}
+
+// stallRetry decides whether an attempt whose upload stalled (#265) is
+// retried: once per run, like a replay, and never for a run pinned to its
+// last slot (that slot stays held until the stalled session's helper lets
+// go of it).
+func stallRetry(o Options, canceled bool, n int) bool {
+	return o.RetryPreempt && !canceled && !o.PreferLast && !o.SameSlot && n < 2
+}
+
+// uploadStall is the error of an attempt whose upload to the lease's runner
+// stopped arriving while the helper kept answering, or nil. A VM out of
+// memory can't keep up with what it is sent either: that stays a lost
+// runner, which its memory keeps from being replayed.
+func uploadStall(l *Lease) error {
+	if l == nil || !l.Sess.UploadStalled() || l.Sess.MemoryPressure(PressureWindow) != "" {
+		return nil
+	}
+	return l.Sess.LostErr()
 }
 
 // replayable decides whether an attempt that lost its runner (lost, from
@@ -476,6 +518,11 @@ func replayable(lost string, res Result, o Options, canceled bool, n int) (retry
 // hadn't been dispatched, and otherwise not (its outcome is unknown), with
 // a warning that says so instead of blaming the run or the VM.
 //
+// A VM whose state the cloud couldn't report (its listing failed or timed
+// out) is treated as still running, since only a listing shows it gone
+// (#266): not replayed after dispatch, unless its region went silent as
+// below, and the warning says EC2 couldn't tell rather than blaming the run.
+//
 // A VM the cloud still runs that was lost after the command was dispatched,
 // with no memory pressure, may instead have gone silent with its whole
 // region, as this client sees it (regionSilent: a network partition, #229).
@@ -502,8 +549,19 @@ func whyNoReplayCtx(ctx context.Context, lease *Lease, noticed bool, at stage, e
 	if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
 		return noReplay{code: "MEMORY_PRESSURE", why: at.where() + ": it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
 	}
-	if !at.dispatched || !instanceRunning(lease) {
+	if !at.dispatched {
 		return noReplay{}
+	}
+	vm := instanceState(lease)
+	if vm == vmGone {
+		return noReplay{}
+	}
+	// EC2 not answering says nothing about whether the VM was reclaimed:
+	// it may still be running the command (#266). Only the region going
+	// silent with it, below, clears the run for a replay then.
+	ec2 := ", although EC2 still reports it running"
+	if vm == vmUnknown {
+		ec2 = ", and EC2 couldn't confirm whether it is still running (the lookup failed or timed out)"
 	}
 	if rl := regionSilentFn(ctx, lease); rl != nil {
 		holdSilent(ctx, lease, rl)
@@ -511,15 +569,22 @@ func whyNoReplayCtx(ctx context.Context, lease *Lease, noticed bool, at stage, e
 		// (once the helper there has given up on it), unless nothing
 		// showed the VM's memory: an older helper's heartbeats, or none.
 		if _, ok := lease.Sess.LastMemory(); !ok {
-			return noReplay{code: "REGION_UNREACHABLE", why: at.where() + ", although EC2 still reports it running: " + rl.String() + ". Its heartbeats never reported the VM's memory, so the run isn't replayed, and the attempt's outcome is unknown. Rerun it", region: rl}
+			return noReplay{code: "REGION_UNREACHABLE", why: at.where() + ec2 + ": " + rl.String() + ". Its heartbeats never reported the VM's memory, so the run isn't replayed, and the attempt's outcome is unknown. Rerun it", region: rl}
 		}
 		return noReplay{region: rl}
+	}
+	if vm == vmUnknown {
+		why := at.where() + ec2 + ", without a Spot notice: the VM may still be running it, so the attempt's outcome is unknown"
+		if m := lastMemory(lease.Sess); m != "" {
+			why += " (" + m + ")"
+		}
+		return noReplay{code: "RUNNER_UNRESPONSIVE", why: why + ". Check for its side effects before rerunning it"}
 	}
 	what := "the command"
 	if at.phase == phaseSetup || at.phase == phaseStartSetup {
 		what = "[setup] run"
 	}
-	why := at.where() + ", although EC2 still reports it running, without a Spot notice: "
+	why := at.where() + ec2 + ", without a Spot notice: "
 	if !at.started {
 		// Handed over, but not confirmed started: nothing says it ran,
 		// let alone overloaded the VM, but it may have.
@@ -725,7 +790,14 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if o.Sync != "none" {
 		o.Rep.Status("scanning %s", ws.Root)
 		t := time.Now()
-		m, err = manifest.Build(ctx, ManifestOptions(ws.Root, p))
+		if o.Scan != nil && att.n == 1 && att.moves == 0 {
+			// A fan-out's part starts from the scan its siblings share.
+			m, err = o.Scan.get(ctx)
+		} else {
+			// A replay or a move scans afresh: the worktree may have
+			// changed since, and the slot it lands on must get that.
+			m, err = buildManifest(ctx, ManifestOptions(ws.Root, p))
+		}
 		res.spend(PhaseScan, time.Since(t))
 		if err != nil {
 			return res, infra(fmt.Errorf("enumerating files: %w", err)), ""
@@ -861,8 +933,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	recordLastRun := func() { keepLastRun(ws, o, lastRun, &res) }
 	label := fmt.Sprintf("%s#%d", r.Name, lease.Acq.Token)
 
-	// 3. Forward sync.
+	// 3. Forward sync. The uploads are watched for getting through (#265).
 	if m != nil {
+		sess.WatchUploads(true)
 		if lease.Acq.FingerprintMatch {
 			o.Rep.Event("sync_in", map[string]any{"mode": "fingerprint_hit", "files": 0, "bytes": 0, "duration_ms": 0})
 		} else {
@@ -875,18 +948,43 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			}
 			syn, err := syncIn(ctx, sess, m, p.Deps.CacheDirs, stray, o)
 			if err != nil {
+				if serr := uploadStall(lease); serr != nil {
+					res.stalled = true
+					return res, infra(fmt.Errorf("sync to %s: %w", r.Name, serr)), ""
+				}
 				return res, infra(fmt.Errorf("sync to %s: %w", r.Name, err)), lostRunner(lease, err)
 			}
 			// The sync removed whatever an earlier write-back held here.
 			clearHeld(ws, lastRun)
 			res.Synced, res.SyncBytes = syn.Written, syn.Bytes
-			o.Rep.Event("sync_in", map[string]any{"mode": "delta", "files": syn.Written, "deleted": syn.Deleted, "bytes": syn.Bytes, "duration_ms": time.Since(t).Milliseconds()})
-			o.Rep.Status("%s · synced %d files (%s) in %s", label, syn.Written, ui.Bytes(syn.Bytes), ui.Dur(time.Since(t)))
+			ev := map[string]any{"mode": "delta", "files": syn.Written, "deleted": syn.Deleted, "bytes": syn.Bytes, "duration_ms": time.Since(t).Milliseconds()}
+			reused := ""
+			if syn.Reused > 0 {
+				ev["reused"] = syn.Reused
+				reused = fmt.Sprintf(", %d copied from other slots", syn.Reused)
+			}
+			o.Rep.Event("sync_in", ev)
+			o.Rep.Status("%s · synced %d files (%s)%s in %s", label, syn.Written, ui.Bytes(syn.Bytes), reused, ui.Dur(time.Since(t)))
 		}
 		// Before the image and dependencies, so install scripts see it too.
 		prog.set(phaseGitSeed)
 		if err := seedGit(ctx, sess, m, p.Sync.GitSeed, o, label); err != nil {
+			if serr := uploadStall(lease); serr != nil {
+				res.stalled = true
+				return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, serr)), ""
+			}
 			return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, err)), lostRunner(lease, err)
+		}
+		// A stall judged as the upload ended still ends the attempt: as a
+		// stall, or (memory pressure) as a lost runner.
+		sess.WatchUploads(false)
+		if sess.UploadStalled() {
+			if serr := uploadStall(lease); serr != nil {
+				res.stalled = true
+				return res, infra(fmt.Errorf("uploading to %s: %w", r.Name, serr)), ""
+			}
+			err := sess.LostErr()
+			return res, infra(fmt.Errorf("uploading to %s: %w", r.Name, err)), lostRunner(lease, err)
 		}
 	}
 
@@ -1117,6 +1215,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		res.OOMKilled = true
 		o.Rep.Warn("OOM_KILLED", "%s", oomMessage(result.MemoryLimitMB))
 	}
+	res.speed = runSpeed(lease, ws, o, result, ex.Env, res.Canceled)
 
 	// 6. Write-back of mutations.
 	if m != nil && o.Sync == "auto" && wantWriteback(o.Writeback, res.ExitCode) &&
@@ -2063,31 +2162,72 @@ func waitIfRunning(lease *Lease, rep ui.Reporter) func(time.Duration) time.Durat
 	}
 }
 
-// instanceRunning asks the cloud (the instance's own region, for a
-// multi-region fleet) whether a lease's VM is running, within 10s; false
-// when it can't tell.
-func instanceRunning(lease *Lease) bool {
-	if lease.InstanceID == "" || lease.Provider == nil {
-		return false
+// vmState is what the cloud says about a lease's VM.
+type vmState int
+
+const (
+	// vmGone: the cloud listed the fleet and the VM isn't running in it
+	// (listed in another state, or not at all), or the lease has no VM.
+	vmGone vmState = iota
+	// vmRunning: the cloud lists the VM as running.
+	vmRunning
+	// vmUnknown: the cloud couldn't tell (the listing failed or ran out
+	// of time, or there is no fleet to ask), so the VM may well still be
+	// running (#266).
+	vmUnknown
+)
+
+func (s vmState) String() string {
+	switch s {
+	case vmRunning:
+		return "running"
+	case vmUnknown:
+		return "unknown"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	return "gone"
+}
+
+// instanceLookupTime bounds instanceState's listing (tests shorten it).
+var instanceLookupTime = 10 * time.Second
+
+// instanceState asks the cloud (the instance's own region, for a
+// multi-region fleet) whether a lease's VM is running, within
+// instanceLookupTime: vmUnknown when it can't tell. Only a listing that
+// succeeded shows the VM gone.
+func instanceState(lease *Lease) vmState {
+	if lease.InstanceID == "" {
+		return vmGone
+	}
+	if lease.Provider == nil {
+		return vmUnknown
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), instanceLookupTime)
 	defer cancel()
 	f, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.Fleet)
 	if !ok {
 		if f, ok = lease.Provider.(provider.Fleet); !ok {
-			return false
+			return vmUnknown
 		}
 	}
 	list, err := f.List(ctx)
 	if err != nil {
-		return false
+		return vmUnknown
 	}
 	for _, in := range list {
 		if in.ID == lease.InstanceID {
-			return in.State == provider.StateRunning
+			if in.State == provider.StateRunning {
+				return vmRunning
+			}
+			return vmGone
 		}
 	}
-	return false
+	return vmGone
+}
+
+// instanceRunning reports whether the cloud lists a lease's VM as running;
+// false when it can't tell.
+func instanceRunning(lease *Lease) bool {
+	return instanceState(lease) == vmRunning
 }
 
 // oomMessage explains an OOM_KILLED result; limitMB is the memory pool's

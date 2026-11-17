@@ -249,6 +249,43 @@ func (g *AWSGlobal) claimTrial(region string) bool {
 	return ok
 }
 
+// admitRegion decides, as an attempt goes out, whether region takes it:
+// ok unless the region is held unreachable or another launch is its trial.
+// When its hold has lapsed, this attempt becomes its trial, and trial is
+// when it was claimed (else zero; see dropTrialAt). One placement.lock
+// step, so overlapping launches can't both take the trial.
+func (g *AWSGlobal) admitRegion(region string) (ok bool, trial time.Time) {
+	now := g.clock().UTC() // round-trips through placement.json exactly
+	ran := false
+	err := g.withState(func(st *placementState) {
+		ran = true
+		var claimed bool
+		if ok, claimed = claimTrial(st.Cooldown, unreachKey(region), now, g.trialFor()); claimed {
+			trial = now
+		}
+	})
+	switch {
+	case !ran:
+		// Unreadable state: the attempt's own record of the launch
+		// (beforeSend) fails with the reason.
+		return true, time.Time{}
+	case err != nil && !trial.IsZero():
+		return false, time.Time{} // a trial not saved isn't this attempt's
+	}
+	return ok, trial
+}
+
+// dropTrialAt is dropTrial for the trial claimed at: a later launch's
+// trial (this one's lapsed meanwhile) stays.
+func (g *AWSGlobal) dropTrialAt(region string, at time.Time) {
+	_ = g.withState(func(st *placementState) {
+		if c, ok := st.Cooldown[unreachKey(region)]; ok && c.Trial.Equal(at) {
+			c.Trial = time.Time{}
+			st.Cooldown[unreachKey(region)] = c
+		}
+	})
+}
+
 // dropTrial lets region take launches again after its trial launch failed
 // (nothing launched there to try it).
 func (g *AWSGlobal) dropTrial(region string) {

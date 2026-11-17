@@ -262,38 +262,6 @@ func (a *AWSSpot) Status(ctx context.Context) (Info, error) {
 // Forget is a no-op: the AWS provider keeps no cached instance state.
 func (a *AWSSpot) Forget() {}
 
-// lockUp takes the per-runner provisioning lock, honoring ctx.
-func (a *AWSSpot) lockUp(ctx context.Context, log Logger) (func(), error) {
-	if err := os.MkdirAll(a.dir, 0o700); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(filepath.Join(a.dir, "up.lock"), os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	logged := false
-	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
-			f.Close()
-			return nil, err
-		}
-		if !logged && log != nil {
-			log("waiting for another spotexec process that is provisioning %s", a.r.Name)
-			logged = true
-		}
-		select {
-		case <-ctx.Done():
-			f.Close()
-			return nil, ctx.Err()
-		case <-time.After(250 * time.Millisecond):
-		}
-	}
-}
-
 // List returns this runner's pending and running instances.
 func (a *AWSSpot) List(ctx context.Context) ([]Instance, error) {
 	insts, err := a.describe(ctx, "pending", "running")
@@ -321,9 +289,10 @@ func (a *AWSSpot) Launch(ctx context.Context, log Logger) (Instance, error) {
 	if log == nil {
 		log = func(string, ...any) {}
 	}
-	// Shares the provisioning lock with Down, so `spotexec down` cannot
-	// finish while a launch is about to create an instance.
-	unlock, err := a.lockUp(ctx, nil)
+	// Shares the provisioning lock with other launches and with Down, so
+	// `spotexec down` cannot finish while a launch is about to create an
+	// instance.
+	unlock, err := a.lockLaunch(ctx)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -371,12 +340,16 @@ func (a *AWSSpot) Up(ctx context.Context, log Logger) (Info, error) {
 	// Stopped leftovers (e.g. an on-demand fallback stopped from the console)
 	// still bill for their volume: terminate them.
 	if stopped, err := a.describe(ctx, "stopped"); err == nil && len(stopped) > 0 {
-		p := url.Values{}
+		ids := make([]string, len(stopped))
 		for i, s := range stopped {
-			p.Set("InstanceId."+strconv.Itoa(i+1), s.InstanceID)
+			ids[i] = s.InstanceID
 		}
-		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err == nil {
-			log("terminated %d stopped instance(s) left over for %s", len(stopped), a.r.Name)
+		done, err := a.terminate(ctx, ids)
+		if len(done) > 0 {
+			log("terminated %d stopped instance(s) left over for %s", len(done), a.r.Name)
+		}
+		if err != nil {
+			log("stopped leftovers for %s: %v", a.r.Name, err)
 		}
 	}
 	in, err := a.ranker().launch(ctx, log)
@@ -391,61 +364,110 @@ func (a *AWSSpot) Up(ctx context.Context, log Logger) (Info, error) {
 	return info, err
 }
 
+// bootPollInterval spaces waitRunning's status reads.
+var bootPollInterval = 3 * time.Second
+
 // waitRunning polls until the instance is running with a public IP.
+//
+// A status read that fails transiently (throttling, a 5xx, the network)
+// says nothing about the instance, so the wait rides it out until the boot
+// deadline instead of giving up a VM that may be booting fine: a burst of
+// launches can throttle DescribeInstances for longer than one Query call's
+// retries. Only a fresh read decides the instance is gone or unusable.
 func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger) (Info, error) {
-	deadline := time.Now().Add(a.r.BootTimeout.Duration)
-	if a.r.BootTimeout.Duration <= 0 {
-		deadline = time.Now().Add(10 * time.Minute)
+	timeout := a.r.BootTimeout.Duration
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
 	}
+	bctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	logged := ""
 	var runningNoIP time.Time
+	var readErr error // the latest failure of an ongoing status-read outage
+	delay := bootPollInterval
+	fresh := true // inst is an observation not yet acted on
 	for {
-		switch inst.State {
-		case "running":
-			if inst.IPAddress != "" {
-				a.pruneKnownHosts()
-				return a.info(inst), nil
+		if fresh {
+			fresh = false
+			switch inst.State {
+			case "running":
+				if inst.IPAddress != "" {
+					a.pruneKnownHosts()
+					return a.info(inst), nil
+				}
+				if runningNoIP.IsZero() {
+					runningNoIP = time.Now()
+				} else if time.Since(runningNoIP) > 45*time.Second {
+					_ = a.Terminate(ctx, inst.InstanceID)
+					return Info{}, fmt.Errorf("instance %s is running without a public IPv4 address (terminated it); use a subnet that can assign public IPs (subnet_id)", inst.InstanceID)
+				}
+			case "shutting-down", "terminated", "stopping", "stopped":
+				return Info{}, fmt.Errorf("instance %s entered state %q while booting (spot capacity reclaimed?)", inst.InstanceID, inst.State)
 			}
-			if runningNoIP.IsZero() {
-				runningNoIP = time.Now()
-			} else if time.Since(runningNoIP) > 45*time.Second {
-				_ = a.Terminate(ctx, inst.InstanceID)
-				return Info{}, fmt.Errorf("instance %s is running without a public IPv4 address (terminated it); use a subnet that can assign public IPs (subnet_id)", inst.InstanceID)
+			if logged != inst.State {
+				if inst.InstanceType != "" {
+					log("waiting for %s (%s, %s)", inst.InstanceID, inst.InstanceType, inst.State)
+				} else {
+					log("waiting for %s (%s)", inst.InstanceID, inst.State)
+				}
+				logged = inst.State
 			}
-		case "shutting-down", "terminated", "stopping", "stopped":
-			return Info{}, fmt.Errorf("instance %s entered state %q while booting (spot capacity reclaimed?)", inst.InstanceID, inst.State)
-		}
-		if logged != inst.State {
-			if inst.InstanceType != "" {
-				log("waiting for %s (%s, %s)", inst.InstanceID, inst.InstanceType, inst.State)
-			} else {
-				log("waiting for %s (%s)", inst.InstanceID, inst.State)
-			}
-			logged = inst.State
-		}
-		if time.Now().After(deadline) {
-			return Info{}, fmt.Errorf("instance %s not running with a public IP after %s (state %s)", inst.InstanceID, a.r.BootTimeout.Duration, inst.State)
 		}
 		select {
-		case <-ctx.Done():
-			return Info{}, ctx.Err()
-		case <-time.After(3 * time.Second):
+		case <-bctx.Done():
+			if ctx.Err() != nil {
+				return Info{}, ctx.Err()
+			}
+			if readErr != nil {
+				return Info{}, fmt.Errorf("instance %s not running with a public IP after %s: its status could not be read: %w", inst.InstanceID, timeout, readErr)
+			}
+			return Info{}, fmt.Errorf("instance %s not running with a public IP after %s (state %s)", inst.InstanceID, timeout, inst.State)
+		case <-time.After(delay):
 		}
 		p := url.Values{}
 		p.Set("InstanceId.1", inst.InstanceID)
-		b, err := a.api.ec2(ctx, "DescribeInstances", p)
+		var tried error
+		b, err := a.api.ec2(withQueryErrSink(bctx, &tried), "DescribeInstances", p)
 		if err != nil {
+			if ctx.Err() != nil {
+				return Info{}, ctx.Err()
+			}
+			if bctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+				// The boot deadline cut the read short: report what its
+				// attempts were failing with.
+				switch {
+				case tried != nil:
+					readErr = tried
+				case readErr == nil:
+					readErr = errors.New("DescribeInstances did not answer")
+				}
+				continue
+			}
 			if awsCode(err) == "InvalidInstanceID.NotFound" {
 				continue // eventual consistency right after launch
 			}
-			return Info{}, err
+			var ce *CredentialError
+			if errors.As(err, &ce) || classifyAWSError(err) != errRetryable {
+				return Info{}, err
+			}
+			if readErr == nil {
+				log("reading %s's status failed (%v); retrying until its boot deadline", inst.InstanceID, err)
+			} else {
+				delay = min(2*delay, 4*bootPollInterval) // Query backs off within a call; this eases off between them
+			}
+			readErr = err
+			// How long it has really lacked an IP is unknown until reads
+			// work again.
+			runningNoIP = time.Time{}
+			continue
 		}
 		got, _, err := parseDescribeInstances(b)
 		if err != nil {
 			return Info{}, err
 		}
 		if len(got) > 0 {
-			inst = got[0]
+			inst, fresh = got[0], true
+			readErr, delay = nil, bootPollInterval
 		}
 	}
 }
@@ -516,6 +538,7 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 		UserBootstrap: a.r.UserBootstrap, BootstrapTimeout: a.r.BootTimeout.Duration,
 	}
 	var ami, rootDev string
+	var img ec2Image
 	volume := a.r.VolumeGB
 	if spec.bake {
 		opts.IdleTimeout, opts.MaxLifetime = 60*time.Minute, 60*time.Minute
@@ -532,7 +555,7 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 				// and run the bootstrap instead.
 				log("not using baked image %s: %s; booting the current Ubuntu image (run `spotexec image bake %s`)", b.ID, b.Stale, a.r.Name)
 			default:
-				ami, rootDev = b.ID, b.img.RootDevice
+				ami, rootDev, img = b.ID, b.img.RootDevice, b.img
 				opts.BootstrapScript, opts.UserBootstrap = "", ""
 				if size := b.img.rootSize(); size > volume {
 					volume = size // can't launch with a volume smaller than the image's snapshot
@@ -548,7 +571,9 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 			}
 		}
 	}
-	ud, err := cloudinit.Render(opts)
+	// User-data that doesn't fit even without the work volume fails here,
+	// before any AWS call can turn it into a regional error.
+	plain, err := cloudinit.Render(opts)
 	if err != nil {
 		return ec2Instance{}, err
 	}
@@ -558,8 +583,38 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 		}
 	}
 	if rootDev == "" {
-		if rootDev, err = a.rootDevice(ctx, ami); err != nil {
+		if img, err = a.describeImage(ctx, ami); err != nil {
 			return ec2Instance{}, asRegionError(ctx, err)
+		}
+		rootDev = img.RootDevice
+	}
+	workDev := ""
+	// The bake builder gets no work volume: CreateImage would capture it.
+	if gb := a.r.WorkVolume(); gb > 0 && !spec.bake {
+		root := a.r.WorkRoot
+		if root == "" {
+			root = "~/.cache/spotexec"
+		}
+		var why string
+		workDev, why = workDevice(img)
+		switch {
+		case !cloudinit.WorkRootOK(root):
+			log("no work volume: work_root %q isn't a plain path (dependency caches are copied into each slot)", root)
+		case workDev == "":
+			log("no work volume: %s (dependency caches are copied into each slot)", why)
+		default:
+			opts.WorkVolumeGB, opts.WorkRoot = gb, root
+		}
+	}
+	ud := plain
+	if opts.WorkVolumeGB > 0 {
+		// The work volume's setup must not cost a bootstrap script that
+		// fitted the 16 KiB of user-data without it.
+		if withVol, err := cloudinit.Render(opts); err == nil {
+			ud = withVol
+		} else {
+			log("no work volume: %v (dependency caches are copied into each slot)", err)
+			opts.WorkVolumeGB, opts.WorkRoot = 0, ""
 		}
 	}
 	sgs, err := a.securityGroups(ctx, log)
@@ -589,6 +644,13 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.Itoa(volume))
 	base.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
+	if opts.WorkVolumeGB > 0 {
+		// Blank: user-data finds it by size, whatever the guest calls it.
+		base.Set("BlockDeviceMapping.2.DeviceName", workDev)
+		base.Set("BlockDeviceMapping.2.Ebs.VolumeType", "gp3")
+		base.Set("BlockDeviceMapping.2.Ebs.VolumeSize", strconv.Itoa(opts.WorkVolumeGB))
+		base.Set("BlockDeviceMapping.2.Ebs.DeleteOnTermination", "true")
+	}
 	tags := [][2]string{{tagRunner, a.r.Name}, {tagOwner, owner}, {tagHost, HostLabel()}, {"Name", "spotexec-" + a.r.Name}}
 	if spec.bake {
 		// Never part of the fleet: the scheduler must not place work on it.
@@ -840,7 +902,15 @@ func (a *AWSSpot) runOne(ctx context.Context, base url.Values, itype string, spo
 	for attempt := 0; attempt < 4; attempt++ {
 		b, err := a.api.ec2(ctx, "RunInstances", p)
 		if err == nil {
-			return parseRunInstances(b)
+			inst, perr := parseRunInstances(b)
+			if perr == nil && inst.InstanceID == "" {
+				perr = errors.New("no instance ID in the response")
+			}
+			if perr != nil {
+				// EC2 accepted the request: it may have made an instance.
+				return ec2Instance{}, fmt.Errorf("%w: unreadable RunInstances response: %v", ErrLaunchAmbiguous, perr)
+			}
+			return inst, nil
 		}
 		lastErr = err
 		if c := awsCode(err); c == "IdempotentInstanceTerminated" || c == "IdempotentParameterMismatch" {
@@ -885,17 +955,47 @@ func (a *AWSSpot) resolveAMI(ctx context.Context) (string, error) {
 // rootDevice reads the AMI's root device name (Ubuntu uses /dev/sda1,
 // Amazon Linux /dev/xvda); a wrong name would attach a second disk instead
 // of growing the root volume.
-func (a *AWSSpot) rootDevice(ctx context.Context, ami string) (string, error) {
+func (a *AWSSpot) describeImage(ctx context.Context, ami string) (ec2Image, error) {
 	p := url.Values{}
 	p.Set("ImageId.1", ami)
 	b, err := a.api.ec2(ctx, "DescribeImages", p)
 	if err != nil {
-		return "", fmt.Errorf("describe AMI %s: %w", ami, err)
+		return ec2Image{}, fmt.Errorf("describe AMI %s: %w", ami, err)
 	}
-	if dev := xmlFirst(b, "imagesSet>item>rootDeviceName"); dev != "" {
-		return dev, nil
+	var out struct {
+		Images []ec2Image `xml:"imagesSet>item"`
 	}
-	return "", fmt.Errorf("AMI %s not found in %s", ami, a.r.Region)
+	if err := xml.Unmarshal(b, &out); err == nil && len(out.Images) > 0 && out.Images[0].RootDevice != "" {
+		return out.Images[0], nil
+	}
+	return ec2Image{}, fmt.Errorf("AMI %s not found in %s", ami, a.r.Region)
+}
+
+// workDevice names the work volume's mapping: the first of /dev/sdf to
+// /dev/sdp the image doesn't map (as sdX or xvdX). None when the image maps
+// an EBS volume besides its root: user-data tells the work volume by its
+// size and blankness, which a data volume of the image could share.
+func workDevice(img ec2Image) (dev, why string) {
+	used := map[string]bool{}
+	norm := func(n string) string {
+		n = strings.TrimPrefix(n, "/dev/")
+		n = strings.TrimPrefix(n, "xv")
+		n = strings.TrimPrefix(n, "s")
+		return strings.TrimRight(n, "0123456789") // "da1" -> "da"
+	}
+	for _, d := range img.Devices {
+		used[norm(d.Name)] = true
+		if d.EBS != nil && norm(d.Name) != norm(img.RootDevice) {
+			return "", fmt.Sprintf("image %s maps an EBS volume at %s besides its root", img.ID, d.Name)
+		}
+	}
+	used[norm(img.RootDevice)] = true
+	for c := 'f'; c <= 'p'; c++ {
+		if !used["d"+string(c)] {
+			return "/dev/sd" + string(c), ""
+		}
+	}
+	return "", fmt.Sprintf("image %s maps every device from /dev/sdf to /dev/sdp", img.ID)
 }
 
 // securityGroups returns configured SGs or finds/creates spotexec-ssh.
@@ -937,6 +1037,22 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 	if id != "" && hasSSHIngress([]byte(body), a.r.SSHCIDR) {
 		return []string{id}, nil
 	}
+	// Overlapping launches on this machine create or open it one at a
+	// time, so the second finds the first's group rather than racing its
+	// creation (a fresh group may not be listed yet).
+	if a.dir != "" {
+		unlock, err := waitLockFile(ctx, a.lockPath("sg-"+a.r.Region+".lock"), syscall.LOCK_EX, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+		if id, err = find(); err != nil {
+			return nil, err
+		}
+		if id != "" && hasSSHIngress([]byte(body), a.r.SSHCIDR) {
+			return []string{id}, nil
+		}
+	}
 	if id == "" {
 		owner, err := a.ownerTag()
 		if err != nil {
@@ -959,8 +1075,20 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 			id = xmlFirst(b, "groupId")
 			log("created security group %s (%s) in %s", sgName, id, vpc)
 		case awsCode(err) == "InvalidGroup.Duplicate":
-			if id, err = find(); err != nil {
-				return nil, err
+			// Made meanwhile (another runner or machine), and maybe not
+			// listed yet.
+			for try := 0; ; try++ {
+				if id, err = find(); err != nil {
+					return nil, err
+				}
+				if id != "" || try == 5 {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(time.Second):
+				}
 			}
 		default:
 			return nil, fmt.Errorf("create security group: %w", err)
@@ -1156,22 +1284,90 @@ func (a *AWSSpot) downLocked(ctx context.Context, log Logger) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(insts) > 0 {
-		p := url.Values{}
-		for i, inst := range insts {
-			p.Set("InstanceId."+strconv.Itoa(i+1), inst.InstanceID)
-		}
-		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err != nil {
-			return 0, fmt.Errorf("terminate: %w", err)
-		}
-		for _, inst := range insts {
-			log("terminating %s (%s)", inst.InstanceID, inst.InstanceType)
-			_ = os.Remove(a.knownHosts(inst.InstanceID))
-		}
-	} else {
+	if len(insts) == 0 {
 		log("no running instances for %s", a.r.Name)
+		return 0, nil
 	}
-	return len(insts), nil
+	ids := make([]string, len(insts))
+	types := make(map[string]string, len(insts))
+	for i, inst := range insts {
+		ids[i] = inst.InstanceID
+		types[inst.InstanceID] = inst.InstanceType
+	}
+	done, err := a.terminate(ctx, ids)
+	for _, id := range done {
+		log("terminating %s (%s)", id, types[id])
+		_ = os.Remove(a.knownHosts(id))
+	}
+	if len(done) > 0 {
+		a.releaseClaims(done)
+	}
+	return len(done), err
+}
+
+// maxTerminateIDs is the most instance IDs EC2 takes in one
+// TerminateInstances request.
+const maxTerminateIDs = 1000
+
+// terminateRefill is how long EC2's TerminateInstances resource bucket takes
+// to regain one instance (20 a second by default). A full batch empties the
+// default bucket, so the next one can be throttled for longer than query's
+// own retries cover.
+var terminateRefill = 50 * time.Millisecond
+
+// terminate ends the given instances in batches EC2 accepts. It sends every
+// batch even after one is refused, and returns the IDs of the batches EC2
+// accepted, with an error naming those it refused or never sent. A refused
+// batch's outcome isn't known (EC2 can end part of it, and a lost response
+// hides an accepted one), but listing and terminating again is safe:
+// instances already shutting down drop out of the listing.
+func (a *AWSSpot) terminate(ctx context.Context, ids []string) ([]string, error) {
+	var done []string
+	var errs []error
+	failed := 0
+	batches := (len(ids) + maxTerminateIDs - 1) / maxTerminateIDs
+	for b := 0; b < batches; b++ {
+		lo := b * maxTerminateIDs
+		if err := ctx.Err(); err != nil {
+			failed += len(ids) - lo
+			errs = append(errs, fmt.Errorf("batches %d to %d of %d (%d instances) not sent: %w", b+1, batches, batches, len(ids)-lo, err))
+			break
+		}
+		batch := ids[lo:min(lo+maxTerminateIDs, len(ids))]
+		err := a.terminateBatch(ctx, batch)
+		if awsCode(err) == "RequestLimitExceeded" {
+			// Wait for the bucket to refill enough for this batch, then try
+			// once more.
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Duration(len(batch)) * terminateRefill):
+			}
+			if ctx.Err() != nil {
+				err = errors.Join(err, ctx.Err())
+			} else {
+				err = a.terminateBatch(ctx, batch)
+			}
+		}
+		if err != nil {
+			failed += len(batch)
+			errs = append(errs, fmt.Errorf("batch %d of %d (%d instances): %w", b+1, batches, len(batch), err))
+			continue
+		}
+		done = append(done, batch...)
+	}
+	if len(errs) > 0 {
+		return done, fmt.Errorf("terminate: %d of %d instances not confirmed: %w", failed, len(ids), errors.Join(errs...))
+	}
+	return done, nil
+}
+
+func (a *AWSSpot) terminateBatch(ctx context.Context, ids []string) error {
+	p := url.Values{}
+	for i, id := range ids {
+		p.Set("InstanceId."+strconv.Itoa(i+1), id)
+	}
+	_, err := a.api.ec2(ctx, "TerminateInstances", p)
+	return err
 }
 
 // Doctor checks credentials, identity, AMI and networking.

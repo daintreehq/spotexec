@@ -404,20 +404,22 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 				n = min(max(h.CPUs/4, 1), protocol.MaxSlots)
 			}
 			// Jobs running commands fill the slots; the helper admits more
-			// to prepare (sync, image, dependencies) or write back meanwhile.
-			running := protocol.RunningJobs(h.Holders)
+			// to wait for a run permit, to prepare (sync, image,
+			// dependencies) or to write back meanwhile.
+			running, waiting, preparing := jobPhases(h.Holders)
 			if exclusiveHeld(h.Holders) {
 				running = n // one job, the whole VM
 			}
 			slots = fmt.Sprintf("%d/%d", running, n)
-			more := 0
-			for _, x := range h.Holders {
-				if !x.Running() {
-					more++
-				}
+			var more []string
+			if waiting > 0 {
+				more = append(more, fmt.Sprintf("+%d waiting", waiting))
 			}
-			if more > 0 {
-				slots += fmt.Sprintf(" (+%d)", more)
+			if preparing > 0 {
+				more = append(more, fmt.Sprintf("+%d preparing", preparing))
+			}
+			if len(more) > 0 {
+				slots += " (" + strings.Join(more, ", ") + ")"
 			}
 			if h.CPUs > 0 && h.Load1 > 0 {
 				load = fmt.Sprintf("%.1f/%d", h.Load1, h.CPUs)
@@ -489,6 +491,43 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 			fmt.Fprintf(w, "  %s waiting for workspace slot %d: %s  (%s, %s pid %d, %s)\n", s.Name, h.Slot, h.Client.Command, age, h.Client.Host, h.Client.PID, h.Client.Worktree)
 		}
 	}
+}
+
+// jobPhases counts a VM's jobs by what they do: run a command (or hold
+// command capacity for the whole lease, as an older helper's or an
+// exclusive run's do), wait for a run permit, or prepare and write back.
+// A run holding several tokens (exclusive) counts once, and so does a run
+// permit: a job releasing one unlocks it before clearing its record, so
+// for a moment its successor may show the same permit; one of the two
+// runs, the other writes back.
+func jobPhases(hs []protocol.Holder) (running, waiting, preparing int) {
+	seen, permits := map[int]bool{}, map[int]bool{}
+	for i, h := range hs {
+		id := h.HelperPID
+		if id == 0 {
+			id = -1 - i
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		switch {
+		case h.Phased && h.Phase == protocol.PhaseRun && h.Run > 0:
+			if permits[h.Run] {
+				preparing++
+			} else {
+				permits[h.Run] = true
+				running++
+			}
+		case !h.Phased || h.Phase == protocol.PhaseRun:
+			running++
+		case h.Phase == protocol.PhaseRunWait:
+			waiting++
+		default:
+			preparing++
+		}
+	}
+	return running, waiting, preparing
 }
 
 // exclusiveHeld reports whether one run holds several tokens: an
@@ -698,15 +737,20 @@ func cmdUp() *cobra.Command {
 				count = 1
 			}
 			// Prewarming goes through the pool ledger, so it respects
-			// max_instances (when set) and concurrent sx processes see the
-			// launches.
+			// max_instances and the cap on live VMs (when set), and
+			// concurrent sx processes see the launches.
 			pool := client.NewPool(r, f)
-			ids, err := pool.Reserve(ctx, count)
+			rsv, err := pool.ReserveWhy(ctx, count)
 			if err != nil {
 				return err
 			}
+			ids := rsv.IDs
 			if len(ids) < count {
-				rep.Warn("MAX_INSTANCES", "%s: launching %d of %d requested (max_instances = %d)", r.Name, len(ids), count, r.MaxInstances)
+				code := "MAX_INSTANCES"
+				if rsv.LiveCap {
+					code = "LIVE_INSTANCE_CAP"
+				}
+				rep.Warn(code, "%s: launching %d of %d requested: %s", r.Name, len(ids), count, rsv.Reason)
 			}
 			if len(ids) == 0 {
 				return nil
@@ -1381,7 +1425,17 @@ func cmdCloudInit() *cobra.Command {
 			if user == "" {
 				user = "ubuntu"
 			}
-			s, err := cloudinit.Render(cloudinit.Options{User: user, PublicKey: pub, IdleTimeout: r.IdleTimeout.Duration, MaxLifetime: r.MaxLifetime.Duration, BootstrapScript: r.BootstrapScript, UserBootstrap: r.UserBootstrap})
+			o := cloudinit.Options{User: user, PublicKey: pub, IdleTimeout: r.IdleTimeout.Duration, MaxLifetime: r.MaxLifetime.Duration, BootstrapScript: r.BootstrapScript, UserBootstrap: r.UserBootstrap, BootstrapTimeout: r.BootTimeout.Duration}
+			// As launched: with the work volume's setup when it fits (the
+			// image's own mappings can still rule it out at launch).
+			if gb := r.WorkVolume(); gb > 0 && cloudinit.WorkRootOK(r.WorkRoot) {
+				o.WorkVolumeGB, o.WorkRoot = gb, r.WorkRoot
+			}
+			s, err := cloudinit.Render(o)
+			if err != nil && o.WorkVolumeGB > 0 {
+				o.WorkVolumeGB, o.WorkRoot = 0, ""
+				s, err = cloudinit.Render(o)
+			}
 			if err != nil {
 				return err
 			}

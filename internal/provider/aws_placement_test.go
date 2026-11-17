@@ -285,7 +285,7 @@ func TestRunCostFasterTypeWins(t *testing.T) {
 			t.Fatalf("winner's cost %+v", in.Placement)
 		}
 		// m6i: an hour of m7a's work takes it 1.1 hours.
-		if !strings.Contains(in.Placement.Why, "scores $0.155 (+$0.105 slower type (91% speed))") {
+		if !strings.Contains(in.Placement.Why, "scores $0.155 (+$0.105 slower type (91% speed, assumed))") {
 			t.Fatalf("why: %s", in.Placement.Why)
 		}
 	}

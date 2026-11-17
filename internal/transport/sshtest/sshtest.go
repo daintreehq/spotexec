@@ -14,11 +14,18 @@
 //     writing nothing (a wedged helper or half-open channel);
 //   - rpc-pressure: after the handshake the helper sends one heartbeat
 //     reporting memory pressure, then goes silent (a VM out of memory);
-//   - rpc-heartbeat: after the handshake the helper sends only heartbeats
-//     and never answers (alive, but slow);
+//   - rpc-heartbeat: after the handshake the helper sends only heartbeats,
+//     each with what it has received, reads everything sent to it and never
+//     answers (alive, but slow);
+//   - rpc-crawl: after the handshake the helper sends heartbeats with what
+//     it has received, but reads only the number of bytes in the file per
+//     heartbeat (a connection crawling upstream, #265);
 //   - rpc-memory: after the handshake the helper sends one heartbeat per
 //     comma-separated value in the file, each that many MiB available of
 //     16000, then goes silent;
+//   - rpc-sync: after the handshake the helper answers each manifest by
+//     asking for the paths listed in the file, reads them, and reports
+//     them synced;
 //   - hold-fds: another process keeps the session's stdin, stdout and
 //     stderr open after the fake is killed, as a ControlMaster does for a
 //     stuck channel (its pid goes in hold-fds.pid; it exits within 30s).
@@ -32,6 +39,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -83,6 +91,19 @@ func Install(t testing.TB) *Fake {
 // Set creates a behavior file (see the package doc) with content val.
 func (f *Fake) Set(name, val string) {
 	_ = os.WriteFile(filepath.Join(f.State, name), []byte(val), 0o600)
+}
+
+// countReader adds every byte read through it to n, as the helper counts
+// what it receives.
+type countReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c countReader) Read(b []byte) (int, error) {
+	k, err := c.r.Read(b)
+	c.n.Add(int64(k))
+	return k, err
 }
 
 // Release ends the process hold-fds started, if any.
@@ -174,7 +195,9 @@ func run(args []string) int {
 
 func rpc() int {
 	st := os.Getenv("FAKE_SSH_STATE")
-	conn := protocol.NewConn(os.Stdin, os.Stdout)
+	var recv atomic.Int64
+	in := countReader{os.Stdin, &recv}
+	conn := protocol.NewConn(in, os.Stdout)
 	if _, err := conn.ReadFrame(); err != nil {
 		return 1
 	}
@@ -238,11 +261,62 @@ func rpc() int {
 		}
 		time.Sleep(time.Hour)
 	}
-	if _, err := os.Stat(filepath.Join(st, "rpc-heartbeat")); err == nil {
-		go func() { _, _ = io.Copy(io.Discard, os.Stdin); os.Exit(0) }()
+	// rpc-sync: answers each manifest by asking for the paths listed in the
+	// file (one per line), reads the upload, and reports it synced.
+	if b, err := os.ReadFile(filepath.Join(st, "rpc-sync")); err == nil {
+		var need []string
+		for _, l := range strings.Split(string(b), "\n") {
+			if l != "" {
+				need = append(need, l)
+			}
+		}
+		for {
+			f, err := conn.ReadFrame()
+			if err != nil {
+				return 0
+			}
+			if env, err := protocol.Decode(f); err != nil || env.Type != protocol.TypeManifest {
+				continue
+			}
+			if err := conn.Send(protocol.TypeNeed, protocol.Need{Paths: need}); err != nil {
+				return 1
+			}
+			if len(need) > 0 {
+				for {
+					f, err := conn.ReadFrame()
+					if err != nil {
+						return 1
+					}
+					if f.Kind == protocol.KindBlobEnd {
+						break
+					}
+				}
+			}
+			if err := conn.Send(protocol.TypeSynced, protocol.Synced{Written: len(need)}); err != nil {
+				return 1
+			}
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(st, "rpc-crawl")); err == nil {
+		per, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		buf := make([]byte, max(per, 1))
 		for {
 			time.Sleep(50 * time.Millisecond)
-			if conn.Send(protocol.TypeHeartbeat, nil) != nil {
+			if per > 0 {
+				if _, err := io.ReadFull(in, buf); err != nil {
+					return 0
+				}
+			}
+			if conn.Send(protocol.TypeHeartbeat, protocol.Heartbeat{Received: recv.Load()}) != nil {
+				return 0
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join(st, "rpc-heartbeat")); err == nil {
+		go func() { _, _ = io.Copy(io.Discard, in); os.Exit(0) }()
+		for {
+			time.Sleep(50 * time.Millisecond)
+			if conn.Send(protocol.TypeHeartbeat, protocol.Heartbeat{Received: recv.Load()}) != nil {
 				return 0
 			}
 		}

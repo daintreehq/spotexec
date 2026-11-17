@@ -57,6 +57,16 @@ type Session struct {
 	onSilent atomic.Pointer[func(time.Duration) time.Duration]
 	pressure atomic.Pointer[pressureSeen]  // the latest heartbeat showing memory pressure
 	memory   atomic.Pointer[MemoryReading] // the latest heartbeat's memory reading
+	sent     atomic.Int64                  // bytes written to the helper so far
+	writing  atomic.Bool                   // a write to the helper is under way
+	up       uploadWatch                   // whether what we send is getting through
+	// retired is closed once the master a stalled upload ran on has been
+	// dealt with (see UploadStalled).
+	retired chan struct{}
+	// client and master are the connection the session runs on: the
+	// master's pid (0 if unknown), retired when an upload stalls on it.
+	client *Client
+	master atomic.Int64
 	// OnEvent receives helper events that arrive while waiting for replies.
 	OnEvent func(protocol.Event)
 }
@@ -97,7 +107,7 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s, err := c.openHelper(ctx, dialed)
+	s, err := c.openHelper(ctx, dialed, pid)
 	if err == nil || !IsConnError(err) || ctx.Err() != nil {
 		return s, err
 	}
@@ -113,7 +123,7 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 	if pid, _, err = c.ensureMaster(ctx); err != nil {
 		return nil, err
 	}
-	s, err = c.openHelper(ctx, true)
+	s, err = c.openHelper(ctx, true, pid)
 	if err != nil && IsConnError(err) && ctx.Err() == nil {
 		c.dropMaster(pid)
 	}
@@ -121,8 +131,9 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 }
 
 // openHelper installs the helper if needed and opens a session on it.
-// fresh says the master was just dialed (so it is known to be live).
-func (c *Client) openHelper(ctx context.Context, fresh bool) (*Session, error) {
+// fresh says the master was just dialed (so it is known to be live); pid
+// is that master's.
+func (c *Client) openHelper(ctx context.Context, fresh bool, pid int) (*Session, error) {
 	probe, hs := probeTimeout, handshakeTimeout
 	if !fresh {
 		probe, hs = reusedHandshakeTimeout, reusedHandshakeTimeout
@@ -131,12 +142,12 @@ func (c *Client) openHelper(ctx context.Context, fresh bool) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s, err := c.open(ctx, path, hs)
+	s, err := c.open(ctx, path, hs, pid)
 	if err != nil && !IsConnError(err) && ctx.Err() == nil {
 		// Stale marker (helper removed remotely, or work_root wiped): reinstall.
 		c.ForgetHelper()
 		if path, err2 := c.ensureHelper(ctx, true, probe); err2 == nil {
-			s, err = c.open(ctx, path, hs)
+			s, err = c.open(ctx, path, hs, pid)
 		} else {
 			err = err2 // why the reinstall failed is the useful error
 		}
@@ -144,7 +155,7 @@ func (c *Client) openHelper(ctx context.Context, fresh bool) (*Session, error) {
 	return s, err
 }
 
-func (c *Client) open(ctx context.Context, path string, handshake time.Duration) (*Session, error) {
+func (c *Client) open(ctx context.Context, path string, handshake time.Duration, master int) (*Session, error) {
 	cmd := exec.Command("ssh", c.Args("exec "+path+" rpc")...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -154,7 +165,8 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now()}
+	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now(), client: c, retired: make(chan struct{})}
+	s.master.Store(int64(master))
 	cmd.Stderr = s.stderr
 	// A master holding a stuck channel keeps the stderr pipe open after the
 	// client is gone: don't let that hold up Wait (and so Dead) for long.
@@ -165,8 +177,9 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	s.patience = HelperPatience
 	s.period = min(5*time.Second, SilenceLimit/4)
 	s.clk.boot, s.clk.bootOK = sinceBoot()
-	s.Conn = protocol.NewConn(protocol.ProgressReader{R: stdout, OnRead: s.heard}, stdin)
+	s.Conn = protocol.NewConn(protocol.ProgressReader{R: stdout, OnRead: s.heard}, countWriter{stdin, s})
 	s.heard()
+	s.up.window, s.up.floor = UploadStallWindow, UploadStallFloor
 	go s.readLoop()
 	go s.heartbeat()
 	s.limit.Store(int64(SilenceLimit))
@@ -227,6 +240,12 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	if err := env.Unmarshal(&s.Hello); err != nil {
 		s.Close()
 		return nil, err
+	}
+	// The master looked up before the session started may have been
+	// replaced since: then which one carries it is unknown, and a stall
+	// retires none.
+	if cur, ok := c.masterPID(ctx); !ok || cur != master {
+		s.master.Store(0)
 	}
 	return s, nil
 }
@@ -289,6 +308,9 @@ func (s *Session) readLoop() {
 		}
 		s.heard()
 		s.backed.Store(false)
+		// Nor was what it read from us meanwhile: it may have been
+		// waiting on us too.
+		s.up.reset()
 	}
 }
 
@@ -357,6 +379,23 @@ func (s *Session) watchdog() {
 				asked = false
 			}
 			s.recovered(seen, base/2)
+			// The verdict is the session's error, set while the watch is
+			// still armed: a caller that ends the upload either sees it or
+			// heads off any later one.
+			if s.up.judge(func(why string) bool {
+				return s.firstErr(fmt.Errorf("%w: %s", errUploadStalled, why))
+			}) {
+				s.silent.Store(true)
+				// The master carrying it most likely carries nothing else
+				// either: no new session may go onto it, a retry's included.
+				if s.client != nil {
+					s.client.retireMaster(int(s.master.Load()))
+				}
+				close(s.retired)
+				s.lostMu.Do(func() { close(s.lost) })
+				s.Abort()
+				return
+			}
 			silent := s.silence()
 			if silent <= s.Limit() {
 				continue
@@ -431,6 +470,7 @@ func (s *Session) observe(busy time.Duration) time.Duration {
 	if gap <= max(s.period, minSuspension) {
 		return 0
 	}
+	s.up.reset() // no upload got through while we were away
 	s.woke.Store(mono)
 	s.away.Store(max(s.away.Load(), int64(gap)))
 	return gap
@@ -477,12 +517,18 @@ func (s *Session) heartbeat() {
 	}
 }
 
-func (s *Session) setErr(err error) {
+func (s *Session) setErr(err error) { s.firstErr(err) }
+
+// firstErr sets the session's error, if it has none yet, and reports
+// whether it did.
+func (s *Session) firstErr(err error) bool {
 	s.errMu.Lock()
 	defer s.errMu.Unlock()
 	if s.err == nil {
 		s.err = err
+		return true
 	}
+	return false
 }
 
 func (s *Session) wrap(err error) error {
@@ -516,7 +562,7 @@ func (s *Session) lostErr() error {
 		err = io.ErrUnexpectedEOF
 	}
 	msg := "connection to runner lost" + s.suspendedNote()
-	if errors.Is(err, errSilent) {
+	if errors.Is(err, errSilent) || errors.Is(err, errUploadStalled) {
 		msg = err.Error()
 	}
 	return &ConnError{Target: "helper", Msg: msg, Err: s.wrap(err)}
@@ -665,6 +711,10 @@ func (s *Session) notePressure(env protocol.Envelope) {
 	}
 	if what := hb.Pressure(); what != "" {
 		s.pressure.Store(&pressureSeen{at: now, what: what})
+	}
+	// After the memory: a stall it proves must be judged knowing that.
+	if hb.Received > 0 {
+		s.up.note(s.now(), hb.Received, time.Duration(hb.HeldMS)*time.Millisecond, s.sent.Load(), s.writing.Load())
 	}
 }
 
