@@ -157,7 +157,7 @@ func TestMeasuredSpeedsWorkloadsWeighTheSame(t *testing.T) {
 	runs(st, now, "third", "m7a.2xlarge", 15, 15, 15)
 	runs(st, now, "third", "m6a.2xlarge", 40, 40, 40)
 	got = measuredSpeeds(st.Speed, now.Add(time.Minute))
-	if g := got["m6a.2xlarge"]; g.Group != "m6a.2xlarge" || !(g.Relative > 0.2 && g.Relative < 0.3) {
+	if g := got["m6a.2xlarge"]; g.Group != "m6a.2xlarge" || math.Abs(g.Relative-0.247480) > 1e-6 {
 		t.Fatalf("m6a %+v", g)
 	}
 }
@@ -200,8 +200,11 @@ func TestRecordSpeedBounds(t *testing.T) {
 	at := now.Add(time.Hour)
 	for i := 0; i < speedWorkloads+3; i++ {
 		if i == speedWorkloads {
-			// The first by name, run again: the least recently run go.
+			// The first by name, run again, and then once more by a clock
+			// set back: its latest run counts, and the least recently run
+			// go.
 			recordSpeed(st, "w000", "m7a.2xlarge", time.Second, at.Add(time.Duration(i)*time.Second))
+			recordSpeed(st, "w000", "m7a.2xlarge", time.Second, at.Add(-time.Minute))
 		}
 		recordSpeed(st, fmt.Sprintf("w%03d", i), "m7a.2xlarge", time.Second, at.Add(time.Duration(i)*time.Second))
 	}
@@ -367,7 +370,7 @@ func TestRunCostsMeasuredLabel(t *testing.T) {
 			t.Errorf("against m8a, %s: %+v", it, got)
 		}
 	}
-	c = runCosts(m, opts("m7a.2xlarge", "m6a.2xlarge", "c7a.2xlarge"), placementEvidence{now: time.Now()})
+	c = runCosts(m, opts("c7a.2xlarge", "m6a.2xlarge", "m7a.2xlarge"), placementEvidence{now: time.Now()})
 	for it, want := range map[string]RunCost{
 		"c7a.2xlarge": {RelSpeed: 1, SpeedFrom: SpeedByGeneration},
 		"m7a.2xlarge": {RelSpeed: 1, SpeedFrom: SpeedMeasured},

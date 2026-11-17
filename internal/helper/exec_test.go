@@ -139,10 +139,11 @@ func TestExecCommandTimeLeavesSetupOut(t *testing.T) {
 	if o.res.CommandMS < 200 || o.res.CommandMS >= 600 || o.res.SetupMS < 600 || o.res.DurationMS < o.res.SetupMS+o.res.CommandMS {
 		t.Fatalf("command %d ms, setup %d ms, all %d ms", o.res.CommandMS, o.res.SetupMS, o.res.DurationMS)
 	}
-	// A command that never started has no time.
-	o, _ = runExec(t, protocol.Exec{Shell: `true`, Cwd: "missing-dir", Snapshot: true}, "")
-	if o.res.StartError != "" && o.res.CommandMS != 0 {
-		t.Fatalf("not started: %+v", o.res)
+	// What the command leaves running isn't its time: reaping it takes
+	// the grace period.
+	o, _ = runExec(t, protocol.Exec{Shell: `(trap '' TERM; sleep 30) & sleep 0.1`, GraceMS: 1500, Snapshot: true}, "")
+	if o.res.ExitCode != 0 || o.res.CommandMS < 100 || o.res.CommandMS >= 1000 || o.res.DurationMS < 1500 {
+		t.Fatalf("left a process running: command %d ms, all %d ms (%+v)", o.res.CommandMS, o.res.DurationMS, o.res)
 	}
 }
 

@@ -119,6 +119,9 @@ type procResult struct {
 	canceled bool
 	spotIntr bool
 	startErr error
+	// ran is how long the process ran, from its start until it exited
+	// (0: it never started), without reaping what it left behind.
+	ran time.Duration
 }
 
 // teeOut, passed to runProc as out, sees the output as it goes to the
@@ -202,6 +205,7 @@ func (s *Session) runProc1(script, dir string, env map[string]string, timeout, g
 		ew.Close()
 		return procResult{code: 127, startErr: err}
 	}
+	started := time.Now()
 	ow.Close()
 	ew.Close()
 	pgid := cmd.Process.Pid
@@ -258,6 +262,7 @@ loop:
 	for {
 		select {
 		case waitErr = <-exited:
+			res.ran = time.Since(started)
 			break loop
 		case <-timer:
 			res.timedOut = true
@@ -482,7 +487,6 @@ func (s *Session) exec(e protocol.Exec) error {
 	// container) before this helper is signalled itself: that is a lost
 	// runner, not the script's result. One that finished on its own is
 	// never one.
-	var ranFor time.Duration // the last script's own process
 	runPhase := func(shell, dir string, timeout time.Duration, out io.Writer) (pr procResult, shutdown, oom bool, err error) {
 		script, runEnv, cleanup := shell, env, func() error { return nil }
 		if strings.TrimSpace(e.Setup) != "" {
@@ -508,9 +512,7 @@ func (s *Session) exec(e protocol.Exec) error {
 			}
 			script, runEnv, cleanup = host, hostEnv, c
 		}
-		ran := time.Now()
 		pr = s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch, out)
-		ranFor = time.Since(ran)
 		shutdown = pr.startErr == nil && !pr.timedOut && shutdownExit(pr.code, e.Container != nil) && systemStopping()
 		if err := cleanup(); err != nil {
 			if shutdown {
@@ -574,8 +576,8 @@ func (s *Session) exec(e protocol.Exec) error {
 			stuck = true
 			return err
 		}
-		if pr.startErr == nil {
-			commandMS = max(ranFor.Milliseconds(), 1)
+		if pr.ran > 0 {
+			commandMS = max(pr.ran.Milliseconds(), 1)
 		}
 	}
 	// The command and its container are gone: collecting and writing back
