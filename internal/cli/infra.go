@@ -509,12 +509,12 @@ func jobPhases(hs []protocol.Holder) (running, waiting, preparing int) {
 		}
 		seen[id] = true
 		switch {
-		case !h.Running():
-			preparing++
+		case !h.Phased || h.Phase == protocol.PhaseRun:
+			running++
 		case h.Phase == protocol.PhaseRunWait:
 			waiting++
 		default:
-			running++
+			preparing++
 		}
 	}
 	return running, waiting, preparing
