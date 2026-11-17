@@ -388,7 +388,7 @@ func TestRunUserFilesBudget(t *testing.T) {
 	if usersBudget < 2*time.Minute {
 		t.Fatalf("budget %v: a busy VM's runs need minutes", usersBudget)
 	}
-	bin, calls := statefulDocker(t, false, "", "", "")
+	bin, _ := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	writeTar(t, filepath.Join(bin, "tar-passwd"), "passwd", "root:x:0:0:root:/root:/bin/bash\n")
 	setSleep := func(d string) {
@@ -430,7 +430,6 @@ func TestRunUserFilesBudget(t *testing.T) {
 	// started runs start in the background once a read is under way.
 	started := func(ctx context.Context) <-chan error {
 		t.Helper()
-		n := len(callsWith(t, calls, "create --pull never"))
 		errs := make(chan error, 1)
 		bg.Add(1)
 		go func() {
@@ -438,7 +437,11 @@ func TestRunUserFilesBudget(t *testing.T) {
 			_, err := start(ctx)
 			errs <- err
 		}()
-		for t0 := time.Now(); len(callsWith(t, calls, "create --pull never")) == n; time.Sleep(20 * time.Millisecond) {
+		// The sleeper's pid, written before it sleeps (setSleep removed the last).
+		for t0 := time.Now(); ; time.Sleep(20 * time.Millisecond) {
+			if b, _ := os.ReadFile(filepath.Join(bin, "create-pid")); strings.HasSuffix(string(b), "\n") {
+				break
+			}
 			if time.Since(t0) > 5*time.Second {
 				t.Fatal("no read started")
 			}
