@@ -301,7 +301,7 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 	_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "deps_install", Message: d.Install})
 	cleanup := func() error { return nil }
 	if d.Container != nil {
-		host, hostEnv, c, err := s.containerScript(d.Container, d.Install, s.workspace, env)
+		host, hostEnv, c, err := s.containerScript(context.Background(), d.Container, d.Install, s.workspace, env)
 		if err != nil {
 			return perr(protocol.CodeDepsFailed, "%s", uncoded(err))
 		}
