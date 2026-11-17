@@ -153,7 +153,8 @@ var usersBudget = 5 * time.Minute
 // image's own, in which uid and gid resolve (withRunUser). They are made
 // from the image's files once per image, uid and gid on this VM, under the
 // work root (Layout.Users), where every slot of the runner user finds
-// them, and read from a container that is created but never started, so
+// them and acquiring a slot (which clears its run directory) leaves them,
+// and read from a container that is created but never started, so
 // the image needs no tools. Runs that need the same files together wait
 // for one read rather than each creating a container.
 func (s *Session) runUserFiles(ctx context.Context, d dockerRunner, image string, uid, gid int) (passwd, group string, err error) {

@@ -286,9 +286,9 @@ func TestMountsAt(t *testing.T) {
 	}
 }
 
-// Slots of one runner user share the users files of an image: first runs
-// that start together on a fresh VM read the image once, and a later slot
-// reuses what the first one made, after that slot's run directory is gone.
+// Slots of one runner user share the users files of an image: runs that
+// start together read the image once, and every later run reuses what the
+// first one made, though acquiring a slot clears its run directory.
 func TestRunUserFilesSharedAcrossSlots(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("runs as root: no run user to add")
@@ -352,16 +352,19 @@ func TestRunUserFilesSharedAcrossSlots(t *testing.T) {
 		}
 	}
 
-	// A slot released (its run directory cleared) and a new one: no read.
+	// Later runs, on a slot acquired again (which clears its run directory)
+	// and on a slot new to the image, while the VM is busy: no read.
 	if err := os.RemoveAll(filepath.Join(sessions[0].slotDir, "run")); err != nil {
 		t.Fatal(err)
 	}
-	src, err := run(session(4))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b, err := os.ReadFile(src); err != nil || !strings.HasPrefix(string(b), "root:x:0:0:") {
-		t.Fatalf("passwd %q (%v)", b, err)
+	for _, s := range []*Session{sessions[0], session(4)} {
+		src, err := run(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b, err := os.ReadFile(src); err != nil || !strings.HasPrefix(string(b), "root:x:0:0:") {
+			t.Fatalf("passwd %q (%v)", b, err)
+		}
 	}
 	if n := len(callsWith(t, calls, "create --pull never")); n != 1 {
 		t.Fatalf("image read %d times", n)
