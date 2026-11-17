@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -57,8 +58,8 @@ func slowHelpers(t *testing.T, after time.Duration, lease, honor bool) func() []
 // against it.
 func TestAcquireScanStopsAtQueueDeadline(t *testing.T) {
 	pool, fleets := fakeFleetsOf(t, map[string][]string{"healthy": {"b1", "b2", "b3", "b4"}}, 4)
-	probed := slowHelpers(t, 2*time.Second, false, true)
-	const queue = 200 * time.Millisecond
+	probed := slowHelpers(t, 5*time.Second, false, true)
+	const queue = 500 * time.Millisecond
 	start := time.Now()
 	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: queue, Rep: nopRep{}, NoBoot: true})
 	took := time.Since(start)
@@ -69,8 +70,8 @@ func TestAcquireScanStopsAtQueueDeadline(t *testing.T) {
 	if took > queue+time.Second {
 		t.Fatalf("returned after %s with a %s queue timeout (probed %v)", took, queue, probed())
 	}
-	if p := probed(); len(p) > 1 {
-		t.Fatalf("probed %v after the deadline", p)
+	if p := probed(); len(p) != 1 {
+		t.Fatalf("probed %v, want just the first VM, cut off by the deadline", p)
 	}
 	st := readState(t, NewPool(pool[0], fleets["healthy"]))
 	for _, h := range []string{"b1", "b2", "b3", "b4"} {
@@ -78,9 +79,15 @@ func TestAcquireScanStopsAtQueueDeadline(t *testing.T) {
 			t.Fatalf("%s marked unreachable for a probe the deadline cut: %+v", h, n)
 		}
 	}
-	for id, a := range NewPool(pool[0], nil).state(t).Attempts {
-		if a.State == attSent || a.State == attAcquired {
-			t.Fatalf("attempt %s left %v", id, a.State)
+	// The request went out before the deadline cut it: the helper may hold
+	// the slot until it notices, so the attempt is left uncertain, not firm.
+	atts := NewPool(pool[0], nil).state(t).Attempts
+	if len(atts) != 1 {
+		t.Fatalf("attempts %v, want the one interrupted probe's", atts)
+	}
+	for id, a := range atts {
+		if a.State != attUncertain {
+			t.Fatalf("attempt %s left %v, want uncertain", id, a.State)
 		}
 	}
 }
@@ -89,8 +96,9 @@ func TestAcquireScanStopsAtQueueDeadline(t *testing.T) {
 // doesn't place the run: the slot is given back and the run times out.
 func TestAcquireLateLeaseIsReleased(t *testing.T) {
 	pool := fleetsOf(t, map[string][]string{"healthy": {"b1", "b2"}})
-	probed := slowHelpers(t, 300*time.Millisecond, true, false)
-	l, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: 100 * time.Millisecond, Rep: nopRep{}, NoBoot: true})
+	probed := slowHelpers(t, time.Second, true, false)
+	rep := &recRep{}
+	l, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: 500 * time.Millisecond, Rep: rep, NoBoot: true})
 	WaitLaunches(5 * time.Second)
 	if l != nil || err == nil || !strings.Contains(err.Error(), protocol.CodeQueueTimeout) {
 		t.Fatalf("lease %v, error %v; want a queue timeout", l, err)
@@ -101,27 +109,45 @@ func TestAcquireLateLeaseIsReleased(t *testing.T) {
 	if s := NewPool(pool[0], nil).state(t); len(s.Attempts) != 0 {
 		t.Fatalf("attempts after a late lease: %v", s.Attempts)
 	}
+	rep.mu.Lock()
+	defer rep.mu.Unlock()
+	if slices.Contains(rep.events, "placed") {
+		t.Fatalf("a late lease reported as placed: %v", rep.events)
+	}
 }
 
 // #269: a cloud listing that outlasts queue_timeout ends with the queue
 // timeout, not after the listing gives up on its own, and not as "no runner
 // available".
 func TestAcquireListingStopsAtQueueDeadline(t *testing.T) {
-	pool, fleets := fakeFleetsOf(t, map[string][]string{"healthy": {"b1"}}, 1)
-	fleets["healthy"].slowList = true
-	probed := slowHelpers(t, 0, true, true)
-	const queue = 200 * time.Millisecond
-	start := time.Now()
-	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: queue, Rep: nopRep{}, NoBoot: true})
-	took := time.Since(start)
-	WaitLaunches(5 * time.Second)
-	if err == nil || !strings.Contains(err.Error(), protocol.CodeQueueTimeout) {
-		t.Fatalf("error = %v, want a queue timeout", err)
-	}
-	if took > queue+time.Second {
-		t.Fatalf("returned after %s with a %s queue timeout", took, queue)
-	}
-	if p := probed(); len(p) != 0 {
-		t.Fatalf("probed %v without a listing", p)
+	for _, policy := range []string{config.PolicyConsolidate, config.PolicyLegacy} {
+		t.Run(policy, func(t *testing.T) {
+			pool, fleets := fakeFleetsOf(t, map[string][]string{"healthy": {"b1"}}, 1)
+			pool[0].Scheduling.Policy = policy
+			f := fleets["healthy"]
+			f.slowList = true
+			probed := slowHelpers(t, 0, true, true)
+			const queue = 200 * time.Millisecond
+			start := time.Now()
+			_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: queue, Rep: nopRep{}, NoBoot: true})
+			took := time.Since(start)
+			WaitLaunches(5 * time.Second)
+			if err == nil || !strings.Contains(err.Error(), protocol.CodeQueueTimeout) {
+				t.Fatalf("error = %v, want a queue timeout", err)
+			}
+			if took > queue+time.Second {
+				t.Fatalf("returned after %s with a %s queue timeout", took, queue)
+			}
+			f.mu.Lock()
+			listed := f.listDeadline
+			f.mu.Unlock()
+			// Acquire sets its deadline just after start: allow it that.
+			if by := start.Add(queue + 100*time.Millisecond); listed.IsZero() || listed.After(by) {
+				t.Fatalf("listing's deadline %v, want the queue's (by %v)", listed, by)
+			}
+			if p := probed(); len(p) != 0 {
+				t.Fatalf("probed %v without a listing", p)
+			}
+		})
 	}
 }

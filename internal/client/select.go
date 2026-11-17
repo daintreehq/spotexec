@@ -545,6 +545,14 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
 			}
+			if err := stop(); err != nil {
+				// Out of time while planning: no launch for a run that has
+				// already given up.
+				if d.Launch && !provisioning[d.ID] {
+					m.pool.Cancel(d.ID)
+				}
+				return nil, err
+			}
 			for _, id := range d.Reap {
 				if !m.pool.commitReap(id) {
 					continue // a run reserved it meanwhile
@@ -630,7 +638,10 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		} else {
 			req.Rep.Status("queued %s%s · %s", pos, ui.Dur(time.Since(start)), status)
 		}
-		if time.Now().After(deadline) {
+		if err := stop(); err != nil {
+			if ctx.Err() != nil {
+				return nil, err
+			}
 			return nil, fmt.Errorf("%s: no free slot within %s (%s)", protocol.CodeQueueTimeout, queue, status)
 		}
 		// Poll interval grows with queue position: the head probes most
@@ -788,8 +799,11 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	if rerr == nil {
 		req.Base.Client.Attempt = aid
 		req.onSend = func() error {
-			if err := m.pool.markSent(aid); err != nil {
+			if err := m.pool.markSentCtx(ctx, aid); err != nil {
 				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return err // out of time while waiting for the ledger: not sent
 			}
 			sent = true
 			return nil
@@ -1086,7 +1100,11 @@ func tryAcquire(ctx context.Context, req AcquireRequest, r *config.Runner, p pro
 				Message: fmt.Sprintf("no slot on %s within %s (the runner never answered)", r.Name, req.QueueTimeout.Round(time.Second))}}}
 		}
 		if err != nil {
-			s.Close()
+			if ctx.Err() != nil {
+				s.Abort() // the caller gave up: no polite goodbye to a helper that may be silent
+			} else {
+				s.Close()
+			}
 			return nil, nil, err
 		}
 		switch env.Type {

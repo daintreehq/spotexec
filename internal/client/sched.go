@@ -680,7 +680,13 @@ func (s *schedState) promote(id string, now time.Time, why string) {
 // "reserved" when its process dies provably never reached the VM.
 // It fails (and the request must not go out) if that can't be recorded.
 func (p *Pool) markSent(id string) error {
-	return p.with(func(st *poolState) error {
+	return p.markSentCtx(context.Background(), id)
+}
+
+// markSentCtx is markSent, but gives up waiting for the ledger's lock when
+// ctx ends.
+func (p *Pool) markSentCtx(ctx context.Context, id string) error {
+	return p.withCtx(ctx, func(st *poolState) error {
 		a := st.sched().Attempts[id]
 		if a == nil {
 			return errors.New("reservation lost")
