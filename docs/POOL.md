@@ -79,9 +79,10 @@ takes part in scheduling, and every VM shuts itself down.
      launch's lead, and those releases cover the demand not already
      starting, `Plan` holds the launch. The lead is the median time recent
      launches took from being planned to their VM first serving (timed by
-     `spotexec up`, or by a run that saw the VM still booting within the
-     30s before it served), or two minutes until three launches have been
-     timed, and never more than ten. The hold lasts only while such
+     `spotexec up`, or by runs that saw the VM still booting within the
+     30s before it served, or that probed it without an answer from within
+     30s of its launch until it served, never more than 30s apart), or two
+     minutes until three launches have been timed, and never more than ten. The hold lasts only while such
      releases are still predicted and the job has waited less than the
      lead: a prediction that turns out overdue frees nothing, so the next
      round launches, and a job that has waited longer than the lead is
