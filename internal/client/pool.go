@@ -916,7 +916,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		}
 		d.QuotaErr = st.quotaBlocked(p.since)
 		var wholeVM bool
-		d.Ready, wholeVM = p.readyRoom(st, d.Demand-d.Capacity, demand, covered, whole, pendingVM, d.Waited, d.Lead, now)
+		d.Ready, wholeVM = p.readyRoom(st, d.Demand-d.Capacity, demand, covered, whole, away, pendingVM, d.Waited, d.Lead, now)
 		bootFailed := ""
 		for id, n := range st.Notes {
 			if n.BootFailed && time.Since(n.BootFailedAt) < time.Hour {
@@ -1437,7 +1437,11 @@ func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendi
 // while this process has waited less than a launch's lead: the ledger
 // knows only this machine's jobs, so a VM another machine fills looks free
 // here, and demand still waiting past the lead launches as before.
-func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, pendingVM map[string]bool, waited, lead time.Duration, now time.Time) (covers int, wholeLeft bool) {
+//
+// Room on a VM in a region some waiters can't use (away: replays kept out
+// of a silent region, #240) takes only the shared demand of the others,
+// and no whole-VM waiter, so those replays don't wait out a lead for it.
+func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, away awayDemand, pendingVM map[string]bool, waited, lead time.Duration, now time.Time) (covers int, wholeLeft bool) {
 	shared := total
 	for _, wt := range whole {
 		shared -= wt
@@ -1459,12 +1463,16 @@ func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, p
 	}
 	s := st.sched()
 	var empty []int
-	free := 0
+	free, freeAway := 0, 0
 	for _, w := range p.views(st, now) {
 		if !w.eligible || !w.ready || pendingVM[w.in.ID] || s.Fences[w.in.ID] != nil {
 			continue
 		}
 		if n := st.Notes[w.in.ID]; n.reaping(now) || now.Before(n.BusyUntil) {
+			continue
+		}
+		if w.in.Region != "" && away.avoided(w.in.Region) {
+			freeAway += max(w.units-w.firm-w.unc, 0)
 			continue
 		}
 		if w.firm+w.unc == 0 {
@@ -1484,7 +1492,11 @@ func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, p
 	for _, u := range empty[placed:] {
 		free += u
 	}
-	covers += min(shared, free)
+	awayW := 0
+	for _, a := range away {
+		awayW += a.weight
+	}
+	covers += min(shared, free+min(freeAway, max(0, shared-awayW)))
 	return min(covers, need), placed < len(left)
 }
 
