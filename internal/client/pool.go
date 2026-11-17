@@ -839,12 +839,12 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		demand, whole, away := p.waitersAway()
 		d.Demand = demand - covered
 		listed := map[string]bool{}
-		unusable := map[string]bool{} // listed, in a region some waiters can't use
+		unusable := map[string]string{} // listed, in a region some waiters can't use: its region
 		usable, total := 0, 0
 		for _, in := range st.Instances {
 			listed[in.ID] = true
 			if in.Region != "" && away.avoided(in.Region) {
-				unusable[in.ID] = true
+				unusable[in.ID] = in.Region
 			}
 			total++
 			if !st.Notes[in.ID].closed() {
@@ -852,8 +852,8 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			}
 		}
 		slots := p.SlotsPerInstance()
-		excludedCap := 0                // pending slots in VMs some waiters can't use
-		excludedVM := map[string]bool{} // those VMs
+		excludedCap := 0                 // pending slots in VMs some waiters can't use
+		awayRegions := map[string]bool{} // their regions
 		inLedger := map[string]bool{}
 		pendingVM := map[string]bool{} // instances whose slots count as pending
 		for _, l := range st.Launches {
@@ -872,9 +872,17 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 					// won't serve, so another launch (elsewhere) may.
 					continue
 				}
-				if unusable[l.InstanceID] {
+				rg := unusable[l.InstanceID]
+				if rg == "" && !listed[l.InstanceID] && l.Region != "" && away.avoided(l.Region) {
+					rg = l.Region // launched there, not listed yet
+				}
+				if rg != "" {
+					if !listed[l.InstanceID] {
+						usable++
+						total++
+					}
 					excludedCap += slots // it won't serve every waiter
-					excludedVM[l.InstanceID] = true
+					awayRegions[rg], pendingVM[l.InstanceID] = true, true
 					continue
 				}
 			}
@@ -895,9 +903,9 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			if inLedger[in.ID] || (n != nil && (n.Ready || n.closed())) {
 				continue
 			}
-			if unusable[in.ID] && time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
+			if unusable[in.ID] != "" && time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
 				excludedCap += slots // it won't serve every waiter
-				excludedVM[in.ID] = true
+				awayRegions[in.Region], pendingVM[in.ID] = true, true
 				continue
 			}
 			if time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
@@ -907,7 +915,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			}
 		}
 		// Booting VMs some waiters can't use serve only the others.
-		d.Capacity += min(excludedCap, max(0, d.Demand-away.weightAvoiding(st.Instances, excludedVM)))
+		d.Capacity += min(excludedCap, max(0, d.Demand-away.weightAvoiding(awayRegions)))
 		d.Live = usable
 		now := time.Now()
 		d.Lead, d.LeadLearned = st.sched().launchLead(now)
@@ -1492,9 +1500,11 @@ func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, a
 	for _, u := range empty[placed:] {
 		free += u
 	}
-	awayW := 0
+	awayW := 0 // shared demand that can't use freeAway
 	for _, a := range away {
-		awayW += a.weight
+		if !a.whole {
+			awayW += a.weight
+		}
 	}
 	covers += min(shared, free+min(freeAway, max(0, shared-awayW)))
 	return min(covers, need), placed < len(left)
@@ -1515,6 +1525,7 @@ const awayMark, awaySep = "~", "+"
 // awayDemand is what the waiters that can't use some regions weigh.
 type awayDemand []struct {
 	weight  int
+	whole   bool // a whole-VM waiter
 	regions []string
 }
 
@@ -1528,17 +1539,11 @@ func (a awayDemand) avoided(region string) bool {
 	return false
 }
 
-// weightAvoiding is the demand of the waiters that can't use the region
-// of one of vms (by ID, among insts). A waiter that avoids any of those
+// weightAvoiding is the demand of the waiters that can't use one of
+// regions. A waiter that avoids any of those
 // regions counts whole, even if it could use a VM in another of them: with
 // several regions avoided at once that may cost a launch, never a wait.
-func (a awayDemand) weightAvoiding(insts []provider.Instance, vms map[string]bool) int {
-	regions := map[string]bool{}
-	for _, in := range insts {
-		if vms[in.ID] && in.Region != "" {
-			regions[in.Region] = true
-		}
-	}
+func (a awayDemand) weightAvoiding(regions map[string]bool) int {
 	n := 0
 	for _, w := range a {
 		for _, rg := range w.regions {
@@ -1611,8 +1616,9 @@ func (p *Pool) waitersAway() (total int, whole []int, away awayDemand) {
 			tail, _, _ = strings.Cut(tail, ".")
 			away = append(away, struct {
 				weight  int
+				whole   bool
 				regions []string
-			}{w, strings.Split(tail, awaySep)})
+			}{w, w > 1 || strings.HasSuffix(e.Name(), exclusiveWaiter), strings.Split(tail, awaySep)})
 		}
 	}
 	return total, whole, away

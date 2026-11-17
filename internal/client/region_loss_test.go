@@ -699,3 +699,21 @@ func TestAcquireBootOnly(t *testing.T) {
 		}
 	}
 }
+
+// A launch into an avoided region that isn't listed yet doesn't cover a
+// replay kept out of that region either.
+func TestPlanUnlistedLaunchInAvoidedRegion(t *testing.T) {
+	p, _ := testPool(t, 4)
+	_ = p.with(func(st *poolState) error {
+		st.Launches = append(st.Launches, launchRec{ID: "l1", InstanceID: "i-new", Region: "ap-south-1", Started: time.Now()})
+		return nil
+	})
+	w, err := p.RegisterAway(1, false, []string{"ap-south-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Done()
+	if d, err := p.Plan(context.Background(), 0); err != nil || !d.Launch {
+		t.Fatalf("%+v, %v: want a launch elsewhere", d, err)
+	}
+}
