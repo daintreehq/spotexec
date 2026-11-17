@@ -7,31 +7,31 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// overlap counts RunInstances requests in flight at once, holding each
-// for hold.
-type overlap struct {
-	hold      time.Duration
-	now, peak atomic.Int32
-}
-
-func (o *overlap) onRun(string) {
-	n := o.now.Add(1)
-	for {
-		p := o.peak.Load()
-		if n <= p || o.peak.CompareAndSwap(p, n) {
-			break
-		}
+// launchAll starts n launches and returns their results.
+func launchAll(n int, launch func() error) <-chan error {
+	out := make(chan error, n)
+	for range n {
+		go func() { out <- launch() }()
 	}
-	time.Sleep(o.hold)
-	o.now.Add(-1)
+	return out
 }
 
-// Independent launches of one runner reach EC2 together, up to the cap.
+// noMore fails if another RunInstances arrives within a short wait.
+func noMore(t *testing.T, h *held, why string) {
+	t.Helper()
+	select {
+	case r := <-h.started:
+		t.Fatalf("a launch reached %s %s", r, why)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// Independent launches of one runner reach EC2 together, launchSlots at a
+// time: the rest go as those finish.
 func TestGlobalLaunchesOverlap(t *testing.T) {
 	f := &fakeRegionsEC2{prices: map[string][][3]string{
 		"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}, {"r-one-1b", "c6a.2xlarge", "0.06"}},
@@ -41,27 +41,20 @@ func TestGlobalLaunchesOverlap(t *testing.T) {
 	if _, err := g.Prices(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
-	o := &overlap{hold: 100 * time.Millisecond}
-	f.onRun = o.onRun
+	h := newHeld()
+	f.onRun = h.onRun
+	t.Cleanup(h.free)
 	const n = 8
-	var wg sync.WaitGroup
-	errs := make(chan error, n)
+	done := launchAll(n, func() error { _, err := g.Launch(context.Background(), t.Logf); return err })
+	for range launchSlots {
+		h.wait(t) // these are all sending at once
+	}
+	noMore(t, h, "past the launch slots")
+	h.free()
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := g.Launch(context.Background(), t.Logf); err != nil {
-				errs <- err
-			}
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Fatal(err)
-	}
-	if p := o.peak.Load(); p < 2 || p > launchSlots {
-		t.Fatalf("peak concurrent RunInstances = %d, want 2..%d", p, launchSlots)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 	if got := len(f.callsOf("RunInstances")); got != n {
 		t.Fatalf("RunInstances calls = %d, want %d", got, n)
@@ -75,30 +68,29 @@ func TestRegionalLaunchesOverlap(t *testing.T) {
 	}}
 	g := newGlobalEnv(t, f, "r-one-1")
 	a := g.home()
-	o := &overlap{hold: 100 * time.Millisecond}
-	f.onRun = o.onRun
-	const n = 4
-	var wg sync.WaitGroup
-	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := a.Launch(context.Background(), t.Logf); err != nil {
-				t.Error(err)
-			}
-		}()
+	h := newHeld()
+	f.onRun = h.onRun
+	t.Cleanup(h.free)
+	const n = 6
+	done := launchAll(n, func() error { _, err := a.Launch(context.Background(), t.Logf); return err })
+	for range launchSlots {
+		h.wait(t)
 	}
-	wg.Wait()
-	if p := o.peak.Load(); p < 2 {
-		t.Fatalf("peak concurrent RunInstances = %d, want overlap", p)
+	noMore(t, h, "past the launch slots")
+	h.free()
+	for range n {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
-// held makes RunInstances wait until released, telling started about
-// each request as it arrives.
+// held makes RunInstances wait until freed, telling started about each
+// request as it arrives.
 type held struct {
 	started chan string
 	release chan struct{}
+	once    sync.Once
 }
 
 func newHeld() *held { return &held{started: make(chan string, 16), release: make(chan struct{})} }
@@ -106,6 +98,21 @@ func newHeld() *held { return &held{started: make(chan string, 16), release: mak
 func (h *held) onRun(region string) {
 	h.started <- region
 	<-h.release
+}
+
+// free lets every held request (and every later one) answer.
+func (h *held) free() { h.once.Do(func() { close(h.release) }) }
+
+// wait waits for the next request to arrive.
+func (h *held) wait(t *testing.T) string {
+	t.Helper()
+	select {
+	case r := <-h.started:
+		return r
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for a RunInstances request")
+		return ""
+	}
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -133,6 +140,7 @@ func TestDownCoordinatesWithOverlappingLaunches(t *testing.T) {
 	}
 	h := newHeld()
 	f.onRun = h.onRun
+	t.Cleanup(h.free)
 	launched := make(chan error, 3)
 	launch := func() {
 		_, err := g.Launch(context.Background(), t.Logf)
@@ -140,8 +148,8 @@ func TestDownCoordinatesWithOverlappingLaunches(t *testing.T) {
 	}
 	go launch()
 	go launch()
-	<-h.started
-	<-h.started // both are sending
+	h.wait(t)
+	h.wait(t) // both are sending
 	downDone := make(chan error, 1)
 	go func() { downDone <- g.Down(context.Background(), t.Logf) }()
 	pending := g.home().lockPath(upWriterPending)
@@ -154,7 +162,7 @@ func TestDownCoordinatesWithOverlappingLaunches(t *testing.T) {
 		t.Fatalf("a launch reached %s while Down was waiting", r)
 	case <-time.After(300 * time.Millisecond):
 	}
-	close(h.release)
+	h.free()
 	for range 2 {
 		if err := <-launched; err != nil {
 			t.Fatal(err)
@@ -198,6 +206,9 @@ func TestLaunchClearsDeadWritersMarker(t *testing.T) {
 	if _, err := a.Launch(ctx, t.Logf); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(a.lockPath(upWriterPending)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("dead writer's marker still there: %v", err)
+	}
 }
 
 // A launch waiting for the lock gives up when its context ends.
@@ -209,11 +220,24 @@ func TestLaunchLockHonorsContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	if _, err := a.lockLaunch(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want the deadline", err)
+	}
+	unlock()
+	// Every slot taken.
+	for range launchSlots {
+		release, err := a.lockLaunch(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer release()
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := a.lockLaunch(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("with every slot taken: err = %v, want the deadline", err)
 	}
 }
 
@@ -228,18 +252,25 @@ func TestOverlappingLaunchesShareQuota(t *testing.T) {
 	a := g.home()
 	h := newHeld()
 	f.onRun = h.onRun
-	first := make(chan error, 1)
-	go func() {
-		_, err := a.Launch(context.Background(), t.Logf)
-		first <- err
-	}()
-	<-h.started
-	_, err := a.Launch(context.Background(), t.Logf)
-	var qe *QuotaError
-	if !errors.As(err, &qe) {
-		t.Fatalf("second launch: %v, want the quota refusal", err)
+	t.Cleanup(h.free)
+	first := launchAll(1, func() error { _, err := a.Launch(context.Background(), t.Logf); return err })
+	h.wait(t)
+	second := launchAll(1, func() error { _, err := a.Launch(context.Background(), t.Logf); return err })
+	select {
+	case err := <-second:
+		var qe *QuotaError
+		if !errors.As(err, &qe) {
+			t.Fatalf("second launch: %v, want the quota refusal", err)
+		}
+		if !strings.Contains(err.Error(), "8 of 8 vCPUs in use: 8 by this machine") {
+			t.Fatalf("refusal doesn't count the first launch as this machine's: %v", err)
+		}
+	case r := <-h.started:
+		t.Fatalf("second launch sent to %s into the same headroom", r)
+	case <-time.After(10 * time.Second):
+		t.Fatal("second launch hung")
 	}
-	close(h.release)
+	h.free()
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
@@ -264,8 +295,11 @@ func TestRefusedLaunchFreesItsClaim(t *testing.T) {
 	}
 	g := newGlobalEnv(t, f, "r-one-1")
 	a := g.home()
-	if _, err := a.Launch(context.Background(), t.Logf); err == nil {
-		t.Fatal("launch succeeded without capacity")
+	if _, err := a.Launch(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "InsufficientInstanceCapacity") {
+		t.Fatalf("err = %v, want EC2's capacity refusal", err)
+	}
+	if runs := f.callsOf("RunInstances"); len(runs) != 1 {
+		t.Fatalf("RunInstances %v, want the one priced option sent", runs)
 	}
 	var live int
 	if err := a.withClaims(func(cs map[string]quotaClaim) { live = len(cs) }); err != nil {
@@ -273,5 +307,25 @@ func TestRefusedLaunchFreesItsClaim(t *testing.T) {
 	}
 	if live != 0 {
 		t.Fatalf("%d claim(s) left after refusals", live)
+	}
+}
+
+// Down frees the quota its VMs held: a replacement can launch at once,
+// though their claims haven't lapsed.
+func TestDownReleasesClaims(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}}},
+		quota:  map[string]int{"r-one-1": 8},
+	}
+	g := newGlobalEnv(t, f, "r-one-1")
+	a := g.home()
+	if _, err := a.Launch(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Down(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Launch(context.Background(), t.Logf); err != nil {
+		t.Fatalf("launch after down: %v", err)
 	}
 }

@@ -1416,6 +1416,10 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 		in.Placement = &Placement{Order: config.LaunchListed, Why: why}
 		return in, nil
 	}
+	// Regions this client can't reach take no launch (cool has them); one
+	// whose hold lapsed takes one, to try it again. Read before cool, so a
+	// trial another launch claims in between shows in cool as a hold.
+	unreachHeldNow, lapsed := g.unreachRegions()
 	cool := g.cooldowns(t.Prices)
 	// An explicit max_price is AWS's cap on the Spot bid: options already
 	// above it would only be refused.
@@ -1425,10 +1429,7 @@ func (g *AWSGlobal) launch(ctx context.Context, log Logger) (Instance, error) {
 	skipZone := map[string]bool{}
 	atCap := g.refusedAtCap(t.Prices) // region/type refused at max_price (SpotMaxPriceTooLow)
 	broken := g.brokenRegions()       // regions whose setup failed (no on-demand there either)
-	// Regions this client can't reach take no launch (cool has them); one
-	// whose hold lapsed takes one, to try it again.
-	unreachHeldNow, lapsed := g.unreachRegions()
-	var unreachSkipped []string // held regions passed over, for the error
+	var unreachSkipped []string       // held regions passed over, for the error
 	var tried []string
 	// When quota is all that stopped every option (others can't work as
 	// configured: no network there, or above max_price), the error is a

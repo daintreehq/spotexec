@@ -952,8 +952,20 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 			id = xmlFirst(b, "groupId")
 			log("created security group %s (%s) in %s", sgName, id, vpc)
 		case awsCode(err) == "InvalidGroup.Duplicate":
-			if id, err = find(); err != nil {
-				return nil, err
+			// Made meanwhile (another runner or machine), and maybe not
+			// listed yet.
+			for try := 0; ; try++ {
+				if id, err = find(); err != nil {
+					return nil, err
+				}
+				if id != "" || try == 5 {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(time.Second):
+				}
 			}
 		default:
 			return nil, fmt.Errorf("create security group: %w", err)
@@ -1157,10 +1169,13 @@ func (a *AWSSpot) downLocked(ctx context.Context, log Logger) (int, error) {
 		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err != nil {
 			return 0, fmt.Errorf("terminate: %w", err)
 		}
+		ids := make([]string, 0, len(insts))
 		for _, inst := range insts {
 			log("terminating %s (%s)", inst.InstanceID, inst.InstanceType)
 			_ = os.Remove(a.knownHosts(inst.InstanceID))
+			ids = append(ids, inst.InstanceID)
 		}
+		a.releaseClaims(ids)
 	} else {
 		log("no running instances for %s", a.r.Name)
 	}

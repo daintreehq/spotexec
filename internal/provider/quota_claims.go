@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -27,30 +28,42 @@ type quotaClaim struct {
 const (
 	quotaClaimsFile = "quota-claims.json"
 	quotaClaimsLock = "quota-claims.lock"
-	// claimSending bounds a claim while its request is out, so one left by
-	// a process that died ends.
-	claimSending = 5 * time.Minute
+	// claimSending bounds a claim while its request is out (with the
+	// call's own retries), so one left by a process that died ends.
+	claimSending = 10 * time.Minute
 	// claimListLag keeps a claim after its launch (or a lost response)
 	// until listings can show the instance.
 	claimListLag = 2 * time.Minute
+	// claimsWait bounds a wait for the claims lock, which is only ever
+	// held for a read and a write.
+	claimsWait = 30 * time.Second
 )
 
 // withClaims runs fn on the runner's live quota claims under their lock
-// and saves them. Without a state directory there are none to keep.
+// and saves them. Without a state directory there are none to keep. An
+// error before fn runs (the lock, the file) means fn didn't run.
 func (a *AWSSpot) withClaims(fn func(cs map[string]quotaClaim)) error {
 	if a.dir == "" {
 		fn(map[string]quotaClaim{})
 		return nil
 	}
-	release, err := waitLockFile(context.Background(), a.lockPath(quotaClaimsLock), syscall.LOCK_EX, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), claimsWait)
+	defer cancel()
+	release, err := waitLockFile(ctx, a.lockPath(quotaClaimsLock), syscall.LOCK_EX, nil)
 	if err != nil {
 		return err
 	}
 	defer release()
 	path := a.lockPath(quotaClaimsFile)
-	cs := map[string]quotaClaim{}
-	if b, err := os.ReadFile(path); err == nil {
+	var cs map[string]quotaClaim
+	switch b, err := os.ReadFile(path); {
+	case err == nil:
 		_ = json.Unmarshal(b, &cs) // unreadable: claims are short-lived, start over
+	case !errors.Is(err, fs.ErrNotExist):
+		return err
+	}
+	if cs == nil {
+		cs = map[string]quotaClaim{}
 	}
 	now := time.Now()
 	for k, c := range cs {
@@ -110,32 +123,50 @@ func (a *AWSSpot) admitClaimed(u QuotaUsage, need int) (*QuotaError, func(ec2Ins
 	_, _ = rand.Read(b[:])
 	key := hex.EncodeToString(b[:])
 	var qe *QuotaError
-	err := a.withClaims(func(cs map[string]quotaClaim) {
+	ran := false
+	_ = a.withClaims(func(cs map[string]quotaClaim) {
+		ran = true
 		if qe = a.admitSpot(u.claimed(cs), need); qe == nil {
 			cs[key] = quotaClaim{Region: u.Region, VCPUs: need, Until: time.Now().Add(claimSending)}
 		}
 	})
-	if err != nil {
+	switch {
+	case !ran:
 		// No claims to go by: the usage alone decides, as before.
 		return a.admitSpot(u, need), func(ec2Instance, error) {}
-	}
-	if qe != nil {
-		return qe, nil
+	case qe != nil:
+		return qe, nil // refused even if saving failed
 	}
 	return nil, func(inst ec2Instance, err error) {
 		_ = a.withClaims(func(cs map[string]quotaClaim) {
-			c, ok := cs[key]
+			// Recorded afresh: a request that outlasted claimSending may
+			// have had its claim pruned.
+			c := quotaClaim{Region: u.Region, VCPUs: need, Until: time.Now().Add(claimListLag)}
 			switch {
-			case !ok:
 			case err == nil:
-				c.ID, c.Until = inst.InstanceID, time.Now().Add(claimListLag)
+				c.ID = inst.InstanceID
 				cs[key] = c
 			case errors.Is(err, ErrLaunchAmbiguous):
-				c.Until = time.Now().Add(claimListLag) // it may have launched
-				cs[key] = c
+				cs[key] = c // it may have launched
 			default:
 				delete(cs, key)
 			}
 		})
 	}
+}
+
+// releaseClaims drops the claims on instances in region that were just
+// terminated, so their vCPUs are free once listings stop showing them.
+func (a *AWSSpot) releaseClaims(ids []string) {
+	gone := map[string]bool{}
+	for _, id := range ids {
+		gone[id] = true
+	}
+	_ = a.withClaims(func(cs map[string]quotaClaim) {
+		for k, c := range cs {
+			if c.Region == a.r.Region && c.ID != "" && gone[c.ID] {
+				delete(cs, k)
+			}
+		}
+	})
 }
