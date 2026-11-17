@@ -17,7 +17,7 @@ Each of these showed up on Daintree's first runs, and none had shown up in spote
 
 | Found | Changed in 0.4 |
 | :--- | :--- |
-| Containers saw every CPU on the VM, so four test runs each started workers for eight cores, and a VM's load reached 11.6 on 8 vCPUs. | Each container sees only its slot's CPUs (#65). |
+| Containers saw every CPU on the VM, so four test runs each started workers for eight cores, and a VM's load reached 11.6 on 8 vCPUs. | Each container saw only its slot's CPUs (#65). Since #254, jobs share the VM's CPUs again, and worker counts [come from `$SPOTEXEC_CPUS`](tuning.md#size-worker-pools-with-spotexec_cpus). |
 | A typecheck using over 5 GB, next to three test shards, ran a 16 GB VM out of memory. The VM stopped answering, all four of its jobs were replayed elsewhere, and the replayed typecheck took a second VM down the same way. | Shared slots draw from one memory pool per VM, with a reserve kept back for the runner. An out-of-memory kill is reported as `OOM_KILLED` with exit 137, and a run whose VM ran out of memory isn't replayed (#70). |
 | A per-container memory limit halved Node's default heap, to about 2 GB, even on a whole VM. | The limit sits on a parent cgroup that Node doesn't see, and `--exclusive` runs have none (#70). |
 | Tests and scripts that ask git about the checkout failed: the slot had no `.git`. | [`git_seed`](running.md#git-on-the-runner) gives the slot a one-commit repository matching the local HEAD, branch and status (#69). |

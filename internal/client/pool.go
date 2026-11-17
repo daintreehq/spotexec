@@ -841,13 +841,17 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		listed := map[string]bool{}
 		unusable := map[string]string{} // listed, in a region some waiters can't use: its region
 		usable, total := 0, 0
+		s, now := st.sched(), time.Now()
 		for _, in := range st.Instances {
 			listed[in.ID] = true
 			if in.Region != "" && away.avoided(in.Region) {
 				unusable[in.ID] = in.Region
 			}
 			total++
-			if !st.Notes[in.ID].closed() {
+			n := st.Notes[in.ID]
+			// A VM whose drain a job may still cancel counts toward
+			// max_instances: it may serve again.
+			if v := s.VMs[in.ID]; !n.closed() || (v != nil && in.State == provider.StateRunning && reclaimable(v, n, now)) {
 				usable++
 			}
 		}
@@ -917,7 +921,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		// Booting VMs some waiters can't use serve only the others.
 		d.Capacity += min(excludedCap, max(0, d.Demand-away.weightAvoiding(awayRegions)))
 		d.Live = usable
-		now := time.Now()
+		now = time.Now()
 		d.Lead, d.LeadLearned = st.sched().launchLead(now)
 		if !p.since.IsZero() {
 			d.Waited = now.Sub(p.since)
@@ -1437,8 +1441,8 @@ func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendi
 // in the queue) is demand all the same, so without this an idle fleet
 // launches for it moments before it takes a free slot (#239).
 //
-// A VM counts only while a job would be placed on it: ready, open, not
-// suspect or just found busy, not being ended to make room or held back
+// A VM counts only while a job would be placed on it: ready, open (or
+// with an early drain the job would cancel), not suspect or just found busy, not being ended to make room or held back
 // for an exclusive job (a fence), and not still counted as starting
 // capacity (pendingVM). Slots held by this machine's live or uncertain
 // attempts aren't free, an attempt still in flight included. And only
@@ -1473,7 +1477,9 @@ func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, a
 	var empty []int
 	free, freeAway := 0, 0
 	for _, w := range p.views(st, now) {
-		if !w.eligible || !w.ready || pendingVM[w.in.ID] || s.Fences[w.in.ID] != nil {
+		// A VM whose drain can still be cancelled is room too: the next
+		// job to probe takes it back.
+		if !(w.eligible || w.reclaim) || !w.ready || pendingVM[w.in.ID] || s.Fences[w.in.ID] != nil {
 			continue
 		}
 		if n := st.Notes[w.in.ID]; n.reaping(now) || now.Before(n.BusyUntil) {

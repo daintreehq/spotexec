@@ -19,7 +19,13 @@ func TestProgressTimesEachPhase(t *testing.T) {
 	at(15)
 	p.set(phaseDepsCheck)
 	at(16)
-	p.set(phaseDeps)
+	p.event("deps_install")
+	at(25)
+	p.event("deps_flush") // #253: writing them to disk is dependency time
+	if s := p.get(); s.phase != phaseDepsFlush || s.dispatched {
+		t.Fatalf("stage after deps_flush %+v", s)
+	}
+	p.event("deps_cache") // names no phase
 	at(30)
 	p.dispatch(true)
 	at(31)
@@ -56,7 +62,7 @@ func TestProgressTimesEachPhase(t *testing.T) {
 }
 
 func TestEveryAttemptPhaseHasAKind(t *testing.T) {
-	for _, ph := range []string{phaseSync, phaseGitSeed, phaseImage, phaseDepsCheck, phaseDeps, phaseRunWait, phaseStartSetup, phaseSetup, phaseStartCommand, phaseCommand, phaseWriteback} {
+	for _, ph := range []string{phaseSync, phaseGitSeed, phaseImage, phaseDepsCheck, phaseDeps, phaseDepsFlush, phaseRunWait, phaseStartSetup, phaseSetup, phaseStartCommand, phaseCommand, phaseWriteback} {
 		if phaseKind[ph] == "" {
 			t.Errorf("%q counts as no kind of time", ph)
 		}

@@ -76,6 +76,10 @@ type AcquireRequest struct {
 	// onSend, when set, runs just before the acquire request is sent; an
 	// error stops it going out.
 	onSend func() error
+	// seeking: the run's mark, made before it scanned its files; Acquire
+	// makes its own without one (or with one already withdrawn). Withdrawn
+	// as Acquire returns.
+	seeking *Seeking
 }
 
 // noBoot reports whether runner's fleet may not launch for the request.
@@ -149,6 +153,14 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		}
 		members = append(members, m)
 	}
+	// Seeking a slot from here (or the run's scan) until Acquire returns:
+	// no surplus VM is drained early meanwhile (#257).
+	seek := req.seeking
+	if seek == nil || seek.withdrawn() {
+		seek = Seek(req.Pool) // a spare's request copies its run's spent mark
+	}
+	defer seek.Done()
+	seek.Touch()
 	q := QueueFor(req.Pool)
 	var ticket *Ticket
 	defer func() { ticket.Leave() }()
@@ -717,10 +729,12 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	// Recorded in the fleet's ledger before any contact, so concurrent sx
 	// processes see the slot as taken while this acquire is in flight.
 	aid, rerr := m.pool.reserveOn(in, c.claim)
-	if errors.Is(rerr, errNoRoom) || errors.Is(rerr, errReaping) {
+	if errors.Is(rerr, errNoRoom) || errors.Is(rerr, errReaping) || (rerr != nil && c.claim.Reclaim != "") {
+		// A drain is cancelled only after the ledger re-checked the VM.
 		return nil, nil, outSkipped
 	}
 	sent := false
+	req.Base.Undrain = c.claim.Reclaim
 	if rerr == nil {
 		req.Base.Client.Attempt = aid
 		req.onSend = func() error {
@@ -745,6 +759,9 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 		case lease != nil:
 			m.pool.commitAttempt(aid, lease.Acq, time.Time{})
 			lease.ledger = &ledgerRef{pool: m.pool, id: aid}
+			if c.claim.Reclaim != "" {
+				m.pool.reclaimed(in.ID, c.claim.Reclaim) // the helper cancelled its drain
+			}
 		case err != nil && sent && !isRefusal(err):
 			// The request went out and no answer came back: it may hold a
 			// slot until the helper notices this client is gone.

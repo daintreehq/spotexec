@@ -13,18 +13,23 @@ import (
 	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
-// A project container is pinned to its slot's share of the machine's CPUs
-// with --cpuset-cpus, so the CPU count it sees matches SPOTEXEC_CPUS. nproc,
-// os.availableParallelism(), GOMAXPROCS, make -j, cargo and most test
-// runners size their worker pools from the affinity mask, which only a
-// cpuset changes; a CFS quota (--cpus) caps CPU time but leaves them all
-// seeing the whole VM, so every slot would still start one worker per vCPU.
+// Jobs sharing a runner share its CPUs: a project container may use any of
+// them, and when jobs contend, the kernel divides CPU time between their
+// containers by cgroup weight, equal for each, among those that can use it
+// at that moment. So a job runs on every idle CPU, and no slot count leaves
+// CPUs that no job may use. The cost is that nproc,
+// os.availableParallelism() and GOMAXPROCS see the whole VM in every
+// container; SPOTEXEC_CPUS is each job's share, for sizing worker pools.
 //
-// The share is the same count as SPOTEXEC_CPUS: max(1, CPUs / slots). The
-// job holding token t (SPOTEXEC_SLOT, unique on the host across repos) gets
-// the t-th block of that many CPUs, so concurrent jobs never overlap until
-// there are more slots than CPUs. CPUs left over by an uneven division stay
-// unpinned, for the helper, sync and dockerd.
+// container.cpu_pinning restores a fixed partition, for timing-sensitive
+// work: the container is pinned with --cpuset-cpus to a block of the CPUs of
+// its own, so the CPU count it sees matches its share. nproc and the rest
+// size their pools from the affinity mask, which only a cpuset changes; a
+// CFS quota (--cpus) caps CPU time but leaves them all seeing the whole VM.
+// The job holding run permit or token t gets the t-th of max_slots blocks,
+// which together cover every CPU: CPUs / slots each, plus one more for the
+// first CPUs % slots blocks. With more slots than CPUs, each gets one CPU,
+// wrapping.
 
 // cpuOptions are the docker run flags that set a CPU limit, or move the
 // container to a cgroup whose CPUs we can't see: if container.options sets
@@ -160,14 +165,24 @@ func planCPUSet(h cpuHost, token, slots int, exclusive bool, opts []string) (set
 	case h.numCPU != n:
 		return "", fmt.Sprintf("the helper may use %d of the host's %d CPUs", h.numCPU, n)
 	}
-	k := max(1, n/slots)
-	if k >= n {
-		return "", ""
+	if n <= 1 {
+		return "", "" // the job gets every CPU anyway
 	}
-	// More slots than CPUs: one CPU each, wrapping. Tokens are taken lowest
-	// first, so jobs only share a CPU once every CPU has one.
-	b := (max(token, 1) - 1) % (n / k)
-	return formatCPUList(h.cpus[b*k : b*k+k]), ""
+	if slots >= n {
+		// One CPU each, wrapping. Tokens are taken lowest first, so jobs
+		// only share a CPU once every CPU has one.
+		c := (max(token, 1) - 1) % n
+		return formatCPUList(h.cpus[c : c+1]), ""
+	}
+	// slots blocks covering every CPU: q each, and the first r one more.
+	q, r := n/slots, n%slots
+	b := (max(token, 1) - 1) % slots
+	start := b*q + min(b, r)
+	size := q
+	if b < r {
+		size++
+	}
+	return formatCPUList(h.cpus[start : start+size]), ""
 }
 
 var (
@@ -219,13 +234,25 @@ func readCPUHost(info string) cpuHost {
 	return h
 }
 
+// cpuShare is SPOTEXEC_CPUS for this session's job: the helper's CPUs ÷ the
+// machine's slot count, at least 1, or all of them when the job has the
+// runner to itself (as the client computes it for commands).
+func (s *Session) cpuShare() int {
+	n := runtime.NumCPU()
+	if s.acq.Exclusive || len(s.tokens) > 1 || s.maxSlots <= 1 {
+		return n
+	}
+	return max(1, n/s.maxSlots)
+}
+
 // cpusetArgs returns the docker run arguments pinning this session's
-// container to its slot's CPUs, if any. It never fails a run: when the
-// cpuset can't be trusted to be valid, nothing is pinned and a
-// container_cpus event (seen with --json or --events-file) says why.
+// container to its slot's CPUs, when container.cpu_pinning asks for it. It
+// never fails a run: when the cpuset can't be trusted to be valid, nothing
+// is pinned and a container_cpus event (seen with --json or --events-file)
+// says why.
 func (s *Session) cpusetArgs(run *protocol.ContainerRun, d dockerRunner) []string {
 	exclusive := s.acq.Exclusive || len(s.tokens) > 1
-	if exclusive || s.maxSlots <= 1 || cpuOption(run.Options) != "" {
+	if !run.CPUPinning || exclusive || s.maxSlots <= 1 || cpuOption(run.Options) != "" {
 		return nil // skip reading the host: nothing would be pinned
 	}
 	h := readCPUHost(d.info)

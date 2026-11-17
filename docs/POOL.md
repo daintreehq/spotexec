@@ -68,6 +68,12 @@ takes part in scheduling, and every VM shuts itself down.
    prepares there and waits for a free slot to run its command. A VM
    whose slots all run commands (or whose admitted jobs wait to) refuses.
    Plain requests (older clients) still see a VM full at `max_slots` jobs.
+   A job that has waited 30s for a slot to run its command looks every 10s
+   for a free slot on another VM of its runner (a plain request: never
+   overflow, never a launch), such as one that finished booting since. When
+   it gets one, it withdraws from the busy VM (`withdraw`; the helper
+   honours it only while the job still waits, so nothing has run there) and
+   prepares and runs on the new VM. A run moves at most twice (`move.go`).
 4. **Queue and scale out.** If every slot is busy, the job takes a ticket in
    a fair local queue (priority, then arrival; `queue.go`) and registers as
    demand on each fleet (a waiter file under `waiters/`). Under `pool.lock`,
@@ -246,11 +252,13 @@ What it costs:
 - **Results.** Once a drained VM ends, `exec`, `pull` and `--same-slot` can
   no longer reach its workspaces. `result_retention` is how long after its
   last job they still can.
-- **Relaunches.** Once its drain is committed, no new job is placed on the
-  VM, even while it is still up keeping its results (`exec`, `pull` and
-  `--same-slot` still reach their exact slot until it ends). If demand comes
-  back, new jobs go to the retained VMs if they have room, and otherwise
-  wait for a new VM to boot.
+- **Relaunches.** Once its drain is committed, the VM stops taking new
+  jobs while the retained VMs have room (`exec`, `pull` and `--same-slot`
+  still reach their exact slot until it ends). If demand comes back while
+  it is still up, after the standby VMs a job takes it back before any VM
+  launches: the job's acquire cancels the drain the VM took over, and the
+  VM rejoins the retained set. Once the VM has started shutting down (or
+  on a VM drained at once, below), new jobs wait for a new VM to boot.
 
 To keep surplus VMs until `idle_timeout` instead:
 
@@ -261,13 +269,16 @@ early_drain = false
 
 For a standby VM that has been standby for 30 seconds, isn't warm, holds
 nothing of this machine's (no job, reservation, uncertain attempt or
-exclusive fence), with no job queued and the retained VMs covering recent
-demand without it, `sx` (as a job's lease ends) or the pool manager (each
+exclusive fence), with no job queued or looking for a slot (from before it
+scans its files until it holds one, so a standby VM a starting run may need
+isn't drained under it) and the retained VMs covering recent demand without
+it, `sx` (as a job's lease ends) or the pool manager (each
 probe pass):
 
 1. records the drain in the ledger (`drain_requested`). From then on the VM
-   is never placed on again, even if the request below times out, so a
-   delayed request can't drain a VM that just took new work;
+   isn't placed on, even if the request below times out, so a delayed
+   request can't drain a VM that just took new work (until the VM has
+   answered, below);
 2. hands it to the VM (`spotexec-helper schedule-drain`, over the helper
    this machine already installed: installing one would touch its idle
    clock). The helper writes `drain_after` beside the watchdog's other
@@ -276,6 +287,16 @@ probe pass):
    would at `idle_timeout`: it writes the drain marker first, so nothing can
    start after. Nothing on this machine has to keep running for it;
 3. records the answer (`drain_scheduled`), and the VM isn't asked again.
+
+Until the watchdog ends it, a VM whose drain is scheduled is still
+capacity: launches wait for it as for a ready VM, and with the retained and
+standby VMs full, the next job is placed on it with the drain's operation
+ID. The helper cancels the drain only once that job holds a slot and the
+lifecycle lock, which the watchdog needs exclusively: it removes
+`drain_after`, refreshes the VM's activity (which the watchdog rechecks
+under the lock) and records the operation as cancelled, so a request for it
+that arrives late drains nothing. A VM whose drain marker is already
+written refuses the job as draining, and it launches elsewhere.
 
 A VM booted by an older spotexec has a watchdog that doesn't read
 `drain_after`. It is asked to drain now instead (`try-drain`): the helper

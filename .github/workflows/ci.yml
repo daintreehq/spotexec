@@ -11,10 +11,9 @@ permissions:
 
 jobs:
   test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    # Linux only: macOS runners queue for minutes, so the macOS tests run on
+    # a developer's Mac instead.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -56,11 +55,9 @@ jobs:
     # Builds the release artifacts the way the Release workflow does (a
     # snapshot, nothing published), then tests what users install: the
     # archive, the sx entry point, completions and, on Linux, the .deb, .rpm
-    # and .apk packages.
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    # and .apk packages. The darwin archives are still cross-compiled here,
+    # but only the Linux archive is unpacked and run.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:

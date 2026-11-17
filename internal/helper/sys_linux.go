@@ -59,6 +59,16 @@ func hostMemTotal() int64 {
 	return 0
 }
 
+// pendingWrites is the page cache waiting to be written to disk, in
+// bytes, or 0.
+func pendingWrites() int64 {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	return meminfoPending(string(b))
+}
+
 func inoCtime(fi fs.FileInfo) (uint64, int64) {
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		return st.Ino, st.Ctim.Sec*1e9 + st.Ctim.Nsec

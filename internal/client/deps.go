@@ -82,8 +82,12 @@ func consumeDeps(ctx context.Context, next func(context.Context) (protocol.Frame
 		case protocol.TypeEvent:
 			var ev protocol.Event
 			_ = env.Unmarshal(&ev)
-			if ev.Name == "deps_install" {
+			switch ev.Name {
+			case "deps_install":
 				st.phase(fmt.Sprintf("%s · installing dependencies (%s)", label, ev.Message))
+			case "deps_flush":
+				// Message: how much is waiting, e.g. "8.1 GB".
+				st.phase(fmt.Sprintf("%s · writing %s to disk before the container starts", label, ev.Message))
 			}
 			onEvent(ev)
 			continue

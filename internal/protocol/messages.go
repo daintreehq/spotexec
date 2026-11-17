@@ -38,6 +38,12 @@ const (
 	TypeGitDrop     = "git_drop" // no body, no reply: remove a .git an earlier seed left in the slot
 	TypeShareWait   = "share_wait"
 	TypeShareDone   = "share_done"
+	// TypeWithdraw (no body, no reply of its own): take the job back if it
+	// still waits for a run permit, because the client found a free slot
+	// on another VM. Honored only while the job waits (the exec's Result
+	// then has Withdrawn set); ignored once its [setup] run or command has
+	// a permit.
+	TypeWithdraw = "withdraw"
 )
 
 // MaxSlots caps slots per machine, explicit (max_slots) or automatic
@@ -145,6 +151,11 @@ type Acquire struct {
 	// MaxSlots jobs, whatever they are doing. Clients ask for it once no
 	// runner has a free slot, before queueing or launching a VM.
 	Overflow bool `json:"overflow,omitempty"`
+	// Undrain: the early drain (its operation ID) the client committed on
+	// this VM and now cancels, renewed demand taking the warm VM back
+	// before it ends: the helper withdraws its scheduled drain once the
+	// slot is held, and refuses as draining if it can't.
+	Undrain string `json:"undrain,omitempty"`
 }
 
 // LifetimeDrainAhead is how long before an ephemeral VM's max_lifetime it
@@ -287,6 +298,9 @@ type ContainerRun struct {
 	// Docker gives the command a Docker socket (scoped to the run) so it
 	// can start containers of its own.
 	Docker bool `json:"docker,omitempty"`
+	// CPUPinning pins a shared slot's container to a block of CPUs of its
+	// own; otherwise it may use any of the runner's CPUs.
+	CPUPinning bool `json:"cpu_pinning,omitempty"`
 }
 
 // RegistryAuth is a short-lived login for the image registry (ECR).
@@ -367,6 +381,9 @@ type DepsResult struct {
 	Missing  bool   `json:"missing,omitempty"` // Probe: nothing to restore, an install is needed
 	Method   string `json:"method"`
 	MS       int64  `json:"ms"`
+	// FlushMS is the part of MS spent waiting for what the dependencies
+	// wrote to reach the disk, before a containerised run (#253).
+	FlushMS int64 `json:"flush_ms,omitempty"`
 }
 
 // ShareWait asks the helper to wait for the background transfer this
@@ -421,6 +438,10 @@ type Result struct {
 	TimedOut    bool   `json:"timed_out"`
 	Canceled    bool   `json:"canceled"`
 	Interrupted bool   `json:"spot_interrupted"`
+	// Withdrawn: the client withdrew the job (TypeWithdraw) while it
+	// waited for a run permit. Nothing ran, and the workspace is as the
+	// client's sync left it.
+	Withdrawn bool `json:"withdrawn,omitempty"`
 	// Shutdown: the command was killed by the VM shutting down (a Spot
 	// reclaim): a lost runner, not the command's result.
 	Shutdown   bool     `json:"shutdown,omitempty"`

@@ -165,6 +165,10 @@ type Result struct {
 	// lostWhen is when the attempt gave up on its runner (no earlier than
 	// the last word it sent the helper).
 	lostWhen time.Time
+	// moveTo: the attempt withdrew from a VM where it waited for a run
+	// permit, nothing having run, and carries on in this slot elsewhere.
+	moveTo *Lease
+	moveFP string
 }
 
 // stage is how far an attempt had got: the phase it was in, whether the
@@ -241,6 +245,17 @@ func (p *progress) timings() map[string]time.Duration {
 		out[k] = d
 	}
 	return out
+}
+
+// event records a phase the helper's event named starts: installing the
+// dependencies, or writing them to disk (#253).
+func (p *progress) event(name string) {
+	switch name {
+	case "deps_install":
+		p.set(phaseDeps)
+	case "deps_flush":
+		p.set(phaseDepsFlush)
+	}
 }
 
 // dispatch records that the command is being handed to the helper, from
@@ -347,6 +362,13 @@ type attempt struct {
 	// holds the region (#225), may launch for it.
 	bootOnly string
 	fresh    *bool // an earlier attempt already showed CONTAINER_FRESH
+	// lease: a slot on another VM a job waiting for a run permit moved to
+	// (#256); this attempt carries on there instead of selecting a runner.
+	// fp is the fingerprint that slot was acquired with: its fingerprint
+	// hit holds only if this attempt's scan still matches.
+	lease *Lease
+	fp    string
+	moves int // how many times this run moved (at most maxMoves)
 }
 
 // Run executes opts.Command remotely for workspace ws. If the runner is lost
@@ -376,6 +398,12 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 			spent[k] += d
 		}
 		res.Phases, res.Attempts = spent, att.n
+		att.lease, att.fp = res.moveTo, res.moveFP
+		if att.lease != nil {
+			// Not a replay: nothing ran, and the slot is already held.
+			att.moves++
+			continue
+		}
 		retry, code, why := replayable(lost, res, o, ctx.Err() != nil, att.n)
 		if why != "" {
 			o.Rep.Warn(code, "%s", why)
@@ -520,6 +548,7 @@ const (
 	phaseImage        = "preparing the container image"
 	phaseDepsCheck    = "checking the dependency cache"
 	phaseDeps         = "installing dependencies"
+	phaseDepsFlush    = "writing dependencies to disk"
 	phaseRunWait      = "waiting for a free slot to run the command"
 	phaseStartSetup   = "starting [setup] run"
 	phaseSetup        = "running [setup] run"
@@ -545,7 +574,7 @@ const (
 var phaseKind = map[string]string{
 	phaseSync: PhaseSync, phaseGitSeed: PhaseSync,
 	phaseImage:     PhaseImage,
-	phaseDepsCheck: PhaseDeps, phaseDeps: PhaseDeps,
+	phaseDepsCheck: PhaseDeps, phaseDeps: PhaseDeps, phaseDepsFlush: PhaseDeps,
 	phaseRunWait:    PhaseQueued,
 	phaseStartSetup: PhaseSetup, phaseSetup: PhaseSetup,
 	phaseStartCommand: PhaseCommand, phaseCommand: PhaseCommand,
@@ -678,8 +707,20 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if err != nil && (!o.PreferLast && !o.SameSlot || len(o.LastWithin) > 0) {
 		return res, infra(err), ""
 	}
+	// Seeking a slot from before the scan until one is held: no surplus VM
+	// this run may need is drained early meanwhile (#257).
+	var seek *Seeking
+	if !o.PreferLast && !o.SameSlot && att.lease == nil {
+		seek = Seek(pool)
+	}
+	defer seek.Done()
 
 	// 1. Local manifest (what the remote workspace must contain).
+	// A slot this attempt moved to is its own from the start: given back
+	// unused if the attempt ends before taking it up.
+	moved := att.lease
+	defer func() { moved.abandon() }()
+
 	var m *manifest.Manifest
 	if o.Sync != "none" {
 		o.Rep.Status("scanning %s", ws.Root)
@@ -710,7 +751,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	// Without a sync the slot's files are not ours: don't claim ownership.
 	base.KeepOwner = o.Sync == "none"
 	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot || att.noBoot, BootOnly: att.bootOnly, Exclude: att.exclude, Priority: o.Priority,
-		Task: TaskKey(ws.RepoID, o.Display)}
+		Task: TaskKey(ws.RepoID, o.Display), seeking: seek}
 	if o.Sync != "none" {
 		// A launch for this run prefers regions that hold its caches.
 		req.Project = func(r *config.Runner) *provider.Project { return PlacementProject(p, ws, m, o.NoDeps, r) }
@@ -725,7 +766,15 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}
 	var lease *Lease
-	if o.PreferLast || o.SameSlot {
+	if moved != nil {
+		// Moved here from a VM with no free slot. The scan is new (the
+		// earlier attempt's manifest took that VM's upload corrections), so
+		// the slot's fingerprint hit counts only if it still matches.
+		lease, moved = moved, nil
+		if m == nil || m.Fingerprint != att.fp {
+			lease.Acq.FingerprintMatch = false
+		}
+	} else if o.PreferLast || o.SameSlot {
 		// exec runs without syncing, so it must land in exactly the slot that
 		// holds this worktree's files; --same-slot syncs, but wants the same
 		// machine state (whatever the last commands installed there).
@@ -799,9 +848,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	sess := lease.Sess
 	sess.OnEvent = func(ev protocol.Event) {
 		o.Rep.Event(ev.Name, map[string]any{"message": ev.Message})
-		if ev.Name == "deps_install" {
-			prog.set(phaseDeps)
-		}
+		prog.event(ev.Name)
 		if ev.Name == "spot_interruption" {
 			noticed.Store(true)
 			reclaimed()
@@ -853,7 +900,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			err, lost := imageErr(lease, err)
 			return res, err, lost
 		}
-		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root", Network: p.Container.Network, Docker: p.Container.Docker}
+		crun = &protocol.ContainerRun{Image: ref, Options: p.Container.Options, Root: p.Container.User == "root", Network: p.Container.Network, Docker: p.Container.Docker, CPUPinning: p.Container.CPUPinning}
 		imageID = id
 		lastRun.Image = ref
 		res.Image = ref
@@ -980,22 +1027,44 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		prog.setupDone()
 		o.Rep.Status("%s · running %s", label, o.Display)
 	}
+	// A job waiting for a run permit may move to a free slot on another VM
+	// of its fleet (#256), unless it must stay on this one or already moved
+	// as often as it may.
+	var mv *mover
+	if _, fleet := lease.Provider.(provider.Fleet); fleet && lease.InstanceID != "" && m != nil &&
+		!o.Exclusive && !o.PreferLast && !o.SameSlot && att.moves < maxMoves {
+		mv = newMover(func(ctx context.Context) *Lease { return findMove(ctx, req, lease) })
+	}
+	defer mv.close()
 	// Every slot on the VM is running a command: the helper holds this one
 	// back, its files prepared, until one finishes.
 	onRunWait := func(waiting bool, msg string) {
 		if waiting {
 			prog.runWait()
 			o.Rep.Status("%s · %s", label, msg)
+			mv.start(ctx)
 			return
 		}
+		mv.stop()
 		prog.runSlot()
 		o.Rep.Status("%s", running)
 	}
-	result, err := pumpExec(sess, outW, errW, o, onSpot, afterSetup, prog.started, onRunWait)
+	result, err := pumpExec(sessStream{sess}, outW, errW, o, onSpot, afterSetup, prog.started, onRunWait, mv.ready())
 	outW.Flush()
 	errW.Flush()
 	if err != nil {
 		return res, infra(execFailure(label, r.Name, err, sess != nil && sess.Dead())), lostRunner(lease, err)
+	}
+	if result.Withdrawn {
+		to := mv.take()
+		if to == nil { // never asked for: nothing ran, but there is nowhere to go
+			return res, infra(fmt.Errorf("%s withdrew the run before it started", label)), ""
+		}
+		o.Rep.Event("moved", map[string]any{"from": lease.InstanceID, "to": to.InstanceID, "runner": to.Runner.Name, "slot": to.Acq.Token})
+		o.Rep.Status("%s had no free slot; moving to %s#%d on %s", label, to.Runner.Name, to.Acq.Token, to.InstanceID)
+		lease.abandon()
+		res.moveTo, res.moveFP = to, req.Base.Fingerprint
+		return res, nil, ""
 	}
 	res.ExitCode, res.TimedOut = result.ExitCode, result.TimedOut
 	// An interrupt (Ctrl-C, SIGTERM) at any point up to the final result
@@ -1693,6 +1762,9 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	if upload != nil {
 		ev["uploaded"], ev["upload_ms"] = upload.OK, upload.MS
 	}
+	if dr.FlushMS > 0 {
+		ev["flush_ms"] = dr.FlushMS
+	}
 	o.Rep.Event("deps", ev)
 	return dr, nil
 }
@@ -1853,8 +1925,22 @@ func setupFailure(p *config.Project, o Options, r protocol.Result) (int, string)
 	return 1, fmt.Sprintf("[setup] run failed (exit %d); the command did not run. Its output is above; skip the setup with --no-setup or setup = false on a task", r.ExitCode)
 }
 
+// execStream is the session an exec's frames come in on (a
+// transport.Session; tests script one).
+type execStream interface {
+	Next(context.Context) (protocol.Frame, error)
+	Send(typ string, body any) error
+	Abort()
+}
+
+type sessStream struct{ *transport.Session }
+
+func (s sessStream) Send(typ string, body any) error { return s.Conn.Send(typ, body) }
+
 // pumpExec streams output until the result arrives, forwarding interrupts.
-func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot, afterSetup, onStarted func(), onRunWait func(waiting bool, msg string)) (protocol.Result, error) {
+// Once withdraw is closed (a slot elsewhere is held for a job waiting for a
+// run permit), it asks the helper to withdraw the job (#256).
+func pumpExec(s execStream, stdout, stderr io.Writer, o Options, onSpot, afterSetup, onStarted func(), onRunWait func(waiting bool, msg string), withdraw <-chan struct{}) (protocol.Result, error) {
 	var res protocol.Result
 	type fr struct {
 		f   protocol.Frame
@@ -1894,7 +1980,11 @@ func pumpExec(s *transport.Session, stdout, stderr io.Writer, o Options, onSpot,
 			if canceledAt.IsZero() {
 				canceledAt = time.Now()
 			}
-			go func() { _ = s.Conn.Send(protocol.TypeCancel, protocol.Cancel{Reason: "interrupt"}) }()
+			go func() { _ = s.Send(protocol.TypeCancel, protocol.Cancel{Reason: "interrupt"}) }()
+			continue
+		case <-withdraw:
+			withdraw = nil
+			go func() { _ = s.Send(protocol.TypeWithdraw, nil) }()
 			continue
 		case x := <-frames:
 			if x.err != nil {

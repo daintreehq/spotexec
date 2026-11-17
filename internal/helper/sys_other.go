@@ -25,6 +25,9 @@ func hostMemTotal() int64 {
 	return int64(binary.LittleEndian.Uint64(b))
 }
 
+// pendingWrites needs /proc/meminfo: unknown here.
+func pendingWrites() int64 { return 0 }
+
 func inoCtime(fi fs.FileInfo) (uint64, int64) {
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		return uint64(st.Ino), st.Ctimespec.Sec*1e9 + st.Ctimespec.Nsec

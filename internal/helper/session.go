@@ -554,8 +554,8 @@ func (s *Session) dispatch(env protocol.Envelope) error {
 			return err
 		}
 		return s.shareWait(w)
-	case protocol.TypeCancel:
-		return nil // nothing running
+	case protocol.TypeCancel, protocol.TypeWithdraw:
+		return nil // nothing running, or waiting to
 	case protocol.TypeBye:
 		return errBye
 	}

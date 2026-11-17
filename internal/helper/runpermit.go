@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -19,8 +20,9 @@ var runPoll = 200 * time.Millisecond
 // whose CPU block it is pinned to.
 //
 // It waits for one, holding its token and workspace, until the queue
-// timeout or the client cancels or goes. canceled: the client canceled
-// while it waited (nothing ran). A job admitted before the VM neared its
+// timeout or the client cancels, withdraws the job (errWithdrawn: it found
+// a free slot on another VM) or goes. canceled: the client canceled while
+// it waited (nothing ran). A job admitted before the VM neared its
 // max_lifetime still runs, as one that never waited does.
 func (s *Session) takeRun() (canceled bool, err error) {
 	s.relMu.Lock()
@@ -43,9 +45,12 @@ func (s *Session) takeRun() (canceled bool, err error) {
 		if attempt > 0 {
 			// Before every later attempt: a permit that frees just as the
 			// client cancels, or the wait runs out, must not start it.
-			if s.cancelQueued() {
+			if canceled, withdrawn := s.stopQueued(); canceled {
 				unwait()
 				return true, nil
+			} else if withdrawn {
+				unwait()
+				return false, errWithdrawn
 			}
 			if q := time.Duration(s.acq.QueueMS) * time.Millisecond; q > 0 && time.Since(start) > q {
 				unwait()
@@ -71,6 +76,10 @@ func (s *Session) takeRun() (canceled bool, err error) {
 		time.Sleep(runPoll)
 	}
 }
+
+// errWithdrawn ends a run-permit wait the client withdrew
+// (protocol.TypeWithdraw): nothing ran, and the job goes elsewhere.
+var errWithdrawn = errors.New("withdrawn while waiting for a run permit")
 
 // tryRun takes a free run permit if there is room for one, under the run
 // gate: two jobs counting at once could each see the last one free, or

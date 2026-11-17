@@ -101,17 +101,22 @@ chmod 0644 "$D/features"
 cat > /usr/local/sbin/spotexec-watchdog <<'WATCHDOG'
 #!/bin/bash
 D=/var/tmp/spotexec
-IDLE={{.IdleSecs}}
-LIMIT="{{.IdleText}}"
 MAXLIFE={{.MaxSecs}}
 # A scheduled early drain (spotexec-helper schedule-drain): this VM is
 # surplus and ends once idle this many seconds, when that is sooner.
-after=$(head -c 16 "$D/drain_after" 2>/dev/null | head -n 1)
-case "$after" in ''|*[!0-9]*) after= ;; esac
-if [ -n "$after" ] && [ "${#after}" -le 9 ] && [ "$after" -lt "$IDLE" ]; then
-  IDLE=$after
-  LIMIT="${after}s, surplus: early drain"
-fi
+# Read again under the lifecycle lock: a job that took the VM back
+# meanwhile cancelled it.
+limit() {
+  IDLE={{.IdleSecs}}
+  LIMIT="{{.IdleText}}"
+  after=$(head -c 16 "$D/drain_after" 2>/dev/null | head -n 1)
+  case "$after" in ''|*[!0-9]*) after= ;; esac
+  if [ -n "$after" ] && [ "${#after}" -le 9 ] && [ "$after" -lt "$IDLE" ]; then
+    IDLE=$after
+    LIMIT="${after}s, surplus: early drain"
+  fi
+}
+limit
 now=$(date +%s)
 created=$(cat "$D/created_at" 2>/dev/null || echo "$now")
 destroy() {
@@ -143,6 +148,7 @@ idle_for() {
 # An active spotexec session holds this lock shared; only shut down if none do.
 exec 9<"$D/lifecycle.lock"
 flock -n -x 9 || exit 0
+limit
 [ "$(idle_for)" -ge "$IDLE" ] || exit 0
 destroy "idle for $(idle_for)s (limit $LIMIT)"
 WATCHDOG

@@ -274,6 +274,14 @@ func (s *Session) deps(d protocol.Deps) error {
 	if err := saveSlotState(s.slotDir, s.state); err != nil {
 		return err
 	}
+	if d.Container != nil {
+		// The run's container start would otherwise wait for these writes.
+		waited, err := s.flushDeps()
+		if err != nil {
+			return err
+		}
+		res.FlushMS = waited.Milliseconds()
+	}
 	res.MS = time.Since(start).Milliseconds()
 	return s.c.Send(protocol.TypeDepsResult, res)
 }
@@ -290,6 +298,9 @@ func (s *Session) buildDeps(d protocol.Deps, key, cacheRoot string) error {
 	if mb := s.memoryShareMB(); mb > 0 {
 		env["SPOTEXEC_MEMORY"] = strconv.FormatInt(mb, 10)
 	}
+	// The install may use every CPU, so it gets the share to size its
+	// worker pools from, as commands do.
+	env["SPOTEXEC_CPUS"] = strconv.Itoa(s.cpuShare())
 	for k, v := range d.Env {
 		env[k] = v
 	}
