@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -186,13 +187,26 @@ func TestDepsProbeHydratesALocalCache(t *testing.T) {
 // The install sees the job's CPU share, and the project's [env] can
 // override it.
 func TestDepsInstallGetsCPUShare(t *testing.T) {
-	s, _ := depsSession(t)
-	d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p vendor && echo \"$SPOTEXEC_CPUS\" > vendor/cpus", CacheDirs: []string{"vendor"}}
-	if err := s.deps(d); err != nil {
-		t.Fatal(err)
-	}
-	if b, err := os.ReadFile(filepath.Join(s.workspace, "vendor", "cpus")); err != nil || strings.TrimSpace(string(b)) != strconv.Itoa(s.cpuShare()) {
-		t.Fatalf("SPOTEXEC_CPUS %q, %v; want %d", b, err, s.cpuShare())
+	n := runtime.NumCPU()
+	for _, c := range []struct {
+		name  string
+		slots int
+		env   map[string]string
+		want  string
+	}{
+		{"one slot", 1, nil, strconv.Itoa(n)},
+		{"four slots", 4, nil, strconv.Itoa(max(1, n/4))},
+		{"[env] wins", 4, map[string]string{"SPOTEXEC_CPUS": "3"}, "3"},
+	} {
+		s, _ := depsSession(t) // a fresh cache, so the install runs
+		s.maxSlots = c.slots
+		d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p vendor && echo \"$SPOTEXEC_CPUS\" > vendor/cpus", CacheDirs: []string{"vendor"}, Env: c.env}
+		if err := s.deps(d); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := os.ReadFile(filepath.Join(s.workspace, "vendor", "cpus")); err != nil || strings.TrimSpace(string(b)) != c.want {
+			t.Errorf("%s: SPOTEXEC_CPUS %q, %v; want %s", c.name, b, err, c.want)
+		}
 	}
 }
 
