@@ -2,11 +2,13 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,7 +29,11 @@ type fakeBulkEC2 struct {
 	live      map[string]bool // not yet terminated
 	failCall  map[int]bool    // TerminateInstances calls (1-based) to refuse
 	stopped   bool            // list every instance as stopped
+	decoys    bool            // the first page also holds another owner's and another runner's instance
+	throttle  int             // after the first accepted batch, throttle this many TerminateInstances calls
+	onAccept  func()          // called (locked) after each accepted batch
 	termCalls int
+	throttled int
 	terms     [][]string // IDs of each accepted TerminateInstances
 	pages     int
 }
@@ -65,6 +71,11 @@ func (f *fakeBulkEC2) handler() http.Handler {
 				ec2Err(w, 400, "UnauthorizedOperation")
 				return
 			}
+			if len(f.terms) > 0 && f.throttled < f.throttle {
+				f.throttled++
+				ec2Err(w, 503, "RequestLimitExceeded")
+				return
+			}
 			for _, id := range ids {
 				if !f.live[id] {
 					f.t.Errorf("terminated %s, which isn't live", id)
@@ -72,6 +83,9 @@ func (f *fakeBulkEC2) handler() http.Handler {
 				delete(f.live, id)
 			}
 			f.terms = append(f.terms, ids)
+			if f.onAccept != nil {
+				f.onAccept()
+			}
 			fmt.Fprint(w, `<TerminateInstancesResponse/>`)
 		default:
 			f.t.Errorf("unexpected %s", p.Get("Action"))
@@ -104,6 +118,12 @@ func (f *fakeBulkEC2) describe(w http.ResponseWriter, p url.Values) {
 		st = "stopped"
 	}
 	fmt.Fprint(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet>`)
+	if f.decoys && start == 0 {
+		// Returned despite the filters (as a stale listing might): the
+		// tags still rule them out.
+		fmt.Fprintf(w, `<item><instanceId>i-other-owner</instanceId><instanceState><name>running</name></instanceState><tagSet><item><key>%s</key><value>s</value></item><item><key>%s</key><value>someone-else</value></item></tagSet></item>`, tagRunner, tagOwner)
+		fmt.Fprintf(w, `<item><instanceId>i-other-runner</instanceId><instanceState><name>running</name></instanceState><tagSet><item><key>%s</key><value>other</value></item><item><key>%s</key><value>%s</value></item></tagSet></item>`, tagRunner, tagOwner, f.owner)
+	}
 	for _, id := range live[start:end] {
 		fmt.Fprintf(w, `<item><instanceId>%s</instanceId><instanceType>c7a.2xlarge</instanceType><instanceState><name>%s</name></instanceState><tagSet><item><key>%s</key><value>s</value></item><item><key>%s</key><value>%s</value></item></tagSet></item>`,
 			id, st, tagRunner, tagOwner, f.owner)
@@ -155,6 +175,7 @@ func TestDownBatchesTerminations(t *testing.T) {
 	} {
 		t.Run(strconv.Itoa(tc.n), func(t *testing.T) {
 			f := newFakeBulkEC2(t, tc.n)
+			f.decoys = true
 			a := newBulkEnv(t, f)
 			var logged int
 			n, err := a.downLocked(context.Background(), func(format string, _ ...any) {
@@ -185,6 +206,14 @@ func TestDownReportsFailedBatchAndRetries(t *testing.T) {
 	f := newFakeBulkEC2(t, 2500)
 	f.failCall[2] = true // the second of three batches is refused
 	a := newBulkEnv(t, f)
+	if err := os.MkdirAll(a.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range f.ids {
+		if err := os.WriteFile(a.knownHosts(id), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var logged []string
 	n, err := a.downLocked(context.Background(), func(format string, args ...any) {
 		if strings.HasPrefix(format, "terminating ") {
@@ -207,9 +236,13 @@ func TestDownReportsFailedBatchAndRetries(t *testing.T) {
 	}
 	// Only the refused batch's instances are left, and only accepted ones
 	// were reported.
-	for _, id := range f.ids[1000:2000] {
-		if !f.live[id] {
-			t.Fatalf("%s from the refused batch was terminated", id)
+	for i, id := range f.ids {
+		refused := i >= 1000 && i < 2000
+		if f.live[id] != refused {
+			t.Fatalf("%s live=%v, want %v", id, f.live[id], refused)
+		}
+		if _, err := os.Stat(a.knownHosts(id)); (err == nil) != refused {
+			t.Fatalf("%s known_hosts kept=%v, want %v", id, err == nil, refused)
 		}
 	}
 	for _, id := range logged {
@@ -246,5 +279,43 @@ func TestTerminateBatchesIDs(t *testing.T) {
 	}
 	if got := batchSizes(f.terms); fmt.Sprint(got) != "[1000 1]" {
 		t.Fatalf("batches %v, want [1000 1]", got)
+	}
+}
+
+func TestTerminateWaitsOutThrottle(t *testing.T) {
+	oldBackoff, oldRefill := queryRetryBase, terminateRefill
+	queryRetryBase, terminateRefill = time.Millisecond, time.Microsecond
+	t.Cleanup(func() { queryRetryBase, terminateRefill = oldBackoff, oldRefill })
+	f := newFakeBulkEC2(t, 2000)
+	f.throttle = 5 // more than query's own retries absorb
+	a := newBulkEnv(t, f)
+	done, err := a.terminate(context.Background(), f.ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(done) != 2000 || len(f.live) != 0 || f.throttled != 5 {
+		t.Fatalf("terminated %d, %d left, throttled %d", len(done), len(f.live), f.throttled)
+	}
+}
+
+func TestTerminateStopsWhenCancelled(t *testing.T) {
+	f := newFakeBulkEC2(t, 2500)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cancelled while the first batch is in flight: EC2 took it, but no
+	// answer came back, so it isn't reported, and nothing more is sent.
+	f.onAccept = cancel
+	a := newBulkEnv(t, f)
+	done, err := a.terminate(ctx, f.ids)
+	if len(done) != 0 || f.termCalls != 1 {
+		t.Fatalf("reported %d in %d calls, want 0 in 1", len(done), f.termCalls)
+	}
+	for _, want := range []string{"2500 of 2500", "batch 1 of 3", "batches 2 to 3 of 3 (1500 instances) not sent"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %v lacks %q", err, want)
+		}
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error %v isn't context.Canceled", err)
 	}
 }

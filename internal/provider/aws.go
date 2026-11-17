@@ -344,8 +344,12 @@ func (a *AWSSpot) Up(ctx context.Context, log Logger) (Info, error) {
 		for i, s := range stopped {
 			ids[i] = s.InstanceID
 		}
-		if done, _ := a.terminate(ctx, ids); len(done) > 0 {
+		done, err := a.terminate(ctx, ids)
+		if len(done) > 0 {
 			log("terminated %d stopped instance(s) left over for %s", len(done), a.r.Name)
+		}
+		if err != nil {
+			log("stopped leftovers for %s: %v", a.r.Name, err)
 		}
 	}
 	in, err := a.ranker().launch(ctx, log)
@@ -1305,6 +1309,12 @@ func (a *AWSSpot) downLocked(ctx context.Context, log Logger) (int, error) {
 // TerminateInstances request.
 const maxTerminateIDs = 1000
 
+// terminateRefill is how long EC2's TerminateInstances resource bucket takes
+// to regain one instance (20 a second by default). A full batch empties the
+// default bucket, so the next one can be throttled for longer than query's
+// own retries cover.
+var terminateRefill = 50 * time.Millisecond
+
 // terminate ends the given instances in batches EC2 accepts. It sends every
 // batch even after one is refused, and returns the IDs of the batches EC2
 // accepted, with an error naming those it refused. A refused batch's
@@ -1315,12 +1325,24 @@ func (a *AWSSpot) terminate(ctx context.Context, ids []string) ([]string, error)
 	failed := 0
 	batches := (len(ids) + maxTerminateIDs - 1) / maxTerminateIDs
 	for b := 0; b < batches; b++ {
-		batch := ids[b*maxTerminateIDs : min((b+1)*maxTerminateIDs, len(ids))]
-		p := url.Values{}
-		for i, id := range batch {
-			p.Set("InstanceId."+strconv.Itoa(i+1), id)
+		lo := b * maxTerminateIDs
+		if err := ctx.Err(); err != nil {
+			failed += len(ids) - lo
+			errs = append(errs, fmt.Errorf("batches %d to %d of %d (%d instances) not sent: %w", b+1, batches, batches, len(ids)-lo, err))
+			break
 		}
-		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err != nil {
+		batch := ids[lo:min(lo+maxTerminateIDs, len(ids))]
+		err := a.terminateBatch(ctx, batch)
+		if awsCode(err) == "RequestLimitExceeded" {
+			// Wait for the bucket to refill enough for this batch, then try
+			// once more.
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Duration(len(batch)) * terminateRefill):
+				err = a.terminateBatch(ctx, batch)
+			}
+		}
+		if err != nil {
 			failed += len(batch)
 			errs = append(errs, fmt.Errorf("batch %d of %d (%d instances): %w", b+1, batches, len(batch), err))
 			continue
@@ -1331,6 +1353,15 @@ func (a *AWSSpot) terminate(ctx context.Context, ids []string) ([]string, error)
 		return done, fmt.Errorf("terminate: %d of %d instances not terminated: %w", failed, len(ids), errors.Join(errs...))
 	}
 	return done, nil
+}
+
+func (a *AWSSpot) terminateBatch(ctx context.Context, ids []string) error {
+	p := url.Values{}
+	for i, id := range ids {
+		p.Set("InstanceId."+strconv.Itoa(i+1), id)
+	}
+	_, err := a.api.ec2(ctx, "TerminateInstances", p)
+	return err
 }
 
 // Doctor checks credentials, identity, AMI and networking.

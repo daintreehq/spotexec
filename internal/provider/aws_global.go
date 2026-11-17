@@ -1932,7 +1932,8 @@ func (g *AWSGlobal) Down(ctx context.Context, log Logger) error {
 		log("no running instances for %s in %d region(s)", g.r.Name, len(regions))
 	}
 	if rerr != nil {
-		errs[g.r.Region] = rerr
+		// Keep the home region's own failure (a refused batch) as well.
+		errs[g.r.Region] = errors.Join(errs[g.r.Region], rerr)
 	}
 	return joinRegionErrors(errs)
 }
