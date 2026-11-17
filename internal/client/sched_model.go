@@ -321,8 +321,7 @@ const (
 	// leadGap: a VM first seen ready more than this after it was last seen
 	// booting (or last failed to answer, in a watch: note.WatchN) was ready
 	// unobserved for an unknown time, so its launch isn't timed. It also
-	// bounds a watch's other stretches: its start after the launch, and the
-	// gaps between its probes.
+	// bounds the gaps between a watch's probes.
 	leadGap = 30 * time.Second
 )
 

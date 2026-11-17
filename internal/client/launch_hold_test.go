@@ -346,14 +346,17 @@ func TestWatchedLaunchIsTimed(t *testing.T) {
 		want     bool
 	}{
 		{"steady", at(5), []probe{{20, false}, {35, false}, {50, false}}, 60, true},
-		{"edges", at(5), []probe{{35, false}, {65, false}}, 95, true},
-		{"anchored on the planned launch", time.Time{}, []probe{{30, false}, {60, false}}, 90, true},
+		{"edges", at(5), []probe{{65, false}, {95, false}}, 125, true},
+		{"anchored on the planned launch", time.Time{}, []probe{{60, false}, {90, false}}, 120, true},
+		{"provider time before the plan", at(-5), []probe{{60, false}, {90, false}}, 120, true},
+		{"provider clock ahead", at(3600), []probe{{50, false}, {70, false}}, 80, true},
 		{"one probe", at(5), []probe{{20, false}}, 25, false},
-		{"started late", at(5), []probe{{36, false}, {50, false}}, 60, false},
-		{"started late, no provider time", time.Time{}, []probe{{31, false}, {50, false}}, 60, false},
+		{"started late", at(5), []probe{{66, false}, {80, false}}, 90, false},
+		{"started late, no provider time", time.Time{}, []probe{{61, false}, {80, false}}, 90, false},
 		{"gap", at(5), []probe{{20, false}, {51, false}, {60, false}}, 70, false},
 		{"ready unobserved", at(5), []probe{{20, false}, {35, false}}, 66, false},
-		{"past boot_timeout", at(5), []probe{{20, false}, {35, false}, {50, true}}, 60, false},
+		{"late", at(5), []probe{{20, false}, {35, false}, {50, true}}, 60, false},
+		{"clock went back", at(5), []probe{{20, false}, {35, false}, {30, false}}, 40, false},
 	} {
 		st := &poolState{Notes: map[string]*note{}}
 		st.Launches = []launchRec{{ID: "l1", InstanceID: "i-a", Started: t0}}
@@ -370,22 +373,75 @@ func TestWatchedLaunchIsTimed(t *testing.T) {
 	}
 
 	// A VM probed before its launch record names it isn't watched yet:
-	// the watch starts with the first probe that can be anchored.
+	// the watch starts with the first probe that can be anchored. The
+	// count saturates, and once ready nothing more is timed or watched.
 	st := &poolState{Notes: map[string]*note{}}
 	st.watch("i-a", at(5), false, at(15))
 	if n := st.Notes["i-a"]; n.WatchN != 0 {
 		t.Fatalf("unrecorded launch: %+v, want no watch", *n)
 	}
 	st.Launches = []launchRec{{ID: "l1", InstanceID: "i-a", Started: t0}}
-	st.watch("i-a", at(5), false, at(25))
-	st.watch("i-a", at(5), false, at(40))
+	for _, s := range []int{25, 40, 45} {
+		st.watch("i-a", at(5), false, at(s))
+	}
+	if n := st.Notes["i-a"]; n.WatchN != watchMin || !n.WatchAt.Equal(at(45)) {
+		t.Fatalf("watched thrice: %+v, want %d probes, the last at 45s", *n, watchMin)
+	}
 	st.markReady("i-a", at(50))
-	// And once ready, nothing more is timed or watched.
 	st.watch("i-a", at(5), false, at(55))
 	st.markReady("i-a", at(60))
-	if l := st.sched().Leads; len(l) != 1 || l[0].S != 50 || st.Notes["i-a"].WatchN != watchMin {
-		t.Fatalf("leads %+v, note %+v", l, *st.Notes["i-a"])
+	if l, n := st.sched().Leads, st.Notes["i-a"]; len(l) != 1 || l[0].S != 50 || !n.WatchAt.Equal(at(45)) {
+		t.Fatalf("leads %+v, note %+v", l, *n)
 	}
+
+	// A failed launch record anchors nothing.
+	st = &poolState{Notes: map[string]*note{}}
+	st.Launches = []launchRec{{ID: "l1", InstanceID: "i-a", Started: t0, Failed: true}}
+	st.watch("i-a", at(5), false, at(15))
+	if n := st.Notes["i-a"]; n.WatchN != 0 {
+		t.Fatalf("failed launch: %+v, want no watch", *n)
+	}
+}
+
+// Observe feeds the watch: failures to answer and booting replies extend
+// it, other replies don't, and a VM still silent past boot_timeout (or in
+// a region held as unreachable) breaks it. An unknown provider launch time
+// isn't past boot_timeout.
+func TestObserveWatchesLaunches(t *testing.T) {
+	p, f := testPool(t, 8)
+	p.R.BootTimeout.Duration = 5 * time.Second
+	now := time.Now()
+	ids := []string{"i-zero", "i-old", "i-boot", "i-refused", "i-held"}
+	for _, id := range ids {
+		in := provider.Instance{ID: id, State: provider.StateRunning, LaunchedAt: now, Target: provider.Target{Host: "192.0.2.9"}}
+		if id == "i-held" {
+			in.Region = "far"
+		}
+		f.insts = append(f.insts, in)
+	}
+	p.loaded(t, func(st *poolState) {
+		for _, id := range ids {
+			st.Launches = append(st.Launches, launchRec{ID: "l-" + id, InstanceID: id, Started: now.Add(-3 * time.Second), PID: os.Getpid()})
+		}
+		st.Held = map[string]time.Time{"far": time.Now()}
+	})
+	for _, o := range []Outcome{OutUnreachable, OutUnreachable} {
+		p.Observe("i-zero", o, time.Time{})
+		p.Observe("i-old", o, now.Add(-10*time.Second))
+		p.Observe("i-held", o, now)
+	}
+	p.loaded(t, func(st *poolState) { st.note("i-boot").WatchN, st.note("i-boot").WatchAt = 1, time.Now() })
+	p.Observe("i-boot", OutBooting, now)
+	p.Observe("i-refused", outRefused, now)
+	p.Observe("i-refused", outRefused, now)
+	want := map[string]int{"i-zero": watchMin, "i-old": -1, "i-boot": watchMin, "i-refused": 0, "i-held": -1}
+	p.loaded(t, func(st *poolState) {
+		for id, n := range want {
+			if got := st.note(id).WatchN; got != n {
+				t.Errorf("%s: watch %d, want %d", id, got, n)
+			}
+		}
+	})
 }
 
 // Three launches watched from launch to serving, never seen booting, make
