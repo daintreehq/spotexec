@@ -496,9 +496,12 @@ func printStatus(w *os.File, sts []runnerStatus, cfg *config.Config) {
 // jobPhases counts a VM's jobs by what they do: run a command (or hold
 // command capacity for the whole lease, as an older helper's or an
 // exclusive run's do), wait for a run permit, or prepare and write back.
-// A run holding several tokens (exclusive) counts once.
+// A run holding several tokens (exclusive) counts once, and so does a run
+// permit: a job releasing one unlocks it before clearing its record, so
+// for a moment its successor may show the same permit; one of the two
+// runs, the other writes back.
 func jobPhases(hs []protocol.Holder) (running, waiting, preparing int) {
-	seen := map[int]bool{}
+	seen, permits := map[int]bool{}, map[int]bool{}
 	for i, h := range hs {
 		id := h.HelperPID
 		if id == 0 {
@@ -509,6 +512,13 @@ func jobPhases(hs []protocol.Holder) (running, waiting, preparing int) {
 		}
 		seen[id] = true
 		switch {
+		case h.Phased && h.Phase == protocol.PhaseRun && h.Run > 0:
+			if permits[h.Run] {
+				preparing++
+			} else {
+				permits[h.Run] = true
+				running++
+			}
 		case !h.Phased || h.Phase == protocol.PhaseRun:
 			running++
 		case h.Phase == protocol.PhaseRunWait:

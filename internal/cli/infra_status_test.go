@@ -297,3 +297,56 @@ func TestStatusSlotsShowPermitWaitersApart(t *testing.T) {
 		t.Fatalf("slots column:\n%s", out)
 	}
 }
+
+// jobPhases counts a run holding several tokens once, a run permit once
+// (a job releasing one unlocks it before clearing its record), and each
+// token without a record apart.
+func TestJobPhases(t *testing.T) {
+	run := func(pid, permit int) protocol.Holder {
+		return protocol.Holder{HelperPID: pid, Phased: true, Phase: protocol.PhaseRun, Run: permit}
+	}
+	wait := protocol.Holder{HelperPID: 30, Phased: true, Phase: protocol.PhaseRunWait}
+	prep := protocol.Holder{HelperPID: 40, Phased: true}
+	excl := protocol.Holder{HelperPID: 50}
+	for _, c := range []struct {
+		name    string
+		hs      []protocol.Holder
+		r, w, p int
+	}{
+		{"exclusive", []protocol.Holder{excl, excl, excl}, 1, 0, 0},
+		{"no records", []protocol.Holder{{}, {}}, 2, 0, 0},
+		{"phases", []protocol.Holder{run(10, 1), wait, prep}, 1, 1, 1},
+		{"permit handoff", []protocol.Holder{run(10, 1), run(11, 1), run(12, 2)}, 2, 0, 1},
+		{"waiter only", []protocol.Holder{wait}, 0, 1, 0},
+	} {
+		r, w, p := jobPhases(c.hs)
+		if r != c.r || w != c.w || p != c.p {
+			t.Errorf("%s: jobPhases = %d running, %d waiting, %d preparing; want %d, %d, %d", c.name, r, w, p, c.r, c.w, c.p)
+		}
+	}
+}
+
+// A group with no jobs is left out of the slots column.
+func TestStatusSlotsOmitEmptyGroups(t *testing.T) {
+	for want, hs := range map[string][]protocol.Holder{
+		" 1/1 (+1 waiting) ": {
+			{Token: 1, HelperPID: 10, Phased: true, Phase: protocol.PhaseRun, Run: 1},
+			{Token: 2, HelperPID: 20, Phased: true, Phase: protocol.PhaseRunWait},
+		},
+		" 0/1 (+1 preparing) ": {{Token: 1, HelperPID: 10, Phased: true}},
+	} {
+		path := filepath.Join(t.TempDir(), "out")
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		printStatus(f, []runnerStatus{{Name: "spot/i-1", Type: "aws-spot", r: &config.Runner{MaxSlots: 1},
+			Info:   provider.Info{State: provider.StateRunning, InstanceID: "i-1"},
+			Helper: &helper.Status{Holders: hs, SlotCount: 1, IdleS: -1}}}, nil)
+		f.Close()
+		b, _ := os.ReadFile(path)
+		if out := string(b); !strings.Contains(out, want) {
+			t.Errorf("no %q in slots column:\n%s", want, out)
+		}
+	}
+}
