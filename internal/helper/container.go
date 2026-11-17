@@ -248,7 +248,7 @@ func (s *Session) image(m protocol.Image) error {
 	defer cancel()
 	d, installed, err := s.ensureDocker(ctx)
 	if err != nil {
-		return perr(protocol.CodeImageFailed, "%v", err)
+		return imageFailed(err)
 	}
 	res := protocol.ImageResult{InstalledDocker: installed}
 	exists := func(ref string) bool {
@@ -393,7 +393,7 @@ func (s *Session) image(m protocol.Image) error {
 		}
 		buildCtx, dockerfile, cleanup, err := s.stageContext(m)
 		if err != nil {
-			return perr(protocol.CodeImageFailed, "%v", err)
+			return imageFailed(err)
 		}
 		defer cleanup()
 		_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_build", Message: m.Dockerfile})
@@ -768,7 +768,7 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 		passwd, group, err := s.runUserFiles(ctx, d, run.Image, uid, gid)
 		cancel()
 		if err != nil {
-			return "", nil, nil, perr(protocol.CodeImageFailed, "%v", err)
+			return "", nil, nil, imageFailed(err)
 		}
 		// --mount, not -v: a missing source fails the run instead of
 		// becoming an empty directory. A file container.options already

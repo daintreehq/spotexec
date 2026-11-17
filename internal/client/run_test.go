@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -537,5 +538,32 @@ func TestSpareRequestHasNoTask(t *testing.T) {
 	spare := spareRequest(AcquireRequest{Task: "t"}, "i-1", nil)
 	if spare.Task != "" || !spare.Exclude["i-1"] {
 		t.Fatalf("spare request %+v", spare)
+	}
+}
+
+// #250: an error the helper reported during execution names that failure,
+// code once; only a runner that went away is a lost runner.
+func TestExecFailureNamesHelperErrors(t *testing.T) {
+	image := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "can't read the users of image x: docker create: signal: killed"}}
+	got := execFailure("aws#3", "aws", image).Error()
+	if strings.Contains(got, "lost runner") || strings.Count(got, protocol.CodeImageFailed) != 1 || !strings.HasPrefix(got, "aws#3: IMAGE_FAILED: can't read") {
+		t.Fatalf("helper error: %q", got)
+	}
+	queue := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeQueueTimeout, Message: "no slot"}}
+	if got := execFailure("aws#3", "aws", queue).Error(); got != "aws#3: QUEUE_TIMEOUT: no slot" {
+		t.Fatalf("queue timeout: %q", got)
+	}
+	for name, err := range map[string]error{
+		"connection": &transport.ConnError{Target: "helper", Msg: "runner did not confirm cancellation"},
+		"shutdown":   &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeShutdown, Message: "the runner is shutting down"}},
+		"other":      fmt.Errorf("decode: bad frame"),
+	} {
+		if got := execFailure("aws#3", "aws", err).Error(); !strings.HasPrefix(got, "lost runner aws during execution: ") {
+			t.Errorf("%s: %q", name, got)
+		}
+	}
+	var re *transport.RemoteError
+	if !errors.As(execFailure("aws#3", "aws", image), &re) || re.Code != protocol.CodeImageFailed {
+		t.Fatal("the helper's error is no longer wrapped")
 	}
 }

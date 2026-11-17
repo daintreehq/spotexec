@@ -649,6 +649,18 @@ func lostRunner(l *Lease, err error) string {
 	return "static"
 }
 
+// execFailure is the error of a run whose command the helper didn't see
+// through. One the helper reported itself, with the VM still answering, is
+// named as that failure: only a runner that went away (the connection or
+// session lost, the VM shutting down) is a lost runner (#250).
+func execFailure(label, runner string, err error) error {
+	var re *transport.RemoteError
+	if errors.As(err, &re) && !helperShutdown(err) {
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	return fmt.Errorf("lost runner %s during execution: %w", runner, err)
+}
+
 func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, att attempt) (res Result, err error, lost string) {
 	start := time.Now()
 	p := cfg.Project
@@ -979,10 +991,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	outW.Flush()
 	errW.Flush()
 	if err != nil {
-		if re := (*transport.RemoteError)(nil); errors.As(err, &re) && re.Code == protocol.CodeQueueTimeout {
-			return res, infra(fmt.Errorf("%s: %w", label, err)), ""
-		}
-		return res, infra(fmt.Errorf("lost runner %s during execution: %w", r.Name, err)), lostRunner(lease, err)
+		return res, infra(execFailure(label, r.Name, err)), lostRunner(lease, err)
 	}
 	res.ExitCode, res.TimedOut = result.ExitCode, result.TimedOut
 	// An interrupt (Ctrl-C, SIGTERM) at any point up to the final result

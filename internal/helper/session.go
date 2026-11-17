@@ -272,6 +272,16 @@ func perr(code, format string, a ...any) error {
 	return &protoError{code: code, msg: fmt.Sprintf(format, a...)}
 }
 
+// imageFailed reports err as IMAGE_FAILED, keeping the code of an error the
+// helper already gave one: wrapping it again would print its code twice
+// (#250).
+func imageFailed(err error) error {
+	if pe, ok := err.(*protoError); ok {
+		return pe
+	}
+	return perr(protocol.CodeImageFailed, "%v", err)
+}
+
 // stoppingNow is systemStopping (tests stand in for the VM shutting down).
 var stoppingNow = systemStopping
 

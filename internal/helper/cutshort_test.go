@@ -50,3 +50,19 @@ func TestCutShortOnlyWhileStopping(t *testing.T) {
 		t.Error("a non-protocol error changed")
 	}
 }
+
+// #250: an error that already carries the helper's code keeps it once;
+// anything else becomes IMAGE_FAILED.
+func TestImageFailedKeepsOneCode(t *testing.T) {
+	inner := perr(protocol.CodeImageFailed, "can't read the users of image x: docker create: signal: killed")
+	if got := imageFailed(inner); got != inner {
+		t.Fatalf("re-wrapped a coded error: %v", got)
+	}
+	var pe *protoError
+	if got := imageFailed(inner); !errors.As(got, &pe) || pe.wire().Message != "can't read the users of image x: docker create: signal: killed" {
+		t.Fatalf("got %v", got)
+	}
+	if got := imageFailed(fmt.Errorf("invalid image reference %q", "x y")); !errors.As(got, &pe) || pe.code != protocol.CodeImageFailed || pe.msg != `invalid image reference "x y"` {
+		t.Fatalf("plain error: %v", got)
+	}
+}
