@@ -545,25 +545,32 @@ func TestSpareRequestHasNoTask(t *testing.T) {
 // code once; only a runner that went away is a lost runner.
 func TestExecFailureNamesHelperErrors(t *testing.T) {
 	image := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeImageFailed, Message: "can't read the users of image x: docker create: signal: killed"}}
-	got := execFailure("aws#3", "aws", image).Error()
-	if strings.Contains(got, "lost runner") || strings.Count(got, protocol.CodeImageFailed) != 1 || !strings.HasPrefix(got, "aws#3: IMAGE_FAILED: can't read") {
-		t.Fatalf("helper error: %q", got)
-	}
 	queue := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeQueueTimeout, Message: "no slot"}}
-	if got := execFailure("aws#3", "aws", queue).Error(); got != "aws#3: QUEUE_TIMEOUT: no slot" {
-		t.Fatalf("queue timeout: %q", got)
-	}
-	for name, err := range map[string]error{
-		"connection": &transport.ConnError{Target: "helper", Msg: "runner did not confirm cancellation"},
-		"shutdown":   &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeShutdown, Message: "the runner is shutting down"}},
-		"other":      fmt.Errorf("decode: bad frame"),
+	shutdown := &transport.RemoteError{ErrorMsg: protocol.ErrorMsg{Code: protocol.CodeShutdown, Message: "the runner is shutting down"}}
+	conn := &transport.ConnError{Target: "helper", Msg: "runner did not confirm cancellation"}
+	garbled := errors.New("invalid character 'x' looking for beginning of value")
+	for _, c := range []struct {
+		name string
+		err  error
+		dead bool
+		want string
+	}{
+		{"helper error", image, false, "aws#3: IMAGE_FAILED: can't read the users of image x: docker create: signal: killed"},
+		{"helper error, session since gone", image, true, "aws#3: IMAGE_FAILED: can't read"},
+		{"wrapped helper error", fmt.Errorf("exec: %w", image), false, "aws#3: exec: IMAGE_FAILED: can't read"},
+		{"queue timeout", queue, false, "aws#3: QUEUE_TIMEOUT: no slot"},
+		{"shutdown", shutdown, false, "lost runner aws during execution: RUNNER_SHUTTING_DOWN"},
+		{"connection", conn, false, "lost runner aws during execution: "},
+		{"unreadable reply", garbled, false, "aws#3: unreadable reply from the runner during execution: invalid character"},
+		{"unreadable reply, session gone", garbled, true, "lost runner aws during execution: invalid character"},
 	} {
-		if got := execFailure("aws#3", "aws", err).Error(); !strings.HasPrefix(got, "lost runner aws during execution: ") {
-			t.Errorf("%s: %q", name, got)
+		got := execFailure("aws#3", "aws", c.err, c.dead).Error()
+		if !strings.HasPrefix(got, c.want) || strings.Count(got, protocol.CodeImageFailed) > 1 {
+			t.Errorf("%s: got %q, want it to start %q", c.name, got, c.want)
 		}
 	}
 	var re *transport.RemoteError
-	if !errors.As(execFailure("aws#3", "aws", image), &re) || re.Code != protocol.CodeImageFailed {
+	if !errors.As(execFailure("aws#3", "aws", image, false), &re) || re.Code != protocol.CodeImageFailed {
 		t.Fatal("the helper's error is no longer wrapped")
 	}
 }

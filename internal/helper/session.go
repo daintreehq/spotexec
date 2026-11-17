@@ -282,6 +282,15 @@ func imageFailed(err error) error {
 	return perr(protocol.CodeImageFailed, "%v", err)
 }
 
+// uncoded is err's message without the code of an error the helper already
+// gave one, for wrapping it under another code.
+func uncoded(err error) string {
+	if pe, ok := err.(*protoError); ok {
+		return pe.msg
+	}
+	return err.Error()
+}
+
 // stoppingNow is systemStopping (tests stand in for the VM shutting down).
 var stoppingNow = systemStopping
 

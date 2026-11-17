@@ -65,4 +65,12 @@ func TestImageFailedKeepsOneCode(t *testing.T) {
 	if got := imageFailed(fmt.Errorf("invalid image reference %q", "x y")); !errors.As(got, &pe) || pe.code != protocol.CodeImageFailed || pe.msg != `invalid image reference "x y"` {
 		t.Fatalf("plain error: %v", got)
 	}
+	// Under another code (a dependency install's container), the message
+	// loses the inner code.
+	if got := perr(protocol.CodeDepsFailed, "%s", uncoded(inner)).Error(); got != "DEPS_FAILED: can't read the users of image x: docker create: signal: killed" {
+		t.Fatalf("deps: %q", got)
+	}
+	if got := uncoded(errors.New("plain")); got != "plain" {
+		t.Fatalf("plain: %q", got)
+	}
 }
