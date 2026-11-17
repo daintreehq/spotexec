@@ -169,6 +169,11 @@ type Result struct {
 	// permit, nothing having run, and carries on in this slot elsewhere.
 	moveTo *Lease
 	moveFP string
+	// stalled: the attempt's upload stopped arriving on a connection whose
+	// helper kept answering (#265), before anything ran. stalledOn is the
+	// VM it was uploading to ("" on a static runner).
+	stalled   bool
+	stalledOn string
 }
 
 // stage is how far an attempt had got: the phase it was in, whether the
@@ -404,6 +409,22 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 			att.moves++
 			continue
 		}
+		if res.stalled {
+			if !stallRetry(o, ctx.Err() != nil, att.n) {
+				return res, err
+			}
+			// Nothing ran, and the VM isn't to blame: the connection to it
+			// is. Its master is retired; this run tries elsewhere if it can
+			// (a path that crawled once may crawl again), without marking
+			// the VM lost for anyone else.
+			o.Rep.Warn("UPLOAD_STALLED", "%v; retrying the run on a fresh connection", err)
+			o.Rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "reason": "upload_stalled"})
+			if res.stalledOn != "" {
+				att.exclude[res.stalledOn] = true
+			}
+			att.n++
+			continue
+		}
 		retry, code, why := replayable(lost, res, o, ctx.Err() != nil, att.n)
 		if why != "" {
 			o.Rep.Warn(code, "%s", why)
@@ -426,6 +447,25 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		}
 		att.n++
 	}
+}
+
+// stallRetry decides whether an attempt whose upload stalled (#265) is
+// retried: once per run, like a replay, and never for a run pinned to its
+// last slot (that slot stays held until the stalled session's helper lets
+// go of it).
+func stallRetry(o Options, canceled bool, n int) bool {
+	return o.RetryPreempt && !canceled && !o.PreferLast && !o.SameSlot && n < 2
+}
+
+// uploadStall is the error of an attempt whose upload to the lease's runner
+// stopped arriving while the helper kept answering, or nil. A VM out of
+// memory can't keep up with what it is sent either: that stays a lost
+// runner, which its memory keeps from being replayed.
+func uploadStall(l *Lease) error {
+	if l == nil || !l.Sess.UploadStalled() || l.Sess.MemoryPressure(PressureWindow) != "" {
+		return nil
+	}
+	return l.Sess.LostErr()
 }
 
 // replayable decides whether an attempt that lost its runner (lost, from
@@ -875,6 +915,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			}
 			syn, err := syncIn(ctx, sess, m, p.Deps.CacheDirs, stray, o)
 			if err != nil {
+				if serr := uploadStall(lease); serr != nil {
+					res.stalled, res.stalledOn = true, lease.InstanceID
+					return res, infra(fmt.Errorf("sync to %s: %w", r.Name, serr)), ""
+				}
 				return res, infra(fmt.Errorf("sync to %s: %w", r.Name, err)), lostRunner(lease, err)
 			}
 			// The sync removed whatever an earlier write-back held here.
@@ -886,6 +930,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		// Before the image and dependencies, so install scripts see it too.
 		prog.set(phaseGitSeed)
 		if err := seedGit(ctx, sess, m, p.Sync.GitSeed, o, label); err != nil {
+			if serr := uploadStall(lease); serr != nil {
+				res.stalled, res.stalledOn = true, lease.InstanceID
+				return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, serr)), ""
+			}
 			return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, err)), lostRunner(lease, err)
 		}
 	}

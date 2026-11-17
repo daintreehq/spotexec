@@ -32,7 +32,7 @@ func TestCrawlingUploadStalls(t *testing.T) {
 	e := newFakeEnv(t)
 	short(t, &UploadStallWindow, time.Second)
 	short(t, &SilenceLimit, 2*time.Second) // the watchdog ticks every 500ms
-	e.Set("rpc-crawl", "64") // ~1 KiB/s, with a heartbeat every 50ms
+	e.Set("rpc-crawl", "64")               // ~1 KiB/s, with a heartbeat every 50ms
 	s := e.session(t)
 	errc := upload(s)
 	start := time.Now()
