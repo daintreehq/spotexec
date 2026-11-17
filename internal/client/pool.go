@@ -692,7 +692,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		}
 		d.QuotaErr = st.quotaBlocked(p.since)
 		var wholeVM bool
-		d.Ready, wholeVM = p.readyRoom(st, d.Demand-d.Capacity, demand, whole, pendingVM, d.Waited, d.Lead, now)
+		d.Ready, wholeVM = p.readyRoom(st, d.Demand-d.Capacity, demand, covered, whole, pendingVM, d.Waited, d.Lead, now)
 		bootFailed := ""
 		for id, n := range st.Notes {
 			if n.BootFailed && time.Since(n.BootFailedAt) < time.Hour {
@@ -1187,7 +1187,10 @@ func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendi
 // whole-VM waiter is left without a VM. Each whole-VM waiter takes a VM
 // with nothing on it, the smallest first; the shared demand takes the free
 // slots left, on the empty VMs no whole-VM waiter took and beside the jobs
-// on the others. A waiter that can't probe yet (behind an exclusive job
+// on the others. The demand higher-priority fleets cover (`covered`, not
+// saying whose) comes off the shared waiters first: what is left is the
+// hardest to place, so a whole-VM waiter no fleet has an empty VM for is
+// never taken as covered by slots that serve only shared ones. A waiter that can't probe yet (behind an exclusive job
 // in the queue) is demand all the same, so without this an idle fleet
 // launches for it moments before it takes a free slot (#239).
 //
@@ -1199,9 +1202,25 @@ func (p *Pool) releaseSoon(st *poolState, d *LaunchDecision, wholeVM bool, pendi
 // while this process has waited less than a launch's lead: the ledger
 // knows only this machine's jobs, so a VM another machine fills looks free
 // here, and demand still waiting past the lead launches as before.
-func (p *Pool) readyRoom(st *poolState, need, total int, whole []int, pendingVM map[string]bool, waited, lead time.Duration, now time.Time) (covers int, wholeLeft bool) {
+func (p *Pool) readyRoom(st *poolState, need, total, covered int, whole []int, pendingVM map[string]bool, waited, lead time.Duration, now time.Time) (covers int, wholeLeft bool) {
+	shared := total
+	for _, wt := range whole {
+		shared -= wt
+	}
+	shared = max(shared, 0)
+	upstream := min(max(covered, 0), shared)
+	shared -= upstream
+	upstream = max(covered, 0) - upstream
+	var left []int // whole-VM waiters not covered upstream
+	for _, wt := range whole {
+		if upstream >= wt {
+			upstream -= wt
+			continue
+		}
+		left = append(left, wt)
+	}
 	if need <= 0 || waited >= lead {
-		return 0, len(whole) > 0
+		return 0, len(left) > 0
 	}
 	s := st.sched()
 	var empty []int
@@ -1220,9 +1239,8 @@ func (p *Pool) readyRoom(st *poolState, need, total int, whole []int, pendingVM 
 		free += max(w.units-w.firm-w.unc, 0)
 	}
 	sort.Ints(empty)
-	placed, shared := 0, total
-	for _, wt := range whole {
-		shared -= wt
+	placed := 0
+	for _, wt := range left {
 		if placed < len(empty) {
 			covers += wt
 			placed++
@@ -1231,8 +1249,8 @@ func (p *Pool) readyRoom(st *poolState, need, total int, whole []int, pendingVM 
 	for _, u := range empty[placed:] {
 		free += u
 	}
-	covers += min(max(shared, 0), free)
-	return min(covers, need), placed < len(whole)
+	covers += min(shared, free)
+	return min(covers, need), placed < len(left)
 }
 
 func plural(n int, what string) string {

@@ -7,6 +7,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/ui"
 )
 
 // readyFleet is `vms` ready four-slot VMs, idle by this machine's ledger,
@@ -142,19 +145,90 @@ func TestReadyCoverThenHold(t *testing.T) {
 	}
 }
 
-// The acceptance case through Acquire: an exclusive part at the head of
-// the queue is still probing the first idle VM when three shared parts
-// queue behind it (they don't probe past it). They launch nothing, and
-// all four parts run on the two VMs.
-func TestMultipartRunOnIdleFleetLaunchesNothing(t *testing.T) {
-	pool, fleets := fakeFleetsOf(t, map[string][]string{"healthy": {"h1", "h2"}}, 4)
-	pool[0].MaxSlots = 4
-	f := fleets["healthy"]
-	p := NewPool(pool[0], f)
+// A slot an uncertain attempt (a dead process's, not yet reconciled) may
+// hold isn't free for shared demand either.
+func TestUncertainSlotIsNotFree(t *testing.T) {
+	p := readyFleet(t, 1, 4, 0, time.Second)
 	p.loaded(t, func(st *poolState) {
-		allReady(st, time.Now())
-		p.views(st, time.Now())
+		hold(st.sched(), "i-0", "a", time.Now())
+		for _, a := range st.sched().Attempts {
+			a.State = attUncertain
+		}
 	})
+	if d, _ := p.Plan(context.Background(), 0); !d.Launch || d.Ready != 3 {
+		t.Fatalf("%+v, want 3 slots covered and a launch for the fourth job", d)
+	}
+}
+
+// An exclusive part takes the smallest empty VM, leaving the larger one's
+// slots to the shared parts.
+func TestExclusiveTakesSmallestEmptyVM(t *testing.T) {
+	p := readyFleet(t, 2, 4, 1, time.Second)
+	p.loaded(t, func(st *poolState) { st.sched().VMs["i-1"].Slots = 2 })
+	if d, _ := p.Plan(context.Background(), 0); d.Launch || d.Ready != 8 {
+		t.Fatalf("%+v, want the exclusive part on the two-slot VM and the shared ones on the four-slot VM", d)
+	}
+}
+
+// Ready credit covers only demand nothing else does: not what this
+// fleet's launches cover, nor what higher-priority fleets do, and those
+// cover shared demand before an exclusive part's.
+func TestReadyCreditCoversOnlyResidualDemand(t *testing.T) {
+	ctx := context.Background()
+	// Five shared parts: a launch already covers four, so the empty VM
+	// covers only the fifth.
+	p := readyFleet(t, 2, 5, 0, time.Second)
+	p.loaded(t, func(st *poolState) {
+		st.Launches = []launchRec{{ID: "l1", Started: time.Now(), PID: os.Getpid()}}
+		st.note("i-1").Draining = true
+	})
+	if d, _ := p.Plan(ctx, 0); d.Launch || d.Ready != 1 || d.Capacity != 4 {
+		t.Fatalf("launch pending: %+v, want 1 slot covered by the ready VM", d)
+	}
+
+	// An exclusive part and four shared ones; a higher-priority fleet
+	// covers four slots, and this one has four free slots but no empty
+	// VM. What is covered upstream is the shared parts: the exclusive one
+	// still needs a VM.
+	p = readyFleet(t, 2, 4, 1, time.Second)
+	p.loaded(t, func(st *poolState) {
+		for _, vm := range []string{"i-0", "i-1"} {
+			hold(st.sched(), vm, "a"+vm, time.Now())
+			hold(st.sched(), vm, "b"+vm, time.Now())
+		}
+	})
+	if d, _ := p.Plan(ctx, 4); !d.Launch || d.Ready != 0 {
+		t.Fatalf("covered upstream: %+v, want a launch for the exclusive part", d)
+	}
+}
+
+// parkRep records events, signals each queue round (its status line), and
+// while parked holds the job there, before its next round.
+type parkRep struct {
+	roundRep
+	resume <-chan struct{}
+}
+
+func (r *parkRep) Status(f string, a ...any) {
+	r.roundRep.Status(f, a...)
+	<-r.resume
+}
+
+// multipartRun starts an exclusive part, and while it is still probing
+// the first VM, three shared parts queued behind it (they don't probe
+// past it). Once each shared part has planned a round, the exclusive part
+// gets its VM, and then the shared parts go on. It returns the VMs the
+// parts ran on and the events of every part.
+func multipartRun(t *testing.T, pool []*config.Runner, fleets map[string]*fakeFleet) (map[string]int, []*placeRep) {
+	t.Helper()
+	for _, r := range pool {
+		r.MaxSlots = 4
+		p := NewPool(r, fleets[r.Name])
+		p.loaded(t, func(st *poolState) {
+			allReady(st, time.Now())
+			p.views(st, time.Now())
+		})
+	}
 	probing, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	scriptHelpers(t, func(req AcquireRequest, _ string, _ int) (*Lease, error) {
@@ -168,47 +242,96 @@ func TestMultipartRunOnIdleFleetLaunchesNothing(t *testing.T) {
 		l   *Lease
 		err error
 	}
-	results := make(chan result, 4)
-	acquire := func(exclusive bool, rep *roundRep) {
+	acquire := func(exclusive bool, rep ui.Reporter, out chan<- result) {
 		req := AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: rep}
 		req.Base.Exclusive = exclusive
 		l, err := Acquire(context.Background(), req)
-		results <- result{l, err}
+		out <- result{l, err}
 	}
-	lint := &roundRep{rounds: make(chan struct{}, 64)}
-	go acquire(true, lint)
-	<-probing
-	reps := []*roundRep{}
-	for range 3 {
-		rep := &roundRep{rounds: make(chan struct{}, 64)}
-		reps = append(reps, rep)
-		go acquire(false, rep)
-	}
-	// Each shared part has planned a few queued rounds behind it.
-	for _, rep := range reps {
-		for range 2 {
-			<-rep.rounds
+	var leases []*Lease
+	t.Cleanup(func() {
+		for _, l := range leases {
+			l.Close()
 		}
-	}
-	close(release)
-	vms := map[string]int{}
-	for range 4 {
-		r := <-results
+	})
+	got := map[string]int{}
+	take := func(r result) {
+		t.Helper()
 		if r.err != nil {
 			t.Fatal(r.err)
 		}
-		vms[r.l.InstanceID]++
-		defer r.l.Close()
+		leases = append(leases, r.l)
+		got[r.l.InstanceID]++
+	}
+	lint, lintDone := &roundRep{rounds: make(chan struct{}, 64)}, make(chan result, 1)
+	go acquire(true, lint, lintDone)
+	<-probing
+	resume, shared := make(chan struct{}), make(chan result, 3)
+	var reps []*parkRep
+	for range 3 {
+		rep := &parkRep{roundRep: roundRep{rounds: make(chan struct{}, 64)}, resume: resume}
+		reps = append(reps, rep)
+		go acquire(false, rep, shared)
+	}
+	for _, rep := range reps {
+		<-rep.rounds // planned a round behind the exclusive part, and parked
+	}
+	close(release)
+	take(<-lintDone)
+	close(resume)
+	for range 3 {
+		take(<-shared)
 	}
 	WaitLaunches(5 * time.Second)
-	for _, rep := range append(reps, lint) {
+	all := []*placeRep{&lint.placeRep}
+	for _, rep := range reps {
+		all = append(all, &rep.placeRep)
+	}
+	return got, all
+}
+
+func launched(t *testing.T, reps []*placeRep, fleets map[string]*fakeFleet) {
+	t.Helper()
+	for _, rep := range reps {
 		for i, n := range rep.names {
 			if n == "scale_out" {
 				t.Fatalf("launched while ready VMs had room: %v", rep.events[i])
 			}
 		}
 	}
-	if f.n != 0 || len(vms) != 2 {
-		t.Fatalf("%d launched, parts on %v, want none launched and the parts on both VMs", f.n, vms)
+	for name, f := range fleets {
+		f.mu.Lock()
+		n := f.n
+		f.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("%s launched %d VMs, want none", name, n)
+		}
 	}
+}
+
+// The acceptance case through Acquire: a multi-part run on an idle fleet
+// with room for it launches nothing, and its parts run on both VMs.
+func TestMultipartRunOnIdleFleetLaunchesNothing(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"healthy": {"h1", "h2"}}, 4)
+	vms, reps := multipartRun(t, pool, fleets)
+	launched(t, reps, fleets)
+	if len(vms) != 2 {
+		t.Fatalf("parts on %v, want both VMs", vms)
+	}
+}
+
+// Demand the preferred fleet's ready VMs cover is covered for the next
+// fleet too: that one, full but free to grow, launches nothing for it.
+func TestReadyCoverReachesLowerPriorityFleets(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"broken": {"b1", "b2"}, "healthy": {"h1"}}, 4)
+	full := NewPool(pool[1], fleets["healthy"])
+	full.loaded(t, func(st *poolState) {
+		allReady(st, time.Now())
+		full.views(st, time.Now())
+		for _, wt := range []string{"a", "b", "c", "d"} {
+			hold(st.sched(), "i-h1", wt, time.Now())
+		}
+	})
+	_, reps := multipartRun(t, pool, fleets)
+	launched(t, reps, fleets)
 }
