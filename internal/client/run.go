@@ -343,7 +343,10 @@ type attempt struct {
 	n       int
 	exclude map[string]bool // fleet instances lost in earlier attempts (and regions: regionKey)
 	noBoot  bool            // replaying after a regional loss: only on VMs there are
-	fresh   *bool           // an earlier attempt already showed CONTAINER_FRESH
+	// bootOnly: replaying after a regional loss, only this runner, which
+	// holds the region (#225), may launch for it.
+	bootOnly string
+	fresh    *bool // an earlier attempt already showed CONTAINER_FRESH
 }
 
 // Run executes opts.Command remotely for workspace ws. If the runner is lost
@@ -690,7 +693,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	// Without a sync the slot's files are not ours: don't claim ownership.
 	base.KeepOwner = o.Sync == "none"
-	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot || att.noBoot, Exclude: att.exclude, Priority: o.Priority,
+	req := AcquireRequest{Pool: pool, Base: base, QueueTimeout: o.QueueTimeout, Rep: o.Rep, NoBoot: o.NoBoot || att.noBoot, BootOnly: att.bootOnly, Exclude: att.exclude, Priority: o.Priority,
 		Task: TaskKey(ws.RepoID, o.Display)}
 	if o.Sync != "none" {
 		// A launch for this run prefers regions that hold its caches.

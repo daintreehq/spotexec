@@ -428,12 +428,23 @@ func (g *AWSGlobal) unreachDetail(region string) string {
 
 // AnswersOutside implements RegionAnswerer: a listing of the runner's VMs
 // (DescribeInstances) in another launch region that succeeds, empty or
-// not, is an answer; an error of any kind is not.
+// not, is an answer; an error of any kind is not. Configured regions are
+// asked as they are, without looking up which are enabled first (one that
+// isn't fails, and doesn't count), so the lookup can't use up ctx.
 func (g *AWSGlobal) AnswersOutside(ctx context.Context, region string) string {
-	if g.oneRegion() || ctx.Err() != nil {
+	if ctx.Err() != nil {
 		return ""
 	}
-	regions, _ := g.PlacementRegions(ctx)
+	var regions []string
+	switch {
+	case g.oneRegion():
+		// A runner moved to one region may still have VMs in another.
+		regions = []string{g.r.Region}
+	case !g.r.AnyRegion():
+		regions = g.r.Regions
+	default:
+		regions, _ = g.PlacementRegions(ctx)
+	}
 	var ask []string
 	for _, rg := range regions {
 		if rg != region && rg != "" && len(ask) < answerRegions {

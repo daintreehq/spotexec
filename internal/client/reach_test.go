@@ -20,12 +20,15 @@ type holdFleet struct {
 	asked   []string          // HoldRegion calls, by region
 	reached []string          // ReachedRegion calls
 	closed  bool              // RegionHolds reports no region left open
+	refuse  bool              // HoldRegion records the call but holds nothing
 }
 
 func (h *holdFleet) HoldRegion(region, why string) {
 	h.hmu.Lock()
 	defer h.hmu.Unlock()
-	h.holds[region] = why
+	if !h.refuse {
+		h.holds[region] = why
+	}
 	h.asked = append(h.asked, region)
 }
 

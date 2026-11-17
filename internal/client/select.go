@@ -60,7 +60,10 @@ type AcquireRequest struct {
 	PreferInstance string
 	Rep            ui.Reporter
 	NoBoot         bool // never launch fleet instances
-	Priority       int  // queue priority (higher first)
+	// BootOnly, when set, names the one runner whose fleet may launch for
+	// the request (a replay kept out of a region its fleet holds, #240).
+	BootOnly string
+	Priority int // queue priority (higher first)
 	// Exclude: fleet instance IDs to avoid (e.g. one being reclaimed), and
 	// whole regions to avoid as regionKey(region).
 	Exclude map[string]bool
@@ -73,6 +76,11 @@ type AcquireRequest struct {
 	// onSend, when set, runs just before the acquire request is sent; an
 	// error stops it going out.
 	onSend func() error
+}
+
+// noBoot reports whether runner's fleet may not launch for the request.
+func (req *AcquireRequest) noBoot(runner string) bool {
+	return req.NoBoot || (req.BootOnly != "" && runner != req.BootOnly)
 }
 
 // Connect opens a helper session on a known target.
@@ -240,7 +248,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
 					continue
 				}
-				if !req.NoBoot || usable > 0 {
+				if !req.noBoot(m.r.Name) || usable > 0 {
 					reachable++
 				}
 				fleetCands[m] = cands
@@ -252,7 +260,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				roundErrs = append(roundErrs, fmt.Sprintf("%s: %v", m.r.Name, err))
 				continue
 			}
-			if !req.NoBoot || usable > 0 {
+			if !req.noBoot(m.r.Name) || usable > 0 {
 				reachable++ // a fleet can always grow (or is growing)
 			}
 			readyFirst(cands, m.r.WorkRoot)
@@ -454,7 +462,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				}
 				continue
 			}
-			if req.NoBoot {
+			if req.noBoot(m.r.Name) {
 				continue // can't grow: don't signal demand others would launch for
 			}
 			if waiters[m.r.Name] == nil {
@@ -471,10 +479,10 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				waiters[m.r.Name] = w
 				wmu.Unlock()
 			}
-			if req.NoBoot {
+			if req.noBoot(m.r.Name) {
 				continue
 			}
-			d, err := m.pool.Plan(ctx, covered)
+			d, err := m.pool.PlanFor(ctx, covered, req.Exclude)
 			if err != nil {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue

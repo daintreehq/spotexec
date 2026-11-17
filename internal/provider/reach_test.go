@@ -259,39 +259,53 @@ func TestSimRegionHoldsAndCutOff(t *testing.T) {
 	}
 }
 
-// #240: AnswersOutside lists the runner's VMs in the fleet's other launch
-// regions (inactive ones included) and returns one that answered; errors,
-// a region that never answers, and the asked region itself don't count.
+// #240: AnswersOutside lists the runner's VMs in up to three of the
+// fleet's other configured regions at once (without looking up which are
+// enabled first) and returns one that answered: errors, a region that never
+// answers, and the asked region itself don't count, and one that hangs
+// doesn't hold up an answer from another.
 func TestGlobalAnswersOutside(t *testing.T) {
 	ctx := context.Background()
-	f := &fakeRegionsEC2{listErr: map[string]string{"r-two-1": "UnauthorizedOperation"}}
-	g := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1")
-	discovered(t, g)
-	if got := g.AnswersOutside(ctx, "r-one-1"); got != "r-three-1" {
-		t.Fatalf("answered %q, want r-three-1", got)
+	f := &fakeRegionsEC2{listErr: map[string]string{"r-three-1": "UnauthorizedOperation"}, dead: map[string]bool{"r-two-1": true}}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1", "r-three-1", "r-four-1", "r-five-1")
+	start := time.Now()
+	if got := g.AnswersOutside(ctx, "r-one-1"); got != "r-four-1" || time.Since(start) > 5*time.Second {
+		t.Fatalf("answered %q after %s, want r-four-1", got, time.Since(start))
+	}
+	if n := len(f.callsOf("DescribeRegions")); n != 0 {
+		t.Fatalf("looked up enabled regions first: %d calls", n)
 	}
 	for _, c := range f.callsOf("DescribeInstances") {
-		if strings.HasPrefix(c, "r-one-1 ") {
-			t.Fatalf("asked the silent region itself: %v", f.callsOf("DescribeInstances"))
+		if strings.HasPrefix(c, "r-one-1 ") || strings.HasPrefix(c, "r-five-1 ") {
+			t.Fatalf("asked the silent region, or past three: %v", f.callsOf("DescribeInstances"))
 		}
 	}
 
 	// Every other region fails, or never answers before ctx ends.
-	f2 := &fakeRegionsEC2{listErr: map[string]string{"r-two-1": "UnauthorizedOperation"}, dead: map[string]bool{"r-three-1": true}, noRegions: true}
+	f2 := &fakeRegionsEC2{listErr: map[string]string{"r-two-1": "UnauthorizedOperation"}, dead: map[string]bool{"r-three-1": true}}
 	g2 := newGlobalEnv(t, f2, "r-one-1", "r-two-1", "r-three-1")
-	discovered(t, g2)
 	tctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancel()
-	start := time.Now()
+	start = time.Now()
 	if got := g2.AnswersOutside(tctx, "r-one-1"); got != "" || time.Since(start) > 5*time.Second {
 		t.Fatalf("answered %q after %s", got, time.Since(start))
 	}
+	if got := f2.callsOf("DescribeInstances"); len(got) != 1 || got[0] != "r-two-1 DescribeInstances" {
+		t.Fatalf("didn't ask both other regions: %v (r-three-1 is dead: %v)", got, f2.calls)
+	}
 
-	// One region: nothing outside it to ask.
+	// A runner moved to one region: its home region answers for a VM left
+	// in another, and nothing answers for the home region itself.
 	f3 := &fakeRegionsEC2{}
 	g3 := newGlobalEnv(t, f3, "r-one-1")
 	g3.legacy = true
+	if got := g3.AnswersOutside(ctx, "r-two-1"); got != "r-one-1" {
+		t.Fatalf("legacy runner answered %q outside r-two-1, want r-one-1", got)
+	}
+	f3.mu.Lock()
+	f3.calls = nil
+	f3.mu.Unlock()
 	if got := g3.AnswersOutside(ctx, "r-one-1"); got != "" || len(f3.callsOf("DescribeInstances")) != 0 {
-		t.Fatalf("legacy runner answered %q, calls %v", got, f3.callsOf("DescribeInstances"))
+		t.Fatalf("legacy runner answered %q outside its only region, calls %v", got, f3.callsOf("DescribeInstances"))
 	}
 }

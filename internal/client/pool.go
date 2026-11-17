@@ -826,6 +826,15 @@ type LaunchDecision struct {
 // would serve (a short burst waits for them; demand still waiting after a
 // launch's lead launches).
 func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
+	return p.PlanFor(ctx, covered, nil)
+}
+
+// PlanFor is Plan for a request that may not use exclude's VMs and regions
+// (AcquireRequest.Exclude): a VM it excludes still counts toward
+// max_instances, but its pending slots don't cover the request's demand,
+// so a replay kept out of a silent region isn't left waiting on a VM
+// booting there (#240).
+func (p *Pool) PlanFor(ctx context.Context, covered int, exclude map[string]bool) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
@@ -834,9 +843,13 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		demand, whole := p.waiters()
 		d.Demand = demand - covered
 		listed := map[string]bool{}
+		unusable := map[string]bool{} // listed, but excluded from this request
 		usable, total := 0, 0
 		for _, in := range st.Instances {
 			listed[in.ID] = true
+			if excluded(exclude, in) {
+				unusable[in.ID] = true
+			}
 			total++
 			if !st.Notes[in.ID].closed() {
 				usable++
@@ -861,6 +874,9 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 					// won't serve, so another launch (elsewhere) may.
 					continue
 				}
+				if unusable[l.InstanceID] {
+					continue // it won't serve this request
+				}
 			}
 			if l.InstanceID == "" || !listed[l.InstanceID] {
 				usable++
@@ -876,7 +892,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			n := st.Notes[in.ID]
 			// Only never-ready instances count here: a ready one is already
 			// serving (its launch-grace capacity, if any, is in the ledger).
-			if inLedger[in.ID] || (n != nil && (n.Ready || n.closed())) {
+			if inLedger[in.ID] || unusable[in.ID] || (n != nil && (n.Ready || n.closed())) {
 				continue
 			}
 			if time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {

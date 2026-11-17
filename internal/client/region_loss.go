@@ -164,20 +164,27 @@ func regionSilent(ctx context.Context, lease *Lease) *regionLoss {
 		wg.Add(1)
 		go probe(in, false)
 	}
+	var outside chan string
 	if len(others) == 0 {
-		wg.Add(1)
+		// Not waited for past ctx: a fleet's API check may block on state
+		// another process holds.
+		outside = make(chan string, 1)
 		go func() {
-			defer wg.Done()
 			actx, cancel := context.WithTimeout(ctx, regionProbeTime)
 			defer cancel()
-			if rg := ans.AnswersOutside(actx, region); rg != "" && rg != region {
-				mu.Lock()
-				answered, api = rg, true
-				mu.Unlock()
-			}
+			outside <- ans.AnswersOutside(actx, region)
 		}()
 	}
 	wg.Wait()
+	if outside != nil {
+		select {
+		case rg := <-outside:
+			if rg != "" && rg != region {
+				answered, api = rg, true
+			}
+		case <-ctx.Done():
+		}
+	}
 	if vetoed || answered == "" || ctx.Err() != nil {
 		return nil
 	}
@@ -249,11 +256,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // replayAfterRegion readies att to replay a run lost to its region going
 // silent (res.noReplay.region): on a VM outside that region, once the
 // helper there has given up on the lost attempt (regionReplayAfter). It
-// waits for that, and is false when ctx ended first. The replay may launch
-// a VM when the region is still held (#225), renewed now, and the fleet
-// has a region left open, so the launch goes elsewhere (#240: the whole
-// fleet may have been in the silent region); otherwise it takes only a VM
-// already running outside the region, since a launch might well go there.
+// waits for that, and is false when ctx ended first. The lost VM's runner
+// may launch a VM for the replay (no other runner may) when the region is
+// still held there (#225), renewed now, and the fleet has a region left
+// open, so the launch goes elsewhere (#240: the whole fleet may have been
+// in the silent region); otherwise the replay takes only a VM already
+// running outside the region, since a launch might well go there.
 func replayAfterRegion(ctx context.Context, rep ui.Reporter, att *attempt, res Result, lost string) bool {
 	rl := res.noReplay.region
 	wait := regionReplayWait(res.lostWhen)
@@ -264,6 +272,8 @@ func replayAfterRegion(ctx context.Context, rep ui.Reporter, att *attempt, res R
 	if !sleepCtx(ctx, wait) {
 		return false
 	}
-	att.noBoot = !rl.pool.launchOutside(ctx, rl.region, rl.why())
+	if rl.pool.launchOutside(ctx, rl.region, rl.why()) {
+		att.noBoot, att.bootOnly = false, rl.pool.R.Name
+	}
 	return true
 }
