@@ -57,6 +57,14 @@ type Session struct {
 	onSilent atomic.Pointer[func(time.Duration) time.Duration]
 	pressure atomic.Pointer[pressureSeen]  // the latest heartbeat showing memory pressure
 	memory   atomic.Pointer[MemoryReading] // the latest heartbeat's memory reading
+	sent     atomic.Int64                  // bytes written to the helper so far
+	writing  atomic.Bool                   // a write to the helper is under way
+	up       uploadWatch                   // whether what we send is getting through
+	stalled  atomic.Bool                   // the watchdog gave up on an upload that stopped arriving
+	// client and master are the connection the session runs on: the
+	// master's pid (0 if unknown), retired when an upload stalls on it.
+	client *Client
+	master int
 	// OnEvent receives helper events that arrive while waiting for replies.
 	OnEvent func(protocol.Event)
 }
@@ -97,7 +105,7 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s, err := c.openHelper(ctx, dialed)
+	s, err := c.openHelper(ctx, dialed, pid)
 	if err == nil || !IsConnError(err) || ctx.Err() != nil {
 		return s, err
 	}
@@ -113,7 +121,7 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 	if pid, _, err = c.ensureMaster(ctx); err != nil {
 		return nil, err
 	}
-	s, err = c.openHelper(ctx, true)
+	s, err = c.openHelper(ctx, true, pid)
 	if err != nil && IsConnError(err) && ctx.Err() == nil {
 		c.dropMaster(pid)
 	}
@@ -121,8 +129,9 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 }
 
 // openHelper installs the helper if needed and opens a session on it.
-// fresh says the master was just dialed (so it is known to be live).
-func (c *Client) openHelper(ctx context.Context, fresh bool) (*Session, error) {
+// fresh says the master was just dialed (so it is known to be live); pid
+// is that master's.
+func (c *Client) openHelper(ctx context.Context, fresh bool, pid int) (*Session, error) {
 	probe, hs := probeTimeout, handshakeTimeout
 	if !fresh {
 		probe, hs = reusedHandshakeTimeout, reusedHandshakeTimeout
@@ -131,12 +140,12 @@ func (c *Client) openHelper(ctx context.Context, fresh bool) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s, err := c.open(ctx, path, hs)
+	s, err := c.open(ctx, path, hs, pid)
 	if err != nil && !IsConnError(err) && ctx.Err() == nil {
 		// Stale marker (helper removed remotely, or work_root wiped): reinstall.
 		c.ForgetHelper()
 		if path, err2 := c.ensureHelper(ctx, true, probe); err2 == nil {
-			s, err = c.open(ctx, path, hs)
+			s, err = c.open(ctx, path, hs, pid)
 		} else {
 			err = err2 // why the reinstall failed is the useful error
 		}
@@ -144,7 +153,7 @@ func (c *Client) openHelper(ctx context.Context, fresh bool) (*Session, error) {
 	return s, err
 }
 
-func (c *Client) open(ctx context.Context, path string, handshake time.Duration) (*Session, error) {
+func (c *Client) open(ctx context.Context, path string, handshake time.Duration, master int) (*Session, error) {
 	cmd := exec.Command("ssh", c.Args("exec "+path+" rpc")...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -154,7 +163,7 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now()}
+	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now(), client: c, master: master}
 	cmd.Stderr = s.stderr
 	// A master holding a stuck channel keeps the stderr pipe open after the
 	// client is gone: don't let that hold up Wait (and so Dead) for long.
@@ -165,8 +174,9 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration)
 	s.patience = HelperPatience
 	s.period = min(5*time.Second, SilenceLimit/4)
 	s.clk.boot, s.clk.bootOK = sinceBoot()
-	s.Conn = protocol.NewConn(protocol.ProgressReader{R: stdout, OnRead: s.heard}, stdin)
+	s.Conn = protocol.NewConn(protocol.ProgressReader{R: stdout, OnRead: s.heard}, countWriter{stdin, s})
 	s.heard()
+	s.up.window, s.up.floor = UploadStallWindow, UploadStallFloor
 	go s.readLoop()
 	go s.heartbeat()
 	s.limit.Store(int64(SilenceLimit))
@@ -289,6 +299,9 @@ func (s *Session) readLoop() {
 		}
 		s.heard()
 		s.backed.Store(false)
+		// Nor was what it read from us meanwhile: it may have been
+		// waiting on us too.
+		s.up.reset()
 	}
 }
 
@@ -347,6 +360,7 @@ func (s *Session) watchdog() {
 				// Any grace was for a silence this suspension interrupted.
 				s.limit.Store(int64(base))
 				asked = false
+				s.up.reset() // nor did an upload get through while we slept
 			}
 			// The helper sent something since onSilent was asked: that
 			// silence is over. Drop its grace, so a later one is noticed
@@ -357,6 +371,19 @@ func (s *Session) watchdog() {
 				asked = false
 			}
 			s.recovered(seen, base/2)
+			if why := s.up.judge(); why != "" {
+				s.setErr(fmt.Errorf("%w: %s", errUploadStalled, why))
+				s.stalled.Store(true)
+				s.silent.Store(true)
+				s.lostMu.Do(func() { close(s.lost) })
+				s.Abort()
+				// The master carrying it most likely carries nothing
+				// else either: no new session goes onto it.
+				if s.client != nil {
+					s.client.retireMaster(s.master)
+				}
+				return
+			}
 			silent := s.silence()
 			if silent <= s.Limit() {
 				continue
@@ -516,7 +543,7 @@ func (s *Session) lostErr() error {
 		err = io.ErrUnexpectedEOF
 	}
 	msg := "connection to runner lost" + s.suspendedNote()
-	if errors.Is(err, errSilent) {
+	if errors.Is(err, errSilent) || errors.Is(err, errUploadStalled) {
 		msg = err.Error()
 	}
 	return &ConnError{Target: "helper", Msg: msg, Err: s.wrap(err)}
@@ -658,6 +685,9 @@ func (s *Session) notePressure(env protocol.Envelope) {
 	var hb protocol.Heartbeat
 	if len(env.Body) == 0 || env.Unmarshal(&hb) != nil {
 		return
+	}
+	if hb.Received > 0 {
+		s.up.note(s.now(), hb.Received, s.sent.Load(), s.writing.Load())
 	}
 	now := time.Now()
 	if hb.MemTotalMB > 0 {

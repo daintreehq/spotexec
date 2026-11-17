@@ -295,6 +295,27 @@ func (c *Client) dropMaster(pid int) {
 	_ = exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "stop", "--", c.T.Host).Run()
 }
 
+// retireMaster retires the master with this pid as dropMaster does, but
+// only while that exact master is the one in use: a session can outlive its
+// master's replacement, which it must never stop. pid 0 (unknown) retires
+// nothing.
+func (c *Client) retireMaster(pid int) {
+	if pid <= 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), muxTimeout)
+	defer cancel()
+	unlock, err := c.lockMaster(ctx)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	if cur, ok := c.masterPID(ctx); !ok || cur != pid {
+		return
+	}
+	_ = exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "stop", "--", c.T.Host).Run()
+}
+
 // ConnError is an SSH-level failure (exit 255 or master start failure).
 type ConnError struct {
 	Target string

@@ -39,6 +39,8 @@ type Session struct {
 	// silent, or alive.
 	born     time.Time
 	lastSeen atomic.Int64
+	// received counts the bytes read from the client (Heartbeat.Received).
+	received atomic.Int64
 	// stalledAt is when the helper last found itself unscheduled for
 	// seconds (see watchStalls); 0 (never) until then.
 	stalledAt atomic.Int64
@@ -211,7 +213,7 @@ func Serve(in io.Reader, out io.Writer) error {
 	s := newSession()
 	// Liveness counts bytes arriving, so a large manifest still streaming
 	// over a slow link is not mistaken for a silent client.
-	s.c = protocol.NewConn(protocol.ProgressReader{R: in, OnRead: s.heard}, out)
+	s.c = protocol.NewConn(protocol.ProgressReader{R: countReader{in, &s.received}, OnRead: s.heard}, out)
 	current.Store(s)
 	go s.readLoop()
 	defer s.release()
@@ -257,6 +259,7 @@ func Serve(in io.Reader, out io.Writer) error {
 					}
 				}
 				lastSent = time.Now()
+				hb.Received = s.received.Load()
 				_ = s.c.Send(protocol.TypeHeartbeat, hb)
 			}
 		}
@@ -289,6 +292,18 @@ func Serve(in io.Reader, out io.Writer) error {
 			return err
 		}
 	}
+}
+
+// countReader adds every byte read through it to n.
+type countReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c countReader) Read(b []byte) (int, error) {
+	k, err := c.r.Read(b)
+	c.n.Add(int64(k))
+	return k, err
 }
 
 var errBye = errors.New("bye")
