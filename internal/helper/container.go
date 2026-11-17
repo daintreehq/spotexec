@@ -248,7 +248,7 @@ func (s *Session) image(m protocol.Image) error {
 	defer cancel()
 	d, installed, err := s.ensureDocker(ctx)
 	if err != nil {
-		return perr(protocol.CodeImageFailed, "%v", err)
+		return imageFailed(err)
 	}
 	res := protocol.ImageResult{InstalledDocker: installed}
 	exists := func(ref string) bool {
@@ -393,7 +393,7 @@ func (s *Session) image(m protocol.Image) error {
 		}
 		buildCtx, dockerfile, cleanup, err := s.stageContext(m)
 		if err != nil {
-			return perr(protocol.CodeImageFailed, "%v", err)
+			return imageFailed(err)
 		}
 		defer cleanup()
 		_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "image_build", Message: m.Dockerfile})
@@ -737,8 +737,9 @@ func ImagePush(root string) error {
 // is written to a file (no quoting games) and the environment is passed by
 // name (-e KEY, values taken from the docker client's environment, so
 // multi-line values survive). The container has a deterministic name so it
-// can be force-removed on every exit path.
-func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string, env map[string]string) (string, map[string]string, func() error, error) {
+// can be force-removed on every exit path. Ending ctx (the client's
+// cancel) or teardown ends the slow preparation before the container.
+func (s *Session) containerScript(ctx context.Context, run *protocol.ContainerRun, script, dir string, env map[string]string) (string, map[string]string, func() error, error) {
 	d, err := probeDocker(context.Background())
 	if err != nil {
 		return "", nil, nil, err
@@ -764,11 +765,11 @@ func (s *Session) containerScript(run *protocol.ContainerRun, script, dir string
 	// Under procMu, so teardown waits for the container it creates.
 	var users []string
 	if uid, gid := os.Getuid(), os.Getgid(); !run.Root && uid != 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, done := s.startPrep(ctx, usersBudget)
 		passwd, group, err := s.runUserFiles(ctx, d, run.Image, uid, gid)
-		cancel()
+		done()
 		if err != nil {
-			return "", nil, nil, perr(protocol.CodeImageFailed, "%v", err)
+			return "", nil, nil, imageFailed(err)
 		}
 		// --mount, not -v: a missing source fails the run instead of
 		// becoming an empty directory. A file container.options already

@@ -5,6 +5,7 @@
 package helper
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -51,6 +52,10 @@ type Session struct {
 	relMu    sync.Mutex
 	procMu   sync.Mutex  // held while a process or container is being started
 	stopping atomic.Bool // Shutdown/lastResort own cleanup and exit
+	// prepCancel ends the slow preparation a start does under procMu (see
+	// startPrep), so teardown doesn't wait it out; guarded by prepMu.
+	prepMu     sync.Mutex
+	prepCancel context.CancelFunc
 
 	lifecycle *flock
 	tokens    []*flock
@@ -112,6 +117,7 @@ func Shutdown(code int) {
 // slot read here under relMu stays this session's until release below.
 func (s *Session) teardown() {
 	s.stopping.Store(true)
+	s.cancelPrep()
 	s.procMu.Lock() // wait out a start in progress; none begins after this
 	s.procMu.Unlock()
 	if pg := int(s.child.Load()); pg > 0 {
@@ -131,6 +137,37 @@ func (s *Session) teardown() {
 		_ = os.RemoveAll(filepath.Join(slotDir, "run"))
 	}
 	s.releaseLocks(true)
+}
+
+// startPrep returns a context, ending after budget or with parent, for
+// preparation a
+// start does under procMu that can take minutes (reading an image's users),
+// and done, to call once it is over. Teardown cancels it rather than wait
+// for it: stopping is set before teardown takes prepMu, so a context made
+// after teardown looked is cancelled here.
+func (s *Session) startPrep(parent context.Context, budget time.Duration) (ctx context.Context, done func()) {
+	ctx, cancel := context.WithTimeout(parent, budget)
+	s.prepMu.Lock()
+	defer s.prepMu.Unlock()
+	if s.stopping.Load() {
+		cancel()
+	}
+	s.prepCancel = cancel
+	return ctx, func() {
+		s.prepMu.Lock()
+		s.prepCancel = nil
+		s.prepMu.Unlock()
+		cancel()
+	}
+}
+
+// cancelPrep ends the preparation a start is doing (startPrep), if any.
+func (s *Session) cancelPrep() {
+	s.prepMu.Lock()
+	defer s.prepMu.Unlock()
+	if s.prepCancel != nil {
+		s.prepCancel()
+	}
 }
 
 // parkIfStopping, called with relMu held, parks the calling goroutine for
@@ -270,6 +307,25 @@ func (e *protoError) wire() protocol.ErrorMsg {
 
 func perr(code, format string, a ...any) error {
 	return &protoError{code: code, msg: fmt.Sprintf(format, a...)}
+}
+
+// imageFailed reports err as IMAGE_FAILED, keeping the code of an error the
+// helper already gave one: wrapping it again would print its code twice
+// (#250).
+func imageFailed(err error) error {
+	if pe, ok := err.(*protoError); ok {
+		return pe
+	}
+	return perr(protocol.CodeImageFailed, "%v", err)
+}
+
+// uncoded is err's message without the code of an error the helper already
+// gave one, for wrapping it under another code.
+func uncoded(err error) string {
+	if pe, ok := err.(*protoError); ok {
+		return pe.msg
+	}
+	return err.Error()
 }
 
 // stoppingNow is systemStopping (tests stand in for the VM shutting down).

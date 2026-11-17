@@ -551,7 +551,14 @@ case "$1 $2" in
 "info "*) cat "$d/info" 2>/dev/null ;;
 "network rm") k=network; shift 2; ` + rm + ` ;;
 "volume rm") k=volume; shift 3; ` + rm + ` ;;
-"image inspect") echo sha256:` + strings.Repeat("0", 64) + ` ;;
+"create --pull") [ -f "$d/create-sleep" ] && { echo $$ > "$d/create-pid"; exec sleep "$(cat "$d/create-sleep")"; } ;;
+"image inspect")
+	# Holds each caller until that many have asked (at most 5 s).
+	if [ -f "$d/inspect-barrier" ]; then
+		i=0
+		while [ "$(grep -c '^image inspect' "$d/calls")" -lt "$(cat "$d/inspect-barrier")" ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+	fi
+	echo sha256:` + strings.Repeat("0", 64) + ` ;;
 "cp -L")
 	[ -f "$d/cp-fail" ] && { echo "Error response from daemon: boom" >&2; exit 1; }
 	f="$d/tar-${3##*/}"
@@ -593,12 +600,12 @@ func TestContainerScriptDocker(t *testing.T) {
 	bin, calls := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	slot := t.TempDir()
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	host, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22"}, "true", s.workspace, map[string]string{})
+	host, _, cleanup, err := s.containerScript(context.Background(), &protocol.ContainerRun{Image: "node:22"}, "true", s.workspace, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,7 +625,7 @@ func TestContainerScriptDocker(t *testing.T) {
 		}
 	}
 
-	host, _, cleanup, err = s.containerScript(&protocol.ContainerRun{Image: "node:22", Docker: true}, "true", s.workspace, map[string]string{"TESTCONTAINERS_HOST_OVERRIDE": "10.1.1.1"})
+	host, _, cleanup, err = s.containerScript(context.Background(), &protocol.ContainerRun{Image: "node:22", Docker: true}, "true", s.workspace, map[string]string{"TESTCONTAINERS_HOST_OVERRIDE": "10.1.1.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,9 +704,9 @@ func TestContainerScriptDockerCleanupFails(t *testing.T) {
 	bin, _ := statefulDocker(t, true, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	slot := t.TempDir()
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
 	os.MkdirAll(s.workspace, 0o755)
-	_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Docker: true}, "true", s.workspace, map[string]string{})
+	_, _, cleanup, err := s.containerScript(context.Background(), &protocol.ContainerRun{Image: "node:22", Docker: true}, "true", s.workspace, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,12 +735,12 @@ func TestContainerScriptGiveBackFails(t *testing.T) {
 	bin, _ := statefulDocker(t, false, "", "", "")
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	slot := t.TempDir()
-	s := &Session{slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
+	s := &Session{layout: Layout{Root: t.TempDir()}, slotDir: slot, workspace: filepath.Join(slot, "workspace"), repoID: "repo"}
 	locked := filepath.Join(s.workspace, "out")
 	if err := os.MkdirAll(locked, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "node:22", Root: true}, "true", s.workspace, map[string]string{})
+	_, _, cleanup, err := s.containerScript(context.Background(), &protocol.ContainerRun{Image: "node:22", Root: true}, "true", s.workspace, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
