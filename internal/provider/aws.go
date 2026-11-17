@@ -548,7 +548,29 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 			}
 		}
 	}
+	// The bake builder gets no work volume: CreateImage would capture it.
+	if gb := a.r.WorkVolume(); gb > 0 && !spec.bake {
+		root := a.r.WorkRoot
+		if root == "" {
+			root = "~/.cache/spotexec"
+		}
+		if cloudinit.WorkRootOK(root) {
+			opts.WorkVolumeGB, opts.WorkRoot = gb, root
+		} else {
+			log("no work volume: work_root %q isn't a plain path (dependency caches are copied into each slot)", root)
+		}
+	}
 	ud, err := cloudinit.Render(opts)
+	if err != nil && opts.WorkVolumeGB > 0 {
+		// The work volume's setup must not cost a bootstrap script that
+		// fitted the 16 KiB of user-data without it.
+		o := opts
+		o.WorkVolumeGB, o.WorkRoot = 0, ""
+		if ud2, err2 := cloudinit.Render(o); err2 == nil {
+			log("no work volume: %v (dependency caches are copied into each slot)", err)
+			ud, err, opts = ud2, nil, o
+		}
+	}
 	if err != nil {
 		return ec2Instance{}, err
 	}
@@ -589,6 +611,17 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
 	base.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.Itoa(volume))
 	base.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
+	if opts.WorkVolumeGB > 0 {
+		// Blank: user-data finds it by size, whatever the device is called.
+		dev := "/dev/sdf"
+		if rootDev == dev {
+			dev = "/dev/sdg"
+		}
+		base.Set("BlockDeviceMapping.2.DeviceName", dev)
+		base.Set("BlockDeviceMapping.2.Ebs.VolumeType", "gp3")
+		base.Set("BlockDeviceMapping.2.Ebs.VolumeSize", strconv.Itoa(opts.WorkVolumeGB))
+		base.Set("BlockDeviceMapping.2.Ebs.DeleteOnTermination", "true")
+	}
 	tags := [][2]string{{tagRunner, a.r.Name}, {tagOwner, owner}, {tagHost, HostLabel()}, {"Name", "spotexec-" + a.r.Name}}
 	if spec.bake {
 		// Never part of the fleet: the scheduler must not place work on it.

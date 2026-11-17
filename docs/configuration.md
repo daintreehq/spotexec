@@ -130,6 +130,7 @@ The remote user's login shell can be anything (bash, zsh, fish, tcsh, nushell): 
 | `max_price` | the on-demand price | Spot bid cap in USD per hour: a positive number or string (`0.40`, `"0.40"`, `"$0.40"`), at most 10000. Options priced above it are skipped, and so is their on-demand fallback. |
 | `on_demand_fallback` | `false` | Launch on-demand when no Spot capacity is available, trying the types in their Spot-price order. With `max_price`, only the types whose Spot price is at or under it. |
 | `volume_gb` | `64` | Root gp3 volume, from 8 to 16384. |
+| `work_volume_gb` | `64`; none with an `ami-…` ID | A second gp3 volume, formatted XFS on first boot and mounted at `work_root`, which holds the slots and dependency caches. On XFS a cached dependency set reaches a slot by reflink: the slot shares the cache's data until it writes to a file, so restoring it takes seconds and adds next to nothing to disk use. On the ext4 root it is a full copy. `0` keeps the work root on the root volume. From 8 to 16384, billed like the root volume. A `work_root` with characters other than letters, digits and `_ . / ~ + -` gets none. |
 | `ami` | `auto` | `auto` uses the newest matching bake, else Ubuntu 24.04. `base` ignores bakes. An `ami-…` ID pins one image. |
 | `user` | `ubuntu` | Login user of the AMI. |
 | `subnet_id`, `security_group_ids` | default VPC, a managed `spotexec-ssh` group | Network placement. |

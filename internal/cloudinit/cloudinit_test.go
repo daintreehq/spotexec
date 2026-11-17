@@ -1,6 +1,7 @@
 package cloudinit
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -342,5 +343,153 @@ func TestWatchdogScheduledDrain(t *testing.T) {
 	env = []string{"FLOCK_CANCEL=1"}
 	if gone, log := run("120\n", 3*time.Minute); gone {
 		t.Fatalf("ended on a drain cancelled before it took the lock: %q", log)
+	}
+}
+
+// The work volume section (#264) is rendered only when asked for, stays
+// valid bash within the user-data budget, and refuses a work root it can't
+// put in the script and /etc/fstab as is.
+func TestRenderWorkVolume(t *testing.T) {
+	base := Options{User: "ubuntu", PublicKey: "ssh-ed25519 AAAA test", BootstrapScript: strings.Repeat("apt-get install -y build-essential\n", 40)}
+	s, err := Render(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(s, "sx_workvol") || strings.Contains(s, "mkfs.xfs") {
+		t.Fatal("work volume set up without one")
+	}
+	o := base
+	o.WorkVolumeGB, o.WorkRoot = 64, "~/.cache/spotexec"
+	s, err = Render(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "ud.sh")
+	os.WriteFile(p, []byte(s), 0o644)
+	if out, err := exec.Command("bash", "-n", p).CombinedOutput(); err != nil {
+		t.Fatalf("bash -n: %v: %s", err, out)
+	}
+	for _, want := range []string{"$2 == 68719476736", "w='~/.cache/spotexec'", "mkfs.xfs -q -K -m reflink=1"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("user-data missing %q", want)
+		}
+	}
+	// Mounted before the key that lets anyone write to it is authorized.
+	if strings.Index(s, "\nsx_workvol()") > strings.Index(s, "authorized_keys") || strings.Index(s, "\nsx_workvol()") < strings.Index(s, "spotexec-watchdog.timer") {
+		t.Fatal("work volume set up out of order")
+	}
+	for _, bad := range []string{"", "~/a b", "/srv/$(id)", "/srv/x'y", "/srv/../etc", "/srv/~x", "~user/x"} {
+		o.WorkRoot = bad
+		if _, err := Render(o); err == nil {
+			t.Errorf("work root %q accepted", bad)
+		}
+	}
+}
+
+func TestWorkRootOK(t *testing.T) {
+	for p, want := range map[string]bool{"~": true, "~/.cache/spotexec": true, "/mnt/work": true, "work": true, "/a/b-c_d.e+f": true,
+		"": false, "~user": false, "/a/~b": false, "/a b": false, "/a/../b": false, "/a\n": false, `/a"b`: false} {
+		if got := WorkRootOK(p); got != want {
+			t.Errorf("WorkRootOK(%q) = %v", p, got)
+		}
+	}
+}
+
+// sx_workvol, run against stubbed disk tools: it formats and mounts the one
+// blank disk of the requested size, and touches nothing when that disk
+// can't be told apart or the work root is already in use.
+func TestWorkVolumeSetup(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("no bash")
+	}
+	const gib64 = "68719476736"
+	type disk struct {
+		name, size string
+		parts, fs  bool
+	}
+	run := func(t *testing.T, root string, disks []disk, prep func(home string)) (log, calls, fstab string, err error) {
+		t.Helper()
+		dir := t.TempDir()
+		home := filepath.Join(dir, "home")
+		if root == "" {
+			root = "~/.cache/spotexec"
+		}
+		root = strings.ReplaceAll(root, "$TMP", dir)
+		os.MkdirAll(home, 0o755)
+		if prep != nil {
+			prep(home)
+		}
+		s, rerr := Render(Options{User: "ubuntu", PublicKey: "ssh-ed25519 AAAA test", WorkVolumeGB: 64, WorkRoot: root})
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		start := strings.Index(s, "sx_workvol() {")
+		end := strings.Index(s[start:], "\n}\n")
+		if start < 0 || end < 0 {
+			t.Fatal("no sx_workvol in user-data")
+		}
+		fn := strings.ReplaceAll(s[start:start+end+3], "/etc/fstab", filepath.Join(dir, "fstab"))
+		var list, parts, fs strings.Builder
+		for _, d := range disks {
+			fmt.Fprintf(&list, "echo '%s %s disk'; ", d.name, d.size)
+			if d.parts {
+				fmt.Fprintf(&parts, "%s) printf '%%s\\n%%s1\\n' $3 $3 ;; ", d.name)
+			}
+			if d.fs {
+				fmt.Fprintf(&fs, "%s) return 0 ;; ", d.name)
+			}
+		}
+		stubs := `
+C=` + filepath.Join(dir, "calls") + `
+getent() { echo "ubuntu:x:1000:1000::` + home + `:/bin/bash"; }
+id() { echo ubuntu; }
+sleep() { :; }
+lsblk() { case "$1" in -dbnpo) ` + list.String() + `;; -npo) case "$3" in ` + parts.String() + `*) echo "$3" ;; esac ;; esac; }
+blkid() { if [ "$1" = -p ]; then case "$2" in ` + fs.String() + `*) return 2 ;; esac; fi; echo uuid-1; }
+mkfs.xfs() { echo "mkfs $*" >> "$C"; }
+runuser() { while [ "$1" != -- ]; do shift; done; shift; "$@"; }
+mount() { echo "mount $*" >> "$C"; }
+umount() { echo "umount $*" >> "$C"; }
+chown() { echo "chown $*" >> "$C"; }
+`
+		out, err := exec.Command("bash", "-c", "set -u\n"+stubs+fn+"sx_workvol").CombinedOutput()
+		c, _ := os.ReadFile(filepath.Join(dir, "calls"))
+		f, _ := os.ReadFile(filepath.Join(dir, "fstab"))
+		return strings.ReplaceAll(string(out), home, "$HOME"), strings.ReplaceAll(strings.ReplaceAll(string(c), home, "$HOME"), dir, "$TMP"), strings.ReplaceAll(strings.ReplaceAll(string(f), home, "$HOME"), dir, "$TMP"), err
+	}
+	root := disk{name: "/dev/nvme0n1", size: gib64, parts: true}
+	t.Run("the blank disk of its size", func(t *testing.T) {
+		log, calls, fstab, err := run(t, "", []disk{root, {name: "/dev/nvme1n1", size: "75000000000"}, {name: "/dev/nvme2n1", size: gib64}}, nil)
+		if err != nil {
+			t.Fatalf("%v: %s", err, log)
+		}
+		want := "mkfs -q -K -m reflink=1 -L spotexecwork /dev/nvme2n1\nmount -t xfs -o noatime /dev/nvme2n1 $HOME/.cache/spotexec\nchown ubuntu:ubuntu $HOME/.cache/spotexec\n"
+		if calls != want || fstab != "UUID=uuid-1 $HOME/.cache/spotexec xfs noatime,nofail 0 0\n" {
+			t.Fatalf("calls:\n%s\nfstab: %q\nlog: %s", calls, fstab, log)
+		}
+	})
+	t.Run("an absolute work root", func(t *testing.T) {
+		_, calls, fstab, err := run(t, "$TMP/srv/work", []disk{root, {name: "/dev/xvdf", size: gib64}}, nil)
+		if err != nil || !strings.Contains(calls, "mount -t xfs -o noatime /dev/xvdf $TMP/srv/work\n") || !strings.HasPrefix(fstab, "UUID=uuid-1 $TMP/srv/work ") {
+			t.Fatalf("%v\n%s\n%s", err, calls, fstab)
+		}
+	})
+	for name, c := range map[string]struct {
+		disks []disk
+		prep  func(home string)
+		log   string
+	}{
+		"no such disk":          {[]disk{root, {name: "/dev/nvme1n1", size: "75000000000"}}, nil, "found 0 blank disks of 64 GiB"},
+		"two such disks":        {[]disk{root, {name: "/dev/nvme1n1", size: gib64}, {name: "/dev/nvme2n1", size: gib64}}, nil, "found 2 blank disks"},
+		"only a used disk":      {[]disk{root, {name: "/dev/nvme1n1", size: gib64, fs: true}}, nil, "found 0 blank disks"},
+		"work root has content": {[]disk{root, {name: "/dev/nvme1n1", size: gib64}}, func(h string) { os.MkdirAll(filepath.Join(h, ".cache/spotexec/bin"), 0o755) }, "is in use"},
+		"work root is a link":   {[]disk{root, {name: "/dev/nvme1n1", size: gib64}}, func(h string) { os.MkdirAll(filepath.Join(h, ".cache"), 0o755); os.Symlink("/tmp", filepath.Join(h, ".cache/spotexec")) }, "is in use"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			log, calls, fstab, err := run(t, "", c.disks, c.prep)
+			if err == nil || !strings.Contains(log, c.log) || calls != "" || fstab != "" {
+				t.Fatalf("err %v, log %q, calls %q, fstab %q", err, log, calls, fstab)
+			}
+		})
 	}
 }
