@@ -1303,3 +1303,6 @@ type AccountInstance struct {
 	Launched time.Time `json:"launched"`
 	Mine     bool      `json:"mine"`
 }
+
+// launchSlots caps a runner's launch requests in flight at once.
+const launchSlots = 4
