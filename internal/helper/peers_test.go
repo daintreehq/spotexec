@@ -460,8 +460,11 @@ func TestSyncCopiesAnUploadPublishedBeforeItsTurn(t *testing.T) {
 	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
 	ws := bigSet(nil)
 
-	scanned, resume := make(chan struct{}), make(chan struct{})
-	t.Cleanup(sync.OnceFunc(func() { close(resume) })) // never leave it paused
+	scanned, resume, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(resume) })
+	// Registered after the sessions, so it runs before they are released:
+	// never leave the paused sync running past the test.
+	t.Cleanup(func() { release(); <-finished })
 	peerScanned = func(s *Session) {
 		if s == b {
 			close(scanned)
@@ -471,7 +474,7 @@ func TestSyncCopiesAnUploadPublishedBeforeItsTurn(t *testing.T) {
 	t.Cleanup(func() { peerScanned = nil })
 
 	reply := make(chan syncReply, 1)
-	go func() { reply <- client{}.sync(b, ws) }()
+	go func() { defer close(finished); reply <- client{}.sync(b, ws) }()
 	select {
 	case <-scanned:
 	case r := <-reply:
@@ -480,7 +483,7 @@ func TestSyncCopiesAnUploadPublishedBeforeItsTurn(t *testing.T) {
 	if need, _ := playSync(t, a, ws); len(need) != len(ws) {
 		t.Fatalf("first slot asked for %d files, want %d", len(need), len(ws))
 	}
-	resume <- struct{}{}
+	release()
 	r := <-reply
 	if r.err != nil {
 		t.Fatal(r.err)
@@ -660,4 +663,42 @@ func TestSyncLeavesATypeChangeToTheClient(t *testing.T) {
 		t.Fatalf("directory there when asked: %v, asked for %v", dirAtNeed, r.need)
 	}
 	checkWorkspace(t, b.workspace, workingSet{"a": "alpha\n"})
+}
+
+// Candidates that fail their hash are dropped once: the next file with
+// that content goes straight to one that verifies.
+func TestSyncDropsAFailingCandidate(t *testing.T) {
+	root := t.TempDir()
+	alpha := fsid.Bytes([]byte("alpha\n"))
+	// Slot one records alpha at three files that hold other bytes, each at
+	// its current signature, so they rank first.
+	a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
+	rec := map[string]storedEntry{}
+	for _, p := range []string{"x1", "x2", "x3"} {
+		writeFile(t, a.workspace, p, "omega\n")
+		fi, err := os.Lstat(filepath.Join(a.workspace, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sg, _ := sigOf(fi)
+		rec[p] = entryFrom(alpha, sg)
+	}
+	if err := writeJSON(a.manifestPath(), rec); err != nil {
+		t.Fatal(err)
+	}
+	// Slot two holds alpha, but at a signature its record no longer
+	// matches, so it ranks after them.
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	writeFile(t, b.workspace, "good", "alpha\n")
+	if err := writeJSON(b.manifestPath(), map[string]storedEntry{"good": {ID: alpha, Mode: fsid.ModeFile, Size: 6}}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := slotSession(t, root, protocol.Acquire{WorktreeKey: "three"})
+	ws := workingSet{"d1": "alpha\n", "d2": "alpha\n", "d3": "alpha\n", "d4": "alpha\n"}
+	need, _ := playSync(t, c, ws)
+	if want := []string{"d1"}; !reflect.DeepEqual(need, want) {
+		t.Fatalf("asked for %v, want only the first file %v", need, want)
+	}
+	checkWorkspace(t, c.workspace, ws)
 }

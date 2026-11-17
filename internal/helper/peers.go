@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -143,6 +144,7 @@ func validMode(m uint32) bool {
 type candKey struct {
 	id   string
 	link bool
+	size int64
 }
 
 // peerCands ranks the candidates for each content once per scan: many
@@ -157,7 +159,7 @@ type peerCands struct {
 // their slot recorded first, then any of the right type and size (a file
 // touched since can still hold the bytes).
 func (c *peerCands) rank(e protocol.Entry) []string {
-	k := candKey{e.ID, e.Mode == fsid.ModeSymlink}
+	k := candKey{e.ID, e.Mode == fsid.ModeSymlink, e.Size}
 	if r, ok := c.ranked[k]; ok {
 		return r
 	}
@@ -196,14 +198,18 @@ func (s *Session) fromPeers(p string, e protocol.Entry, c *peerCands) bool {
 			return false
 		}
 	}
-	k := candKey{e.ID, e.Mode == fsid.ModeSymlink}
+	k := candKey{e.ID, e.Mode == fsid.ModeSymlink, e.Size}
 	for tries := 0; tries < peerTries; tries++ {
 		r := c.rank(e)
 		if len(r) == 0 {
 			return false
 		}
-		if s.placeFromPeer(p, e, r[0]) == nil {
+		err := s.placeFromPeer(p, e, r[0])
+		if err == nil {
 			return true
+		}
+		if _, ok := err.(destErr); ok {
+			return false
 		}
 		c.ranked[k] = r[1:]
 	}
@@ -223,13 +229,13 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 		}
 		full, err := fsid.PrepareParent(s.workspace, p)
 		if err != nil {
-			return err
+			return destErr{err}
 		}
 		if fi, err := os.Lstat(full); err == nil && fi.IsDir() {
-			return fmt.Errorf("%s: a directory is in the way", p)
+			return destErr{fmt.Errorf("%s: a directory is in the way", p)}
 		}
 		if _, _, err := writeEntry(full, &tar.Header{Name: p, Typeflag: tar.TypeSymlink, Linkname: target, Mode: 0o777}, nil); err != nil {
-			return err
+			return destErr{err}
 		}
 		return s.record(p, full, e.ID)
 	}
@@ -247,7 +253,7 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 	tmp := filepath.Join(s.slotDir, fmt.Sprintf(".peer-tmp-%d-%d", os.Getpid(), time.Now().UnixNano()))
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fsid.Perm(e.Mode))
 	if err != nil {
-		return err
+		return destErr{err}
 	}
 	var full string
 	// A file that grows meanwhile reads past its size and fails the hash.
@@ -258,6 +264,7 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 	if err == nil && id != e.ID {
 		err = fmt.Errorf("%s: content changed", src)
 	}
+	verified := err == nil // what fails from here is the destination's
 	if err == nil {
 		err = os.Chmod(tmp, fsid.Perm(e.Mode)) // umask-proof
 	}
@@ -276,10 +283,17 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 	}
 	if err != nil {
 		os.Remove(tmp)
+		if verified {
+			return destErr{err}
+		}
 		return err
 	}
 	return s.record(p, full, id)
 }
+
+// destErr: a peer copy failed at the destination, not because of its
+// source, which stays a candidate for other files.
+type destErr struct{ error }
 
 // record stores what is now at full as p's synced entry.
 func (s *Session) record(p, full, id string) error {
@@ -314,9 +328,11 @@ func shareWorthy(need []string, want map[string]protocol.Entry) bool {
 // ran out), what is still needed, and how many files were copied.
 func (s *Session) uploadTurn(need []string, want map[string]protocol.Entry) (*flock, []string, int, error) {
 	// Copies a helper killed mid-way left behind (the slot is ours).
-	if old, _ := filepath.Glob(filepath.Join(s.slotDir, ".peer-tmp-*")); len(old) > 0 {
-		for _, f := range old {
-			_ = os.Remove(f)
+	if ents, err := os.ReadDir(s.slotDir); err == nil {
+		for _, d := range ents {
+			if strings.HasPrefix(d.Name(), ".peer-tmp-") {
+				_ = os.Remove(filepath.Join(s.slotDir, d.Name()))
+			}
 		}
 	}
 	rest, copied, v := s.fillFromPeers(need, want)
