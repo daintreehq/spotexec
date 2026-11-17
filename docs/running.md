@@ -71,7 +71,7 @@ Every command gets:
 | `SPOTEXEC_WORKSPACE` | Absolute path of the remote checkout. |
 | `SPOTEXEC_SLOT` | Host-wide slot number, unique across repos. |
 | `SPOTEXEC_PORT_BASE` | `20000 + slot × 1000`. Bind test servers here and parallel jobs never collide. For tests that bind fixed ports, see [private networking](environments.md#settings). |
-| `SPOTEXEC_CPUS` | This job's share: vCPUs ÷ slots, rounded down (at least 1), or all of them with `--exclusive`. In a [project container](environments.md#project-containers) on a Linux runner, the job is normally also [pinned](environments.md#settings) to that many CPUs, so `nproc` and other tools that count the CPUs they may use see the same number. |
+| `SPOTEXEC_CPUS` | This job's share: vCPUs ÷ slots, rounded down (at least 1), or all of them with `--exclusive`. Advice for sizing worker pools: jobs sharing a VM [share its CPUs](environments.md#settings), so `nproc` and other tools that count the CPUs they may use see the whole VM, unless the project sets `cpu_pinning`. |
 | `SPOTEXEC_MEMORY` | This job's fair share of memory in MiB: the machine's memory, less a reserve for the runner itself (1/16 of it, between 512 MiB and 2 GiB), ÷ slots, or all of that with `--exclusive`; at least 256. Advice for sizing heaps and worker counts (`NODE_OPTIONS=--max-old-space-size=$((SPOTEXEC_MEMORY * 3 / 4))`); nothing enforces it. In a [project container](environments.md#settings), jobs sharing a VM are capped together, not one by one. |
 | `SPOTEXEC_SLOTS` | Slots per machine. |
 | `SPOTEXEC_SHARD`, `SPOTEXEC_SHARDS` | Only in a [sharded task](configuration.md#tasks): this part's number (from 1) and the number of parts, the same as `{shard}` and `{shards}`. |
