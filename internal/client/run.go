@@ -170,10 +170,8 @@ type Result struct {
 	moveTo *Lease
 	moveFP string
 	// stalled: the attempt's upload stopped arriving on a connection whose
-	// helper kept answering (#265), before anything ran. stalledOn is the
-	// VM it was uploading to ("" on a static runner).
-	stalled   bool
-	stalledOn string
+	// helper kept answering (#265), before anything ran.
+	stalled bool
 }
 
 // stage is how far an attempt had got: the phase it was in, whether the
@@ -414,14 +412,10 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 				return res, err
 			}
 			// Nothing ran, and the VM isn't to blame: the connection to it
-			// is. Its master is retired; this run tries elsewhere if it can
-			// (a path that crawled once may crawl again), without marking
-			// the VM lost for anyone else.
+			// is, and its master is retired. The VM stays eligible (it may
+			// be the only one), and is never marked lost for anyone else.
 			o.Rep.Warn("UPLOAD_STALLED", "%v; retrying the run on a fresh connection", err)
 			o.Rep.Event("retry", map[string]any{"run_id": att.runID, "attempt": att.n + 1, "reason": "upload_stalled"})
-			if res.stalledOn != "" {
-				att.exclude[res.stalledOn] = true
-			}
 			att.n++
 			continue
 		}
@@ -901,8 +895,9 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	recordLastRun := func() { keepLastRun(ws, o, lastRun, &res) }
 	label := fmt.Sprintf("%s#%d", r.Name, lease.Acq.Token)
 
-	// 3. Forward sync.
+	// 3. Forward sync. The uploads are watched for getting through (#265).
 	if m != nil {
+		sess.WatchUploads(true)
 		if lease.Acq.FingerprintMatch {
 			o.Rep.Event("sync_in", map[string]any{"mode": "fingerprint_hit", "files": 0, "bytes": 0, "duration_ms": 0})
 		} else {
@@ -916,7 +911,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 			syn, err := syncIn(ctx, sess, m, p.Deps.CacheDirs, stray, o)
 			if err != nil {
 				if serr := uploadStall(lease); serr != nil {
-					res.stalled, res.stalledOn = true, lease.InstanceID
+					res.stalled = true
 					return res, infra(fmt.Errorf("sync to %s: %w", r.Name, serr)), ""
 				}
 				return res, infra(fmt.Errorf("sync to %s: %w", r.Name, err)), lostRunner(lease, err)
@@ -931,11 +926,12 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		prog.set(phaseGitSeed)
 		if err := seedGit(ctx, sess, m, p.Sync.GitSeed, o, label); err != nil {
 			if serr := uploadStall(lease); serr != nil {
-				res.stalled, res.stalledOn = true, lease.InstanceID
+				res.stalled = true
 				return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, serr)), ""
 			}
 			return res, infra(fmt.Errorf("seeding .git on %s: %w", r.Name, err)), lostRunner(lease, err)
 		}
+		sess.WatchUploads(false)
 	}
 
 	// 4. Project container image.

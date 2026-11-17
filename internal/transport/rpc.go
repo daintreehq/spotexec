@@ -64,7 +64,7 @@ type Session struct {
 	// client and master are the connection the session runs on: the
 	// master's pid (0 if unknown), retired when an upload stalls on it.
 	client *Client
-	master int
+	master atomic.Int64
 	// OnEvent receives helper events that arrive while waiting for replies.
 	OnEvent func(protocol.Event)
 }
@@ -163,7 +163,8 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration,
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now(), client: c, master: master}
+	s := &Session{cmd: cmd, stdin: stdin, stdout: stdout, stderr: &lockedBuf{}, frames: make(chan protocol.Frame, 256), done: make(chan struct{}), closing: make(chan struct{}), lost: make(chan struct{}), born: time.Now(), client: c}
+	s.master.Store(int64(master))
 	cmd.Stderr = s.stderr
 	// A master holding a stuck channel keeps the stderr pipe open after the
 	// client is gone: don't let that hold up Wait (and so Dead) for long.
@@ -237,6 +238,12 @@ func (c *Client) open(ctx context.Context, path string, handshake time.Duration,
 	if err := env.Unmarshal(&s.Hello); err != nil {
 		s.Close()
 		return nil, err
+	}
+	// The master looked up before the session started may have been
+	// replaced since: then which one carries it is unknown, and a stall
+	// retires none.
+	if cur, ok := c.masterPID(ctx); !ok || cur != master {
+		s.master.Store(0)
 	}
 	return s, nil
 }
@@ -360,7 +367,6 @@ func (s *Session) watchdog() {
 				// Any grace was for a silence this suspension interrupted.
 				s.limit.Store(int64(base))
 				asked = false
-				s.up.reset() // nor did an upload get through while we slept
 			}
 			// The helper sent something since onSilent was asked: that
 			// silence is over. Drop its grace, so a later one is noticed
@@ -372,16 +378,19 @@ func (s *Session) watchdog() {
 			}
 			s.recovered(seen, base/2)
 			if why := s.up.judge(); why != "" {
-				s.setErr(fmt.Errorf("%w: %s", errUploadStalled, why))
+				if !s.firstErr(fmt.Errorf("%w: %s", errUploadStalled, why)) {
+					return // the session ended otherwise meanwhile
+				}
 				s.stalled.Store(true)
 				s.silent.Store(true)
+				// The master carrying it most likely carries nothing else
+				// either: retired before anyone hears of the stall, so a
+				// retry can't open its session there.
+				if s.client != nil {
+					s.client.retireMaster(int(s.master.Load()))
+				}
 				s.lostMu.Do(func() { close(s.lost) })
 				s.Abort()
-				// The master carrying it most likely carries nothing
-				// else either: no new session goes onto it.
-				if s.client != nil {
-					s.client.retireMaster(s.master)
-				}
 				return
 			}
 			silent := s.silence()
@@ -458,6 +467,7 @@ func (s *Session) observe(busy time.Duration) time.Duration {
 	if gap <= max(s.period, minSuspension) {
 		return 0
 	}
+	s.up.reset() // no upload got through while we were away
 	s.woke.Store(mono)
 	s.away.Store(max(s.away.Load(), int64(gap)))
 	return gap
@@ -504,12 +514,18 @@ func (s *Session) heartbeat() {
 	}
 }
 
-func (s *Session) setErr(err error) {
+func (s *Session) setErr(err error) { s.firstErr(err) }
+
+// firstErr sets the session's error, if it has none yet, and reports
+// whether it did.
+func (s *Session) firstErr(err error) bool {
 	s.errMu.Lock()
 	defer s.errMu.Unlock()
 	if s.err == nil {
 		s.err = err
+		return true
 	}
+	return false
 }
 
 func (s *Session) wrap(err error) error {
@@ -686,15 +702,16 @@ func (s *Session) notePressure(env protocol.Envelope) {
 	if len(env.Body) == 0 || env.Unmarshal(&hb) != nil {
 		return
 	}
-	if hb.Received > 0 {
-		s.up.note(s.now(), hb.Received, s.sent.Load(), s.writing.Load())
-	}
 	now := time.Now()
 	if hb.MemTotalMB > 0 {
 		s.memory.Store(&MemoryReading{At: now, AvailMB: hb.MemAvailMB, TotalMB: hb.MemTotalMB})
 	}
 	if what := hb.Pressure(); what != "" {
 		s.pressure.Store(&pressureSeen{at: now, what: what})
+	}
+	// After the memory: a stall it proves must be judged knowing that.
+	if hb.Received > 0 {
+		s.up.note(s.now(), hb.Received, time.Duration(hb.HeldMS)*time.Millisecond, s.sent.Load(), s.writing.Load())
 	}
 }
 

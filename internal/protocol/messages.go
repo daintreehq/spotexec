@@ -482,6 +482,11 @@ type Heartbeat struct {
 	// Received is every byte the helper has read from the client so far
 	// on this session, frames still arriving included.
 	Received int64 `json:"received,omitempty"`
+	// HeldMS is how long, in all, the helper has left what the client sent
+	// unread because it was still busy with what came before (its queue
+	// full), the current wait included: time that says nothing about the
+	// connection.
+	HeldMS int64 `json:"held_ms,omitempty"`
 }
 
 // Pressure says whether a heartbeat shows a runner running out of memory:

@@ -62,45 +62,61 @@ type uploadWatch struct {
 	// session opened.
 	window time.Duration
 	floor  int64
+	// armed: an upload spotexec drives (a sync, a .git seed) is under way.
+	// Nothing else is judged: once a command runs, only control messages
+	// go up, and a reply held up behind its output must not look like an
+	// upload going nowhere.
+	armed bool
 	// The latest heartbeat's reading, not yet judged: when it arrived (on
-	// the session clock), what the helper had received, and what it was
-	// owed then.
-	fresh    bool
-	at, recv int64
-	owed     int64
-	watching bool  // bytes were owed at the checkpoint
-	ckAt     int64 // the checkpoint: when,
-	ckRecv   int64 // what had arrived,
-	ckOwed   int64 // and what was still owed
+	// the session clock), what the helper had received, how long it had
+	// left what we sent unread (ns), and what it was owed then.
+	fresh          bool
+	at, recv, held int64
+	owed           int64
+	watching       bool  // bytes were owed at the checkpoint
+	ckAt           int64 // the checkpoint: when,
+	ckRecv, ckHeld int64 // what had arrived, how long the helper had held,
+	ckOwed         int64 // and what was still owed
 }
 
-// note records a heartbeat's report that recv bytes have arrived, at now,
-// with sent written so far and writing whether a write is blocked.
-func (u *uploadWatch) note(now, recv, sent int64, writing bool) {
+// note records a heartbeat's report, at now, that recv bytes have arrived
+// and the helper held what we sent unread for held in all, with sent
+// written so far and writing whether a write is blocked.
+func (u *uploadWatch) note(now, recv int64, held time.Duration, sent int64, writing bool) {
 	owed := sent - recv
 	if writing {
 		owed = max(owed, 1)
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.fresh, u.at, u.recv, u.owed = true, now, recv, owed
+	u.fresh, u.at, u.recv, u.held, u.owed = true, now, recv, int64(held), owed
 }
 
-// reset forgets the checkpoint: time passed that says nothing about the
-// connection (this process suspended, or not reading the helper).
+// reset forgets the checkpoint and any reading not yet judged: time passed
+// that says nothing about the connection (this process suspended, or not
+// reading the helper).
 func (u *uploadWatch) reset() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.watching, u.fresh = false, false
 }
 
+// arm starts (on) or ends judging uploads, from the next reading.
+func (u *uploadWatch) arm(on bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.armed, u.watching, u.fresh = on, false, false
+}
+
 // judge takes in the latest heartbeat's reading and says why the upload has
 // stalled, or "". Only readings judge: a helper that went quiet altogether
-// is the silence watchdog's to judge.
+// is the silence watchdog's to judge. Time the helper held what we sent
+// unread doesn't count.
 func (u *uploadWatch) judge() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if !u.fresh {
+	if !u.fresh || !u.armed {
+		u.fresh = false
 		return ""
 	}
 	u.fresh = false
@@ -108,14 +124,14 @@ func (u *uploadWatch) judge() string {
 		got := u.recv - u.ckRecv
 		if got >= min(u.floor, u.ckOwed) {
 			u.watching = false // it got through: start afresh from here
-		} else if d := time.Duration(u.at - u.ckAt); d >= u.window {
+		} else if d := time.Duration(u.at - u.ckAt - max(u.held-u.ckHeld, 0)); d >= u.window {
 			return fmt.Sprintf("%s arrived in %s, with %s still on its way", kib(max(got, 0)), d.Round(time.Second), kib(u.owed))
 		} else {
 			return ""
 		}
 	}
 	if u.owed > 0 {
-		u.watching, u.ckAt, u.ckRecv, u.ckOwed = true, u.at, u.recv, u.owed
+		u.watching, u.ckAt, u.ckRecv, u.ckHeld, u.ckOwed = true, u.at, u.recv, u.held, u.owed
 	}
 	return ""
 }
@@ -126,6 +142,11 @@ func kib(n int64) string {
 	}
 	return fmt.Sprintf("%d KiB", (n+1023)>>10)
 }
+
+// WatchUploads starts (on) or ends watching that what is sent to the helper
+// arrives: on around an upload spotexec drives, such as a sync, off before
+// anything else.
+func (s *Session) WatchUploads(on bool) { s.up.arm(on) }
 
 // UploadStalled reports whether the session ended because what was sent to
 // the helper stopped arriving while the helper itself kept answering: the
