@@ -347,10 +347,10 @@ func TestQueueCachedRules(t *testing.T) {
 	join(t, q, 9, false) // the queue changes after the scan
 	before := time.Unix(0, snap.Start).Add(-time.Millisecond)
 	after := time.Unix(0, snap.Start).Add(time.Millisecond)
-	if _, ok := q.cached(name, after); ok {
+	if _, ok := q.cached(name, after, new(os.FileInfo)); ok {
 		t.Fatal("a changed queue answered from a scan older than the lookup")
 	}
-	if st, ok := q.cached(name, before); !ok || st.Position != 0 {
+	if st, ok := q.cached(name, before, new(os.FileInfo)); !ok || st.Position != 0 {
 		t.Fatalf("a scan begun after the lookup: %+v %v", st, ok)
 	}
 	// A scan slower than the TTL is still fresh when it lands: its age
@@ -360,12 +360,22 @@ func TestQueueCachedRules(t *testing.T) {
 	slow.Start = time.Now().Add(-time.Minute).UnixNano()
 	slow.Done = time.Now().UnixNano()
 	q.publish(slow)
-	if _, ok := q.cached(name, time.Unix(0, slow.Start).Add(-time.Millisecond)); !ok {
+	if _, ok := q.cached(name, time.Unix(0, slow.Start).Add(-time.Millisecond), new(os.FileInfo)); !ok {
 		t.Fatal("a slow scan expired before its first reader")
 	}
-	shorten(t, &snapshotTTL, 0)
-	if _, ok := q.cached(name, before); ok {
-		t.Fatal("an expired scan answered")
+	// Not one older than the lookup would have waited for the lock.
+	shorten(t, &queueLockWait, 0)
+	if _, ok := q.cached(name, before, new(os.FileInfo)); ok {
+		t.Fatal("a scan older than the lock wait answered")
+	}
+	// A lookup doesn't decode the same snapshot twice.
+	shorten(t, &queueLockWait, time.Hour)
+	looked := new(os.FileInfo)
+	if _, ok := q.cached(name, after, looked); ok {
+		t.Fatal("a changed queue answered from a scan older than the lookup")
+	}
+	if _, ok := q.cached(name, before, looked); ok {
+		t.Fatal("a snapshot already found wanting was read again")
 	}
 }
 

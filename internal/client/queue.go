@@ -189,7 +189,8 @@ func (q *Queue) State(t *Ticket) QueueState {
 	t.Touch()
 	name := filepath.Base(t.path)
 	asked := time.Now()
-	if st, ok := q.cached(name, asked); ok {
+	var looked os.FileInfo // the last snapshot read, so it is decoded once
+	if st, ok := q.cached(name, asked, &looked); ok {
 		return st
 	}
 	if err := os.MkdirAll(q.dir, 0o700); err != nil {
@@ -210,7 +211,7 @@ func (q *Queue) State(t *Ticket) QueueState {
 			return QueueState{Position: unknownPosition}
 		}
 		// Busy: whoever holds it is scanning, and its snapshot answers us.
-		if st, ok := q.cached(name, asked); ok {
+		if st, ok := q.cached(name, asked, &looked); ok {
 			return st
 		}
 		if time.Now().After(deadline) {
@@ -221,7 +222,7 @@ func (q *Queue) State(t *Ticket) QueueState {
 		time.Sleep(20 * time.Millisecond)
 	}
 	defer func() { _ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN) }()
-	if st, ok := q.cached(name, asked); ok {
+	if st, ok := q.cached(name, asked, &looked); ok {
 		return st
 	}
 	snap, ok := q.scan()
@@ -266,11 +267,30 @@ func (s *snapshot) position(name string) (QueueState, bool) {
 }
 
 // cached answers a lookup asked at `asked` from the published snapshot,
-// when that is as good as a scan of our own: a recent scan that began
-// after we asked, or one of a queue that hasn't changed since (no ticket
-// joined or left, none of the stopped ones resumed).
-func (q *Queue) cached(name string, asked time.Time) (QueueState, bool) {
-	b, err := os.ReadFile(filepath.Join(q.dir, snapshotName))
+// when that is as good as a scan of our own: a scan that began after we
+// asked, or a recent one of a queue that hasn't changed since (no ticket
+// joined or left, none of the stopped ones resumed). looked is the last
+// snapshot this lookup read: one found wanting isn't decoded again.
+func (q *Queue) cached(name string, asked time.Time, looked *os.FileInfo) (QueueState, bool) {
+	path := filepath.Join(q.dir, snapshotName)
+	same := func(fi os.FileInfo) bool {
+		prev := *looked
+		return prev != nil && os.SameFile(prev, fi) && prev.ModTime().Equal(fi.ModTime()) && prev.Size() == fi.Size()
+	}
+	if fi, err := os.Stat(path); err != nil || same(fi) {
+		return QueueState{}, false // none yet, or the one already found wanting
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return QueueState{}, false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return QueueState{}, false
+	}
+	*looked = fi
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return QueueState{}, false
 	}
@@ -286,13 +306,12 @@ func (q *Queue) cached(name string, asked time.Time) (QueueState, bool) {
 	if !ok {
 		return QueueState{}, false // not seen yet (or no longer live): scan
 	}
-	if now.Sub(done) > snapshotTTL {
-		return QueueState{}, false
-	}
 	if !start.Before(asked) {
-		return st, true
+		// As good as our own scan. One that waited longer than we would
+		// have for the lock is not (this process was stopped meanwhile).
+		return st, now.Sub(done) <= queueLockWait
 	}
-	if !s.unchanged(q.dir) {
+	if now.Sub(done) > snapshotTTL || !s.unchanged(q.dir) {
 		return QueueState{}, false
 	}
 	return st, true
