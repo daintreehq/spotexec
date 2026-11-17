@@ -1517,7 +1517,9 @@ func (a awayDemand) avoided(region string) bool {
 }
 
 // weightAvoiding is the demand of the waiters that can't use the region
-// of one of vms (by ID, among insts).
+// of one of vms (by ID, among insts). A waiter that avoids any of those
+// regions counts whole, even if it could use a VM in another of them: with
+// several regions avoided at once that may cost a launch, never a wait.
 func (a awayDemand) weightAvoiding(insts []provider.Instance, vms map[string]bool) int {
 	regions := map[string]bool{}
 	for _, in := range insts {
