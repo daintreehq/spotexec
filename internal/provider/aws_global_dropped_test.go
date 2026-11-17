@@ -138,3 +138,45 @@ func TestGlobalRemovedRegionKeptOnLaunchDuringCheck(t *testing.T) {
 		t.Fatalf("a region launched in during its check was dropped: %q", got)
 	}
 }
+
+// State kept before last launches were recorded has holds only: a removed
+// region's last launch counts from the first empty listing, and the region
+// is dropped once that has settled.
+func TestGlobalRemovedRegionFromOldStateDroppedAfterSettling(t *testing.T) {
+	f := &fakeRegionsEC2{}
+	g := newGlobalEnv(t, f, "r-one-1")
+	discovered(t, g)
+	if err := g.markActive("r-two-1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.List(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := active(t, g); got != "r-two-1" {
+		t.Fatalf("dropped with no record of its last launch: %q", got)
+	}
+	g.now = func() time.Time { return time.Now().Add(launchSettle + time.Minute) }
+	if _, err := g.List(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := active(t, g); got != "" {
+		t.Fatalf("still listed once settled: %q", got)
+	}
+}
+
+// A runner moved from regions back to one region drops its old regions
+// once they're empty too.
+func TestGlobalLegacyRegionDroppedOnceEmpty(t *testing.T) {
+	f := &fakeRegionsEC2{}
+	g := newGlobalEnv(t, f, "r-one-1", "r-two-1")
+	discovered(t, g)
+	launchedAgo(t, g, "r-two-1", 30*time.Minute)
+	g.r.Regions = nil
+	g.legacy = true
+	if _, err := g.List(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := active(t, g); got != "" {
+		t.Fatalf("an empty old region is still listed: %q", got)
+	}
+}
