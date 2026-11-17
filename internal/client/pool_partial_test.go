@@ -271,7 +271,11 @@ func TestRefreshReturnsCallerCancellation(t *testing.T) {
 	p.Fleet = rf
 	listedIDs(t, p, false)
 	var listed time.Time
-	_ = p.with(func(st *poolState) error { listed = st.ListedAt.Add(-listTTL - time.Second); st.ListedAt = listed; return nil })
+	_ = p.with(func(st *poolState) error {
+		listed = st.ListedAt.Add(-listTTL - time.Second)
+		st.ListedAt = listed
+		return nil
+	})
 
 	rf.stalled["ap-south-1"] = true
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
