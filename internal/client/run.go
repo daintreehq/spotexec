@@ -475,6 +475,7 @@ func whyNoReplayCtx(ctx context.Context, lease *Lease, noticed bool, at stage, e
 		return noReplay{}
 	}
 	if rl := regionSilentFn(ctx, lease); rl != nil {
+		holdSilent(ctx, lease, rl)
 		// Not the VM stalling: its whole region went silent. Replayed
 		// (once the helper there has given up on it), unless nothing
 		// showed the VM's memory: an older helper's heartbeats, or none.
