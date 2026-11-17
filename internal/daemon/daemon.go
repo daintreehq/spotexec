@@ -143,9 +143,9 @@ type fleet struct {
 	// Circuit breaker: replacements of instances that never became healthy.
 	failures []time.Time
 	paused   time.Time
-	// VMs this daemon launched that haven't answered yet, by the pass that
-	// sent them, and the latest such pass that already counted a failure:
-	// VMs launched together that fail together count once.
+	// VMs this daemon launched that haven't become usable yet, by the pass
+	// that sent them, and the latest such pass that already counted a
+	// failure: VMs launched together that fail together count once.
 	batchOf     map[string]launchBatch
 	failedBatch int
 	// The breaker restarts when the runner's config changes in a way that
@@ -532,7 +532,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		}
 	}
 	for id, b := range fl.batchOf {
-		if gone(id) && time.Since(b.at) > forgetAfter {
+		// Kept while an sx client's bootstrap failure report for it is still
+		// to be counted below, so its batch still counts once.
+		if gone(id) && !view.BootFailed[id] && time.Since(b.at) > forgetAfter {
 			delete(fl.batchOf, id)
 		}
 	}

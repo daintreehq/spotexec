@@ -694,9 +694,17 @@ func TestBreakerCountsAnsweringBatchOnce(t *testing.T) {
 			// Each failed batch is replaced by a fresh one, until the third.
 			var st FleetStatus
 			for batch := 1; batch <= 3; batch++ {
-				for range tc.steps {
+				for i := range tc.steps {
 					if st = pass(); batch < 3 && st.LastError != "" {
 						t.Fatalf("batch %d: paused: %q (%d failures)", batch, st.LastError, recent(d, fl))
+					}
+					if i < len(tc.steps)-1 { // still booting: nothing counted, batch kept
+						d.mu.Lock()
+						batches := len(fl.batchOf)
+						d.mu.Unlock()
+						if n := recent(d, fl); n != batch-1 || batches != 3*batch {
+							t.Fatalf("batch %d booting: %d failures, %d batch records; want %d and %d", batch, n, batches, batch-1, 3*batch)
+						}
 					}
 				}
 				if n := recent(d, fl); n != batch {
@@ -777,6 +785,19 @@ func TestBreakerAccounting(t *testing.T) {
 	}
 	if _, ok := fl.counted["i-9"]; !ok {
 		t.Error("a recent counted entry was dropped")
+	}
+
+	// A batch long gone from listings whose bootstrap failures an sx client
+	// reported keeps its batch until they are counted: once, not per VM.
+	n := recent(d, fl)
+	for _, id := range []string{"i-x", "i-y"} {
+		fl.batchOf[id] = launchBatch{pass: 30, epoch: 1, at: now.Add(-2 * forgetAfter)}
+		fl.pool.Observe(id, client.OutBootFailed, time.Time{})
+	}
+	fl.lastPrb = time.Now()
+	d.manage(context.Background(), fl)
+	if got := recent(d, fl); got != n+1 {
+		t.Errorf("a client-reported failed batch counted %d failures, want 1", got-n)
 	}
 }
 
