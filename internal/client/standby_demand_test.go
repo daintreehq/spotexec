@@ -74,6 +74,9 @@ func TestNoEarlyDrainWhileARunSeeks(t *testing.T) {
 // marks are swept.
 func TestSeekingMarkLifecycle(t *testing.T) {
 	p, _ := schedPool(t, 1, 2)
+	beat := seekBeat
+	seekBeat = time.Hour // refreshed only by hand here
+	t.Cleanup(func() { seekBeat = beat })
 	off := false
 	other := *p.R
 	other.Name, other.Scheduling.EarlyDrain = "kept", &off
