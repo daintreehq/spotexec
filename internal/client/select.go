@@ -717,10 +717,12 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	// Recorded in the fleet's ledger before any contact, so concurrent sx
 	// processes see the slot as taken while this acquire is in flight.
 	aid, rerr := m.pool.reserveOn(in, c.claim)
-	if errors.Is(rerr, errNoRoom) || errors.Is(rerr, errReaping) {
+	if errors.Is(rerr, errNoRoom) || errors.Is(rerr, errReaping) || (rerr != nil && c.claim.Reclaim != "") {
+		// A drain is cancelled only after the ledger re-checked the VM.
 		return nil, nil, outSkipped
 	}
 	sent := false
+	req.Base.Undrain = c.claim.Reclaim
 	if rerr == nil {
 		req.Base.Client.Attempt = aid
 		req.onSend = func() error {
@@ -745,6 +747,9 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 		case lease != nil:
 			m.pool.commitAttempt(aid, lease.Acq, time.Time{})
 			lease.ledger = &ledgerRef{pool: m.pool, id: aid}
+			if c.claim.Reclaim != "" {
+				m.pool.reclaimed(in.ID, c.claim.Reclaim) // the helper cancelled its drain
+			}
 		case err != nil && sent && !isRefusal(err):
 			// The request went out and no answer came back: it may hold a
 			// slot until the helper notices this client is gone.

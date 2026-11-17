@@ -260,8 +260,9 @@ func TestWatchdogScheduledDrain(t *testing.T) {
 	shims := map[string]string{
 		"logger": "#!/bin/sh\nshift 2; echo \"$*\" >> \"" + d + "/log\"\n",
 		// $FLOCK_HELD: a session holds the lifecycle lock; $FLOCK_TOUCH: one
-		// ends (touching activity) while the watchdog waits for it.
-		"flock": "#!/bin/sh\n[ -n \"$FLOCK_TOUCH\" ] && touch \"" + d + "/activity\"\n[ -z \"$FLOCK_HELD\" ]\n",
+		// ends (touching activity) while the watchdog waits for it;
+		// $FLOCK_CANCEL: one cancels the drain (#255) meanwhile.
+		"flock": "#!/bin/sh\n[ -n \"$FLOCK_TOUCH\" ] && touch \"" + d + "/activity\"\n[ -n \"$FLOCK_CANCEL\" ] && rm -f \"" + d + "/drain_after\"\n[ -z \"$FLOCK_HELD\" ]\n",
 	}
 	if exec.Command("stat", "-c", "%Y", dir).Run() != nil {
 		shims["stat"] = "#!/bin/sh\nexec /usr/bin/stat -f %m \"$3\"\n" // BSD stat
@@ -336,5 +337,10 @@ func TestWatchdogScheduledDrain(t *testing.T) {
 	env = []string{"FLOCK_TOUCH=1"}
 	if gone, _ := run("120\n", 3*time.Minute); gone {
 		t.Fatal("ended just after a session touched activity")
+	}
+	// A drain cancelled after the watchdog first read it: idle_timeout again.
+	env = []string{"FLOCK_CANCEL=1"}
+	if gone, log := run("120\n", 3*time.Minute); gone {
+		t.Fatalf("ended on a drain cancelled before it took the lock: %q", log)
 	}
 }

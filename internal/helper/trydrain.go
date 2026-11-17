@@ -27,6 +27,7 @@ const (
 	DrainProtected   = "protected"        // idle for less than the result-retention time
 	DrainAlready     = "already_draining" // draining for another reason
 	DrainUnsupported = "unsupported"      // not an ephemeral spotexec VM
+	DrainCancelled   = "cancelled"        // the operation was cancelled: renewed demand took the VM back
 )
 
 // TryDrainResult is printed by `spotexec-helper try-drain`.
@@ -89,6 +90,12 @@ func tryDrain(root, op, reason string, minIdle time.Duration, lockPath, activity
 	if draining(root) {
 		return already()
 	}
+	// A session that cancelled this operation holds the lifecycle lock
+	// shared while it does, so this read can't race it.
+	if cancelledOp(root, op) {
+		res.Result = DrainCancelled
+		return res
+	}
 	l := Layout{Root: root}
 	if h := readHolders(l); len(h) > 0 {
 		res.Result, res.Detail = DrainBusy, fmt.Sprintf("%d session(s)", len(h))
@@ -147,8 +154,9 @@ const DrainScheduled = "scheduled"
 // wait to the VM instead: it records the least idle time in drain_after,
 // and the watchdog (cloud-init) ends the VM once it has been idle that long
 // with no session holding its lifecycle lock, exactly as it would at
-// idle_timeout. The record only ever shortens the wait; it is written once
-// and never withdrawn (the client has already stopped placing on the VM).
+// idle_timeout. The record only ever shortens the wait. It is withdrawn
+// only by an acquire that cancels the drain (CancelDrain): renewed demand
+// taking the warm VM back before it ends.
 
 // drainAfterFile and featuresFile live beside the drain marker.
 func drainAfterFile(root string) string {
@@ -203,6 +211,18 @@ func scheduleDrain(root, op string, minIdle time.Duration, ephemeral bool) TryDr
 		}
 		return res
 	}
+	// Serialized with CancelDrain: a request delayed past its cancellation
+	// must not schedule the drain again.
+	unlock, err := lockDrainState(root)
+	if err != nil {
+		res.Result, res.Detail = DrainBusy, "locking the drain schedule: "+err.Error()
+		return res
+	}
+	defer unlock()
+	if cancelledOp(root, op) {
+		res.Result = DrainCancelled
+		return res
+	}
 	if _, err := os.Stat(drainAfterFile(root)); err == nil {
 		// Already scheduled (a retry whose answer was lost, or another
 		// operation): the first record stands.
@@ -248,4 +268,130 @@ func scheduleDrain(root, op string, minIdle time.Duration, ephemeral bool) TryDr
 	}
 	res.Result = DrainScheduled
 	return res
+}
+
+// Cancelling a scheduled drain: when demand comes back while a drained VM
+// is still up, a job's acquire takes the VM back (protocol.Acquire.Undrain)
+// rather than let it end and launch a cold one. The acquire cancels the
+// drain only once it holds a slot and the lifecycle lock shared: the
+// watchdog can't end the VM while it does (it needs that lock
+// exclusively), and the session's activity, rechecked by the watchdog
+// under the lock, outdates a drain_after it read before the cancel.
+
+// drainCancelledFile lists the cancelled operations, so a request for one
+// that arrives late (its answer was lost, and the client has since taken
+// the VM back) drains nothing. drainStateLock serializes schedule-drain
+// with the cancel.
+func drainCancelledFile(root string) string {
+	if onSpotexecVM() {
+		return filepath.Join(LifecycleDir, "drain_cancelled")
+	}
+	return filepath.Join(root, "drain_cancelled")
+}
+
+func drainStateLock(root string) string {
+	if onSpotexecVM() {
+		return filepath.Join(LifecycleDir, "drain.lock")
+	}
+	return filepath.Join(root, "drain.lock")
+}
+
+// drainStateWait bounds the wait for the drain-state lock: its holders
+// only touch a few small files, so a longer wait means one is stuck.
+const drainStateWait = 5 * time.Second
+
+// lockDrainState takes the drain-state lock exclusively, returning its
+// release.
+func lockDrainState(root string) (func(), error) {
+	deadline := time.Now().Add(drainStateWait)
+	for {
+		l, ok, err := tryLock(drainStateLock(root))
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return l.Unlock, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("drain state locked for over %s", drainStateWait)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// cancelledOp reports whether op was cancelled on this VM.
+func cancelledOp(root, op string) bool {
+	if op == "" {
+		return false
+	}
+	b, err := os.ReadFile(drainCancelledFile(root))
+	if err != nil {
+		return false
+	}
+	for _, l := range strings.Fields(string(b)) {
+		if l == op {
+			return true
+		}
+	}
+	return false
+}
+
+// validDrainOp keeps an operation ID to one word (the cancelled list is
+// read as words).
+func validDrainOp(op string) bool {
+	if op == "" || len(op) > 64 {
+		return false
+	}
+	for _, c := range op {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// CancelDrain withdraws this VM's scheduled drain for a session that holds
+// its lifecycle lock shared, recording op (the drain the client committed)
+// as cancelled first. Its caller has checked the VM isn't draining: a
+// drain marker is never withdrawn. An error means the drain may still
+// stand.
+func CancelDrain(root, op string) error {
+	if !validDrainOp(op) {
+		return fmt.Errorf("invalid drain operation %q", op)
+	}
+	unlock, err := lockDrainState(root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if cancelledOp(root, op) {
+		// Cancelled already (a retry): a drain scheduled since is another
+		// operation's, and stands; this one's, left by a cancel cut short
+		// after recording it, is withdrawn now.
+		if b, err := os.ReadFile(drainOpFile(root)); err == nil && strings.TrimSpace(string(b)) == op {
+			if err := os.Remove(drainAfterFile(root)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			_ = os.Remove(drainOpFile(root))
+		}
+		touchActivity(root)
+		return nil
+	}
+	f, err := os.OpenFile(drainCancelledFile(root), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(f, op)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(drainAfterFile(root)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_ = os.Remove(drainOpFile(root))
+	touchActivity(root)
+	return nil
 }

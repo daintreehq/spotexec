@@ -35,7 +35,9 @@ const (
 	// unless the retained VMs are full, so the VM idles out.
 	roleStandby = "standby"
 	// roleDrainRequested: an early drain was committed locally. Never
-	// reopened, even if the request to the VM times out.
+	// reopened, even if the request to the VM times out, except by a job
+	// that cancels the drain the VM took over (claim.Reclaim) while the
+	// retained VMs are full.
 	roleDrainRequested = "drain_requested"
 	// roleDraining: the VM is draining (shutting down). Never reopened.
 	roleDraining = "draining"
@@ -139,6 +141,10 @@ type vmSched struct {
 	// DrainScheduled: the VM took the drain over (schedule-drain): its
 	// watchdog ends it once idle result_retention, so it isn't asked again.
 	DrainScheduled bool `json:"drain_scheduled,omitempty"`
+	// Undrained: the early drain a job's acquire cancelled (reclaimed):
+	// pool.json is saved after sched.json, so a retiring note left behind
+	// is stale, not a committed drain.
+	Undrained string `json:"undrained,omitempty"`
 	// Price: the VM's hourly price in USD when known, and when it was seen.
 	Price   float64   `json:"price,omitempty"`
 	PriceAt time.Time `json:"price_at,omitempty"`
@@ -543,6 +549,11 @@ type claim struct {
 	// unless Latency: latency mode returning a worktree to its files).
 	Promote bool
 	Latency bool
+	// Reclaim: the VM is drain_requested with its drain scheduled (this
+	// operation), and the policy chose to take it back: the acquire
+	// cancels the drain (protocol.Acquire.Undrain). Re-checked when
+	// reserving like Promote.
+	Reclaim string
 	// Exclude: VMs this job may not use (not stored).
 	Exclude map[string]bool
 	// Force: reserve whatever the ledger says (legacy placement, exact
@@ -592,7 +603,13 @@ func (p *Pool) reserveOn(in provider.Instance, c claim) (string, error) {
 				return errNoRoom
 			}
 			switch v.Role {
-			case roleDrainRequested, roleDraining:
+			case roleDrainRequested:
+				// Only to cancel the drain the VM took over, and only while
+				// no retained VM has room.
+				if c.Reclaim == "" || c.Reclaim != v.DrainOp || !reclaimable(v, st.Notes[in.ID], now) || p.retainedRoom(st, now, c) {
+					return errNoRoom
+				}
+			case roleDraining:
 				return errNoRoom
 			case roleStandby:
 				if !c.Promote || (!c.Latency && p.retainedRoom(st, now, c)) {
@@ -907,6 +924,9 @@ func (c candidate) event() map[string]any {
 	}
 	if c.claim.Promote {
 		ev["promoted"] = true
+	}
+	if c.claim.Reclaim != "" {
+		ev["drain_cancelled"] = true
 	}
 	return ev
 }
