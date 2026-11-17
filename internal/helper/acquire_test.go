@@ -3,6 +3,7 @@ package helper
 import (
 	"bytes"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -370,5 +371,46 @@ func TestTokenProbeDoesNotHoldSlotCount(t *testing.T) {
 	}
 	if s.maxSlots != 4 || readSlotCount(l) != 4 {
 		t.Fatalf("run used %d slots, recorded %d; want 4", s.maxSlots, readSlotCount(l))
+	}
+}
+
+// #255: an acquire that takes a drained VM back cancels its scheduled drain
+// once it holds the slot; without Undrain the schedule stands.
+func TestAcquireUndrainCancelsScheduledDrain(t *testing.T) {
+	root := t.TempDir()
+	after := filepath.Join(root, "drain_after")
+	if err := os.WriteFile(after, []byte("120\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := testSession(t, root)
+	if err := a.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(after); err != nil {
+		t.Fatal("an ordinary acquire withdrew the drain")
+	}
+	b := testSession(t, root)
+	if err := b.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 2, Undrain: "op1"}); err != nil || b.slotLock == nil {
+		t.Fatalf("undrain acquire: %v", err)
+	}
+	if _, err := os.Stat(after); !os.IsNotExist(err) {
+		t.Fatalf("drain_after left: %v", err)
+	}
+	if !cancelledOp(root, "op1") {
+		t.Fatal("the cancelled operation wasn't recorded")
+	}
+	// A drain marker is never withdrawn: refused as draining.
+	a.release()
+	b.release()
+	if err := os.WriteFile(filepath.Join(root, "draining"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := testSession(t, root)
+	var pe *protoError
+	if err := c.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 2, Undrain: "op1"}); !errors.As(err, &pe) || pe.code != protocol.CodeDraining {
+		t.Fatalf("undrain on a draining VM: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "draining")); err != nil {
+		t.Fatal("the drain marker was withdrawn")
 	}
 }

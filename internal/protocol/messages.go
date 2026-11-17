@@ -145,6 +145,11 @@ type Acquire struct {
 	// MaxSlots jobs, whatever they are doing. Clients ask for it once no
 	// runner has a free slot, before queueing or launching a VM.
 	Overflow bool `json:"overflow,omitempty"`
+	// Undrain: the early drain (its operation ID) the client committed on
+	// this VM and now cancels, renewed demand taking the warm VM back
+	// before it ends: the helper withdraws its scheduled drain once the
+	// slot is held, and refuses as draining if it can't.
+	Undrain string `json:"undrain,omitempty"`
 }
 
 // LifetimeDrainAhead is how long before an ephemeral VM's max_lifetime it

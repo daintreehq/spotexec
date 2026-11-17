@@ -38,6 +38,10 @@ type vmView struct {
 	unc      int  // slots taken by uncertain attempts
 	eligible bool // running, reachable, matching, not draining
 	ready    bool // seen answering
+	// reclaim: its early drain is scheduled but not carried out yet (the
+	// VM is up, keeping its results): renewed demand may take it back,
+	// cancelling the drain (claim.Reclaim), before any launch.
+	reclaim bool
 }
 
 // views lists the running VMs with their scheduling records, creating the
@@ -66,9 +70,20 @@ func (p *Pool) views(st *poolState, now time.Time) []vmView {
 			in: in, v: v, units: s.units(p.R, in.ID), admits: s.admits(p.R, in.ID), firm: f, unc: u,
 			eligible: !n.closed() && (v.Role == roleRetained || v.Role == roleStandby) && (n == nil || !now.Before(n.SuspectUntil)),
 			ready:    n != nil && n.Ready,
+			reclaim:  reclaimable(v, n, now),
 		})
 	}
 	return out
+}
+
+// reclaimable reports whether a VM's early drain can still be cancelled:
+// the VM took the drain over (schedule-drain answered, so no request for
+// it is still on its way), and nothing says it is draining, outdated or
+// unreachable. A drain still being asked for, or one carried out at once
+// (try-drain, on an older watchdog), is never cancelled.
+func reclaimable(v *vmSched, n *note, now time.Time) bool {
+	return v.Role == roleDrainRequested && v.DrainScheduled && v.DrainOp != "" &&
+		n != nil && !n.Draining && n.Mismatch == "" && !now.Before(n.SuspectUntil)
 }
 
 // lastUseful is when a VM last did work for this machine.
@@ -317,17 +332,17 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			ready bool // this machine installed the helper there (no upload first)
 		}
 		var keep, latency []ranked
-		var standby, over []vmView
+		var standby, reclaim, over []vmView
 		for _, w := range p.views(st, now) {
 			n := st.Notes[w.in.ID]
 			if excluded(exclude, w.in) {
 				continue
 			}
-			if !n.closed() && (w.v.Role == roleRetained || w.v.Role == roleStandby) {
+			if (!n.closed() && (w.v.Role == roleRetained || w.v.Role == roleStandby)) || w.reclaim {
 				usable++
 				window += w.units
 			}
-			if !w.eligible || (n != nil && now.Before(n.BusyUntil)) {
+			if !(w.eligible || w.reclaim) || (n != nil && now.Before(n.BusyUntil)) {
 				continue
 			}
 			if f := s.Fences[w.in.ID]; f != nil && f.Owner != owner {
@@ -358,6 +373,8 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			switch {
 			case w.v.Role == roleRetained:
 				keep = append(keep, r)
+			case w.reclaim:
+				reclaim = append(reclaim, w)
 			case p.R.SchedMode() == config.ModeLatency && r.cache == 2:
 				latency = append(latency, r)
 			default:
@@ -454,6 +471,16 @@ func (p *Pool) Rank(ctx context.Context, exclude map[string]bool, c claim) (out 
 			cl := base
 			cl.Promote = true
 			add(*w, cl, "retained VMs full: bringing back a standby VM")
+		}
+		// Then a VM whose early drain hasn't ended it yet, the most
+		// recently used first: warm, unlike a launch.
+		sort.SliceStable(reclaim, func(i, j int) bool {
+			return reclaim[i].v.lastUseful().After(reclaim[j].v.lastUseful())
+		})
+		for _, w := range reclaim {
+			cl := base
+			cl.Reclaim = w.v.DrainOp
+			add(w, cl, "retained VMs full: cancelling a drain still under way")
 		}
 		sort.SliceStable(over, func(i, j int) bool { return over[i].firm < over[j].firm })
 		for _, w := range over {
@@ -696,6 +723,27 @@ func (p *Pool) finishDrain(ctx context.Context, id, op, result, detail string) {
 				v.Reason += " (" + detail + ")"
 			}
 		}
+		return nil
+	})
+}
+
+// reclaimed records that a job's acquire cancelled a VM's early drain
+// (claim.Reclaim): the VM rejoins the retained set, as a promoted standby
+// VM does. An answer for another drain, or a VM no longer
+// drain_requested, changes nothing.
+func (p *Pool) reclaimed(id, op string) {
+	_ = p.with(func(st *poolState) error {
+		s := st.sched()
+		v := s.VMs[id]
+		if v == nil || v.Role != roleDrainRequested || v.DrainOp != op {
+			return nil
+		}
+		now := time.Now()
+		s.Seq++
+		v.Role, v.Since, v.Reason, v.Joined, v.Hold = roleRetained, now, "drain cancelled: retained VMs were full", s.Seq, now.Add(minResidence)
+		v.DrainOp, v.DrainScheduled = "", false
+		st.note(id).Retiring = false
+		s.Generation++
 		return nil
 	})
 }

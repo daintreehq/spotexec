@@ -291,6 +291,15 @@ capacity:
 	if err := lifetimeGate(a); err != nil { // the cutoff may have passed while waiting
 		return err
 	}
+	// Renewed demand taking back a VM the client had drained (its drain
+	// scheduled, not yet carried out): cancelled now that this session
+	// holds a slot and the lifecycle lock, so the watchdog can't end the VM
+	// meanwhile. A drain that can't be cancelled stands: refused as one.
+	if a.Undrain != "" {
+		if err := CancelDrain(s.layout.Root, a.Undrain); err != nil {
+			return perr(protocol.CodeDraining, "its early drain could not be cancelled: %v", err)
+		}
+	}
 	root := s.layout.Root
 	s.owned.Store(&root)
 	return s.c.Send(protocol.TypeAcquired, protocol.Acquired{

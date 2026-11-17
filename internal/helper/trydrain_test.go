@@ -3,6 +3,7 @@ package helper
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -131,5 +132,71 @@ func TestScheduleDrain(t *testing.T) {
 	}
 	if r := scheduleDrain(root, "op9", time.Second, true); r.Result != DrainAlready {
 		t.Fatalf("after draining, another op: %+v", r)
+	}
+}
+
+// #255: renewed demand takes back a VM whose drain is scheduled. The
+// cancel withdraws drain_after, keeps the VM's activity fresh, and records
+// the operation, so a request for it that arrives late (schedule-drain or
+// try-drain) drains nothing; another operation may still drain the VM.
+func TestCancelDrain(t *testing.T) {
+	root := t.TempDir()
+	lock := filepath.Join(root, "lifecycle.lock")
+	activity := filepath.Join(root, "activity-file")
+	for _, p := range []string{lock, activity} {
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "features"), []byte("drain_after\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := scheduleDrain(root, "op1", 2*time.Minute, true); r.Result != DrainScheduled {
+		t.Fatalf("schedule: %+v", r)
+	}
+	old := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(filepath.Join(root, "activity"), old, old); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"", "a b", "../x", strings.Repeat("a", 65)} {
+		if err := CancelDrain(root, bad); err == nil {
+			t.Fatalf("cancelled with operation %q", bad)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "drain_after")); err != nil {
+		t.Fatal("an invalid cancel withdrew the drain")
+	}
+	for range 2 { // a retry is harmless
+		if err := CancelDrain(root, "op1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"drain_after", "drain_op"} {
+		if _, err := os.Stat(filepath.Join(root, f)); !os.IsNotExist(err) {
+			t.Fatalf("%s left after the cancel: %v", f, err)
+		}
+	}
+	if fi, err := os.Stat(filepath.Join(root, "activity")); err != nil || time.Since(fi.ModTime()) > time.Minute {
+		t.Fatalf("activity not refreshed: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "drain_cancelled")); string(b) != "op1\n" {
+		t.Fatalf("cancelled list %q", b)
+	}
+	// The cancelled operation's late requests drain nothing.
+	if r := scheduleDrain(root, "op1", 2*time.Minute, true); r.Result != DrainCancelled {
+		t.Fatalf("late schedule-drain: %+v", r)
+	}
+	if _, err := os.Stat(filepath.Join(root, "drain_after")); !os.IsNotExist(err) {
+		t.Fatal("a late schedule-drain rescheduled a cancelled drain")
+	}
+	if err := os.Chtimes(activity, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if r := tryDrain(root, "op1", "test", time.Minute, lock, activity, true); r.Result != DrainCancelled || draining(root) {
+		t.Fatalf("late try-drain: %+v (draining %v)", r, draining(root))
+	}
+	// A later drain of the VM is a new operation.
+	if r := scheduleDrain(root, "op2", 2*time.Minute, true); r.Result != DrainScheduled {
+		t.Fatalf("a new drain after the cancel: %+v", r)
 	}
 }
