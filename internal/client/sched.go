@@ -141,6 +141,10 @@ type vmSched struct {
 	// DrainScheduled: the VM took the drain over (schedule-drain): its
 	// watchdog ends it once idle result_retention, so it isn't asked again.
 	DrainScheduled bool `json:"drain_scheduled,omitempty"`
+	// Undrained: the early drain a job's acquire cancelled (reclaimed):
+	// pool.json is saved after sched.json, so a retiring note left behind
+	// is stale, not a committed drain.
+	Undrained string `json:"undrained,omitempty"`
 	// Price: the VM's hourly price in USD when known, and when it was seen.
 	Price   float64   `json:"price,omitempty"`
 	PriceAt time.Time `json:"price_at,omitempty"`

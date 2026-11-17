@@ -841,13 +841,17 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		listed := map[string]bool{}
 		unusable := map[string]string{} // listed, in a region some waiters can't use: its region
 		usable, total := 0, 0
+		s, now := st.sched(), time.Now()
 		for _, in := range st.Instances {
 			listed[in.ID] = true
 			if in.Region != "" && away.avoided(in.Region) {
 				unusable[in.ID] = in.Region
 			}
 			total++
-			if !st.Notes[in.ID].closed() {
+			n := st.Notes[in.ID]
+			// A VM whose drain a job may still cancel counts toward
+			// max_instances: it may serve again.
+			if v := s.VMs[in.ID]; !n.closed() || (v != nil && in.State == provider.StateRunning && reclaimable(v, n, now)) {
 				usable++
 			}
 		}
@@ -917,7 +921,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		// Booting VMs some waiters can't use serve only the others.
 		d.Capacity += min(excludedCap, max(0, d.Demand-away.weightAvoiding(awayRegions)))
 		d.Live = usable
-		now := time.Now()
+		now = time.Now()
 		d.Lead, d.LeadLearned = st.sched().launchLead(now)
 		if !p.since.IsZero() {
 			d.Waited = now.Sub(p.since)

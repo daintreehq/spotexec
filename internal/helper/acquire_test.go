@@ -399,14 +399,28 @@ func TestAcquireUndrainCancelsScheduledDrain(t *testing.T) {
 	if !cancelledOp(root, "op1") {
 		t.Fatal("the cancelled operation wasn't recorded")
 	}
-	// A drain marker is never withdrawn: refused as draining.
+	// A cancel that fails refuses the job as draining, holding nothing.
 	a.release()
 	b.release()
+	if err := os.WriteFile(after, []byte("120\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e := testSession(t, root)
+	var pe *protoError
+	if err := e.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 2, Undrain: "not an op"}); !errors.As(err, &pe) || pe.code != protocol.CodeDraining {
+		t.Fatalf("a failed cancel: %v", err)
+	}
+	if e.slotLock != nil || len(e.tokens) > 0 || len(readHolders(Layout{Root: root})) > 0 {
+		t.Fatal("a refused acquire still holds its slot")
+	}
+	if _, err := os.Stat(after); err != nil {
+		t.Fatal("a failed cancel withdrew the drain")
+	}
+	// A drain marker is never withdrawn: refused as draining.
 	if err := os.WriteFile(filepath.Join(root, "draining"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	c := testSession(t, root)
-	var pe *protoError
 	if err := c.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 2, Undrain: "op1"}); !errors.As(err, &pe) || pe.code != protocol.CodeDraining {
 		t.Fatalf("undrain on a draining VM: %v", err)
 	}

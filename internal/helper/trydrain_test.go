@@ -155,7 +155,11 @@ func TestCancelDrain(t *testing.T) {
 		t.Fatalf("schedule: %+v", r)
 	}
 	old := time.Now().Add(-10 * time.Minute)
-	if err := os.Chtimes(filepath.Join(root, "activity"), old, old); err != nil && !os.IsNotExist(err) {
+	act := filepath.Join(root, "activity") // what touchActivity refreshes off a VM
+	if err := os.WriteFile(act, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(act, old, old); err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range []string{"", "a b", "../x", strings.Repeat("a", 65)} {
@@ -176,7 +180,7 @@ func TestCancelDrain(t *testing.T) {
 			t.Fatalf("%s left after the cancel: %v", f, err)
 		}
 	}
-	if fi, err := os.Stat(filepath.Join(root, "activity")); err != nil || time.Since(fi.ModTime()) > time.Minute {
+	if fi, err := os.Stat(act); err != nil || time.Since(fi.ModTime()) > time.Minute {
 		t.Fatalf("activity not refreshed: %v", err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(root, "drain_cancelled")); string(b) != "op1\n" {
@@ -195,8 +199,28 @@ func TestCancelDrain(t *testing.T) {
 	if r := tryDrain(root, "op1", "test", time.Minute, lock, activity, true); r.Result != DrainCancelled || draining(root) {
 		t.Fatalf("late try-drain: %+v (draining %v)", r, draining(root))
 	}
-	// A later drain of the VM is a new operation.
+	// A later drain of the VM is a new operation, and a retried cancel of
+	// the old one leaves it standing.
 	if r := scheduleDrain(root, "op2", 2*time.Minute, true); r.Result != DrainScheduled {
 		t.Fatalf("a new drain after the cancel: %+v", r)
+	}
+	if err := CancelDrain(root, "op1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "drain_after")); err != nil {
+		t.Fatal("a retried cancel withdrew a newer drain")
+	}
+	// A stuck holder of the drain-state lock fails the cancel, in time.
+	l, ok, err := tryLock(drainStateLock(root))
+	if err != nil || !ok {
+		t.Fatalf("drain lock: %v %v", ok, err)
+	}
+	start := time.Now()
+	if err := CancelDrain(root, "op2"); err == nil || time.Since(start) > drainStateWait+2*time.Second {
+		t.Fatalf("cancel past a stuck lock: %v after %s", err, time.Since(start))
+	}
+	l.Unlock()
+	if _, err := os.Stat(filepath.Join(root, "drain_after")); err != nil {
+		t.Fatal("a failed cancel withdrew the drain")
 	}
 }

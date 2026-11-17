@@ -296,21 +296,27 @@ func drainStateLock(root string) string {
 	return filepath.Join(root, "drain.lock")
 }
 
-// lockDrainState takes the drain-state lock exclusively (both of its
-// holders only touch a few small files), returning its release.
+// drainStateWait bounds the wait for the drain-state lock: its holders
+// only touch a few small files, so a longer wait means one is stuck.
+const drainStateWait = 5 * time.Second
+
+// lockDrainState takes the drain-state lock exclusively, returning its
+// release.
 func lockDrainState(root string) (func(), error) {
-	f, err := openLockFile(drainStateLock(root))
-	if err != nil {
-		return nil, err
+	deadline := time.Now().Add(drainStateWait)
+	for {
+		l, ok, err := tryLock(drainStateLock(root))
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return l.Unlock, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("drain state locked for over %s", drainStateWait)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		f.Close()
-	}, nil
 }
 
 // cancelledOp reports whether op was cancelled on this VM.
@@ -358,18 +364,22 @@ func CancelDrain(root, op string) error {
 		return err
 	}
 	defer unlock()
-	if !cancelledOp(root, op) {
-		f, err := os.OpenFile(drainCancelledFile(root), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
-		if err != nil {
-			return err
-		}
-		_, err = fmt.Fprintln(f, op)
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			return err
-		}
+	if cancelledOp(root, op) {
+		// Cancelled already (a retry): a drain scheduled since is another
+		// operation's, and stands.
+		touchActivity(root)
+		return nil
+	}
+	f, err := os.OpenFile(drainCancelledFile(root), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(f, op)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
 	}
 	if err := os.Remove(drainAfterFile(root)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err

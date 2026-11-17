@@ -59,8 +59,12 @@ func (p *Pool) views(st *poolState, now time.Time) []vmView {
 			v.Role, v.Since, v.Reason = roleDraining, now, "draining"
 			s.Generation++
 		} else if n != nil && n.Retiring && v.Role != roleDraining && v.Role != roleDrainRequested {
-			v.Role, v.Since, v.Reason = roleDrainRequested, now, "early drain requested"
-			s.Generation++
+			if v.Undrained != "" {
+				n.Retiring = false // its drain was cancelled: the note wasn't saved
+			} else {
+				v.Role, v.Since, v.Reason = roleDrainRequested, now, "early drain requested"
+				s.Generation++
+			}
 		} else if v.Role == roleDrainRequested && (n == nil || !n.Retiring) {
 			st.note(in.ID).Retiring = true // the two files disagreed: a committed drain wins
 			n = st.Notes[in.ID]
@@ -670,7 +674,7 @@ func (p *Pool) BeginDrain(ctx context.Context, id string) (op string, ok bool, e
 		}
 		op, ok = newAttemptID(), true
 		v.Role, v.Since, v.Reason, v.DrainOp, v.DrainAt = roleDrainRequested, now, "early drain requested", op, now
-		v.DrainScheduled = false
+		v.DrainScheduled, v.Undrained = false, ""
 		st.note(id).Retiring = true // no longer capacity: replacements may launch
 		s.Generation++
 		return nil
@@ -741,7 +745,7 @@ func (p *Pool) reclaimed(id, op string) {
 		now := time.Now()
 		s.Seq++
 		v.Role, v.Since, v.Reason, v.Joined, v.Hold = roleRetained, now, "drain cancelled: retained VMs were full", s.Seq, now.Add(minResidence)
-		v.DrainOp, v.DrainScheduled = "", false
+		v.DrainOp, v.DrainScheduled, v.Undrained = "", false, op
 		st.note(id).Retiring = false
 		s.Generation++
 		return nil
