@@ -61,6 +61,9 @@ func TestPlanCPUSetRanges(t *testing.T) {
 		{"uneven: 6 vCPUs 4 slots, second gets 2-3", host(6), 2, 4, "2-3"},
 		{"uneven: 6 vCPUs 4 slots, last gets 5", host(6), 4, 4, "5"},
 		{"uneven: 8 vCPUs 6 slots, last gets 7", host(8), 6, 6, "7"},
+		{"uneven: 8 vCPUs 6 slots, token 7 wraps to the first", host(8), 7, 6, "0-1"},
+		{"uneven: 8 vCPUs 6 slots, token 12 wraps to the last", host(8), 12, 6, "7"},
+		{"uneven: 10 vCPUs 4 slots, token 6 wraps to the second", host(10), 6, 4, "3-5"},
 		{"more slots than CPUs: one CPU each", host(4), 3, 8, "2"},
 		{"more slots than CPUs wraps", host(4), 6, 8, "1"},
 		{"token beyond this client's max_slots wraps", host(8), 6, 4, "2-3"},
@@ -110,10 +113,25 @@ func TestPlanCPUSetDisjointAndCoversEveryCPU(t *testing.T) {
 		seen := map[string]bool{}
 		for tok := 1; tok <= n+3; tok++ {
 			set, _ := planCPUSet(host(n), tok, n+3, false, nil)
+			if want := strconv.Itoa((tok - 1) % n); set != want {
+				t.Fatalf("n=%d slots=%d tok=%d: %q, want CPU %s alone", n, n+3, tok, set, want)
+			}
 			seen[set] = true
 		}
 		if len(seen) != n {
 			t.Fatalf("n=%d slots=%d: blocks %v, want each CPU alone", n, n+3, seen)
+		}
+	}
+	// Tokens past the slot count wrap onto the same blocks.
+	for n := 2; n <= 24; n++ {
+		for slots := 2; slots <= n; slots++ {
+			for tok := 1; tok <= slots; tok++ {
+				a, _ := planCPUSet(host(n), tok, slots, false, nil)
+				b, _ := planCPUSet(host(n), tok+slots, slots, false, nil)
+				if a != b {
+					t.Fatalf("n=%d slots=%d: token %d got %q, token %d got %q", n, slots, tok, a, tok+slots, b)
+				}
+			}
 		}
 	}
 }
@@ -286,6 +304,32 @@ func TestCpusetArgsPinsOnLinux(t *testing.T) {
 	// Without cpu_pinning the same job may use every CPU.
 	if got := s.cpusetArgs(&protocol.ContainerRun{Options: []string{"--shm-size=1g"}}, d); got != nil {
 		t.Fatalf("not asked to pin: got %v", got)
+	}
+}
+
+// The dependency install gets SPOTEXEC_CPUS as commands do: the machine's
+// share, or every CPU for a job alone on the runner.
+func TestCPUShare(t *testing.T) {
+	n := runtime.NumCPU()
+	s := &Session{maxSlots: 4, tokens: []*flock{nil}}
+	if got := s.cpuShare(); got != max(1, n/4) {
+		t.Fatalf("4 slots: %d, want %d", got, max(1, n/4))
+	}
+	s.maxSlots = n * 2
+	if got := s.cpuShare(); got != 1 {
+		t.Fatalf("more slots than CPUs: %d, want 1", got)
+	}
+	s.maxSlots = 1
+	if got := s.cpuShare(); got != n {
+		t.Fatalf("one slot: %d, want %d", got, n)
+	}
+	s.maxSlots, s.acq.Exclusive = 4, true
+	if got := s.cpuShare(); got != n {
+		t.Fatalf("exclusive: %d, want %d", got, n)
+	}
+	s.acq.Exclusive, s.tokens = false, []*flock{nil, nil}
+	if got := s.cpuShare(); got != n {
+		t.Fatalf("every token: %d, want %d", got, n)
 	}
 }
 

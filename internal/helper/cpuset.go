@@ -234,6 +234,17 @@ func readCPUHost(info string) cpuHost {
 	return h
 }
 
+// cpuShare is SPOTEXEC_CPUS for this session's job: the helper's CPUs ÷ the
+// machine's slot count, at least 1, or all of them when the job has the
+// runner to itself (as the client computes it for commands).
+func (s *Session) cpuShare() int {
+	n := runtime.NumCPU()
+	if s.acq.Exclusive || len(s.tokens) > 1 || s.maxSlots <= 1 {
+		return n
+	}
+	return max(1, n/s.maxSlots)
+}
+
 // cpusetArgs returns the docker run arguments pinning this session's
 // container to its slot's CPUs, when container.cpu_pinning asks for it. It
 // never fails a run: when the cpuset can't be trusted to be valid, nothing

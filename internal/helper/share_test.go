@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -179,6 +180,19 @@ func TestDepsProbeHydratesALocalCache(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(s.workspace, "vendor", "installed")); err != nil || string(b) != "one\n" {
 		t.Fatalf("hydrated %q, %v", b, err)
+	}
+}
+
+// The install sees the job's CPU share, and the project's [env] can
+// override it.
+func TestDepsInstallGetsCPUShare(t *testing.T) {
+	s, _ := depsSession(t)
+	d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p vendor && echo \"$SPOTEXEC_CPUS\" > vendor/cpus", CacheDirs: []string{"vendor"}}
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(s.workspace, "vendor", "cpus")); err != nil || strings.TrimSpace(string(b)) != strconv.Itoa(s.cpuShare()) {
+		t.Fatalf("SPOTEXEC_CPUS %q, %v; want %d", b, err, s.cpuShare())
 	}
 }
 

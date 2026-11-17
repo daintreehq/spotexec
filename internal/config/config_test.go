@@ -952,10 +952,11 @@ func TestContainerDockerNeedsContainer(t *testing.T) {
 
 func TestContainerCPUPinning(t *testing.T) {
 	for body, ok := range map[string]bool{
-		"[container]\nimage = \"node:22\"\ncpu_pinning = true\n":    true,
-		"[container]\nimage = \"node:22\"\n":                        true,
-		"[container]\ncpu_pinning = true\n":                         false,
-		"[container]\nimage = \"node:22\"\ncpu_pinning = \"yes\"\n": false,
+		"[container]\nimage = \"node:22\"\ncpu_pinning = true\n":         true,
+		"[container]\nimage = \"node:22\"\n":                             true,
+		"[container]\ncpu_pinning = true\n":                              false,
+		"[container]\ndockerfile = \"Dockerfile\"\ncpu_pinning = true\n": true,
+		"[container]\nimage = \"node:22\"\ncpu_pinning = \"yes\"\n":      false,
 	} {
 		pp := filepath.Join(t.TempDir(), ".spotexec.toml")
 		os.WriteFile(pp, []byte(body), 0o644)
