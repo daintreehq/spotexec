@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,11 +23,12 @@ type fakeFlush struct {
 	syncs   atomic.Int32
 	started chan string   // the directory of each sync started
 	finish  chan error    // ends a sync in progress
-	stop    chan struct{} // ends every sync, at the test's end
-	startEr error         // the sync can't start
-	shares  atomic.Bool   // Docker is on the work root's filesystem
-	pending atomic.Int64  // bytes waiting
-	asked   atomic.Int32  // dockerSharesFS calls
+	stop    chan struct{} // ends every sync (release)
+	once    sync.Once
+	startEr error        // the sync can't start
+	shares  atomic.Bool  // Docker is on the work root's filesystem
+	pending atomic.Int64 // bytes waiting
+	asked   atomic.Int32 // dockerSharesFS calls
 }
 
 func stubFlush(t *testing.T) *fakeFlush {
@@ -56,11 +58,14 @@ func stubFlush(t *testing.T) *fakeFlush {
 	}
 	flushTick = 10 * time.Millisecond
 	t.Cleanup(func() {
-		close(f.stop)
+		f.release()
 		pendingBytes, startSync, dockerSharesFS, flushTick = oldP, oldS, oldD, oldT
 	})
 	return f
 }
+
+// release ends every sync, now and later.
+func (f *fakeFlush) release() { f.once.Do(func() { close(f.stop) }) }
 
 // waitSync waits for the next sync to start, and returns its directory.
 func (f *fakeFlush) waitSync(t *testing.T) string {
@@ -96,15 +101,23 @@ func containerDeps(t *testing.T, s *Session) protocol.Deps {
 	return d
 }
 
-// depsAsync runs the request, and returns a wait for its end, bounded.
-func depsAsync(t *testing.T, s *Session, d protocol.Deps) func() error {
+// depsAsync runs the request, and returns a wait for its end, bounded. A
+// test that fails while the request waits ends its sync, so the request
+// ends before the session is released.
+func depsAsync(t *testing.T, s *Session, f *fakeFlush, d protocol.Deps) func() error {
 	t.Helper()
 	errc := make(chan error, 1)
 	go func() { errc <- s.deps(d) }()
 	ended := false
 	t.Cleanup(func() {
-		if !ended {
-			<-errc // the session must be idle before its cleanup
+		if ended {
+			return
+		}
+		f.release()
+		select {
+		case <-errc:
+		case <-time.After(10 * time.Second):
+			t.Error("the request outlived the test")
 		}
 	})
 	return func() error {
@@ -167,7 +180,7 @@ func protoCode(err error) string {
 func TestDepsFlushBeforeAContainerRun(t *testing.T) {
 	f := stubFlush(t)
 	s, out := depsSession(t)
-	end := depsAsync(t, s, containerDeps(t, s))
+	end := depsAsync(t, s, f, containerDeps(t, s))
 	if dir := f.waitSync(t); dir != s.layout.Root {
 		t.Fatalf("synced %s, want the work root %s", dir, s.layout.Root)
 	}
@@ -279,13 +292,13 @@ func TestDepsFlushFailureIsNotTheRunsFailure(t *testing.T) {
 		}
 	})
 	t.Run("over budget", func(t *testing.T) {
-		stubFlush(t) // never finishes
+		f := stubFlush(t) // never finishes
 		old := flushBudget
 		flushBudget = 100 * time.Millisecond
 		t.Cleanup(func() { flushBudget = old })
 		s, out := depsSession(t)
 		start := time.Now()
-		if err := depsAsync(t, s, containerDeps(t, s))(); err != nil {
+		if err := depsAsync(t, s, f, containerDeps(t, s))(); err != nil {
 			t.Fatal(err)
 		}
 		if took := time.Since(start); took > 3*time.Second {
@@ -315,7 +328,7 @@ func TestDepsFlushEndsWithTheSession(t *testing.T) {
 			s, out := depsSession(t)
 			// Before the session's own cleanup (which parks while stopping).
 			t.Cleanup(func() { s.stopping.Store(false) })
-			end := depsAsync(t, s, containerDeps(t, s))
+			end := depsAsync(t, s, f, containerDeps(t, s))
 			f.waitSync(t)
 			c.end(s)
 			if err := end(); protoCode(err) != c.code {
