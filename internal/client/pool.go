@@ -826,15 +826,15 @@ type LaunchDecision struct {
 // would serve (a short burst waits for them; demand still waiting after a
 // launch's lead launches).
 func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
-	return p.PlanFor(ctx, covered, nil)
+	return p.PlanFor(ctx, covered, nil, 0)
 }
 
-// PlanFor is Plan for a request that may not use exclude's VMs and regions
-// (AcquireRequest.Exclude): a VM it excludes still counts toward
-// max_instances, but its pending slots don't cover the request's demand,
-// so a replay kept out of a silent region isn't left waiting on a VM
-// booting there (#240).
-func (p *Pool) PlanFor(ctx context.Context, covered int, exclude map[string]bool) (LaunchDecision, error) {
+// PlanFor is Plan for a request of own slots that may not use exclude's VMs
+// and regions (AcquireRequest.Exclude): a VM it excludes still counts
+// toward max_instances, and its pending slots still cover the other
+// waiters' demand, but not the request's own, so a replay kept out of a
+// silent region isn't left waiting on a VM booting there (#240).
+func (p *Pool) PlanFor(ctx context.Context, covered int, exclude map[string]bool, own int) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
@@ -856,6 +856,7 @@ func (p *Pool) PlanFor(ctx context.Context, covered int, exclude map[string]bool
 			}
 		}
 		slots := p.SlotsPerInstance()
+		excludedCap := 0 // pending slots in VMs exclude rules out
 		inLedger := map[string]bool{}
 		pendingVM := map[string]bool{} // instances whose slots count as pending
 		for _, l := range st.Launches {
@@ -875,7 +876,8 @@ func (p *Pool) PlanFor(ctx context.Context, covered int, exclude map[string]bool
 					continue
 				}
 				if unusable[l.InstanceID] {
-					continue // it won't serve this request
+					excludedCap += slots // it won't serve this request
+					continue
 				}
 			}
 			if l.InstanceID == "" || !listed[l.InstanceID] {
@@ -892,7 +894,11 @@ func (p *Pool) PlanFor(ctx context.Context, covered int, exclude map[string]bool
 			n := st.Notes[in.ID]
 			// Only never-ready instances count here: a ready one is already
 			// serving (its launch-grace capacity, if any, is in the ledger).
-			if inLedger[in.ID] || unusable[in.ID] || (n != nil && (n.Ready || n.closed())) {
+			if inLedger[in.ID] || (n != nil && (n.Ready || n.closed())) {
+				continue
+			}
+			if unusable[in.ID] && time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
+				excludedCap += slots // it won't serve this request
 				continue
 			}
 			if time.Since(in.LaunchedAt) < p.R.BootTimeout.Duration {
@@ -901,6 +907,8 @@ func (p *Pool) PlanFor(ctx context.Context, covered int, exclude map[string]bool
 				d.Capacity += slots
 			}
 		}
+		// Booting VMs this request can't use serve the other waiters first.
+		d.Capacity += min(excludedCap, max(0, d.Demand-own))
 		d.Live = usable
 		now := time.Now()
 		d.Lead, d.LeadLearned = st.sched().launchLead(now)

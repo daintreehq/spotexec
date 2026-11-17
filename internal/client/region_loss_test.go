@@ -635,7 +635,7 @@ func TestPlanForSkipsExcludedPendingCapacity(t *testing.T) {
 		if d, err := p.Plan(context.Background(), 0); err != nil || d.Launch || !strings.Contains(d.Reason, "being launched") {
 			t.Fatalf("ledger=%v: unexcluded plan %+v, %v", ledger, d, err)
 		}
-		d, err := p.PlanFor(context.Background(), 0, map[string]bool{regionKey("ap-south-1"): true})
+		d, err := p.PlanFor(context.Background(), 0, map[string]bool{regionKey("ap-south-1"): true}, 1)
 		if err != nil || !d.Launch || d.Live != 1 {
 			t.Fatalf("ledger=%v: excluded plan %+v, %v", ledger, d, err)
 		}
@@ -644,9 +644,24 @@ func TestPlanForSkipsExcludedPendingCapacity(t *testing.T) {
 		// At max_instances it still counts.
 		p = booting(ledger, 1)
 		w, _ = p.Register(1)
-		if d, _ := p.PlanFor(context.Background(), 0, map[string]bool{regionKey("ap-south-1"): true}); d.Launch || !strings.Contains(d.Reason, "max_instances") {
+		if d, _ := p.PlanFor(context.Background(), 0, map[string]bool{regionKey("ap-south-1"): true}, 1); d.Launch || !strings.Contains(d.Reason, "max_instances") {
 			t.Fatalf("ledger=%v: at max: %+v", ledger, d)
 		}
+		w.Done()
+
+		// Other waiters can still use it: with two of theirs and one of
+		// the request's, one launch covers the request, not two.
+		p = booting(ledger, 4)
+		others, _ := p.Register(2)
+		w, _ = p.Register(1)
+		away := map[string]bool{regionKey("ap-south-1"): true}
+		if d, _ := p.PlanFor(context.Background(), 0, away, 1); !d.Launch {
+			t.Fatalf("ledger=%v: mixed waiters, first plan: %+v", ledger, d)
+		}
+		if d, _ := p.PlanFor(context.Background(), 0, away, 1); d.Launch {
+			t.Fatalf("ledger=%v: mixed waiters, launched a second VM: %+v", ledger, d)
+		}
+		others.Done()
 		w.Done()
 	}
 }
