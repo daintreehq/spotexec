@@ -43,6 +43,7 @@ type fakeBulkEC2 struct {
 	attempts     []int         // size of every TerminateInstances request
 	terms        [][]string    // IDs of each accepted request
 	pages        int
+	srv          *httptest.Server
 }
 
 func newFakeBulkEC2(t *testing.T, n int) *fakeBulkEC2 {
@@ -171,6 +172,13 @@ func (f *fakeBulkEC2) settle() {
 	f.mu.Unlock()
 }
 
+// finish shuts the server down, waiting for every handler, even one a
+// cancelled client left behind.
+func (f *fakeBulkEC2) finish() {
+	f.srv.Close()
+	f.settle()
+}
+
 func newBulkEnv(t *testing.T, f *fakeBulkEC2) *AWSSpot {
 	t.Helper()
 	t.Setenv("SPOTEXEC_CONFIG_DIR", t.TempDir())
@@ -182,6 +190,7 @@ func newBulkEnv(t *testing.T, f *fakeBulkEC2) *AWSSpot {
 	f.owner = owner
 	srv := httptest.NewServer(f.handler())
 	t.Cleanup(srv.Close)
+	f.srv = srv
 	r := &config.Runner{Name: "s", Type: config.TypeAWSSpot, Region: "r-one-1",
 		InstanceTypes: []string{"c7a.2xlarge"}, Arch: "amd64", User: "ubuntu", VolumeGB: 64,
 		SSHCIDR: "0.0.0.0/0", MaxInstances: 4, MaxLifetime: config.Duration{Duration: 2 * time.Hour},
@@ -370,13 +379,13 @@ func TestUpTerminatesStoppedLeftoversInBatches(t *testing.T) {
 }
 
 func TestTerminateWaitsOutThrottle(t *testing.T) {
-	fastRetries(t, time.Millisecond)
+	fastRetries(t, 2*time.Millisecond)
 	for _, tc := range []struct {
 		n        int
 		min, max time.Duration // the refill wait for the throttled second batch
 	}{
-		{2000, time.Second, 0},
-		{1500, 500 * time.Millisecond, 950 * time.Millisecond}, // sized for its 500, not a full 1000
+		{2000, 2 * time.Second, 0},
+		{1500, time.Second, 1900 * time.Millisecond}, // sized for its 500, not a full 1000
 	} {
 		t.Run(strconv.Itoa(tc.n), func(t *testing.T) {
 			f := newFakeBulkEC2(t, tc.n)
@@ -417,12 +426,14 @@ func TestTerminateCancelledDuringRefill(t *testing.T) {
 	f := newFakeBulkEC2(t, 2000)
 	f.throttle = 100
 	a := newBulkEnv(t, f)
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	// Long enough for query's five quick throttled attempts, far short of
+	// the hour-long refill.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	start := time.Now()
 	done, err := a.terminate(ctx, f.ids)
-	f.settle()
-	if time.Since(start) > 5*time.Second {
+	f.finish()
+	if time.Since(start) > 10*time.Second {
 		t.Fatalf("took %v to notice the deadline", time.Since(start))
 	}
 	if len(done) != 1000 || f.throttled != 5 {
@@ -444,7 +455,7 @@ func TestTerminateStopsWhenCancelled(t *testing.T) {
 	f.cancelOnAccept = cancel
 	a := newBulkEnv(t, f)
 	done, err := a.terminate(ctx, f.ids)
-	f.settle()
+	f.finish()
 	if len(done) != 0 || fmt.Sprint(f.attempts) != "[1000]" || len(f.terms) != 1 {
 		t.Fatalf("reported %d; requests %v, accepted %d", len(done), f.attempts, len(f.terms))
 	}
