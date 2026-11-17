@@ -19,12 +19,13 @@ import (
 
 // bootReply is the fake EC2 endpoint's answer to one status read: an HTTP
 // status and body, a transport error, or a read that hangs until its
-// context ends.
+// context ends (and then, with late, answers anyway).
 type bootReply struct {
 	status int
 	body   string
 	err    error
 	hang   bool
+	late   bool
 }
 
 func bootErr(status int, code string) bootReply {
@@ -72,7 +73,9 @@ func newBootEnv(t *testing.T, bootTimeout time.Duration, script func(n int) boot
 		switch {
 		case rep.hang:
 			<-r.Context().Done()
-			return nil, r.Context().Err()
+			if !rep.late {
+				return nil, r.Context().Err()
+			}
 		case rep.err != nil:
 			return nil, rep.err
 		}
@@ -322,6 +325,19 @@ func TestWaitRunningCredentialFailure(t *testing.T) {
 			e := newBootEnv(t, time.Minute, func(int) bootReply { return bootErr(401, "AuthFailure") })
 			_, err := e.a.WaitRunning(context.Background(), "i-boot", nil)
 			if _, ok := err.(*CredentialError); !ok || e.reads.Load() > 2 {
+				t.Fatalf("err = %T %v after %d reads", err, err, e.reads.Load())
+			}
+		})
+	})
+	t.Run("rejected as the boot deadline passes", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newBootEnv(t, 10*time.Second, func(n int) bootReply {
+				r := bootErr(401, "AuthFailure")
+				r.hang, r.late = n == 2, true // the refreshed attempt answers only after the deadline
+				return r
+			})
+			_, err := e.a.WaitRunning(context.Background(), "i-boot", nil)
+			if _, ok := err.(*CredentialError); !ok || e.reads.Load() != 2 {
 				t.Fatalf("err = %T %v after %d reads", err, err, e.reads.Load())
 			}
 		})
