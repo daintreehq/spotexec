@@ -56,6 +56,7 @@ type fakeRegionsEC2 struct {
 	policyErr   map[string]bool              // regions whose PutLifecyclePolicy is denied
 	cached      map[string]map[string]bool   // region -> dependency cache object keys held
 	cacheErr    map[string]int               // region -> HTTP status the cache bucket answers
+	onOwned     func(region string)          // called (unlocked) on each by-owner (leftovers) listing
 	calls       []string                     // "region Action [detail]"
 	next        int
 }
@@ -402,6 +403,11 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			byOwner := p.Get("Filter.1.Name") == "tag:spotexec-owner"
 			if byOwner {
 				f.log(region, act+" owned")
+				if hook := f.onOwned; hook != nil {
+					f.mu.Unlock()
+					hook(region)
+					f.mu.Lock()
+				}
 				if f.hangOwned[region] {
 					f.mu.Unlock()
 					<-r.Context().Done()
