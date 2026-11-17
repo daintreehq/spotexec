@@ -445,15 +445,8 @@ func TestInstanceState(t *testing.T) {
 	// A listing that never answers is given up on at the deadline (no
 	// sooner: the fake returns only once its context ends).
 	f.listErr, f.slowList = nil, true
-	done := make(chan vmState, 1)
 	start := time.Now()
-	go func() { done <- instanceState(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}) }()
-	select {
-	case got := <-done:
-		if el := time.Since(start); got != vmUnknown || el < instanceLookupTime {
-			t.Errorf("list deadline: %v after %s", got, el)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the listing had no deadline")
+	if got, el := instanceState(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}), time.Since(start); got != vmUnknown || el < instanceLookupTime || el > 2*time.Second {
+		t.Errorf("list deadline: %v after %s", got, el)
 	}
 }
