@@ -20,7 +20,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/cloudinit"
@@ -262,38 +261,6 @@ func (a *AWSSpot) Status(ctx context.Context) (Info, error) {
 // Forget is a no-op: the AWS provider keeps no cached instance state.
 func (a *AWSSpot) Forget() {}
 
-// lockUp takes the per-runner provisioning lock, honoring ctx.
-func (a *AWSSpot) lockUp(ctx context.Context, log Logger) (func(), error) {
-	if err := os.MkdirAll(a.dir, 0o700); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(filepath.Join(a.dir, "up.lock"), os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	logged := false
-	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
-			f.Close()
-			return nil, err
-		}
-		if !logged && log != nil {
-			log("waiting for another spotexec process that is provisioning %s", a.r.Name)
-			logged = true
-		}
-		select {
-		case <-ctx.Done():
-			f.Close()
-			return nil, ctx.Err()
-		case <-time.After(250 * time.Millisecond):
-		}
-	}
-}
-
 // List returns this runner's pending and running instances.
 func (a *AWSSpot) List(ctx context.Context) ([]Instance, error) {
 	insts, err := a.describe(ctx, "pending", "running")
@@ -321,9 +288,10 @@ func (a *AWSSpot) Launch(ctx context.Context, log Logger) (Instance, error) {
 	if log == nil {
 		log = func(string, ...any) {}
 	}
-	// Shares the provisioning lock with Down, so `spotexec down` cannot
-	// finish while a launch is about to create an instance.
-	unlock, err := a.lockUp(ctx, nil)
+	// Shares the provisioning lock with other launches and with Down, so
+	// `spotexec down` cannot finish while a launch is about to create an
+	// instance.
+	unlock, err := a.lockLaunch(ctx)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -1303,6 +1271,3 @@ type AccountInstance struct {
 	Launched time.Time `json:"launched"`
 	Mine     bool      `json:"mine"`
 }
-
-// launchSlots caps a runner's launch requests in flight at once.
-const launchSlots = 4

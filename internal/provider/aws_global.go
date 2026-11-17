@@ -1324,8 +1324,9 @@ func (g *AWSGlobal) Launch(ctx context.Context, log Logger) (Instance, error) {
 		log = func(string, ...any) {}
 	}
 	// One provisioning lock for the runner (all regions share its state
-	// directory), shared with Down.
-	unlock, err := g.home().lockUp(ctx, nil)
+	// directory): launches share it with each other, and Down and Up take
+	// it alone.
+	unlock, err := g.home().lockLaunch(ctx)
 	if err != nil {
 		return Instance{}, err
 	}
