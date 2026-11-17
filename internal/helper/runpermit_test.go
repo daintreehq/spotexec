@@ -464,17 +464,29 @@ func TestWithdrawEndsRunWait(t *testing.T) {
 }
 
 // A withdraw that arrives once the job has its permit is too late: the
-// command runs as usual and its result says nothing of a withdraw.
+// running command reads it and carries on (it is no interrupt), its result
+// says nothing of a withdraw, and one left over after the run is no
+// unknown message.
 func TestWithdrawAfterPermitIsIgnored(t *testing.T) {
 	root := t.TempDir()
 	s := admitted(t, root)
 	s.frames <- withdrawFrame(t)
-	res := execResult(t, s, protocol.Exec{Shell: "touch ran"})
+	res := execResult(t, s, protocol.Exec{Shell: "sleep 0.5; touch ran"})
 	if res.Withdrawn || res.Canceled || res.ExitCode != 0 {
 		t.Fatalf("result of a run with a late withdraw: %+v", res)
 	}
 	if _, err := os.Stat(filepath.Join(s.workspace, "ran")); err != nil {
-		t.Fatal("the command didn't run")
+		t.Fatal("the command didn't run to its end")
+	}
+	if len(s.frames) != 0 {
+		t.Fatal("the running command never read the withdraw")
+	}
+	env, err := protocol.Decode(withdrawFrame(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.dispatch(env); err != nil {
+		t.Fatalf("a withdraw after the run: %v", err)
 	}
 }
 

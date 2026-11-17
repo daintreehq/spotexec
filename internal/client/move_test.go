@@ -183,11 +183,13 @@ func TestWaitingJobWithdrawsOnceASlotIsFound(t *testing.T) {
 }
 
 // A job that gets its run permit where it is gives back a slot found
-// elsewhere meanwhile, unused: no withdraw, and the ledger forgets it.
+// elsewhere meanwhile, unused, as soon as run_slot says so (while its
+// command still runs), and the ledger forgets it.
 func TestPermitFirstGivesTheFoundSlotBack(t *testing.T) {
 	shortMoves(t)
 	to, p := heldLease(t)
 	mv := newMover(func(context.Context) *Lease { return to })
+	defer mv.close()
 	f := newFakeExec(t)
 	f.push(protocol.TypeEvent, protocol.Event{Name: "run_wait", Message: "all 2 slots are running commands"})
 	onRunWait := func(waiting bool, _ string) {
@@ -195,27 +197,39 @@ func TestPermitFirstGivesTheFoundSlotBack(t *testing.T) {
 			mv.start(context.Background())
 			<-mv.ready() // found before the permit came
 			f.push(protocol.TypeEvent, protocol.Event{Name: "run_slot"})
-			f.push(protocol.TypeResult, protocol.Result{ExitCode: 0})
 			return
 		}
 		mv.stop()
 	}
-	// The withdraw the found slot prompts races the run_slot already
-	// queued: a helper ignores one that comes after the permit, which the
-	// fake can't, so it counts as not sent if the result came first.
-	res, err := pumpExec(noWithdrawReply{f}, io.Discard, io.Discard, Options{Rep: nopRep{}}, nil, nil, nil, onRunWait, mv.ready())
-	if err != nil {
-		t.Fatal(err)
+	type out struct {
+		res protocol.Result
+		err error
 	}
-	mv.close()
-	if res.Withdrawn {
-		t.Fatalf("result %+v: withdrawn after its permit", res)
+	done := make(chan out, 1)
+	// The withdraw the found slot prompts races the run_slot already
+	// queued: a helper ignores one that comes after the permit.
+	go func() {
+		res, err := pumpExec(noWithdrawReply{f}, io.Discard, io.Discard, Options{Rep: nopRep{}}, nil, nil, nil, onRunWait, mv.ready())
+		done <- out{res, err}
+	}()
+	held := func() int { firm, _ := p.state(t).held(p.R, to.InstanceID); return firm }
+	for deadline := time.Now().Add(5 * time.Second); held() != 0; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("ledger still holds %d jobs on %s while the command runs", held(), to.InstanceID)
+		}
+	}
+	select {
+	case o := <-done:
+		t.Fatalf("pumpExec returned %+v, %v before the command's result", o.res, o.err)
+	default:
+	}
+	f.push(protocol.TypeResult, protocol.Result{ExitCode: 0})
+	o := <-done
+	if o.err != nil || o.res.Withdrawn {
+		t.Fatalf("result %+v, %v: want the command's own", o.res, o.err)
 	}
 	if l := mv.take(); l != nil {
 		t.Fatal("the slot found was kept after the permit came")
-	}
-	if firm, _ := p.state(t).held(p.R, to.InstanceID); firm != 0 {
-		t.Fatalf("ledger still holds %d jobs on %s", firm, to.InstanceID)
 	}
 }
 

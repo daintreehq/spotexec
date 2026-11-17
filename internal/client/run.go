@@ -168,7 +168,7 @@ type Result struct {
 	// moveTo: the attempt withdrew from a VM where it waited for a run
 	// permit, nothing having run, and carries on in this slot elsewhere.
 	moveTo *Lease
-	moveM  *manifest.Manifest
+	moveFP string
 }
 
 // stage is how far an attempt had got: the phase it was in, whether the
@@ -362,11 +362,12 @@ type attempt struct {
 	// holds the region (#225), may launch for it.
 	bootOnly string
 	fresh    *bool // an earlier attempt already showed CONTAINER_FRESH
-	// lease and m: a slot on another VM a job waiting for a run permit
-	// moved to (#256), and the manifest it was syncing; this attempt
-	// carries on there instead of selecting a runner and scanning again.
+	// lease: a slot on another VM a job waiting for a run permit moved to
+	// (#256); this attempt carries on there instead of selecting a runner.
+	// fp is the fingerprint that slot was acquired with: its fingerprint
+	// hit holds only if this attempt's scan still matches.
 	lease *Lease
-	m     *manifest.Manifest
+	fp    string
 	moves int // how many times this run moved (at most maxMoves)
 }
 
@@ -397,7 +398,7 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 			spent[k] += d
 		}
 		res.Phases, res.Attempts = spent, att.n
-		att.lease, att.m = res.moveTo, res.moveM
+		att.lease, att.fp = res.moveTo, res.moveFP
 		if att.lease != nil {
 			// Not a replay: nothing ran, and the slot is already held.
 			att.moves++
@@ -708,10 +709,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 
 	// 1. Local manifest (what the remote workspace must contain).
+	// A slot this attempt moved to is its own from the start: given back
+	// unused if the attempt ends before taking it up.
+	moved := att.lease
+	defer func() { moved.abandon() }()
+
 	var m *manifest.Manifest
-	if att.m != nil {
-		m = att.m // a moved attempt syncs what the first one scanned
-	} else if o.Sync != "none" {
+	if o.Sync != "none" {
 		o.Rep.Status("scanning %s", ws.Root)
 		t := time.Now()
 		m, err = manifest.Build(ctx, ManifestOptions(ws.Root, p))
@@ -755,8 +759,14 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 	}
 	var lease *Lease
-	if att.lease != nil {
-		lease = att.lease // moved here from a VM with no free slot
+	if moved != nil {
+		// Moved here from a VM with no free slot. The scan is new (the
+		// earlier attempt's manifest took that VM's upload corrections), so
+		// the slot's fingerprint hit counts only if it still matches.
+		lease, moved = moved, nil
+		if m == nil || m.Fingerprint != att.fp {
+			lease.Acq.FingerprintMatch = false
+		}
 	} else if o.PreferLast || o.SameSlot {
 		// exec runs without syncing, so it must land in exactly the slot that
 		// holds this worktree's files; --same-slot syncs, but wants the same
@@ -1046,7 +1056,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		o.Rep.Event("moved", map[string]any{"from": lease.InstanceID, "to": to.InstanceID, "runner": to.Runner.Name, "slot": to.Acq.Token})
 		o.Rep.Status("%s had no free slot; moving to %s#%d on %s", label, to.Runner.Name, to.Acq.Token, to.InstanceID)
 		lease.abandon()
-		res.moveTo, res.moveM = to, m
+		res.moveTo, res.moveFP = to, req.Base.Fingerprint
 		return res, nil, ""
 	}
 	res.ExitCode, res.TimedOut = result.ExitCode, result.TimedOut
