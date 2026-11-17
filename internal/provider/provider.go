@@ -109,9 +109,9 @@ type Fleet interface {
 }
 
 // RegionLister is implemented by fleets spread over regions that can list
-// the regions they reach even when another can't be listed. It is for
-// showing the fleet (`spotexec status`); the pool uses List, which fails
-// as a whole so that it never believes an unlisted region's VMs gone.
+// the regions they reach even when another can't be listed. `spotexec
+// status` shows what it lists; the client pool uses it too, keeping the
+// VMs it last saw in each unlisted region so it never believes them gone.
 type RegionLister interface {
 	// ListReachable returns the live instances of every region it could
 	// list and, for each region it couldn't, why. It waits on no region

@@ -93,3 +93,152 @@ func TestRefreshUsesRegionsThatAnswered(t *testing.T) {
 		t.Fatalf("partial listing: want the new VM seen and the stalled region's VM kept, got %v", got)
 	}
 }
+
+// A VM gone from a region that answered is gone; the stalled region's
+// launches and the views every caller gets (forced or not) keep what was
+// last known there, until the region answers again.
+func TestPartialListingKeepsWhatItCantSee(t *testing.T) {
+	p, f := testPool(t, 4)
+	rf := &stallFleet{fakeFleet: f, stalled: map[string]bool{}}
+	p.Fleet = rf
+	host := provider.Target{Host: "127.0.0.1"}
+	f.insts = []provider.Instance{
+		{ID: "i-east", Region: "us-east-1", State: provider.StateRunning, Target: host, LaunchedAt: time.Now()},
+		{ID: "i-south", Region: "ap-south-1", State: provider.StateRunning, Target: host, LaunchedAt: time.Now()},
+	}
+	listedIDs(t, p, false)
+	// Launches whose VMs were never listed: one in the region that will
+	// stall, one in a region that answers, and one whose provisioner died
+	// before RunInstances returned. All are past every expiry.
+	old := time.Now().Add(-p.R.BootTimeout.Duration - listLagGrace - time.Hour)
+	_ = p.with(func(st *poolState) error {
+		st.Launches = []launchRec{
+			{ID: "l-south", InstanceID: "i-booting", Region: "ap-south-1", Started: old, PID: 1},
+			{ID: "l-east", InstanceID: "i-vanished", Region: "us-east-1", Started: old, PID: 1},
+			{ID: "l-orphan", Started: old, PID: -1},
+		}
+		st.Notes = map[string]*note{"i-gone-earlier": {Ready: true}}
+		return nil
+	})
+
+	rf.stalled["ap-south-1"] = true
+	f.insts = f.insts[1:] // i-east ends
+	staleList(p)
+	if got := listedIDs(t, p, true); !slices.Equal(got, []string{"i-south"}) {
+		t.Fatalf("forced partial listing: %v", got)
+	}
+	var launches []string
+	_ = p.with(func(st *poolState) error {
+		for _, l := range st.Launches {
+			launches = append(launches, l.ID)
+		}
+		if !slices.Equal(st.Unlisted, []string{"ap-south-1"}) {
+			t.Errorf("unlisted regions not recorded: %v", st.Unlisted)
+		}
+		if st.Notes["i-gone-earlier"] == nil {
+			t.Error("a note was forgotten while a region couldn't be listed")
+		}
+		return nil
+	})
+	if !slices.Equal(launches, []string{"l-south", "l-orphan"}) {
+		t.Fatalf("launches kept while ap-south-1 is unlisted: want l-south and l-orphan, got %v", launches)
+	}
+	v, _ := p.Snapshot(context.Background(), false)
+	if v.Launching != 2 || !slices.Equal(v.Unlisted, []string{"ap-south-1"}) {
+		t.Fatalf("view: launching %d unlisted %v", v.Launching, v.Unlisted)
+	}
+
+	// The region answers again: what it no longer holds is gone.
+	rf.stalled = map[string]bool{}
+	f.insts = nil
+	staleList(p)
+	if got := listedIDs(t, p, false); len(got) != 0 {
+		t.Fatalf("recovered listing: %v", got)
+	}
+	_ = p.with(func(st *poolState) error {
+		if len(st.Launches) != 0 || len(st.Unlisted) != 0 || st.Notes["i-gone-earlier"] != nil {
+			t.Errorf("not reconciled after a full listing: launches %v unlisted %v notes %v", st.Launches, st.Unlisted, st.Notes)
+		}
+		return nil
+	})
+}
+
+// A region whose API never answers holds a refresh (and the pool lock)
+// only for refreshBudget, and the regions that answered are still used.
+func TestRefreshIsBoundedWhenARegionHangs(t *testing.T) {
+	defer func(r, l time.Duration) { refreshBudget, listBudget = r, l }(refreshBudget, listBudget)
+	refreshBudget, listBudget = 400*time.Millisecond, 200*time.Millisecond
+	p, f := testPool(t, 4)
+	m := &hangMatcher{}
+	rf := &stallFleet{fakeFleet: f, stalled: map[string]bool{}, hang: true}
+	p.Fleet = &matchingStallFleet{stallFleet: rf, hangMatcher: m}
+	host := provider.Target{Host: "127.0.0.1"}
+	f.insts = []provider.Instance{
+		{ID: "i-south", Region: "ap-south-1", State: provider.StateRunning, Target: host, LaunchedAt: time.Now()},
+	}
+	listedIDs(t, p, false)
+
+	rf.stalled["ap-south-1"] = true
+	f.insts = append(f.insts, provider.Instance{ID: "i-new", Region: "us-east-1", State: provider.StateRunning,
+		Target: host, LaunchedAt: time.Now()})
+	staleList(p)
+	start := time.Now()
+	got := listedIDs(t, p, false)
+	if took := time.Since(start); took > refreshBudget+300*time.Millisecond {
+		t.Fatalf("refresh took %s, past its budget of %s", took, refreshBudget)
+	}
+	if !m.called {
+		t.Fatal("the VMs weren't judged against the config")
+	}
+	if !slices.Equal(got, []string{"i-new", "i-south"}) {
+		t.Fatalf("bounded partial listing: %v", got)
+	}
+}
+
+// hangMatcher judges VMs only once its context ends, like a type lookup
+// in a region that doesn't answer.
+type hangMatcher struct{ called bool }
+
+func (m *hangMatcher) Mismatches(ctx context.Context, _ []provider.Instance) map[string]string {
+	m.called = true
+	<-ctx.Done()
+	return nil
+}
+
+type matchingStallFleet struct {
+	*stallFleet
+	*hangMatcher
+}
+
+// With no earlier listing there is nothing to keep for a region that
+// doesn't answer, and expired credentials are said at once, as before.
+func TestPartialListingErrors(t *testing.T) {
+	p, f := testPool(t, 4)
+	rf := &stallFleet{fakeFleet: f, stalled: map[string]bool{"ap-south-1": true}}
+	p.Fleet = rf
+	if _, err := p.Snapshot(context.Background(), false); err == nil {
+		t.Fatal("a first listing missing a region was taken as the whole fleet")
+	}
+
+	p2, f2 := testPool(t, 4)
+	cf := &credStallFleet{stallFleet: &stallFleet{fakeFleet: f2, stalled: map[string]bool{}}}
+	p2.Fleet = cf
+	listedIDs(t, p2, false)
+	cf.stalled["us-east-1"] = true
+	staleList(p2)
+	_, err := p2.Snapshot(context.Background(), false)
+	var ce *provider.CredentialError
+	if !errors.As(err, &ce) {
+		t.Fatalf("credential failure served a cached view: %v", err)
+	}
+}
+
+type credStallFleet struct{ *stallFleet }
+
+func (f *credStallFleet) ListReachable(ctx context.Context) ([]provider.Instance, map[string]error, error) {
+	insts, unlisted, err := f.stallFleet.ListReachable(ctx)
+	for rg := range unlisted {
+		unlisted[rg] = &provider.CredentialError{Err: errors.New("token expired")}
+	}
+	return insts, unlisted, err
+}

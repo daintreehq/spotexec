@@ -445,6 +445,10 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	st.Demand, st.Launching = view.Demand, view.Launching
 	now := time.Now()
 	listed := map[string]bool{}
+	// gone: id is not listed, and the listing covered every region. While
+	// a region can't be listed, absence proves nothing: what is known
+	// about its VMs (counted launches, terminations in flight) is kept.
+	gone := func(id string) bool { return !listed[id] && len(view.Unlisted) == 0 }
 	for _, in := range view.Instances {
 		listed[in.ID] = true
 		if _, ok := fl.seen[in.ID]; !ok {
@@ -452,7 +456,7 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 		}
 	}
 	for id := range fl.seen {
-		if !listed[id] {
+		if gone(id) {
 			delete(fl.seen, id)
 			delete(fl.noticed, id)
 			delete(fl.bootFailed, id)
@@ -467,12 +471,12 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// listing showed it): forgotten once listings would show it.
 	d.mu.Lock()
 	for id, t := range fl.counted {
-		if !listed[id] && !view.BootFailed[id] && time.Since(t) > forgetAfter {
+		if gone(id) && !view.BootFailed[id] && time.Since(t) > forgetAfter {
 			delete(fl.counted, id)
 		}
 	}
 	for id, b := range fl.batchOf {
-		if !listed[id] && time.Since(b.at) > forgetAfter {
+		if gone(id) && time.Since(b.at) > forgetAfter {
 			delete(fl.batchOf, id)
 		}
 	}
@@ -481,7 +485,9 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	// 1. Retry terminations that haven't taken effect yet.
 	for id, why := range fl.killing {
 		if !listed[id] {
-			delete(fl.killing, id)
+			if gone(id) {
+				delete(fl.killing, id)
+			}
 			continue
 		}
 		d.terminate(ctx, fl, id, why, true)

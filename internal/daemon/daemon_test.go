@@ -846,3 +846,50 @@ func TestRetirementWaitsForReplacement(t *testing.T) {
 		t.Fatalf("retired %v, want both, one after the other", got)
 	}
 }
+
+// unlistedFleet is a fleet one of whose regions doesn't answer: it lists
+// the others, and names that one.
+type unlistedFleet struct{ *fakeFleet }
+
+func (f *unlistedFleet) ListReachable(ctx context.Context) ([]provider.Instance, map[string]error, error) {
+	insts, err := f.List(ctx)
+	return insts, map[string]error{"ap-south-1": errors.New("no answer")}, err
+}
+
+// Issue #241: while a region can't be listed, a VM's absence from the
+// view proves nothing, so the manager forgets nothing for it; a listing
+// of every region then forgets as before.
+func TestManageForgetsNothingWhileARegionIsUnlisted(t *testing.T) {
+	_, cfgPath := setup(t)
+	writeConfig(t, cfgPath, runnerConfig("a.large", 0))
+	d, _ := start(t)
+	fl := fleetNamed(d, "pool")
+	fl.lastPrb = time.Now()
+	d.manage(context.Background(), fl)
+
+	ff := fl.pool.Fleet.(*fakeFleet)
+	fl.pool.Fleet = &unlistedFleet{ff}
+	old := time.Now().Add(-2 * forgetAfter)
+	fl.counted["i-old"] = old
+	fl.batchOf["i-old"] = launchBatch{at: old}
+	fl.killing["i-old"] = "test"
+	fl.seen["i-old"] = old
+	d.manage(context.Background(), fl)
+	_, counted := fl.counted["i-old"]
+	_, batch := fl.batchOf["i-old"]
+	_, killing := fl.killing["i-old"]
+	_, seen := fl.seen["i-old"]
+	if !counted || !batch || !killing || !seen {
+		t.Fatalf("forgotten while a region was unlisted: counted %v batch %v killing %v seen %v", counted, batch, killing, seen)
+	}
+
+	fl.pool.Fleet = ff
+	d.manage(context.Background(), fl)
+	_, counted = fl.counted["i-old"]
+	_, batch = fl.batchOf["i-old"]
+	_, killing = fl.killing["i-old"]
+	_, seen = fl.seen["i-old"]
+	if counted || batch || killing || seen {
+		t.Fatalf("kept after a full listing: counted %v batch %v killing %v seen %v", counted, batch, killing, seen)
+	}
+}

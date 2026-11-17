@@ -44,6 +44,15 @@ const (
 	quotaRetry    = 5 * time.Minute  // after a quota refusal, unless one of our VMs ends first
 )
 
+// A refresh runs under the pool lock, so every process using the runner's
+// pool waits behind it. refreshBudget bounds the whole of it (listing and
+// judging the VMs against the config), and listBudget the listing within
+// it, so one region whose API doesn't answer delays them only that long.
+var (
+	refreshBudget = 15 * time.Second
+	listBudget    = 10 * time.Second
+)
+
 type note struct {
 	Failures     int       `json:"failures,omitempty"`
 	Draining     bool      `json:"draining,omitempty"`
@@ -93,11 +102,18 @@ type launchRec struct {
 	PID        int       `json:"pid"`
 	Failed     bool      `json:"failed,omitempty"`
 	Ambiguous  time.Time `json:"ambiguous,omitempty"` // when RunInstances' outcome became unknown
+	// Region the instance launched in ("" until known): while that region
+	// can't be listed, the instance's absence proves nothing.
+	Region string `json:"region,omitempty"`
 }
 
 type poolState struct {
 	Instances     []provider.Instance `json:"instances"`
 	ListedAt      time.Time           `json:"listed_at"`
+	// Unlisted: the regions the last listing couldn't list. Their VMs are
+	// those last seen there, and nothing is forgotten for being absent
+	// until a listing covers every region again.
+	Unlisted []string `json:"unlisted,omitempty"`
 	Launches      []launchRec         `json:"launches"`
 	Notes         map[string]*note    `json:"notes"`
 	BackoffUntil  time.Time           `json:"backoff_until,omitempty"`
@@ -336,7 +352,8 @@ func (p *Pool) drainAging(st *poolState) {
 // the requirements differ from those last judged against (the config
 // changed, or another process runs with a different one). An instance the
 // fleet can't judge keeps its last verdict under the same requirements,
-// and matches under new ones: a failed lookup never retires VMs.
+// and matches under new ones: a failed lookup never retires VMs. ctx
+// bounds it (refresh's budget).
 func (p *Pool) matchConfig(ctx context.Context, st *poolState, relisted bool) {
 	m, ok := p.Fleet.(provider.Matcher)
 	if !ok {
@@ -346,9 +363,7 @@ func (p *Pool) matchConfig(ctx context.Context, st *poolState, relisted bool) {
 	if !relisted && key == st.MatchKey {
 		return
 	}
-	mctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	judged := m.Mismatches(mctx, st.Instances)
+	judged := m.Mismatches(ctx, st.Instances)
 	same := key == st.MatchKey
 	st.MatchKey = key
 	for _, in := range st.Instances {
@@ -367,16 +382,40 @@ func (p *Pool) matchConfig(ctx context.Context, st *poolState, relisted bool) {
 // refresh re-lists the fleet when the cached listing is stale (or force),
 // reconciling notes and the launch ledger, and drains instances near
 // max_lifetime. Called with the lock held, so one process refreshes while
-// the others wait and reuse its result.
+// the others wait and reuse its result; refreshBudget bounds how long.
+//
+// A fleet spread over regions lists the regions that answer: their VMs
+// replace the cached ones, while a region that doesn't answer keeps the
+// VMs last seen there, and nothing is forgotten for being absent (see
+// poolState.Unlisted). A forced refresh (status, the pool manager) gets
+// that view too: it is the truth for every region that answered.
 func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	defer p.drainAging(st)
+	rctx, cancel := context.WithTimeout(ctx, refreshBudget)
+	defer cancel()
 	if !force && time.Since(st.ListedAt) < listTTL {
-		p.matchConfig(ctx, st, false)
+		p.matchConfig(rctx, st, false)
 		return nil
 	}
-	lctx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	defer cancel()
-	insts, err := p.Fleet.List(lctx)
+	insts, unlisted, err := p.list(rctx)
+	if err == nil && ctx.Err() != nil {
+		// The caller gave up: what was listed is cut short by that, not by
+		// the cloud.
+		err = ctx.Err()
+	}
+	if err == nil && len(unlisted) > 0 && st.ListedAt.IsZero() {
+		// Nothing known yet of the regions that didn't answer.
+		err = joinUnlisted(unlisted)
+	}
+	if err == nil {
+		for _, e := range unlisted {
+			var ce *provider.CredentialError
+			if errors.As(e, &ce) {
+				err = joinUnlisted(unlisted)
+				break
+			}
+		}
+	}
 	if err != nil && force {
 		// A forced refresh (status, the pool manager) wants the truth, not
 		// a cached view it might act on.
@@ -393,7 +432,7 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 			// Serve the cached view and back off, rather than letting every
 			// waiting agent retry the API (throttling) or give up.
 			st.ListedAt = time.Now().Add(-listTTL + 5*time.Second)
-			p.matchConfig(ctx, st, false)
+			p.matchConfig(rctx, st, false)
 			return nil
 		}
 		return err
@@ -407,20 +446,28 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 			seenBefore[id] = true
 		}
 	}
-	st.Instances = insts
-	p.matchConfig(ctx, st, true)
+	st.Instances = keepUnlisted(insts, st.Instances, unlisted)
+	st.Unlisted = nil
+	for rg := range unlisted {
+		st.Unlisted = append(st.Unlisted, rg)
+	}
+	sort.Strings(st.Unlisted)
+	partial := len(unlisted) > 0
+	p.matchConfig(rctx, st, true)
 	// Fresh from now: a slow type lookup in matchConfig mustn't leave the
 	// listing already stale, sending every waiting process to re-list.
 	st.ListedAt = time.Now()
 	live := map[string]bool{}
-	for _, in := range insts {
+	for _, in := range st.Instances {
 		live[in.ID] = true
 	}
-	for id, n := range st.Notes {
-		// A bootstrap failure is remembered for an hour after its VM is
-		// gone: it says the runner's setup is broken, not just that VM.
-		if !live[id] && !(n.BootFailed && time.Since(n.BootFailedAt) < time.Hour) {
-			delete(st.Notes, id)
+	if !partial {
+		for id, n := range st.Notes {
+			// A bootstrap failure is remembered for an hour after its VM is
+			// gone: it says the runner's setup is broken, not just that VM.
+			if !live[id] && !(n.BootFailed && time.Since(n.BootFailedAt) < time.Hour) {
+				delete(st.Notes, id)
+			}
 		}
 	}
 	var keep []launchRec
@@ -428,6 +475,10 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 		age := time.Since(l.Started)
 		switch {
 		case l.Failed:
+		case partial && !live[l.InstanceID] && (l.Region == "" || unlisted[l.Region] != nil):
+			// Not seen, and it may be in a region that didn't answer: still
+			// counted until a listing can tell.
+			keep = append(keep, l)
 		case age > p.R.BootTimeout.Duration+time.Minute:
 			// Never became usable: give up counting it as pending capacity.
 		case l.InstanceID != "" && !live[l.InstanceID] && (age > listLagGrace || seenBefore[l.InstanceID]):
@@ -450,8 +501,61 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 		}
 	}
 	st.Launches = keep
-	st.sched().forgetGone(live)
+	if !partial {
+		st.sched().forgetGone(live)
+	}
 	return nil
+}
+
+// list lists the fleet within listBudget: a fleet spread over regions
+// lists those that answer, and says which didn't.
+func (p *Pool) list(ctx context.Context) ([]provider.Instance, map[string]error, error) {
+	ctx, cancel := context.WithTimeout(ctx, listBudget)
+	defer cancel()
+	if rl, ok := p.Fleet.(provider.RegionLister); ok {
+		return rl.ListReachable(ctx)
+	}
+	insts, err := p.Fleet.List(ctx)
+	return insts, nil, err
+}
+
+// keepUnlisted is a listing with, for each region it couldn't list, the
+// instances last seen there (and those of no known region), since their
+// absence proves nothing.
+func keepUnlisted(listed, cached []provider.Instance, unlisted map[string]error) []provider.Instance {
+	if len(unlisted) == 0 {
+		return listed
+	}
+	out := append([]provider.Instance(nil), listed...)
+	seen := map[string]bool{}
+	for _, in := range listed {
+		seen[in.ID] = true
+	}
+	for _, in := range cached {
+		if seen[in.ID] {
+			continue
+		}
+		if _, gone := unlisted[in.Region]; gone || in.Region == "" {
+			seen[in.ID] = true
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
+// joinUnlisted is one error for the regions a listing couldn't list,
+// keeping a credential failure findable with errors.As.
+func joinUnlisted(unlisted map[string]error) error {
+	regions := make([]string, 0, len(unlisted))
+	for rg := range unlisted {
+		regions = append(regions, rg)
+	}
+	sort.Strings(regions)
+	errs := make([]error, 0, len(regions))
+	for _, rg := range regions {
+		errs = append(errs, fmt.Errorf("%s: %w", rg, unlisted[rg]))
+	}
+	return errors.Join(errs...)
 }
 
 func pidAlive(pid int) bool {
@@ -970,6 +1074,7 @@ func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger
 		for i := range st.Launches {
 			if st.Launches[i].ID == id {
 				st.Launches[i].InstanceID = in.ID
+				st.Launches[i].Region = in.Region
 			}
 		}
 		// There was room after all.
@@ -1226,7 +1331,7 @@ func (p *Pool) Snapshot(ctx context.Context, force bool) (poolView, error) {
 		if err := p.refresh(ctx, st, force); err != nil {
 			return err
 		}
-		v.Instances = st.Instances
+		v.Instances, v.Unlisted = st.Instances, st.Unlisted
 		v.Draining, v.BootFailed, v.Mismatch = map[string]bool{}, map[string]bool{}, map[string]string{}
 		for id, n := range st.Notes {
 			if n.Draining {
@@ -1265,6 +1370,10 @@ type poolView struct {
 	Launching     int
 	Demand        int
 	LastLaunchErr string
+	// Unlisted: regions the listing couldn't list (poolState.Unlisted).
+	// Their VMs are the ones last seen there, so absence from this view
+	// doesn't mean a VM there is gone.
+	Unlisted []string
 }
 
 // staleListing forces the next refresh to re-list while keeping the cached
