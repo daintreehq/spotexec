@@ -267,10 +267,12 @@ func (s *snapshot) position(name string) (QueueState, bool) {
 }
 
 // cached answers a lookup asked at `asked` from the published snapshot,
-// when that is as good as a scan of our own: a scan that began after we
-// asked, or a recent one of a queue that hasn't changed since (no ticket
-// joined or left, none of the stopped ones resumed). looked is the last
-// snapshot this lookup read: one found wanting isn't decoded again.
+// when that is as good as a scan of our own: a recent scan that began
+// after we asked, or a recent one of a queue that hasn't changed since
+// (no ticket joined or left, none of the stopped ones resumed). A scan
+// that began after we asked stays "recent" for as long as we would have
+// waited for the lock. looked is the last snapshot this lookup decoded:
+// one found wanting isn't decoded again.
 func (q *Queue) cached(name string, asked time.Time, looked *os.FileInfo) (QueueState, bool) {
 	path := filepath.Join(q.dir, snapshotName)
 	same := func(fi os.FileInfo) bool {
@@ -289,7 +291,6 @@ func (q *Queue) cached(name string, asked time.Time, looked *os.FileInfo) (Queue
 	if err != nil {
 		return QueueState{}, false
 	}
-	*looked = fi
 	b, err := io.ReadAll(f)
 	if err != nil {
 		return QueueState{}, false
@@ -298,6 +299,7 @@ func (q *Queue) cached(name string, asked time.Time, looked *os.FileInfo) (Queue
 	if json.Unmarshal(b, &s) != nil {
 		return QueueState{}, false
 	}
+	*looked = fi
 	start, done, now := time.Unix(0, s.Start), time.Unix(0, s.Done), time.Now()
 	if start.After(done) || done.After(now) {
 		return QueueState{}, false // the clock went back: can't tell its age
@@ -306,12 +308,16 @@ func (q *Queue) cached(name string, asked time.Time, looked *os.FileInfo) (Queue
 	if !ok {
 		return QueueState{}, false // not seen yet (or no longer live): scan
 	}
+	age, limit := now.Sub(done), snapshotTTL
 	if !start.Before(asked) {
-		// As good as our own scan. One that waited longer than we would
-		// have for the lock is not (this process was stopped meanwhile).
-		return st, now.Sub(done) <= queueLockWait
+		if age <= snapshotTTL {
+			return st, true // as good as our own scan
+		}
+		// Read late (a busy machine): still ours while the queue is
+		// unchanged, for as long as we would have waited for the lock.
+		limit = queueLockWait
 	}
-	if now.Sub(done) > snapshotTTL || !s.unchanged(q.dir) {
+	if age > limit || !s.unchanged(q.dir) {
 		return QueueState{}, false
 	}
 	return st, true

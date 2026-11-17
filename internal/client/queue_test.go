@@ -332,50 +332,54 @@ func TestQueueWaiterUsesPublishedSnapshot(t *testing.T) {
 	}
 }
 
-// A scan that began after the lookup asked answers it even though the
-// queue has changed since; an older one only while the queue is unchanged.
+// Which published snapshots answer a lookup: a recent scan that began
+// after it asked whatever has changed since; otherwise only a recent one of
+// an unchanged queue, recent counting from when the scan finished.
 func TestQueueCachedRules(t *testing.T) {
-	shorten(t, &snapshotTTL, time.Hour)
+	shorten(t, &snapshotTTL, time.Second)
+	shorten(t, &queueLockWait, 10*time.Second)
 	q := testQueue(t)
 	a := join(t, q, 0, false)
+	z := join(t, q, 9, false)
 	name := filepath.Base(a.path)
-	snap, ok := q.scan()
-	if !ok {
-		t.Fatal("scan inconclusive")
+	whole := []snapEntry{{Name: filepath.Base(z.path)}, {Name: name}} // the queue as it is
+	partial := []snapEntry{{Name: name}}                              // z joined after it
+	now := time.Now()
+	ago := func(d time.Duration) time.Time { return now.Add(-d) }
+	cases := []struct {
+		what        string
+		live        []snapEntry
+		start, done time.Time
+		asked       time.Time
+		ok          bool
+	}{
+		{"post-ask, recent, changed since", partial, ago(time.Minute), ago(100 * time.Millisecond), ago(2 * time.Minute), true},
+		{"post-ask, read late, changed since", partial, ago(time.Minute), ago(3 * time.Second), ago(2 * time.Minute), false},
+		{"post-ask, read late, unchanged", whole, ago(time.Minute), ago(3 * time.Second), ago(2 * time.Minute), true},
+		{"post-ask, older than the lock wait", whole, ago(time.Minute), ago(11 * time.Second), ago(2 * time.Minute), false},
+		{"pre-ask, changed since", partial, ago(time.Minute), ago(100 * time.Millisecond), ago(30 * time.Second), false},
+		{"pre-ask, slow scan just finished, unchanged", whole, ago(time.Minute), ago(100 * time.Millisecond), ago(30 * time.Second), true},
+		{"pre-ask, expired, unchanged", whole, ago(3 * time.Second), ago(2 * time.Second), ago(time.Second), false},
 	}
-	q.publish(snap)
-	join(t, q, 9, false) // the queue changes after the scan
-	before := time.Unix(0, snap.Start).Add(-time.Millisecond)
-	after := time.Unix(0, snap.Start).Add(time.Millisecond)
-	if _, ok := q.cached(name, after, new(os.FileInfo)); ok {
-		t.Fatal("a changed queue answered from a scan older than the lookup")
+	for _, c := range cases {
+		q.publish(snapshot{Start: c.start.UnixNano(), Done: c.done.UnixNano(), Live: c.live})
+		if _, ok := q.cached(name, c.asked, new(os.FileInfo)); ok != c.ok {
+			t.Errorf("%s: answered %v, want %v", c.what, ok, c.ok)
+		}
 	}
-	if st, ok := q.cached(name, before, new(os.FileInfo)); !ok || st.Position != 0 {
-		t.Fatalf("a scan begun after the lookup: %+v %v", st, ok)
-	}
-	// A scan slower than the TTL is still fresh when it lands: its age
-	// counts from when it finished.
-	shorten(t, &snapshotTTL, time.Second)
-	slow := snap
-	slow.Start = time.Now().Add(-time.Minute).UnixNano()
-	slow.Done = time.Now().UnixNano()
-	q.publish(slow)
-	if _, ok := q.cached(name, time.Unix(0, slow.Start).Add(-time.Millisecond), new(os.FileInfo)); !ok {
-		t.Fatal("a slow scan expired before its first reader")
-	}
-	// Not one older than the lookup would have waited for the lock.
-	shorten(t, &queueLockWait, 0)
-	if _, ok := q.cached(name, before, new(os.FileInfo)); ok {
-		t.Fatal("a scan older than the lock wait answered")
-	}
-	// A lookup doesn't decode the same snapshot twice.
-	shorten(t, &queueLockWait, time.Hour)
+	// A lookup doesn't decode a snapshot it found wanting again, even once
+	// it would do (it waits for the next one instead).
+	q.publish(snapshot{Start: ago(time.Minute).UnixNano(), Done: now.UnixNano(), Live: whole[1:]})
 	looked := new(os.FileInfo)
-	if _, ok := q.cached(name, after, looked); ok {
-		t.Fatal("a changed queue answered from a scan older than the lookup")
+	if _, ok := q.cached(name, ago(30*time.Second), looked); ok {
+		t.Fatal("a changed queue answered")
 	}
-	if _, ok := q.cached(name, before, looked); ok {
-		t.Fatal("a snapshot already found wanting was read again")
+	z.Leave()
+	if _, ok := q.cached(name, ago(30*time.Second), looked); ok {
+		t.Fatal("a snapshot already found wanting was decoded again")
+	}
+	if _, ok := q.cached(name, ago(30*time.Second), new(os.FileInfo)); !ok {
+		t.Fatal("the snapshot of a queue now unchanged didn't answer a new lookup")
 	}
 }
 
