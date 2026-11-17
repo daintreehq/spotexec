@@ -192,8 +192,17 @@ func TestGlobalRemovedRegionSettlesFromListingStart(t *testing.T) {
 	launchedAgo(t, g, c, "r-two-1", launchSettle-time.Minute)
 	g.r.Regions = []string{"r-one-1"}
 	start := c.now()
-	f.onOwned = func(string) { c.set(start.Add(2 * time.Minute)) }
+	slowed := false
+	f.onList = func(region string) {
+		if region == "r-two-1" {
+			c.set(start.Add(2 * time.Minute))
+			slowed = true
+		}
+	}
 	listOK(t, g)
+	if !slowed {
+		t.Fatal("the removed region was never listed")
+	}
 	if got := active(t, g); got != "r-two-1" {
 		t.Fatalf("dropped on a listing begun inside the settle window: %q", got)
 	}
@@ -359,9 +368,13 @@ func TestGlobalLaunchRecordsActivityAfterSending(t *testing.T) {
 		t.Fatal(err)
 	}
 	later := c.now().Add(launchSettle * 2)
-	f.onRun = func(string) { c.set(later) }
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
+	// The request is sent, then its answer is lost.
+	f.onRun = func(string) {
+		c.set(later)
+		cancel()
+	}
 	if _, err := g.Launch(ctx, t.Logf); !errors.Is(err, ErrLaunchAmbiguous) {
 		t.Fatalf("err = %v, want ErrLaunchAmbiguous", err)
 	}
@@ -380,12 +393,29 @@ func TestGlobalBakeLaunchRecordsActivity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Meanwhile a listing found the region empty and dropped it.
+	if err := g.withState(func(st *placementState) {
+		delete(st.Active, "r-two-1")
+		delete(st.Busy, "r-two-1")
+	}); err != nil {
+		t.Fatal(err)
+	}
 	later := c.now().Add(launchSettle * 2)
 	c.set(later)
+	sent := false
+	f.onRun = func(region string) {
+		sent = true
+		if got := active(t, g); got != "r-two-1" {
+			t.Errorf("builder sent with its region unlisted: %q", got)
+		}
+		if got := busyAt(t, g, region); !got.Equal(later) {
+			t.Errorf("activity when sent = %v, want %v", got, later)
+		}
+	}
 	if _, err := a.BakeLaunch(context.Background(), t.Logf, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := busyAt(t, g, "r-two-1"); !got.Equal(later) {
-		t.Fatalf("activity = %v, want %v (the builder's launch)", got, later)
+	if !sent {
+		t.Fatal("no builder sent")
 	}
 }

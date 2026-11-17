@@ -58,6 +58,7 @@ type fakeRegionsEC2 struct {
 	cacheErr    map[string]int               // region -> HTTP status the cache bucket answers
 	onOwned     func(region string)          // called (unlocked) on each by-owner (leftovers) listing
 	onRun       func(region string)          // called (unlocked) on each RunInstances
+	onList      func(region string)          // called (unlocked) on each fleet (tag-filtered) listing
 	calls       []string                     // "region Action [detail]"
 	next        int
 }
@@ -422,6 +423,11 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 				}
 			} else {
 				f.log(region, act)
+				if hook := f.onList; hook != nil {
+					f.mu.Unlock()
+					hook(region)
+					f.mu.Lock()
+				}
 			}
 			if code := f.listErr[region]; code != "" {
 				ec2Err(w, 403, code)
