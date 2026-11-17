@@ -361,3 +361,73 @@ func TestOOMMessage(t *testing.T) {
 		t.Errorf("outside the pool: %q", m)
 	}
 }
+
+// #266: a VM whose state EC2 couldn't report (the listing failed, or ran
+// out of time) isn't taken for a gone one once the command was dispatched:
+// the run isn't replayed, and the warning says EC2 couldn't tell, without
+// claiming it still runs the VM. Lost before dispatch, or with a Spot
+// notice, it is still replayed.
+func TestFailedLookupWithholdsReplay(t *testing.T) {
+	stubRegionSilent(t, nil)
+	old := instanceLookupTime
+	t.Cleanup(func() { instanceLookupTime = old })
+	instanceLookupTime = 50 * time.Millisecond
+	retry := Options{RetryPreempt: true, Sync: "auto"}
+	for _, c := range []struct {
+		name string
+		set  func(*fakeFleet)
+	}{
+		{"list error", func(f *fakeFleet) { f.listErr = errors.New("RequestLimitExceeded") }},
+		{"list deadline", func(f *fakeFleet) { f.slowList = true }},
+	} {
+		r, f := testFleet()
+		c.set(f)
+		lease := &Lease{Runner: r, Provider: f, InstanceID: "i-run"}
+		for _, at := range []stage{running, starting} {
+			got := whyNoReplay(lease, false, at, false)
+			if got.code != "RUNNER_UNRESPONSIVE" || got.region != nil {
+				t.Errorf("%s at %+v: %q (%q), want RUNNER_UNRESPONSIVE", c.name, at, got.code, got.why)
+			}
+			if !strings.HasPrefix(got.why, at.where()+", and EC2 couldn't report whether it is still running") || strings.Contains(got.why, "still reports it running") || !strings.Contains(got.why, "outcome is unknown") {
+				t.Errorf("%s at %+v: %q", c.name, at, got.why)
+			}
+			ok, code, why := replayable("i-run", Result{noReplay: got, lostAt: at}, retry, false, 1)
+			if ok || code != "RUNNER_UNRESPONSIVE" || !strings.Contains(why, "not replaying") {
+				t.Errorf("%s at %+v replayed: %v %q %q", c.name, at, ok, code, why)
+			}
+		}
+		for _, cc := range []struct {
+			noticed bool
+			at      stage
+		}{{true, running}, {false, depsCheck}, {false, stage{phase: phaseSync}}} {
+			got := whyNoReplay(lease, cc.noticed, cc.at, false)
+			if got.code != "" || got.region != nil {
+				t.Errorf("%s noticed=%v at %+v: %q (%q), want a replay", c.name, cc.noticed, cc.at, got.code, got.why)
+			}
+		}
+	}
+}
+
+// #266: what a lookup says about the lost VM: running, gone (listed in
+// another state, or not listed at all), or unknown when the listing failed
+// or ran out of time.
+func TestInstanceState(t *testing.T) {
+	old := instanceLookupTime
+	t.Cleanup(func() { instanceLookupTime = old })
+	instanceLookupTime = 50 * time.Millisecond
+	r, f := testFleet()
+	for id, want := range map[string]vmState{"i-run": vmRunning, "i-pend": vmGone, "i-gone": vmGone} {
+		if got := instanceState(&Lease{Runner: r, Provider: f, InstanceID: id}); got != want {
+			t.Errorf("%s: %v, want %v", id, got, want)
+		}
+	}
+	f.listErr = errors.New("throttled")
+	if got := instanceState(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}); got != vmUnknown {
+		t.Errorf("list error: %v", got)
+	}
+	f.listErr, f.slowList = nil, true
+	start := time.Now()
+	if got := instanceState(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}); got != vmUnknown || time.Since(start) > 2*time.Second {
+		t.Errorf("list deadline: %v after %s", got, time.Since(start))
+	}
+}

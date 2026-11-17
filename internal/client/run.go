@@ -502,8 +502,21 @@ func whyNoReplayCtx(ctx context.Context, lease *Lease, noticed bool, at stage, e
 	if p := lease.Sess.MemoryPressure(PressureWindow); p != "" {
 		return noReplay{code: "MEMORY_PRESSURE", why: at.where() + ": it was out of memory (" + p + "); it would likely run out on another VM too. Give the run more memory (--exclusive, fewer max_slots, a larger instance type) or make it use less"}
 	}
-	if !at.dispatched || !instanceRunning(lease) {
+	if !at.dispatched {
 		return noReplay{}
+	}
+	vm := instanceState(lease)
+	if vm == vmGone {
+		return noReplay{}
+	}
+	if vm == vmUnknown {
+		// The VM may still be running the command: EC2 not answering
+		// says nothing about whether it was reclaimed (#266).
+		why := at.where() + ", and EC2 couldn't report whether it is still running (the lookup failed or timed out), so the VM may still be running it and the attempt's outcome is unknown"
+		if m := lastMemory(lease.Sess); m != "" {
+			why += " (" + m + ")"
+		}
+		return noReplay{code: "RUNNER_UNRESPONSIVE", why: why + ". Rerun it"}
 	}
 	if rl := regionSilentFn(ctx, lease); rl != nil {
 		holdSilent(ctx, lease, rl)
@@ -2063,31 +2076,68 @@ func waitIfRunning(lease *Lease, rep ui.Reporter) func(time.Duration) time.Durat
 	}
 }
 
-// instanceRunning asks the cloud (the instance's own region, for a
-// multi-region fleet) whether a lease's VM is running, within 10s; false
-// when it can't tell.
-func instanceRunning(lease *Lease) bool {
-	if lease.InstanceID == "" || lease.Provider == nil {
-		return false
+// vmState is what the cloud says about a lease's VM.
+type vmState int
+
+const (
+	// vmGone: the cloud listed the fleet and the VM isn't running in it
+	// (listed in another state, or not at all), or the lease has no VM
+	// the cloud could be asked about.
+	vmGone vmState = iota
+	// vmRunning: the cloud lists the VM as running.
+	vmRunning
+	// vmUnknown: the cloud couldn't be asked (the listing failed or ran
+	// out of time), so the VM may well still be running (#266).
+	vmUnknown
+)
+
+func (s vmState) String() string {
+	switch s {
+	case vmRunning:
+		return "running"
+	case vmUnknown:
+		return "unknown"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	return "gone"
+}
+
+// instanceLookupTime bounds instanceState's listing (tests shorten it).
+var instanceLookupTime = 10 * time.Second
+
+// instanceState asks the cloud (the instance's own region, for a
+// multi-region fleet) whether a lease's VM is running, within
+// instanceLookupTime: vmUnknown when it can't tell.
+func instanceState(lease *Lease) vmState {
+	if lease.InstanceID == "" || lease.Provider == nil {
+		return vmGone
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), instanceLookupTime)
 	defer cancel()
 	f, ok := provider.ForInstance(ctx, lease.Provider, lease.InstanceID).(provider.Fleet)
 	if !ok {
 		if f, ok = lease.Provider.(provider.Fleet); !ok {
-			return false
+			return vmGone
 		}
 	}
 	list, err := f.List(ctx)
 	if err != nil {
-		return false
+		return vmUnknown
 	}
 	for _, in := range list {
 		if in.ID == lease.InstanceID {
-			return in.State == provider.StateRunning
+			if in.State == provider.StateRunning {
+				return vmRunning
+			}
+			return vmGone
 		}
 	}
-	return false
+	return vmGone
+}
+
+// instanceRunning reports whether the cloud lists a lease's VM as running;
+// false when it can't tell.
+func instanceRunning(lease *Lease) bool {
+	return instanceState(lease) == vmRunning
 }
 
 // oomMessage explains an OOM_KILLED result; limitMB is the memory pool's
