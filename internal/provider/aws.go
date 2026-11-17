@@ -1317,8 +1317,10 @@ var terminateRefill = 50 * time.Millisecond
 
 // terminate ends the given instances in batches EC2 accepts. It sends every
 // batch even after one is refused, and returns the IDs of the batches EC2
-// accepted, with an error naming those it refused. A refused batch's
-// instances are left as they were, so running it again is safe.
+// accepted, with an error naming those it refused or never sent. A refused
+// batch's outcome isn't known (EC2 can end part of it, and a lost response
+// hides an accepted one), but listing and terminating again is safe:
+// instances already shutting down drop out of the listing.
 func (a *AWSSpot) terminate(ctx context.Context, ids []string) ([]string, error) {
 	var done []string
 	var errs []error
@@ -1338,6 +1340,7 @@ func (a *AWSSpot) terminate(ctx context.Context, ids []string) ([]string, error)
 			// once more.
 			select {
 			case <-ctx.Done():
+				err = errors.Join(err, ctx.Err())
 			case <-time.After(time.Duration(len(batch)) * terminateRefill):
 				err = a.terminateBatch(ctx, batch)
 			}
@@ -1350,7 +1353,7 @@ func (a *AWSSpot) terminate(ctx context.Context, ids []string) ([]string, error)
 		done = append(done, batch...)
 	}
 	if len(errs) > 0 {
-		return done, fmt.Errorf("terminate: %d of %d instances not terminated: %w", failed, len(ids), errors.Join(errs...))
+		return done, fmt.Errorf("terminate: %d of %d instances not confirmed: %w", failed, len(ids), errors.Join(errs...))
 	}
 	return done, nil
 }
