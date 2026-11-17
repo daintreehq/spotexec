@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -268,6 +269,17 @@ func TestRegionLossVerdict(t *testing.T) {
 		}
 	}
 
+	// #266: a VM whose state EC2 couldn't report, lost with its region:
+	// the regional verdicts hold, without claiming EC2 still runs it.
+	f.listErr = errors.New("throttled")
+	if got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run"}, false, running, false); got.code != "REGION_UNREACHABLE" || got.region != rl || !strings.HasPrefix(got.why, "while running the command, and EC2 couldn't confirm whether it is still running (the lookup failed or timed out): ap-south-1 looks unreachable") {
+		t.Fatalf("failed lookup, no memory reading: %q (%q)", got.code, got.why)
+	}
+	if got := whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run", Sess: s}, false, running, false); got.code != "" || got.region != rl {
+		t.Fatalf("failed lookup with memory: %q (%q), want a regional replay", got.code, got.why)
+	}
+	f.listErr = nil
+
 	// Verdicts reached before the region is looked at.
 	*calls = 0
 	for _, c := range []struct {
@@ -287,6 +299,16 @@ func TestRegionLossVerdict(t *testing.T) {
 	}
 	if *calls != 0 {
 		t.Fatalf("probed the region %d times for verdicts that don't need it", *calls)
+	}
+
+	// #266: a failed lookup with no regional loss: not replayed, and the
+	// warning carries the last memory reading and says to check for side
+	// effects, without blaming the run.
+	stubRegionSilent(t, nil)
+	f.listErr = errors.New("throttled")
+	got = whyNoReplay(&Lease{Runner: r, Provider: f, InstanceID: "i-run", Sess: s}, false, running, false)
+	if got.code != "RUNNER_UNRESPONSIVE" || got.region != nil || !strings.Contains(got.why, "couldn't confirm whether it is still running") || !strings.Contains(got.why, "memory available") || !strings.Contains(got.why, "side effects") || strings.Contains(got.why, "overloaded") {
+		t.Fatalf("failed lookup, no regional loss: %q (%q)", got.code, got.why)
 	}
 }
 

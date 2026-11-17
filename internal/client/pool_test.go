@@ -28,6 +28,11 @@ type fakeFleet struct {
 	// placement: what Launch says about where it launched (WaitRunning,
 	// like a cloud listing, doesn't know).
 	placement *provider.Placement
+	// listErr: List fails with it; slowList: List blocks until its
+	// context ends, which must carry a deadline.
+	listErr  error
+	slowList bool
+	lists    int // List calls
 }
 
 func (f *fakeFleet) Runner() *config.Runner                        { return f.r }
@@ -39,7 +44,21 @@ func (f *fakeFleet) Down(context.Context, provider.Logger) error { return nil }
 func (f *fakeFleet) Doctor(context.Context) []provider.Check     { return nil }
 func (f *fakeFleet) Forget()                                     {}
 
-func (f *fakeFleet) List(context.Context) ([]provider.Instance, error) {
+func (f *fakeFleet) List(ctx context.Context) ([]provider.Instance, error) {
+	f.mu.Lock()
+	f.lists++
+	slow, err := f.slowList, f.listErr
+	f.mu.Unlock()
+	if slow {
+		if _, ok := ctx.Deadline(); !ok {
+			panic("fakeFleet: a slow List with no deadline would never return")
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]provider.Instance(nil), f.insts...), nil
