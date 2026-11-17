@@ -48,6 +48,9 @@ type AWSSpot struct {
 	// placed: one region of a multi-region runner, which uses default VPCs
 	// only (messages mustn't suggest subnet_id).
 	placed bool
+	// launching: for a region of a multi-region runner, records in the
+	// runner's placement state that a launch is being sent here (nil: none).
+	launching func() error
 }
 
 // NewAWSSpot constructs the provider.
@@ -476,7 +479,8 @@ type launchSpec struct {
 	// ones, or for vcpus every eligible type).
 	types []string
 	// beforeSend runs once preparation succeeded, just before the first
-	// RunInstances; an error stops the launch with nothing sent.
+	// RunInstances; an error stops the launch with nothing sent. It runs
+	// again once the launch has stopped sending, whatever came of it.
 	beforeSend func() error
 }
 
@@ -644,6 +648,9 @@ func (a *AWSSpot) launchWith(ctx context.Context, log Logger, spec launchSpec) (
 		if err := spec.beforeSend(); err != nil {
 			return ec2Instance{}, err
 		}
+		// A long run of attempts, or a lost response, still leaves a
+		// recent record of the launch.
+		defer func() { _ = spec.beforeSend() }()
 	}
 	try := a.admitting(usage, func(itype string, spot bool) (ec2Instance, error) {
 		return a.runOne(ctx, base, itype, spot, log)

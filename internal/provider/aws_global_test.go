@@ -57,6 +57,7 @@ type fakeRegionsEC2 struct {
 	cached      map[string]map[string]bool   // region -> dependency cache object keys held
 	cacheErr    map[string]int               // region -> HTTP status the cache bucket answers
 	onOwned     func(region string)          // called (unlocked) on each by-owner (leftovers) listing
+	onRun       func(region string)          // called (unlocked) on each RunInstances
 	calls       []string                     // "region Action [detail]"
 	next        int
 }
@@ -343,6 +344,11 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			f.log(region, "market "+market)
 			if bid := p.Get("InstanceMarketOptions.SpotOptions.MaxPrice"); bid != "" {
 				f.log(region, "bid "+bid)
+			}
+			if hook := f.onRun; hook != nil {
+				f.mu.Unlock()
+				hook(region)
+				f.mu.Lock()
 			}
 			if f.hang {
 				f.mu.Unlock()
