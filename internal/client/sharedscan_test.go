@@ -9,8 +9,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/fsid"
 	"github.com/daintreehq/spotexec/internal/manifest"
 	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
@@ -18,14 +20,15 @@ import (
 )
 
 // countScans counts buildManifest's scans for the test; gate, when set,
-// holds each scan until it is closed.
-func countScans(t *testing.T, gate chan struct{}) *atomic.Int32 {
+// holds each scan until it is closed, after a send on started.
+func countScans(t *testing.T, gate, started chan struct{}) *atomic.Int32 {
 	t.Helper()
 	var n atomic.Int32
 	old := buildManifest
 	buildManifest = func(ctx context.Context, o manifest.Options) (*manifest.Manifest, error) {
 		n.Add(1)
 		if gate != nil {
+			started <- struct{}{}
 			select {
 			case <-gate:
 			case <-ctx.Done():
@@ -58,15 +61,21 @@ func scanRoot(t *testing.T) *Workspace {
 // that stops waiting (fail_fast, Ctrl-C on its own) doesn't end it for the
 // others.
 func TestSharedScanIsTakenOnceForEveryPart(t *testing.T) {
-	gate := make(chan struct{})
-	scans := countScans(t, gate)
+	gate, started := make(chan struct{}), make(chan struct{}, 1)
+	scans := countScans(t, gate, started)
 	ws := scanRoot(t)
 	scan := NewSharedScan(context.Background(), ws, &config.Project{})
 	defer scan.Close()
 
+	// The first part starts the scan, then stops waiting for it.
 	first, stop := context.WithCancel(context.Background())
 	firstErr := make(chan error, 1)
 	go func() { _, err := scan.get(first); firstErr <- err }()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first part never started the scan")
+	}
 	var wg sync.WaitGroup
 	got := make([]*manifest.Manifest, 3)
 	errs := make([]error, 3)
@@ -75,8 +84,14 @@ func TestSharedScanIsTakenOnceForEveryPart(t *testing.T) {
 		go func() { defer wg.Done(); got[i], errs[i] = scan.get(context.Background()) }()
 	}
 	stop()
-	if err := <-firstErr; !errors.Is(err, context.Canceled) {
-		t.Fatalf("the part that stopped waiting: %v", err)
+	select {
+	case err := <-firstErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the part that stopped waiting: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		close(gate)
+		t.Fatal("the part that stopped waiting is still waiting")
 	}
 	close(gate)
 	wg.Wait()
@@ -101,7 +116,7 @@ func TestSharedScanIsTakenOnceForEveryPart(t *testing.T) {
 
 // A failed scan fails every part that syncs, each with the scan's error.
 func TestSharedScanErrorReachesEveryPart(t *testing.T) {
-	scans := countScans(t, nil)
+	scans := countScans(t, nil, nil)
 	ws := scanRoot(t)
 	scan := NewSharedScan(context.Background(), ws, &config.Project{Sync: config.Sync{Source: "git"}})
 	defer scan.Close()
@@ -146,7 +161,7 @@ func TestSharedScanUploadCorrectionStaysWithItsPart(t *testing.T) {
 	if _, err := syncIn(context.Background(), s, sent, nil, nil, Options{Rep: quietRep(t)}); err != nil {
 		t.Fatal(err)
 	}
-	if e := sent.ByPath["a.txt"]; e.ID == scanned.ID || e.Size != 2 {
+	if e := sent.ByPath["a.txt"]; e.ID != fsid.Bytes([]byte("BB")) || e.Size != 2 || scanned.ID != fsid.Bytes([]byte("A")) {
 		t.Fatalf("the uploading part's baseline: %+v (scanned %+v)", e, scanned)
 	}
 	if sibling.ByPath["a.txt"] != scanned {
@@ -164,29 +179,47 @@ func TestSharedScanUploadCorrectionStaysWithItsPart(t *testing.T) {
 // move scans the worktree afresh. (A Dockerfile missing from the working set
 // stops each attempt right after its scan.)
 func TestOnlyAFirstAttemptUsesTheSharedScan(t *testing.T) {
-	scans := countScans(t, nil)
+	scans := countScans(t, nil, nil)
 	ws := scanRoot(t)
 	p := &config.Project{Container: config.Container{Dockerfile: ".spotexec/Missing"}}
 	cfg := &config.Config{Global: &config.Global{Runners: map[string]*config.Runner{"box": {Name: "box", Type: "ssh", Host: "nobody@127.0.0.1:1"}}}, Project: p}
 	t.Setenv("SPOTEXEC_POOL", "")
 	scan := NewSharedScan(context.Background(), ws, p)
 	defer scan.Close()
-	o := Options{Sync: "auto", Writeback: "always", Rep: quietRep(t), Scan: scan}
-	try := func(att attempt) {
+	rep := &scanRep{}
+	o := Options{Sync: "auto", Writeback: "always", Rep: rep, Scan: scan}
+	// try runs one attempt and returns how many files its scan held.
+	try := func(att attempt) int {
 		t.Helper()
 		att.runID, att.exclude, att.fresh = "run", map[string]bool{}, new(bool)
 		if _, err, _ := runOnce(context.Background(), cfg, ws, o, att); err == nil || !strings.Contains(err.Error(), "not in the synced working set") {
 			t.Fatalf("%+v: %v", att, err)
 		}
+		return rep.files[len(rep.files)-1]
 	}
-	for range 3 {
-		try(attempt{n: 1})
+	add := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(ws.Root, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scanned := try(attempt{n: 1})
+	add("b.txt")
+	for range 2 {
+		if n := try(attempt{n: 1}); n != scanned {
+			t.Fatalf("a first attempt saw %d files, the shared scan %d", n, scanned)
+		}
 	}
 	if n := scans.Load(); n != 1 {
 		t.Fatalf("three first attempts: %d scans", n)
 	}
-	try(attempt{n: 2})
-	try(attempt{n: 1, moves: 1})
+	if n := try(attempt{n: 2}); n != scanned+1 {
+		t.Fatalf("a replay saw %d files, want %d", n, scanned+1)
+	}
+	add("c.txt")
+	if n := try(attempt{n: 1, moves: 1}); n != scanned+2 {
+		t.Fatalf("a move saw %d files, want %d", n, scanned+2)
+	}
 	if n := scans.Load(); n != 3 {
 		t.Fatalf("a replay and a move: %d scans in all, want 3", n)
 	}
@@ -197,5 +230,17 @@ func TestOnlyAFirstAttemptUsesTheSharedScan(t *testing.T) {
 	}
 	if n := scans.Load(); n != 3 {
 		t.Fatalf("an unsynced part scanned: %d", n)
+	}
+}
+
+// scanRep records the file count of each manifest event.
+type scanRep struct {
+	nopRep
+	files []int
+}
+
+func (r *scanRep) Event(name string, f map[string]any) {
+	if name == "manifest" {
+		r.files = append(r.files, f["files"].(int))
 	}
 }

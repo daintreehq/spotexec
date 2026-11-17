@@ -13,6 +13,9 @@ import (
 func gitProject(t *testing.T, toml string) string {
 	t.Helper()
 	dir := project(t, toml)
+	// Only the fixture's own Git settings apply.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	for i, f := range []string{"a.txt", "b.txt", "sub/c.txt"} {
 		p := filepath.Join(dir, f)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -111,7 +114,8 @@ parallel = ["x", "y", "z"]
 	t.Setenv("HOME", t.TempDir())
 	trace := filepath.Join(t.TempDir(), "trace")
 	t.Setenv("GIT_TRACE", trace)
-	run := func(args ...string) (scans, manifests, errs int) {
+	// run returns the scans, and each part's manifest events and error.
+	run := func(args ...string) (scans int, manifests map[string]int, errs map[string]string) {
 		t.Helper()
 		code, stderr := runMain(t, "sx", append([]string{"-C", dir, "--json"}, args...)...)
 		if code == 0 {
@@ -124,26 +128,33 @@ parallel = ["x", "y", "z"]
 				scans++
 			}
 		}
+		manifests, errs = map[string]int{}, map[string]string{}
 		for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
 			var ev map[string]any
 			if json.Unmarshal([]byte(line), &ev) != nil {
 				t.Fatalf("not NDJSON: %q", line)
 			}
+			task, _ := ev["task"].(string)
 			switch ev["event"] {
 			case "manifest":
-				manifests++
+				manifests[task]++
 			case "error":
-				if ev["task"] != nil && ev["task"] != "all" {
-					errs++
+				if task != "all" {
+					errs[task], _ = ev["message"].(string)
 				}
 			}
 		}
 		return
 	}
-	if s, m, e := run("all"); s != 1 || m != 2 || e != 3 {
-		t.Errorf("x, y and an unsynced z: %d scans, %d manifests, %d part errors; want 1, 2, 3", s, m, e)
+	synced := "not in the synced working set"
+	s, m, e := run("all")
+	if s != 1 || len(m) != 2 || m["x"] != 1 || m["y"] != 1 {
+		t.Errorf("x, y and an unsynced z: %d scans, manifests %v; want 1 scan, one manifest each for x and y", s, m)
 	}
-	if s, m, e := run("--sync", "none", "all"); s != 0 || m != 0 || e != 3 {
-		t.Errorf("--sync none: %d scans, %d manifests, %d part errors; want 0, 0, 3", s, m, e)
+	if len(e) != 3 || !strings.Contains(e["x"], synced) || !strings.Contains(e["y"], synced) || e["z"] == "" || strings.Contains(e["z"], synced) {
+		t.Errorf("part errors: %v", e)
+	}
+	if s, m, e := run("--sync", "none", "all"); s != 0 || len(m) != 0 || len(e) != 3 {
+		t.Errorf("--sync none: %d scans, manifests %v, errors %v; want none, none, 3", s, m, e)
 	}
 }

@@ -264,7 +264,12 @@ func rpc() int {
 	// rpc-sync: answers each manifest by asking for the paths listed in the
 	// file (one per line), reads the upload, and reports it synced.
 	if b, err := os.ReadFile(filepath.Join(st, "rpc-sync")); err == nil {
-		need := strings.Fields(string(b))
+		var need []string
+		for _, l := range strings.Split(string(b), "\n") {
+			if l != "" {
+				need = append(need, l)
+			}
+		}
 		for {
 			f, err := conn.ReadFrame()
 			if err != nil {
