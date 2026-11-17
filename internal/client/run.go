@@ -96,6 +96,10 @@ type Options struct {
 	// Env is set for the command over the project's env (a shard's
 	// SPOTEXEC_SHARD and SPOTEXEC_SHARDS).
 	Env map[string]string
+	// Scan, for a part of a fan-out, is the worktree scan its parts share:
+	// a synced run's first attempt starts from a copy of it instead of
+	// scanning the worktree itself.
+	Scan *SharedScan
 }
 
 // Result of a run.
@@ -786,7 +790,14 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if o.Sync != "none" {
 		o.Rep.Status("scanning %s", ws.Root)
 		t := time.Now()
-		m, err = manifest.Build(ctx, ManifestOptions(ws.Root, p))
+		if o.Scan != nil && att.n == 1 && att.moves == 0 {
+			// A fan-out's part starts from the scan its siblings share.
+			m, err = o.Scan.get(ctx)
+		} else {
+			// A replay or a move scans afresh: the worktree may have
+			// changed since, and the slot it lands on must get that.
+			m, err = buildManifest(ctx, ManifestOptions(ws.Root, p))
+		}
 		res.spend(PhaseScan, time.Since(t))
 		if err != nil {
 			return res, infra(fmt.Errorf("enumerating files: %w", err)), ""

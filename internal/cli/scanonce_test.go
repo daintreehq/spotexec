@@ -90,3 +90,60 @@ run = "true"
 		t.Errorf("%d shards reported the missing lockfile, want 4: %q", failed, stderr)
 	}
 }
+
+// Parts that sync share the scan; one that doesn't sync never scans, and
+// with --sync none nothing does. (A Dockerfile missing here stops every
+// part before any runner is contacted.)
+func TestParallelTaskScansOnlyForItsSyncedParts(t *testing.T) {
+	dir := gitProject(t, `[container]
+dockerfile = ".spotexec/Missing"
+[tasks.x]
+run = "true"
+[tasks.y]
+run = "true"
+sync = "in"
+[tasks.z]
+run = "true"
+sync = "none"
+[tasks.all]
+parallel = ["x", "y", "z"]
+`)
+	t.Setenv("HOME", t.TempDir())
+	trace := filepath.Join(t.TempDir(), "trace")
+	t.Setenv("GIT_TRACE", trace)
+	run := func(args ...string) (scans, manifests, errs int) {
+		t.Helper()
+		code, stderr := runMain(t, "sx", append([]string{"-C", dir, "--json"}, args...)...)
+		if code == 0 {
+			t.Fatalf("%v: exit 0, stderr %q", args, stderr)
+		}
+		b, _ := os.ReadFile(trace)
+		os.Remove(trace)
+		for _, l := range strings.Split(string(b), "\n") {
+			if strings.Contains(l, "ls-files") && strings.Contains(l, " -s ") {
+				scans++
+			}
+		}
+		for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+			var ev map[string]any
+			if json.Unmarshal([]byte(line), &ev) != nil {
+				t.Fatalf("not NDJSON: %q", line)
+			}
+			switch ev["event"] {
+			case "manifest":
+				manifests++
+			case "error":
+				if ev["task"] != nil && ev["task"] != "all" {
+					errs++
+				}
+			}
+		}
+		return
+	}
+	if s, m, e := run("all"); s != 1 || m != 2 || e != 3 {
+		t.Errorf("x, y and an unsynced z: %d scans, %d manifests, %d part errors; want 1, 2, 3", s, m, e)
+	}
+	if s, m, e := run("--sync", "none", "all"); s != 0 || m != 0 || e != 3 {
+		t.Errorf("--sync none: %d scans, %d manifests, %d part errors; want 0, 0, 3", s, m, e)
+	}
+}

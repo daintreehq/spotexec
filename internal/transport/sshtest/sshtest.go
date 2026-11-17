@@ -23,6 +23,9 @@
 //   - rpc-memory: after the handshake the helper sends one heartbeat per
 //     comma-separated value in the file, each that many MiB available of
 //     16000, then goes silent;
+//   - rpc-sync: after the handshake the helper answers each manifest by
+//     asking for the paths listed in the file, reads them, and reports
+//     them synced;
 //   - hold-fds: another process keeps the session's stdin, stdout and
 //     stderr open after the fake is killed, as a ControlMaster does for a
 //     stuck channel (its pid goes in hold-fds.pid; it exits within 30s).
@@ -257,6 +260,37 @@ func rpc() int {
 			}
 		}
 		time.Sleep(time.Hour)
+	}
+	// rpc-sync: answers each manifest by asking for the paths listed in the
+	// file (one per line), reads the upload, and reports it synced.
+	if b, err := os.ReadFile(filepath.Join(st, "rpc-sync")); err == nil {
+		need := strings.Fields(string(b))
+		for {
+			f, err := conn.ReadFrame()
+			if err != nil {
+				return 0
+			}
+			if env, err := protocol.Decode(f); err != nil || env.Type != protocol.TypeManifest {
+				continue
+			}
+			if err := conn.Send(protocol.TypeNeed, protocol.Need{Paths: need}); err != nil {
+				return 1
+			}
+			if len(need) > 0 {
+				for {
+					f, err := conn.ReadFrame()
+					if err != nil {
+						return 1
+					}
+					if f.Kind == protocol.KindBlobEnd {
+						break
+					}
+				}
+			}
+			if err := conn.Send(protocol.TypeSynced, protocol.Synced{Written: len(need)}); err != nil {
+				return 1
+			}
+		}
 	}
 	if b, err := os.ReadFile(filepath.Join(st, "rpc-crawl")); err == nil {
 		per, _ := strconv.Atoi(strings.TrimSpace(string(b)))
