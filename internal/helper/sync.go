@@ -214,6 +214,7 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		need = append(need, e.Path)
 		needBytes += e.Size
 	}
+	need, needBytes, _ = s.fillFromPeers(need, want)
 	sort.Strings(need)
 	if err := s.c.Send(protocol.TypeNeed, protocol.Need{Paths: need, Bytes: needBytes}); err != nil {
 		return err
