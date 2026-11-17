@@ -68,6 +68,12 @@ takes part in scheduling, and every VM shuts itself down.
    prepares there and waits for a free slot to run its command. A VM
    whose slots all run commands (or whose admitted jobs wait to) refuses.
    Plain requests (older clients) still see a VM full at `max_slots` jobs.
+   A job that has waited 30s for a slot to run its command looks every 10s
+   for a free slot on another VM of its runner (a plain request: never
+   overflow, never a launch), such as one that finished booting since. When
+   it gets one, it withdraws from the busy VM (`withdraw`; the helper
+   honours it only while the job still waits, so nothing has run there) and
+   prepares and runs on the new VM. A run moves at most twice (`move.go`).
 4. **Queue and scale out.** If every slot is busy, the job takes a ticket in
    a fair local queue (priority, then arrival; `queue.go`) and registers as
    demand on each fleet (a waiter file under `waiters/`). Under `pool.lock`,
