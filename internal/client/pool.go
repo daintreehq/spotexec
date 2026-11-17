@@ -1014,17 +1014,26 @@ func liveCapReason(st *poolState, maxInstances int) string {
 // up), still respecting max_instances and the cap on live VMs (when set).
 // It returns the launch IDs.
 func (p *Pool) Reserve(ctx context.Context, n int) ([]string, error) {
-	ids, _, err := p.ReserveWhy(ctx, n)
-	return ids, err
+	res, err := p.ReserveWhy(ctx, n)
+	return res.IDs, err
+}
+
+// Reservation is what ReserveWhy recorded, and why it fell short.
+type Reservation struct {
+	IDs []string
+	// Reason says why fewer launches were recorded than asked for (empty
+	// when all were): at max_instances, or held by the cap on live VMs.
+	Reason string
+	// LiveCap is set when the cap on live VMs (twice max_instances,
+	// counting draining and outdated VMs and launches not yet listed) held
+	// them, rather than max_instances.
+	LiveCap bool
 }
 
 // ReserveWhy is Reserve, also saying why fewer than n launches were
-// recorded: at max_instances, or held by the cap on live VMs (twice
-// max_instances, counting draining and outdated VMs and launches not yet
-// listed). The reason is empty when all n were.
-func (p *Pool) ReserveWhy(ctx context.Context, n int) ([]string, string, error) {
-	var ids []string
-	why := ""
+// recorded.
+func (p *Pool) ReserveWhy(ctx context.Context, n int) (Reservation, error) {
+	var res Reservation
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, true); err != nil {
 			return err
@@ -1044,26 +1053,26 @@ func (p *Pool) ReserveWhy(ctx context.Context, n int) ([]string, string, error) 
 				total++
 			}
 		}
-		for len(ids) < n {
+		for len(res.IDs) < n {
 			if !p.R.BelowMax(usable) {
-				why = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
+				res.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
 				break
 			}
 			if p.R.Capped() && total >= 2*p.R.MaxInstances {
-				why = liveCapReason(st, p.R.MaxInstances)
+				res.Reason, res.LiveCap = liveCapReason(st, p.R.MaxInstances), true
 				break
 			}
 			var b [6]byte
 			_, _ = rand.Read(b[:])
 			id := hex.EncodeToString(b[:])
 			st.Launches = append(st.Launches, launchRec{ID: id, Started: time.Now(), PID: os.Getpid()})
-			ids = append(ids, id)
+			res.IDs = append(res.IDs, id)
 			usable++
 			total++
 		}
 		return nil
 	})
-	return ids, why, err
+	return res, err
 }
 
 // EnsureMin reserves launches to bring the fleet up to min usable instances

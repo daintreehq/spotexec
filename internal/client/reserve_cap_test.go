@@ -7,82 +7,12 @@ import (
 	"testing"
 )
 
-// Issue #273: manual prewarming (spotexec up) counted only usable VMs, so a
-// capped fleet whose old VMs were draining grew past twice max_instances
-// alive. Reserve honours the same live cap as Plan and EnsureMin, and says
-// what holds the launches.
-func TestReserveRespectsLiveCap(t *testing.T) {
+// launchDraining reserves, provisions and drains n VMs one at a time, so
+// each stays live but out of service.
+func launchDraining(t *testing.T, p *Pool, n int) {
+	t.Helper()
 	ctx := context.Background()
-	p, _ := testPool(t, 2)
-	drain := func(n int) {
-		t.Helper()
-		ids, _ := p.Reserve(ctx, n)
-		if len(ids) != n {
-			t.Fatalf("reserved %d of %d", len(ids), n)
-		}
-		for _, id := range ids {
-			in, err := p.Provision(ctx, id, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			p.Observe(in.ID, OutDraining, in.LaunchedAt)
-		}
-	}
-
-	// Three live, all draining: one more fits under 2*max = 4.
-	drain(2)
-	drain(1)
-	ids, why, err := p.ReserveWhy(ctx, 2)
-	if err != nil || len(ids) != 1 {
-		t.Fatalf("three live: reserved %d (%v), want 1", len(ids), err)
-	}
-	if !strings.Contains(why, "3 draining VMs") || !strings.Contains(why, "4 live VMs") {
-		t.Fatalf("reason %q doesn't name the draining VMs holding the allowance", why)
-	}
-	// That reservation is pending and unlisted: it counts, so a concurrent
-	// prewarm gets nothing.
-	if ids, why, _ := p.ReserveWhy(ctx, 2); len(ids) != 0 || !strings.Contains(why, "twice max_instances") {
-		t.Fatalf("pending launch not counted: reserved %d (%q)", len(ids), why)
-	}
-	if _, err := p.Provision(ctx, ids[0], nil); err != nil {
-		t.Fatal(err)
-	}
-	// Four live (three draining, one usable), listed and in the ledger: none.
-	if ids, why, _ := p.ReserveWhy(ctx, 2); len(ids) != 0 || !strings.Contains(why, "3 draining VMs") {
-		t.Fatalf("four live: reserved %d (%q), want 0", len(ids), why)
-	}
-	if ids, _ := p.Reserve(ctx, 2); len(ids) != 0 {
-		t.Fatalf("four live via Reserve: reserved %d, want 0", len(ids))
-	}
-	if n := listed(t, p.Fleet.(*fakeFleet)); n != 4 {
-		t.Fatalf("live VMs %d, want 4", n)
-	}
-}
-
-// Below the live cap, max_instances is what limits a prewarm, and the
-// reason says so.
-func TestReserveWhyNamesMaxInstances(t *testing.T) {
-	ctx := context.Background()
-	p, _ := testPool(t, 2)
-	ids, why, err := p.ReserveWhy(ctx, 3)
-	if err != nil || len(ids) != 2 || why != "at max_instances (2)" {
-		t.Fatalf("reserved %d, reason %q, err %v", len(ids), why, err)
-	}
-	if ids, why, _ := p.ReserveWhy(ctx, 1); len(ids) != 0 || why != "at max_instances (2)" {
-		t.Fatalf("reserved %d, reason %q", len(ids), why)
-	}
-	p, _ = testPool(t, 2)
-	if _, why, _ := p.ReserveWhy(ctx, 2); why != "" {
-		t.Fatalf("full grant gave a reason: %q", why)
-	}
-}
-
-// Two prewarms at once (separate processes sharing the ledger) at three
-// live VMs get one launch between them.
-func TestReserveLiveCapAcrossConcurrentCallers(t *testing.T) {
-	ctx := context.Background()
-	p, f := testPool(t, 2)
-	for range 3 {
+	for range n {
 		ids, _ := p.Reserve(ctx, 1)
 		if len(ids) != 1 {
 			t.Fatalf("setup reserved %d", len(ids))
@@ -93,6 +23,106 @@ func TestReserveLiveCapAcrossConcurrentCallers(t *testing.T) {
 		}
 		p.Observe(in.ID, OutDraining, in.LaunchedAt)
 	}
+}
+
+// Issue #273: manual prewarming (spotexec up) counted only usable VMs, so a
+// capped fleet whose old VMs were draining grew past twice max_instances
+// alive. Reserve honours the same live cap as Plan and EnsureMin, and says
+// what holds the launches.
+func TestReserveRespectsLiveCap(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 2)
+
+	// Three live, all draining: one more fits under 2*max = 4.
+	launchDraining(t, p, 3)
+	res, err := p.ReserveWhy(ctx, 2)
+	if err != nil || len(res.IDs) != 1 || !res.LiveCap {
+		t.Fatalf("three live: %+v (%v), want 1 held by the live cap", res, err)
+	}
+	if !strings.Contains(res.Reason, "3 draining VMs") || !strings.Contains(res.Reason, "4 live VMs") {
+		t.Fatalf("reason %q doesn't name the draining VMs holding the allowance", res.Reason)
+	}
+	// That reservation is pending and unlisted: it counts, so a second
+	// prewarm gets nothing.
+	if r2, _ := p.ReserveWhy(ctx, 2); len(r2.IDs) != 0 || !r2.LiveCap {
+		t.Fatalf("pending launch not counted: %+v", r2)
+	}
+	if _, err := p.Provision(ctx, res.IDs[0], nil); err != nil {
+		t.Fatal(err)
+	}
+	// Four live (three draining, one usable), listed and in the ledger: none.
+	if r2, _ := p.ReserveWhy(ctx, 2); len(r2.IDs) != 0 || !strings.Contains(r2.Reason, "3 draining VMs") {
+		t.Fatalf("four live: %+v, want 0", r2)
+	}
+	if ids, _ := p.Reserve(ctx, 2); len(ids) != 0 {
+		t.Fatalf("four live via Reserve: reserved %d, want 0", len(ids))
+	}
+	if n := listed(t, f); n != 4 {
+		t.Fatalf("live VMs %d, want 4", n)
+	}
+}
+
+// A listed VM still in the ledger (booted, not yet ready) counts once
+// toward the live cap: at max_instances = 3, four draining and one booting
+// VM leave room for exactly one more of the six.
+func TestReserveLiveCapCountsListedLaunchOnce(t *testing.T) {
+	ctx := context.Background()
+	p, _ := testPool(t, 3)
+	launchDraining(t, p, 4)
+	ids, _ := p.Reserve(ctx, 1)
+	if _, err := p.Provision(ctx, ids[0], nil); err != nil {
+		t.Fatal(err)
+	}
+	if st := readState(t, p); len(st.Launches) != 1 || st.Launches[0].InstanceID == "" {
+		t.Fatalf("fixture: want the booting VM in the ledger, got %+v", st.Launches)
+	}
+	res, err := p.ReserveWhy(ctx, 3)
+	if err != nil || len(res.IDs) != 1 || !res.LiveCap {
+		t.Fatalf("reserved %+v (%v), want 1 held by the live cap", res, err)
+	}
+	if !strings.Contains(res.Reason, "4 draining VMs") || !strings.Contains(res.Reason, "6 live VMs") {
+		t.Fatalf("reason %q", res.Reason)
+	}
+}
+
+// Below the live cap, max_instances is what limits a prewarm, and the
+// reason says so; when both bind, max_instances is named, as Plan does.
+func TestReserveWhyNamesMaxInstances(t *testing.T) {
+	ctx := context.Background()
+	p, _ := testPool(t, 2)
+	res, err := p.ReserveWhy(ctx, 3)
+	if err != nil || len(res.IDs) != 2 || res.Reason != "at max_instances (2)" || res.LiveCap {
+		t.Fatalf("reserved %+v, err %v", res, err)
+	}
+	if res, _ := p.ReserveWhy(ctx, 1); len(res.IDs) != 0 || res.Reason != "at max_instances (2)" {
+		t.Fatalf("reserved %+v", res)
+	}
+	p, _ = testPool(t, 2)
+	if res, _ := p.ReserveWhy(ctx, 2); res.Reason != "" || len(res.IDs) != 2 {
+		t.Fatalf("full grant: %+v", res)
+	}
+
+	// Two draining and two usable at max_instances = 2: both limits bind.
+	p, _ = testPool(t, 2)
+	launchDraining(t, p, 2)
+	ids, _ := p.Reserve(ctx, 2)
+	for _, id := range ids {
+		if _, err := p.Provision(ctx, id, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if res, _ := p.ReserveWhy(ctx, 1); len(res.IDs) != 0 || res.Reason != "at max_instances (2)" || res.LiveCap {
+		t.Fatalf("both limits: %+v", res)
+	}
+}
+
+// Two prewarms at once at three live VMs get one launch between them. The
+// two pool handles share the ledger and its lock file, as separate
+// processes do.
+func TestReserveLiveCapAcrossConcurrentCallers(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 2)
+	launchDraining(t, p, 3)
 	pools := []*Pool{NewPool(p.R, f), NewPool(p.R, f)}
 	got := make(chan int, len(pools))
 	var wg sync.WaitGroup
@@ -100,11 +130,11 @@ func TestReserveLiveCapAcrossConcurrentCallers(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ids, _, err := q.ReserveWhy(ctx, 2)
+			res, err := q.ReserveWhy(ctx, 2)
 			if err != nil {
 				t.Error(err)
 			}
-			got <- len(ids)
+			got <- len(res.IDs)
 		}()
 	}
 	wg.Wait()
