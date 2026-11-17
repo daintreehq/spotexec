@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,9 +49,10 @@ type client struct {
 }
 
 type syncReply struct {
-	need []string
-	res  protocol.Synced
-	err  error
+	need      []string
+	needBytes int64
+	res       protocol.Synced
+	err       error
 }
 
 // playSync syncs w to s and returns what the helper asked for.
@@ -102,7 +104,7 @@ func (c client) sync(s *Session, w workingSet) syncReply {
 			case protocol.TypeNeed:
 				var need protocol.Need
 				_ = env.Unmarshal(&need)
-				r.need = need.Paths
+				r.need, r.needBytes = need.Paths, need.Bytes
 				if c.onNeed != nil {
 					c.onNeed(need.Paths)
 				}
@@ -226,24 +228,35 @@ func TestSyncCopiesWhatAnotherSlotHolds(t *testing.T) {
 	if b.slotDir == a.slotDir {
 		t.Fatal("both sessions hold one slot")
 	}
-	need, res := playSync(t, b, second)
-	if want := []string{"only/c.txt"}; !reflect.DeepEqual(need, want) {
-		t.Fatalf("second slot asked for %v, want %v", need, want)
+	r := client{}.sync(b, second)
+	if r.err != nil {
+		t.Fatal(r.err)
 	}
-	if res.Written != 1 {
-		t.Fatalf("written = %d, want 1", res.Written)
+	if want := []string{"only/c.txt"}; !reflect.DeepEqual(r.need, want) {
+		t.Fatalf("second slot asked for %v, want %v", r.need, want)
+	}
+	if r.needBytes != int64(len("mine\n")) {
+		t.Fatalf("Need.Bytes = %d, want only what is still sent (%d)", r.needBytes, len("mine\n"))
+	}
+	if r.res.Written != 1 || r.res.Reused != len(second)-1 {
+		t.Fatalf("written %d, reused %d; want 1 and %d", r.res.Written, r.res.Reused, len(second)-1)
 	}
 	checkWorkspace(t, b.workspace, second)
 
-	// Copies, not links: a run changing one slot's file leaves the other's.
-	writeFile(t, a.workspace, "a.txt", "changed by a run\n")
-	checkWorkspace(t, b.workspace, workingSet{"a.txt": "alpha\n"})
-
-	// What was copied is recorded as synced: the next sync needs nothing.
-	need, _ = playSync(t, b, second)
-	if len(need) != 0 {
-		t.Fatalf("resync asked for %v", need)
+	// What was copied is recorded as synced in the slot's manifest.
+	var rec map[string]storedEntry
+	if err := readJSON(b.manifestPath(), &rec); err != nil {
+		t.Fatal(err)
 	}
+	for _, e := range second.manifest().Entries {
+		if rec[e.Path].ID != e.ID {
+			t.Errorf("%s recorded as %q, want %q", e.Path, rec[e.Path].ID, e.ID)
+		}
+	}
+
+	// Copies, not links: a run changing one slot's file leaves the other's.
+	writeFile(t, a.workspace, "src/b.go", "changed by a run\n")
+	checkWorkspace(t, b.workspace, workingSet{"src/b.go": "package b\n"})
 }
 
 // A peer file that no longer holds what its slot recorded (a run there
@@ -309,6 +322,7 @@ func TestSyncRejectedPeerCopyLeavesTheFile(t *testing.T) {
 	a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
 	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
 	playSync(t, b, workingSet{"a.txt": "older\n"})
+	writeFile(t, b.workspace, "out", "a run's output\n") // never synced
 
 	// a records alpha at a.txt, but holds other bytes at that signature.
 	writeFile(t, a.workspace, "a.txt", "omega\n")
@@ -321,21 +335,27 @@ func TestSyncRejectedPeerCopyLeavesTheFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var atNeed string
+	var atNeed, outAtNeed string
+	ws := workingSet{"a.txt": "alpha\n", "out/a.txt": "alpha\n"}
 	r := client{onNeed: func([]string) {
 		bb, _ := os.ReadFile(filepath.Join(b.workspace, "a.txt"))
 		atNeed = string(bb)
-	}}.sync(b, workingSet{"a.txt": "alpha\n"})
+		bb, _ = os.ReadFile(filepath.Join(b.workspace, "out"))
+		outAtNeed = string(bb)
+	}}.sync(b, ws)
 	if r.err != nil {
 		t.Fatal(r.err)
 	}
-	if want := []string{"a.txt"}; !reflect.DeepEqual(r.need, want) {
+	if want := []string{"a.txt", "out/a.txt"}; !reflect.DeepEqual(r.need, want) {
 		t.Fatalf("asked for %v, want %v", r.need, want)
 	}
 	if atNeed != "older\n" {
 		t.Fatalf("a.txt was %q when the client was asked, want the slot's own %q", atNeed, "older\n")
 	}
-	checkWorkspace(t, b.workspace, workingSet{"a.txt": "alpha\n"})
+	if outAtNeed != "a run's output\n" {
+		t.Fatalf("out was %q when the client was asked: a rejected copy replaced it", outAtNeed)
+	}
+	checkWorkspace(t, b.workspace, ws)
 }
 
 // bigSet is a working set large enough that slots share its upload.
@@ -383,6 +403,8 @@ func TestSyncColdSlotsShareOneUpload(t *testing.T) {
 	// The first slot takes the upload and holds its archive until every
 	// other slot is waiting for it.
 	hold := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release) // never leave the uploader blocked on a failure
 	asked := make(chan struct{})
 	replies := make([]chan syncReply, n)
 	for i := range replies {
@@ -401,7 +423,7 @@ func TestSyncColdSlotsShareOneUpload(t *testing.T) {
 		go func() { replies[i] <- client{events: ev}.sync(ss[i], sets[i]) }()
 		waitEvent(t, ev, "sync_wait")
 	}
-	close(hold)
+	release()
 
 	total := 0
 	for i := range n {
@@ -449,7 +471,11 @@ func TestSyncCopiesAnUploadPublishedBeforeItsTurn(t *testing.T) {
 
 	reply := make(chan syncReply, 1)
 	go func() { reply <- client{}.sync(b, ws) }()
-	<-scanned
+	select {
+	case <-scanned:
+	case r := <-reply:
+		t.Fatalf("the slot finished before its peer scan: %+v", r)
+	}
 	if need, _ := playSync(t, a, ws); len(need) != len(ws) {
 		t.Fatalf("first slot asked for %d files, want %d", len(need), len(ws))
 	}
@@ -476,15 +502,26 @@ func TestSyncStopsWaitingForAStalledUpload(t *testing.T) {
 	ws := bigSet(nil)
 
 	hold, asked := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release)
 	first := make(chan syncReply, 1)
 	go func() { first <- client{hold: hold, onNeed: func([]string) { close(asked) }}.sync(a, ws) }()
 	<-asked
-	need, _ := playSync(t, b, ws)
-	if len(need) != len(ws) {
-		t.Fatalf("asked for %d files, want all %d", len(need), len(ws))
+	ev := make(chan string, 16)
+	start := time.Now()
+	r := client{events: ev}.sync(b, ws)
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if took := time.Since(start); took < syncShareWait {
+		t.Fatalf("gave up after %s, before the %s wait", took, syncShareWait)
+	}
+	waitEvent(t, ev, "sync_wait")
+	if len(r.need) != len(ws) {
+		t.Fatalf("asked for %d files, want all %d", len(r.need), len(ws))
 	}
 	checkWorkspace(t, b.workspace, ws)
-	close(hold)
+	release()
 	if r := <-first; r.err != nil {
 		t.Fatal(r.err)
 	}
@@ -500,14 +537,71 @@ func TestSyncSmallRemainderDoesNotWait(t *testing.T) {
 	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
 
 	hold, asked := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release)
 	first := make(chan syncReply, 1)
 	go func() { first <- client{hold: hold, onNeed: func([]string) { close(asked) }}.sync(a, bigSet(nil)) }()
 	<-asked
 	if need, _ := playSync(t, b, workingSet{"a.txt": "alpha\n"}); len(need) != 1 {
 		t.Fatalf("asked for %v", need)
 	}
-	close(hold)
+	release()
 	if r := <-first; r.err != nil {
 		t.Fatal(r.err)
+	}
+}
+
+// A remainder shares an upload from 256 files or 1 MiB.
+func TestShareWorthyThresholds(t *testing.T) {
+	files := func(n int, size int64) ([]string, map[string]protocol.Entry) {
+		var need []string
+		want := map[string]protocol.Entry{}
+		for i := range n {
+			p := fmt.Sprintf("f%d", i)
+			need = append(need, p)
+			want[p] = protocol.Entry{Path: p, Size: size}
+		}
+		return need, want
+	}
+	for _, c := range []struct {
+		n    int
+		size int64
+		want bool
+	}{
+		{shareMinFiles - 1, 1, false},
+		{shareMinFiles, 0, true},
+		{1, shareMinBytes - 1, false},
+		{1, shareMinBytes, true},
+		{2, shareMinBytes / 2, true},
+		{0, 0, false},
+	} {
+		need, want := files(c.n, c.size)
+		if got := shareWorthy(need, want); got != c.want {
+			t.Errorf("%d files of %d bytes: shareWorthy = %v, want %v", c.n, c.size, got, c.want)
+		}
+	}
+}
+
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("client gone") }
+
+// Files copied from another slot stay recorded when the client is gone
+// before it can be asked for the rest, so a later sync still prunes them.
+func TestSyncRecordsCopiesWhenTheClientIsGone(t *testing.T) {
+	root := t.TempDir()
+	a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
+	playSync(t, a, workingSet{"a.txt": "alpha\n"})
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	b.c = protocol.NewConn(strings.NewReader(""), failWriter{})
+	if err := b.syncManifest(workingSet{"a.txt": "alpha\n", "b.txt": "beta\n"}.manifest()); err == nil {
+		t.Fatal("sync succeeded with no client")
+	}
+	var rec map[string]storedEntry
+	if err := readJSON(b.manifestPath(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec["a.txt"].ID != fsid.Bytes([]byte("alpha\n")) {
+		t.Fatalf("the copied a.txt isn't recorded: %v", rec)
 	}
 }

@@ -124,8 +124,10 @@ func (s *Session) fillFromPeers(need []string, want map[string]protocol.Entry) (
 		ids[want[p].ID] = true
 	}
 	idx, v := s.peerIndex(ids)
+	good := map[string]string{} // content ID -> a source that just verified
 	for _, p := range need {
-		if s.fromPeers(p, want[p], idx[want[p].ID]) {
+		e := want[p]
+		if validMode(e.Mode) && s.fromPeers(p, e, idx[e.ID], good) {
 			copied++
 			continue
 		}
@@ -134,13 +136,28 @@ func (s *Session) fillFromPeers(need []string, want map[string]protocol.Entry) (
 	return rest, copied, v
 }
 
+func validMode(m uint32) bool {
+	return m == fsid.ModeFile || m == fsid.ModeExec || m == fsid.ModeSymlink
+}
+
+// peerLooks bounds the candidates examined for one file: many files can
+// share one content ID (every empty file does), and each is a candidate.
+const peerLooks = 16
+
 // fromPeers puts e in place at p from the first candidate that verifies:
-// those still matching what their slot recorded first, then any of the
-// right type and size (a file touched since can still hold the bytes).
-func (s *Session) fromPeers(p string, e protocol.Entry, srcs []peerFile) bool {
+// the source that last verified for this content, then those still
+// matching what their slot recorded, then any of the right type and size
+// (a file touched since can still hold the bytes).
+func (s *Session) fromPeers(p string, e protocol.Entry, srcs []peerFile, good map[string]string) bool {
+	if src, ok := good[e.ID]; ok && s.placeFromPeer(p, e, src) == nil {
+		return true
+	}
 	link := e.Mode == fsid.ModeSymlink
 	var fresh, other []string
-	for _, src := range srcs {
+	for i, src := range srcs {
+		if i == peerLooks {
+			break
+		}
 		if (src.e.Mode == fsid.ModeSymlink) != link || src.e.Size != e.Size {
 			continue
 		}
@@ -163,6 +180,7 @@ func (s *Session) fromPeers(p string, e protocol.Entry, srcs []peerFile) bool {
 			break
 		}
 		if s.placeFromPeer(p, e, full) == nil {
+			good[e.ID] = full
 			return true
 		}
 	}
@@ -198,16 +216,14 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() || fi.Size() != e.Size {
 		return fmt.Errorf("%s: not the recorded file", src)
 	}
-	full, err := fsid.PrepareParent(s.workspace, p)
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(full)
-	tmp := filepath.Join(dir, fmt.Sprintf(".spotexec-tmp-%d-%d", os.Getpid(), time.Now().UnixNano()))
+	// Staged beside the workspace (same filesystem, out of a run's tree),
+	// and nothing in the workspace changes until the copy has verified.
+	tmp := filepath.Join(s.slotDir, fmt.Sprintf(".peer-tmp-%d-%d", os.Getpid(), time.Now().UnixNano()))
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fsid.Perm(e.Mode))
 	if err != nil {
 		return err
 	}
+	var full string
 	// A file that grows meanwhile reads past its size and fails the hash.
 	id, err := fsid.Reader(io.TeeReader(io.LimitReader(f, e.Size+1), out), e.Size)
 	if cerr := out.Close(); err == nil {
@@ -218,6 +234,9 @@ func (s *Session) placeFromPeer(p string, e protocol.Entry, src string) error {
 	}
 	if err == nil {
 		err = os.Chmod(tmp, fsid.Perm(e.Mode)) // umask-proof
+	}
+	if err == nil {
+		full, err = fsid.PrepareParent(s.workspace, p)
 	}
 	if err == nil {
 		// Replace a directory occupying the target path (type change).

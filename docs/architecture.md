@@ -73,7 +73,7 @@ The trust boundaries, from the inside out:
 ## Design decisions
 
 - **No backend.** Coordination lives in local `flock`ed state plus cloud tags, and every VM is responsible for its own death. Losing your laptop mid-run costs, at most, one `idle_timeout` of Spot time.
-- **No rsync.** Sync streams a gzip'd tar of exactly the blobs the slot is missing, over the RPC channel. A file another slot of the same repository on that VM already holds is copied from there instead (and checked against its hash), so slots filling on a fresh VM receive a working set once between them. macOS ships openrsync, which differs from GNU rsync 3.x. Owning the bytes also makes the write-back baseline exact: what was uploaded is what the 3-way check compares against.
+- **No rsync.** Sync streams a gzip'd tar of exactly the blobs the slot is missing, over the RPC channel. A file another slot of the same repository on that VM already holds is copied from there instead (and checked against its hash), and while one slot receives a large upload, another slot of the repository with a large upload of its own waits for it and copies what it brought, so slots filling together on a fresh VM receive a shared working set about once between them. macOS ships openrsync, which differs from GNU rsync 3.x. Owning the bytes also makes the write-back baseline exact: what was uploaded is what the 3-way check compares against.
 - **Git blob IDs (SHA-1), not a faster hash.** Clean tracked files reuse the index's IDs and are never read.
 - **The watchdog is shell plus systemd,** installed by cloud-init before anything else runs. It exists before spotexec ever connects, and needs nothing from it.
 - **Hardlink hydration is opt-in.** Shared inodes let one slot corrupt another's dependencies.

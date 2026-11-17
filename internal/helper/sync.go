@@ -226,6 +226,7 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 	}
 	sort.Strings(need)
 	if err := s.c.Send(protocol.TypeNeed, protocol.Need{Paths: need, Bytes: needBytes}); err != nil {
+		_ = s.saveStored() // what was copied from other slots is in place
 		return err
 	}
 	res := protocol.Synced{Deleted: deleted, Reused: reused}
@@ -242,6 +243,7 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 			return perr(protocol.CodeSyncFailed, "%v", err)
 		}
 		if err := br.Drain(); err != nil {
+			_ = s.saveStored()
 			return perr(protocol.CodeSyncFailed, "%v", err)
 		}
 		res.Written, res.Bytes, res.Corrected = written, bytes, corrected
