@@ -431,7 +431,9 @@ func (a *AWSSpot) BakeLaunch(ctx context.Context, log Logger, prepull []string) 
 	if log == nil {
 		log = func(string, ...any) {}
 	}
-	inst, err := a.launchWith(ctx, log, launchSpec{bake: true, prepull: prepull})
+	// A bake may wait long after its region was picked (for the bake
+	// lock, for one): record the builder's launch as it's sent.
+	inst, err := a.launchWith(ctx, log, launchSpec{bake: true, prepull: prepull, beforeSend: a.launching})
 	if err != nil {
 		return Instance{}, err
 	}
