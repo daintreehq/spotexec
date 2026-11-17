@@ -560,17 +560,16 @@ func TestExecFailureNamesHelperErrors(t *testing.T) {
 		{"wrapped helper error", fmt.Errorf("exec: %w", image), false, "aws#3: exec: IMAGE_FAILED: can't read"},
 		{"queue timeout", queue, false, "aws#3: QUEUE_TIMEOUT: no slot"},
 		{"shutdown", shutdown, false, "lost runner aws during execution: RUNNER_SHUTTING_DOWN"},
-		{"connection", conn, false, "lost runner aws during execution: "},
+		{"connection", conn, false, "lost runner aws during execution: " + conn.Error()},
 		{"unreadable reply", garbled, false, "aws#3: unreadable reply from the runner during execution: invalid character"},
 		{"unreadable reply, session gone", garbled, true, "lost runner aws during execution: invalid character"},
 	} {
-		got := execFailure("aws#3", "aws", c.err, c.dead).Error()
-		if !strings.HasPrefix(got, c.want) || strings.Count(got, protocol.CodeImageFailed) > 1 {
+		err := execFailure("aws#3", "aws", c.err, c.dead)
+		if got := err.Error(); !strings.HasPrefix(got, c.want) || strings.Count(got, protocol.CodeImageFailed) > 1 {
 			t.Errorf("%s: got %q, want it to start %q", c.name, got, c.want)
 		}
-	}
-	var re *transport.RemoteError
-	if !errors.As(execFailure("aws#3", "aws", image, false), &re) || re.Code != protocol.CodeImageFailed {
-		t.Fatal("the helper's error is no longer wrapped")
+		if !errors.Is(err, c.err) {
+			t.Errorf("%s: the cause is no longer wrapped", c.name)
+		}
 	}
 }

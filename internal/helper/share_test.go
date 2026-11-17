@@ -468,6 +468,9 @@ func TestImageBuildFailureIsMarked(t *testing.T) {
 			if _, serr := os.Stat(filepath.Join(dir, "built")); (serr == nil) != tc.synced {
 				t.Fatalf("stub build ran: %v, want %v", serr == nil, tc.synced)
 			}
+			if strings.Contains(pe.msg, protocol.CodeImageFailed) {
+				t.Fatalf("code twice: %v", err) // #250
+			}
 			if pe.buildFailed != tc.marked || pe.wire().BuildFailed != tc.marked {
 				t.Fatalf("%v: marked %v (sent %v), want %v", err, pe.buildFailed, pe.wire().BuildFailed, tc.marked)
 			}
