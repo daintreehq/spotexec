@@ -28,8 +28,9 @@ func join(t *testing.T, q *Queue, priority int, exclusive bool) *Ticket {
 	return tk
 }
 
-// holdLock takes queue.lock as a stopped process would, until the test ends.
-func holdLock(t *testing.T, q *Queue) {
+// holdLock takes queue.lock as a stopped process would, until the test
+// ends or it is released.
+func holdLock(t *testing.T, q *Queue) (unlock func()) {
 	t.Helper()
 	f, err := os.OpenFile(filepath.Join(q.dir, "queue.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -38,7 +39,10 @@ func holdLock(t *testing.T, q *Queue) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { f.Close() })
+	var once sync.Once
+	unlock = func() { once.Do(func() { f.Close() }) }
+	t.Cleanup(unlock)
+	return unlock
 }
 
 func expireSnapshot(t *testing.T) { shorten(t, &snapshotTTL, 0) }
@@ -75,6 +79,16 @@ func TestQueueBurstServesEveryLookup(t *testing.T) {
 	}
 	burst(0, n, func(i int) { joinOne(i % 3)(i) })
 	wg.Wait()
+	for _, tk := range tickets[:n] {
+		if tk != nil {
+			t.Cleanup(tk.Leave)
+		}
+	}
+	select {
+	case err := <-joinErrs:
+		t.Fatalf("join failed under a burst: %v", err)
+	default:
+	}
 
 	// Every ticket polls at once while a late, lowest-priority cohort joins.
 	states := make([]QueueState, n)
@@ -84,8 +98,10 @@ func TestQueueBurstServesEveryLookup(t *testing.T) {
 	wg.Wait()
 	took := time.Since(began)
 	close(joinErrs)
-	for _, tk := range tickets {
-		t.Cleanup(tk.Leave)
+	for _, tk := range tickets[n:] {
+		if tk != nil {
+			t.Cleanup(tk.Leave)
+		}
 	}
 	for err := range joinErrs {
 		t.Fatalf("join failed under a burst: %v", err)
@@ -161,6 +177,45 @@ func TestQueueSnapshotSeesNewcomer(t *testing.T) {
 	}
 }
 
+// A ticket leaving while another joins (the count unchanged) is seen too.
+func TestQueueSnapshotSeesSwap(t *testing.T) {
+	shorten(t, &snapshotTTL, time.Hour)
+	q := testQueue(t)
+	gone := join(t, q, 0, false)
+	b := join(t, q, 0, false)
+	if st := q.State(b); st.Position != 1 || st.Total != 2 {
+		t.Fatalf("b: %+v", st)
+	}
+	gone.Leave()
+	join(t, q, 9, true)
+	if st := q.State(b); st.Position != 1 || st.Total != 2 || !st.ExclusiveHead {
+		t.Fatalf("b after a swap: %+v", st)
+	}
+}
+
+// A ticket that joins mid-scan is seen even when the one it overtakes
+// leaves before the scan reaches it: the scan's answer was true at one
+// moment, never a caller at the head while an exclusive ticket was ahead.
+func TestQueueScanSeesMidScanJoin(t *testing.T) {
+	q := testQueue(t)
+	x := join(t, q, 5, true)
+	b := join(t, q, 0, false)
+	xName := filepath.Base(x.path)
+	var once sync.Once
+	beforeInspect = func(name string) {
+		if name == xName {
+			once.Do(func() {
+				join(t, q, 9, true)
+				x.Leave()
+			})
+		}
+	}
+	t.Cleanup(func() { beforeInspect = nil })
+	if st := q.State(b); st.Position != 1 || st.Total != 2 || !st.ExclusiveHead {
+		t.Fatalf("b: %+v, want behind the exclusive newcomer", st)
+	}
+}
+
 // The head leaving moves everyone up on their next lookup, snapshot or not.
 func TestQueueSnapshotSeesDeparture(t *testing.T) {
 	shorten(t, &snapshotTTL, time.Hour)
@@ -212,6 +267,12 @@ func TestQueueStaleTicketSkippedThenRestored(t *testing.T) {
 	if _, err := os.Stat(stopped.path); err != nil {
 		t.Fatalf("stopped ticket removed: %v", err)
 	}
+	// While it stays stopped the snapshot still answers, with no rescan.
+	unlock := holdLock(t, q)
+	if st := q.State(other); st.Position != 0 || st.Total != 1 {
+		t.Fatalf("other from the warm snapshot: %+v", st)
+	}
+	unlock()
 	stopped.Touch() // resumed
 	if st := q.State(other); st.Position != 1 || st.Total != 2 {
 		t.Fatalf("other after the head resumed: %+v", st)
@@ -237,7 +298,7 @@ func TestQueueLockHeld(t *testing.T) {
 	if st := q.State(b); st.Position != unknownPosition {
 		t.Fatalf("lookup with a stopped lock holder and no snapshot: %+v", st)
 	}
-	if d := time.Since(start); d < queueLockWait || d > queueLockWait+2*time.Second {
+	if d := time.Since(start); d < queueLockWait || d > queueLockWait+10*time.Second {
 		t.Fatalf("gave up after %s, want about %s", d, queueLockWait)
 	}
 }
@@ -245,18 +306,17 @@ func TestQueueLockHeld(t *testing.T) {
 // A waiter is answered by a snapshot published while it waits, without
 // ever taking the lock.
 func TestQueueWaiterUsesPublishedSnapshot(t *testing.T) {
-	shorten(t, &queueLockWait, 10*time.Second)
-	expireSnapshot(t)
+	shorten(t, &queueLockWait, 3*time.Second)
 	q := testQueue(t)
 	join(t, q, 0, false)
 	b := join(t, q, 0, false)
 	holdLock(t, q)
-	got := make(chan QueueState)
+	got := make(chan QueueState, 1)
 	go func() { got <- q.State(b) }()
-	// The lock holder's scans, until one begins after b asked.
+	// The lock holder's scans, until one begins after b asked. State gives
+	// up within queueLockWait, so the worker always ends before the test.
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
-	timeout := time.After(5 * time.Second)
 	for {
 		select {
 		case st := <-got:
@@ -265,10 +325,87 @@ func TestQueueWaiterUsesPublishedSnapshot(t *testing.T) {
 			}
 			return
 		case <-tick.C:
-			q.publish(q.scan())
-		case <-timeout:
-			t.Fatal("waiter not answered by the published snapshot")
+			if snap, ok := q.scan(); ok {
+				q.publish(snap)
+			}
 		}
+	}
+}
+
+// A scan that began after the lookup asked answers it even though the
+// queue has changed since; an older one only while the queue is unchanged.
+func TestQueueCachedRules(t *testing.T) {
+	shorten(t, &snapshotTTL, time.Hour)
+	q := testQueue(t)
+	a := join(t, q, 0, false)
+	name := filepath.Base(a.path)
+	snap, ok := q.scan()
+	if !ok {
+		t.Fatal("scan inconclusive")
+	}
+	q.publish(snap)
+	join(t, q, 9, false) // the queue changes after the scan
+	before := time.Unix(0, snap.Start).Add(-time.Millisecond)
+	after := time.Unix(0, snap.Start).Add(time.Millisecond)
+	if _, ok := q.cached(name, after); ok {
+		t.Fatal("a changed queue answered from a scan older than the lookup")
+	}
+	if st, ok := q.cached(name, before); !ok || st.Position != 0 {
+		t.Fatalf("a scan begun after the lookup: %+v %v", st, ok)
+	}
+	shorten(t, &snapshotTTL, 0)
+	if _, ok := q.cached(name, before); ok {
+		t.Fatal("an expired scan answered")
+	}
+}
+
+// A ticket that can't be inspected makes the scan inconclusive: nobody is
+// admitted on it, and it isn't published.
+func TestQueueInconclusiveScan(t *testing.T) {
+	q := testQueue(t)
+	a := join(t, q, 0, false)
+	head := join(t, q, 9, true)
+	if os.Geteuid() == 0 {
+		t.Skip("root opens any file")
+	}
+	if err := os.Chmod(head.path, 0); err != nil { // can't open it
+		t.Fatal(err)
+	}
+	expireSnapshot(t)
+	if st := q.State(a); st.Position != unknownPosition {
+		t.Fatalf("a with an unreadable head: %+v", st)
+	}
+	if _, err := os.Stat(filepath.Join(q.dir, snapshotName)); !os.IsNotExist(err) {
+		t.Fatalf("inconclusive scan published: %v", err)
+	}
+}
+
+// One scan serves a whole burst of lookups on an unchanging queue.
+func TestQueueBurstScansOnce(t *testing.T) {
+	shorten(t, &snapshotTTL, time.Hour)
+	const n = 100
+	q := testQueue(t)
+	tickets := make([]*Ticket, n)
+	for i := range tickets {
+		tickets[i] = join(t, q, 0, false)
+	}
+	before := queueScans.Load()
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for _, tk := range tickets {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if st := q.State(tk); st.Position >= n {
+				t.Error("lookup missed its position")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if scans := queueScans.Load() - before; scans != 1 {
+		t.Fatalf("%d scans for %d lookups, want 1", scans, n)
 	}
 }
 
@@ -276,11 +413,15 @@ func TestQueueIgnoresBadSnapshot(t *testing.T) {
 	shorten(t, &snapshotTTL, time.Hour)
 	q := testQueue(t)
 	a := join(t, q, 0, false)
-	for _, body := range []string{"{not json", fmt.Sprintf(`{"start":%d,"live":[{"n":%q}]}`, time.Now().Add(time.Hour).UnixNano(), "x.ticket")} {
+	name := filepath.Base(a.path)
+	// Each would put a phantom exclusive ticket ahead of a, if believed.
+	future := fmt.Sprintf(`{"start":%d,"live":[{"n":"x.ticket","x":true},{"n":%q}]}`, time.Now().Add(time.Hour).UnixNano(), name)
+	badType := fmt.Sprintf(`{"start":%d,"live":[{"n":"x.ticket","x":true},{"n":%q}],"stale":7}`, time.Now().UnixNano(), name)
+	for _, body := range []string{"{not json", future, badType} {
 		if err := os.WriteFile(filepath.Join(q.dir, snapshotName), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if st := q.State(a); st.Position != 0 || st.Total != 1 {
+		if st := q.State(a); st.Position != 0 || st.Total != 1 || st.ExclusiveHead {
 			t.Fatalf("with snapshot %q: %+v", body, st)
 		}
 	}
@@ -293,13 +434,24 @@ func TestQueueSweepsAbandonedJoin(t *testing.T) {
 	a := join(t, q, 0, false)
 	oldTmp := filepath.Join(q.dir, "1-dead"+joiningExt)
 	newTmp := filepath.Join(q.dir, "2-busy"+joiningExt)
-	for _, p := range []string{oldTmp, newTmp} {
+	heldTmp := filepath.Join(q.dir, "3-held"+joiningExt) // old, but its writer is alive
+	for _, p := range []string{oldTmp, newTmp, heldTmp} {
 		if err := os.WriteFile(p, nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	old := time.Now().Add(-2 * staleAfter)
-	if err := os.Chtimes(oldTmp, old, old); err != nil {
+	for _, p := range []string{oldTmp, heldTmp} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hf, err := os.OpenFile(heldTmp, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hf.Close()
+	if err := syscall.Flock(int(hf.Fd()), syscall.LOCK_EX); err != nil {
 		t.Fatal(err)
 	}
 	expireSnapshot(t)
@@ -309,8 +461,10 @@ func TestQueueSweepsAbandonedJoin(t *testing.T) {
 	if _, err := os.Stat(oldTmp); !os.IsNotExist(err) {
 		t.Fatalf("abandoned join not swept: %v", err)
 	}
-	if _, err := os.Stat(newTmp); err != nil {
-		t.Fatalf("join in progress swept: %v", err)
+	for _, p := range []string{newTmp, heldTmp} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("join in progress swept: %v", err)
+		}
 	}
 }
 

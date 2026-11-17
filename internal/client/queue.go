@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -91,11 +94,30 @@ func (q *Queue) Join(priority int, exclusive bool, command string) (*Ticket, err
 	if err := os.MkdirAll(q.dir, 0o700); err != nil {
 		return nil, err
 	}
+	if len(command) > 120 {
+		command = command[:119] + "…"
+	}
+	for attempt := 1; ; attempt++ {
+		t, err := q.join(ticketData{Priority: priority, Enqueued: time.Now().UnixNano(), Exclusive: exclusive, Command: command, PID: os.Getpid()})
+		if err == nil || !errors.Is(err, errJoinRace) || attempt == 3 {
+			return t, err
+		}
+	}
+}
+
+// errJoinRace: a sweep took the half-written ticket (this process was
+// stopped mid-Join for longer than staleAfter); try again under a new name.
+var errJoinRace = errors.New("queue ticket swept while being written")
+
+func (q *Queue) join(tk ticketData) (*Ticket, error) {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	base := filepath.Join(q.dir, fmt.Sprintf("%d-%s", os.Getpid(), hex.EncodeToString(b[:])))
 	tmp, path := base+joiningExt, base+ticketExt
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if os.IsExist(err) {
+		return nil, errJoinRace // a name already taken: draw another
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -104,23 +126,38 @@ func (q *Queue) Join(priority int, exclusive bool, command string) (*Ticket, err
 		_ = f.Close()
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if err == syscall.EWOULDBLOCK {
+			_ = f.Close() // the sweep holds it and removes it
+			return nil, errJoinRace
+		}
 		return fail(err)
 	}
-	if len(command) > 120 {
-		command = command[:119] + "…"
-	}
-	t := &Ticket{f: f, path: path, tk: ticketData{Priority: priority, Enqueued: time.Now().UnixNano(), Exclusive: exclusive, Command: command, PID: os.Getpid()}}
-	data, _ := json.Marshal(t.tk)
+	data, _ := json.Marshal(tk)
 	if _, err := f.Write(data); err != nil {
 		return fail(err)
 	}
-	// A link, not a rename: it never replaces another ticket of that name.
-	if err := os.Link(tmp, path); err != nil {
-		return fail(err)
+	// A link, not a rename, where the filesystem has them: it never
+	// replaces another ticket of that name.
+	err = os.Link(tmp, path)
+	switch {
+	case err == nil:
+		_ = os.Remove(tmp)
+	case os.IsExist(err):
+		return fail(errJoinRace)
+	case os.IsNotExist(err):
+		_ = f.Close()
+		return nil, errJoinRace
+	default:
+		if err := os.Rename(tmp, path); err != nil {
+			if os.IsNotExist(err) {
+				_ = f.Close()
+				return nil, errJoinRace
+			}
+			return fail(err)
+		}
 	}
-	_ = os.Remove(tmp)
-	return t, nil
+	return &Ticket{f: f, path: path, tk: tk}, nil
 }
 
 // Leave removes the ticket.
@@ -187,7 +224,10 @@ func (q *Queue) State(t *Ticket) QueueState {
 	if st, ok := q.cached(name, asked); ok {
 		return st
 	}
-	snap := q.scan()
+	snap, ok := q.scan()
+	if !ok {
+		return QueueState{Position: unknownPosition} // can't tell: don't probe this round
+	}
 	q.publish(snap)
 	st, _ := snap.position(name)
 	return st
@@ -225,9 +265,9 @@ func (s *snapshot) position(name string) (QueueState, bool) {
 }
 
 // cached answers a lookup asked at `asked` from the published snapshot,
-// when that is as good as a scan of our own: a scan begun after we asked,
-// or a recent one of a queue that hasn't changed since (no ticket joined
-// or left, none of the stopped ones resumed).
+// when that is as good as a scan of our own: a recent scan that began
+// after we asked, or one of a queue that hasn't changed since (no ticket
+// joined or left, none of the stopped ones resumed).
 func (q *Queue) cached(name string, asked time.Time) (QueueState, bool) {
 	b, err := os.ReadFile(filepath.Join(q.dir, snapshotName))
 	if err != nil {
@@ -245,10 +285,13 @@ func (q *Queue) cached(name string, asked time.Time) (QueueState, bool) {
 	if !ok {
 		return QueueState{}, false // not seen yet (or no longer live): scan
 	}
+	if now.Sub(start) > snapshotTTL {
+		return QueueState{}, false
+	}
 	if !start.Before(asked) {
 		return st, true
 	}
-	if now.Sub(start) > snapshotTTL || !s.unchanged(q.dir) {
+	if !s.unchanged(q.dir) {
 		return QueueState{}, false
 	}
 	return st, true
@@ -316,54 +359,71 @@ type liveTicket struct {
 	tk   ticketData
 }
 
+// queueScans counts full scans of a queue (tests check they're coalesced).
+var queueScans atomic.Int64
+
+// beforeInspect, when set, runs before a scan looks at each ticket (tests
+// change the queue mid-scan).
+var beforeInspect func(name string)
+
+// scanPasses bounds how many times a scan lists the queue again to look
+// at tickets that joined while it ran.
+const scanPasses = 8
+
 // scan lists tickets held by running processes, in admission order, and
-// sweeps dead ones (and tickets abandoned while being written). Must be
-// called with queue.lock held.
-func (q *Queue) scan() snapshot {
-	s := snapshot{Start: time.Now().UnixNano()}
-	ents, _ := os.ReadDir(q.dir)
+// sweeps dead ones (and tickets abandoned while being written). It looks
+// again at the queue until a listing holds no ticket it hasn't looked at,
+// so what it returns was true at that moment: a ticket that joined while
+// it ran is never missed because the one it overtook left meanwhile. ok
+// is false when it couldn't see the whole queue (an I/O error, or tickets
+// joining faster than it could look): nobody may be admitted on it. Must
+// be called with queue.lock held.
+func (q *Queue) scan() (s snapshot, ok bool) {
+	queueScans.Add(1)
+	s.Start = time.Now().UnixNano()
 	var live []liveTicket
 	buf := make([]byte, 4096)
-	for _, e := range ents {
-		name := e.Name()
-		ticket, joining := strings.HasSuffix(name, ticketExt), strings.HasSuffix(name, joiningExt)
-		if !ticket && !joining {
-			continue
-		}
-		path := filepath.Join(q.dir, name)
-		f, err := os.OpenFile(path, os.O_RDWR, 0)
+	looked := map[string]bool{}
+	for pass := 1; ; pass++ {
+		ents, err := os.ReadDir(q.dir)
 		if err != nil {
-			continue
+			return s, false
 		}
-		fi, ferr := f.Stat()
-		if joining {
-			// Its writer locks it right after creating it; one left unlocked
-			// this long belongs to a process that died mid-Join.
-			if ferr == nil && time.Since(fi.ModTime()) > staleAfter && syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
-				_ = os.Remove(path)
+		more := false
+		for _, e := range ents {
+			name := e.Name()
+			if looked[name] {
+				continue
 			}
-			f.Close()
-			continue
+			looked[name] = true
+			switch {
+			case strings.HasSuffix(name, joiningExt):
+				q.sweepJoining(name)
+			case strings.HasSuffix(name, ticketExt):
+				more = true
+				if beforeInspect != nil {
+					beforeInspect(name)
+				}
+				tk, kind, err := q.inspect(name, buf)
+				if err != nil {
+					return s, false
+				}
+				switch kind {
+				case ticketLive:
+					live = append(live, liveTicket{name: name, tk: tk})
+				case ticketStale:
+					s.Stale = append(s.Stale, name)
+				case ticketUnreadable:
+					s.Other = append(s.Other, name)
+				}
+			}
 		}
-		if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
-			_ = os.Remove(path) // nobody holds it: the process died
-			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-			f.Close()
-			continue
+		if !more {
+			break
 		}
-		if ferr == nil && time.Since(fi.ModTime()) > staleAfter {
-			f.Close()
-			s.Stale = append(s.Stale, name) // holder is stopped; it counts again when it resumes
-			continue
+		if pass == scanPasses {
+			return s, false
 		}
-		n, _ := f.ReadAt(buf, 0)
-		f.Close()
-		var tk ticketData
-		if json.Unmarshal(buf[:n], &tk) != nil {
-			s.Other = append(s.Other, name)
-			continue
-		}
-		live = append(live, liveTicket{name: name, tk: tk})
 	}
 	sort.Slice(live, func(i, j int) bool {
 		if live[i].tk.Priority != live[j].tk.Priority {
@@ -378,5 +438,68 @@ func (q *Queue) scan() snapshot {
 	for i, x := range live {
 		s.Live[i] = snapEntry{Name: x.name, Exclusive: x.tk.Exclusive}
 	}
-	return s
+	return s, true
+}
+
+type ticketKind int
+
+const (
+	ticketGone       ticketKind = iota // left, or its process died (swept)
+	ticketLive                         // in the queue
+	ticketStale                        // held, but its holder is stopped
+	ticketUnreadable                   // held, but not a ticket we can read
+)
+
+// inspect looks at one ticket. An error means it couldn't tell.
+func (q *Queue) inspect(name string, buf []byte) (ticketData, ticketKind, error) {
+	var tk ticketData
+	path := filepath.Join(q.dir, name)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if os.IsNotExist(err) {
+		return tk, ticketGone, nil
+	}
+	if err != nil {
+		return tk, ticketGone, err
+	}
+	defer f.Close()
+	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+		_ = os.Remove(path) // nobody holds it: the process died
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return tk, ticketGone, nil
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return tk, ticketGone, err
+	}
+	if time.Since(fi.ModTime()) > staleAfter {
+		return tk, ticketStale, nil // it counts again when it resumes
+	}
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		return tk, ticketGone, err
+	}
+	if json.Unmarshal(buf[:n], &tk) != nil {
+		return tk, ticketUnreadable, nil
+	}
+	return tk, ticketLive, nil
+}
+
+// sweepJoining removes a ticket abandoned while being written. Its writer
+// locks it right after creating it; one left unlocked this long belongs to
+// a process that died mid-Join.
+func (q *Queue) sweepJoining(name string) {
+	path := filepath.Join(q.dir, name)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || time.Since(fi.ModTime()) <= staleAfter {
+		return
+	}
+	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+		_ = os.Remove(path)
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	}
 }
