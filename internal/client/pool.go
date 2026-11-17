@@ -66,7 +66,16 @@ type note struct {
 	// BootSeenAt: when a probe last found its helper still running
 	// first-boot setup, so its first ready probe times its launch. (Not a
 	// failure to answer: a VM that was ready unobserved can fail one too.)
-	BootSeenAt   time.Time `json:"boot_seen_at,omitempty"`
+	BootSeenAt time.Time `json:"boot_seen_at,omitempty"`
+	// A watch, which also times the launch when no booting answer was seen
+	// (a baked VM can finish first-boot setup before it first answers):
+	// WatchN probes before it first served found it not serving yet, the
+	// first within watchStart of its launch, the last (WatchAt) and each
+	// since within leadGap of the one before. It saturates at watchMin, and
+	// is -1 once broken: a late start, a gap, or a silent VM past
+	// boot_timeout or in a region this client can't reach.
+	WatchAt      time.Time `json:"watch_at,omitempty"`
+	WatchN       int       `json:"watch_n,omitempty"`
 	BootFailed   bool      `json:"boot_failed,omitempty"`
 	BootFailedAt time.Time `json:"boot_failed_at,omitempty"`
 	// Why the instance no longer satisfies the runner's requirements (""
@@ -272,15 +281,84 @@ func (n *note) markReady(now time.Time) {
 	}
 }
 
+const (
+	// watchMin: probes a watch needs before it times a launch. One failure
+	// to answer just before serving proves little: a VM ready unobserved
+	// can fail one too.
+	watchMin = 2
+	// watchStart: how soon after its launch a watch's first probe must
+	// end. Looser than leadGap: listing a new VM (pending, then running,
+	// through an 8s cache) and an SSH connect timeout come first, and a
+	// probe that found the VM not serving yet bounds nothing it missed.
+	watchStart = time.Minute
+)
+
 // markReady records instance id as serving, and times its launch when it
-// was watched booting until now (leadGap), so the time isn't inflated by
-// a stretch nobody probed it.
+// was watched booting until now (leadGap), or watched from its launch
+// until now (note.WatchN), so the time isn't inflated by a stretch nobody
+// probed it.
 func (st *poolState) markReady(id string, now time.Time) {
 	n := st.note(id)
-	if !n.Ready && !n.BootSeenAt.IsZero() && now.Sub(n.BootSeenAt) <= leadGap {
+	booted := !n.BootSeenAt.IsZero() && now.Sub(n.BootSeenAt) <= leadGap
+	watched := n.WatchN >= watchMin && now.Sub(n.WatchAt) <= leadGap
+	if !n.Ready && (booted || watched) {
 		st.timeLaunch(id, now)
 	}
 	n.markReady(now)
+}
+
+// watch extends instance id's watch with a probe at now that found it not
+// serving yet (no answer, or still booting). launchedAt is the provider's
+// launch time (zero if unknown); late says a VM still not answering may
+// have been ready behind an unreachable network all along (it is past
+// boot_timeout, or its region is held).
+func (st *poolState) watch(id string, launchedAt time.Time, late bool, now time.Time) {
+	n := st.note(id)
+	if n.Ready || n.WatchN < 0 {
+		return
+	}
+	from, within := n.WatchAt, leadGap
+	if n.WatchN == 0 {
+		var ok bool
+		if from, ok = st.launchStart(id, launchedAt, now); !ok {
+			return // not this fleet's launch on record (yet): nothing to time
+		}
+		within = watchStart
+	}
+	if late || now.Sub(from) > within || now.Before(from) {
+		n.WatchN, n.WatchAt = -1, time.Time{}
+		return
+	}
+	n.WatchN, n.WatchAt = min(n.WatchN+1, watchMin), now
+}
+
+// launchStart is when instance id came to exist, as far as a watch goes:
+// its launch record's start, or the provider's launch time when later
+// (planning, pricing and capacity retries come first, and a VM can't be
+// probed before it exists) but not after now (the provider's clock may
+// run ahead of this one).
+func (st *poolState) launchStart(id string, launchedAt, now time.Time) (time.Time, bool) {
+	for _, l := range st.Launches {
+		if l.InstanceID == id && !l.Failed && !l.Started.IsZero() {
+			if launchedAt.After(l.Started) && !launchedAt.After(now) {
+				return launchedAt, true
+			}
+			return l.Started, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// regionHeld reports whether instance id is in a region this client holds
+// launches out of, as one it can't reach (reach.go).
+func (st *poolState) regionHeld(id string, now time.Time) bool {
+	for _, in := range st.Instances {
+		if in.ID == id {
+			at, held := st.Held[in.Region]
+			return in.Region != "" && held && now.Sub(at) <= heldFor
+		}
+	}
+	return false
 }
 
 // timeLaunch records how long instance id's launch took to serve, from
@@ -677,6 +755,7 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 			if !n.Ready {
 				n.BootSeenAt = now
 			}
+			st.watch(id, launchedAt, false, now)
 		case OutUnreachable, outRefused:
 			if o == OutUnreachable {
 				n.Silent = now
@@ -687,10 +766,14 @@ func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
 			// suspect (but still counts toward capacity: unreachable is not
 			// absent).
 			n.Failures++
-			if time.Since(launchedAt) < p.R.BootTimeout.Duration || n.Failures < 2 {
+			young := time.Since(launchedAt) < p.R.BootTimeout.Duration
+			if young || n.Failures < 2 {
 				n.BusyUntil = now.Add(3 * time.Second)
 			} else {
 				n.SuspectUntil = now.Add(suspectFor)
+			}
+			if o == OutUnreachable {
+				st.watch(id, launchedAt, (!young && !launchedAt.IsZero()) || st.regionHeld(id, now), now)
 			}
 		}
 		// The fleet's hold is set under this lock too, so a reply and a
