@@ -28,7 +28,10 @@ func countScans(t *testing.T, gate, started chan struct{}) *atomic.Int32 {
 	buildManifest = func(ctx context.Context, o manifest.Options) (*manifest.Manifest, error) {
 		n.Add(1)
 		if gate != nil {
-			started <- struct{}{}
+			select { // a second scan (a regression) mustn't block here
+			case started <- struct{}{}:
+			default:
+			}
 			select {
 			case <-gate:
 			case <-ctx.Done():
@@ -192,10 +195,14 @@ func TestOnlyAFirstAttemptUsesTheSharedScan(t *testing.T) {
 	try := func(att attempt) int {
 		t.Helper()
 		att.runID, att.exclude, att.fresh = "run", map[string]bool{}, new(bool)
+		before := len(rep.files)
 		if _, err, _ := runOnce(context.Background(), cfg, ws, o, att); err == nil || !strings.Contains(err.Error(), "not in the synced working set") {
 			t.Fatalf("%+v: %v", att, err)
 		}
-		return rep.files[len(rep.files)-1]
+		if len(rep.files) != before+1 {
+			t.Fatalf("%+v: %d manifest events", att, len(rep.files)-before)
+		}
+		return rep.files[before]
 	}
 	add := func(name string) {
 		t.Helper()
