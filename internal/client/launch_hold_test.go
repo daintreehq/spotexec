@@ -280,7 +280,7 @@ func TestLaunchLead(t *testing.T) {
 
 // A launch is timed when its VM, watched booting, first serves; not when
 // it was first seen ready after nobody had probed it for a while, nor
-// after a failure to answer (a VM ready unobserved fails those too).
+// after a lone failure to answer (a VM ready unobserved fails those too).
 func TestReadyTimesItsLaunch(t *testing.T) {
 	p, f := testPool(t, 4)
 	now := time.Now()
@@ -324,6 +324,95 @@ func TestReadyAfterUnwatchedGapIsNotTimed(t *testing.T) {
 		if n := len(st.sched().Leads); n != c.want || !st.Notes["i-a"].Ready {
 			t.Errorf("seen booting %s before ready: %d samples, want %d", now.Sub(c.seen), n, c.want)
 		}
+	}
+}
+
+// #243: a baked VM can finish first-boot setup before it first answers,
+// so it is never seen booting. Watched steadily from its launch until it
+// first served, its launch is timed all the same; a watch that started
+// late, broke off, or is a lone failure to answer times nothing.
+func TestWatchedLaunchIsTimed(t *testing.T) {
+	t0 := time.Now().Add(-time.Hour)
+	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
+	type probe struct {
+		s    int
+		late bool
+	}
+	for _, c := range []struct {
+		name     string
+		launched time.Time // the provider's launch time
+		probes   []probe
+		ready    int
+		want     bool
+	}{
+		{"steady", at(5), []probe{{20, false}, {35, false}, {50, false}}, 60, true},
+		{"edges", at(5), []probe{{35, false}, {65, false}}, 95, true},
+		{"anchored on the planned launch", time.Time{}, []probe{{30, false}, {60, false}}, 90, true},
+		{"one probe", at(5), []probe{{20, false}}, 25, false},
+		{"started late", at(5), []probe{{36, false}, {50, false}}, 60, false},
+		{"started late, no provider time", time.Time{}, []probe{{31, false}, {50, false}}, 60, false},
+		{"gap", at(5), []probe{{20, false}, {51, false}, {60, false}}, 70, false},
+		{"ready unobserved", at(5), []probe{{20, false}, {35, false}}, 66, false},
+		{"past boot_timeout", at(5), []probe{{20, false}, {35, false}, {50, true}}, 60, false},
+	} {
+		st := &poolState{Notes: map[string]*note{}}
+		st.Launches = []launchRec{{ID: "l1", InstanceID: "i-a", Started: t0}}
+		for _, p := range c.probes {
+			st.watch("i-a", c.launched, p.late, at(p.s))
+		}
+		st.markReady("i-a", at(c.ready))
+		if got := len(st.sched().Leads) == 1; got != c.want {
+			t.Errorf("%s: timed %v, want %v (note %+v)", c.name, got, c.want, *st.Notes["i-a"])
+		}
+		if c.want && st.sched().Leads[0].S != float64(c.ready) {
+			t.Errorf("%s: lead %vs, want %ds from planning", c.name, st.sched().Leads[0].S, c.ready)
+		}
+	}
+
+	// A VM probed before its launch record names it isn't watched yet:
+	// the watch starts with the first probe that can be anchored.
+	st := &poolState{Notes: map[string]*note{}}
+	st.watch("i-a", at(5), false, at(15))
+	if n := st.Notes["i-a"]; n.WatchN != 0 {
+		t.Fatalf("unrecorded launch: %+v, want no watch", *n)
+	}
+	st.Launches = []launchRec{{ID: "l1", InstanceID: "i-a", Started: t0}}
+	st.watch("i-a", at(5), false, at(25))
+	st.watch("i-a", at(5), false, at(40))
+	st.markReady("i-a", at(50))
+	// And once ready, nothing more is timed or watched.
+	st.watch("i-a", at(5), false, at(55))
+	st.markReady("i-a", at(60))
+	if l := st.sched().Leads; len(l) != 1 || l[0].S != 50 || st.Notes["i-a"].WatchN != watchMin {
+		t.Fatalf("leads %+v, note %+v", l, *st.Notes["i-a"])
+	}
+}
+
+// Three launches watched from launch to serving, never seen booting, make
+// the lead learned, which scale_out events report as lead_learned.
+func TestWatchedLaunchesLearnTheLead(t *testing.T) {
+	p, f := testPool(t, 4)
+	now := time.Now()
+	ids := []string{"i-a", "i-b", "i-c"}
+	for _, id := range ids {
+		f.insts = append(f.insts, provider.Instance{ID: id, State: provider.StateRunning, LaunchedAt: now, Target: provider.Target{Host: "192.0.2.9"}})
+	}
+	p.loaded(t, func(st *poolState) {
+		for _, id := range ids {
+			st.Launches = append(st.Launches, launchRec{ID: "l-" + id, InstanceID: id, Started: now.Add(-40 * time.Second), PID: os.Getpid()})
+		}
+	})
+	for _, id := range ids {
+		p.Observe(id, OutUnreachable, now)
+		p.Observe(id, OutUnreachable, now)
+		p.Observe(id, OutAcquired, now)
+	}
+	d, err := p.Plan(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.LeadLearned || d.Lead < 40*time.Second || d.Lead > time.Minute {
+		t.Fatalf("plan %+v, want a learned ~40s lead", d)
 	}
 }
 
