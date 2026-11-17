@@ -262,38 +262,6 @@ func (a *AWSSpot) Status(ctx context.Context) (Info, error) {
 // Forget is a no-op: the AWS provider keeps no cached instance state.
 func (a *AWSSpot) Forget() {}
 
-// lockUp takes the per-runner provisioning lock, honoring ctx.
-func (a *AWSSpot) lockUp(ctx context.Context, log Logger) (func(), error) {
-	if err := os.MkdirAll(a.dir, 0o700); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(filepath.Join(a.dir, "up.lock"), os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	logged := false
-	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
-			f.Close()
-			return nil, err
-		}
-		if !logged && log != nil {
-			log("waiting for another spotexec process that is provisioning %s", a.r.Name)
-			logged = true
-		}
-		select {
-		case <-ctx.Done():
-			f.Close()
-			return nil, ctx.Err()
-		case <-time.After(250 * time.Millisecond):
-		}
-	}
-}
-
 // List returns this runner's pending and running instances.
 func (a *AWSSpot) List(ctx context.Context) ([]Instance, error) {
 	insts, err := a.describe(ctx, "pending", "running")
@@ -321,9 +289,10 @@ func (a *AWSSpot) Launch(ctx context.Context, log Logger) (Instance, error) {
 	if log == nil {
 		log = func(string, ...any) {}
 	}
-	// Shares the provisioning lock with Down, so `spotexec down` cannot
-	// finish while a launch is about to create an instance.
-	unlock, err := a.lockUp(ctx, nil)
+	// Shares the provisioning lock with other launches and with Down, so
+	// `spotexec down` cannot finish while a launch is about to create an
+	// instance.
+	unlock, err := a.lockLaunch(ctx)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -880,7 +849,15 @@ func (a *AWSSpot) runOne(ctx context.Context, base url.Values, itype string, spo
 	for attempt := 0; attempt < 4; attempt++ {
 		b, err := a.api.ec2(ctx, "RunInstances", p)
 		if err == nil {
-			return parseRunInstances(b)
+			inst, perr := parseRunInstances(b)
+			if perr == nil && inst.InstanceID == "" {
+				perr = errors.New("no instance ID in the response")
+			}
+			if perr != nil {
+				// EC2 accepted the request: it may have made an instance.
+				return ec2Instance{}, fmt.Errorf("%w: unreadable RunInstances response: %v", ErrLaunchAmbiguous, perr)
+			}
+			return inst, nil
 		}
 		lastErr = err
 		if c := awsCode(err); c == "IdempotentInstanceTerminated" || c == "IdempotentParameterMismatch" {
@@ -1007,6 +984,22 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 	if id != "" && hasSSHIngress([]byte(body), a.r.SSHCIDR) {
 		return []string{id}, nil
 	}
+	// Overlapping launches on this machine create or open it one at a
+	// time, so the second finds the first's group rather than racing its
+	// creation (a fresh group may not be listed yet).
+	if a.dir != "" {
+		unlock, err := waitLockFile(ctx, a.lockPath("sg-"+a.r.Region+".lock"), syscall.LOCK_EX, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+		if id, err = find(); err != nil {
+			return nil, err
+		}
+		if id != "" && hasSSHIngress([]byte(body), a.r.SSHCIDR) {
+			return []string{id}, nil
+		}
+	}
 	if id == "" {
 		owner, err := a.ownerTag()
 		if err != nil {
@@ -1029,8 +1022,20 @@ func (a *AWSSpot) securityGroups(ctx context.Context, log Logger) ([]string, err
 			id = xmlFirst(b, "groupId")
 			log("created security group %s (%s) in %s", sgName, id, vpc)
 		case awsCode(err) == "InvalidGroup.Duplicate":
-			if id, err = find(); err != nil {
-				return nil, err
+			// Made meanwhile (another runner or machine), and maybe not
+			// listed yet.
+			for try := 0; ; try++ {
+				if id, err = find(); err != nil {
+					return nil, err
+				}
+				if id != "" || try == 5 {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(time.Second):
+				}
 			}
 		default:
 			return nil, fmt.Errorf("create security group: %w", err)
@@ -1234,10 +1239,13 @@ func (a *AWSSpot) downLocked(ctx context.Context, log Logger) (int, error) {
 		if _, err := a.api.ec2(ctx, "TerminateInstances", p); err != nil {
 			return 0, fmt.Errorf("terminate: %w", err)
 		}
+		ids := make([]string, 0, len(insts))
 		for _, inst := range insts {
 			log("terminating %s (%s)", inst.InstanceID, inst.InstanceType)
 			_ = os.Remove(a.knownHosts(inst.InstanceID))
+			ids = append(ids, inst.InstanceID)
 		}
+		a.releaseClaims(ids)
 	} else {
 		log("no running instances for %s", a.r.Name)
 	}

@@ -450,8 +450,13 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 			}
 			fmt.Fprint(w, `</instancesSet></item></reservationSet></DescribeInstancesResponse>`)
 		case "TerminateInstances":
-			f.log(region, act+" "+p.Get("InstanceId.1"))
-			delete(f.instances[region], p.Get("InstanceId.1"))
+			ids := []string{}
+			for i := 1; p.Get(fmt.Sprintf("InstanceId.%d", i)) != ""; i++ {
+				id := p.Get(fmt.Sprintf("InstanceId.%d", i))
+				ids = append(ids, id)
+				delete(f.instances[region], id)
+			}
+			f.log(region, act+" "+strings.Join(ids, " "))
 			fmt.Fprint(w, `<TerminateInstancesResponse/>`)
 		default:
 			t.Errorf("unexpected %s %s", region, act)
