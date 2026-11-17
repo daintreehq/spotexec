@@ -310,7 +310,7 @@ func (q *Queue) cached(name string, asked time.Time, looked *os.FileInfo) (Queue
 	}
 	age, limit := now.Sub(done), snapshotTTL
 	if !start.Before(asked) {
-		if age <= snapshotTTL {
+		if age <= snapshotTTL && done.Sub(start) <= snapshotTTL {
 			return st, true // as good as our own scan
 		}
 		// Read late (a busy machine): still ours while the queue is

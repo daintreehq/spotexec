@@ -336,14 +336,14 @@ func TestQueueWaiterUsesPublishedSnapshot(t *testing.T) {
 // after it asked whatever has changed since; otherwise only a recent one of
 // an unchanged queue, recent counting from when the scan finished.
 func TestQueueCachedRules(t *testing.T) {
-	shorten(t, &snapshotTTL, time.Second)
-	shorten(t, &queueLockWait, 10*time.Second)
+	shorten(t, &snapshotTTL, time.Minute)
+	shorten(t, &queueLockWait, 10*time.Minute)
 	q := testQueue(t)
 	a := join(t, q, 0, false)
-	z := join(t, q, 9, false)
+	z := join(t, q, 9, true)
 	name := filepath.Base(a.path)
-	whole := []snapEntry{{Name: filepath.Base(z.path)}, {Name: name}} // the queue as it is
-	partial := []snapEntry{{Name: name}}                              // z joined after it
+	whole := []snapEntry{{Name: filepath.Base(z.path), Exclusive: true}, {Name: name}} // the queue as it is
+	partial := []snapEntry{{Name: name}}                                               // z joined after it
 	now := time.Now()
 	ago := func(d time.Duration) time.Time { return now.Add(-d) }
 	cases := []struct {
@@ -353,32 +353,34 @@ func TestQueueCachedRules(t *testing.T) {
 		asked       time.Time
 		ok          bool
 	}{
-		{"post-ask, recent, changed since", partial, ago(time.Minute), ago(100 * time.Millisecond), ago(2 * time.Minute), true},
-		{"post-ask, read late, changed since", partial, ago(time.Minute), ago(3 * time.Second), ago(2 * time.Minute), false},
-		{"post-ask, read late, unchanged", whole, ago(time.Minute), ago(3 * time.Second), ago(2 * time.Minute), true},
-		{"post-ask, older than the lock wait", whole, ago(time.Minute), ago(11 * time.Second), ago(2 * time.Minute), false},
-		{"pre-ask, changed since", partial, ago(time.Minute), ago(100 * time.Millisecond), ago(30 * time.Second), false},
-		{"pre-ask, slow scan just finished, unchanged", whole, ago(time.Minute), ago(100 * time.Millisecond), ago(30 * time.Second), true},
-		{"pre-ask, expired, unchanged", whole, ago(3 * time.Second), ago(2 * time.Second), ago(time.Second), false},
+		{"post-ask, recent, changed since", partial, ago(2 * time.Second), ago(time.Second), ago(3 * time.Second), true},
+		{"post-ask, recent but a slow scan, changed since", partial, ago(time.Hour), ago(time.Second), ago(3 * time.Hour), false},
+		{"post-ask, read late, changed since", partial, ago(3 * time.Minute), ago(2 * time.Minute), ago(4 * time.Minute), false},
+		{"post-ask, read late, unchanged", whole, ago(3 * time.Minute), ago(2 * time.Minute), ago(4 * time.Minute), true},
+		{"post-ask, older than the lock wait", whole, ago(time.Hour), ago(11 * time.Minute), ago(2 * time.Hour), false},
+		{"pre-ask, changed since", partial, ago(time.Hour), ago(time.Second), ago(30 * time.Minute), false},
+		{"pre-ask, slow scan just finished, unchanged", whole, ago(time.Hour), ago(time.Second), ago(30 * time.Minute), true},
+		{"pre-ask, expired, unchanged", whole, ago(3 * time.Minute), ago(2 * time.Minute), ago(time.Minute), false},
 	}
 	for _, c := range cases {
 		q.publish(snapshot{Start: c.start.UnixNano(), Done: c.done.UnixNano(), Live: c.live})
-		if _, ok := q.cached(name, c.asked, new(os.FileInfo)); ok != c.ok {
-			t.Errorf("%s: answered %v, want %v", c.what, ok, c.ok)
+		st, ok := q.cached(name, c.asked, new(os.FileInfo))
+		if ok != c.ok || ok && st.Position != len(c.live)-1 {
+			t.Errorf("%s: answered %v %+v, want %v", c.what, ok, st, c.ok)
 		}
 	}
 	// A lookup doesn't decode a snapshot it found wanting again, even once
 	// it would do (it waits for the next one instead).
-	q.publish(snapshot{Start: ago(time.Minute).UnixNano(), Done: now.UnixNano(), Live: whole[1:]})
+	q.publish(snapshot{Start: ago(time.Hour).UnixNano(), Done: now.UnixNano(), Live: whole[1:]})
 	looked := new(os.FileInfo)
-	if _, ok := q.cached(name, ago(30*time.Second), looked); ok {
+	if _, ok := q.cached(name, ago(30*time.Minute), looked); ok {
 		t.Fatal("a changed queue answered")
 	}
 	z.Leave()
-	if _, ok := q.cached(name, ago(30*time.Second), looked); ok {
+	if _, ok := q.cached(name, ago(30*time.Minute), looked); ok {
 		t.Fatal("a snapshot already found wanting was decoded again")
 	}
-	if _, ok := q.cached(name, ago(30*time.Second), new(os.FileInfo)); !ok {
+	if _, ok := q.cached(name, ago(30*time.Minute), new(os.FileInfo)); !ok {
 		t.Fatal("the snapshot of a queue now unchanged didn't answer a new lookup")
 	}
 }
