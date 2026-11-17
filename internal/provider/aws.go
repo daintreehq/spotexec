@@ -391,6 +391,9 @@ func (a *AWSSpot) Up(ctx context.Context, log Logger) (Info, error) {
 	return info, err
 }
 
+// bootPollInterval spaces waitRunning's status reads.
+var bootPollInterval = 3 * time.Second
+
 // waitRunning polls until the instance is running with a public IP.
 func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger) (Info, error) {
 	deadline := time.Now().Add(a.r.BootTimeout.Duration)
@@ -429,7 +432,7 @@ func (a *AWSSpot) waitRunning(ctx context.Context, inst ec2Instance, log Logger)
 		select {
 		case <-ctx.Done():
 			return Info{}, ctx.Err()
-		case <-time.After(3 * time.Second):
+		case <-time.After(bootPollInterval):
 		}
 		p := url.Values{}
 		p.Set("InstanceId.1", inst.InstanceID)

@@ -108,6 +108,9 @@ func parseAWSXMLError(status int, body []byte) *awsError {
 // queryAttemptTimeout bounds one attempt of a read-only Query call.
 var queryAttemptTimeout = 20 * time.Second
 
+// queryRetryBase scales the backoff between a Query call's attempts.
+var queryRetryBase = 300 * time.Millisecond
+
 func readOnlyAction(action string) bool {
 	return strings.HasPrefix(action, "Describe") || strings.HasPrefix(action, "Get")
 }
@@ -191,7 +194,7 @@ func (c *awsClient) query(ctx context.Context, service, version, action string, 
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(1<<attempt) * 300 * time.Millisecond):
+			case <-time.After(time.Duration(1<<attempt) * queryRetryBase):
 			}
 		}
 		// Each attempt of a read gets its own deadline, so one stuck
