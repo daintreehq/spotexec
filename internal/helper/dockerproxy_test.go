@@ -551,6 +551,7 @@ case "$1 $2" in
 "info "*) cat "$d/info" 2>/dev/null ;;
 "network rm") k=network; shift 2; ` + rm + ` ;;
 "volume rm") k=volume; shift 3; ` + rm + ` ;;
+"create --pull") [ -f "$d/create-sleep" ] && sleep "$(cat "$d/create-sleep")" ;;
 "image inspect") echo sha256:` + strings.Repeat("0", 64) + ` ;;
 "cp -L")
 	[ -f "$d/cp-fail" ] && { echo "Error response from daemon: boom" >&2; exit 1; }

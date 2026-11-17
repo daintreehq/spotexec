@@ -284,3 +284,85 @@ func TestMountsAt(t *testing.T) {
 		}
 	}
 }
+
+// Slots of one runner user share the users files of an image: first runs
+// that start together on a fresh VM read the image once, and a later slot
+// reuses what the first one made, after that slot's run directory is gone.
+func TestRunUserFilesSharedAcrossSlots(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("runs as root: no run user to add")
+	}
+	bin, calls := statefulDocker(t, false, "", "", "")
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	writeTar(t, filepath.Join(bin, "tar-passwd"), "passwd", "root:x:0:0:root:/root:/bin/bash\n")
+	// Slow enough that every first run asks before the read finishes.
+	if err := os.WriteFile(filepath.Join(bin, "create-sleep"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l := Layout{Root: t.TempDir()}
+	session := func(n int) *Session {
+		s := &Session{layout: l, slotDir: l.Slot("repo", n), repoID: "repo"}
+		s.workspace = filepath.Join(s.slotDir, "workspace")
+		if err := os.MkdirAll(s.workspace, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	mountRe := regexp.MustCompile(`type=bind,source=([^,]+),target=/etc/passwd,readonly`)
+	run := func(s *Session) (string, error) {
+		host, _, cleanup, err := s.containerScript(&protocol.ContainerRun{Image: "python:3"}, "true", s.workspace, map[string]string{})
+		if err != nil {
+			return "", err
+		}
+		if err := cleanup(); err != nil {
+			return "", err
+		}
+		m := mountRe.FindStringSubmatch(host)
+		if m == nil {
+			return "", errors.New("no passwd mount: " + host)
+		}
+		return m[1], nil
+	}
+
+	sessions := []*Session{session(0), session(1), session(2), session(3)}
+	sources := make([]string, len(sessions))
+	errs := make(chan error, len(sessions))
+	for i, s := range sessions {
+		go func() {
+			var err error
+			sources[i], err = run(s)
+			errs <- err
+		}()
+	}
+	for range sessions {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(callsWith(t, calls, "create --pull never")); n != 1 {
+		t.Fatalf("image read %d times by %d first runs", n, len(sessions))
+	}
+	for i, src := range sources {
+		if src != sources[0] {
+			t.Fatalf("slot %d mounts %s, slot 0 %s", i, src, sources[0])
+		}
+		if strings.HasPrefix(src, sessions[i].slotDir+string(filepath.Separator)) {
+			t.Fatalf("users files kept in the slot: %s", src)
+		}
+	}
+
+	// A slot released (its run directory cleared) and a new one: no read.
+	if err := os.RemoveAll(filepath.Join(sessions[0].slotDir, "run")); err != nil {
+		t.Fatal(err)
+	}
+	src, err := run(session(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(src); err != nil || !strings.HasPrefix(string(b), "root:x:0:0:") {
+		t.Fatalf("passwd %q (%v)", b, err)
+	}
+	if n := len(callsWith(t, calls, "create --pull never")); n != 1 {
+		t.Fatalf("image read %d times", n)
+	}
+}
