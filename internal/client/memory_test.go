@@ -111,6 +111,30 @@ func TestLostBeforeTheCommandIsReplayed(t *testing.T) {
 	}
 }
 
+// A run its caller interrupted, whose session the interrupt ended, isn't
+// reported as having lost its runner (#289): the VM is blamed only when the
+// session was given up on for silence, which the interrupt can't cause.
+func TestInterruptedRunBlamesNoRunner(t *testing.T) {
+	retry := Options{RetryPreempt: true, Sync: "auto"}
+	for _, nr := range []noReplay{
+		{code: "RUNNER_UNRESPONSIVE", why: "while running the command, although EC2 still reports it running, without a Spot notice: the command may be what overloaded it"},
+		{code: "MEMORY_PRESSURE", why: "while running the command: it was out of memory (120 MiB of 16000 MiB memory available)"},
+		{code: "CLIENT_SUSPENDED", why: "while running the command, after this machine was asleep"},
+	} {
+		res := Result{noReplay: nr, lostAt: running}
+		if ok, code, why := replayable("i-run", res, retry, true, 1); ok || code != "" || why != "" {
+			t.Errorf("%s, interrupted: replay %v, code %q (%q); want no replay and no warning", nr.code, ok, code, why)
+		}
+		res.lostSilent = true
+		if ok, code, why := replayable("i-run", res, retry, true, 1); ok || code != nr.code || !strings.HasPrefix(why, "lost i-run "+nr.why) || strings.Contains(why, "not replaying") {
+			t.Errorf("%s, silent, then interrupted: replay %v, code %q (%q); want the warning, without a withheld replay", nr.code, ok, code, why)
+		}
+		if ok, code, _ := replayable("i-run", Result{noReplay: nr, lostAt: running}, retry, false, 1); ok || code != nr.code {
+			t.Errorf("%s, not interrupted: replay %v, code %q; want the warning", nr.code, ok, code)
+		}
+	}
+}
+
 // Once the command was dispatched, the warning names the phase, the last
 // memory reading when there is one, and suggests --exclusive only to a run
 // that didn't already have it.

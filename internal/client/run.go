@@ -166,6 +166,10 @@ type Result struct {
 	noReplay noReplay
 	// lostAt, when the runner was lost, is how far the attempt had got.
 	lostAt stage
+	// lostSilent, when the runner was lost, is whether the session was
+	// given up on because the helper went silent (transport.Session.Silent):
+	// a loss an interrupt can't have caused.
+	lostSilent bool
 	// lostWhen is when the attempt gave up on its runner (no earlier than
 	// the last word it sent the helper).
 	lostWhen time.Time
