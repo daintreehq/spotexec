@@ -862,12 +862,19 @@ func cmdDown() *cobra.Command {
 					errs = append(errs, err.Error())
 					continue
 				}
+				// Marked first: a launch reserved meanwhile (a concurrent
+				// up) keeps its reservation through the reset.
+				f, fleet := p.(provider.Fleet)
+				var mark client.DownMark
+				if fleet {
+					mark = client.NewPool(r, f).MarkDown()
+				}
 				if err := p.Down(cmd.Context(), func(f string, a ...any) { fmt.Fprintf(os.Stderr, "%s: %s\n", r.Name, fmt.Sprintf(f, a...)) }); err != nil {
 					errs = append(errs, fmt.Sprintf("%s: %v", r.Name, err))
 					continue
 				}
-				if f, ok := p.(provider.Fleet); ok {
-					client.NewPool(r, f).Reset()
+				if fleet {
+					client.NewPool(r, f).Reset(mark)
 				}
 				fmt.Printf("%s: terminated\n", r.Name)
 				if r.MinInstances > 0 && daemon.Running() != 0 {

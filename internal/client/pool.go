@@ -1134,12 +1134,42 @@ func (p *Pool) Cancel(id string) {
 	})
 }
 
-// Reset forgets all local pool state (after `spotexec down`).
-func (p *Pool) Reset() {
+// DownMark is what a teardown can end of the pool's launches: those already
+// bound to an instance (or failed) when it began. MarkDown takes it.
+type DownMark map[string]bool
+
+// MarkDown records, before `spotexec down` lists the fleet, which launch
+// reservations it can have seen.
+func (p *Pool) MarkDown() DownMark {
+	m := DownMark{}
 	_ = p.with(func(st *poolState) error {
+		for _, l := range st.Launches {
+			if l.Failed || l.InstanceID != "" {
+				m[l.ID] = true
+			}
+		}
+		return nil
+	})
+	return m
+}
+
+// Reset forgets local pool state after `spotexec down` (marked by m before
+// it began), except the launch reservations it can't have ended: one still
+// being sent when it began, or reserved since (a concurrent up's prewarm),
+// keeps counting toward max_instances, so no other process reserves the
+// same room. One whose VM did end stops counting once listings show it
+// gone, as for any launch.
+func (p *Pool) Reset(m DownMark) {
+	_ = p.with(func(st *poolState) error {
+		var keep []launchRec
+		for _, l := range st.Launches {
+			if !l.Failed && !m[l.ID] {
+				keep = append(keep, l)
+			}
+		}
 		// Held stays: the fleet's region holds outlive a teardown, and an
 		// answer from the region must still end them.
-		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}, Held: st.Held}
+		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}, Held: st.Held, Launches: keep}
 		return nil
 	})
 }

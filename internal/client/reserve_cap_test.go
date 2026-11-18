@@ -147,3 +147,44 @@ func TestReserveLiveCapAcrossConcurrentCallers(t *testing.T) {
 		t.Fatalf("concurrent prewarms reserved %d at three live, want 1", sum)
 	}
 }
+
+// A launch reserved while `spotexec down` runs (a concurrent up's prewarm)
+// keeps its reservation through the reset that follows (#295), so another
+// process can't reserve the same room and push the fleet past
+// max_instances. The VMs the teardown ended free theirs.
+func TestResetKeepsLaunchesReservedDuringDown(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 2)
+	ids, _ := p.Reserve(ctx, 1)
+	if _, err := p.Provision(ctx, ids[0], nil); err != nil {
+		t.Fatal(err)
+	}
+	mark := p.MarkDown()
+	// The prewarm reserves while the teardown lists and terminates.
+	prewarm, _ := p.Reserve(ctx, 1)
+	if len(prewarm) != 1 {
+		t.Fatalf("prewarm reserved %d", len(prewarm))
+	}
+	f.mu.Lock()
+	f.insts = nil // down ended the VM it listed
+	f.mu.Unlock()
+	p.Reset(mark)
+	if got, _ := p.Reserve(ctx, 2); len(got) != 1 {
+		t.Fatalf("reserved %d after down, want 1: the prewarm's launch still counts", len(got))
+	}
+	if _, err := p.Provision(ctx, prewarm[0], nil); err != nil {
+		t.Fatalf("the prewarm's launch lost its reservation: %v", err)
+	}
+	if st := readState(t, p); !hasLaunch(st, prewarm[0]) {
+		t.Fatalf("prewarm's launch record gone: %+v", st.Launches)
+	}
+}
+
+func hasLaunch(st poolState, id string) bool {
+	for _, l := range st.Launches {
+		if l.ID == id && l.InstanceID != "" {
+			return true
+		}
+	}
+	return false
+}
