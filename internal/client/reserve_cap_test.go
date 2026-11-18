@@ -147,3 +147,76 @@ func TestReserveLiveCapAcrossConcurrentCallers(t *testing.T) {
 		t.Fatalf("concurrent prewarms reserved %d at three live, want 1", sum)
 	}
 }
+
+// A launch reserved while `spotexec down` runs (a concurrent up's prewarm)
+// keeps its reservation through the reset that follows (#295), so another
+// process can't reserve the same room and push the fleet past
+// max_instances. The VMs the teardown ended free theirs.
+func TestResetKeepsLaunchesReservedDuringDown(t *testing.T) {
+	ctx := context.Background()
+	p, f := testPool(t, 2)
+	ids, _ := p.Reserve(ctx, 1)
+	if _, err := p.Provision(ctx, ids[0], nil); err != nil {
+		t.Fatal(err)
+	}
+	mark := p.MarkDown(context.Background())
+	// The prewarm reserves while the teardown lists and terminates.
+	prewarm, _ := p.Reserve(ctx, 1)
+	if len(prewarm) != 1 {
+		t.Fatalf("prewarm reserved %d", len(prewarm))
+	}
+	f.mu.Lock()
+	f.insts = nil // down ended the VM it listed
+	f.mu.Unlock()
+	p.Reset(mark)
+	if st := readState(t, p); len(st.Launches) != 1 || st.Launches[0].ID != prewarm[0] {
+		t.Fatalf("launches after reset %+v, want just the prewarm's", st.Launches)
+	}
+	if got, _ := p.Reserve(ctx, 2); len(got) != 1 {
+		t.Fatalf("reserved %d after down, want 1: the prewarm's launch still counts", len(got))
+	}
+	if _, err := p.Provision(ctx, prewarm[0], nil); err != nil {
+		t.Fatalf("the prewarm's launch lost its reservation: %v", err)
+	}
+	if st := readState(t, p); !hasLaunch(st, prewarm[0]) {
+		t.Fatalf("prewarm's launch record gone: %+v", st.Launches)
+	}
+}
+
+func hasLaunch(st poolState, id string) bool {
+	for _, l := range st.Launches {
+		if l.ID == id && l.InstanceID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// A VM launched after down listed the fleet, with a run already placed on
+// it, keeps that run in the ledger through the reset (#295): it still
+// protects the VM from boot cleanup.
+func TestResetKeepsRunsOnVMsDownDidNotSee(t *testing.T) {
+	ctx := context.Background()
+	p, _ := testPool(t, 2)
+	mark := p.MarkDown(ctx)
+	ids, _ := p.Reserve(ctx, 1)
+	in, err := p.Provision(ctx, ids[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aid, err := p.reserveOn(in, claim{})
+	if err == nil {
+		err = p.markSent(aid)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq := p.state(t).Seq
+	p.Reset(mark)
+	if s := p.state(t); !s.protected(in.ID) || s.Seq != seq || s.VMs[in.ID] == nil {
+		t.Fatalf("the reset forgot what the ledger knew of %s: protected %v, seq %d (was %d), vm %v", in.ID, s.protected(in.ID), s.Seq, seq, s.VMs[in.ID])
+	}
+	if p.fenceBooting(in.ID) {
+		t.Fatal("boot cleanup may end a VM a run is using")
+	}
+}

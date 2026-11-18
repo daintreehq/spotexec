@@ -345,6 +345,9 @@ type placementState struct {
 	// Speed: workload -> instance type -> how long its successful runs'
 	// commands took on VMs of that type, oldest first (see RecordRunSpeed).
 	Speed map[string]map[string][]speedSample `json:"speed,omitempty"`
+	// Memory: workload -> the peak memory of its latest runs on VMs of
+	// this runner, oldest first (see RecordRunMemory).
+	Memory map[string][]memSample `json:"memory,omitempty"`
 	// Discovered: every managed region has been listed once. Until then
 	// (first use, an upgrade from single-region, a lost state file) listings
 	// cover them all rather than trusting Active.

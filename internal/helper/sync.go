@@ -120,10 +120,21 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		want[e.Path] = e
 	}
 
-	// Prune files we previously synced that are no longer in the manifest.
+	// Prune files we previously synced that are no longer in the manifest,
+	// and those a sync was writing when its helper died, before it could
+	// record them.
+	prune := make([]string, 0, len(s.stored)+len(s.state.Writing))
+	for p := range s.stored {
+		prune = append(prune, p)
+	}
+	for _, p := range s.state.Writing {
+		if _, ok := s.stored[p]; !ok {
+			prune = append(prune, p)
+		}
+	}
 	deleted := 0
 	var dirs []string
-	for p := range s.stored {
+	for _, p := range prune {
 		if _, ok := want[p]; ok {
 			continue
 		}
@@ -214,6 +225,37 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		need = append(need, e.Path)
 		needBytes += e.Size
 	}
+	// Each path the copies and the archive may create is known before the
+	// first is: a helper that dies between placing a file and saving the
+	// manifest leaves nothing the next sync can't prune. Only paths with
+	// nothing there yet (a file already there is the slot's, never pruned
+	// on this record), and those an interrupted sync left that are still
+	// wanted, until a saved manifest records them.
+	var writing []string
+	journaled := make(map[string]bool, len(s.state.Writing))
+	for _, p := range s.state.Writing {
+		journaled[p] = true
+		if _, ok := want[p]; ok {
+			writing = append(writing, p)
+		}
+	}
+	for _, p := range need {
+		full, err := fsid.SafeJoin(s.workspace, p)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Lstat(full); errors.Is(err, fs.ErrNotExist) && !journaled[p] {
+			writing = append(writing, p)
+		}
+	}
+	changed := !slices.Equal(writing, s.state.Writing)
+	s.state.Writing = writing
+	if changed {
+		if err := saveSlotState(s.slotDir, s.state); err != nil {
+			_ = s.saveStored()
+			return err
+		}
+	}
 	upload, need, reused, err := s.uploadTurn(need, want)
 	if err != nil {
 		_ = s.saveStored()
@@ -256,6 +298,7 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		return err
 	}
 	upload.Unlock() // recorded: other slots can copy what came
+	s.state.Writing = nil
 	if len(res.Corrected) == 0 {
 		s.state.Fingerprint = m.Fingerprint
 	}

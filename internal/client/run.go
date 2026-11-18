@@ -47,6 +47,12 @@ const (
 	// ExitImageBuild: the project's own Dockerfile failed to build
 	// (ImageBuildError), so the command never ran.
 	ExitImageBuild = 123
+	// ExitOOM: the command failed after the kernel's OOM killer killed a
+	// process in its container (OOM_KILLED), whatever code the command
+	// itself exited with, so running out of memory isn't mistaken for a
+	// test or type failure (#294). 128+SIGKILL, what the killed process
+	// itself exits with.
+	ExitOOM = 137
 )
 
 // Large-sync guardrails.
@@ -166,6 +172,10 @@ type Result struct {
 	noReplay noReplay
 	// lostAt, when the runner was lost, is how far the attempt had got.
 	lostAt stage
+	// lostSilent, when the runner was lost, is whether the session was
+	// given up on because the helper went silent (transport.Session.Silent):
+	// a loss an interrupt can't have caused.
+	lostSilent bool
 	// lostWhen is when the attempt gave up on its runner (no earlier than
 	// the last word it sent the helper).
 	lostWhen time.Time
@@ -350,6 +360,14 @@ type InfraError struct{ Err error }
 func (e *InfraError) Error() string { return e.Err.Error() }
 func (e *InfraError) Unwrap() error { return e.Err }
 
+// WritebackError is the error of a run whose command finished but whose
+// file changes could not be written back. A caller that reports an
+// interrupted run's interrupt rather than its error still says this.
+type WritebackError struct{ Err error }
+
+func (e *WritebackError) Error() string { return e.Err.Error() }
+func (e *WritebackError) Unwrap() error { return e.Err }
+
 func infra(err error) error {
 	if err == nil {
 		return nil
@@ -479,8 +497,14 @@ func uploadStall(l *Lease) error {
 // it. A run lost to its whole region going silent (noReplay.region, with
 // no code) is replayed like a reclaimed one; when the options rule the
 // replay out, the warning still says the region went silent.
+//
+// A run its caller interrupted (canceled) is never replayed, and its loss
+// is explained only when the session was given up on for silence
+// (res.lostSilent): otherwise the interrupt most likely ended the session
+// itself (a Ctrl-C reaches the ssh client too), and the VM isn't to blame
+// (#289).
 func replayable(lost string, res Result, o Options, canceled bool, n int) (retry bool, code, why string) {
-	if lost == "" {
+	if lost == "" || canceled && !res.lostSilent {
 		return false, "", ""
 	}
 	eligible := o.RetryPreempt && !canceled && o.Sync != "none" && !o.PreferLast && !o.SameSlot && n < 2
@@ -683,6 +707,19 @@ func noteReclaimed(lease *Lease) {
 // still reports a VM running while its OS halts.
 func replayVerdict(ctx context.Context, lease *Lease, noticed bool, err error, at stage, exclusive bool) noReplay {
 	return whyNoReplayCtx(ctx, lease, noticed || vmShutdown(err), at, exclusive)
+}
+
+// lossVerdict is what an attempt that lost its runner records: why it
+// must not be replayed (replayVerdict, for a fleet lease), and whether its
+// session was given up on for silence. An interrupt that ended the session
+// isn't the VM's doing (#289): replayable reports nothing for that loss, so
+// EC2 isn't asked about it.
+func lossVerdict(ctx context.Context, lease *Lease, noticed bool, err error, at stage, exclusive bool) (nr noReplay, silent bool) {
+	silent = lease.Sess.Silent()
+	if lease.InstanceID != "" && (ctx.Err() == nil || silent) {
+		nr = replayVerdict(ctx, lease, noticed, err, at, exclusive)
+	}
+	return nr, silent
 }
 
 // shutdownErr is what runOnce returns when the VM's shutdown killed the
@@ -896,9 +933,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 		if lost != "" {
 			res.lostAt, res.lostWhen = prog.get(), time.Now()
-			if lease.InstanceID != "" {
-				res.noReplay = replayVerdict(ctx, lease, noticed.Load(), err, res.lostAt, o.Exclusive)
-			}
+			res.noReplay, res.lostSilent = lossVerdict(ctx, lease, noticed.Load(), err, res.lostAt, o.Exclusive)
 		}
 	}()
 	// Before the command starts, Ctrl-C aborts the session outright (a
@@ -1069,6 +1104,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		running = fmt.Sprintf("%s · running setup ([setup] run)", label)
 		o.Rep.Event("setup", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": run})
 	}
+	// What earlier runs of it needed at their peak, for the runner to
+	// start it only where that fits (#294).
+	memWorkload := memoryWorkload(ws, o, ex)
+	ex.MemoryMB = provider.RunMemory(r, memWorkload)
 	o.Rep.Status("%s", running)
 	o.Rep.Event("exec", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": o.Display, "cwd": ws.Cwd})
 	stopWatch.Do(func() { close(execStarted) })
@@ -1165,6 +1204,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		return res, nil, ""
 	}
 	res.ExitCode, res.TimedOut = result.ExitCode, result.TimedOut
+	recordRunMemory(r, memWorkload, result)
 	// An interrupt (Ctrl-C, SIGTERM) at any point up to the final result
 	// makes the run interrupted: 130, never a success.
 	checkCanceled := func() {
@@ -1214,6 +1254,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if result.OOMKilled {
 		res.OOMKilled = true
 		o.Rep.Warn("OOM_KILLED", "%s", oomMessage(result.MemoryLimitMB))
+		res.ExitCode = oomExit(res)
 	}
 	res.speed = runSpeed(lease, ws, o, result, ex.Env, res.Canceled)
 
@@ -1246,7 +1287,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
-			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)), ""
+			return res, infra(&WritebackError{fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)}), ""
 		}
 		res.Mutated, res.Deleted = wb.Applied, wb.Deleted
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "held_files": len(wb.HeldNew), "held_bytes": wb.HeldNewBytes, "duration_ms": time.Since(t).Milliseconds()})
@@ -1485,6 +1526,52 @@ func shutdownRunner(l *Lease) string {
 func conflictExit(res Result, failOnConflict bool) int {
 	if failOnConflict && len(res.Conflicts) > 0 && res.ExitCode == 0 && !res.Canceled && !res.TimedOut && !res.SetupFailed {
 		return ExitWritebackConflict
+	}
+	return res.ExitCode
+}
+
+// memoryWorkload names what a run's peak memory is kept under: its
+// workload (SpeedWorkload) and its [setup] run, which runs in the same
+// measurement; "" for a run that can't be in a memory pool (on the runner
+// itself, or with the VM to itself), which keeps none.
+func memoryWorkload(ws *Workspace, o Options, ex protocol.Exec) string {
+	if ex.Container == nil || o.Exclusive {
+		return ""
+	}
+	w := SpeedWorkload(ws.RepoID, ws.Cwd, o, ex.Env)
+	if ex.SetupRun != "" {
+		sum := sha256.Sum256([]byte(w + "\x00" + ex.SetupRun))
+		w = hex.EncodeToString(sum[:16])
+	}
+	return w
+}
+
+// recordRunMemory keeps what a run used at its peak in the memory pool, for
+// the next run of the same workload to reserve: only a run that finished
+// cleanly, since one stopped early (canceled, timed out, a failed setup)
+// never reached its peak; or the pool's whole cap when it was OOM killed
+// there, so that run starts only once nothing else runs beside it (and
+// measures what it needs alone). Best effort, and kept whatever happens to
+// the run's write-back.
+func recordRunMemory(r *config.Runner, workload string, result protocol.Result) {
+	mb := result.PeakMemoryMB
+	switch {
+	case result.OOMKilled && result.MemoryLimitMB > 0:
+		mb = max(mb, result.MemoryLimitMB)
+	case result.ExitCode != 0 || result.TimedOut || result.Canceled || result.Shutdown || result.SetupFailed || result.StartError != "":
+		return
+	}
+	_ = provider.RecordRunMemory(r, workload, mb)
+}
+
+// oomExit is the exit code of a run whose container had a process OOM
+// killed: ExitOOM when the command (or its [setup]) failed, so the failure
+// reads as memory, not as the command's own (a task script exits 1 when
+// the compiler it ran was killed). A command that still succeeded, timed
+// out or was interrupted keeps its code.
+func oomExit(res Result) int {
+	if res.OOMKilled && res.ExitCode != 0 && !res.Canceled && !res.TimedOut {
+		return ExitOOM
 	}
 	return res.ExitCode
 }

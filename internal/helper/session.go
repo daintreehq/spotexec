@@ -86,7 +86,11 @@ type Session struct {
 		name    string
 		d       dockerRunner
 		started time.Time
+		cid     string // the file docker writes its ID to, when in the memory pool
 	}
+	// runMem is the memory the current exec's command reserves in the
+	// pool, recorded with its run permit (see runmemory.go).
+	runMem     runMemRecord
 	stored     map[string]storedEntry
 	exiting    atomic.Bool
 	child      atomic.Int64 // running command's process group, if any
@@ -688,6 +692,9 @@ func (s *Session) releaseLocks(teardown bool) {
 	// still at the last heartbeat.
 	if held {
 		touchActivity(s.layout.Root)
+	}
+	if s.run != nil {
+		_ = os.Remove(s.layout.RunMem(s.runIdx))
 	}
 	s.run.Unlock()
 	s.run, s.runIdx = nil, 0

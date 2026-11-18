@@ -115,6 +115,9 @@ type launchRec struct {
 	// Region the instance launched in ("" until known): while that region
 	// can't be listed, the instance's absence proves nothing.
 	Region string `json:"region,omitempty"`
+	// Demand: launched by Plan for waiting jobs (not `spotexec up`): the
+	// controller lets it go once it is found unused (#297).
+	Demand bool `json:"demand,omitempty"`
 }
 
 type poolState struct {
@@ -549,10 +552,12 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	// Fresh from now: a slow type lookup in matchConfig mustn't leave the
 	// listing already stale, sending every waiting process to re-list.
 	st.ListedAt = time.Now()
-	live := map[string]bool{}
+	live, serving := map[string]bool{}, map[string]bool{}
 	for _, in := range st.Instances {
 		live[in.ID] = true
+		serving[in.ID] = in.State == provider.StateRunning && in.Target.Host != ""
 	}
+	st.keepDemand(serving, time.Now())
 	if !partial {
 		for id, n := range st.Notes {
 			// A bootstrap failure is remembered for an hour after its VM is
@@ -720,10 +725,17 @@ const (
 // region when it shows the client can't reach the region (or ends that
 // hold when the VM answered).
 func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
+	p.ObserveCtx(context.Background(), id, o, launchedAt)
+}
+
+// ObserveCtx is Observe, but gives up waiting for the ledger's lock (and
+// the observation) when ctx ends: an acquire out of queue time doesn't
+// wait on a stopped process holding it (#295).
+func (p *Pool) ObserveCtx(ctx context.Context, id string, o Outcome, launchedAt time.Time) {
 	if o == outSkipped {
 		return
 	}
-	_ = p.with(func(st *poolState) error {
+	_ = p.withCtx(ctx, func(st *poolState) error {
 		n := st.note(id)
 		now := time.Now()
 		switch o {
@@ -963,11 +975,15 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Held, d.Deferred = true, d.Demand-d.Capacity-d.Ready
 			d.Reason = fmt.Sprintf("%s on running VMs expected to free within %s, sooner than a new VM (~%s)",
 				plural(d.Deferred, "slot"), ui.Dur(d.FreeIn), ui.Dur(d.Lead))
+		case p.briefWait(st, &d, demand, whole, away, pendingVM, now):
+			d.Held, d.Deferred = true, 1
+			d.Reason = fmt.Sprintf("a job on a full VM may end any moment (no predicted end, or just past it): waiting up to %s more before launching (~%s)",
+				ui.Dur(min(briefWaitFor, d.Lead)-d.Waited), ui.Dur(d.Lead))
 		default:
 			var b [6]byte
 			_, _ = rand.Read(b[:])
 			d.Launch, d.ID = true, hex.EncodeToString(b[:])
-			st.Launches = append(st.Launches, launchRec{ID: d.ID, Started: time.Now(), PID: os.Getpid()})
+			st.Launches = append(st.Launches, launchRec{ID: d.ID, Started: time.Now(), PID: os.Getpid(), Demand: true})
 			d.Pending++
 			d.Capacity += slots
 		}
@@ -1134,12 +1150,79 @@ func (p *Pool) Cancel(id string) {
 	})
 }
 
-// Reset forgets all local pool state (after `spotexec down`).
-func (p *Pool) Reset() {
+// DownMark is what a teardown can end of the pool's launches: those already
+// bound to an instance (or failed) when it began. MarkDown takes it.
+type DownMark map[string]bool
+
+// MarkDown records, before `spotexec down` lists the fleet, which launch
+// reservations it can have seen. It gives up waiting for the ledger when
+// ctx ends; without a mark, Reset keeps every launch not known to have
+// failed (they stop counting once listings show them gone).
+func (p *Pool) MarkDown(ctx context.Context) DownMark {
+	m := DownMark{}
+	_ = p.withCtx(ctx, func(st *poolState) error {
+		for _, l := range st.Launches {
+			if l.Failed || l.InstanceID != "" {
+				m[l.ID] = true
+			}
+		}
+		return nil
+	})
+	return m
+}
+
+// Reset forgets local pool state after `spotexec down` (marked by m before
+// it began), except the launch reservations it can't have ended: one still
+// being sent when it began, or reserved since (a concurrent up's prewarm),
+// keeps counting toward max_instances, so no other process reserves the
+// same room. One whose VM did end stops counting once listings show it
+// gone, as for any launch.
+func (p *Pool) Reset(m DownMark) {
 	_ = p.with(func(st *poolState) error {
+		var keep []launchRec
+		vms := map[string]bool{} // the kept launches' VMs: down didn't see them
+		for _, l := range st.Launches {
+			if !l.Failed && !m[l.ID] {
+				keep = append(keep, l)
+				if l.InstanceID != "" {
+					vms[l.InstanceID] = true
+				}
+			}
+		}
+		// What the ledger knows of those VMs stays too: a run already
+		// placed on one still protects it (fenceBooting).
+		old, notes := st.sched(), map[string]*note{}
+		// Seq stays with them: a kept VM's Joined must stay below any VM
+		// that joins later.
+		sched := &schedState{Version: schedVersion, Seq: old.Seq}
+		for id, a := range old.Attempts {
+			if vms[a.VM] {
+				if sched.Attempts == nil {
+					sched.Attempts = map[string]*claimRec{}
+				}
+				sched.Attempts[id] = a
+			}
+		}
+		for vm := range vms {
+			if f := old.Fences[vm]; f != nil {
+				if sched.Fences == nil {
+					sched.Fences = map[string]*fence{}
+				}
+				sched.Fences[vm] = f
+			}
+			if v := old.VMs[vm]; v != nil {
+				if sched.VMs == nil {
+					sched.VMs = map[string]*vmSched{}
+				}
+				sched.VMs[vm] = v
+			}
+			if n := st.Notes[vm]; n != nil {
+				notes[vm] = n
+			}
+		}
 		// Held stays: the fleet's region holds outlive a teardown, and an
 		// answer from the region must still end them.
-		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}, Held: st.Held}
+		*st = poolState{Notes: notes, Sched: sched, Held: st.Held, Launches: keep}
 		return nil
 	})
 }
@@ -1260,6 +1343,11 @@ func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger
 	recorded = true
 	launchesInFlight.Done()
 	ran, err := p.Fleet.WaitRunning(ctx, in.ID, log)
+	if err != nil && ctx.Err() == nil && !p.fenceBooting(in.ID) {
+		// Its status never read, yet listings showed it serving: a run
+		// already reached it, so it stays (and keeps its reservation).
+		return in, fmt.Errorf("%w (%s was left running: a run is using it)", err, in.ID)
+	}
 	if err != nil && ctx.Err() == nil {
 		// Reclaimed or broken while booting (a bad volume key, an instant
 		// Spot reclaim, no public IP): end it so it can't linger unusable,
@@ -1295,6 +1383,45 @@ func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger
 		ran.Zone = in.Zone
 	}
 	return ran, err
+}
+
+// fenceBooting reports whether a VM this client launched, and is about to
+// end because it never got ready, may be ended, and if so fences it: until
+// the termination request is out, no claim (not even an exact slot)
+// reserves it, and reservations (and an exclusive job's fence) that sent
+// nothing yet are revoked (their send then fails: nothing reaches the VM). A VM a run already sent to or
+// holds a slot on is not ended (#295): fleet listings can show it serving
+// while its own status can't be read (a throttled lookup by ID). Without
+// the ledger, it may be ended as before.
+func (p *Pool) fenceBooting(id string) bool {
+	ok := true
+	_ = p.with(func(st *poolState) error {
+		s := st.sched()
+		now := time.Now()
+		s.reconcileOwners(now) // a dead process's reservation doesn't hold it
+		var unsent []string
+		for aid, a := range s.Attempts {
+			if a.VM != id || !a.live() {
+				continue
+			}
+			if a.State != attReserved {
+				ok = false
+				return nil
+			}
+			unsent = append(unsent, aid)
+		}
+		for _, aid := range unsent {
+			delete(s.Attempts, aid)
+		}
+		delete(s.Fences, id) // an exclusive job waiting for it goes elsewhere
+		if len(unsent) > 0 {
+			s.sample(p.R, now)
+		}
+		n := st.note(id)
+		n.Reaping, n.ReapCommitted = now, true
+		return nil
+	})
+	return ok
 }
 
 func firstLine(s string) string {
@@ -1395,6 +1522,61 @@ func (w *Waiter) Done() {
 	_ = syscall.Flock(int(w.f.Fd()), syscall.LOCK_UN)
 	_ = w.f.Close()
 	w.f = nil
+}
+
+// briefWaitFor bounds briefWait: a lone job waits this long at most for a
+// full VM's slot before its fleet launches (#297).
+const briefWaitFor = 15 * time.Second
+
+// justFreedFor is how long after this machine releases a slot on a VM a
+// probe's busy hint there (busyHintFor) is taken for one that saw the slot
+// still held: past it, a VM still reported full is full with someone
+// else's jobs.
+const justFreedFor = 3 * time.Second
+
+// briefWait reports whether a lone waiting job, which has waited only
+// moments, may wait a little longer for a slot on a full VM whose jobs
+// have no prediction, or only just passed it (releaseSoon counts neither):
+// one of them is likely to end before a new VM would serve, and a VM
+// launched for that job would get no work (#297). Past briefWaitFor (or
+// the launch's lead, if shorter) the demand launches as before. A burst,
+// a whole-VM waiter, or a VM with jobs admitted beyond its slots launches
+// at once, as does a fleet whose jobs are known to end later.
+func (p *Pool) briefWait(st *poolState, d *LaunchDecision, demand int, whole []int, away awayDemand, pendingVM map[string]bool, now time.Time) bool {
+	if demand != 1 || len(whole) > 0 || d.Demand-d.Capacity-d.Ready != 1 || p.since.IsZero() || d.Waited < 0 || d.Waited >= min(briefWaitFor, d.Lead) {
+		return false
+	}
+	s := st.sched()
+	for _, in := range st.Instances {
+		n := st.Notes[in.ID]
+		if in.State != provider.StateRunning || in.Target.Host == "" || n == nil || !n.Ready || n.closed() || now.Before(n.SuspectUntil) ||
+			pendingVM[in.ID] || s.Fences[in.ID] != nil || (in.Region != "" && away.avoided(in.Region)) {
+			continue
+		}
+		firm, unc := s.held(p.R, in.ID)
+		// A slot this machine released here moments ago, which a probe's
+		// busy hint still hides from readyRoom (the probe saw the VM full
+		// before the release, or before the helper had let the slot go):
+		// the waiting job's next probe takes it. Only a busy reply's hint
+		// (a failed probe's cooldown leaves Failures set), and only
+		// briefly: a VM still reported full by then is full with another
+		// machine's jobs.
+		if v := s.VMs[in.ID]; v != nil && now.Before(n.BusyUntil) && n.Failures == 0 && !v.LastEnd.IsZero() && now.Sub(v.LastEnd) < justFreedFor &&
+			unc == 0 && firm < s.units(p.R, in.ID) {
+			return true
+		}
+		// Full with this machine's own jobs, none beyond its slots: the
+		// next slot to free is the waiting job's.
+		if unc > 0 || firm != s.units(p.R, in.ID) {
+			continue
+		}
+		for _, a := range s.Attempts {
+			if a.VM == in.ID && a.State == attAcquired && (a.Expect.IsZero() || (!a.Expect.After(now) && now.Sub(a.Expect) < briefWaitFor)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // releaseSoon reports whether the demand this fleet isn't launching for,

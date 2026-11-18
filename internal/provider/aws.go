@@ -480,7 +480,14 @@ func (a *AWSSpot) launchOrUnbaked(ctx context.Context, log Logger, spec launchSp
 	if err != nil && !spec.bake && !spec.noBake && (a.r.AMI == "" || a.r.AMI == "auto") && strings.HasPrefix(awsCode(err), "InvalidAMIID") {
 		log("baked image is gone (%s); launching from the current Ubuntu image", awsCode(err))
 		spec.noBake = true
-		return a.launchWith(ctx, log, spec)
+		inst, err = a.launchWith(ctx, log, spec)
+	}
+	if err == nil && !spec.bake {
+		// Under the provisioning lock still, so a Down after this launch
+		// finds it even before tag-filtered listings show it.
+		if nerr := a.noteLaunched(inst.InstanceID); nerr != nil {
+			log("couldn't note %s for `spotexec down` (it finds it once listings show it): %v", inst.InstanceID, nerr)
+		}
 	}
 	return inst, err
 }
@@ -1244,6 +1251,10 @@ func (a *AWSSpot) Terminate(ctx context.Context, id string) error {
 	err := a.terminateAny(ctx, id)
 	if err == nil {
 		_ = os.Remove(a.knownHosts(id))
+		// Its vCPUs are free once listings stop showing it, as after Down:
+		// a replacement near the Spot quota needn't wait out the claim.
+		a.releaseClaims([]string{id})
+		a.forgetLaunched([]string{id})
 	}
 	return err
 }
@@ -1284,9 +1295,13 @@ func (a *AWSSpot) downLocked(ctx context.Context, log Logger) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	recent, lerr := a.unlistedLaunches(ctx, insts)
+	insts = append(insts, recent...)
 	if len(insts) == 0 {
-		log("no running instances for %s", a.r.Name)
-		return 0, nil
+		if lerr == nil {
+			log("no running instances for %s", a.r.Name)
+		}
+		return 0, lerr
 	}
 	ids := make([]string, len(insts))
 	types := make(map[string]string, len(insts))
@@ -1301,8 +1316,63 @@ func (a *AWSSpot) downLocked(ctx context.Context, log Logger) (int, error) {
 	}
 	if len(done) > 0 {
 		a.releaseClaims(done)
+		a.forgetLaunched(done)
 	}
-	return len(done), err
+	return len(done), errors.Join(err, lerr)
+}
+
+// unlistedLaunches looks up by ID the instances this machine launched in
+// the region moments ago that listed (a tag-filtered listing) leaves out:
+// EC2's tag index can lag a brand-new instance. Those still ours and not
+// yet ending are returned; an error names the ones that couldn't be looked
+// up, which may still be running.
+func (a *AWSSpot) unlistedLaunches(ctx context.Context, listed []ec2Instance) ([]ec2Instance, error) {
+	ids, err := a.recentLaunches()
+	if err != nil {
+		err = fmt.Errorf("can't read the VMs launched moments ago (a listing may not show them yet): %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, err
+	}
+	owner, oerr := a.ownerTag()
+	if oerr != nil {
+		return nil, errors.Join(err, oerr)
+	}
+	seen := map[string]bool{}
+	for _, i := range listed {
+		seen[i.InstanceID] = true
+	}
+	// Looked up at once: each may wait out EC2's lag for a brand-new ID.
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var out []ec2Instance
+	errs := []error{err}
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			i, err := a.describeID(ctx, id)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("can't look up %s, launched moments ago: %w", id, err))
+				return
+			}
+			switch i.State {
+			case "pending", "running", "stopping", "stopped":
+			default:
+				return // already ending
+			}
+			if i.tag(tagOwner) == owner && i.tag(tagRunner) == a.r.Name {
+				out = append(out, i)
+			}
+		}()
+	}
+	wg.Wait()
+	return out, errors.Join(errs...)
 }
 
 // maxTerminateIDs is the most instance IDs EC2 takes in one

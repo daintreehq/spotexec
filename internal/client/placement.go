@@ -127,6 +127,7 @@ type speedSample struct {
 	runner   *config.Runner
 	workload string
 	itype    string
+	vm       string
 	took     time.Duration
 }
 
@@ -144,14 +145,14 @@ func runSpeed(lease *Lease, ws *Workspace, o Options, r protocol.Result, env map
 	if r.ExitCode != 0 || r.TimedOut || r.Canceled || r.Shutdown || r.Withdrawn || r.SetupFailed || r.OOMKilled || r.StartError != "" || r.CommandMS <= 0 {
 		return nil
 	}
-	return &speedSample{runner: lease.Runner, workload: SpeedWorkload(ws.RepoID, ws.Cwd, o, env), itype: lease.Instance.Type, took: time.Duration(r.CommandMS) * time.Millisecond}
+	return &speedSample{runner: lease.Runner, workload: SpeedWorkload(ws.RepoID, ws.Cwd, o, env), itype: lease.Instance.Type, vm: lease.InstanceID, took: time.Duration(r.CommandMS) * time.Millisecond}
 }
 
 // recordRunSpeed keeps s, if any. Best effort: a failure to save it never
 // fails the run.
 func recordRunSpeed(s *speedSample) {
 	if s != nil {
-		_ = provider.RecordRunSpeed(s.runner, s.workload, s.itype, s.took)
+		_ = provider.RecordRunSpeed(s.runner, s.workload, s.itype, s.vm, s.took)
 	}
 }
 

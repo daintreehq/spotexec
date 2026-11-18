@@ -105,6 +105,7 @@ func (v *vmSched) lastUseful() time.Time {
 func (p *Pool) control(st *poolState, now time.Time) {
 	s := st.sched()
 	s.reconcileOwners(now)
+	st.keepDemand(nil, now)
 	vs := p.views(st, now)
 	s.sample(p.R, now)
 	if p.R.SchedPolicy() == config.PolicyLegacy {
@@ -161,6 +162,7 @@ func (p *Pool) control(st *poolState, now time.Time) {
 	// Capacity is what answers: a VM still booting can't stand in for one
 	// that works.
 	exclusive := len(s.Fences) > 0
+	quiet := !exclusive && p.waiterDemand() == 0
 	demand := max(s.demandNow(p.R), s.demandP90(now)) + p.R.Scheduling.SpareSlots
 	capacity := 0
 	for _, w := range ret {
@@ -169,7 +171,7 @@ func (p *Pool) control(st *poolState, now time.Time) {
 		}
 	}
 	var victims []*vmView
-	if !exclusive && p.waiterDemand() == 0 {
+	if quiet {
 		for _, w := range ret {
 			if !w.ready || warm[w.in.ID] || now.Before(w.v.Hold) || s.inflight(w.in.ID) || s.Fences[w.in.ID] != nil || s.exactOn(w.in.ID) {
 				continue
@@ -179,12 +181,16 @@ func (p *Pool) control(st *poolState, now time.Time) {
 			}
 		}
 	}
+	unused := quiet && p.unusedSurplus(st, ret, warm, now) // this epoch's one VM, if any
 	if len(victims) == 0 {
 		s.SurplusSince = time.Time{}
 		return
 	}
 	if s.SurplusSince.IsZero() || s.SurplusSince.After(now) {
 		s.SurplusSince = now
+		return
+	}
+	if unused {
 		return
 	}
 	if now.Sub(s.SurplusSince) < sustainSurplus {
@@ -196,6 +202,78 @@ func (p *Pool) control(st *poolState, now time.Time) {
 	v.Role, v.Since, v.Hold = roleStandby, now, time.Time{}
 	v.Reason = fmt.Sprintf("surplus: recent demand (%d slots) fits the other retained VMs (%d slots)", demand, capacity-victim.units)
 	s.Generation++
+}
+
+// unusedSurplus lets one retained VM go that this machine launched for
+// waiting jobs (vmSched.Demand) and never placed a job on, once its
+// minimum residence is over and the other retained VMs that answer cover
+// the slots held now, plus spare_slots (#297). It reports whether it did.
+// Recent demand (p90) doesn't keep such a VM: demand came and went
+// without it. Nor does its never having answered: no job reaching it is
+// why. Standby is reversible: demand that returns promotes it before any
+// launch, and BeginDrain still checks recent demand before committing its
+// early drain. A VM another machine launched may be serving that machine,
+// and one `spotexec up` launched was asked for, so neither goes this way;
+// they wait for the sustained surplus in control.
+func (p *Pool) unusedSurplus(st *poolState, ret []*vmView, warm map[string]bool, now time.Time) bool {
+	if len(st.Unlisted) > 0 {
+		return false // VMs carried from regions that didn't answer may be gone: they cover nothing here
+	}
+	s := st.sched()
+	need := s.demandNow(p.R) + p.R.Scheduling.SpareSlots
+	var unused []*vmView
+	for _, w := range ret {
+		id := w.in.ID
+		if !w.v.Demand || warm[id] || now.Before(w.v.Hold) || !w.v.lastUseful().IsZero() || s.protected(id) {
+			continue
+		}
+		if n := st.Notes[id]; n != nil && !n.LastUsed.IsZero() {
+			continue
+		}
+		if p.otherReady(ret, w) >= need {
+			unused = append(unused, w)
+		}
+	}
+	if len(unused) == 0 {
+		return false
+	}
+	victim := p.pickVictim(s, unused, ret, now)
+	v := victim.v
+	v.Role, v.Since, v.Hold = roleStandby, now, time.Time{}
+	v.Reason = fmt.Sprintf("unused: demand now (%d slots) fits the other retained VMs (%d slots)", need, p.otherReady(ret, victim))
+	s.Generation++
+	return true
+}
+
+// keepDemand copies onto the VMs' records which of them this machine
+// launched for waiting jobs, so it outlives the launch records (pruned at
+// boot_timeout, or once the VM serves). A VM in serving (running, with an
+// address: one views would list) gets a record if it has none yet, as
+// views would give it (refresh runs this before pruning); nil marks only
+// VMs with a record.
+func (st *poolState) keepDemand(serving map[string]bool, now time.Time) {
+	s := st.sched()
+	for _, l := range st.Launches {
+		if !l.Demand || l.Failed || l.InstanceID == "" {
+			continue
+		}
+		if v := s.VMs[l.InstanceID]; v != nil {
+			v.Demand = true
+		} else if serving[l.InstanceID] {
+			s.vm(l.InstanceID, now).Demand = true
+		}
+	}
+}
+
+// otherReady is the slots of the retained VMs other than w that answer.
+func (p *Pool) otherReady(ret []*vmView, w *vmView) int {
+	n := 0
+	for _, o := range ret {
+		if o != w && o.ready {
+			n += o.units
+		}
+	}
+	return n
 }
 
 // exactOn reports a live exec/pull/--same-slot attempt on a VM.

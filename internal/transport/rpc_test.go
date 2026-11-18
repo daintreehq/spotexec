@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -157,6 +158,56 @@ func TestSilentHelperWhileWaiting(t *testing.T) {
 	}
 	if !s.Dead() {
 		t.Fatal("session not dead after the watchdog")
+	}
+	if !s.Silent() {
+		t.Fatal("a session the watchdog gave up on isn't marked silent")
+	}
+}
+
+// A session that ends because its ssh client was killed here (as an
+// interrupt that reaches it does) didn't lose a silent helper (#289), even
+// when the watchdog was judging a silence as the connection ended: the
+// first error the session recorded decides.
+func TestEndedSessionIsNotSilent(t *testing.T) {
+	e := newFakeEnv(t)
+	short(t, &SilenceLimit, time.Second)
+	e.Set("rpc-silent", "")
+	s := e.session(t)
+	asked, release := make(chan struct{}), make(chan struct{})
+	var once, released sync.Once
+	let := func() { released.Do(func() { close(release) }) }
+	t.Cleanup(let) // a failed wait mustn't leave the watchdog blocked
+	s.SetOnSilent(func(time.Duration) time.Duration {
+		once.Do(func() { close(asked) })
+		<-release
+		return 0 // no grace: the watchdog gives up once it may go on
+	})
+	select {
+	case <-asked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the watchdog never judged the silence")
+	}
+	s.Abort() // the connection ends while the watchdog is judging
+	deadline := time.Now().Add(5 * time.Second)
+	for !s.Dead() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !s.Dead() {
+		t.Fatal("killed session not dead")
+	}
+	let()
+	deadline = time.Now().Add(5 * time.Second)
+	for !s.silent.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !s.silent.Load() {
+		t.Fatal("the watchdog didn't go on to give up on the helper")
+	}
+	if s.Silent() {
+		t.Fatalf("a session whose connection ended first is marked silent (%v)", s.LostErr())
+	}
+	if (*Session)(nil).Silent() {
+		t.Fatal("a nil session is silent")
 	}
 }
 

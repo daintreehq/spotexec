@@ -222,13 +222,14 @@ systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependenc
   disks in no fixed order, so no device name is trusted; the launch adds
   the volume only to an image that maps no other EBS volume, so no data
   disk of the image can pass for it. Anything unexpected leaves the work
-  root on the root disk, where slots copy their caches as before. Kept
+  root on the root disk, where slots copy their caches as before, and so
+  does a disk tool that hangs (bounded by timeout). Kept
   short: these comments aren't rendered, and user-data is capped at 16 KiB.
 */}}
 
 # ---- 1b. Work volume (XFS, for reflinked dependency caches) ----
 sx_workvol() {
-  local u={{.User}} g h w d dev= n=0 uuid end=$((SECONDS + 60))
+  local u={{.User}} g h w d r dev= n=0 uuid end=$((SECONDS + 60))
   command -v mkfs.xfs >/dev/null || { echo "no mkfs.xfs"; return 1; }
   h=$(getent passwd "$u" | cut -d: -f6); g=$(id -gn "$u") || return 1
   [ -n "$h" ] || return 1
@@ -240,13 +241,15 @@ sx_workvol() {
     n=0
     for d in $(lsblk -dbnpo NAME,SIZE,TYPE,MODEL 2>/dev/null | awk '$2 == {{.WorkVolumeBytes}} && $3 == "disk" && !/Instance Storage/ { print $1 }'); do
       [ "$(lsblk -npo NAME "$d" 2>/dev/null | wc -l)" -eq 1 ] || continue
-      blkid -p "$d" >/dev/null 2>&1; [ $? -eq 2 ] && dev=$d n=$((n + 1))
+      timeout -k 5 10 blkid -p "$d" >/dev/null 2>&1; r=$?
+      [ $r -lt 124 ] || { echo "blkid -p $d timed out"; return 1; }
+      [ $r -eq 2 ] && dev=$d n=$((n + 1))
     done
     [ "$n" -eq 0 ] && [ $SECONDS -lt $end ] || break
     sleep 1
   done
   [ "$n" -eq 1 ] || { echo "found $n blank disks of {{.WorkVolumeGB}} GiB"; return 1; }
-  mkfs.xfs -q -K -m reflink=1 -L spotexecwork "$dev" && uuid=$(blkid -s UUID -o value "$dev") && [ -n "$uuid" ] || return 1
+  timeout -k 5 120 mkfs.xfs -q -K -m reflink=1 -L spotexecwork "$dev" && uuid=$(timeout -k 5 10 blkid -s UUID -o value "$dev") && [ -n "$uuid" ] || { echo "can't format $dev"; return 1; }
   runuser -u "$u" -- mkdir -p "$w" 2>/dev/null || { mkdir -p "$w" && chown "$u:$g" "$w"; } || return 1
   inuse && return 1
   mount -t xfs -o noatime "$dev" "$w" || return 1

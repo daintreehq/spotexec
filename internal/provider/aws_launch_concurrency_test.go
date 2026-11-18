@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -342,6 +343,95 @@ func TestDownReleasesClaims(t *testing.T) {
 	}
 	if _, err := a.Launch(context.Background(), t.Logf); err != nil {
 		t.Fatalf("launch after down: %v", err)
+	}
+}
+
+// Terminating one VM frees its claim too (#295): a replacement launched at
+// once near the Spot quota isn't refused for the VM just ended. One whose
+// termination EC2 refused keeps it.
+func TestTerminateReleasesItsClaim(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}}},
+		quota:  map[string]int{"r-one-1": 8},
+	}
+	g := newGlobalEnv(t, f, "r-one-1")
+	a := g.home()
+	in, err := a.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := quotaClaim{Region: "r-one-1", ID: "i-other", Until: time.Now().Add(time.Hour)}
+	if err := a.withClaims(func(cs map[string]quotaClaim) { cs["other"] = other }); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.termErr = map[string]string{"r-one-1": "UnauthorizedOperation"}
+	f.mu.Unlock()
+	if err := a.Terminate(context.Background(), in.ID); err == nil {
+		t.Fatal("terminate succeeded though EC2 refused it")
+	}
+	f.mu.Lock()
+	f.termErr = nil
+	f.hidden = map[string]bool{in.ID: true} // listings no longer show it: only its claim counts
+	f.mu.Unlock()
+	if _, err := a.Launch(context.Background(), t.Logf); err == nil {
+		t.Fatal("launched past the quota: a refused termination released the claim")
+	}
+	if err := a.Terminate(context.Background(), in.ID); err != nil {
+		t.Fatal(err)
+	}
+	var kept bool
+	if err := a.withClaims(func(cs map[string]quotaClaim) { _, kept = cs["other"] }); err != nil || !kept {
+		t.Fatalf("another VM's claim released with it (%v)", err)
+	}
+	if ids, err := a.recentLaunches(); err != nil || slices.Contains(ids, in.ID) {
+		t.Fatalf("the terminated VM is still noted for down: %v (%v)", ids, err)
+	}
+	if _, err := a.Launch(context.Background(), t.Logf); err != nil {
+		t.Fatalf("launch right after terminate: %v", err)
+	}
+}
+
+// Down finds a VM launched moments ago that the tag-filtered listing
+// doesn't show yet, by its ID (#295), and only if it is still this
+// runner's.
+func TestDownFindsUnlistedLaunches(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}}}}
+	g := newGlobalEnv(t, f, "r-one-1")
+	a := g.home()
+	var ids []string
+	for range 4 {
+		in, err := a.Launch(context.Background(), t.Logf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, in.ID)
+	}
+	f.mu.Lock()
+	f.hidden = map[string]bool{ids[1]: true, ids[2]: true, ids[3]: true}
+	f.foreign = map[string]bool{ids[2]: true}
+	f.state = map[string]string{ids[3]: "shutting-down"} // already ending
+	f.calls = nil
+	f.mu.Unlock()
+	if err := a.Down(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	terms := f.callsOf("TerminateInstances")
+	if len(terms) != 1 || !strings.Contains(terms[0], ids[0]) || !strings.Contains(terms[0], ids[1]) || strings.Contains(terms[0], ids[2]) || strings.Contains(terms[0], ids[3]) {
+		t.Fatalf("terminated %v, want %s and the unlisted %s (not %s, another machine's, nor %s, ending)", terms, ids[0], ids[1], ids[2], ids[3])
+	}
+	if by := f.callsOf("DescribeInstances " + ids[0]); len(by) != 0 {
+		t.Fatalf("looked up %s by ID though the listing showed it", ids[0])
+	}
+	// Terminated: not looked up again.
+	f.mu.Lock()
+	f.calls = nil
+	f.mu.Unlock()
+	if err := a.Down(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if by := f.callsOf("DescribeInstances " + ids[1]); len(by) != 0 {
+		t.Fatalf("looked %s up again after terminating it: %v", ids[1], by)
 	}
 }
 

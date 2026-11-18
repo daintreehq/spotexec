@@ -124,6 +124,12 @@ func (l Layout) RunLock(i int) string {
 }
 
 // RunGate serializes counting and taking run permits, held for an instant.
+// RunMem is the record of the memory the holder of run permit i reserves
+// (runMemRecord), written under the run gate as the permit is taken.
+func (l Layout) RunMem(i int) string {
+	return filepath.Join(l.Root, "tokens", fmt.Sprintf("run-%02d.mem.json", i))
+}
+
 func (l Layout) RunGate() string       { return filepath.Join(l.Root, "tokens", "run-gate.lock") }
 func (l Layout) Repo(id string) string { return filepath.Join(l.Root, "repos", id) }
 func (l Layout) Slot(id string, n int) string {
@@ -145,6 +151,12 @@ type SlotState struct {
 	// found to be ignored. They stay (a no-sync follow-up can inspect them)
 	// until the next run that syncs into the slot, which removes them.
 	Pending []string `json:"pending,omitempty"`
+	// Writing: the paths a sync was about to write (copies from other
+	// slots, then the client's archive), saved before the first of them.
+	// One a helper that died left in place before recording it in the
+	// manifest is pruned like a synced file by the next sync that doesn't
+	// want it (#295).
+	Writing []string `json:"writing,omitempty"`
 	// Sweep: a run started here but its created files were never collected
 	// (the helper died). The next acquire walks the workspace (skipping
 	// SweepSkip) and makes every file that isn't synced pending.

@@ -669,6 +669,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) (code int) {
 		if ctx.Err() != nil {
 			interrupted = true
 			rep.Clear()
+			warnWritebackFailed(rep, err)
 			return finish(client.ExitInterrupted)
 		}
 		if f.fallsBack(l, o, res, err) {
@@ -1162,17 +1163,21 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			subStart := time.Now()
 			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
 			interrupted := ctx.Err() != nil
-			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot, conflicts: len(res.Conflicts)}
+			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot, conflicts: len(res.Conflicts), oom: res.OOMKilled}
 			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
 				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, part.label)
 				localStart := time.Now()
 				out.code, err = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(parts)), nil
-				out.runner, out.slot, out.local = "", 0, true
+				out.runner, out.slot, out.local, out.oom = "", 0, true, false
 				interrupted = ctx.Err() != nil
 				rec.localPhase(rp, time.Since(localStart))
 			}
 			if err != nil {
 				out.code = failExit(err)
+				if interrupted {
+					// Ended by the interrupt: 130, as a single run (#289).
+					out.code = client.ExitInterrupted
+				}
 			}
 			code := out.code
 			out.took = res.Duration
@@ -1205,10 +1210,18 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			rec.end(rp, res, failed, code, out.status, out.local)
 			// report runs with mu held.
 			report := func() {
+				// A stopped or interrupted part's error isn't printed: still
+				// say if its changes didn't land.
+				if out.status == partStopped || out.status == partInterrupted {
+					warnWritebackFailed(sr.Reporter, err) // sr.Warn would take mu
+				}
 				if wasStopped {
 					return
 				}
-				if err != nil {
+				// An interrupted part reports the interrupt, not the error
+				// it ended with (such as the session the interrupt ended),
+				// as a single run does.
+				if err != nil && out.status != partInterrupted {
 					sr.event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 					if !rep.IsJSON() {
 						fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
@@ -1356,6 +1369,16 @@ var errorCodes = map[string]bool{
 
 // failExit is the exit code of a run that failed with err: 123 when the
 // project's Dockerfile failed to build, else 125 (spotexec failed).
+// warnWritebackFailed says that an interrupted run's file changes weren't
+// written back, when that is what err (the error its interrupt is reported
+// in place of) says: the interrupt doesn't excuse changes that didn't land.
+func warnWritebackFailed(rep ui.Reporter, err error) {
+	var we *client.WritebackError
+	if errors.As(err, &we) {
+		rep.Warn("WRITEBACK_FAILED", "%v", err)
+	}
+}
+
 func failExit(err error) int {
 	var be *client.ImageBuildError
 	if errors.As(err, &be) && be.Project() {

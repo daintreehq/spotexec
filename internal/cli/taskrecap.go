@@ -28,6 +28,9 @@ type partOutcome struct {
 	local  bool // ran on this machine (--fallback-local)
 	// conflicts is how many of its changes write-back kept a local edit over.
 	conflicts int
+	// oom: it failed because a process in its container was OOM killed
+	// (exit client.ExitOOM).
+	oom bool
 }
 
 // conflictNote is a summary line's " · N conflicts", empty for none.
@@ -52,31 +55,34 @@ func totalConflicts(outs []partOutcome) int {
 // taskExit is a parallel or sharded run's exit code: the first failed
 // part's, in the task's own order, except that a spotexec failure (125)
 // outranks a command's own failure, so agents can tell "tests failed" from
-// "couldn't run tests", and the project's Dockerfile failing to build (123)
-// outranks a command's failure but not a spotexec one; and 130 when the
-// run was interrupted.
+// "couldn't run tests", the project's Dockerfile failing to build (123)
+// outranks a command's failure but not a spotexec one, and a part that ran
+// out of memory (137, OOM_KILLED) outranks a command's own failure but
+// neither of those; and 130 when the run was interrupted.
 func taskExit(outs []partOutcome, interrupted bool) int {
 	if interrupted {
 		return client.ExitInterrupted
 	}
-	rank := func(code int) int {
-		switch code {
-		case 0:
+	rank := func(o partOutcome) int {
+		switch {
+		case o.code == 0:
 			return 0
-		case client.ExitInfra:
+		case o.code == client.ExitInfra:
+			return 4
+		case o.code == client.ExitImageBuild:
 			return 3
-		case client.ExitImageBuild:
+		case o.oom && o.code == client.ExitOOM:
 			return 2
 		}
 		return 1
 	}
-	exit := 0
+	exit, top := 0, 0
 	for _, o := range outs {
 		if o.status == partStopped {
 			continue // the failure that stopped it is what counts
 		}
-		if rank(o.code) > rank(exit) {
-			exit = o.code
+		if r := rank(o); r > top {
+			exit, top = o.code, r
 		}
 	}
 	return exit

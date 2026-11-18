@@ -295,7 +295,7 @@ func TestResetKeepsHeld(t *testing.T) {
 	old := vmIn("i-old", "r-a", 11*time.Minute)
 	p, h := regionPool(t, 4, old)
 	failTwice(p, old)
-	p.Reset()
+	p.Reset(p.MarkDown(context.Background()))
 	if _, _, err := p.Candidates(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}

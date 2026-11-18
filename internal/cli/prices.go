@@ -237,6 +237,9 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 				if c.SpeedFrom == provider.SpeedMeasured {
 					how = "measured"
 				}
+				if c.SpeedCapped {
+					how += ",capped"
+				}
 				speed += fmt.Sprintf(" %.0f%% %s", c.RelSpeed*100, how)
 			}
 			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t%s\t", c.Score, speed, cold, added(c.Distance), added(c.Failures))
@@ -312,7 +315,7 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 func speedFactor(m *provider.RunCostModel) string {
 	gen := fmt.Sprintf("each instance generation counts as %.0f%% faster per vCPU", (m.GenSpeedup-1)*100)
 	if len(m.MeasuredSpeeds) == 0 {
-		return "a slower type (SPEED, assumed: " + gen + "; measured instead once the same command has run 3 times on each of two types)"
+		return fmt.Sprintf("a slower type (SPEED, assumed: %s; measured instead once the same command has run %d times on each of two types)", gen, provider.SpeedMinRuns)
 	}
 	// Each group of types measured against each other, against its
 	// newest generation.
@@ -339,7 +342,11 @@ func speedFactor(m *provider.RunCostModel) string {
 		}
 		parts = append(parts, strings.Join(ts, ", ")+" of "+against)
 	}
-	return fmt.Sprintf("a slower type (SPEED, measured from the same commands' successful runs on each type lately: %s; assumed for other types: %s)", strings.Join(parts, "; "), gen)
+	capped := ""
+	if m.SpeedCap > 0 {
+		capped = fmt.Sprintf(", and moving a type's charge at most %g hours of its Spot price from that assumption", m.SpeedCap)
+	}
+	return fmt.Sprintf("a slower type (SPEED, measured from the same commands' successful runs on each type lately, drawn toward the generation assumption as far as few VMs or scattered runs leave them unsure%s: %s; assumed for other types: %s)", capped, strings.Join(parts, "; "), gen)
 }
 
 // coldMinutes is one part of a cold start as the run-cost note shows it:
