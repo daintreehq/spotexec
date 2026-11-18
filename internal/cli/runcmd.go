@@ -1210,15 +1210,18 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			rec.end(rp, res, failed, code, out.status, out.local)
 			// report runs with mu held.
 			report := func() {
+				// A stopped or interrupted part's error isn't printed: still
+				// say if its changes didn't land.
+				if out.status == partStopped || out.status == partInterrupted {
+					warnWritebackFailed(sr.Reporter, err) // sr.Warn would take mu
+				}
 				if wasStopped {
 					return
 				}
 				// An interrupted part reports the interrupt, not the error
 				// it ended with (such as the session the interrupt ended),
 				// as a single run does.
-				if out.status == partInterrupted {
-					warnWritebackFailed(sr.Reporter, err) // sr.Warn would take mu
-				} else if err != nil {
+				if err != nil && out.status != partInterrupted {
 					sr.event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 					if !rep.IsJSON() {
 						fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
