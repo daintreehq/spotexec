@@ -2,6 +2,8 @@ package provider
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -35,17 +37,21 @@ func TestExpectedMemory(t *testing.T) {
 	if got := expectedMemory(st, "tc", now.Add(memFor+time.Hour)); got != 0 {
 		t.Fatalf("expired: %d", got)
 	}
-	// Recording forgets what expired, and the least recently run
-	// workloads past memWorkloads.
+	// Recording forgets what expired, right away.
 	later := now.Add(memFor + time.Hour)
-	for i := 0; i <= memWorkloads; i++ {
-		recordMemory(st, fmt.Sprintf("w%03d", i), 100, later.Add(time.Duration(i)*time.Second))
+	recordMemory(st, "fresh", 100, later)
+	if _, ok := st.Memory["tc"]; ok || len(st.Memory) != 1 {
+		t.Fatalf("an expired workload was kept: %v", st.Memory)
 	}
-	if _, ok := st.Memory["tc"]; ok {
-		t.Fatal("an expired workload was kept")
+	// Past memWorkloads, the least recently run go first, whatever their
+	// names: here "z" ran longest ago.
+	recordMemory(st, "z", 100, later.Add(time.Second))
+	for i := 0; i < memWorkloads-1; i++ {
+		recordMemory(st, fmt.Sprintf("w%03d", i), 100, later.Add(time.Duration(i+2)*time.Second))
 	}
-	if _, ok := st.Memory["w000"]; ok || len(st.Memory) != memWorkloads {
-		t.Fatalf("%d workloads kept, w000 among them: %v", len(st.Memory), ok)
+	recordMemory(st, "fresh", 100, later.Add(time.Hour))
+	if _, ok := st.Memory["z"]; ok || len(st.Memory) != memWorkloads {
+		t.Fatalf("%d workloads kept, the least recent among them: %v", len(st.Memory), ok)
 	}
 }
 
@@ -54,8 +60,11 @@ func TestExpectedMemory(t *testing.T) {
 func TestRecordRunMemory(t *testing.T) {
 	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
 	ssh := &config.Runner{Name: "box", Type: config.TypeSSH}
-	if err := RecordRunMemory(ssh, "w", 1000); err != nil || RunMemory(ssh, "w") != 0 {
-		t.Fatal("an SSH runner kept a peak")
+	if err := RecordRunMemory(ssh, "w", 1000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(RunnerStateDir("box"), "placement.json")); !os.IsNotExist(err) {
+		t.Fatalf("an SSH runner kept a peak: %v", err)
 	}
 	spot := &config.Runner{Name: "aws", Type: config.TypeAWSSpot}
 	for _, mb := range []int64{1000, 3000, 0, 2000} {

@@ -264,6 +264,42 @@ func TestRecordRunMemory(t *testing.T) {
 	if got := provider.RunMemory(r, "other"); got != 0 {
 		t.Fatalf("an OOM kill outside the pool, unmeasured: %d MiB", got)
 	}
+	// A run stopped short of its peak teaches nothing.
+	for name, res := range map[string]protocol.Result{
+		"canceled":     {ExitCode: 130, Canceled: true},
+		"timed out":    {ExitCode: 124, TimedOut: true},
+		"failed":       {ExitCode: 1},
+		"setup failed": {ExitCode: 1, SetupFailed: true},
+		"shut down":    {ExitCode: 137, Shutdown: true},
+	} {
+		res.PeakMemoryMB = 100
+		recordRunMemory(r, "short", res)
+		if got := provider.RunMemory(r, "short"); got != 0 {
+			t.Fatalf("%s run recorded %d MiB", name, got)
+		}
+	}
+}
+
+// A run's peak is kept per workload and [setup] run; one that can't run in
+// the pool keeps none.
+func TestMemoryWorkload(t *testing.T) {
+	ws := &Workspace{RepoID: "repo", Cwd: "."}
+	o := Options{Command: "npm run typecheck"}
+	c := &protocol.ContainerRun{Image: "img"}
+	plain := memoryWorkload(ws, o, protocol.Exec{Container: c, Env: map[string]string{"A": "1"}})
+	if plain == "" || plain != memoryWorkload(ws, o, protocol.Exec{Container: c, Env: map[string]string{"A": "1", "SPOTEXEC_RUN_ID": "x"}}) {
+		t.Fatalf("workload %q differs from run to run", plain)
+	}
+	if setup := memoryWorkload(ws, o, protocol.Exec{Container: c, Env: map[string]string{"A": "1"}, SetupRun: "npm run build"}); setup == "" || setup == plain {
+		t.Fatalf("with a [setup] run: %q, without: %q", setup, plain)
+	}
+	if w := memoryWorkload(ws, o, protocol.Exec{Env: map[string]string{"A": "1"}}); w != "" {
+		t.Fatalf("a command on the runner itself: %q", w)
+	}
+	o.Exclusive = true
+	if w := memoryWorkload(ws, o, protocol.Exec{Container: c}); w != "" {
+		t.Fatalf("an exclusive run: %q", w)
+	}
 }
 
 func TestInterruptedRunIsNeverOnSuccess(t *testing.T) {

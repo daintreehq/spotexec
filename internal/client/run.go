@@ -1077,7 +1077,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	}
 	// What earlier runs of it needed at their peak, for the runner to
 	// start it only where that fits (#294).
-	memWorkload := SpeedWorkload(ws.RepoID, ws.Cwd, o, env)
+	memWorkload := memoryWorkload(ws, o, ex)
 	ex.MemoryMB = provider.RunMemory(r, memWorkload)
 	o.Rep.Status("%s", running)
 	o.Rep.Event("exec", map[string]any{"runner": r.Name, "slot": lease.Acq.Token, "command": o.Display, "cwd": ws.Cwd})
@@ -1501,15 +1501,36 @@ func conflictExit(res Result, failOnConflict bool) int {
 	return res.ExitCode
 }
 
+// memoryWorkload names what a run's peak memory is kept under: its
+// workload (SpeedWorkload) and its [setup] run, which runs in the same
+// measurement; "" for a run that can't be in a memory pool (on the runner
+// itself, or with the VM to itself), which keeps none.
+func memoryWorkload(ws *Workspace, o Options, ex protocol.Exec) string {
+	if ex.Container == nil || o.Exclusive {
+		return ""
+	}
+	w := SpeedWorkload(ws.RepoID, ws.Cwd, o, ex.Env)
+	if ex.SetupRun != "" {
+		sum := sha256.Sum256([]byte(w + "\x00" + ex.SetupRun))
+		w = hex.EncodeToString(sum[:16])
+	}
+	return w
+}
+
 // recordRunMemory keeps what a run used at its peak in the memory pool, for
-// the next run of the same workload to reserve: the pool's whole cap when
-// it was OOM killed there, so that run starts only once nothing else runs
-// beside it (and measures what it needs alone). Best effort, and kept
-// whatever happens to the run's write-back.
+// the next run of the same workload to reserve: only a run that finished
+// cleanly, since one stopped early (canceled, timed out, a failed setup)
+// never reached its peak; or the pool's whole cap when it was OOM killed
+// there, so that run starts only once nothing else runs beside it (and
+// measures what it needs alone). Best effort, and kept whatever happens to
+// the run's write-back.
 func recordRunMemory(r *config.Runner, workload string, result protocol.Result) {
 	mb := result.PeakMemoryMB
-	if result.OOMKilled && result.MemoryLimitMB > 0 {
+	switch {
+	case result.OOMKilled && result.MemoryLimitMB > 0:
 		mb = max(mb, result.MemoryLimitMB)
+	case result.ExitCode != 0 || result.TimedOut || result.Canceled || result.Shutdown || result.SetupFailed || result.StartError != "":
+		return
 	}
 	_ = provider.RecordRunMemory(r, workload, mb)
 }

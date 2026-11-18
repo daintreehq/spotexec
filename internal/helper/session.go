@@ -693,6 +693,9 @@ func (s *Session) releaseLocks(teardown bool) {
 	if held {
 		touchActivity(s.layout.Root)
 	}
+	if s.run != nil {
+		_ = os.Remove(s.layout.RunMem(s.runIdx))
+	}
 	s.run.Unlock()
 	s.run, s.runIdx = nil, 0
 	s.gate.Unlock()

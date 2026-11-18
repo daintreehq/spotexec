@@ -516,7 +516,10 @@ func (s *Session) exec(e protocol.Exec) error {
 		}
 		var stopWatch func() int64
 		if e.Container != nil && s.lastContainer.cid != "" {
-			stopWatch = s.watchMemory(s.lastContainer.cid, s.runIdx)
+			s.relMu.Lock()
+			permit := s.runIdx
+			s.relMu.Unlock()
+			stopWatch = s.watchMemory(s.lastContainer.cid, permit)
 		}
 		pr = s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch, out)
 		if stopWatch != nil {

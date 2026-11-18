@@ -1,6 +1,9 @@
 package provider
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -40,7 +43,7 @@ func memoryRunner(r *config.Runner) bool {
 }
 
 // RecordRunMemory records the peak memory (MiB) a run of workload (see
-// client.SpeedWorkload) used on a VM of runner r, for the next run of it to
+// client.memoryWorkload) used on a VM of runner r, for the next run of it to
 // reserve. Best effort: skipped when the state stays busy.
 func RecordRunMemory(r *config.Runner, workload string, mb int64) error {
 	if !memoryRunner(r) || workload == "" || mb <= 0 {
@@ -52,15 +55,23 @@ func RecordRunMemory(r *config.Runner, workload string, mb int64) error {
 
 // RunMemory is the memory (MiB) a run of workload is expected to need on a
 // VM of runner r: the largest peak of its latest runs; 0 when none was
-// measured lately (or the state stayed busy).
+// measured lately. It reads placement.json as last saved (replaced
+// atomically), without its lock: a busy fleet never hides a known peak.
 func RunMemory(r *config.Runner, workload string) int64 {
 	if !memoryRunner(r) || workload == "" {
 		return 0
 	}
-	g := &AWSGlobal{r: r, dir: RunnerStateDir(r.Name)}
-	var mb int64
-	_ = g.withStateWait(memLockWait, func(st *placementState) { mb = expectedMemory(st, workload, g.clock()) })
-	return mb
+	b, err := os.ReadFile(filepath.Join(RunnerStateDir(r.Name), "placement.json"))
+	if err != nil {
+		return 0
+	}
+	var st struct {
+		Memory map[string][]memSample `json:"memory"`
+	}
+	if json.Unmarshal(b, &st) != nil {
+		return 0
+	}
+	return expectedMemory(&placementState{Memory: st.Memory}, workload, time.Now())
 }
 
 func expectedMemory(st *placementState, workload string, now time.Time) int64 {

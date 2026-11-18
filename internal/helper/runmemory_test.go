@@ -22,9 +22,9 @@ func fakePool(t *testing.T, limitMB, usedMB int64) string {
 	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte(fmt.Sprint(limitMB*mib)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	old := poolCgroups
-	poolCgroups = []string{dir}
-	t.Cleanup(func() { poolCgroups = old })
+	old, oldPlanned := poolCgroups, poolPlanned
+	poolCgroups, poolPlanned = []string{dir}, func() bool { return false }
+	t.Cleanup(func() { poolCgroups, poolPlanned = old, oldPlanned })
 	return dir
 }
 
@@ -37,8 +37,8 @@ func setCgroup(t *testing.T, dir string, usedMB, cacheMB int64) {
 	}
 	cur := (usedMB + cacheMB) * mib
 	stat := fmt.Sprintf("anon %d\nfile %d\nkernel 0\nshmem %d\n", usedMB*mib, cacheMB*mib, 0)
-	for f, v := range map[string]string{"memory.current": fmt.Sprint(cur), "memory.stat": stat} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte(v), 0o644); err != nil {
+	for _, f := range [][2]string{{"memory.current", fmt.Sprint(cur)}, {"memory.stat", stat}} {
+		if err := os.WriteFile(filepath.Join(dir, f[0]), []byte(f[1]), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -154,19 +154,32 @@ func TestMemoryWaitCountsGrowthNotUse(t *testing.T) {
 	// A cgroup outside the pool is never read: a's use then doesn't count
 	// against its reservation, and 6000 used plus 8000 to come leave b
 	// too little.
-	writeJSON(a.layout.RunMem(a.runIdx), runMemRecord{Pooled: true, ReserveMB: 8000, Cgroup: filepath.Join(t.TempDir(), "elsewhere")})
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	setCgroup(t, elsewhere, 6000, 0)
+	writeJSON(a.layout.RunMem(a.runIdx), runMemRecord{Pooled: true, ReserveMB: 8000, Cgroup: elsewhere})
 	setCgroup(t, pool, 6000, 0)
 	if why := b.memoryWait(2); why == "" {
 		t.Fatal("b admitted on a cgroup outside the pool")
+	}
+	// A record a dead helper left says nothing: a's permit reserves the
+	// fair share (5000), whatever the record claims.
+	writeJSON(a.layout.RunMem(a.runIdx), runMemRecord{Pooled: false, PID: 1 << 30})
+	setCgroup(t, pool, 7500, 0)
+	if why := b.memoryWait(2); why == "" {
+		t.Fatal("b admitted on a dead helper's record: 7500 used + 5000 to come leave 7500")
+	}
+	setCgroup(t, pool, 7000, 0)
+	if why := b.memoryWait(2); why != "" {
+		t.Fatalf("b refused with exactly its 8000 left: %s", why)
 	}
 }
 
 // A command with no other command running starts however much it needs;
 // one with an unknown peak reserves the fair share; a command outside the
-// pool, or on a VM without one, takes a permit as before.
+// pool takes a permit as before.
 func TestMemoryWaitBounds(t *testing.T) {
 	root := t.TempDir()
-	fakePool(t, 16000, 0)
+	pool := fakePool(t, 16000, 0)
 	jobs := pooledJobs(t, root, 3, 4, 0)
 	a, b, c := jobs[0], jobs[1], jobs[2]
 	a.runMem.ReserveMB = 50000
@@ -187,19 +200,78 @@ func TestMemoryWaitBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.releaseRun()
-	// Unknown peaks: 4000 each (16000 ÷ 4 slots); b reserves nothing.
+	// Unknown peaks: 4000 each (16000 ÷ 4 slots); b, outside the pool,
+	// reserves nothing. c fits while 8000 is left after a's 4000 to come,
+	// not at 7999.
+	a.runMem.ReserveMB = 0
 	if _, err := a.takeRun(); err != nil {
 		t.Fatal(err)
 	}
-	a.runMem.ReserveMB = 0
-	writeJSON(a.layout.RunMem(a.runIdx), a.runMem)
+	setCgroup(t, pool, 4000, 0)
 	if why := c.memoryWait(3); why != "" {
-		t.Fatalf("c refused beside one unknown command: %s", why)
+		t.Fatalf("c refused with 8000 left beside one unknown command: %s", why)
 	}
-	poolCgroups = []string{filepath.Join(t.TempDir(), "none")}
-	c.planRunMemory(protocol.Exec{Container: &protocol.ContainerRun{Image: "img"}, MemoryMB: 99999})
-	if c.runMem.Pooled || c.memoryWait(3) != "" {
-		t.Fatal("a VM without a pool held a command back")
+	setCgroup(t, pool, 4001, 0)
+	c.runMem.ReserveMB = 8000
+	if why := c.memoryWait(3); why == "" {
+		t.Fatal("c admitted with 7999 left")
+	}
+	c.runMem.ReserveMB = 0
+	if why := c.memoryWait(3); why != "" {
+		t.Fatalf("an unknown c (4000) refused with 7999 left: %s", why)
+	}
+}
+
+// #294 on a fresh VM: no job has run in the pool yet, so its cgroup doesn't
+// exist, but its commands will run in it. Its planned cap applies.
+func TestMemoryWaitBeforeThePoolExists(t *testing.T) {
+	root := t.TempDir()
+	fakePool(t, 1, 0)
+	poolCgroups = []string{filepath.Join(t.TempDir(), "spotexec.slice")}
+	poolPlanned = func() bool { return true }
+	oldTotal := poolMemTotal
+	poolMemTotal = func() int64 { return 32 << 30 } // a 30 GiB pool
+	t.Cleanup(func() { poolMemTotal = oldTotal })
+	jobs := pooledJobs(t, root, 4, 6, 8192)
+	for _, s := range jobs[:3] {
+		if !s.runMem.Pooled {
+			t.Fatal("a container job on a VM whose pool isn't set up yet planned outside it")
+		}
+		if _, err := s.takeRun(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if why := jobs[3].memoryWait(4); !strings.Contains(why, "waiting for memory") {
+		t.Fatalf("the fourth 8 GiB job on a 30 GiB pool: %q", why)
+	}
+	poolPlanned = func() bool { return false }
+	jobs[3].planRunMemory(protocol.Exec{Container: &protocol.ContainerRun{Image: "img"}, MemoryMB: 8192})
+	if jobs[3].runMem.Pooled || jobs[3].memoryWait(4) != "" {
+		t.Fatal("a runner that will never have a pool held a command back")
+	}
+}
+
+// A job of an older helper, holding its slot for its whole lease, runs its
+// command without a permit: it still reserves the fair share.
+func TestMemoryWaitCountsOlderHelpersJobs(t *testing.T) {
+	root := t.TempDir()
+	fakePool(t, 16000, 0)
+	l := Layout{Root: root}
+	old, ok, err := tryLock(l.TokenLock(1))
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	defer old.Unlock()
+	if err := writeJSON(l.TokenHolder(1), protocol.Holder{Token: 1, RepoID: "old", HelperPID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	a := pooledJobs(t, root, 1, 4, 12001)[0]
+	if why := a.memoryWait(2); why == "" {
+		t.Fatal("12001 started beside an older job's 4000 in a 16000 pool")
+	}
+	a.runMem.ReserveMB = 12000
+	if why := a.memoryWait(2); why != "" {
+		t.Fatalf("12000 refused beside an older job's 4000 in a 16000 pool: %s", why)
 	}
 }
 
@@ -209,7 +281,7 @@ func TestWatchMemory(t *testing.T) {
 	root := t.TempDir()
 	pool := fakePool(t, 16000, 0)
 	old := memSampleEvery
-	memSampleEvery = 10 * time.Millisecond
+	memSampleEvery = 5 * time.Millisecond
 	t.Cleanup(func() { memSampleEvery = old })
 	s := pooledJobs(t, root, 1, 2, 1000)[0]
 	if _, err := s.takeRun(); err != nil {
@@ -218,18 +290,18 @@ func TestWatchMemory(t *testing.T) {
 	id := strings.Repeat("b", 64)
 	cid := filepath.Join(t.TempDir(), "c.cid")
 	stop := s.watchMemory(cid, s.runIdx)
-	os.WriteFile(cid, []byte(id), 0o644)
 	cg := filepath.Join(pool, id) // cgroupfs layout
-	setCgroup(t, cg, 700, 3000)
+	setCgroup(t, cg, 700, 0)
+	os.WriteFile(cid, []byte(id), 0o644)
 	var r runMemRecord
 	eventually(t, "the cgroup to be recorded", func() bool {
 		return readJSON(s.layout.RunMem(s.runIdx), &r) == nil && r.Cgroup == cg
 	})
-	if !r.Pooled || r.ReserveMB != 1000 {
+	if !r.Pooled || r.ReserveMB != 1000 || r.PID != os.Getpid() {
 		t.Fatalf("record %+v", r)
 	}
 	setCgroup(t, cg, 1500, 0)
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	setCgroup(t, cg, 200, 0)
 	if got := stop(); got != 1500 {
 		t.Fatalf("peak %d MiB, want 1500", got)
@@ -238,9 +310,30 @@ func TestWatchMemory(t *testing.T) {
 	if _, err := os.Stat(s.layout.RunMem(1)); !os.IsNotExist(err) {
 		t.Fatalf("the permit's memory record outlived it: %v", err)
 	}
-	// An ID that isn't one is never looked up.
-	os.WriteFile(cid, []byte("../../etc"), 0o644)
+	// An ID that isn't a container's is never looked up, even where a
+	// cgroup of that name exists.
+	setCgroup(t, filepath.Join(pool, "notanid"), 1, 0)
+	os.WriteFile(cid, []byte("notanid"), 0o644)
 	if d := containerCgroup(cid); d != "" {
 		t.Fatalf("resolved %q", d)
+	}
+}
+
+// Session teardown (the client gone, the runner stopping) leaves no
+// reservation behind with the permit it gives back.
+func TestReleaseDropsTheMemoryRecord(t *testing.T) {
+	root := t.TempDir()
+	fakePool(t, 16000, 0)
+	s := pooledJobs(t, root, 1, 2, 1000)[0]
+	if _, err := s.takeRun(); err != nil {
+		t.Fatal(err)
+	}
+	rec := s.layout.RunMem(s.runIdx)
+	if _, err := os.Stat(rec); err != nil {
+		t.Fatal(err)
+	}
+	s.release()
+	if _, err := os.Stat(rec); !os.IsNotExist(err) {
+		t.Fatalf("record after teardown: %v", err)
 	}
 }

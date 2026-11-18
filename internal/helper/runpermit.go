@@ -55,6 +55,9 @@ func (s *Session) takeRun() (canceled bool, err error) {
 			}
 			if q := time.Duration(s.acq.QueueMS) * time.Millisecond; q > 0 && time.Since(start) > q {
 				unwait()
+				if noticed == "memory" {
+					return false, perr(protocol.CodeQueueTimeout, "no room in the runner's memory pool to run the command within %s", q)
+				}
 				return false, perr(protocol.CodeQueueTimeout, "no free slot to run the command within %s", q)
 			}
 		}
@@ -76,8 +79,12 @@ func (s *Session) takeRun() (canceled bool, err error) {
 			s.updateHolder(func(h *protocol.Holder) { h.Phase = protocol.PhaseRunWait })
 		}
 		// Told once per reason: memory's figures change on every attempt.
+		// A gate another job held says nothing new.
 		reason, msg := "slots", fmt.Sprintf("all %d slots are running commands; waiting for one to finish", s.maxSlots)
-		if memWait != "" {
+		switch {
+		case memWait == memGateBusy && noticed != "":
+			reason = noticed
+		case memWait != "" && memWait != memGateBusy:
 			reason, msg = "memory", memWait
 		}
 		if reason != noticed {
@@ -95,7 +102,8 @@ var errWithdrawn = errors.New("withdrawn while waiting for a run permit")
 // tryRun takes a free run permit if there is room for one, under the run
 // gate: two jobs counting at once could each see the last one free, or
 // count each other's probes as held. memWait says why it didn't when a
-// permit is free but the memory pool has no room for the command.
+// permit is free but the memory pool has no room for the command, or is
+// memGateBusy when another job held the gate.
 func (s *Session) tryRun() (got bool, memWait string, err error) {
 	// Held for an instant: a brief wait at most, so the outer loop's
 	// cancel and timeout checks stay current.
@@ -108,7 +116,7 @@ func (s *Session) tryRun() (got bool, memWait string, err error) {
 		if ok {
 			gate = g
 		} else if time.Now().After(deadline) {
-			return false, "", nil // try again on the next attempt
+			return false, memGateBusy, nil // try again on the next attempt
 		} else {
 			time.Sleep(5 * time.Millisecond)
 		}
@@ -129,8 +137,11 @@ func (s *Session) tryRun() (got bool, memWait string, err error) {
 				return false, why, nil
 			}
 			// Before the gate opens: the next job to look counts this
-			// command's reservation.
-			_ = writeJSON(s.layout.RunMem(i), s.runMem)
+			// command's reservation. Without it, the permit isn't taken.
+			if err := writeJSON(s.layout.RunMem(i), s.runMem); err != nil {
+				l.Unlock()
+				return false, "", fmt.Errorf("recording the command's memory with its run permit: %w", err)
+			}
 			s.own(func() {
 				s.run, s.runIdx = l, i
 				s.updateHolder(func(h *protocol.Holder) { h.Phase, h.Run = protocol.PhaseRun, i })

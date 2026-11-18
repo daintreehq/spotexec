@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -42,6 +44,9 @@ var (
 	poolCgroups = []string{"/sys/fs/cgroup/spotexec.slice", "/sys/fs/cgroup/spotexec"}
 	// memSampleEvery is how often a running command's memory is sampled.
 	memSampleEvery = 2 * time.Second
+	// poolMemTotal is the machine's memory, for the pool's planned cap
+	// before its cgroup exists.
+	poolMemTotal = hostMemTotal
 )
 
 // runMemRecord is what a run permit's holder reserves in the memory pool
@@ -57,6 +62,9 @@ type runMemRecord struct {
 	// Cgroup is its running container's cgroup, once known, for what it
 	// already uses of its reservation.
 	Cgroup string `json:"cgroup,omitempty"`
+	// PID is the helper that wrote it: a record whose helper is gone was
+	// left by one that died, and says nothing of the permit's holder.
+	PID int `json:"pid,omitempty"`
 }
 
 // poolDir is the memory pool's cgroup, or "" while there is none (not a
@@ -136,14 +144,25 @@ func containerCgroup(cidFile string) string {
 }
 
 // planRunMemory records what e's command will reserve in the memory pool
-// with its run permit: its expected peak, if it runs in the pool.
+// with its run permit: its expected peak, if it runs in the pool (the pool
+// is set up on spotexec's own Linux VMs, by the first container to run in
+// it, so it may not exist yet).
 func (s *Session) planRunMemory(e protocol.Exec) {
 	alone := s.acq.Exclusive || len(s.tokens) > 1 || s.maxSlots <= 1
 	s.runMem = runMemRecord{
-		Pooled:    e.Container != nil && !alone && memOption(e.Container.Options) == "" && poolDir() != "",
+		Pooled:    e.Container != nil && !alone && memOption(e.Container.Options) == "" && (poolDir() != "" || poolPlanned()),
 		ReserveMB: max(e.MemoryMB, 0),
+		PID:       os.Getpid(),
 	}
 }
+
+// poolPlanned reports whether this runner will have a memory pool once a
+// job runs in it: one of spotexec's own Linux VMs (see planMemory).
+var poolPlanned = func() bool { return runtime.GOOS == "linux" && spotexecVM() }
+
+// memGateBusy is memoryWait's (and tryRun's) answer when another job held
+// the run gate: nothing was learned.
+const memGateBusy = "\x00busy"
 
 // memoryWait says why this session's command can't start yet for memory,
 // or "" when it can: called under the run gate, with permit (the one it
@@ -154,42 +173,67 @@ func (s *Session) memoryWait(permit int) string {
 		return ""
 	}
 	pool := poolDir()
-	limit, ok := cgroupLimit(pool)
-	if !ok {
-		return ""
-	}
-	used, ok := cgroupUsed(pool)
-	if !ok {
+	var limit int64
+	if pool != "" {
+		l, ok := cgroupLimit(pool)
+		if !ok {
+			return ""
+		}
+		limit = l
+	} else if total := poolMemTotal(); total > 0 {
+		limit = poolLimit(total) // not set up yet: nothing runs in it
+	} else {
 		return ""
 	}
 	share := max(limit/int64(max(s.maxSlots, 1))>>20, 1)
 	others := 0
 	var growth int64
+	// Each command's use is read before the pool's: one growing meanwhile
+	// then counts in the pool's use too, never as room.
 	for j := 1; j <= s.maxSlots; j++ {
 		if j == permit || !isHeld(s.layout.RunLock(j)) {
 			continue
 		}
 		var r runMemRecord
-		if err := readJSON(s.layout.RunMem(j), &r); err == nil && !r.Pooled {
+		if err := readJSON(s.layout.RunMem(j), &r); err != nil || (r.PID != 0 && !helperAlive(r.PID)) {
+			// An older helper's permit, or a record a helper that died
+			// left: its command reserves the fair share.
+			r = runMemRecord{Pooled: true}
+		}
+		if !r.Pooled {
 			continue
 		}
-		// A permit without a record (an older helper's) reserves the fair
-		// share, as does a command whose peak is unknown.
 		others++
 		reserve := r.ReserveMB
 		if reserve <= 0 {
 			reserve = share
 		}
 		var u int64
-		if r.Cgroup != "" && strings.HasPrefix(r.Cgroup, pool+"/") {
+		if pool != "" && r.Cgroup != "" && strings.HasPrefix(r.Cgroup, pool+"/") {
 			if b, ok := cgroupUsed(r.Cgroup); ok {
 				u = b >> 20
 			}
 		}
 		growth += max(reserve-u, 0)
 	}
+	// A job of an older helper holding its slot for its whole lease runs
+	// its command without a permit: the fair share too.
+	for _, h := range readHolders(s.layout) {
+		if !h.Phased && h.HelperPID != 0 {
+			others++
+			growth += share
+		}
+	}
 	if others == 0 {
 		return ""
+	}
+	var used int64
+	if pool != "" {
+		u, ok := cgroupUsed(pool)
+		if !ok {
+			return ""
+		}
+		used = u
 	}
 	need := s.runMem.ReserveMB
 	if need <= 0 {
@@ -201,6 +245,12 @@ func (s *Session) memoryWait(permit int) string {
 	}
 	return fmt.Sprintf("waiting for memory: the command needs about %s, and the %d command(s) running leave %s of the %s memory pool once they reach their usual peaks",
 		gib(need<<20), others, gib(max(room, 0)<<20), gib(limit))
+}
+
+// helperAlive reports whether process pid still runs.
+func helperAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
 }
 
 // watchMemory samples the memory of the container whose ID docker writes
