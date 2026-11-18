@@ -380,3 +380,30 @@ func TestUnrecordedReservationRefusesThePermit(t *testing.T) {
 		t.Fatalf("permit 1 afterwards: %d, %v", s.runIdx, err)
 	}
 }
+
+// A sampler that finds its cgroup only after its permit went to another
+// job leaves that job's record alone.
+func TestLateSamplerKeepsOffAnotherJobsPermit(t *testing.T) {
+	root := t.TempDir()
+	pool := fakePool(t, 16000, 0)
+	jobs := pooledJobs(t, root, 2, 2, 1000)
+	a, b := jobs[0], jobs[1]
+	if _, err := a.takeRun(); err != nil {
+		t.Fatal(err)
+	}
+	cid := filepath.Join(t.TempDir(), "c.cid")
+	stop := a.watchMemory(cid, a.runIdx)
+	a.releaseRun()
+	b.runMem.ReserveMB = 2222
+	if _, err := b.takeRun(); err != nil || b.runIdx != 1 {
+		t.Fatalf("b took permit %d: %v", b.runIdx, err)
+	}
+	id := strings.Repeat("c", 64)
+	setCgroup(t, filepath.Join(pool, id), 100, 0)
+	os.WriteFile(cid, []byte(id), 0o644)
+	stop() // samples once more: finds the cgroup now
+	var r runMemRecord
+	if err := readJSON(b.layout.RunMem(1), &r); err != nil || r.ReserveMB != 2222 || r.Cgroup != "" {
+		t.Fatalf("b's record %+v (%v)", r, err)
+	}
+}

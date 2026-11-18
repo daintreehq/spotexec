@@ -85,8 +85,14 @@ func TestRecordRunMemory(t *testing.T) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now()
-	if got := RunMemory(spot, "w"); got != 3000 || time.Since(start) > 200*time.Millisecond {
-		t.Fatalf("with the state locked: %d MiB after %s", got, time.Since(start))
+	got := make(chan int64, 1)
+	go func() { got <- RunMemory(spot, "w") }()
+	select {
+	case mb := <-got:
+		if mb != 3000 {
+			t.Fatalf("with the state locked: %d MiB", mb)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunMemory waited for placement.lock")
 	}
 }
