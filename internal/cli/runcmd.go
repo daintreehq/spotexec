@@ -1163,12 +1163,12 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			subStart := time.Now()
 			res, err := client.Run(subCtx[i], l.cfg, l.ws, o)
 			interrupted := ctx.Err() != nil
-			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot, conflicts: len(res.Conflicts)}
+			out := partOutcome{part: part, code: res.ExitCode, runner: res.Runner, slot: res.Slot, conflicts: len(res.Conflicts), oom: res.OOMKilled}
 			if err != nil && subCtx[i].Err() == nil && f.fallsBack(l, o, res, err) {
 				sr.Warn("LOCAL_FALLBACK", "no runner available (%v); running %s locally", err, part.label)
 				localStart := time.Now()
 				out.code, err = runLocal(subCtx[i], intrs[i], l, o, sr, i, len(parts)), nil
-				out.runner, out.slot, out.local = "", 0, true
+				out.runner, out.slot, out.local, out.oom = "", 0, true, false
 				interrupted = ctx.Err() != nil
 				rec.localPhase(rp, time.Since(localStart))
 			}

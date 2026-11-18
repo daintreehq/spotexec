@@ -17,6 +17,7 @@ import (
 
 	"github.com/daintreehq/spotexec/internal/manifest"
 	"github.com/daintreehq/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 func mf(entries ...protocol.Entry) *manifest.Manifest {
@@ -222,6 +223,82 @@ func TestConflictExit(t *testing.T) {
 		if got := conflictExit(c.res, c.on); got != c.want {
 			t.Errorf("%s: exit %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+func TestOOMExit(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		res  Result
+		want int
+	}{
+		{"no OOM keeps the command's code", Result{ExitCode: 1}, 1},
+		{"a failed command whose process was OOM killed", Result{ExitCode: 1, OOMKilled: true}, ExitOOM},
+		{"the command killed itself", Result{ExitCode: ExitOOM, OOMKilled: true}, ExitOOM},
+		{"a failed [setup] run", Result{ExitCode: 1, OOMKilled: true, SetupFailed: true}, ExitOOM},
+		{"a command that still succeeded keeps 0", Result{OOMKilled: true}, 0},
+		{"timed out stays 124", Result{ExitCode: ExitTimeout, TimedOut: true, OOMKilled: true}, ExitTimeout},
+		{"interrupted stays 130", Result{ExitCode: ExitInterrupted, Canceled: true, OOMKilled: true}, ExitInterrupted},
+	} {
+		if got := oomExit(c.res); got != c.want {
+			t.Errorf("%s: exit %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// A run's peak memory is kept for the next run of its workload to
+// reserve; one OOM killed in the pool is kept at the pool's cap, so the
+// next run starts only once nothing runs beside it (#294).
+func TestRecordRunMemory(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	r := &config.Runner{Name: "aws", Type: config.TypeAWSSpot}
+	recordRunMemory(r, "tc", protocol.Result{PeakMemoryMB: 7000})
+	if got := provider.RunMemory(r, "tc"); got != 7000 {
+		t.Fatalf("expected %d MiB, want 7000", got)
+	}
+	recordRunMemory(r, "tc", protocol.Result{ExitCode: 1, OOMKilled: true, MemoryLimitMB: 29388, PeakMemoryMB: 6000})
+	if got := provider.RunMemory(r, "tc"); got != 29388 {
+		t.Fatalf("after an OOM kill in the pool: %d MiB, want the pool's 29388", got)
+	}
+	recordRunMemory(r, "other", protocol.Result{ExitCode: 137, OOMKilled: true})
+	if got := provider.RunMemory(r, "other"); got != 0 {
+		t.Fatalf("an OOM kill outside the pool, unmeasured: %d MiB", got)
+	}
+	// A run stopped short of its peak teaches nothing.
+	for name, res := range map[string]protocol.Result{
+		"canceled":     {ExitCode: 130, Canceled: true},
+		"timed out":    {ExitCode: 124, TimedOut: true},
+		"failed":       {ExitCode: 1},
+		"setup failed": {ExitCode: 1, SetupFailed: true},
+		"shut down":    {ExitCode: 137, Shutdown: true},
+	} {
+		res.PeakMemoryMB = 100
+		recordRunMemory(r, "short", res)
+		if got := provider.RunMemory(r, "short"); got != 0 {
+			t.Fatalf("%s run recorded %d MiB", name, got)
+		}
+	}
+}
+
+// A run's peak is kept per workload and [setup] run; one that can't run in
+// the pool keeps none.
+func TestMemoryWorkload(t *testing.T) {
+	ws := &Workspace{RepoID: "repo", Cwd: "."}
+	o := Options{Command: "npm run typecheck"}
+	c := &protocol.ContainerRun{Image: "img"}
+	plain := memoryWorkload(ws, o, protocol.Exec{Container: c, Env: map[string]string{"A": "1"}})
+	if plain == "" || plain != memoryWorkload(ws, o, protocol.Exec{Container: c, Env: map[string]string{"A": "1", "SPOTEXEC_RUN_ID": "x"}}) {
+		t.Fatalf("workload %q differs from run to run", plain)
+	}
+	if setup := memoryWorkload(ws, o, protocol.Exec{Container: c, Env: map[string]string{"A": "1"}, SetupRun: "npm run build"}); setup == "" || setup == plain {
+		t.Fatalf("with a [setup] run: %q, without: %q", setup, plain)
+	}
+	if w := memoryWorkload(ws, o, protocol.Exec{Env: map[string]string{"A": "1"}}); w != "" {
+		t.Fatalf("a command on the runner itself: %q", w)
+	}
+	o.Exclusive = true
+	if w := memoryWorkload(ws, o, protocol.Exec{Container: c}); w != "" {
+		t.Fatalf("an exclusive run: %q", w)
 	}
 }
 

@@ -141,6 +141,10 @@ func TestTaskExit(t *testing.T) {
 		{"a broken Dockerfile stays over a later command failure", []partOutcome{part(partFailed, client.ExitImageBuild), part(partFailed, 1)}, false, client.ExitImageBuild},
 		{"125 outranks a broken Dockerfile", []partOutcome{part(partFailed, client.ExitImageBuild), part(partFailed, client.ExitInfra)}, false, client.ExitInfra},
 		{"125 stays over a broken Dockerfile", []partOutcome{part(partFailed, client.ExitInfra), part(partFailed, client.ExitImageBuild)}, false, client.ExitInfra},
+		{"running out of memory outranks a command's failure", []partOutcome{part(partFailed, 1), {status: partFailed, code: client.ExitOOM, oom: true}}, false, client.ExitOOM},
+		{"a plain 137 is a command's failure", []partOutcome{part(partFailed, 1), part(partFailed, client.ExitOOM)}, false, 1},
+		{"a broken Dockerfile outranks running out of memory", []partOutcome{{status: partFailed, code: client.ExitOOM, oom: true}, part(partFailed, client.ExitImageBuild)}, false, client.ExitImageBuild},
+		{"125 outranks running out of memory", []partOutcome{{status: partFailed, code: client.ExitOOM, oom: true}, part(partFailed, client.ExitInfra)}, false, client.ExitInfra},
 		{"stopped parts don't count", []partOutcome{part(partStopped, 130), part(partPassed, 0)}, false, 0},
 		{"interrupted wins", []partOutcome{part(partFailed, client.ExitInfra)}, true, client.ExitInterrupted},
 	} {

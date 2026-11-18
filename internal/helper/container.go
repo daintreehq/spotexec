@@ -754,7 +754,8 @@ func (s *Session) containerScript(ctx context.Context, run *protocol.ContainerRu
 		return "", nil, nil, perr(protocol.CodeImageFailed, "container.options may not set %s", bad)
 	}
 	// Before procMu: these may send an event.
-	limits := append(s.cpusetArgs(run, d), s.memoryArgs(run, d)...)
+	pooled := s.memoryArgs(run, d)
+	limits := append(s.cpusetArgs(run, d), pooled...)
 	limits = append(limits, s.shmArgs(run, d)...)
 	s.procMu.Lock()
 	if s.stopping.Load() {
@@ -790,6 +791,14 @@ func (s *Session) containerScript(ctx context.Context, run *protocol.ContainerRu
 	id := strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	name := s.containerPrefix() + id
 	scriptPath := filepath.Join(runDir, id+".sh")
+	// In the memory pool, docker writes the container's ID here, so its
+	// memory can be sampled while it runs (watchMemory). A --cidfile of
+	// the user's own wins.
+	cidPath := ""
+	if len(pooled) > 0 && !slices.Contains(dockerFlags(run.Options), "--cidfile") {
+		cidPath = filepath.Join(runDir, id+".cid")
+		limits = append(limits, "--cidfile", cidPath)
+	}
 	// The task environment goes to the container only (never into the
 	// docker client's own environment, where e.g. DOCKER_HOST would
 	// redirect `docker run` itself): single-line values via a 0600
@@ -916,7 +925,7 @@ func (s *Session) containerScript(ctx context.Context, run *protocol.ContainerRu
 	if proxy != nil {
 		s.nested.Store(name, nestedRun{d, proxy})
 	}
-	s.lastContainer.name, s.lastContainer.d, s.lastContainer.started = name, d, time.Now()
+	s.lastContainer.name, s.lastContainer.d, s.lastContainer.started, s.lastContainer.cid = name, d, time.Now(), cidPath
 	cleanup := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -940,6 +949,9 @@ func (s *Session) containerScript(ctx context.Context, run *protocol.ContainerRu
 		}
 		os.Remove(scriptPath)
 		os.Remove(envPath)
+		if cidPath != "" {
+			os.Remove(cidPath)
+		}
 		if giveBack {
 			switch err := s.giveBackFiles(ctx, &d, run.Image); {
 			case err == nil:

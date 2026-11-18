@@ -124,6 +124,12 @@ func (l Layout) RunLock(i int) string {
 }
 
 // RunGate serializes counting and taking run permits, held for an instant.
+// RunMem is the record of the memory the holder of run permit i reserves
+// (runMemRecord), written under the run gate as the permit is taken.
+func (l Layout) RunMem(i int) string {
+	return filepath.Join(l.Root, "tokens", fmt.Sprintf("run-%02d.mem.json", i))
+}
+
 func (l Layout) RunGate() string       { return filepath.Join(l.Root, "tokens", "run-gate.lock") }
 func (l Layout) Repo(id string) string { return filepath.Join(l.Root, "repos", id) }
 func (l Layout) Slot(id string, n int) string {
