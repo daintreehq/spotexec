@@ -423,6 +423,7 @@ func TestWorkVolumeSetup(t *testing.T) {
 		mountE bool // mount fails
 		after  int  // the disks show up from this scan on
 		occupy bool // something writes to the work root while mkfs runs
+		hang   string // a disk tool that never returns ("blkid -p", "mkfs.xfs", "blkid -s"): its timeout fires
 	}
 	run := func(t *testing.T, e env) (log, calls, fstab string, err error) {
 		t.Helper()
@@ -480,14 +481,19 @@ func TestWorkVolumeSetup(t *testing.T) {
 		if e.mountE {
 			mountRC = 32
 		}
+		hang := "-"
+		if e.hang != "" {
+			hang = `"` + e.hang + `"*`
+		}
 		stubs := `
 C=` + filepath.Join(dir, "calls") + `
+timeout() { [ "$1" = -k ] && shift 2; shift; case "$*" in ` + hang + `) return 124 ;; esac; SX_T=1 "$@"; }
 getent() { echo "ubuntu:x:1000:1000::` + home + `:/bin/bash"; }
 id() { echo ubuntu; }
 sleep() { SECONDS=$((SECONDS + 1)); }
 lsblk() { case "$1" in -dbnpo) echo >> "$C.scans"; [ "$(wc -l < "$C.scans")" -ge ` + strconv.Itoa(e.after) + ` ] || return 0; ` + list.String() + `;; -npo) case "$3" in ` + parts.String() + `*) echo "$3" ;; esac ;; esac; }
-blkid() { if [ "$1" = -p ]; then case "$2" in ` + probes.String() + `esac; fi; echo uuid-1; }
-mkfs.xfs() { echo "mkfs $*" >> "$C"; ` + occupy + ` }
+blkid() { [ -n "${SX_T:-}" ] || echo "unbounded blkid $*" >> "$C"; if [ "$1" = -p ]; then case "$2" in ` + probes.String() + `esac; fi; echo uuid-1; }
+mkfs.xfs() { [ -n "${SX_T:-}" ] || echo "unbounded mkfs" >> "$C"; echo "mkfs $*" >> "$C"; ` + occupy + ` }
 runuser() { while [ "$1" != -- ]; do shift; done; shift; "$@"; }
 mount() { echo "mount $*" >> "$C"; return ` + strconv.Itoa(mountRC) + `; }
 umount() { echo "umount $*" >> "$C"; }
@@ -551,6 +557,24 @@ chown() { echo "chown $*" >> "$C"; }
 			t.Fatalf("not rolled back: %v\n%s", err, calls)
 		}
 	})
+	// A disk that stops answering mid-probe or mid-format: its tool is
+	// timed out and the work root stays on the root disk, so cloud-init
+	// still reaches the SSH key.
+	for name, c := range map[string]struct{ hang, log string }{
+		"a probe that hangs":       {"blkid -p", "blkid -p /dev/nvme1n1 timed out"},
+		"a format that hangs":      {"mkfs.xfs", "can't format /dev/nvme1n1"},
+		"a uuid lookup that hangs": {"blkid -s", "can't format /dev/nvme1n1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			log, calls, fstab, err := run(t, env{disks: []disk{root, {name: "/dev/nvme1n1", size: gib64}}, hang: c.hang})
+			if err == nil || !strings.Contains(log, c.log) || strings.Contains(calls, "mount") || fstab != "" {
+				t.Fatalf("err %v, log %q, calls %q, fstab %q", err, log, calls, fstab)
+			}
+			if c.hang == "blkid -p" && strings.Contains(calls, "mkfs") {
+				t.Fatalf("formatted after a probe timed out: %q", calls)
+			}
+		})
+	}
 	t.Run("mount fails", func(t *testing.T) {
 		_, calls, fstab, err := run(t, env{disks: []disk{root, {name: "/dev/nvme1n1", size: gib64}}, mountE: true})
 		if err == nil || strings.Contains(calls, "chown") || fstab != "" {
