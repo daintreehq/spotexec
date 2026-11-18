@@ -669,6 +669,7 @@ func (f *runFlags) execute(l *loaded, s runSpec) (code int) {
 		if ctx.Err() != nil {
 			interrupted = true
 			rep.Clear()
+			warnWritebackFailed(rep, err)
 			return finish(client.ExitInterrupted)
 		}
 		if f.fallsBack(l, o, res, err) {
@@ -1215,7 +1216,9 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 				// An interrupted part reports the interrupt, not the error
 				// it ended with (such as the session the interrupt ended),
 				// as a single run does.
-				if err != nil && out.status != partInterrupted {
+				if out.status == partInterrupted {
+					warnWritebackFailed(sr.Reporter, err) // sr.Warn would take mu
+				} else if err != nil {
 					sr.event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 					if !rep.IsJSON() {
 						fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
@@ -1363,6 +1366,16 @@ var errorCodes = map[string]bool{
 
 // failExit is the exit code of a run that failed with err: 123 when the
 // project's Dockerfile failed to build, else 125 (spotexec failed).
+// warnWritebackFailed says that an interrupted run's file changes weren't
+// written back, when that is what err (the error its interrupt is reported
+// in place of) says: the interrupt doesn't excuse changes that didn't land.
+func warnWritebackFailed(rep ui.Reporter, err error) {
+	var we *client.WritebackError
+	if errors.As(err, &we) {
+		rep.Warn("WRITEBACK_FAILED", "%v", err)
+	}
+}
+
 func failExit(err error) int {
 	var be *client.ImageBuildError
 	if errors.As(err, &be) && be.Project() {

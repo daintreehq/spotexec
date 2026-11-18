@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,8 +37,11 @@ func TestInterruptedRemotePartsPrintNoError(t *testing.T) {
 			case <-time.After(50 * time.Millisecond):
 			}
 			if strings.Contains(fake.Log(), "dial") {
-				time.Sleep(500 * time.Millisecond)
-				syscall.Kill(os.Getpid(), syscall.SIGINT)
+				select {
+				case <-done:
+				case <-time.After(500 * time.Millisecond):
+					syscall.Kill(os.Getpid(), syscall.SIGINT)
+				}
 				return
 			}
 		}
@@ -53,4 +58,20 @@ func TestInterruptedRemotePartsPrintNoError(t *testing.T) {
 		`^sx: unit \d/2 · interrupted · \S+ · exit 130$`,
 		`^sx: unit \d/2 · interrupted · \S+ · exit 130$`,
 		`^sx: unit · interrupted · \S+ · exit 130$`)
+}
+
+// An interrupted run whose file changes weren't written back says so,
+// though its error is reported as the interrupt; no other error is.
+func TestInterruptedRunWarnsOfFailedWriteback(t *testing.T) {
+	rep := &warnRecorder{}
+	warnWritebackFailed(rep, &client.InfraError{Err: &client.WritebackError{Err: errors.New("command finished (exit 0) but its file changes could not be written back: disk full")}})
+	if len(rep.warnings) != 1 || !strings.HasPrefix(rep.warnings[0], "WRITEBACK_FAILED: ") || !strings.Contains(rep.warnings[0], "disk full") {
+		t.Fatalf("warnings %q", rep.warnings)
+	}
+	for _, err := range []error{nil, context.Canceled, &client.InfraError{Err: errors.New("lost runner i-run during execution: EOF")}} {
+		rep := &warnRecorder{}
+		if warnWritebackFailed(rep, err); len(rep.warnings) != 0 {
+			t.Errorf("%v: warnings %q", err, rep.warnings)
+		}
+	}
 }

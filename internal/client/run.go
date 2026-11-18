@@ -354,6 +354,14 @@ type InfraError struct{ Err error }
 func (e *InfraError) Error() string { return e.Err.Error() }
 func (e *InfraError) Unwrap() error { return e.Err }
 
+// WritebackError is the error of a run whose command finished but whose
+// file changes could not be written back. A caller that reports an
+// interrupted run's interrupt rather than its error still says this.
+type WritebackError struct{ Err error }
+
+func (e *WritebackError) Error() string { return e.Err.Error() }
+func (e *WritebackError) Unwrap() error { return e.Err }
+
 func infra(err error) error {
 	if err == nil {
 		return nil
@@ -1267,13 +1275,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
-			err = fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)
-			if ctx.Err() != nil {
-				// An interrupted run reports the interrupt, not its error:
-				// still say its changes didn't land.
-				o.Rep.Warn("WRITEBACK_FAILED", "%v", err)
-			}
-			return res, infra(err), ""
+			return res, infra(&WritebackError{fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)}), ""
 		}
 		res.Mutated, res.Deleted = wb.Applied, wb.Deleted
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "held_files": len(wb.HeldNew), "held_bytes": wb.HeldNewBytes, "duration_ms": time.Since(t).Milliseconds()})

@@ -174,7 +174,9 @@ func TestEndedSessionIsNotSilent(t *testing.T) {
 	e.Set("rpc-silent", "")
 	s := e.session(t)
 	asked, release := make(chan struct{}), make(chan struct{})
-	var once sync.Once
+	var once, released sync.Once
+	let := func() { released.Do(func() { close(release) }) }
+	t.Cleanup(let) // a failed wait mustn't leave the watchdog blocked
 	s.SetOnSilent(func(time.Duration) time.Duration {
 		once.Do(func() { close(asked) })
 		<-release
@@ -193,7 +195,7 @@ func TestEndedSessionIsNotSilent(t *testing.T) {
 	if !s.Dead() {
 		t.Fatal("killed session not dead")
 	}
-	close(release)
+	let()
 	deadline = time.Now().Add(5 * time.Second)
 	for !s.silent.Load() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
