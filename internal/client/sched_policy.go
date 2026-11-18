@@ -106,6 +106,11 @@ func (p *Pool) control(st *poolState, now time.Time) {
 	s := st.sched()
 	s.reconcileOwners(now)
 	vs := p.views(st, now)
+	for _, l := range st.Launches {
+		if v := s.VMs[l.InstanceID]; v != nil && l.Demand && !l.Failed && l.InstanceID != "" {
+			v.Demand = true
+		}
+	}
 	s.sample(p.R, now)
 	if p.R.SchedPolicy() == config.PolicyLegacy {
 		s.Warm = nil
@@ -162,9 +167,6 @@ func (p *Pool) control(st *poolState, now time.Time) {
 	// that works.
 	exclusive := len(s.Fences) > 0
 	quiet := !exclusive && p.waiterDemand() == 0
-	if quiet && p.unusedSurplus(st, ret, warm, now) {
-		return
-	}
 	demand := max(s.demandNow(p.R), s.demandP90(now)) + p.R.Scheduling.SpareSlots
 	capacity := 0
 	for _, w := range ret {
@@ -183,12 +185,16 @@ func (p *Pool) control(st *poolState, now time.Time) {
 			}
 		}
 	}
+	unused := quiet && p.unusedSurplus(st, ret, warm, now) // this epoch's one VM, if any
 	if len(victims) == 0 {
 		s.SurplusSince = time.Time{}
 		return
 	}
 	if s.SurplusSince.IsZero() || s.SurplusSince.After(now) {
 		s.SurplusSince = now
+		return
+	}
+	if unused {
 		return
 	}
 	if now.Sub(s.SurplusSince) < sustainSurplus {
@@ -202,30 +208,24 @@ func (p *Pool) control(st *poolState, now time.Time) {
 	s.Generation++
 }
 
-// unusedSurplus lets one retained VM go that this machine launched and
-// never placed a job on, once its minimum residence is over and the other
-// retained VMs that answer cover the slots held now, plus spare_slots
-// (#297). It reports whether it did. Recent demand (p90) doesn't keep
-// such a VM: demand came and went without it. Nor does its never having
-// answered: no job reaching it is why. Standby is reversible: demand that
-// returns promotes it before any launch, and BeginDrain still checks
-// recent demand before committing its early drain. A VM another machine
-// launched may be serving that machine, so only this machine's launches
-// (its ledger) are let go this way; the rest wait for the sustained
-// surplus below.
+// unusedSurplus lets one retained VM go that this machine launched for
+// waiting jobs (vmSched.Demand) and never placed a job on, once its
+// minimum residence is over and the other retained VMs that answer cover
+// the slots held now, plus spare_slots (#297). It reports whether it did.
+// Recent demand (p90) doesn't keep such a VM: demand came and went
+// without it. Nor does its never having answered: no job reaching it is
+// why. Standby is reversible: demand that returns promotes it before any
+// launch, and BeginDrain still checks recent demand before committing its
+// early drain. A VM another machine launched may be serving that machine,
+// and one `spotexec up` launched was asked for, so neither goes this way;
+// they wait for the sustained surplus in control.
 func (p *Pool) unusedSurplus(st *poolState, ret []*vmView, warm map[string]bool, now time.Time) bool {
 	s := st.sched()
-	launched := map[string]bool{}
-	for _, l := range st.Launches {
-		if !l.Failed && l.InstanceID != "" {
-			launched[l.InstanceID] = true
-		}
-	}
 	need := s.demandNow(p.R) + p.R.Scheduling.SpareSlots
 	var unused []*vmView
 	for _, w := range ret {
 		id := w.in.ID
-		if !launched[id] || warm[id] || now.Before(w.v.Hold) || !w.v.lastUseful().IsZero() || s.protected(id) {
+		if !w.v.Demand || warm[id] || now.Before(w.v.Hold) || !w.v.lastUseful().IsZero() || s.protected(id) {
 			continue
 		}
 		if n := st.Notes[id]; n != nil && !n.LastUsed.IsZero() {

@@ -178,11 +178,14 @@ more every 10 seconds while the surplus lasts:
   nor one of the `min_instances` warm VMs;
 - nothing shrinks while jobs are queued, or an exclusive job waits.
 
-A VM this machine launched that never got a job goes standby sooner: once
-it has been in the set a minute, as soon as the other retained VMs that
-answer cover the slots held *now* (plus `spare_slots`), with no 60-second
-wait and whether or not it ever answered. Demand came and went without it,
-so the last minute's peak doesn't keep it.
+A VM this machine launched for waiting jobs (not one `spotexec up` started)
+that never ran a job from this machine goes standby sooner: once it has
+been in the set a minute, as soon as the other retained VMs that answer
+cover the slots held *now* (plus `spare_slots`), with no 60-second wait and
+whether or not it ever answered. Demand came and went without it, so the
+last minute's peak doesn't keep it. It ends early only as any standby VM
+does: once its early drain is handed over (which needs the helper there,
+so with no pool manager to install it, a VM no job ever reached idles out).
 
 A standby VM's running jobs finish, new jobs go elsewhere, and nothing renews
 its idle clock. Once this machine has nothing left on it, it is handed an

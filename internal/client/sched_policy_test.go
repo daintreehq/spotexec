@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 // loaded runs fn on the pool's state under the lock (saving it).
@@ -532,7 +533,7 @@ func TestUnusedLaunchGoesStandby(t *testing.T) {
 			for i := range 4 {
 				hold(s, "i-0", "wt"+string(rune('a'+i)), start)
 			}
-			st.Launches = []launchRec{{ID: "l1", InstanceID: "i-1", Started: start.Add(-time.Minute), PID: os.Getpid()}}
+			st.Launches = []launchRec{{ID: "l1", InstanceID: "i-1", Started: start.Add(-time.Minute), PID: os.Getpid(), Demand: true}}
 			s.Demand = []demandPoint{{start.Add(-time.Minute), 8}, {start.Add(-time.Second), 4}}
 			if fn != nil {
 				fn(st, start)
@@ -555,10 +556,26 @@ func TestUnusedLaunchGoesStandby(t *testing.T) {
 		t.Fatalf("reason %q", v.Reason)
 	}
 
+	// The launch record may expire first (boot_timeout): the VM's own
+	// record keeps that this machine launched it for demand.
+	p, start = setup(t, nil)
+	p.loaded(t, func(st *poolState) {
+		p.views(st, start)
+		st.sched().EpochAt = start.Add(-time.Second) // too soon to act
+		p.control(st, start)
+		st.Launches = nil
+		st.sched().EpochAt = time.Time{}
+		p.control(st, start)
+	})
+	if _, r1 := roles(p, t); r1 != roleStandby {
+		t.Fatalf("after its launch record expired: i-1 %s, want standby", r1)
+	}
+
 	for _, c := range []struct {
 		name string
 		fn   func(st *poolState, now time.Time)
 	}{
+		{"spotexec up", func(st *poolState, now time.Time) { st.Launches[0].Demand = false }},
 		{"residence", func(st *poolState, now time.Time) { st.sched().VMs["i-1"].Hold = now.Add(time.Minute) }},
 		{"another machine's", func(st *poolState, now time.Time) { st.Launches = nil }},
 		{"used", func(st *poolState, now time.Time) { st.sched().VMs["i-1"].LastEnd = now.Add(-time.Minute) }},
@@ -571,6 +588,12 @@ func TestUnusedLaunchGoesStandby(t *testing.T) {
 			hold(st.sched(), "i-0", "wte", now)
 			hold(st.sched(), "i-0", "wtf", now)
 			hold(st.sched(), "i-0", "wtg", now) // seven slots held: more than i-0 has
+		}},
+		{"demand now, it answering", func(st *poolState, now time.Time) {
+			st.note("i-1").markReady(now)
+			hold(st.sched(), "i-0", "wte", now)
+			hold(st.sched(), "i-0", "wtf", now)
+			hold(st.sched(), "i-0", "wtg", now) // its own slots don't count
 		}},
 		{"spare slots", func(st *poolState, now time.Time) {}},
 		{"warm", func(st *poolState, now time.Time) {}},
@@ -601,5 +624,15 @@ func TestUnusedLaunchGoesStandby(t *testing.T) {
 	w.Done()
 	if _, r1 := roles(p, t); r1 != roleRetained {
 		t.Fatalf("with a waiter: i-1 %s, want retained", r1)
+	}
+
+	// The last job's end finds it, with no further job or pool manager.
+	p, _ = setup(t, nil)
+	ready := drainHelperReady
+	drainHelperReady = func(*config.Runner, provider.Instance) bool { return false }
+	t.Cleanup(func() { drainHelperReady = ready })
+	p.DrainSurplus()
+	if _, r1 := roles(p, t); r1 != roleStandby {
+		t.Fatalf("after a lease's drain pass: i-1 %s, want standby", r1)
 	}
 }

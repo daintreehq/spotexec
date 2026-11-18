@@ -115,6 +115,9 @@ type launchRec struct {
 	// Region the instance launched in ("" until known): while that region
 	// can't be listed, the instance's absence proves nothing.
 	Region string `json:"region,omitempty"`
+	// Demand: launched by Plan for waiting jobs (not `spotexec up`): the
+	// controller lets it go once it is found unused (#297).
+	Demand bool `json:"demand,omitempty"`
 }
 
 type poolState struct {
@@ -965,13 +968,13 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 				plural(d.Deferred, "slot"), ui.Dur(d.FreeIn), ui.Dur(d.Lead))
 		case p.briefWait(st, &d, demand, whole, away, pendingVM, now):
 			d.Held, d.Deferred = true, 1
-			d.Reason = fmt.Sprintf("a full VM's jobs may end any moment (their ends unknown or just due): waiting up to %s more before launching (~%s)",
+			d.Reason = fmt.Sprintf("a job on a full VM may end any moment (no predicted end, or just past it): waiting up to %s more before launching (~%s)",
 				ui.Dur(min(briefWaitFor, d.Lead)-d.Waited), ui.Dur(d.Lead))
 		default:
 			var b [6]byte
 			_, _ = rand.Read(b[:])
 			d.Launch, d.ID = true, hex.EncodeToString(b[:])
-			st.Launches = append(st.Launches, launchRec{ID: d.ID, Started: time.Now(), PID: os.Getpid()})
+			st.Launches = append(st.Launches, launchRec{ID: d.ID, Started: time.Now(), PID: os.Getpid(), Demand: true})
 			d.Pending++
 			d.Capacity += slots
 		}
@@ -1420,7 +1423,7 @@ func (p *Pool) briefWait(st *poolState, d *LaunchDecision, demand int, whole []i
 	s := st.sched()
 	for _, in := range st.Instances {
 		n := st.Notes[in.ID]
-		if in.State != provider.StateRunning || n == nil || !n.Ready || n.closed() || now.Before(n.SuspectUntil) ||
+		if in.State != provider.StateRunning || in.Target.Host == "" || n == nil || !n.Ready || n.closed() || now.Before(n.SuspectUntil) ||
 			pendingVM[in.ID] || s.Fences[in.ID] != nil || (in.Region != "" && away.avoided(in.Region)) {
 			continue
 		}
