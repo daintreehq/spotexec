@@ -483,8 +483,14 @@ func uploadStall(l *Lease) error {
 // it. A run lost to its whole region going silent (noReplay.region, with
 // no code) is replayed like a reclaimed one; when the options rule the
 // replay out, the warning still says the region went silent.
+//
+// A run its caller interrupted (canceled) is never replayed, and its loss
+// is explained only when the session was given up on for silence
+// (res.lostSilent): otherwise the interrupt most likely ended the session
+// itself (a Ctrl-C reaches the ssh client too), and the VM isn't to blame
+// (#289).
 func replayable(lost string, res Result, o Options, canceled bool, n int) (retry bool, code, why string) {
-	if lost == "" {
+	if lost == "" || canceled && !res.lostSilent {
 		return false, "", ""
 	}
 	eligible := o.RetryPreempt && !canceled && o.Sync != "none" && !o.PreferLast && !o.SameSlot && n < 2
@@ -900,7 +906,10 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 		if lost != "" {
 			res.lostAt, res.lostWhen = prog.get(), time.Now()
-			if lease.InstanceID != "" {
+			res.lostSilent = lease.Sess.Silent()
+			// An interrupt that ended the session isn't the VM's doing
+			// (#289): replayable reports nothing for it, so don't ask EC2.
+			if lease.InstanceID != "" && (ctx.Err() == nil || res.lostSilent) {
 				res.noReplay = replayVerdict(ctx, lease, noticed.Load(), err, res.lostAt, o.Exclusive)
 			}
 		}

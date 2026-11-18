@@ -158,6 +158,36 @@ func TestSilentHelperWhileWaiting(t *testing.T) {
 	if !s.Dead() {
 		t.Fatal("session not dead after the watchdog")
 	}
+	if !s.Silent() {
+		t.Fatal("a session the watchdog gave up on isn't marked silent")
+	}
+}
+
+// A session that ends because its ssh client was killed here (as an
+// interrupt that reaches it does) didn't lose a silent helper (#289).
+func TestKilledSessionIsNotSilent(t *testing.T) {
+	e := newFakeEnv(t)
+	short(t, &SilenceLimit, time.Second)
+	e.Set("rpc-heartbeat", "")
+	s := e.session(t)
+	s.Abort()
+	if _, err := s.Next(context.Background()); err == nil {
+		t.Fatal("read from a killed session succeeded")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !s.Dead() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !s.Dead() {
+		t.Fatal("killed session not dead")
+	}
+	time.Sleep(1500 * time.Millisecond) // past the silence limit
+	if s.Silent() {
+		t.Fatal("a killed session is marked silent")
+	}
+	if (*Session)(nil).Silent() {
+		t.Fatal("a nil session is silent")
+	}
 }
 
 // ...or sending to it (an upload the helper never reads).

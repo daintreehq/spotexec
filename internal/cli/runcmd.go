@@ -1173,6 +1173,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 			}
 			if err != nil {
 				out.code = failExit(err)
+				if interrupted {
+					// Ended by the interrupt: 130, as a single run (#289).
+					out.code = client.ExitInterrupted
+				}
 			}
 			code := out.code
 			out.took = res.Duration
@@ -1208,7 +1212,10 @@ func (f *runFlags) runTask(l *loaded, name string, args []string) int {
 				if wasStopped {
 					return
 				}
-				if err != nil {
+				// An interrupted part reports the interrupt, not the error
+				// it ended with (such as the session the interrupt ended),
+				// as a single run does.
+				if err != nil && out.status != partInterrupted {
 					sr.event("error", map[string]any{"code": errorCode(err), "message": err.Error()})
 					if !rep.IsJSON() {
 						fmt.Fprintf(os.Stderr, "%sspotexec: %v\n", prefix, err)
