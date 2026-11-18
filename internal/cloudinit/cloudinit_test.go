@@ -419,10 +419,10 @@ func TestWorkVolumeSetup(t *testing.T) {
 		root   string
 		disks  []disk
 		prep   func(home string)
-		fstab  bool // /etc/fstab can't be appended to
-		mountE bool // mount fails
-		after  int  // the disks show up from this scan on
-		occupy bool // something writes to the work root while mkfs runs
+		fstab  bool   // /etc/fstab can't be appended to
+		mountE bool   // mount fails
+		after  int    // the disks show up from this scan on
+		occupy bool   // something writes to the work root while mkfs runs
 		hang   string // a disk tool that never returns ("blkid -p", "mkfs.xfs", "blkid -s"): its timeout fires
 	}
 	run := func(t *testing.T, e env) (log, calls, fstab string, err error) {
