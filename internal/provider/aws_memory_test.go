@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -74,5 +75,18 @@ func TestRecordRunMemory(t *testing.T) {
 	}
 	if got := RunMemory(spot, "w"); got != 3000 {
 		t.Fatalf("expected %d MiB, want 3000", got)
+	}
+	// Read without placement.lock: a busy fleet never hides a known peak.
+	f, err := os.OpenFile(filepath.Join(RunnerStateDir("aws"), "placement.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if got := RunMemory(spot, "w"); got != 3000 || time.Since(start) > 200*time.Millisecond {
+		t.Fatalf("with the state locked: %d MiB after %s", got, time.Since(start))
 	}
 }

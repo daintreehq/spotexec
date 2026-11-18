@@ -173,23 +173,26 @@ func (s *Session) memoryWait(permit int) string {
 		return ""
 	}
 	pool := poolDir()
-	var limit int64
+	limit, ok := int64(0), false
 	if pool != "" {
-		l, ok := cgroupLimit(pool)
-		if !ok {
+		limit, ok = cgroupLimit(pool)
+	}
+	if !ok {
+		// Not set up yet (or its cap not yet written): its planned cap.
+		total := poolMemTotal()
+		if total <= 0 || (pool != "" && !poolPlanned()) {
 			return ""
 		}
-		limit = l
-	} else if total := poolMemTotal(); total > 0 {
-		limit = poolLimit(total) // not set up yet: nothing runs in it
-	} else {
-		return ""
+		limit = poolLimit(total)
 	}
 	share := max(limit/int64(max(s.maxSlots, 1))>>20, 1)
 	others := 0
-	var growth int64
-	// Each command's use is read before the pool's: one growing meanwhile
-	// then counts in the pool's use too, never as room.
+	type running struct {
+		reserve int64
+		cgroup  string
+		used    int64 // MiB
+	}
+	var runs []running
 	for j := 1; j <= s.maxSlots; j++ {
 		if j == permit || !isHeld(s.layout.RunLock(j)) {
 			continue
@@ -204,29 +207,47 @@ func (s *Session) memoryWait(permit int) string {
 			continue
 		}
 		others++
-		reserve := r.ReserveMB
-		if reserve <= 0 {
-			reserve = share
+		run := running{reserve: r.ReserveMB}
+		if run.reserve <= 0 {
+			run.reserve = share
 		}
-		var u int64
 		if pool != "" && r.Cgroup != "" && strings.HasPrefix(r.Cgroup, pool+"/") {
-			if b, ok := cgroupUsed(r.Cgroup); ok {
-				u = b >> 20
-			}
+			run.cgroup = r.Cgroup
 		}
-		growth += max(reserve-u, 0)
+		runs = append(runs, run)
 	}
 	// A job of an older helper holding its slot for its whole lease runs
 	// its command without a permit: the fair share too.
 	for _, h := range readHolders(s.layout) {
 		if !h.Phased && h.HelperPID != 0 {
 			others++
-			growth += share
+			runs = append(runs, running{reserve: share})
 		}
 	}
 	if others == 0 {
 		return ""
 	}
+	// Each command's use is read on both sides of the pool's and the
+	// lower reading counts: one growing or shrinking meanwhile then never
+	// counts as room it doesn't leave.
+	usedNow := func() {
+		for i := range runs {
+			if runs[i].cgroup == "" {
+				continue
+			}
+			u, ok := cgroupUsed(runs[i].cgroup)
+			if !ok {
+				u = 0
+			}
+			if u >>= 20; runs[i].used < 0 || u < runs[i].used {
+				runs[i].used = u
+			}
+		}
+	}
+	for i := range runs {
+		runs[i].used = -1
+	}
+	usedNow()
 	var used int64
 	if pool != "" {
 		u, ok := cgroupUsed(pool)
@@ -234,6 +255,11 @@ func (s *Session) memoryWait(permit int) string {
 			return ""
 		}
 		used = u
+	}
+	usedNow()
+	var growth int64
+	for _, r := range runs {
+		growth += max(r.reserve-max(r.used, 0), 0)
 	}
 	need := s.runMem.ReserveMB
 	if need <= 0 {
@@ -268,7 +294,13 @@ func (s *Session) watchMemory(cidFile string, permit int) (stop func() int64) {
 			if dir == "" {
 				if dir = containerCgroup(cidFile); dir != "" && permit > 0 {
 					rec.Cgroup = dir
-					_ = writeJSON(s.layout.RunMem(permit), rec)
+					// Only while it holds the permit: one given back at
+					// teardown may already be another job's.
+					s.relMu.Lock()
+					if s.run != nil && s.runIdx == permit {
+						_ = writeJSON(s.layout.RunMem(permit), rec)
+					}
+					s.relMu.Unlock()
 				}
 			}
 			if dir != "" {

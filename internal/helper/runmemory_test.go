@@ -337,3 +337,46 @@ func TestReleaseDropsTheMemoryRecord(t *testing.T) {
 		t.Fatalf("record after teardown: %v", err)
 	}
 }
+
+// The pool's cgroup exists before its cap is written (cgroupfs: mkdir,
+// then memory.max): its planned cap applies meanwhile.
+func TestMemoryWaitWhileThePoolIsSetUp(t *testing.T) {
+	root := t.TempDir()
+	pool := fakePool(t, 1, 0)
+	os.WriteFile(filepath.Join(pool, "memory.max"), []byte("max\n"), 0o644)
+	poolPlanned = func() bool { return true }
+	oldTotal := poolMemTotal
+	poolMemTotal = func() int64 { return 32 << 30 }
+	t.Cleanup(func() { poolMemTotal = oldTotal })
+	jobs := pooledJobs(t, root, 4, 6, 8192)
+	for _, s := range jobs[:3] {
+		if _, err := s.takeRun(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if why := jobs[3].memoryWait(4); why == "" {
+		t.Fatal("the fourth 8 GiB job started while the 30 GiB pool's cap was being set")
+	}
+}
+
+// A reservation that can't be recorded refuses the permit (the next job
+// couldn't count it), and leaves it free.
+func TestUnrecordedReservationRefusesThePermit(t *testing.T) {
+	root := t.TempDir()
+	fakePool(t, 16000, 0)
+	s := pooledJobs(t, root, 1, 2, 1000)[0]
+	blocker := filepath.Join(s.layout.RunMem(1), "x")
+	if err := os.MkdirAll(blocker, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.takeRun(); err == nil || s.run != nil {
+		t.Fatalf("permit %d taken without its record (%v)", s.runIdx, err)
+	}
+	if isHeld(s.layout.RunLock(1)) {
+		t.Fatal("the refused permit stayed held")
+	}
+	os.RemoveAll(s.layout.RunMem(1))
+	if _, err := s.takeRun(); err != nil || s.runIdx != 1 {
+		t.Fatalf("permit 1 afterwards: %d, %v", s.runIdx, err)
+	}
+}
