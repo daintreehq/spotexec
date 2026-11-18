@@ -546,7 +546,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
 			}
-			planned(m.r.Name)
+			planned(m.r.Name, d)
 			covered = coverAgain(actx, upstream, m.pool, &d, covered)
 			upstream = append(upstream, m.pool)
 			for _, id := range d.Reap {
@@ -784,18 +784,18 @@ func coverAgain(ctx context.Context, upstream []*Pool, p *Pool, d *LaunchDecisio
 	if now <= covered {
 		return covered
 	}
-	r, short, err := p.Replan(ctx, now, *d)
-	if err != nil || short || p.cancel(d.ID) != nil {
+	r, withdrawn, err := p.Withdraw(ctx, now, *d)
+	if err != nil || !withdrawn {
 		return covered
 	}
 	*d = r
 	return now
 }
 
-// planned is called once a queue round has planned the named fleet, before
-// it plans the next one (tests substitute it, to run other waiters between
-// the two).
-var planned = func(runner string) {}
+// planned is called once a queue round has planned the named fleet (d),
+// before it re-checks a launch or plans the next fleet (tests substitute
+// it, to run other waiters between the two).
+var planned = func(runner string, d LaunchDecision) {}
 
 // helperInstalled reports whether this machine installed the helper on t
 // (tests substitute it).

@@ -353,19 +353,35 @@ func TestReadyCoverHoldsAsPartsRegisterMidRound(t *testing.T) {
 		}
 	})
 	// The first part to plan the preferred fleet waits, before planning
-	// the next, until the other two parts have registered on it.
+	// the next, until the other two parts have planned that one (and so
+	// registered on both). Its own plan of the next fleet then counts them
+	// in its demand but not in what it passed down, and launches before
+	// the re-check.
 	var first atomic.Bool
+	var lower atomic.Int32
+	var raced atomic.Bool
 	old := planned
-	planned = func(runner string) {
-		if runner != "broken" || !first.CompareAndSwap(false, true) {
-			return
-		}
-		for end := time.Now().Add(5 * time.Second); full.waiterDemand() < 2 && time.Now().Before(end); {
-			time.Sleep(time.Millisecond)
+	planned = func(runner string, d LaunchDecision) {
+		switch {
+		case runner == "healthy":
+			if lower.Add(1) == 3 {
+				raced.Store(d.Launch)
+			}
+		case first.CompareAndSwap(false, true):
+			end := time.Now().Add(10 * time.Second)
+			for lower.Load() < 2 && time.Now().Before(end) {
+				time.Sleep(time.Millisecond)
+			}
+			if lower.Load() < 2 {
+				t.Errorf("the other parts didn't plan the next fleet while one part was held")
+			}
 		}
 	}
 	t.Cleanup(func() { planned = old })
 	_, reps := multipartRun(t, pool, fleets)
+	if !raced.Load() {
+		t.Fatal("the held part's plan of the next fleet didn't launch: the interleaving wasn't exercised")
+	}
 	launched(t, reps, fleets)
 }
 
@@ -426,10 +442,14 @@ func TestCoverAgainCancelsOnlyCoveredLaunches(t *testing.T) {
 		// fleet only, and on the lower one only; jobs held on each of the
 		// upper fleet's VMs (the lower fleet's one VM has three).
 		both, exclusive, upper, lower, upperHeld int
-		launch                                   bool
-		covered                                  int // upstream cover once cancelled
+		// late: waiters on the lower fleet only that register after its
+		// plan; the re-check decides for the demand that plan read.
+		late    int
+		launch  bool
+		covered int // upstream cover once cancelled
 	}{
 		{name: "covered upstream now", both: 3, covered: 3},
+		{name: "covered upstream now, a waiter arriving after", both: 3, late: 2, covered: 3},
 		{name: "more than upstream room", both: 12, launch: true},
 		{name: "a waiter only the lower fleet serves", both: 3, lower: 1, launch: true},
 		// Upstream now covers four slots, all shared: the exclusive part
@@ -497,6 +517,9 @@ func TestCoverAgainCancelsOnlyCoveredLaunches(t *testing.T) {
 				t.Fatalf("%+v %v, want a launch", d, err)
 			}
 			id := d.ID
+			for range c.late {
+				register(pools[1], false)
+			}
 			want := before // a launch that stands goes on from the old cover
 			if !c.launch {
 				want = c.covered
@@ -504,12 +527,18 @@ func TestCoverAgainCancelsOnlyCoveredLaunches(t *testing.T) {
 			if got := coverAgain(ctx, pools[:1], pools[1], &d, before); got != want || d.Launch != c.launch {
 				t.Fatalf("covered %d, %+v: want %d, launch=%v", got, d, want, c.launch)
 			}
-			cancelled := false
+			cancelled, found, launches := false, false, 0
 			pools[1].loaded(t, func(st *poolState) {
 				for _, l := range st.Launches {
-					cancelled = cancelled || (l.ID == id && l.Failed)
+					launches++
+					if l.ID == id {
+						found, cancelled = true, l.Failed
+					}
 				}
 			})
+			if !found || launches != 1 {
+				t.Fatalf("launch %s found=%v among %d launches, want it alone in the ledger", id, found, launches)
+			}
 			if cancelled == c.launch {
 				t.Fatalf("launch %s cancelled=%v, want %v", id, cancelled, !c.launch)
 			}
@@ -517,5 +546,68 @@ func TestCoverAgainCancelsOnlyCoveredLaunches(t *testing.T) {
 				t.Fatalf("%+v: a cancelled launch still counted", d)
 			}
 		})
+	}
+}
+
+// #303: two launches re-checked at once can't each count the other as the
+// capacity that makes it unneeded: one is cancelled, the other stands.
+func TestWithdrawCountsOtherWithdrawals(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"broken": {"b1"}, "healthy": {"h1"}}, 4)
+	pool[0].MaxSlots, pool[1].MaxSlots = 2, 1
+	now := time.Now()
+	var pools []*Pool
+	for i, r := range pool {
+		p := NewPool(r, fleets[r.Name])
+		p.loaded(t, func(st *poolState) {
+			allReady(st, now)
+			p.views(st, now)
+			hold(st.sched(), st.Instances[0].ID, "a", now)
+			if i == 0 {
+				hold(st.sched(), st.Instances[0].ID, "b", now)
+			}
+		})
+		pools = append(pools, p)
+	}
+	for range 2 {
+		for _, p := range pools {
+			w, err := p.Register(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(w.Done)
+		}
+	}
+	// The preferred fleet is full: the lower one launches for both waiters.
+	ctx := context.Background()
+	var ds []LaunchDecision
+	for range 2 {
+		d, err := pools[1].Plan(ctx, 0)
+		if err != nil || !d.Launch {
+			t.Fatalf("%+v %v, want a launch", d, err)
+		}
+		ds = append(ds, d)
+	}
+	// A slot frees there: it covers one of them, not both.
+	pools[0].loaded(t, func(st *poolState) {
+		for id, a := range st.sched().Attempts {
+			if a.Worktree == "b" {
+				delete(st.sched().Attempts, id)
+			}
+		}
+	})
+	cover, err := pools[0].Cover(ctx, 0)
+	if err != nil || cover != 1 {
+		t.Fatalf("cover %d %v, want 1", cover, err)
+	}
+	withdrawn := 0
+	for _, d := range ds {
+		if _, ok, err := pools[1].Withdraw(ctx, cover, d); err != nil {
+			t.Fatal(err)
+		} else if ok {
+			withdrawn++
+		}
+	}
+	if withdrawn != 1 {
+		t.Fatalf("%d launches withdrawn, want 1", withdrawn)
 	}
 }

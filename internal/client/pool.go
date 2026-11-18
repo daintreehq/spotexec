@@ -827,10 +827,12 @@ type LaunchDecision struct {
 	Lead        time.Duration
 	LeadLearned bool
 	Waited      time.Duration
-	// waiting is the demand this decision was planned for, and short is
-	// set when a plan that records nothing would have launched.
-	waiting waitingDemand
-	short   bool
+	// waiting is the demand this decision was planned for, short is set
+	// when a plan that records nothing would have launched, and withdrawn
+	// when Withdraw cancelled the launch.
+	waiting   waitingDemand
+	short     bool
+	withdrawn bool
 }
 
 // waitingDemand is a fleet's waiting demand as Plan read it (waitersAway).
@@ -866,18 +868,21 @@ func (p *Pool) Cover(ctx context.Context, covered int) (int, error) {
 	return d.Capacity + d.Deferred + d.Ready, err
 }
 
-// Replan is what Plan would have decided for `last` (a decision it
-// returned) given `covered` instead: for the same waiting demand, without
-// the launch `last` recorded, recording nothing and ending no VM. Short
-// says it would have launched.
-func (p *Pool) Replan(ctx context.Context, covered int, last LaunchDecision) (d LaunchDecision, short bool, err error) {
-	d, err = p.plan(ctx, covered, false, &last)
-	return d, d.short, err
+// Withdraw cancels the launch `last` (a decision Plan returned, whose
+// launch isn't sent yet) when, given `covered` instead, the same waiting
+// demand needs no launch here. It decides as Plan would, without that
+// launch, recording nothing and ending no VM, and cancels under the same
+// lock, so two withdrawals each count the other's cancellation. It returns
+// the decision without the launch, and whether it was cancelled.
+func (p *Pool) Withdraw(ctx context.Context, covered int, last LaunchDecision) (LaunchDecision, bool, error) {
+	d, err := p.plan(ctx, covered, false, &last)
+	return d, d.withdrawn, err
 }
 
 // plan is Plan; with commit false it records no launch and marks no VM
 // for reaping. With last, it plans for last's waiting demand, not the
-// waiters registered now, as if last's launch weren't recorded.
+// waiters registered now, as if last's launch weren't recorded, and
+// cancels that launch (Withdraw) unless this plan would launch.
 func (p *Pool) plan(ctx context.Context, covered int, commit bool, last *LaunchDecision) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
@@ -1036,8 +1041,18 @@ func (p *Pool) plan(ctx context.Context, covered int, commit bool, last *LaunchD
 			d.Pending++
 			d.Capacity += slots
 		}
+		if last != nil && !d.short {
+			for i := range st.Launches {
+				if l := &st.Launches[i]; l.ID == last.ID && l.InstanceID == "" && !l.Failed {
+					l.Failed, d.withdrawn = true, true
+				}
+			}
+		}
 		return nil
 	})
+	if err != nil {
+		d.withdrawn = false // not saved
+	}
 	return d, err
 }
 
@@ -1189,12 +1204,7 @@ func (p *Pool) EnsureMin(ctx context.Context, min int) ([]string, error) {
 
 // Cancel abandons a planned launch that was never sent.
 func (p *Pool) Cancel(id string) {
-	_ = p.cancel(id)
-}
-
-// cancel is Cancel, saying whether the ledger could be updated.
-func (p *Pool) cancel(id string) error {
-	return p.with(func(st *poolState) error {
+	_ = p.with(func(st *poolState) error {
 		for i := range st.Launches {
 			if st.Launches[i].ID == id && st.Launches[i].InstanceID == "" {
 				st.Launches[i].Failed = true
