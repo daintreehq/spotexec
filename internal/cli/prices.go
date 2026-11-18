@@ -339,7 +339,11 @@ func speedFactor(m *provider.RunCostModel) string {
 		}
 		parts = append(parts, strings.Join(ts, ", ")+" of "+against)
 	}
-	return fmt.Sprintf("a slower type (SPEED, measured from the same commands' successful runs on each type lately, drawn toward the generation assumption as far as the runs disagree: %s; assumed for other types: %s)", strings.Join(parts, "; "), gen)
+	capped := ""
+	if m.SpeedCap > 0 {
+		capped = fmt.Sprintf(", and moving a type's charge at most %g hours of its Spot price from that assumption", m.SpeedCap)
+	}
+	return fmt.Sprintf("a slower type (SPEED, measured from the same commands' successful runs on each type lately, drawn toward the generation assumption as far as few VMs or scattered runs leave them unsure%s: %s; assumed for other types: %s)", capped, strings.Join(parts, "; "), gen)
 }
 
 // coldMinutes is one part of a cold start as the run-cost note shows it:

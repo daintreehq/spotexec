@@ -549,3 +549,101 @@ func TestMeasuredSpeedsConsistentRunsOverrideGeneration(t *testing.T) {
 		t.Fatalf("scattered m7a %+v", g)
 	}
 }
+
+// What no spread reveals, every VM of one type busy and every VM of the
+// other quiet, still moves a type's charge at most speedCap hours of its
+// Spot price from what generations alone say, and the launch says so; a
+// type consistently slower on many VMs still pays more than generations
+// alone would charge it.
+func TestRunCostsCapMeasuredCharge(t *testing.T) {
+	now := time.Date(2026, 11, 17, 22, 45, 0, 0, time.UTC)
+	st := &placementState{}
+	vmRuns(st, now, "typecheck", "m7a.2xlarge", 180, 180, 180, 180, 180)
+	vmRuns(st, now, "typecheck", "r7a.2xlarge", 45, 45, 45, 45, 45)
+	m := RunCostModel{WaitCost: 1, HorizonMinutes: 60, GenSpeedup: genSpeedup, RoundTrips: runRoundTrips, SpeedByGen: true, SpeedCap: speedCap,
+		MeasuredSpeeds: measuredSpeeds(st.Speed, now.Add(time.Minute))}
+	ps := []SpotPrice{
+		{Region: "eu-north-1", Zone: "eu-north-1b", Type: "r7a.2xlarge", Price: "0.0792"},
+		{Region: "eu-north-1", Zone: "eu-north-1c", Type: "m7a.2xlarge", Price: "0.0787"},
+	}
+	m7a := runCosts(m, ps, placementEvidence{now: now})[poolKey(ps[1])]
+	if !m7a.SpeedCapped || !approx(m7a.Speed, speedCap*m7a.Compute) || !strings.Contains(m7a.Factors(), "measured, charge capped") {
+		t.Fatalf("m7a %+v: %s", m7a, m7a.Factors())
+	}
+	uncapped := m
+	uncapped.SpeedCap = 0
+	if c := runCosts(uncapped, ps, placementEvidence{now: now})[poolKey(ps[1])]; c.SpeedCapped || c.Speed <= m7a.Speed {
+		t.Fatalf("uncapped m7a %+v", c)
+	}
+
+	// #279: m7a at 0.70x r8a on ten VMs each, 0.91x by generation.
+	st = &placementState{}
+	vmRuns(st, now, "typecheck", "r8a.2xlarge", 72, 70, 74, 71, 73, 72, 70, 74, 71, 73)
+	vmRuns(st, now, "typecheck", "m7a.2xlarge", 104, 101, 105, 103, 102, 104, 101, 105, 103, 102)
+	m.MeasuredSpeeds = measuredSpeeds(st.Speed, now.Add(time.Minute))
+	ps = []SpotPrice{
+		{Region: "eu-north-1", Zone: "eu-north-1b", Type: "r8a.2xlarge", Price: "0.0900"},
+		{Region: "eu-north-1", Zone: "eu-north-1c", Type: "m7a.2xlarge", Price: "0.0787"},
+	}
+	c := runCosts(m, ps, placementEvidence{now: now})
+	slow, gen := c[poolKey(ps[1])], (0.0787+1)*(genSpeedup-1)
+	if slow.SpeedFrom != SpeedMeasured || slow.Speed <= gen+0.2 || slow.Speed > gen+speedCap*0.0787+1e-9 || c[poolKey(ps[0])].Speed != 0 {
+		t.Fatalf("m7a %+v, by generation +$%.3f", slow, gen)
+	}
+}
+
+// A VM counts once however many of the runs it had: four quiet runs on one
+// VM and a busy one on another are typically 90 s, not 59.
+func TestSpeedEstimateCountsVMsOnce(t *testing.T) {
+	var ss []speedSample
+	for i := 0; i < 4; i++ {
+		ss = append(ss, speedSample{MS: 45000, VM: "i-a"})
+	}
+	ss = append(ss, speedSample{MS: 180000, VM: "i-b"})
+	y, v := speedEstimate(ss)
+	if !approx(math.Exp(y), 90000) || v <= 0 {
+		t.Fatalf("typical %v ms, variance %v", math.Exp(y), v)
+	}
+	if _, one := speedEstimate(ss[:4]); !approx(one, speedSpread*speedSpread) {
+		t.Fatalf("one VM's variance %v", one)
+	}
+}
+
+// Runs without a VM (an older client's) count only until SpeedMinRuns runs
+// say theirs: the same VM may be among both.
+func TestMeasuredSpeedsLegacyRunsOnlyUntilVMsKnown(t *testing.T) {
+	exactFit(t)
+	now := time.Date(2026, 11, 17, 22, 45, 0, 0, time.UTC)
+	st := &placementState{}
+	runs(st, now, "w", "m7a.2xlarge", 180, 180, 180, 180)
+	vmRuns(st, now, "w", "r7a.2xlarge", 100, 100, 100, 100, 100)
+	vmRuns(st, now, "w", "m7a.2xlarge", 100)
+	if g := measuredSpeeds(st.Speed, now.Add(time.Minute))["m7a.2xlarge"]; g.Relative >= 0.9 || g.Runs != 5 {
+		t.Fatalf("with legacy runs: %+v", g)
+	}
+	vmRuns(st, now, "w", "m7a.2xlarge", 100, 100, 100, 100, 100)
+	if g := measuredSpeeds(st.Speed, now.Add(time.Minute))["m7a.2xlarge"]; !approx(g.Relative, 1) || g.Runs != 6 {
+		t.Fatalf("VMs known: %+v", g)
+	}
+}
+
+// A time under a millisecond isn't kept, and so doesn't push out a run
+// that was.
+func TestRecordRunSpeedSkipsSubMillisecond(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	vc := &config.Runner{Name: "vc", Type: config.TypeAWSSpot, VCPUs: 8}
+	for i := 0; i < speedSamples; i++ {
+		if err := RecordRunSpeed(vc, "w", "m7a.2xlarge", "i-1", time.Duration(i+1)*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := RecordRunSpeed(vc, "w", "m7a.2xlarge", "i-1", 500*time.Microsecond); err != nil {
+		t.Fatal(err)
+	}
+	g := &AWSGlobal{r: vc, dir: RunnerStateDir(vc.Name)}
+	_ = g.withState(func(st *placementState) {
+		if ss := st.Speed["w"]["m7a.2xlarge"]; len(ss) != speedSamples || ss[0].MS != 1000 {
+			t.Fatalf("kept %d, first %+v", len(ss), ss[0])
+		}
+	})
+}

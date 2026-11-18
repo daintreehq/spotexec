@@ -45,6 +45,13 @@ const (
 	// happen to agree aren't taken as proof.
 	speedSpread    = 0.25
 	speedSpreadVMs = 2.0
+	// speedCap bounds how far measured speeds move an option's run cost
+	// from what its generation alone says: three hours of its Spot price
+	// per hour of work. Runs on busy VMs can make one type look slow on
+	// every VM it ran on lately, which no spread reveals; a type truly
+	// slower still pays several times its price for it, enough to pass
+	// it over among similar types.
+	speedCap = 3.0
 	// speedWorkloads bounds the workloads remembered per runner, and
 	// speedCells the workload and type pairs, so placement.json stays
 	// small: the least recently run is forgotten first.
@@ -225,11 +232,20 @@ func measuredSpeeds(speed map[string]map[string][]speedSample, now time.Time) ma
 	for _, wk := range sortedKeys(speed) {
 		var row []cell
 		for _, it := range sortedKeys(speed[wk]) {
-			var ss []speedSample
+			var ss, tagged []speedSample
 			for _, s := range speed[wk][it] {
 				if usableSpeed(s, now) {
 					ss = append(ss, s)
+					if s.VM != "" {
+						tagged = append(tagged, s)
+					}
 				}
+			}
+			// Runs without a VM (older clients, which also drop the VMs
+			// of runs they save) count only until enough runs say theirs:
+			// the same VM may be among both.
+			if len(tagged) >= SpeedMinRuns {
+				ss = tagged
 			}
 			if len(ss) < SpeedMinRuns {
 				continue

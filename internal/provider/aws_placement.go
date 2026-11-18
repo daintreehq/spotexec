@@ -83,10 +83,13 @@ type RunCost struct {
 	// from its instance generation.
 	RelSpeed float64 `json:"relative_speed"`
 	// SpeedFrom: SpeedMeasured or SpeedByGeneration (vcpus runners only).
-	SpeedFrom string    `json:"speed_from,omitempty"`
-	Warm      bool      `json:"warm"`                // no part of a cold start is paid
-	WarmSeen  time.Time `json:"warm_seen,omitempty"` // last time a VM of this runner ran in the region, when that decided a part
-	RTTMS     int       `json:"rtt_ms,omitempty"`    // TCP connect to the region's EC2 endpoint (0: not measured)
+	SpeedFrom string `json:"speed_from,omitempty"`
+	// SpeedCapped: measured speeds would have moved Speed further from
+	// what generations alone say than RunCostModel.SpeedCap allows.
+	SpeedCapped bool      `json:"speed_capped,omitempty"`
+	Warm        bool      `json:"warm"`                // no part of a cold start is paid
+	WarmSeen    time.Time `json:"warm_seen,omitempty"` // last time a VM of this runner ran in the region, when that decided a part
+	RTTMS       int       `json:"rtt_ms,omitempty"`    // TCP connect to the region's EC2 endpoint (0: not measured)
 }
 
 // ColdParts is what a cold start in a region is made of: booting without a
@@ -137,6 +140,10 @@ type RunCostModel struct {
 	FailureMinutes       float64 `json:"failure_minutes"`
 	FailureHalfLifeHours float64 `json:"failure_half_life_hours"`
 	SpeedByGen           bool    `json:"speed_by_generation"`
+	// SpeedCap bounds how far measured speeds move an option's speed
+	// charge from what generations alone say, in hours of its Spot price
+	// (0: unbounded): see speedCap.
+	SpeedCap float64 `json:"speed_cap_spot_hours,omitempty"`
 	// MeasuredSpeeds: instance type -> its speed as the runner's own runs
 	// measured it (SpeedByGen runners), used in place of GenSpeedup.
 	MeasuredSpeeds map[string]TypeSpeed `json:"measured_speeds,omitempty"`
@@ -281,6 +288,7 @@ func (g *AWSGlobal) costModel(work *coldWork, now time.Time) *RunCostModel {
 		FailureMinutes:       failCost.Minutes(),
 		FailureHalfLifeHours: failHalfLife.Hours(),
 		SpeedByGen:           g.r.ByRequirements(),
+		SpeedCap:             speedCap,
 		Regions:              !g.oneRegion(),
 	}
 }
@@ -313,6 +321,12 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 			return s.Relative
 		}
 		return byGen(t)
+	}
+	// The fastest option by generation alone, which measured speeds are
+	// bounded against (see SpeedCap).
+	genFastest := 0.0
+	for _, p := range ps {
+		genFastest = max(genFastest, byGen(p.Type))
 	}
 	// The fastest option (a measured one on a tie), which every option's
 	// speed is against: a ratio is measured only when both types were
@@ -353,6 +367,17 @@ func runCosts(m RunCostModel, ps []SpotPrice, ev placementEvidence) map[string]R
 		// the extra time costs the VM and the wait.
 		c.Compute = price * h
 		c.Speed = (price + wait) * h * (1/c.RelSpeed - 1)
+		if m.SpeedByGen && m.SpeedCap > 0 && len(m.MeasuredSpeeds) > 0 && genFastest > 0 {
+			// A measurement moves the charge at most SpeedCap hours of the
+			// Spot price from what generations alone say, however thin or
+			// confounded by busy VMs it is: types measured, and those
+			// placed against a measured fastest.
+			byGenOnly := (price + wait) * h * (genFastest/byGen(p.Type) - 1)
+			bound := m.SpeedCap * price * h
+			if d := c.Speed - byGenOnly; d > bound || d < -bound {
+				c.Speed, c.SpeedCapped = byGenOnly+math.Copysign(bound, d), true
+			}
+		}
 		if m.Regions {
 			seen, ok := ev.warm[p.Region]
 			// A time ahead of the clock is no evidence of anything.
@@ -467,6 +492,9 @@ func (c RunCost) SpeedNote() string {
 	how := "assumed"
 	if c.SpeedFrom == SpeedMeasured {
 		how = "measured"
+	}
+	if c.SpeedCapped {
+		how += ", charge capped"
 	}
 	return fmt.Sprintf("%.0f%% speed, %s", c.RelSpeed*100, how)
 }
