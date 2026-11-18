@@ -556,6 +556,7 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	for _, in := range st.Instances {
 		live[in.ID] = true
 	}
+	st.keepDemand(live, time.Now())
 	if !partial {
 		for id, n := range st.Notes {
 			// A bootstrap failure is remembered for an hour after its VM is

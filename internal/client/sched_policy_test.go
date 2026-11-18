@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
-	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 // loaded runs fn on the pool's state under the lock (saving it).
@@ -556,17 +555,28 @@ func TestUnusedLaunchGoesStandby(t *testing.T) {
 		t.Fatalf("reason %q", v.Reason)
 	}
 
-	// The launch record may expire first (boot_timeout): the VM's own
-	// record keeps that this machine launched it for demand.
-	p, start = setup(t, nil)
-	p.loaded(t, func(st *poolState) {
-		p.views(st, start)
-		st.sched().EpochAt = start.Add(-time.Second) // too soon to act
-		p.control(st, start)
-		st.Launches = nil
-		st.sched().EpochAt = time.Time{}
-		p.control(st, start)
+	// The launch record may expire (boot_timeout) before any controller
+	// pass: the listing that prunes it keeps, on the VM's own record, that
+	// this machine launched it for demand.
+	p, start = setup(t, func(st *poolState, now time.Time) {
+		st.Launches[0].Started = now.Add(-p.R.BootTimeout.Duration - 2*time.Minute)
+		delete(st.sched().VMs, "i-1")
 	})
+	if err := p.with(func(st *poolState) error {
+		if err := p.refresh(context.Background(), st, true); err != nil {
+			return err
+		}
+		if len(st.Launches) != 0 {
+			t.Fatalf("launch record kept: %+v", st.Launches)
+		}
+		if v := st.sched().VMs["i-1"]; v != nil {
+			v.Hold = time.Time{}
+		}
+		p.control(st, start)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, r1 := roles(p, t); r1 != roleStandby {
 		t.Fatalf("after its launch record expired: i-1 %s, want standby", r1)
 	}
@@ -626,13 +636,4 @@ func TestUnusedLaunchGoesStandby(t *testing.T) {
 		t.Fatalf("with a waiter: i-1 %s, want retained", r1)
 	}
 
-	// The last job's end finds it, with no further job or pool manager.
-	p, _ = setup(t, nil)
-	ready := drainHelperReady
-	drainHelperReady = func(*config.Runner, provider.Instance) bool { return false }
-	t.Cleanup(func() { drainHelperReady = ready })
-	p.DrainSurplus()
-	if _, r1 := roles(p, t); r1 != roleStandby {
-		t.Fatalf("after a lease's drain pass: i-1 %s, want standby", r1)
-	}
 }

@@ -190,11 +190,20 @@ func TestLoneShortWaitHoldsForAFullVM(t *testing.T) {
 		t.Fatalf("second waiter covered upstream: %+v, want a launch", d)
 	}
 
-	// The wait is bounded: past briefWaitFor the same demand launches.
+	// The wait is bounded: past briefWaitFor the same demand launches,
+	// marked as a launch for demand (unlike `spotexec up`'s).
 	p = fullFleet(t, 1, 16*time.Second, time.Time{}, time.Time{})
 	if d, _ := p.Plan(ctx, 0); !d.Launch || d.Held {
 		t.Fatalf("after the brief wait: %+v, want a launch", d)
 	}
+	if _, err := p.Reserve(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	p.loaded(t, func(st *poolState) {
+		if len(st.Launches) != 2 || !st.Launches[0].Demand || st.Launches[1].Demand {
+			t.Fatalf("launch records %+v, want Plan's marked for demand and Reserve's not", st.Launches)
+		}
+	})
 	// So it is by a learned lead shorter than it.
 	p = fullFleet(t, 1, 8*time.Second, time.Time{}, time.Time{})
 	p.loaded(t, func(st *poolState) {

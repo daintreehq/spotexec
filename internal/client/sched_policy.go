@@ -105,12 +105,8 @@ func (v *vmSched) lastUseful() time.Time {
 func (p *Pool) control(st *poolState, now time.Time) {
 	s := st.sched()
 	s.reconcileOwners(now)
+	st.keepDemand(nil, now)
 	vs := p.views(st, now)
-	for _, l := range st.Launches {
-		if v := s.VMs[l.InstanceID]; v != nil && l.Demand && !l.Failed && l.InstanceID != "" {
-			v.Demand = true
-		}
-	}
 	s.sample(p.R, now)
 	if p.R.SchedPolicy() == config.PolicyLegacy {
 		s.Warm = nil
@@ -244,6 +240,25 @@ func (p *Pool) unusedSurplus(st *poolState, ret []*vmView, warm map[string]bool,
 	v.Reason = fmt.Sprintf("unused: demand now (%d slots) fits the other retained VMs (%d slots)", need, p.otherReady(ret, victim))
 	s.Generation++
 	return true
+}
+
+// keepDemand copies onto the VMs' records which of them this machine
+// launched for waiting jobs, so it outlives the launch records (pruned at
+// boot_timeout, or once the VM serves). listed VMs get a record if they
+// have none yet (refresh runs this before pruning); nil marks only VMs
+// with a record.
+func (st *poolState) keepDemand(listed map[string]bool, now time.Time) {
+	s := st.sched()
+	for _, l := range st.Launches {
+		if !l.Demand || l.Failed || l.InstanceID == "" {
+			continue
+		}
+		if v := s.VMs[l.InstanceID]; v != nil {
+			v.Demand = true
+		} else if listed[l.InstanceID] {
+			s.vm(l.InstanceID, now).Demand = true
+		}
+	}
 }
 
 // otherReady is the slots of the retained VMs other than w that answer.

@@ -127,10 +127,7 @@ const leaseDrainBudget = 5 * time.Second
 // DrainSurplus is the early-drain pass an sx process runs as its lease
 // ends, over the VMs last listed: a standby VM is usually busy, or still
 // keeping its results, while jobs come and go, and the last job to end on
-// it may be the last sx process to run for a while. It runs the
-// controller first, so a VM this job's end leaves surplus (one launched
-// for demand that went elsewhere, #297) is found without waiting for the
-// next job or the pool manager.
+// it may be the last sx process to run for a while.
 func (p *Pool) DrainSurplus() {
 	if !p.R.EarlyDrain() || p.R.SchedPolicy() != config.PolicyConsolidate || !p.R.Ephemeral() {
 		return
@@ -139,7 +136,6 @@ func (p *Pool) DrainSurplus() {
 	defer cancel()
 	var listed []provider.Instance
 	if p.withCtx(ctx, func(st *poolState) error {
-		p.control(st, time.Now())
 		for _, in := range st.Instances {
 			if in.State == provider.StateRunning {
 				listed = append(listed, in)
