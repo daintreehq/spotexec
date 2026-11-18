@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -300,6 +301,24 @@ func TestQueueLockHeld(t *testing.T) {
 	}
 	if d := time.Since(start); d < queueLockWait || d > queueLockWait+10*time.Second {
 		t.Fatalf("gave up after %s, want about %s", d, queueLockWait)
+	}
+}
+
+// A lookup whose acquire runs out of queue time stops waiting for a stopped
+// lock holder then, not queueLockWait later (#295).
+func TestQueueLockWaitEndsWithContext(t *testing.T) {
+	shorten(t, &queueLockWait, time.Hour)
+	q := testQueue(t)
+	a := join(t, q, 0, false)
+	holdLock(t, q)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if st := q.StateCtx(ctx, a); st.Position != unknownPosition {
+		t.Fatalf("lookup with no snapshot under a held lock: %+v", st)
+	}
+	if d := time.Since(start); ctx.Err() == nil || d > 5*time.Second {
+		t.Fatalf("gave up after %s (context: %v), want when its context ended", d, ctx.Err())
 	}
 }
 

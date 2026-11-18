@@ -725,10 +725,17 @@ const (
 // region when it shows the client can't reach the region (or ends that
 // hold when the VM answered).
 func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
+	p.ObserveCtx(context.Background(), id, o, launchedAt)
+}
+
+// ObserveCtx is Observe, but gives up waiting for the ledger's lock (and
+// the observation) when ctx ends: an acquire out of queue time doesn't
+// wait on a stopped process holding it (#295).
+func (p *Pool) ObserveCtx(ctx context.Context, id string, o Outcome, launchedAt time.Time) {
 	if o == outSkipped {
 		return
 	}
-	_ = p.with(func(st *poolState) error {
+	_ = p.withCtx(ctx, func(st *poolState) error {
 		n := st.note(id)
 		now := time.Now()
 		switch o {
@@ -1143,12 +1150,79 @@ func (p *Pool) Cancel(id string) {
 	})
 }
 
-// Reset forgets all local pool state (after `spotexec down`).
-func (p *Pool) Reset() {
+// DownMark is what a teardown can end of the pool's launches: those already
+// bound to an instance (or failed) when it began. MarkDown takes it.
+type DownMark map[string]bool
+
+// MarkDown records, before `spotexec down` lists the fleet, which launch
+// reservations it can have seen. It gives up waiting for the ledger when
+// ctx ends; without a mark, Reset keeps every launch not known to have
+// failed (they stop counting once listings show them gone).
+func (p *Pool) MarkDown(ctx context.Context) DownMark {
+	m := DownMark{}
+	_ = p.withCtx(ctx, func(st *poolState) error {
+		for _, l := range st.Launches {
+			if l.Failed || l.InstanceID != "" {
+				m[l.ID] = true
+			}
+		}
+		return nil
+	})
+	return m
+}
+
+// Reset forgets local pool state after `spotexec down` (marked by m before
+// it began), except the launch reservations it can't have ended: one still
+// being sent when it began, or reserved since (a concurrent up's prewarm),
+// keeps counting toward max_instances, so no other process reserves the
+// same room. One whose VM did end stops counting once listings show it
+// gone, as for any launch.
+func (p *Pool) Reset(m DownMark) {
 	_ = p.with(func(st *poolState) error {
+		var keep []launchRec
+		vms := map[string]bool{} // the kept launches' VMs: down didn't see them
+		for _, l := range st.Launches {
+			if !l.Failed && !m[l.ID] {
+				keep = append(keep, l)
+				if l.InstanceID != "" {
+					vms[l.InstanceID] = true
+				}
+			}
+		}
+		// What the ledger knows of those VMs stays too: a run already
+		// placed on one still protects it (fenceBooting).
+		old, notes := st.sched(), map[string]*note{}
+		// Seq stays with them: a kept VM's Joined must stay below any VM
+		// that joins later.
+		sched := &schedState{Version: schedVersion, Seq: old.Seq}
+		for id, a := range old.Attempts {
+			if vms[a.VM] {
+				if sched.Attempts == nil {
+					sched.Attempts = map[string]*claimRec{}
+				}
+				sched.Attempts[id] = a
+			}
+		}
+		for vm := range vms {
+			if f := old.Fences[vm]; f != nil {
+				if sched.Fences == nil {
+					sched.Fences = map[string]*fence{}
+				}
+				sched.Fences[vm] = f
+			}
+			if v := old.VMs[vm]; v != nil {
+				if sched.VMs == nil {
+					sched.VMs = map[string]*vmSched{}
+				}
+				sched.VMs[vm] = v
+			}
+			if n := st.Notes[vm]; n != nil {
+				notes[vm] = n
+			}
+		}
 		// Held stays: the fleet's region holds outlive a teardown, and an
 		// answer from the region must still end them.
-		*st = poolState{Notes: map[string]*note{}, Sched: &schedState{Version: schedVersion}, Held: st.Held}
+		*st = poolState{Notes: notes, Sched: sched, Held: st.Held, Launches: keep}
 		return nil
 	})
 }
@@ -1269,6 +1343,11 @@ func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger
 	recorded = true
 	launchesInFlight.Done()
 	ran, err := p.Fleet.WaitRunning(ctx, in.ID, log)
+	if err != nil && ctx.Err() == nil && !p.fenceBooting(in.ID) {
+		// Its status never read, yet listings showed it serving: a run
+		// already reached it, so it stays (and keeps its reservation).
+		return in, fmt.Errorf("%w (%s was left running: a run is using it)", err, in.ID)
+	}
 	if err != nil && ctx.Err() == nil {
 		// Reclaimed or broken while booting (a bad volume key, an instant
 		// Spot reclaim, no public IP): end it so it can't linger unusable,
@@ -1304,6 +1383,45 @@ func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger
 		ran.Zone = in.Zone
 	}
 	return ran, err
+}
+
+// fenceBooting reports whether a VM this client launched, and is about to
+// end because it never got ready, may be ended, and if so fences it: until
+// the termination request is out, no claim (not even an exact slot)
+// reserves it, and reservations (and an exclusive job's fence) that sent
+// nothing yet are revoked (their send then fails: nothing reaches the VM). A VM a run already sent to or
+// holds a slot on is not ended (#295): fleet listings can show it serving
+// while its own status can't be read (a throttled lookup by ID). Without
+// the ledger, it may be ended as before.
+func (p *Pool) fenceBooting(id string) bool {
+	ok := true
+	_ = p.with(func(st *poolState) error {
+		s := st.sched()
+		now := time.Now()
+		s.reconcileOwners(now) // a dead process's reservation doesn't hold it
+		var unsent []string
+		for aid, a := range s.Attempts {
+			if a.VM != id || !a.live() {
+				continue
+			}
+			if a.State != attReserved {
+				ok = false
+				return nil
+			}
+			unsent = append(unsent, aid)
+		}
+		for _, aid := range unsent {
+			delete(s.Attempts, aid)
+		}
+		delete(s.Fences, id) // an exclusive job waiting for it goes elsewhere
+		if len(unsent) > 0 {
+			s.sample(p.R, now)
+		}
+		n := st.note(id)
+		n.Reaping, n.ReapCommitted = now, true
+		return nil
+	})
+	return ok
 }
 
 func firstLine(s string) string {

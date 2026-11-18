@@ -25,6 +25,9 @@ type fakeFleet struct {
 	slowRunning bool
 	// goneOnWait: WaitRunning reports the instance gone (reclaimed).
 	goneOnWait bool
+	// onWait, onTerminate: called (unlocked) as WaitRunning answers and as
+	// Terminate is asked to end an instance.
+	onWait, onTerminate func(id string)
 	// placement: what Launch says about where it launched (WaitRunning,
 	// like a cloud listing, doesn't know).
 	placement *provider.Placement
@@ -91,6 +94,9 @@ func (f *fakeFleet) WaitRunning(ctx context.Context, id string, _ provider.Logge
 		<-ctx.Done()
 		return provider.Instance{}, ctx.Err()
 	}
+	if f.onWait != nil {
+		f.onWait(id)
+	}
 	if f.goneOnWait {
 		return provider.Instance{}, errors.New("instance reclaimed while booting")
 	}
@@ -105,6 +111,9 @@ func (f *fakeFleet) WaitRunning(ctx context.Context, id string, _ provider.Logge
 }
 
 func (f *fakeFleet) Terminate(_ context.Context, id string) error {
+	if f.onTerminate != nil {
+		f.onTerminate(id)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.termErr != nil {

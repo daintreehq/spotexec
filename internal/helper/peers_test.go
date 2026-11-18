@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -607,6 +608,100 @@ func TestSyncRecordsCopiesWhenTheClientIsGone(t *testing.T) {
 	}
 	if rec["a.txt"].ID != fsid.Bytes([]byte("alpha\n")) {
 		t.Fatalf("the copied a.txt isn't recorded: %v", rec)
+	}
+}
+
+// A helper that dies after a peer copy put a file in place, but before the
+// manifest recording it was saved, leaves nothing behind (#295): the next
+// sync that doesn't want the file prunes it, and one that does keeps it
+// without asking the client again.
+func TestSyncPrunesFilesWrittenButNeverRecorded(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("wanted=%v", keep), func(t *testing.T) {
+			root := t.TempDir()
+			a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
+			playSync(t, a, workingSet{"a.txt": "alpha\n", "link@": "a.txt"})
+			b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+			b.c = protocol.NewConn(strings.NewReader(""), failWriter{})
+			if err := b.syncManifest(workingSet{"a.txt": "alpha\n", "link@": "a.txt", "b.txt": "beta\n"}.manifest()); err == nil {
+				t.Fatal("sync succeeded with no client")
+			}
+			// As if the helper died before saving the manifest: both copies
+			// are in place, recorded nowhere but in the slot's state.
+			if err := writeJSON(b.manifestPath(), map[string]storedEntry{}); err != nil {
+				t.Fatal(err)
+			}
+			ws := b.workspace
+			checkWorkspace(t, ws, workingSet{"a.txt": "alpha\n", "link@": "a.txt"})
+			b.release()
+			b = slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+			if b.workspace != ws {
+				t.Fatalf("got slot %s, want %s again", b.workspace, ws)
+			}
+			next := workingSet{"b.txt": "beta\n"}
+			if keep {
+				next["a.txt"] = "alpha\n"
+			}
+			need, _ := playSync(t, b, next)
+			if strings.Join(need, ",") != "b.txt" {
+				t.Fatalf("asked for %v, want just b.txt", need)
+			}
+			if _, err := os.Lstat(filepath.Join(ws, "link")); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("unrecorded link survived a sync that doesn't want it: %v", err)
+			}
+			_, err := os.Lstat(filepath.Join(ws, "a.txt"))
+			if keep != (err == nil) {
+				t.Fatalf("a.txt wanted %v, present: %v", keep, err)
+			}
+			if b.state.Writing != nil {
+				t.Fatalf("writing %v after a finished sync", b.state.Writing)
+			}
+		})
+	}
+}
+
+// A file already in the slot where a sync was to write (an untracked
+// output) is the slot's, not the sync's: a sync that fails before writing
+// it, followed by one that no longer wants that path, leaves it (#295).
+func TestSyncKeepsAFileItNeverWrote(t *testing.T) {
+	root := t.TempDir()
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	writeFile(t, b.workspace, "out.txt", "built here\n")
+	b.c = protocol.NewConn(strings.NewReader(""), failWriter{})
+	if err := b.syncManifest(workingSet{"out.txt": "source\n"}.manifest()); err == nil {
+		t.Fatal("sync succeeded with no client")
+	}
+	playSync(t, b, workingSet{"b.txt": "beta\n"})
+	checkWorkspace(t, b.workspace, workingSet{"out.txt": "built here\n"})
+}
+
+// A second sync interrupted before its manifest is saved still leaves the
+// first one's unrecorded copy prunable (#295).
+func TestSyncKeepsTheWritingRecordAcrossTwoInterruptions(t *testing.T) {
+	root := t.TempDir()
+	a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
+	playSync(t, a, workingSet{"x.txt": "ex\n"})
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	interrupted := func(w workingSet) {
+		t.Helper()
+		b.c = protocol.NewConn(strings.NewReader(""), failWriter{})
+		if err := b.syncManifest(w.manifest()); err == nil {
+			t.Fatal("sync succeeded with no client")
+		}
+		if err := writeJSON(b.manifestPath(), map[string]storedEntry{}); err != nil { // died before saving it
+			t.Fatal(err)
+		}
+		ws := b.workspace
+		b.release() // a new helper takes the slot over
+		if b = slotSession(t, root, protocol.Acquire{WorktreeKey: "two"}); b.workspace != ws {
+			t.Fatalf("got slot %s, want %s again", b.workspace, ws)
+		}
+	}
+	interrupted(workingSet{"x.txt": "ex\n"})
+	interrupted(workingSet{"x.txt": "ex\n", "y.txt": "why\n"})
+	playSync(t, b, workingSet{"z.txt": "zed\n"})
+	if _, err := os.Lstat(filepath.Join(b.workspace, "x.txt")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("x.txt, copied by the first interrupted sync, survived: %v", err)
 	}
 }
 
