@@ -320,6 +320,41 @@ func TestWatchMemory(t *testing.T) {
 	}
 }
 
+// A starting container's cgroup is recorded within moments, not at the
+// next sample: until it is, a job deciding whether to start counts the
+// command's memory twice (in the pool's use and in its reservation).
+func TestWatchMemoryFindsTheCgroupPromptly(t *testing.T) {
+	root := t.TempDir()
+	pool := fakePool(t, 16000, 0)
+	oldSample, oldFind := memSampleEvery, memFindEvery
+	memSampleEvery, memFindEvery = time.Hour, 5*time.Millisecond
+	t.Cleanup(func() { memSampleEvery, memFindEvery = oldSample, oldFind })
+	s := pooledJobs(t, root, 1, 2, 1000)[0]
+	if _, err := s.takeRun(); err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("c", 64)
+	cid := filepath.Join(t.TempDir(), "c.cid")
+	var once sync.Once
+	var peak int64
+	watch := s.watchMemory(cid, s.runIdx)
+	stop := func() int64 { once.Do(func() { peak = watch() }); return peak }
+	t.Cleanup(func() { stop() }) // before the globals it reads are restored
+	// Past the first look, which finds nothing: the cgroup appears later.
+	time.Sleep(50 * time.Millisecond)
+	cg := filepath.Join(pool, "docker-"+id+".scope") // systemd layout
+	setCgroup(t, cg, 700, 0)
+	os.WriteFile(cid, []byte(id), 0o644)
+	var r runMemRecord
+	eventually(t, "the cgroup to be recorded", func() bool {
+		return readJSON(s.layout.RunMem(s.runIdx), &r) == nil && r.Cgroup == cg
+	})
+	if got := stop(); got != 700 {
+		t.Fatalf("peak %d MiB, want 700", got)
+	}
+	s.releaseRun()
+}
+
 // Session teardown (the client gone, the runner stopping) leaves no
 // reservation behind with the permit it gives back.
 func TestReleaseDropsTheMemoryRecord(t *testing.T) {

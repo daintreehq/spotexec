@@ -44,6 +44,9 @@ var (
 	poolCgroups = []string{"/sys/fs/cgroup/spotexec.slice", "/sys/fs/cgroup/spotexec"}
 	// memSampleEvery is how often a running command's memory is sampled.
 	memSampleEvery = 2 * time.Second
+	// memFindEvery is how often a starting command's container cgroup is
+	// looked for, until it is found.
+	memFindEvery = 200 * time.Millisecond
 	// poolMemTotal is the machine's memory, for the pool's planned cap
 	// before its cgroup exists.
 	poolMemTotal = hostMemTotal
@@ -309,16 +312,22 @@ func (s *Session) watchMemory(cidFile string, permit int) (stop func() int64) {
 				}
 			}
 		}
-		t := time.NewTicker(memSampleEvery)
-		defer t.Stop()
 		sample()
 		for {
+			// Until the container's cgroup is found, look often: while it
+			// is unrecorded, a job deciding whether to start counts this
+			// command's use twice (in the pool's, and as its whole
+			// reservation still to grow).
+			wait := memSampleEvery
+			if dir == "" {
+				wait = memFindEvery
+			}
 			select {
 			case <-quit:
 				sample()
 				done <- peak >> 20
 				return
-			case <-t.C:
+			case <-time.After(wait):
 				sample()
 			}
 		}
