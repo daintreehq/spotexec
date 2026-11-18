@@ -189,6 +189,62 @@ func TestPrewarmTerminatesVMStillPendingAtDeadline(t *testing.T) {
 	}
 }
 
+// #295: a VM whose status never read through boot, while listings showed
+// it serving, isn't ended under a run already placed on it; one nothing
+// reserved is fenced while it is ended, so no run is placed on it then.
+func TestProvisionFencesABootFailureBeforeEndingIt(t *testing.T) {
+	ctx := context.Background()
+	vm := func(f *fakeFleet, id string) provider.Instance {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for _, in := range f.insts {
+			if in.ID == id {
+				return in
+			}
+		}
+		t.Fatalf("no %s listed", id)
+		return provider.Instance{}
+	}
+	t.Run("a run placed on it", func(t *testing.T) {
+		p, f := testPool(t, 2)
+		f.goneOnWait = true
+		f.onWait = func(id string) {
+			if _, err := p.reserveOn(vm(f, id), claim{}); err != nil {
+				t.Errorf("placing a run while it boots: %v", err)
+			}
+		}
+		terminated := false
+		f.onTerminate = func(string) { terminated = true }
+		ids, _ := p.Reserve(ctx, 1)
+		in, err := p.Provision(ctx, ids[0], nil)
+		if err == nil || !strings.Contains(err.Error(), "left running") {
+			t.Fatalf("err = %v, want the VM left running", err)
+		}
+		if terminated || listed(t, f) != 1 {
+			t.Fatalf("ended %s under the run placed on it", in.ID)
+		}
+		if _, err := p.reserveOn(vm(f, in.ID), claim{}); err != nil {
+			t.Fatalf("the VM left running is fenced: %v", err)
+		}
+	})
+	t.Run("nothing placed on it", func(t *testing.T) {
+		p, f := testPool(t, 2)
+		f.goneOnWait = true
+		var during error
+		f.onTerminate = func(id string) { _, during = p.reserveOn(vm(f, id), claim{Force: true}) }
+		ids, _ := p.Reserve(ctx, 1)
+		if _, err := p.Provision(ctx, ids[0], nil); err == nil || strings.Contains(err.Error(), "left running") {
+			t.Fatalf("err = %v, want the boot failure", err)
+		}
+		if !errors.Is(during, errReaping) {
+			t.Fatalf("an exact slot reserved it while it was being ended: %v", during)
+		}
+		if listed(t, f) != 0 {
+			t.Fatal("the VM that never got ready was left running")
+		}
+	})
+}
+
 func TestProvisionReportsFailedTerminate(t *testing.T) {
 	p, f := testPool(t, 2)
 	f.goneOnWait = true

@@ -87,6 +87,9 @@ func (p *Pool) Prewarm(ctx context.Context, id string, log provider.Logger, read
 			return in, fmt.Errorf("%w (%s finished booting meanwhile, so it was left running; it ends itself after idle_timeout)", err, in.ID)
 		}
 	}
+	if !p.fenceBooting(in.ID) {
+		return in, fmt.Errorf("%w (%s was left running: a run is placed on it)", err, in.ID)
+	}
 	tctx, cancel := context.WithTimeout(bg, 30*time.Second)
 	terr := p.Fleet.Terminate(tctx, in.ID)
 	cancel()

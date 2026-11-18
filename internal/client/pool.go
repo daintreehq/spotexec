@@ -1297,6 +1297,11 @@ func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger
 	recorded = true
 	launchesInFlight.Done()
 	ran, err := p.Fleet.WaitRunning(ctx, in.ID, log)
+	if err != nil && ctx.Err() == nil && !p.fenceBooting(in.ID) {
+		// Its status never read, yet listings showed it serving: a run
+		// already reserved it, so it stays (and keeps its reservation).
+		return in, fmt.Errorf("%w (%s was left running: a run is placed on it)", err, in.ID)
+	}
 	if err != nil && ctx.Err() == nil {
 		// Reclaimed or broken while booting (a bad volume key, an instant
 		// Spot reclaim, no public IP): end it so it can't linger unusable,
@@ -1332,6 +1337,28 @@ func (p *Pool) provisionHeld(ctx context.Context, id string, log provider.Logger
 		ran.Zone = in.Zone
 	}
 	return ran, err
+}
+
+// fenceBooting reports whether a VM this client launched, and is about to
+// end because it never got ready, may be ended, and if so fences it: until
+// the termination request is out, no claim (not even an exact slot)
+// reserves it. A VM a run already reserved is not ended (#295): fleet
+// listings can show it serving while its own status can't be read (a
+// throttled lookup by ID). Without the ledger, it may be ended as before.
+func (p *Pool) fenceBooting(id string) bool {
+	ok := true
+	_ = p.with(func(st *poolState) error {
+		s := st.sched()
+		s.reconcileOwners(time.Now()) // a dead process's reservation doesn't hold it
+		if s.protected(id) {
+			ok = false
+			return nil
+		}
+		n := st.note(id)
+		n.Reaping, n.ReapCommitted = time.Now(), true
+		return nil
+	})
+	return ok
 }
 
 func firstLine(s string) string {
