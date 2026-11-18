@@ -497,6 +497,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 		covered := 0
 		blocked, fleets := 0, 0
 		var blockErr error
+		var upstream []*Pool // the fleets planned so far this round
 		for _, m := range members {
 			if m.pool == nil {
 				continue
@@ -545,6 +546,9 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
 			}
+			planned(m.r.Name, d)
+			covered = coverAgain(actx, upstream, m.pool, &d, covered)
+			upstream = append(upstream, m.pool)
 			for _, id := range d.Reap {
 				if !m.pool.commitReap(id) {
 					continue // a run reserved it meanwhile
@@ -754,6 +758,44 @@ func (m *member) probeStatic(ctx context.Context, req AcquireRequest) (*Lease, [
 	}
 	return lease, holders, err
 }
+
+// coverAgain re-checks, before a lower-priority fleet's launch (d, planned
+// given `covered`) is sent, what the fleets planned before it this round
+// (upstream) cover now. Waiters that registered on them, and then on this
+// fleet, after they were planned are in this fleet's demand but not in
+// covered (#303); every waiter this fleet's plan counted is registered
+// upstream by now. When, given that cover, the same demand needs no
+// launch here, the launch is cancelled and d becomes the decision without
+// it. It returns the cover to go on from: the fresh one once the launch is
+// cancelled, else covered. It never adds a launch: on any doubt the launch
+// stands.
+func coverAgain(ctx context.Context, upstream []*Pool, p *Pool, d *LaunchDecision, covered int) int {
+	if !d.Launch || len(upstream) == 0 {
+		return covered
+	}
+	now := 0
+	for _, u := range upstream {
+		c, err := u.Cover(ctx, now)
+		if err != nil {
+			return covered
+		}
+		now += c
+	}
+	if now <= covered {
+		return covered
+	}
+	r, withdrawn, err := p.Withdraw(ctx, now, *d)
+	if err != nil || !withdrawn {
+		return covered
+	}
+	*d = r
+	return now
+}
+
+// planned is called once a queue round has planned the named fleet (d),
+// before it re-checks a launch or plans the next fleet (tests substitute
+// it, to run other waiters between the two).
+var planned = func(runner string, d LaunchDecision) {}
 
 // helperInstalled reports whether this machine installed the helper on t
 // (tests substitute it).

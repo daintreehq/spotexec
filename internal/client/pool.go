@@ -827,6 +827,19 @@ type LaunchDecision struct {
 	Lead        time.Duration
 	LeadLearned bool
 	Waited      time.Duration
+	// waiting is the demand this decision was planned for, short is set
+	// when a plan that records nothing would have launched, and withdrawn
+	// when Withdraw cancelled the launch.
+	waiting   waitingDemand
+	short     bool
+	withdrawn bool
+}
+
+// waitingDemand is a fleet's waiting demand as Plan read it (waitersAway).
+type waitingDemand struct {
+	total int
+	whole []int
+	away  awayDemand
 }
 
 // Plan decides, under the pool lock, whether this process should launch one
@@ -843,12 +856,47 @@ type LaunchDecision struct {
 // cover only the demand of the waiters that can use it, so those replays
 // aren't left waiting on it.
 func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
+	return p.plan(ctx, covered, true, nil)
+}
+
+// Cover is the demand this fleet covers, as Plan would decide it now
+// given `covered`, without recording a launch or ending a VM: what its
+// launches and ready VMs take, and what waits for slots about to free. A
+// launch Plan would record isn't counted.
+func (p *Pool) Cover(ctx context.Context, covered int) (int, error) {
+	d, err := p.plan(ctx, covered, false, nil)
+	return d.Capacity + d.Deferred + d.Ready, err
+}
+
+// Withdraw cancels the launch `last` (a decision Plan returned, whose
+// launch isn't sent yet) when, given `covered` instead, the same waiting
+// demand needs no launch here. It decides as Plan would, without that
+// launch, recording nothing and ending no VM, and cancels under the same
+// lock, so two withdrawals each count the other's cancellation. It returns
+// the decision without the launch, and whether it was cancelled.
+func (p *Pool) Withdraw(ctx context.Context, covered int, last LaunchDecision) (LaunchDecision, bool, error) {
+	d, err := p.plan(ctx, covered, false, &last)
+	return d, d.withdrawn, err
+}
+
+// plan is Plan; with commit false it records no launch and marks no VM
+// for reaping. With last, it plans for last's waiting demand, not the
+// waiters registered now, as if last's launch weren't recorded, and
+// cancels that launch (Withdraw) unless this plan would launch.
+func (p *Pool) plan(ctx context.Context, covered int, commit bool, last *LaunchDecision) (LaunchDecision, error) {
 	var d LaunchDecision
 	err := p.withCtx(ctx, func(st *poolState) error {
 		if err := p.refresh(ctx, st, false); err != nil {
 			return err
 		}
-		demand, whole, away := p.waitersAway()
+		var w waitingDemand
+		if last != nil {
+			w = last.waiting
+		} else {
+			w.total, w.whole, w.away = p.waitersAway()
+		}
+		d.waiting = w
+		demand, whole, away := w.total, w.whole, w.away
 		d.Demand = demand - covered
 		listed := map[string]bool{}
 		unusable := map[string]string{} // listed, in a region some waiters can't use: its region
@@ -873,7 +921,7 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 		inLedger := map[string]bool{}
 		pendingVM := map[string]bool{} // instances whose slots count as pending
 		for _, l := range st.Launches {
-			if l.Failed {
+			if l.Failed || (last != nil && l.ID == last.ID) {
 				continue
 			}
 			if l.InstanceID != "" {
@@ -959,6 +1007,9 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Reason = fmt.Sprintf("%s free on ready VMs", plural(d.Ready, "slot"))
 		case !p.R.BelowMax(usable):
 			d.Reason = fmt.Sprintf("at max_instances (%d)", p.R.MaxInstances)
+			if !commit {
+				break
+			}
 			if id, region := p.reapable(st, time.Now()); id != "" {
 				d.Reap = []string{id}
 				n := st.note(id)
@@ -979,6 +1030,9 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Held, d.Deferred = true, 1
 			d.Reason = fmt.Sprintf("a job on a full VM may end any moment (no predicted end, or just past it): waiting up to %s more before launching (~%s)",
 				ui.Dur(min(briefWaitFor, d.Lead)-d.Waited), ui.Dur(d.Lead))
+		case !commit:
+			// Would launch: nothing is recorded, so nothing more covered.
+			d.short = true
 		default:
 			var b [6]byte
 			_, _ = rand.Read(b[:])
@@ -987,8 +1041,18 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Pending++
 			d.Capacity += slots
 		}
+		if last != nil && !d.short {
+			for i := range st.Launches {
+				if l := &st.Launches[i]; l.ID == last.ID && l.InstanceID == "" && !l.Failed {
+					l.Failed, d.withdrawn = true, true
+				}
+			}
+		}
 		return nil
 	})
+	if err != nil {
+		d.withdrawn = false // not saved
+	}
 	return d, err
 }
 
