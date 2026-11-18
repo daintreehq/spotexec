@@ -47,6 +47,12 @@ const (
 	// ExitImageBuild: the project's own Dockerfile failed to build
 	// (ImageBuildError), so the command never ran.
 	ExitImageBuild = 123
+	// ExitOOM: the command failed after the kernel's OOM killer killed a
+	// process in its container (OOM_KILLED), whatever code the command
+	// itself exited with, so running out of memory isn't mistaken for a
+	// test or type failure (#294). 128+SIGKILL, what the killed process
+	// itself exits with.
+	ExitOOM = 137
 )
 
 // Large-sync guardrails.
@@ -1214,6 +1220,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 	if result.OOMKilled {
 		res.OOMKilled = true
 		o.Rep.Warn("OOM_KILLED", "%s", oomMessage(result.MemoryLimitMB))
+		res.ExitCode = oomExit(res)
 	}
 	res.speed = runSpeed(lease, ws, o, result, ex.Env, res.Canceled)
 
@@ -1485,6 +1492,18 @@ func shutdownRunner(l *Lease) string {
 func conflictExit(res Result, failOnConflict bool) int {
 	if failOnConflict && len(res.Conflicts) > 0 && res.ExitCode == 0 && !res.Canceled && !res.TimedOut && !res.SetupFailed {
 		return ExitWritebackConflict
+	}
+	return res.ExitCode
+}
+
+// oomExit is the exit code of a run whose container had a process OOM
+// killed: ExitOOM when the command (or its [setup]) failed, so the failure
+// reads as memory, not as the command's own (a task script exits 1 when
+// the compiler it ran was killed). A command that still succeeded, timed
+// out or was interrupted keeps its code.
+func oomExit(res Result) int {
+	if res.OOMKilled && res.ExitCode != 0 && !res.Canceled && !res.TimedOut {
+		return ExitOOM
 	}
 	return res.ExitCode
 }

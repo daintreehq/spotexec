@@ -225,6 +225,26 @@ func TestConflictExit(t *testing.T) {
 	}
 }
 
+func TestOOMExit(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		res  Result
+		want int
+	}{
+		{"no OOM keeps the command's code", Result{ExitCode: 1}, 1},
+		{"a failed command whose process was OOM killed", Result{ExitCode: 1, OOMKilled: true}, ExitOOM},
+		{"the command killed itself", Result{ExitCode: ExitOOM, OOMKilled: true}, ExitOOM},
+		{"a failed [setup] run", Result{ExitCode: 1, OOMKilled: true, SetupFailed: true}, ExitOOM},
+		{"a command that still succeeded keeps 0", Result{OOMKilled: true}, 0},
+		{"timed out stays 124", Result{ExitCode: ExitTimeout, TimedOut: true, OOMKilled: true}, ExitTimeout},
+		{"interrupted stays 130", Result{ExitCode: ExitInterrupted, Canceled: true, OOMKilled: true}, ExitInterrupted},
+	} {
+		if got := oomExit(c.res); got != c.want {
+			t.Errorf("%s: exit %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
 func TestInterruptedRunIsNeverOnSuccess(t *testing.T) {
 	if wantWriteback("on-success", ExitInterrupted) {
 		t.Fatal("an interrupted run counted as success for on-success write-back")
