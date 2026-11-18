@@ -118,29 +118,126 @@ func TestSustainedWaitLaunches(t *testing.T) {
 	}
 }
 
-// A prediction that is missing, already overdue, or later than a launch
-// would serve holds nothing; nor do too few releases, or a whole-VM waiter.
+// A prediction that is missing, or already overdue, holds nothing once a
+// lone job has waited past briefWaitFor (before, briefWait may hold it);
+// one later than a launch would serve holds nothing; nor do too few
+// releases, a whole-VM waiter, or a job overdue for long.
 func TestHoldNeedsPredictedReleases(t *testing.T) {
 	now := time.Now()
 	soon := now.Add(5 * time.Second)
+	brief, past := time.Second, briefWaitFor+time.Second
 	for _, c := range []struct {
 		name    string
 		waiting int
+		waited  time.Duration
 		ends    []time.Time
 	}{
-		{"unknown", 1, []time.Time{{}, {}}},
-		{"overdue", 1, []time.Time{now.Add(-time.Second), now.Add(-time.Second)}},
-		{"after the lead", 1, []time.Time{now.Add(leadDefault + time.Minute), now.Add(leadDefault + time.Minute)}},
-		{"too few", 2, []time.Time{soon, {}}},
+		{"unknown", 1, past, []time.Time{{}, {}}},
+		{"overdue", 1, past, []time.Time{now.Add(-time.Second), now.Add(-time.Second)}},
+		{"long overdue", 1, brief, []time.Time{now.Add(-briefWaitFor - time.Second), now.Add(-time.Minute)}},
+		{"after the lead", 1, brief, []time.Time{now.Add(leadDefault + time.Minute), now.Add(leadDefault + time.Minute)}},
+		{"too few", 2, brief, []time.Time{soon, {}}},
 		// An exclusive job needs a VM to empty, which freeing slots don't
 		// show (two may free on different VMs).
-		{"whole VM", -1, []time.Time{soon, soon}},
-		{"whole VM weighing a slot", -2, []time.Time{soon, soon}},
+		{"whole VM", -1, brief, []time.Time{soon, soon}},
+		{"whole VM weighing a slot", -2, brief, []time.Time{soon, soon}},
+		{"whole VM, ends unknown", -2, brief, []time.Time{{}, {}}},
+		{"two waiting, ends unknown", 2, brief, []time.Time{{}, {}}},
 	} {
-		p := fullFleet(t, c.waiting, time.Second, c.ends...)
+		p := fullFleet(t, c.waiting, c.waited, c.ends...)
 		if d, err := p.Plan(context.Background(), 0); err != nil || !d.Launch || d.Held {
 			t.Errorf("%s: %+v %v, want a launch", c.name, d, err)
 		}
+	}
+}
+
+// #297: a lone job that has waited seconds on a full VM whose jobs' ends
+// are unknown, or only just due, waits up to briefWaitFor for one of them
+// to end instead of launching a VM it would likely never use; and says
+// why. No launch is recorded while it waits.
+func TestLoneShortWaitHoldsForAFullVM(t *testing.T) {
+	now := time.Now()
+	ctx := context.Background()
+	for _, c := range []struct {
+		name string
+		ends []time.Time
+	}{
+		{"unknown", []time.Time{{}, {}}},
+		{"just due", []time.Time{now.Add(-time.Second), now.Add(time.Hour)}},
+		{"one unknown", []time.Time{{}, now.Add(leadDefault + time.Minute)}},
+	} {
+		p := fullFleet(t, 1, 8*time.Second, c.ends...)
+		d, err := p.Plan(ctx, 0)
+		if err != nil || d.Launch || !d.Held || d.Deferred != 1 || d.FreeIn != 0 || !strings.Contains(d.Reason, "may end any moment") {
+			t.Fatalf("%s: %+v %v, want held for a brief wait", c.name, d, err)
+		}
+		p.loaded(t, func(st *poolState) {
+			if len(st.Launches) != 0 {
+				t.Fatalf("%s: launch recorded while held: %+v", c.name, st.Launches)
+			}
+		})
+	}
+
+	// A predicted release within the lead is the ordinary hold, which says
+	// when the slot frees.
+	p := fullFleet(t, 1, 8*time.Second, time.Time{}, now.Add(30*time.Second))
+	if d, _ := p.Plan(ctx, 0); !d.Held || d.FreeIn <= 0 || !strings.Contains(d.Reason, "sooner than a new VM") {
+		t.Fatalf("predicted release: %+v, want the ordinary hold", d)
+	}
+	// Another waiter, even one a higher-priority fleet covers, is a burst.
+	p = fullFleet(t, 2, 8*time.Second, time.Time{}, time.Time{})
+	if d, _ := p.Plan(ctx, 1); !d.Launch || d.Held {
+		t.Fatalf("second waiter covered upstream: %+v, want a launch", d)
+	}
+
+	// The wait is bounded: past briefWaitFor the same demand launches,
+	// marked as a launch for demand (unlike `spotexec up`'s).
+	p = fullFleet(t, 1, 16*time.Second, time.Time{}, time.Time{})
+	if d, _ := p.Plan(ctx, 0); !d.Launch || d.Held {
+		t.Fatalf("after the brief wait: %+v, want a launch", d)
+	}
+	if _, err := p.Reserve(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	p.loaded(t, func(st *poolState) {
+		if len(st.Launches) != 2 || !st.Launches[0].Demand || st.Launches[1].Demand {
+			t.Fatalf("launch records %+v, want Plan's marked for demand and Reserve's not", st.Launches)
+		}
+	})
+	// So it is by a learned lead shorter than it.
+	p = fullFleet(t, 1, 8*time.Second, time.Time{}, time.Time{})
+	p.loaded(t, func(st *poolState) {
+		s := st.sched()
+		for range modelMin {
+			s.Leads = append(s.Leads, leadSample{At: now, S: 5})
+		}
+	})
+	if d, _ := p.Plan(ctx, 0); !d.Launch || d.Held {
+		t.Fatalf("lead shorter than the wait: %+v, want a launch", d)
+	}
+	// A VM with jobs admitted beyond its slots (even one whose helper
+	// admits more), or with a holder that is uncertain besides its full
+	// slots, isn't the lone job's to wait for; nor is one with no address.
+	p = fullFleet(t, 1, 8*time.Second, time.Time{}, time.Time{}, time.Time{})
+	p.loaded(t, func(st *poolState) { st.sched().VMs["i-0"].Slots, st.sched().VMs["i-0"].Admit = 2, 4 })
+	if d, _ := p.Plan(ctx, 0); !d.Launch || d.Held {
+		t.Fatalf("overflow: %+v, want a launch", d)
+	}
+	p = fullFleet(t, 1, 8*time.Second, time.Time{}, time.Time{}, time.Time{})
+	p.loaded(t, func(st *poolState) {
+		for _, a := range st.sched().Attempts {
+			if a.Worktree == "wtc" {
+				a.State = attUncertain
+			}
+		}
+	})
+	if d, _ := p.Plan(ctx, 0); !d.Launch || d.Held {
+		t.Fatalf("uncertain holder: %+v, want a launch", d)
+	}
+	p = fullFleet(t, 1, 8*time.Second, time.Time{}, time.Time{})
+	p.loaded(t, func(st *poolState) { st.Instances[0].Target.Host = "" })
+	if d, _ := p.Plan(ctx, 0); d.Held {
+		t.Fatalf("no address: %+v, want no hold", d)
 	}
 }
 

@@ -109,7 +109,12 @@ takes part in scheduling, and every VM shuts itself down.
      round launches, and a job that has waited longer than the lead is
      sustained demand, and launches as before. A job whose end is unknown
      frees nothing here either, nor does a VM that is draining, outdated,
-     suspect, fenced or still starting. The first slots to free on a VM
+     suspect, fenced or still starting. One exception: a lone job (the only
+     one waiting, for one slot) whose VM is full with this machine's jobs,
+     none admitted beyond its slots, and one of them with no prediction or
+     one that fell due in the last 15 seconds, waits up to 15 seconds (or
+     the lead, if shorter) for that slot before launching, so a job queued
+     for seconds doesn't launch a VM it never uses. The first slots to free on a VM
      whose helper admitted jobs beyond its slots (step 3) are theirs, so
      those releases free nothing for jobs still waiting to be admitted. While an exclusive job no empty
      ready VM covers waits (it needs a whole VM to empty, which freeing
@@ -172,6 +177,15 @@ more every 10 seconds while the surplus lasts:
   an `exec`/`pull`/`--same-slot` in progress or an exclusive job's fence,
   nor one of the `min_instances` warm VMs;
 - nothing shrinks while jobs are queued, or an exclusive job waits.
+
+A VM this machine launched for waiting jobs (not one `spotexec up` started)
+that never ran a job from this machine goes standby sooner: once it has
+been in the set a minute, as soon as the other retained VMs that answer
+cover the slots held *now* (plus `spare_slots`), with no 60-second wait and
+whether or not it ever answered. Demand came and went without it, so the
+last minute's peak doesn't keep it. It ends early only as any standby VM
+does: once its early drain is handed over (which needs the helper there,
+so with no pool manager to install it, a VM no job ever reached idles out).
 
 A standby VM's running jobs finish, new jobs go elsewhere, and nothing renews
 its idle clock. Once this machine has nothing left on it, it is handed an

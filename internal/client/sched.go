@@ -136,6 +136,10 @@ type vmSched struct {
 	// Repos: repository -> when it last ran here (image and dependency
 	// caches are per repository).
 	Repos map[string]time.Time `json:"repos,omitempty"`
+	// Demand: this machine launched it for waiting jobs (from its launch
+	// record, kept here past the record's own life): unused, it may go
+	// standby early (unusedSurplus, #297).
+	Demand bool `json:"demand,omitempty"`
 	// DrainOp names the committed early drain (roleDrainRequested).
 	DrainOp string    `json:"drain_op,omitempty"`
 	DrainAt time.Time `json:"drain_at,omitempty"`
