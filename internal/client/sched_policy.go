@@ -216,6 +216,9 @@ func (p *Pool) control(st *poolState, now time.Time) {
 // and one `spotexec up` launched was asked for, so neither goes this way;
 // they wait for the sustained surplus in control.
 func (p *Pool) unusedSurplus(st *poolState, ret []*vmView, warm map[string]bool, now time.Time) bool {
+	if len(st.Unlisted) > 0 {
+		return false // VMs carried from regions that didn't answer may be gone: they cover nothing here
+	}
 	s := st.sched()
 	need := s.demandNow(p.R) + p.R.Scheduling.SpareSlots
 	var unused []*vmView
@@ -244,10 +247,11 @@ func (p *Pool) unusedSurplus(st *poolState, ret []*vmView, warm map[string]bool,
 
 // keepDemand copies onto the VMs' records which of them this machine
 // launched for waiting jobs, so it outlives the launch records (pruned at
-// boot_timeout, or once the VM serves). listed VMs get a record if they
-// have none yet (refresh runs this before pruning); nil marks only VMs
-// with a record.
-func (st *poolState) keepDemand(listed map[string]bool, now time.Time) {
+// boot_timeout, or once the VM serves). A VM in serving (running, with an
+// address: one views would list) gets a record if it has none yet, as
+// views would give it (refresh runs this before pruning); nil marks only
+// VMs with a record.
+func (st *poolState) keepDemand(serving map[string]bool, now time.Time) {
 	s := st.sched()
 	for _, l := range st.Launches {
 		if !l.Demand || l.Failed || l.InstanceID == "" {
@@ -255,7 +259,7 @@ func (st *poolState) keepDemand(listed map[string]bool, now time.Time) {
 		}
 		if v := s.VMs[l.InstanceID]; v != nil {
 			v.Demand = true
-		} else if listed[l.InstanceID] {
+		} else if serving[l.InstanceID] {
 			s.vm(l.InstanceID, now).Demand = true
 		}
 	}

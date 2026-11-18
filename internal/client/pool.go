@@ -552,11 +552,12 @@ func (p *Pool) refresh(ctx context.Context, st *poolState, force bool) error {
 	// Fresh from now: a slow type lookup in matchConfig mustn't leave the
 	// listing already stale, sending every waiting process to re-list.
 	st.ListedAt = time.Now()
-	live := map[string]bool{}
+	live, serving := map[string]bool{}, map[string]bool{}
 	for _, in := range st.Instances {
 		live[in.ID] = true
+		serving[in.ID] = in.State == provider.StateRunning && in.Target.Host != ""
 	}
-	st.keepDemand(live, time.Now())
+	st.keepDemand(serving, time.Now())
 	if !partial {
 		for id, n := range st.Notes {
 			// A bootstrap failure is remembered for an hour after its VM is

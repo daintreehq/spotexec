@@ -586,6 +586,7 @@ func TestUnusedLaunchGoesStandby(t *testing.T) {
 		fn   func(st *poolState, now time.Time)
 	}{
 		{"spotexec up", func(st *poolState, now time.Time) { st.Launches[0].Demand = false }},
+		{"partial listing", func(st *poolState, now time.Time) { st.Unlisted = []string{"eu-north-1"} }},
 		{"residence", func(st *poolState, now time.Time) { st.sched().VMs["i-1"].Hold = now.Add(time.Minute) }},
 		{"another machine's", func(st *poolState, now time.Time) { st.Launches = nil }},
 		{"used", func(st *poolState, now time.Time) { st.sched().VMs["i-1"].LastEnd = now.Add(-time.Minute) }},
@@ -636,4 +637,19 @@ func TestUnusedLaunchGoesStandby(t *testing.T) {
 		t.Fatalf("with a waiter: i-1 %s, want retained", r1)
 	}
 
+}
+
+// keepDemand marks a demand launch's VM, but starts no record (nor its
+// minimum residence) for a VM not yet serving: views does that once it is.
+func TestKeepDemandWaitsForServingVMs(t *testing.T) {
+	st := &poolState{Launches: []launchRec{
+		{ID: "a", InstanceID: "i-pending", Demand: true},
+		{ID: "b", InstanceID: "i-up", Demand: true},
+		{ID: "c", InstanceID: "i-asked", Demand: false},
+	}}
+	st.keepDemand(map[string]bool{"i-pending": false, "i-up": true, "i-asked": true}, time.Now())
+	s := st.sched()
+	if s.VMs["i-pending"] != nil || s.VMs["i-asked"] != nil || s.VMs["i-up"] == nil || !s.VMs["i-up"].Demand {
+		t.Fatalf("records %+v", s.VMs)
+	}
 }
