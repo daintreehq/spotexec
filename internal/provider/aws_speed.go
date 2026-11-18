@@ -24,24 +24,27 @@ import (
 //
 // Jobs share a VM's CPUs, so a run's time also says how busy its VM was:
 // the same typecheck took 45 s on a quiet r7a and 180 s beside five other
-// jobs (#296). Each workload's runs on a type therefore count by how much
-// they agree, and the fit leans on the generation assumption as far as
-// they don't: a few scattered runs barely move a type from its
+// jobs (#296). So a workload's runs on a type count by the VMs they ran
+// on (runs on one VM share its load), and by how closely those VMs
+// agree, and the fit leans on the generation assumption as far as they
+// don't: a few VMs, or scattered ones, barely move a type from its
 // generation's speed, and many consistent ones replace it.
 const (
 	// speedSamples bounds the runs kept of one workload on one type: enough
-	// for a median that busy and quiet VMs both feed.
+	// that busy and quiet VMs both feed them.
 	speedSamples = 30
 	// speedFor is how long a run counts.
 	speedFor = 30 * 24 * time.Hour
-	// speedMinRuns is the runs of a workload on a type before their
-	// median counts: one run on a VM busy with others says little, and a
-	// spread needs a few to estimate.
-	speedMinRuns = 5
-	// speedNoise is the least spread (the standard deviation of log run
-	// time) assumed of a workload's runs on a type, however alike they
-	// were: no run time is trusted to better than about 5%.
-	speedNoise = 0.05
+	// SpeedMinRuns is the runs of a workload on a type before they count:
+	// one run on a VM busy with others says little.
+	SpeedMinRuns = 5
+	// speedSpread is the spread (the standard deviation of log run time)
+	// assumed from one VM's runs of a workload to another's, as a shared
+	// VM's load moves them, before the VMs themselves show theirs: it
+	// counts as speedSpreadVMs VMs' worth of evidence, so two VMs that
+	// happen to agree aren't taken as proof.
+	speedSpread    = 0.25
+	speedSpreadVMs = 2.0
 	// speedWorkloads bounds the workloads remembered per runner, and
 	// speedCells the workload and type pairs, so placement.json stays
 	// small: the least recently run is forgotten first.
@@ -60,6 +63,9 @@ var speedStray = math.Log(genSpeedup)
 type speedSample struct {
 	MS int64     `json:"ms"`
 	At time.Time `json:"at"`
+	// VM is the instance it ran on ("": unknown, as older clients kept
+	// none: such runs count as one VM).
+	VM string `json:"vm,omitempty"`
 }
 
 // TypeSpeed is a type's speed as measured from the runner's own runs.
@@ -78,18 +84,19 @@ type TypeSpeed struct {
 }
 
 // RecordRunSpeed records how long a successful run's command took on a VM
-// of instance type itype, for runner r's next launches to weigh that
-// type's speed by. workload names what ran (see client.SpeedWorkload): only
-// runs of the same workload are compared. Only vcpus runners weigh speed.
-func RecordRunSpeed(r *config.Runner, workload, itype string, took time.Duration) error {
-	if r == nil || r.Type != config.TypeAWSSpot || !r.ByRequirements() || workload == "" || itype == "" || took <= 0 {
+// of instance type itype (instance vm), for runner r's next launches to
+// weigh that type's speed by. workload names what ran (see
+// client.SpeedWorkload): only runs of the same workload are compared. Only
+// vcpus runners weigh speed.
+func RecordRunSpeed(r *config.Runner, workload, itype, vm string, took time.Duration) error {
+	if r == nil || r.Type != config.TypeAWSSpot || !r.ByRequirements() || workload == "" || itype == "" || took.Milliseconds() <= 0 {
 		return nil
 	}
 	g := &AWSGlobal{r: r, dir: RunnerStateDir(r.Name)}
-	return g.withStateWait(speedLockWait, func(st *placementState) { recordSpeed(st, workload, itype, took, g.clock()) })
+	return g.withStateWait(speedLockWait, func(st *placementState) { recordSpeed(st, workload, itype, vm, took, g.clock()) })
 }
 
-func recordSpeed(st *placementState, workload, itype string, took time.Duration, now time.Time) {
+func recordSpeed(st *placementState, workload, itype, vm string, took time.Duration, now time.Time) {
 	forgetOldSpeed(st, now)
 	if st.Speed == nil {
 		st.Speed = map[string]map[string][]speedSample{}
@@ -99,7 +106,7 @@ func recordSpeed(st *placementState, workload, itype string, took time.Duration,
 		w = map[string][]speedSample{}
 		st.Speed[workload] = w
 	}
-	ss := append(w[itype], speedSample{MS: took.Milliseconds(), At: now})
+	ss := append(w[itype], speedSample{MS: took.Milliseconds(), At: now, VM: vm})
 	if n := len(ss); n > speedSamples {
 		ss = append([]speedSample(nil), ss[n-speedSamples:]...)
 	}
@@ -192,10 +199,11 @@ func forgetOldSpeed(st *placementState, now time.Time) {
 
 // measuredSpeeds is each type's speed as the runner's runs measured it
 // (nil: no workload has run often enough on two types). Each workload's
-// runs on a type count as their median, once there are speedMinRuns of
-// them, weighed by how sure that median is: by the runs' number and how
-// little they spread (a run beside busy neighbours, or with more of the
-// worktree's changes, widens it). The medians are fitted as a workload's
+// runs on a type count once there are SpeedMinRuns of them, as the
+// geometric mean of each VM's (a mean, not a median, which jumps from
+// quiet runs to busy ones when they are about as many), weighed by how
+// sure it is: by the VMs' number and how little they spread (see
+// speedEstimate). The means are fitted as a workload's
 // own length times a type's own slowness, so types compared through
 // different workloads still line up, and a workload run on only one type
 // says nothing. Each type's slowness is also drawn toward its generation's
@@ -209,7 +217,7 @@ func forgetOldSpeed(st *placementState, now time.Time) {
 func measuredSpeeds(speed map[string]map[string][]speedSample, now time.Time) map[string]TypeSpeed {
 	type cell struct {
 		w, t string
-		y    float64 // log of the median, in ms
+		y    float64 // log of the typical time, in ms
 		n    int     // runs
 		wt   float64 // how sure y is: 1 / its variance
 	}
@@ -217,16 +225,17 @@ func measuredSpeeds(speed map[string]map[string][]speedSample, now time.Time) ma
 	for _, wk := range sortedKeys(speed) {
 		var row []cell
 		for _, it := range sortedKeys(speed[wk]) {
-			var ms []int64
+			var ss []speedSample
 			for _, s := range speed[wk][it] {
 				if usableSpeed(s, now) {
-					ms = append(ms, s.MS)
+					ss = append(ss, s)
 				}
 			}
-			if len(ms) < speedMinRuns {
+			if len(ss) < SpeedMinRuns {
 				continue
 			}
-			row = append(row, cell{w: wk, t: it, y: math.Log(median(ms)), n: len(ms), wt: 1 / medianVariance(ms)})
+			y, v := speedEstimate(ss)
+			row = append(row, cell{w: wk, t: it, y: y, n: len(ss), wt: 1 / v})
 		}
 		if len(row) >= 2 {
 			cells = append(cells, row...)
@@ -278,7 +287,7 @@ func measuredSpeeds(speed map[string]map[string][]speedSample, now time.Time) ma
 		for _, t := range ts {
 			newest = max(newest, typeGeneration(t))
 		}
-		// log(median) = a[workload] + b[type], fitted by weighted least
+		// log(time) = a[workload] + b[type], fitted by weighted least
 		// squares, with b drawn toward its generation's (a type of unknown
 		// generation counts as the newest). With each workload's a
 		// eliminated, b solves L b = r (L a weighted Laplacian of the
@@ -337,27 +346,33 @@ func measuredSpeeds(speed map[string]map[string][]speedSample, now time.Time) ma
 	return out
 }
 
-// medianVariance is the variance of the log of ms's median, as an estimate
-// of a workload's typical time on a type: the spread of the runs' log
-// times (at least speedNoise) times pi/2 (a median's, against a mean's),
-// over their number.
-func medianVariance(ms []int64) float64 {
-	n := float64(len(ms))
-	mean := 0.0
-	for _, m := range ms {
-		mean += math.Log(float64(m))
+// speedEstimate is a workload's typical time on a type, from its runs
+// there (log, in ms), and that estimate's variance. Runs on one VM share
+// its load, so each VM counts once, as the mean of its runs' logs; the
+// estimate is the VMs' mean, and its variance their spread over their
+// number, the spread pooled with speedSpread (speedSpreadVMs VMs' worth)
+// so a few VMs can't claim more agreement than they've shown.
+func speedEstimate(ss []speedSample) (y, v float64) {
+	sum, n := map[string]float64{}, map[string]int{}
+	for _, s := range ss {
+		sum[s.VM] += math.Log(float64(s.MS))
+		n[s.VM]++
 	}
-	mean /= n
-	ss := 0.0
-	for _, m := range ms {
-		d := math.Log(float64(m)) - mean
-		ss += d * d
+	var means []float64
+	for _, vm := range sortedKeys(sum) {
+		means = append(means, sum[vm]/float64(n[vm]))
 	}
-	v := speedNoise * speedNoise
-	if len(ms) > 1 {
-		v = max(v, ss/(n-1))
+	m := float64(len(means))
+	for _, x := range means {
+		y += x
 	}
-	return math.Pi / 2 * v / n
+	y /= m
+	dev := 0.0
+	for _, x := range means {
+		dev += (x - y) * (x - y)
+	}
+	spread := (speedSpreadVMs*speedSpread*speedSpread + dev) / (speedSpreadVMs + m - 1)
+	return y, spread / m
 }
 
 // fitTypes solves L b = r for a group's types. The draw toward each type's
@@ -407,16 +422,6 @@ func sortedTypes[C any](cells []C, key func(C) string) []string {
 		seen[key(c)] = true
 	}
 	return sortedKeys(seen)
-}
-
-func median(ms []int64) float64 {
-	s := append([]int64(nil), ms...)
-	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
-	n := len(s)
-	if n%2 == 1 {
-		return float64(s[n/2])
-	}
-	return (float64(s[n/2-1]) + float64(s[n/2])) / 2
 }
 
 func sortedKeys[V any](m map[string]V) []string {

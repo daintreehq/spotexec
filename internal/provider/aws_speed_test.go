@@ -11,11 +11,28 @@ import (
 	"github.com/daintreehq/spotexec/internal/config"
 )
 
-// runs records each duration (seconds) as one run of workload on itype.
+// runs records each duration (seconds) as one run of workload on itype, on
+// a VM not known (as older clients recorded them): all one VM.
 func runs(st *placementState, now time.Time, workload, itype string, secs ...float64) {
 	for i, s := range secs {
-		recordSpeed(st, workload, itype, time.Duration(s*float64(time.Second)), now.Add(time.Duration(i)*time.Second))
+		recordSpeed(st, workload, itype, "", time.Duration(s*float64(time.Second)), now.Add(time.Duration(i)*time.Second))
 	}
+}
+
+// vmRuns is runs, each on a VM of its own.
+func vmRuns(st *placementState, now time.Time, workload, itype string, secs ...float64) {
+	for i, s := range secs {
+		recordSpeed(st, workload, itype, fmt.Sprintf("i-%s-%s-%d", workload, itype, i), time.Duration(s*float64(time.Second)), now.Add(time.Duration(i)*time.Second))
+	}
+}
+
+// geo is the geometric mean of secs.
+func geo(secs ...float64) float64 {
+	sum := 0.0
+	for _, s := range secs {
+		sum += math.Log(s)
+	}
+	return math.Exp(sum / float64(len(secs)))
 }
 
 func approx(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
@@ -28,8 +45,9 @@ func exactFit(t *testing.T) {
 	t.Cleanup(func() { speedStray = old })
 }
 
-// The issue's typecheck (#279): r8a's runs took a median 72 s, m7a's 103 s,
-// so m7a runs at 0.69x r8a's speed, against r8a (the newer generation).
+// The issue's typecheck (#279): r8a's runs took 72 s typically, m7a's 99
+// s, so m7a runs at 0.73x r8a's speed, against r8a (the newer
+// generation): their geometric means.
 func TestMeasuredSpeedsOneWorkload(t *testing.T) {
 	exactFit(t)
 	now := time.Date(2026, 11, 17, 15, 0, 0, 0, time.UTC)
@@ -38,7 +56,7 @@ func TestMeasuredSpeedsOneWorkload(t *testing.T) {
 	runs(st, now, "typecheck", "m7a.2xlarge", 101, 105, 112, 73, 103)
 	got := measuredSpeeds(st.Speed, now.Add(time.Minute))
 	m7a, r8a := got["m7a.2xlarge"], got["r8a.2xlarge"]
-	if m7a.Generation != 8 || m7a.Group != "m7a.2xlarge" || !approx(m7a.Relative, 72.0/103) || m7a.Runs != 5 || m7a.Workload != 1 {
+	if m7a.Generation != 8 || m7a.Group != "m7a.2xlarge" || !approx(m7a.Relative, geo(80, 72, 64, 72, 75)/geo(101, 105, 112, 73, 103)) || m7a.Runs != 5 || m7a.Workload != 1 {
 		t.Fatalf("m7a %+v", m7a)
 	}
 	if r8a.Generation != 8 || r8a.Group != "m7a.2xlarge" || !approx(r8a.Relative, 1) || r8a.Runs != 5 {
@@ -49,7 +67,7 @@ func TestMeasuredSpeedsOneWorkload(t *testing.T) {
 	}
 }
 
-// Too little to compare is no measurement: fewer than speedMinRuns runs on
+// Too little to compare is no measurement: fewer than SpeedMinRuns runs on
 // a type, a workload run on one type only, or runs older than speedFor.
 func TestMeasuredSpeedsNeedsComparableRuns(t *testing.T) {
 	exactFit(t)
@@ -147,7 +165,7 @@ func TestMeasuredSpeedsLongChain(t *testing.T) {
 	}
 }
 
-// Each workload weighs by how sure its medians are: two whose runs agree
+// Each workload weighs by how sure its times are: two whose runs agree
 // as closely and as often, one comparing m7a with m8a at 0.5 and another
 // at 0.8, meet at their geometric mean; runs that scatter widely weigh
 // little against runs that agree.
@@ -164,12 +182,25 @@ func TestMeasuredSpeedsWorkloadsWeighByAgreement(t *testing.T) {
 		t.Fatalf("m7a %+v, want %v", g, math.Sqrt(0.4))
 	}
 	st = &placementState{}
-	runs(st, now, "steady", "m8a.2xlarge", 10, 10, 10, 10, 10)
-	runs(st, now, "steady", "m7a.2xlarge", 20, 20, 20, 20, 20)
-	runs(st, now, "scattered", "m8a.2xlarge", 20, 30, 40, 60, 80)
-	runs(st, now, "scattered", "m7a.2xlarge", 25, 35, 50, 75, 100)
+	vmRuns(st, now, "steady", "m8a.2xlarge", 10, 10, 10, 10, 10, 10, 10, 10, 10, 10)
+	vmRuns(st, now, "steady", "m7a.2xlarge", 20, 20, 20, 20, 20, 20, 20, 20, 20, 20)
+	vmRuns(st, now, "scattered", "m8a.2xlarge", 20, 30, 40, 60, 80, 20, 30, 40, 60, 80)
+	vmRuns(st, now, "scattered", "m7a.2xlarge", 25, 35, 50, 75, 100, 25, 35, 50, 75, 100)
 	got = measuredSpeeds(st.Speed, now.Add(time.Minute))
-	if g := got["m7a.2xlarge"]; g.Relative <= 0.5 || g.Relative > 0.51 {
+	if g := got["m7a.2xlarge"]; g.Relative <= 0.5 || g.Relative > 0.55 {
+		t.Fatalf("m7a %+v, want just over 0.5", g)
+	}
+	// Runs count by their VMs: twenty runs on one VM each weigh less than
+	// ten VMs' runs that agree as closely.
+	st = &placementState{}
+	vmRuns(st, now, "many", "m8a.2xlarge", 10, 10, 10, 10, 10, 10, 10, 10, 10, 10)
+	vmRuns(st, now, "many", "m7a.2xlarge", 20, 20, 20, 20, 20, 20, 20, 20, 20, 20)
+	for i := 0; i < 20; i++ {
+		runs(st, now, "one", "m8a.2xlarge", 40)
+		runs(st, now, "one", "m7a.2xlarge", 50)
+	}
+	got = measuredSpeeds(st.Speed, now.Add(time.Minute))
+	if g := got["m7a.2xlarge"]; g.Relative <= 0.5 || g.Relative > 0.55 || g.Runs != 30 {
 		t.Fatalf("m7a %+v, want just over 0.5", g)
 	}
 }
@@ -204,7 +235,7 @@ func TestRecordSpeedBounds(t *testing.T) {
 	now := time.Date(2026, 11, 17, 15, 0, 0, 0, time.UTC)
 	st := &placementState{}
 	for i := 0; i < speedSamples+5; i++ {
-		recordSpeed(st, "w", "m7a.2xlarge", time.Duration(i+1)*time.Second, now.Add(time.Duration(i)*time.Second))
+		recordSpeed(st, "w", "m7a.2xlarge", "", time.Duration(i+1)*time.Second, now.Add(time.Duration(i)*time.Second))
 	}
 	ss := st.Speed["w"]["m7a.2xlarge"]
 	if len(ss) != speedSamples || ss[0].MS != 6000 || ss[len(ss)-1].MS != int64(speedSamples+5)*1000 {
@@ -216,10 +247,10 @@ func TestRecordSpeedBounds(t *testing.T) {
 			// The first by name, run again, and then once more by a clock
 			// set back: its latest run counts, and the least recently run
 			// go.
-			recordSpeed(st, "w000", "m7a.2xlarge", time.Second, at.Add(time.Duration(i)*time.Second))
-			recordSpeed(st, "w000", "m7a.2xlarge", time.Second, at.Add(-time.Minute))
+			recordSpeed(st, "w000", "m7a.2xlarge", "", time.Second, at.Add(time.Duration(i)*time.Second))
+			recordSpeed(st, "w000", "m7a.2xlarge", "", time.Second, at.Add(-time.Minute))
 		}
-		recordSpeed(st, fmt.Sprintf("w%03d", i), "m7a.2xlarge", time.Second, at.Add(time.Duration(i)*time.Second))
+		recordSpeed(st, fmt.Sprintf("w%03d", i), "m7a.2xlarge", "", time.Second, at.Add(time.Duration(i)*time.Second))
 	}
 	if len(st.Speed) != speedWorkloads || st.Speed["w"] != nil || st.Speed["w000"] == nil || st.Speed["w001"] != nil || st.Speed["w003"] != nil || st.Speed["w004"] == nil {
 		t.Fatalf("%d workloads; w %v, w000 %v, w001 %v, w004 %v", len(st.Speed), st.Speed["w"] != nil, st.Speed["w000"] != nil, st.Speed["w001"] != nil, st.Speed["w004"] != nil)
@@ -229,7 +260,7 @@ func TestRecordSpeedBounds(t *testing.T) {
 	types := []string{"m6a", "m7a", "m8a", "r7a", "r8a"}
 	for i := 0; i < speedWorkloads; i++ {
 		for j, it := range types {
-			recordSpeed(st, fmt.Sprintf("w%03d", i+3), it+".2xlarge", time.Second, at.Add(time.Duration(i*len(types)+j)*time.Second))
+			recordSpeed(st, fmt.Sprintf("w%03d", i+3), it+".2xlarge", "", time.Second, at.Add(time.Duration(i*len(types)+j)*time.Second))
 		}
 	}
 	cells := 0
@@ -255,7 +286,7 @@ func TestRecordSpeedBounds(t *testing.T) {
 func TestRecordRunSpeedOnlyVCPUsRunners(t *testing.T) {
 	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
 	listed := &config.Runner{Name: "listed", Type: config.TypeAWSSpot, InstanceTypes: []string{"m7a.2xlarge"}}
-	if err := RecordRunSpeed(listed, "w", "m7a.2xlarge", time.Minute); err != nil {
+	if err := RecordRunSpeed(listed, "w", "m7a.2xlarge", "i-1", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	g := &AWSGlobal{r: listed, dir: RunnerStateDir(listed.Name)}
@@ -268,17 +299,17 @@ func TestRecordRunSpeedOnlyVCPUsRunners(t *testing.T) {
 	for _, bad := range []struct {
 		w, it string
 		d     time.Duration
-	}{{"", "m7a.2xlarge", time.Minute}, {"w", "", time.Minute}, {"w", "m7a.2xlarge", 0}} {
-		if err := RecordRunSpeed(vc, bad.w, bad.it, bad.d); err != nil {
+	}{{"", "m7a.2xlarge", time.Minute}, {"w", "", time.Minute}, {"w", "m7a.2xlarge", 0}, {"w", "m7a.2xlarge", 500 * time.Microsecond}} {
+		if err := RecordRunSpeed(vc, bad.w, bad.it, "i-1", bad.d); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := RecordRunSpeed(vc, "w", "m7a.2xlarge", time.Minute); err != nil {
+	if err := RecordRunSpeed(vc, "w", "m7a.2xlarge", "i-1", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	g = &AWSGlobal{r: vc, dir: RunnerStateDir(vc.Name)}
 	_ = g.withState(func(st *placementState) {
-		if len(st.Speed) != 1 || len(st.Speed["w"]["m7a.2xlarge"]) != 1 || st.Speed["w"]["m7a.2xlarge"][0].MS != 60000 {
+		if len(st.Speed) != 1 || len(st.Speed["w"]["m7a.2xlarge"]) != 1 || st.Speed["w"]["m7a.2xlarge"][0].MS != 60000 || st.Speed["w"]["m7a.2xlarge"][0].VM != "i-1" {
 			t.Fatalf("speed %+v", st.Speed)
 		}
 	})
@@ -291,14 +322,15 @@ func TestRecordRunSpeedOnlyVCPUsRunners(t *testing.T) {
 func TestRunCostMeasuredSpeedRanks(t *testing.T) {
 	prices := map[string][][3]string{"r-one-1": {
 		{"r-one-1a", "m7a.2xlarge", "0.0600"},
-		{"r-one-1b", "m6i.2xlarge", "0.0500"},
+		{"r-one-1b", "m6i.2xlarge", "0.0400"},
 		{"r-one-1c", "r7a.2xlarge", "0.0700"},
 	}}
 	f := &fakeRegionsEC2{types: map[string][]string{"r-one-1": requirementTypes()}, prices: prices}
 	a := newSingleEnv(t, f, func(r *config.Runner) { reqRunner(r); r.LaunchOrder = config.LaunchRunCost })
-	for i := 0; i < speedMinRuns; i++ {
+	const vms = 10
+	for i := 0; i < vms; i++ {
 		for _, it := range []string{"m7a.2xlarge", "m6i.2xlarge"} {
-			if err := RecordRunSpeed(a.r, "typecheck", it, time.Minute); err != nil {
+			if err := RecordRunSpeed(a.r, "typecheck", it, fmt.Sprintf("i-%s-%d", it, i), time.Minute); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -308,7 +340,7 @@ func TestRunCostMeasuredSpeedRanks(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := in.Placement.Cost
-	if in.Type != "m6i.2xlarge" || c == nil || c.SpeedFrom != SpeedMeasured || c.RelSpeed < 0.99 || c.Speed > 0.01 {
+	if in.Type != "m6i.2xlarge" || c == nil || c.SpeedFrom != SpeedMeasured || c.RelSpeed < 0.98 || c.Speed > 0.02 {
 		t.Fatalf("launched %s, cost %+v", in.Type, c)
 	}
 
@@ -318,7 +350,7 @@ func TestRunCostMeasuredSpeedRanks(t *testing.T) {
 		t.Fatal(err)
 	}
 	k := g.Rank(tbl)
-	if s := k.Model.MeasuredSpeeds["m6i.2xlarge"]; s.Relative < 0.99 || s.Generation != 7 || s.Group != "m6i.2xlarge" || s.Runs != speedMinRuns {
+	if s := k.Model.MeasuredSpeeds["m6i.2xlarge"]; s.Relative < 0.98 || s.Generation != 7 || s.Group != "m6i.2xlarge" || s.Runs != vms {
 		t.Fatalf("model %+v", k.Model.MeasuredSpeeds)
 	}
 	for _, p := range k.Prices {
@@ -337,11 +369,11 @@ func TestRunCostMeasuredSpeedRanks(t *testing.T) {
 
 	// Measured slower than the generation says (0.69x), m6i now loses to
 	// m7a, and says why.
-	for i := 0; i < speedMinRuns; i++ {
-		if err := RecordRunSpeed(a.r, "tests", "m7a.2xlarge", 69*time.Second); err != nil {
+	for i := 0; i < vms; i++ {
+		if err := RecordRunSpeed(a.r, "tests", "m7a.2xlarge", fmt.Sprintf("i-m7a-%d", i), 69*time.Second); err != nil {
 			t.Fatal(err)
 		}
-		if err := RecordRunSpeed(a.r, "tests", "m6i.2xlarge", 100*time.Second); err != nil {
+		if err := RecordRunSpeed(a.r, "tests", "m6i.2xlarge", fmt.Sprintf("i-m6i-%d", i), 100*time.Second); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -355,7 +387,7 @@ func TestRunCostMeasuredSpeedRanks(t *testing.T) {
 			m6i = k.Cost[poolKey(p)]
 		}
 	}
-	if m6i.SpeedFrom != SpeedMeasured || !strings.Contains(m6i.Factors(), "slower type (83% speed, measured)") {
+	if m6i.SpeedFrom != SpeedMeasured || !strings.Contains(m6i.Factors(), "slower type (84% speed, measured)") {
 		t.Fatalf("m6i %+v: %s", m6i, m6i.Factors())
 	}
 }
@@ -402,16 +434,28 @@ func TestRunCostsMeasuredLabel(t *testing.T) {
 // a quiet VM, 147-183 s beside five other jobs), m7a's busier throughout,
 // and their medians said m7a ran at 49% of r7a's speed, the same
 // generation and core count. Runs that scattered barely move either type
-// from its generation's speed, and the extra time charged to m7a stays
-// within a few times its Spot price, not 14 times.
+// from its generation's speed, even counted as nine VMs each, and the
+// extra time charged to m7a stays within a few times its Spot price, not
+// 14 times.
 func TestMeasuredSpeedsScatteredRunsStayNearGeneration(t *testing.T) {
 	now := time.Date(2026, 11, 17, 22, 45, 0, 0, time.UTC)
 	st := &placementState{}
-	runs(st, now, "typecheck", "m7a.2xlarge", 63, 103, 108, 110, 121, 125, 131, 144, 161)
-	runs(st, now, "typecheck", "r7a.2xlarge", 44, 44, 47, 49, 59, 65, 147, 155, 183)
-	got := measuredSpeeds(st.Speed, now.Add(time.Minute))
-	ratio := got["m7a.2xlarge"].Relative / got["r7a.2xlarge"].Relative
-	if ratio < 0.8 || ratio > 1 {
+	vmRuns(st, now, "typecheck", "m7a.2xlarge", 63, 103, 108, 110, 121, 125, 131, 144, 161)
+	vmRuns(st, now, "typecheck", "r7a.2xlarge", 44, 44, 47, 49, 59, 65, 147, 155, 183)
+	checkSameGenCharge(t, measuredSpeeds(st.Speed, now.Add(time.Minute)), 0.85)
+}
+
+// checkSameGenCharge checks m7a against r7a, the same generation: m7a
+// rated at least least of r7a's speed, and the extra time charged to it
+// within three times its Spot price at wait_cost $1/h.
+func checkSameGenCharge(t *testing.T, got map[string]TypeSpeed, least float64) {
+	t.Helper()
+	m7a, r7a := got["m7a.2xlarge"], got["r7a.2xlarge"]
+	if m7a.Relative <= 0 || r7a.Relative <= 0 {
+		t.Fatalf("not measured: %+v", got)
+	}
+	ratio := m7a.Relative / r7a.Relative
+	if ratio < least || ratio > 1/least {
 		t.Fatalf("m7a at %.3f of r7a: %+v", ratio, got)
 	}
 	m := RunCostModel{WaitCost: 1, HorizonMinutes: 60, GenSpeedup: genSpeedup, RoundTrips: runRoundTrips, SpeedByGen: true, MeasuredSpeeds: got}
@@ -419,52 +463,87 @@ func TestMeasuredSpeedsScatteredRunsStayNearGeneration(t *testing.T) {
 		{Region: "eu-north-1", Zone: "eu-north-1b", Type: "r7a.2xlarge", Price: "0.0792"},
 		{Region: "eu-north-1", Zone: "eu-north-1c", Type: "m7a.2xlarge", Price: "0.0787"},
 	}
-	c := runCosts(m, ps, placementEvidence{now: now})
-	slow := c[poolKey(ps[1])]
-	if slow.SpeedFrom != SpeedMeasured || slow.Speed > 3*slow.Compute {
-		t.Fatalf("m7a charged %+v", slow)
+	c := runCosts(m, ps, placementEvidence{now: time.Now()})
+	for _, p := range ps {
+		if got := c[poolKey(p)]; got.SpeedFrom != SpeedMeasured || got.Speed > 3*got.Compute {
+			t.Fatalf("%s charged %+v", p.Type, got)
+		}
 	}
-	t.Logf("m7a at %.3f of r7a, +$%.3f/h", ratio, slow.Speed)
 }
 
 // Two types that run a workload equally fast across many runs measure
 // about the same, whichever of them happened to be busy when: the same
-// mix of quiet and busy runs, in different orders.
+// thirty quiet and busy runs, in a different order.
 func TestMeasuredSpeedsSameMixMeasuresTheSame(t *testing.T) {
 	now := time.Date(2026, 11, 17, 22, 45, 0, 0, time.UTC)
-	mix := []float64{44, 47, 49, 59, 65, 103, 108, 110, 121, 125, 131, 144, 147, 155, 161, 183}
-	var a, b []float64
-	for i := 0; i < speedSamples; i++ {
-		a = append(a, mix[i%len(mix)])
-		b = append(b, mix[(i*7+3)%len(mix)])
+	mix := []float64{44, 47, 49, 59, 65, 103, 108, 110, 121, 125, 131, 144, 147, 155, 161, 183,
+		45, 46, 48, 52, 60, 104, 112, 118, 127, 133, 140, 150, 170, 180}
+	shuffled := append([]float64(nil), mix...)
+	for i := range shuffled {
+		j := (i*7 + 3) % len(shuffled)
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 	}
 	st := &placementState{}
-	runs(st, now, "typecheck", "m7a.2xlarge", a...)
-	runs(st, now, "typecheck", "r7a.2xlarge", b...)
+	vmRuns(st, now, "typecheck", "m7a.2xlarge", mix...)
+	vmRuns(st, now, "typecheck", "r7a.2xlarge", shuffled...)
 	got := measuredSpeeds(st.Speed, now.Add(time.Minute))
-	if ratio := got["m7a.2xlarge"].Relative / got["r7a.2xlarge"].Relative; ratio < 0.95 || ratio > 1/0.95 {
-		t.Fatalf("m7a at %.3f of r7a: %+v", ratio, got)
+	if got["m7a.2xlarge"].Runs != speedSamples || got["r7a.2xlarge"].Runs != speedSamples {
+		t.Fatalf("runs %+v", got)
 	}
+	checkSameGenCharge(t, got, 0.999)
 }
 
-// Consistent runs still replace the generation assumption: m7a at 0.69x
-// r8a's speed (#279), run after run, measures close to that, where the
-// assumption says 0.91x; the same five runs scattered as widely as the
-// issue's leave it nearer the assumption.
+// Quiet and busy runs about as many on each type don't split the types
+// apart: one type's 16 quiet runs and 14 busy ones against the other's
+// 14 and 16 put a median in each mode, 4x apart.
+func TestMeasuredSpeedsEvenModesStayClose(t *testing.T) {
+	now := time.Date(2026, 11, 17, 22, 45, 0, 0, time.UTC)
+	mode := func(quiet int) []float64 {
+		var s []float64
+		for i := 0; i < speedSamples; i++ {
+			if i < quiet {
+				s = append(s, 45)
+			} else {
+				s = append(s, 180)
+			}
+		}
+		return s
+	}
+	st := &placementState{}
+	vmRuns(st, now, "typecheck", "m7a.2xlarge", mode(14)...)
+	vmRuns(st, now, "typecheck", "r7a.2xlarge", mode(16)...)
+	checkSameGenCharge(t, measuredSpeeds(st.Speed, now.Add(time.Minute)), 0.9)
+}
+
+// Runs on one VM share its load: five on a busy VM against five on a quiet
+// one, 4x apart, are one VM each, and don't charge the busy one's type
+// more than a few times its Spot price.
+func TestMeasuredSpeedsOneVMEachStaysNearGeneration(t *testing.T) {
+	now := time.Date(2026, 11, 17, 22, 45, 0, 0, time.UTC)
+	st := &placementState{}
+	for i := 0; i < SpeedMinRuns; i++ {
+		recordSpeed(st, "typecheck", "m7a.2xlarge", "i-busy", 180*time.Second, now.Add(time.Duration(i)*time.Second))
+		recordSpeed(st, "typecheck", "r7a.2xlarge", "i-quiet", 45*time.Second, now.Add(time.Duration(i)*time.Second))
+	}
+	checkSameGenCharge(t, measuredSpeeds(st.Speed, now.Add(time.Minute)), 0.8)
+}
+
+// Consistent runs still replace the generation assumption: m7a at 0.70x
+// r8a's speed (#279), on VM after VM, measures close to that, where the
+// assumption says 0.91x; the same runs scattered as widely as the issue's
+// leave it nearer the assumption.
 func TestMeasuredSpeedsConsistentRunsOverrideGeneration(t *testing.T) {
 	now := time.Date(2026, 11, 17, 15, 0, 0, 0, time.UTC)
 	st := &placementState{}
-	r8a := []float64{72, 70, 74, 71, 73, 72, 70, 74, 71, 73}
-	m7a := []float64{104, 101, 105, 103, 102, 104, 101, 105, 103, 102}
-	runs(st, now, "typecheck", "r8a.2xlarge", r8a...)
-	runs(st, now, "typecheck", "m7a.2xlarge", m7a...)
+	vmRuns(st, now, "typecheck", "r8a.2xlarge", 72, 70, 74, 71, 73, 72, 70, 74, 71, 73)
+	vmRuns(st, now, "typecheck", "m7a.2xlarge", 104, 101, 105, 103, 102, 104, 101, 105, 103, 102)
 	got := measuredSpeeds(st.Speed, now.Add(time.Minute))
-	if g := got["m7a.2xlarge"]; g.Relative < 0.69 || g.Relative > 0.72 {
+	if g := got["m7a.2xlarge"]; g.Relative < 0.69 || g.Relative > 0.75 {
 		t.Fatalf("consistent m7a %+v", g)
 	}
 	st = &placementState{}
-	runs(st, now, "typecheck", "r8a.2xlarge", 45, 72, 150, 60, 180)
-	runs(st, now, "typecheck", "m7a.2xlarge", 63, 103, 110, 161, 144)
+	vmRuns(st, now, "typecheck", "r8a.2xlarge", 45, 72, 150, 60, 180)
+	vmRuns(st, now, "typecheck", "m7a.2xlarge", 63, 103, 110, 161, 144)
 	got = measuredSpeeds(st.Speed, now.Add(time.Minute))
 	if g := got["m7a.2xlarge"]; g.Relative < 0.85 || g.Relative > 1 {
 		t.Fatalf("scattered m7a %+v", g)

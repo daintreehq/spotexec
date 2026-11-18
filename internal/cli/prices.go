@@ -312,7 +312,7 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 func speedFactor(m *provider.RunCostModel) string {
 	gen := fmt.Sprintf("each instance generation counts as %.0f%% faster per vCPU", (m.GenSpeedup-1)*100)
 	if len(m.MeasuredSpeeds) == 0 {
-		return "a slower type (SPEED, assumed: " + gen + "; measured instead once the same command has run 3 times on each of two types)"
+		return fmt.Sprintf("a slower type (SPEED, assumed: %s; measured instead once the same command has run %d times on each of two types)", gen, provider.SpeedMinRuns)
 	}
 	// Each group of types measured against each other, against its
 	// newest generation.
@@ -339,7 +339,7 @@ func speedFactor(m *provider.RunCostModel) string {
 		}
 		parts = append(parts, strings.Join(ts, ", ")+" of "+against)
 	}
-	return fmt.Sprintf("a slower type (SPEED, measured from the same commands' successful runs on each type lately: %s; assumed for other types: %s)", strings.Join(parts, "; "), gen)
+	return fmt.Sprintf("a slower type (SPEED, measured from the same commands' successful runs on each type lately, drawn toward the generation assumption as far as the runs disagree: %s; assumed for other types: %s)", strings.Join(parts, "; "), gen)
 }
 
 // coldMinutes is one part of a cold start as the run-cost note shows it:

@@ -247,13 +247,14 @@ func TestRunSpeed(t *testing.T) {
 	recordRunSpeed(runSpeed(lease, ws, o, noticed, env, false))
 	s := speedState(t, r)
 	w := SpeedWorkload(ws.RepoID, ws.Cwd, o, env)
-	if len(s) != 1 || len(s[w]["m7a.2xlarge"]) != 1 || s[w]["m7a.2xlarge"][0].MS != 70000 {
+	if len(s) != 1 || len(s[w]["m7a.2xlarge"]) != 1 || s[w]["m7a.2xlarge"][0].MS != 70000 || s[w]["m7a.2xlarge"][0].VM != lease.InstanceID {
 		t.Fatalf("speed %v", s)
 	}
 }
 
 type speedRun struct {
-	MS int64 `json:"ms"`
+	MS int64  `json:"ms"`
+	VM string `json:"vm"`
 }
 
 func speedState(t *testing.T, r *config.Runner) map[string]map[string][]speedRun {
