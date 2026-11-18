@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"syscall"
 	"time"
 )
@@ -43,18 +44,24 @@ const (
 // and saves them. Without a state directory there are none to keep. An
 // error before fn runs (the lock, the file) means fn didn't run.
 func (a *AWSSpot) withClaims(fn func(cs map[string]quotaClaim)) error {
+	return a.withLedger(quotaClaimsLock, quotaClaimsFile, fn)
+}
+
+// withLedger is withClaims for any short-lived ledger of claims kept in
+// file under lock (expired entries are dropped first).
+func (a *AWSSpot) withLedger(lock, file string, fn func(cs map[string]quotaClaim)) error {
 	if a.dir == "" {
 		fn(map[string]quotaClaim{})
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), claimsWait)
 	defer cancel()
-	release, err := waitLockFile(ctx, a.lockPath(quotaClaimsLock), syscall.LOCK_EX, nil)
+	release, err := waitLockFile(ctx, a.lockPath(lock), syscall.LOCK_EX, nil)
 	if err != nil {
 		return err
 	}
 	defer release()
-	path := a.lockPath(quotaClaimsFile)
+	path := a.lockPath(file)
 	var cs map[string]quotaClaim
 	switch b, err := os.ReadFile(path); {
 	case err == nil:
@@ -166,6 +173,47 @@ func (a *AWSSpot) releaseClaims(ids []string) {
 		for k, c := range cs {
 			if c.Region == a.r.Region && c.ID != "" && gone[c.ID] {
 				delete(cs, k)
+			}
+		}
+	})
+}
+
+// Every fleet instance this machine launches is noted (a claim with no
+// vCPUs, keyed by its ID) until tag-filtered listings can show it, so a
+// Down right after the launch looks it up by ID instead of missing it.
+const (
+	launchedFile = "launched.json"
+	launchedLock = "launched.lock"
+)
+
+// noteLaunched records instance id, just launched in the region.
+func (a *AWSSpot) noteLaunched(id string) {
+	_ = a.withLedger(launchedLock, launchedFile, func(cs map[string]quotaClaim) {
+		cs[id] = quotaClaim{Region: a.r.Region, ID: id, Until: time.Now().Add(claimListLag)}
+	})
+}
+
+// recentLaunches lists the instances noted in the region whose listing
+// may still lag.
+func (a *AWSSpot) recentLaunches() []string {
+	var ids []string
+	_ = a.withLedger(launchedLock, launchedFile, func(cs map[string]quotaClaim) {
+		for _, c := range cs {
+			if c.Region == a.r.Region && c.ID != "" {
+				ids = append(ids, c.ID)
+			}
+		}
+	})
+	sort.Strings(ids)
+	return ids
+}
+
+// forgetLaunched drops the notes of instances that were just terminated.
+func (a *AWSSpot) forgetLaunched(ids []string) {
+	_ = a.withLedger(launchedLock, launchedFile, func(cs map[string]quotaClaim) {
+		for _, id := range ids {
+			if c, ok := cs[id]; ok && c.Region == a.r.Region {
+				delete(cs, id)
 			}
 		}
 	})

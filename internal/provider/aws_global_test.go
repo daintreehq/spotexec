@@ -60,6 +60,8 @@ type fakeRegionsEC2 struct {
 	onOwned     func(region string)          // called (unlocked) on each by-owner (leftovers) listing
 	onRun       func(region string)          // called (unlocked) on each RunInstances
 	onList      func(region string)          // called (unlocked) on each fleet (tag-filtered) listing
+	hidden      map[string]bool              // instance IDs tag-filtered listings don't show yet (by ID they do)
+	foreign     map[string]bool              // instance IDs whose by-ID answer carries another machine's owner tag
 	calls       []string                     // "region Action [detail]"
 	next        int
 }
@@ -386,6 +388,9 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 					return
 				}
 				owner, _ := ownerID()
+				if f.foreign[id] {
+					owner = "someone-else"
+				}
 				fmt.Fprintf(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>%s</instanceId><instanceType>%s</instanceType><instanceState><name>running</name></instanceState><tagSet><item><key>spotexec-runner</key><value>g</value></item><item><key>spotexec-owner</key><value>%s</value></item></tagSet></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`, id, typ, owner)
 				return
 			}
@@ -444,7 +449,7 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 				if st == "" {
 					st = "running"
 				}
-				if len(want) > 0 && !want[st] {
+				if f.hidden[id] || (len(want) > 0 && !want[st]) {
 					continue
 				}
 				fmt.Fprintf(w, `<item><instanceId>%s</instanceId><instanceType>%s</instanceType><instanceState><name>%s</name></instanceState><launchTime>%s</launchTime><placement><availabilityZone>%sa</availabilityZone></placement><tagSet><item><key>spotexec-runner</key><value>g</value></item><item><key>spotexec-owner</key><value>%s</value></item></tagSet></item>`, id, typ, st, f.launchTime(), region, owner)

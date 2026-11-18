@@ -345,6 +345,83 @@ func TestDownReleasesClaims(t *testing.T) {
 	}
 }
 
+// Terminating one VM frees its claim too (#295): a replacement launched at
+// once near the Spot quota isn't refused for the VM just ended. One whose
+// termination EC2 refused keeps it.
+func TestTerminateReleasesItsClaim(t *testing.T) {
+	f := &fakeRegionsEC2{
+		prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}}},
+		quota:  map[string]int{"r-one-1": 8},
+	}
+	g := newGlobalEnv(t, f, "r-one-1")
+	a := g.home()
+	in, err := a.Launch(context.Background(), t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.termErr = map[string]string{"r-one-1": "UnauthorizedOperation"}
+	f.mu.Unlock()
+	if err := a.Terminate(context.Background(), in.ID); err == nil {
+		t.Fatal("terminate succeeded though EC2 refused it")
+	}
+	f.mu.Lock()
+	f.termErr = nil
+	f.hidden = map[string]bool{in.ID: true} // listings no longer show it: only its claim counts
+	f.mu.Unlock()
+	if _, err := a.Launch(context.Background(), t.Logf); err == nil {
+		t.Fatal("launched past the quota: a refused termination released the claim")
+	}
+	if err := a.Terminate(context.Background(), in.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Launch(context.Background(), t.Logf); err != nil {
+		t.Fatalf("launch right after terminate: %v", err)
+	}
+}
+
+// Down finds a VM launched moments ago that the tag-filtered listing
+// doesn't show yet, by its ID (#295), and only if it is still this
+// runner's.
+func TestDownFindsUnlistedLaunches(t *testing.T) {
+	f := &fakeRegionsEC2{prices: map[string][][3]string{"r-one-1": {{"r-one-1a", "c7a.2xlarge", "0.05"}}}}
+	g := newGlobalEnv(t, f, "r-one-1")
+	a := g.home()
+	var ids []string
+	for range 3 {
+		in, err := a.Launch(context.Background(), t.Logf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, in.ID)
+	}
+	f.mu.Lock()
+	f.hidden = map[string]bool{ids[1]: true, ids[2]: true}
+	f.foreign = map[string]bool{ids[2]: true}
+	f.calls = nil
+	f.mu.Unlock()
+	if err := a.Down(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	terms := f.callsOf("TerminateInstances")
+	if len(terms) != 1 || !strings.Contains(terms[0], ids[0]) || !strings.Contains(terms[0], ids[1]) || strings.Contains(terms[0], ids[2]) {
+		t.Fatalf("terminated %v, want %s and the unlisted %s (not %s, another machine's)", terms, ids[0], ids[1], ids[2])
+	}
+	if by := f.callsOf("DescribeInstances " + ids[0]); len(by) != 0 {
+		t.Fatalf("looked up %s by ID though the listing showed it", ids[0])
+	}
+	// Terminated: not looked up again.
+	f.mu.Lock()
+	f.calls = nil
+	f.mu.Unlock()
+	if err := a.Down(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if by := f.callsOf("DescribeInstances " + ids[1]); len(by) != 0 {
+		t.Fatalf("looked %s up again after terminating it: %v", ids[1], by)
+	}
+}
+
 // A failed trial only clears its own claim: a later launch's trial in the
 // region stays.
 func TestDropTrialAtKeepsANewerTrial(t *testing.T) {

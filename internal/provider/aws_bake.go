@@ -634,19 +634,21 @@ func (a *AWSSpot) waitInstanceState(ctx context.Context, id, want string, max ti
 	return fmt.Errorf("instance %s did not reach %s", id, want)
 }
 
-// terminateAny terminates a builder (tagged spotexec-bake-runner + owner).
-func (a *AWSSpot) terminateAny(ctx context.Context, id string) error {
+// describeID looks one instance up by ID, which (unlike a tag-filtered
+// listing) shows an instance and its tags as soon as RunInstances has
+// returned. Just after launch the ID itself may not be visible yet: it
+// retries briefly (1+2+4+8s), never sleeping after the last attempt. An
+// answer that lists no instance is an error, never "nothing to do".
+func (a *AWSSpot) describeID(ctx context.Context, id string) (ec2Instance, error) {
 	p := url.Values{}
 	p.Set("InstanceId.1", id)
 	var b []byte
 	var err error
-	// Just after launch the ID may not be visible yet: retry briefly
-	// (1+2+4+8s), never sleeping after the last attempt.
 	for attempt, wait := 0, time.Second; attempt < 5; attempt, wait = attempt+1, wait*2 {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return ec2Instance{}, ctx.Err()
 			case <-time.After(wait / 2):
 			}
 		}
@@ -655,17 +657,31 @@ func (a *AWSSpot) terminateAny(ctx context.Context, id string) error {
 		}
 	}
 	if err != nil {
-		return err
+		return ec2Instance{}, err
 	}
 	got, _, err := parseDescribeInstances(b)
-	if err != nil || len(got) == 0 {
+	if err != nil {
+		return ec2Instance{}, err
+	}
+	for _, i := range got {
+		if i.InstanceID == id {
+			return i, nil
+		}
+	}
+	return ec2Instance{}, fmt.Errorf("%s is not visible yet", id)
+}
+
+// terminateAny terminates a builder (tagged spotexec-bake-runner + owner).
+func (a *AWSSpot) terminateAny(ctx context.Context, id string) error {
+	got, err := a.describeID(ctx, id)
+	if err != nil {
 		return err
 	}
 	owner, oerr := a.ownerTag()
 	if oerr != nil || owner == "" {
 		return fmt.Errorf("refusing to terminate %s: can't determine this machine's owner tag: %v", id, oerr)
 	}
-	if got[0].tag(tagOwner) != owner || (got[0].tag(tagBake) != a.r.Name && got[0].tag(tagRunner) != a.r.Name) {
+	if got.tag(tagOwner) != owner || (got.tag(tagBake) != a.r.Name && got.tag(tagRunner) != a.r.Name) {
 		return fmt.Errorf("refusing to terminate %s: not ours", id)
 	}
 	t := url.Values{}
