@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -509,5 +510,96 @@ func TestRankMarksLedgerFullVMSeenFull(t *testing.T) {
 	// jobs call for another. Counting the full VM too (4 slots) would not.
 	if err != nil || !d.Launch || d.Capacity != 4 {
 		t.Fatalf("after Rank: %+v %v, want a second launch with the full VM no longer pending", d, err)
+	}
+}
+
+// #297: a VM this machine launched that never got a job (and so never
+// answered a probe) goes standby on the first epoch after its minimum
+// residence once the busy VM covers the slots held now, even while recent
+// demand (p90) was higher. Nothing else changes role.
+func TestUnusedLaunchGoesStandby(t *testing.T) {
+	setup := func(t *testing.T, fn func(st *poolState, now time.Time)) (*Pool, time.Time) {
+		t.Helper()
+		p, _ := schedPool(t, 2, 6)
+		start := time.Now()
+		p.loaded(t, func(st *poolState) {
+			s := st.sched()
+			st.note("i-0").markReady(start) // i-1 never answered
+			p.views(st, start)
+			for _, v := range s.VMs {
+				v.Hold = time.Time{}
+			}
+			for i := range 4 {
+				hold(s, "i-0", "wt"+string(rune('a'+i)), start)
+			}
+			st.Launches = []launchRec{{ID: "l1", InstanceID: "i-1", Started: start.Add(-time.Minute), PID: os.Getpid()}}
+			s.Demand = []demandPoint{{start.Add(-time.Minute), 8}, {start.Add(-time.Second), 4}}
+			if fn != nil {
+				fn(st, start)
+			}
+		})
+		return p, start
+	}
+	roles := func(p *Pool, t *testing.T) (string, string) {
+		t.Helper()
+		s := p.state(t)
+		return s.VMs["i-0"].Role, s.VMs["i-1"].Role
+	}
+
+	p, start := setup(t, nil)
+	p.loaded(t, func(st *poolState) { p.control(st, start) })
+	if r0, r1 := roles(p, t); r0 != roleRetained || r1 != roleStandby {
+		t.Fatalf("roles %s/%s, want the unused launch on standby at once", r0, r1)
+	}
+	if v := p.state(t).VMs["i-1"]; !strings.Contains(v.Reason, "unused") {
+		t.Fatalf("reason %q", v.Reason)
+	}
+
+	for _, c := range []struct {
+		name string
+		fn   func(st *poolState, now time.Time)
+	}{
+		{"residence", func(st *poolState, now time.Time) { st.sched().VMs["i-1"].Hold = now.Add(time.Minute) }},
+		{"another machine's", func(st *poolState, now time.Time) { st.Launches = nil }},
+		{"used", func(st *poolState, now time.Time) { st.sched().VMs["i-1"].LastEnd = now.Add(-time.Minute) }},
+		{"used by probe", func(st *poolState, now time.Time) { st.note("i-1").LastUsed = now.Add(-time.Minute) }},
+		{"attempt", func(st *poolState, now time.Time) {
+			hold(st.sched(), "i-1", "wtz", now)
+			st.sched().VMs["i-1"].LastStart = time.Time{}
+		}},
+		{"demand now", func(st *poolState, now time.Time) {
+			hold(st.sched(), "i-0", "wte", now)
+			hold(st.sched(), "i-0", "wtf", now)
+			hold(st.sched(), "i-0", "wtg", now) // seven slots held: more than i-0 has
+		}},
+		{"spare slots", func(st *poolState, now time.Time) {}},
+		{"warm", func(st *poolState, now time.Time) {}},
+		{"replacement not answering", func(st *poolState, now time.Time) { st.note("i-0").Ready = false }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p, start := setup(t, c.fn)
+			switch c.name {
+			case "spare slots":
+				p.R.Scheduling.SpareSlots = 3 // 4 held + 3 > 6
+			case "warm":
+				p.R.MinInstances = 2 // both kept warm
+			}
+			p.loaded(t, func(st *poolState) { p.control(st, start) })
+			if _, r1 := roles(p, t); r1 != roleRetained {
+				t.Fatalf("%s: i-1 %s, want retained", c.name, r1)
+			}
+		})
+	}
+
+	// A job waiting for a slot keeps it too.
+	p, start = setup(t, nil)
+	w, err := p.Register(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.loaded(t, func(st *poolState) { p.control(st, start) })
+	w.Done()
+	if _, r1 := roles(p, t); r1 != roleRetained {
+		t.Fatalf("with a waiter: i-1 %s, want retained", r1)
 	}
 }

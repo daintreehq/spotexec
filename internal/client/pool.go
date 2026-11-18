@@ -963,6 +963,10 @@ func (p *Pool) Plan(ctx context.Context, covered int) (LaunchDecision, error) {
 			d.Held, d.Deferred = true, d.Demand-d.Capacity-d.Ready
 			d.Reason = fmt.Sprintf("%s on running VMs expected to free within %s, sooner than a new VM (~%s)",
 				plural(d.Deferred, "slot"), ui.Dur(d.FreeIn), ui.Dur(d.Lead))
+		case p.briefWait(st, &d, demand, whole, away, pendingVM, now):
+			d.Held, d.Deferred = true, 1
+			d.Reason = fmt.Sprintf("a full VM's jobs may end any moment (their ends unknown or just due): waiting up to %s more before launching (~%s)",
+				ui.Dur(min(briefWaitFor, d.Lead)-d.Waited), ui.Dur(d.Lead))
 		default:
 			var b [6]byte
 			_, _ = rand.Read(b[:])
@@ -1395,6 +1399,43 @@ func (w *Waiter) Done() {
 	_ = syscall.Flock(int(w.f.Fd()), syscall.LOCK_UN)
 	_ = w.f.Close()
 	w.f = nil
+}
+
+// briefWaitFor bounds briefWait: a lone job waits this long at most for a
+// full VM's slot before its fleet launches (#297).
+const briefWaitFor = 15 * time.Second
+
+// briefWait reports whether a lone waiting job, which has waited only
+// moments, may wait a little longer for a slot on a full VM whose jobs
+// have no prediction, or only just passed it (releaseSoon counts neither):
+// one of them is likely to end before a new VM would serve, and a VM
+// launched for that job would get no work (#297). Past briefWaitFor (or
+// the launch's lead, if shorter) the demand launches as before. A burst,
+// a whole-VM waiter, or a VM with jobs admitted beyond its slots launches
+// at once, as does a fleet whose jobs are known to end later.
+func (p *Pool) briefWait(st *poolState, d *LaunchDecision, demand int, whole []int, away awayDemand, pendingVM map[string]bool, now time.Time) bool {
+	if demand != 1 || len(whole) > 0 || d.Demand-d.Capacity-d.Ready != 1 || p.since.IsZero() || d.Waited < 0 || d.Waited >= min(briefWaitFor, d.Lead) {
+		return false
+	}
+	s := st.sched()
+	for _, in := range st.Instances {
+		n := st.Notes[in.ID]
+		if in.State != provider.StateRunning || n == nil || !n.Ready || n.closed() || now.Before(n.SuspectUntil) ||
+			pendingVM[in.ID] || s.Fences[in.ID] != nil || (in.Region != "" && away.avoided(in.Region)) {
+			continue
+		}
+		// Full with this machine's own jobs, none beyond its slots: the
+		// next slot to free is the waiting job's.
+		if firm, unc := s.held(p.R, in.ID); unc > 0 || firm != s.units(p.R, in.ID) {
+			continue
+		}
+		for _, a := range s.Attempts {
+			if a.VM == in.ID && a.State == attAcquired && (a.Expect.IsZero() || (!a.Expect.After(now) && now.Sub(a.Expect) < briefWaitFor)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // releaseSoon reports whether the demand this fleet isn't launching for,
