@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -359,6 +360,10 @@ func TestTerminateReleasesItsClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	other := quotaClaim{Region: "r-one-1", ID: "i-other", Until: time.Now().Add(time.Hour)}
+	if err := a.withClaims(func(cs map[string]quotaClaim) { cs["other"] = other }); err != nil {
+		t.Fatal(err)
+	}
 	f.mu.Lock()
 	f.termErr = map[string]string{"r-one-1": "UnauthorizedOperation"}
 	f.mu.Unlock()
@@ -375,6 +380,13 @@ func TestTerminateReleasesItsClaim(t *testing.T) {
 	if err := a.Terminate(context.Background(), in.ID); err != nil {
 		t.Fatal(err)
 	}
+	var kept bool
+	if err := a.withClaims(func(cs map[string]quotaClaim) { _, kept = cs["other"] }); err != nil || !kept {
+		t.Fatalf("another VM's claim released with it (%v)", err)
+	}
+	if ids, err := a.recentLaunches(); err != nil || slices.Contains(ids, in.ID) {
+		t.Fatalf("the terminated VM is still noted for down: %v (%v)", ids, err)
+	}
 	if _, err := a.Launch(context.Background(), t.Logf); err != nil {
 		t.Fatalf("launch right after terminate: %v", err)
 	}
@@ -388,7 +400,7 @@ func TestDownFindsUnlistedLaunches(t *testing.T) {
 	g := newGlobalEnv(t, f, "r-one-1")
 	a := g.home()
 	var ids []string
-	for range 3 {
+	for range 4 {
 		in, err := a.Launch(context.Background(), t.Logf)
 		if err != nil {
 			t.Fatal(err)
@@ -396,16 +408,17 @@ func TestDownFindsUnlistedLaunches(t *testing.T) {
 		ids = append(ids, in.ID)
 	}
 	f.mu.Lock()
-	f.hidden = map[string]bool{ids[1]: true, ids[2]: true}
+	f.hidden = map[string]bool{ids[1]: true, ids[2]: true, ids[3]: true}
 	f.foreign = map[string]bool{ids[2]: true}
+	f.state = map[string]string{ids[3]: "shutting-down"} // already ending
 	f.calls = nil
 	f.mu.Unlock()
 	if err := a.Down(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
 	}
 	terms := f.callsOf("TerminateInstances")
-	if len(terms) != 1 || !strings.Contains(terms[0], ids[0]) || !strings.Contains(terms[0], ids[1]) || strings.Contains(terms[0], ids[2]) {
-		t.Fatalf("terminated %v, want %s and the unlisted %s (not %s, another machine's)", terms, ids[0], ids[1], ids[2])
+	if len(terms) != 1 || !strings.Contains(terms[0], ids[0]) || !strings.Contains(terms[0], ids[1]) || strings.Contains(terms[0], ids[2]) || strings.Contains(terms[0], ids[3]) {
+		t.Fatalf("terminated %v, want %s and the unlisted %s (not %s, another machine's, nor %s, ending)", terms, ids[0], ids[1], ids[2], ids[3])
 	}
 	if by := f.callsOf("DescribeInstances " + ids[0]); len(by) != 0 {
 		t.Fatalf("looked up %s by ID though the listing showed it", ids[0])

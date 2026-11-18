@@ -660,6 +660,51 @@ func TestSyncPrunesFilesWrittenButNeverRecorded(t *testing.T) {
 	}
 }
 
+// A file already in the slot where a sync was to write (an untracked
+// output) is the slot's, not the sync's: a sync that fails before writing
+// it, followed by one that no longer wants that path, leaves it (#295).
+func TestSyncKeepsAFileItNeverWrote(t *testing.T) {
+	root := t.TempDir()
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	writeFile(t, b.workspace, "out.txt", "built here\n")
+	b.c = protocol.NewConn(strings.NewReader(""), failWriter{})
+	if err := b.syncManifest(workingSet{"out.txt": "source\n"}.manifest()); err == nil {
+		t.Fatal("sync succeeded with no client")
+	}
+	playSync(t, b, workingSet{"b.txt": "beta\n"})
+	checkWorkspace(t, b.workspace, workingSet{"out.txt": "built here\n"})
+}
+
+// A second sync interrupted before its manifest is saved still leaves the
+// first one's unrecorded copy prunable (#295).
+func TestSyncKeepsTheWritingRecordAcrossTwoInterruptions(t *testing.T) {
+	root := t.TempDir()
+	a := slotSession(t, root, protocol.Acquire{WorktreeKey: "one"})
+	playSync(t, a, workingSet{"x.txt": "ex\n"})
+	b := slotSession(t, root, protocol.Acquire{WorktreeKey: "two"})
+	interrupted := func(w workingSet) {
+		t.Helper()
+		b.c = protocol.NewConn(strings.NewReader(""), failWriter{})
+		if err := b.syncManifest(w.manifest()); err == nil {
+			t.Fatal("sync succeeded with no client")
+		}
+		if err := writeJSON(b.manifestPath(), map[string]storedEntry{}); err != nil { // died before saving it
+			t.Fatal(err)
+		}
+		ws := b.workspace
+		b.release() // a new helper takes the slot over
+		if b = slotSession(t, root, protocol.Acquire{WorktreeKey: "two"}); b.workspace != ws {
+			t.Fatalf("got slot %s, want %s again", b.workspace, ws)
+		}
+	}
+	interrupted(workingSet{"x.txt": "ex\n"})
+	interrupted(workingSet{"x.txt": "ex\n", "y.txt": "why\n"})
+	playSync(t, b, workingSet{"z.txt": "zed\n"})
+	if _, err := os.Lstat(filepath.Join(b.workspace, "x.txt")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("x.txt, copied by the first interrupted sync, survived: %v", err)
+	}
+}
+
 // An entry whose mode isn't one a worktree can hold is never reused: the
 // client is asked for it.
 func TestSyncNeverReusesAnUnknownMode(t *testing.T) {

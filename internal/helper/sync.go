@@ -225,11 +225,32 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		need = append(need, e.Path)
 		needBytes += e.Size
 	}
-	// Each path the copies and the archive may write is known before the
+	// Each path the copies and the archive may create is known before the
 	// first is: a helper that dies between placing a file and saving the
-	// manifest leaves nothing the next sync can't prune.
-	s.state.Writing = append([]string(nil), need...)
-	if len(need) > 0 {
+	// manifest leaves nothing the next sync can't prune. Only paths with
+	// nothing there yet (a file already there is the slot's, never pruned
+	// on this record), and those an interrupted sync left that are still
+	// wanted, until a saved manifest records them.
+	var writing []string
+	journaled := make(map[string]bool, len(s.state.Writing))
+	for _, p := range s.state.Writing {
+		journaled[p] = true
+		if _, ok := want[p]; ok {
+			writing = append(writing, p)
+		}
+	}
+	for _, p := range need {
+		full, err := fsid.SafeJoin(s.workspace, p)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Lstat(full); errors.Is(err, fs.ErrNotExist) && !journaled[p] {
+			writing = append(writing, p)
+		}
+	}
+	changed := !slices.Equal(writing, s.state.Writing)
+	s.state.Writing = writing
+	if changed {
 		if err := saveSlotState(s.slotDir, s.state); err != nil {
 			_ = s.saveStored()
 			return err

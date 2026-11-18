@@ -88,7 +88,10 @@ func (p *Pool) Prewarm(ctx context.Context, id string, log provider.Logger, read
 		}
 	}
 	if !p.fenceBooting(in.ID) {
-		return in, fmt.Errorf("%w (%s was left running: a run is placed on it)", err, in.ID)
+		if errors.Is(err, ErrBootstrapFailed) {
+			p.failBoot(id, in.ID, err, false, ctx.Err() != nil) // the setup is broken all the same
+		}
+		return in, fmt.Errorf("%w (%s was left running: a run is using it)", err, in.ID)
 	}
 	tctx, cancel := context.WithTimeout(bg, 30*time.Second)
 	terr := p.Fleet.Terminate(tctx, in.ID)

@@ -317,8 +317,8 @@ func TestQueueLockWaitEndsWithContext(t *testing.T) {
 	if st := q.StateCtx(ctx, a); st.Position != unknownPosition {
 		t.Fatalf("lookup with no snapshot under a held lock: %+v", st)
 	}
-	if d := time.Since(start); d > 5*time.Second {
-		t.Fatalf("waited %s past its context", d)
+	if d := time.Since(start); d < 90*time.Millisecond || d > 5*time.Second {
+		t.Fatalf("gave up after %s, want when its context ended (100ms)", d)
 	}
 }
 

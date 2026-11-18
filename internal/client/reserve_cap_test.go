@@ -159,7 +159,7 @@ func TestResetKeepsLaunchesReservedDuringDown(t *testing.T) {
 	if _, err := p.Provision(ctx, ids[0], nil); err != nil {
 		t.Fatal(err)
 	}
-	mark := p.MarkDown()
+	mark := p.MarkDown(context.Background())
 	// The prewarm reserves while the teardown lists and terminates.
 	prewarm, _ := p.Reserve(ctx, 1)
 	if len(prewarm) != 1 {
@@ -169,6 +169,9 @@ func TestResetKeepsLaunchesReservedDuringDown(t *testing.T) {
 	f.insts = nil // down ended the VM it listed
 	f.mu.Unlock()
 	p.Reset(mark)
+	if st := readState(t, p); len(st.Launches) != 1 || st.Launches[0].ID != prewarm[0] {
+		t.Fatalf("launches after reset %+v, want just the prewarm's", st.Launches)
+	}
 	if got, _ := p.Reserve(ctx, 2); len(got) != 1 {
 		t.Fatalf("reserved %d after down, want 1: the prewarm's launch still counts", len(got))
 	}
@@ -187,4 +190,32 @@ func hasLaunch(st poolState, id string) bool {
 		}
 	}
 	return false
+}
+
+// A VM launched after down listed the fleet, with a run already placed on
+// it, keeps that run in the ledger through the reset (#295): it still
+// protects the VM from boot cleanup.
+func TestResetKeepsRunsOnVMsDownDidNotSee(t *testing.T) {
+	ctx := context.Background()
+	p, _ := testPool(t, 2)
+	mark := p.MarkDown(ctx)
+	ids, _ := p.Reserve(ctx, 1)
+	in, err := p.Provision(ctx, ids[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aid, err := p.reserveOn(in, claim{})
+	if err == nil {
+		err = p.markSent(aid)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Reset(mark)
+	if !p.state(t).protected(in.ID) {
+		t.Fatalf("the run on %s was forgotten by the reset", in.ID)
+	}
+	if p.fenceBooting(in.ID) {
+		t.Fatal("boot cleanup may end a VM a run is using")
+	}
 }

@@ -391,7 +391,11 @@ func (f *fakeRegionsEC2) handler(t *testing.T) http.Handler {
 				if f.foreign[id] {
 					owner = "someone-else"
 				}
-				fmt.Fprintf(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>%s</instanceId><instanceType>%s</instanceType><instanceState><name>running</name></instanceState><tagSet><item><key>spotexec-runner</key><value>g</value></item><item><key>spotexec-owner</key><value>%s</value></item></tagSet></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`, id, typ, owner)
+				st := f.state[id]
+				if st == "" {
+					st = "running"
+				}
+				fmt.Fprintf(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>%s</instanceId><instanceType>%s</instanceType><instanceState><name>%s</name></instanceState><tagSet><item><key>spotexec-runner</key><value>g</value></item><item><key>spotexec-owner</key><value>%s</value></item></tagSet></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`, id, typ, st, owner)
 				return
 			}
 			if p.Get("Filter.1.Name") == "tag:spotexec-bake-runner" {

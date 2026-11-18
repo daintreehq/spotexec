@@ -209,7 +209,11 @@ func TestProvisionFencesABootFailureBeforeEndingIt(t *testing.T) {
 		p, f := testPool(t, 2)
 		f.goneOnWait = true
 		f.onWait = func(id string) {
-			if _, err := p.reserveOn(vm(f, id), claim{}); err != nil {
+			aid, err := p.reserveOn(vm(f, id), claim{})
+			if err == nil {
+				err = p.markSent(aid) // its request went out: the VM answered it
+			}
+			if err != nil {
 				t.Errorf("placing a run while it boots: %v", err)
 			}
 		}
@@ -225,6 +229,27 @@ func TestProvisionFencesABootFailureBeforeEndingIt(t *testing.T) {
 		}
 		if _, err := p.reserveOn(vm(f, in.ID), claim{}); err != nil {
 			t.Fatalf("the VM left running is fenced: %v", err)
+		}
+	})
+	t.Run("a run that sent nothing yet", func(t *testing.T) {
+		p, f := testPool(t, 2)
+		f.goneOnWait = true
+		var aid string
+		f.onWait = func(id string) {
+			var err error
+			if aid, err = p.reserveOn(vm(f, id), claim{}); err != nil {
+				t.Errorf("reserving while it boots: %v", err)
+			}
+		}
+		ids, _ := p.Reserve(ctx, 1)
+		if _, err := p.Provision(ctx, ids[0], nil); err == nil || strings.Contains(err.Error(), "left running") {
+			t.Fatalf("err = %v, want the boot failure", err)
+		}
+		if listed(t, f) != 0 {
+			t.Fatal("left running for a reservation that never reached it: nothing would end it")
+		}
+		if err := p.markSent(aid); err == nil {
+			t.Fatal("the revoked reservation still sent its request")
 		}
 	})
 	t.Run("nothing placed on it", func(t *testing.T) {

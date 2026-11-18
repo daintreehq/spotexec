@@ -127,8 +127,10 @@ func TestAcquireCommitStopsAtQueueDeadline(t *testing.T) {
 	pool := fleetsOf(t, map[string][]string{"healthy": {"b1"}})
 	p := NewPool(pool[0], nil)
 	var unlock func()
+	probed := false
 	old := tryAcquireFn
 	tryAcquireFn = func(_ context.Context, req AcquireRequest, r *config.Runner, _ provider.Provider, _ provider.Target, _ bool) (*Lease, []protocol.Holder, error) {
+		probed = true
 		if req.onSend != nil {
 			if err := req.onSend(); err != nil {
 				return nil, nil, err
@@ -153,6 +155,9 @@ func TestAcquireCommitStopsAtQueueDeadline(t *testing.T) {
 		unlock()
 	}
 	WaitLaunches(5 * time.Second)
+	if !probed {
+		t.Fatal("no VM was probed: the slot was never granted")
+	}
 	if l != nil || err == nil || !strings.Contains(err.Error(), protocol.CodeQueueTimeout) {
 		t.Fatalf("lease %v, error %v; want a queue timeout", l, err)
 	}

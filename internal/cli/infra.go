@@ -867,7 +867,7 @@ func cmdDown() *cobra.Command {
 				f, fleet := p.(provider.Fleet)
 				var mark client.DownMark
 				if fleet {
-					mark = client.NewPool(r, f).MarkDown()
+					mark = client.NewPool(r, f).MarkDown(cmd.Context())
 				}
 				if err := p.Down(cmd.Context(), func(f string, a ...any) { fmt.Fprintf(os.Stderr, "%s: %s\n", r.Name, fmt.Sprintf(f, a...)) }); err != nil {
 					errs = append(errs, fmt.Sprintf("%s: %v", r.Name, err))

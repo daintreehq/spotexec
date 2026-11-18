@@ -187,17 +187,17 @@ const (
 )
 
 // noteLaunched records instance id, just launched in the region.
-func (a *AWSSpot) noteLaunched(id string) {
-	_ = a.withLedger(launchedLock, launchedFile, func(cs map[string]quotaClaim) {
+func (a *AWSSpot) noteLaunched(id string) error {
+	return a.withLedger(launchedLock, launchedFile, func(cs map[string]quotaClaim) {
 		cs[id] = quotaClaim{Region: a.r.Region, ID: id, Until: time.Now().Add(claimListLag)}
 	})
 }
 
 // recentLaunches lists the instances noted in the region whose listing
 // may still lag.
-func (a *AWSSpot) recentLaunches() []string {
+func (a *AWSSpot) recentLaunches() ([]string, error) {
 	var ids []string
-	_ = a.withLedger(launchedLock, launchedFile, func(cs map[string]quotaClaim) {
+	err := a.withLedger(launchedLock, launchedFile, func(cs map[string]quotaClaim) {
 		for _, c := range cs {
 			if c.Region == a.r.Region && c.ID != "" {
 				ids = append(ids, c.ID)
@@ -205,7 +205,7 @@ func (a *AWSSpot) recentLaunches() []string {
 		}
 	})
 	sort.Strings(ids)
-	return ids
+	return ids, err
 }
 
 // forgetLaunched drops the notes of instances that were just terminated.
