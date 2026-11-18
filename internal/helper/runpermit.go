@@ -3,6 +3,7 @@ package helper
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -32,9 +33,9 @@ func (s *Session) takeRun() (canceled bool, err error) {
 		return false, nil
 	}
 	start := time.Now()
-	noticed := false
+	noticed := "" // why it waits ("slots" or "memory"), once it does
 	unwait := func() {
-		if noticed {
+		if noticed != "" {
 			s.updateHolder(func(h *protocol.Holder) { h.Phase = "" })
 		}
 	}
@@ -57,21 +58,31 @@ func (s *Session) takeRun() (canceled bool, err error) {
 				return false, perr(protocol.CodeQueueTimeout, "no free slot to run the command within %s", q)
 			}
 		}
-		got, err := s.tryRun()
+		got, memWait, err := s.tryRun()
 		if err != nil {
 			return false, err
 		}
 		if got {
-			if noticed {
-				_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "run_slot", Message: fmt.Sprintf("waited %s for a free slot", time.Since(start).Round(100*time.Millisecond))})
+			if noticed != "" {
+				what := "a free slot"
+				if noticed == "memory" {
+					what = "memory"
+				}
+				_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "run_slot", Message: fmt.Sprintf("waited %s for %s", time.Since(start).Round(100*time.Millisecond), what)})
 			}
 			return false, nil
 		}
-		if !noticed {
-			noticed = true
+		if noticed == "" {
 			s.updateHolder(func(h *protocol.Holder) { h.Phase = protocol.PhaseRunWait })
-			_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "run_wait",
-				Message: fmt.Sprintf("all %d slots are running commands; waiting for one to finish", s.maxSlots)})
+		}
+		// Told once per reason: memory's figures change on every attempt.
+		reason, msg := "slots", fmt.Sprintf("all %d slots are running commands; waiting for one to finish", s.maxSlots)
+		if memWait != "" {
+			reason, msg = "memory", memWait
+		}
+		if reason != noticed {
+			noticed = reason
+			_ = s.c.Send(protocol.TypeEvent, protocol.Event{Name: "run_wait", Message: msg})
 		}
 		time.Sleep(runPoll)
 	}
@@ -83,20 +94,21 @@ var errWithdrawn = errors.New("withdrawn while waiting for a run permit")
 
 // tryRun takes a free run permit if there is room for one, under the run
 // gate: two jobs counting at once could each see the last one free, or
-// count each other's probes as held.
-func (s *Session) tryRun() (bool, error) {
+// count each other's probes as held. memWait says why it didn't when a
+// permit is free but the memory pool has no room for the command.
+func (s *Session) tryRun() (got bool, memWait string, err error) {
 	// Held for an instant: a brief wait at most, so the outer loop's
 	// cancel and timeout checks stay current.
 	var gate *flock
 	for deadline := time.Now().Add(100 * time.Millisecond); gate == nil; {
 		g, ok, err := tryLock(s.layout.RunGate())
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
 		if ok {
 			gate = g
 		} else if time.Now().After(deadline) {
-			return false, nil // try again on the next attempt
+			return false, "", nil // try again on the next attempt
 		} else {
 			time.Sleep(5 * time.Millisecond)
 		}
@@ -105,21 +117,28 @@ func (s *Session) tryRun() (bool, error) {
 	for _, i := range s.runPermits() {
 		l, ok, err := tryLock(s.layout.RunLock(i))
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
 		if ok {
 			if s.stopping.Load() { // own would park, holding the gate
 				l.Unlock()
-				return false, perr(protocol.CodeShutdown, "the runner is shutting down")
+				return false, "", perr(protocol.CodeShutdown, "the runner is shutting down")
 			}
+			if why := s.memoryWait(i); why != "" {
+				l.Unlock()
+				return false, why, nil
+			}
+			// Before the gate opens: the next job to look counts this
+			// command's reservation.
+			_ = writeJSON(s.layout.RunMem(i), s.runMem)
 			s.own(func() {
 				s.run, s.runIdx = l, i
 				s.updateHolder(func(h *protocol.Holder) { h.Phase, h.Run = protocol.PhaseRun, i })
 			})
-			return true, nil
+			return true, "", nil
 		}
 	}
-	return false, nil
+	return false, "", nil
 }
 
 // runPermits lists the run permits this job may take: none once permits
@@ -164,6 +183,7 @@ func (s *Session) releaseRun() {
 	if s.run == nil || s.stopping.Load() || s.exiting.Load() {
 		return // none held, or released (or being released) with everything else
 	}
+	os.Remove(s.layout.RunMem(s.runIdx))
 	s.run.Unlock()
 	s.run, s.runIdx = nil, 0
 	s.updateHolder(func(h *protocol.Holder) { h.Phase, h.Run = "", 0 })

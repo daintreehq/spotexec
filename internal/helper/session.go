@@ -86,7 +86,11 @@ type Session struct {
 		name    string
 		d       dockerRunner
 		started time.Time
+		cid     string // the file docker writes its ID to, when in the memory pool
 	}
+	// runMem is the memory the current exec's command reserves in the
+	// pool, recorded with its run permit (see runmemory.go).
+	runMem     runMemRecord
 	stored     map[string]storedEntry
 	exiting    atomic.Bool
 	child      atomic.Int64 // running command's process group, if any

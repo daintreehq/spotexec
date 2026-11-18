@@ -427,6 +427,11 @@ type Exec struct {
 	// back and sent (as stderr) only if it fails; then Shell never runs.
 	SetupRun       string `json:"setup_run,omitempty"`
 	SetupTimeoutMS int64  `json:"setup_timeout_ms,omitempty"`
+	// MemoryMB is the memory (MiB) the command is expected to need at its
+	// peak, from earlier runs of it (Result.PeakMemoryMB); 0 when unknown.
+	// A helper starts a command in the memory pool only when it fits
+	// beside what the running ones are expected to grow to (#294).
+	MemoryMB int64 `json:"memory_mb,omitempty"`
 }
 
 // Started confirms the child was spawned.
@@ -466,6 +471,11 @@ type Result struct {
 	// MemoryLimitMB is the cap of the memory pool the container ran in
 	// (MiB), or 0 when it ran outside it.
 	MemoryLimitMB int64 `json:"memory_limit_mb,omitempty"`
+	// PeakMemoryMB is the most memory (MiB) the [setup] run's and the
+	// command's containers were seen using in the memory pool, page cache
+	// left out (sampled, so a spike just before exit can be missed); 0
+	// when not measured: no container, or one outside the pool.
+	PeakMemoryMB int64 `json:"peak_memory_mb,omitempty"`
 	// SetupFailed: Exec.SetupRun did not succeed (it failed, timed out, was
 	// canceled or couldn't start), so Shell never ran. ExitCode, Signal,
 	// TimedOut, Canceled, StartError and OOMKilled then describe the setup.

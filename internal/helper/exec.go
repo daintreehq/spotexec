@@ -423,6 +423,7 @@ func (s *Session) exec(e protocol.Exec) error {
 	}
 	// Before anything marks the slot dirty: a job that never gets to run
 	// leaves its workspace as it was.
+	s.planRunMemory(e)
 	if canceled, err := s.takeRun(); errors.Is(err, errWithdrawn) {
 		return s.c.Send(protocol.TypeResult, protocol.Result{Withdrawn: true})
 	} else if err != nil {
@@ -487,6 +488,7 @@ func (s *Session) exec(e protocol.Exec) error {
 	// container) before this helper is signalled itself: that is a lost
 	// runner, not the script's result. One that finished on its own is
 	// never one.
+	var peakMB int64 // the most the containers were seen using in the pool
 	runPhase := func(shell, dir string, timeout time.Duration, out io.Writer) (pr procResult, shutdown, oom bool, err error) {
 		script, runEnv, cleanup := shell, env, func() error { return nil }
 		if strings.TrimSpace(e.Setup) != "" {
@@ -512,7 +514,14 @@ func (s *Session) exec(e protocol.Exec) error {
 			}
 			script, runEnv, cleanup = host, hostEnv, c
 		}
+		var stopWatch func() int64
+		if e.Container != nil && s.lastContainer.cid != "" {
+			stopWatch = s.watchMemory(s.lastContainer.cid, s.runIdx)
+		}
 		pr = s.runProc(script, dir, runEnv, timeout, grace, e.SpotWatch, out)
+		if stopWatch != nil {
+			peakMB = max(peakMB, stopWatch())
+		}
 		shutdown = pr.startErr == nil && !pr.timedOut && shutdownExit(pr.code, e.Container != nil) && systemStopping()
 		if err := cleanup(); err != nil {
 			if shutdown {
@@ -587,6 +596,7 @@ func (s *Session) exec(e protocol.Exec) error {
 		ExitCode: pr.code, Signal: pr.signal, TimedOut: pr.timedOut, Canceled: pr.canceled,
 		Interrupted: pr.spotIntr || s.interrupted.Load(), DurationMS: time.Since(start).Milliseconds(),
 		Shutdown: shutdown, SetupFailed: setupFailed, SetupMS: setupMS, CommandMS: commandMS,
+		PeakMemoryMB: peakMB,
 	}
 	if pr.startErr != nil {
 		res.StartError = pr.startErr.Error()

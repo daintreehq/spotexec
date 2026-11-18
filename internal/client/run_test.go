@@ -17,6 +17,7 @@ import (
 
 	"github.com/daintreehq/spotexec/internal/manifest"
 	"github.com/daintreehq/spotexec/internal/protocol"
+	"github.com/daintreehq/spotexec/internal/provider"
 )
 
 func mf(entries ...protocol.Entry) *manifest.Manifest {
@@ -242,6 +243,26 @@ func TestOOMExit(t *testing.T) {
 		if got := oomExit(c.res); got != c.want {
 			t.Errorf("%s: exit %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// A run's peak memory is kept for the next run of its workload to
+// reserve; one OOM killed in the pool is kept at the pool's cap, so the
+// next run starts only once nothing runs beside it (#294).
+func TestRecordRunMemory(t *testing.T) {
+	t.Setenv("SPOTEXEC_STATE_DIR", t.TempDir())
+	r := &config.Runner{Name: "aws", Type: config.TypeAWSSpot}
+	recordRunMemory(r, "tc", protocol.Result{PeakMemoryMB: 7000})
+	if got := provider.RunMemory(r, "tc"); got != 7000 {
+		t.Fatalf("expected %d MiB, want 7000", got)
+	}
+	recordRunMemory(r, "tc", protocol.Result{ExitCode: 1, OOMKilled: true, MemoryLimitMB: 29388, PeakMemoryMB: 6000})
+	if got := provider.RunMemory(r, "tc"); got != 29388 {
+		t.Fatalf("after an OOM kill in the pool: %d MiB, want the pool's 29388", got)
+	}
+	recordRunMemory(r, "other", protocol.Result{ExitCode: 137, OOMKilled: true})
+	if got := provider.RunMemory(r, "other"); got != 0 {
+		t.Fatalf("an OOM kill outside the pool, unmeasured: %d MiB", got)
 	}
 }
 
