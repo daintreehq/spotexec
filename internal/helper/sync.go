@@ -120,10 +120,21 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		want[e.Path] = e
 	}
 
-	// Prune files we previously synced that are no longer in the manifest.
+	// Prune files we previously synced that are no longer in the manifest,
+	// and those a sync was writing when its helper died, before it could
+	// record them.
+	prune := make([]string, 0, len(s.stored)+len(s.state.Writing))
+	for p := range s.stored {
+		prune = append(prune, p)
+	}
+	for _, p := range s.state.Writing {
+		if _, ok := s.stored[p]; !ok {
+			prune = append(prune, p)
+		}
+	}
 	deleted := 0
 	var dirs []string
-	for p := range s.stored {
+	for _, p := range prune {
 		if _, ok := want[p]; ok {
 			continue
 		}
@@ -214,6 +225,16 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		need = append(need, e.Path)
 		needBytes += e.Size
 	}
+	// Each path the copies and the archive may write is known before the
+	// first is: a helper that dies between placing a file and saving the
+	// manifest leaves nothing the next sync can't prune.
+	s.state.Writing = append([]string(nil), need...)
+	if len(need) > 0 {
+		if err := saveSlotState(s.slotDir, s.state); err != nil {
+			_ = s.saveStored()
+			return err
+		}
+	}
 	upload, need, reused, err := s.uploadTurn(need, want)
 	if err != nil {
 		_ = s.saveStored()
@@ -256,6 +277,7 @@ func (s *Session) syncManifest(m protocol.Manifest) error {
 		return err
 	}
 	upload.Unlock() // recorded: other slots can copy what came
+	s.state.Writing = nil
 	if len(res.Corrected) == 0 {
 		s.state.Fingerprint = m.Fingerprint
 	}

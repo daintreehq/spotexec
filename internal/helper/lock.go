@@ -145,6 +145,12 @@ type SlotState struct {
 	// found to be ignored. They stay (a no-sync follow-up can inspect them)
 	// until the next run that syncs into the slot, which removes them.
 	Pending []string `json:"pending,omitempty"`
+	// Writing: the paths a sync was about to write (copies from other
+	// slots, then the client's archive), saved before the first of them.
+	// One a helper that died left in place before recording it in the
+	// manifest is pruned like a synced file by the next sync that doesn't
+	// want it (#295).
+	Writing []string `json:"writing,omitempty"`
 	// Sweep: a run started here but its created files were never collected
 	// (the helper died). The next acquire walks the workspace (skipping
 	// SweepSkip) and makes every file that isn't synced pending.
