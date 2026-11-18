@@ -695,6 +695,19 @@ func replayVerdict(ctx context.Context, lease *Lease, noticed bool, err error, a
 	return whyNoReplayCtx(ctx, lease, noticed || vmShutdown(err), at, exclusive)
 }
 
+// lossVerdict is what an attempt that lost its runner records: why it
+// must not be replayed (replayVerdict, for a fleet lease), and whether its
+// session was given up on for silence. An interrupt that ended the session
+// isn't the VM's doing (#289): replayable reports nothing for that loss, so
+// EC2 isn't asked about it.
+func lossVerdict(ctx context.Context, lease *Lease, noticed bool, err error, at stage, exclusive bool) (nr noReplay, silent bool) {
+	silent = lease.Sess.Silent()
+	if lease.InstanceID != "" && (ctx.Err() == nil || silent) {
+		nr = replayVerdict(ctx, lease, noticed, err, at, exclusive)
+	}
+	return nr, silent
+}
+
 // shutdownErr is what runOnce returns when the VM's shutdown killed the
 // command.
 func shutdownErr(label string, code int) error {
@@ -906,12 +919,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 		if lost != "" {
 			res.lostAt, res.lostWhen = prog.get(), time.Now()
-			res.lostSilent = lease.Sess.Silent()
-			// An interrupt that ended the session isn't the VM's doing
-			// (#289): replayable reports nothing for it, so don't ask EC2.
-			if lease.InstanceID != "" && (ctx.Err() == nil || res.lostSilent) {
-				res.noReplay = replayVerdict(ctx, lease, noticed.Load(), err, res.lostAt, o.Exclusive)
-			}
+			res.noReplay, res.lostSilent = lossVerdict(ctx, lease, noticed.Load(), err, res.lostAt, o.Exclusive)
 		}
 	}()
 	// Before the command starts, Ctrl-C aborts the session outright (a
@@ -1259,7 +1267,13 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
-			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)), ""
+			err = fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)
+			if ctx.Err() != nil {
+				// An interrupted run reports the interrupt, not its error:
+				// still say its changes didn't land.
+				o.Rep.Warn("WRITEBACK_FAILED", "%v", err)
+			}
+			return res, infra(err), ""
 		}
 		res.Mutated, res.Deleted = wb.Applied, wb.Deleted
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "held_files": len(wb.HeldNew), "held_bytes": wb.HeldNewBytes, "duration_ms": time.Since(t).Milliseconds()})

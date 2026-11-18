@@ -135,6 +135,42 @@ func TestInterruptedRunBlamesNoRunner(t *testing.T) {
 	}
 }
 
+// The loss an attempt records: an interrupted attempt whose session
+// wasn't given up on for silence gets no verdict, and EC2 isn't asked
+// about it; one that wasn't interrupted, or whose helper went silent, does.
+func TestLossVerdict(t *testing.T) {
+	r, f := testFleet()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	lease := &Lease{Runner: r, Provider: f, InstanceID: "i-run"}
+	if nr, silent := lossVerdict(canceled, lease, false, io.EOF, running, false); nr.code != "" || silent || f.lists != 0 {
+		t.Fatalf("interrupted: %q (%q), silent %v, %d listings; want none", nr.code, nr.why, silent, f.lists)
+	}
+	if nr, silent := lossVerdict(context.Background(), lease, false, io.EOF, running, false); nr.code != "RUNNER_UNRESPONSIVE" || silent || f.lists == 0 {
+		t.Fatalf("not interrupted: %q, silent %v, %d listings; want RUNNER_UNRESPONSIVE from a listing", nr.code, silent, f.lists)
+	}
+	sr, tgt := liveRunner(t, "rpc-silent")
+	_, s, err := Connect(context.Background(), sr, tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Abort()
+	deadline := time.Now().Add(10 * time.Second)
+	for !s.Dead() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	lease.Sess = s
+	if nr, silent := lossVerdict(canceled, lease, false, s.LostErr(), running, false); nr.code == "" || !silent {
+		t.Fatalf("silent, then interrupted: %q, silent %v; want a verdict", nr.code, silent)
+	}
+	if _, _, why := replayable("i-run", Result{noReplay: noReplay{code: "RUNNER_UNRESPONSIVE", why: "x"}, lostSilent: true}, Options{}, true, 1); why == "" {
+		t.Fatal("a silent loss, then interrupted, is not explained")
+	}
+	if nr, _ := lossVerdict(context.Background(), &Lease{Runner: r, Provider: f, Sess: s}, false, io.EOF, running, false); nr.code != "" {
+		t.Fatalf("a static runner got a verdict: %q", nr.code)
+	}
+}
+
 // Once the command was dispatched, the warning names the phase, the last
 // memory reading when there is one, and suggests --exclusive only to a run
 // that didn't already have it.
