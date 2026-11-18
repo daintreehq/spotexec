@@ -166,6 +166,10 @@ type Result struct {
 	noReplay noReplay
 	// lostAt, when the runner was lost, is how far the attempt had got.
 	lostAt stage
+	// lostSilent, when the runner was lost, is whether the session was
+	// given up on because the helper went silent (transport.Session.Silent):
+	// a loss an interrupt can't have caused.
+	lostSilent bool
 	// lostWhen is when the attempt gave up on its runner (no earlier than
 	// the last word it sent the helper).
 	lostWhen time.Time
@@ -350,6 +354,14 @@ type InfraError struct{ Err error }
 func (e *InfraError) Error() string { return e.Err.Error() }
 func (e *InfraError) Unwrap() error { return e.Err }
 
+// WritebackError is the error of a run whose command finished but whose
+// file changes could not be written back. A caller that reports an
+// interrupted run's interrupt rather than its error still says this.
+type WritebackError struct{ Err error }
+
+func (e *WritebackError) Error() string { return e.Err.Error() }
+func (e *WritebackError) Unwrap() error { return e.Err }
+
 func infra(err error) error {
 	if err == nil {
 		return nil
@@ -479,8 +491,14 @@ func uploadStall(l *Lease) error {
 // it. A run lost to its whole region going silent (noReplay.region, with
 // no code) is replayed like a reclaimed one; when the options rule the
 // replay out, the warning still says the region went silent.
+//
+// A run its caller interrupted (canceled) is never replayed, and its loss
+// is explained only when the session was given up on for silence
+// (res.lostSilent): otherwise the interrupt most likely ended the session
+// itself (a Ctrl-C reaches the ssh client too), and the VM isn't to blame
+// (#289).
 func replayable(lost string, res Result, o Options, canceled bool, n int) (retry bool, code, why string) {
-	if lost == "" {
+	if lost == "" || canceled && !res.lostSilent {
 		return false, "", ""
 	}
 	eligible := o.RetryPreempt && !canceled && o.Sync != "none" && !o.PreferLast && !o.SameSlot && n < 2
@@ -683,6 +701,19 @@ func noteReclaimed(lease *Lease) {
 // still reports a VM running while its OS halts.
 func replayVerdict(ctx context.Context, lease *Lease, noticed bool, err error, at stage, exclusive bool) noReplay {
 	return whyNoReplayCtx(ctx, lease, noticed || vmShutdown(err), at, exclusive)
+}
+
+// lossVerdict is what an attempt that lost its runner records: why it
+// must not be replayed (replayVerdict, for a fleet lease), and whether its
+// session was given up on for silence. An interrupt that ended the session
+// isn't the VM's doing (#289): replayable reports nothing for that loss, so
+// EC2 isn't asked about it.
+func lossVerdict(ctx context.Context, lease *Lease, noticed bool, err error, at stage, exclusive bool) (nr noReplay, silent bool) {
+	silent = lease.Sess.Silent()
+	if lease.InstanceID != "" && (ctx.Err() == nil || silent) {
+		nr = replayVerdict(ctx, lease, noticed, err, at, exclusive)
+	}
+	return nr, silent
 }
 
 // shutdownErr is what runOnce returns when the VM's shutdown killed the
@@ -896,9 +927,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		}
 		if lost != "" {
 			res.lostAt, res.lostWhen = prog.get(), time.Now()
-			if lease.InstanceID != "" {
-				res.noReplay = replayVerdict(ctx, lease, noticed.Load(), err, res.lostAt, o.Exclusive)
-			}
+			res.noReplay, res.lostSilent = lossVerdict(ctx, lease, noticed.Load(), err, res.lostAt, o.Exclusive)
 		}
 	}()
 	// Before the command starts, Ctrl-C aborts the session outright (a
@@ -1246,7 +1275,7 @@ func runOnce(ctx context.Context, cfg *config.Config, ws *Workspace, o Options, 
 		if err != nil {
 			// The command already finished: never replay it. Report what is
 			// known so the caller can decide.
-			return res, infra(fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)), ""
+			return res, infra(&WritebackError{fmt.Errorf("command finished (exit %d) but its file changes could not be written back: %w", res.ExitCode, err)}), ""
 		}
 		res.Mutated, res.Deleted = wb.Applied, wb.Deleted
 		o.Rep.Event("sync_out", map[string]any{"mutated_files": nz(wb.Applied), "deleted_files": nz(wb.Deleted), "conflicts": nz(wb.Conflicts), "backed_up_files": nz(wb.BackedUp), "held_deletions": nz(wb.Held), "ignored_created": wb.Ignored, "held_files": len(wb.HeldNew), "held_bytes": wb.HeldNewBytes, "duration_ms": time.Since(t).Milliseconds()})

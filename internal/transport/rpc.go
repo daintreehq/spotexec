@@ -652,6 +652,22 @@ func (s *Session) Dead() bool {
 	}
 }
 
+// Silent reports whether the session ended because the watchdog gave up
+// on the helper (silent past its limit, or an upload that stopped getting
+// through), rather than because the connection closed or this side ended
+// it: a loss that stopping the local ssh client can't have caused. The
+// first error the session recorded decides, so a watchdog tick that
+// overlaps the connection ending doesn't claim the loss.
+func (s *Session) Silent() bool {
+	if s == nil {
+		return false
+	}
+	s.errMu.Lock()
+	err := s.err
+	s.errMu.Unlock()
+	return errors.Is(err, errSilent) || errors.Is(err, errUploadStalled)
+}
+
 // Limit is how long the session may currently hear nothing from the
 // helper before it is given up on.
 func (s *Session) Limit() time.Duration { return time.Duration(s.limit.Load()) }

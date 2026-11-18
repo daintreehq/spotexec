@@ -15,6 +15,7 @@ import (
 	"github.com/daintreehq/spotexec/internal/protocol"
 	"github.com/daintreehq/spotexec/internal/provider"
 	"github.com/daintreehq/spotexec/internal/transport"
+	"github.com/daintreehq/spotexec/internal/transport/sshtest"
 	"github.com/daintreehq/spotexec/internal/ui"
 )
 
@@ -22,6 +23,7 @@ import (
 // machine's own state directory: a test that doesn't give the CLI a state
 // directory of its own records into a temporary one.
 func TestMain(m *testing.M) {
+	sshtest.Main() // a test that installs the fake ssh runs it as this binary
 	real := config.StateDir()
 	tmp, err := os.MkdirTemp("", "spotexec-cli-test-")
 	if err != nil {
