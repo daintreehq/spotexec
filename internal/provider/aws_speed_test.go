@@ -350,6 +350,9 @@ func TestRunCostMeasuredSpeedRanks(t *testing.T) {
 		t.Fatal(err)
 	}
 	k := g.Rank(tbl)
+	if k.Model.SpeedCap != speedCap {
+		t.Fatalf("speed cap %v", k.Model.SpeedCap)
+	}
 	if s := k.Model.MeasuredSpeeds["m6i.2xlarge"]; s.Relative < 0.98 || s.Generation != 7 || s.Group != "m6i.2xlarge" || s.Runs != vms {
 		t.Fatalf("model %+v", k.Model.MeasuredSpeeds)
 	}
@@ -621,8 +624,10 @@ func TestMeasuredSpeedsLegacyRunsOnlyUntilVMsKnown(t *testing.T) {
 	if g := measuredSpeeds(st.Speed, now.Add(time.Minute))["m7a.2xlarge"]; g.Relative >= 0.9 || g.Runs != 5 {
 		t.Fatalf("with legacy runs: %+v", g)
 	}
-	vmRuns(st, now, "w", "m7a.2xlarge", 100, 100, 100, 100, 100)
-	if g := measuredSpeeds(st.Speed, now.Add(time.Minute))["m7a.2xlarge"]; !approx(g.Relative, 1) || g.Runs != 6 {
+	for i := 1; i < SpeedMinRuns; i++ {
+		recordSpeed(st, "w", "m7a.2xlarge", fmt.Sprintf("i-%d", i), 100*time.Second, now)
+	}
+	if g := measuredSpeeds(st.Speed, now.Add(time.Minute))["m7a.2xlarge"]; !approx(g.Relative, 1) || g.Runs != SpeedMinRuns {
 		t.Fatalf("VMs known: %+v", g)
 	}
 }

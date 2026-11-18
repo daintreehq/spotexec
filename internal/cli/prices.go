@@ -237,6 +237,9 @@ func (v pricesView) writeText(w io.Writer, limit int) {
 				if c.SpeedFrom == provider.SpeedMeasured {
 					how = "measured"
 				}
+				if c.SpeedCapped {
+					how += ",capped"
+				}
 				speed += fmt.Sprintf(" %.0f%% %s", c.RelSpeed*100, how)
 			}
 			row += fmt.Sprintf("%.3f\t%s\t%s\t%s\t%s\t", c.Score, speed, cold, added(c.Distance), added(c.Failures))

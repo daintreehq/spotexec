@@ -262,6 +262,15 @@ func TestPricesShowMeasuredSpeed(t *testing.T) {
 	if got := strings.Join(strings.Fields(row(strings.Split(out, "\n"), "ap-south-2a")), " "); !strings.Contains(got, "+0.103 69% measured +0.034") {
 		t.Errorf("row: %q", got)
 	}
+	slow.SpeedCapped = true
+	v.k.Cost[optionKey(slowOpt)] = slow
+	var capped bytes.Buffer
+	v.writeText(&capped, 20)
+	if got := strings.Join(strings.Fields(row(strings.Split(capped.String(), "\n"), "ap-south-2a")), " "); !strings.Contains(got, "+0.103 69% measured,capped +0.034") {
+		t.Errorf("capped row: %q", got)
+	}
+	slow.SpeedCapped = false
+	v.k.Cost[optionKey(slowOpt)] = slow
 	want := "a slower type (SPEED, measured from the same commands' successful runs on each type lately, drawn toward the generation assumption as far as few VMs or scattered runs leave them unsure, and moving a type's charge at most 3 hours of its Spot price from that assumption: c6i.2xlarge 80%, c7i.2xlarge 100% of generation 7; m6a.2xlarge 69%, m7a.2xlarge 100% of generation 7; assumed for other types: each instance generation counts as 10% faster per vCPU)"
 	if !strings.Contains(out, want) {
 		t.Errorf("missing %q in:\n%s", want, out)
