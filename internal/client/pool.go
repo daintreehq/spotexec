@@ -1528,6 +1528,12 @@ func (w *Waiter) Done() {
 // full VM's slot before its fleet launches (#297).
 const briefWaitFor = 15 * time.Second
 
+// justFreedFor is how long after this machine releases a slot on a VM a
+// probe's busy hint there (busyHintFor) is taken for one that saw the slot
+// still held: past it, a VM still reported full is full with someone
+// else's jobs.
+const justFreedFor = 3 * time.Second
+
 // briefWait reports whether a lone waiting job, which has waited only
 // moments, may wait a little longer for a slot on a full VM whose jobs
 // have no prediction, or only just passed it (releaseSoon counts neither):
@@ -1547,9 +1553,21 @@ func (p *Pool) briefWait(st *poolState, d *LaunchDecision, demand int, whole []i
 			pendingVM[in.ID] || s.Fences[in.ID] != nil || (in.Region != "" && away.avoided(in.Region)) {
 			continue
 		}
+		firm, unc := s.held(p.R, in.ID)
+		// A slot this machine released here moments ago, which a probe's
+		// busy hint still hides from readyRoom (the probe saw the VM full
+		// before the release, or before the helper had let the slot go):
+		// the waiting job's next probe takes it. Only a busy reply's hint
+		// (a failed probe's cooldown leaves Failures set), and only
+		// briefly: a VM still reported full by then is full with another
+		// machine's jobs.
+		if v := s.VMs[in.ID]; v != nil && now.Before(n.BusyUntil) && n.Failures == 0 && !v.LastEnd.IsZero() && now.Sub(v.LastEnd) < justFreedFor &&
+			unc == 0 && firm < s.units(p.R, in.ID) {
+			return true
+		}
 		// Full with this machine's own jobs, none beyond its slots: the
 		// next slot to free is the waiting job's.
-		if firm, unc := s.held(p.R, in.ID); unc > 0 || firm != s.units(p.R, in.ID) {
+		if unc > 0 || firm != s.units(p.R, in.ID) {
 			continue
 		}
 		for _, a := range s.Attempts {

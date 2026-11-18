@@ -241,6 +241,76 @@ func TestLoneShortWaitHoldsForAFullVM(t *testing.T) {
 	}
 }
 
+// A slot this machine has just released, on a VM a probe found full a
+// moment ago, is the waiting job's next probe's: the stale busy hint hides
+// it from readyRoom and the VM no longer looks full in the ledger, which
+// launched a VM nothing would use as the lone job's wait was ending.
+func TestBriefWaitHoldsThroughAJustFreedSlot(t *testing.T) {
+	ctx := context.Background()
+	p := fullFleet(t, 1, 8*time.Second, time.Time{}, time.Time{})
+	p.Observe("i-0", OutBusy, time.Time{})
+	var id string
+	p.loaded(t, func(st *poolState) {
+		for aid := range st.sched().Attempts {
+			id = aid
+			break
+		}
+	})
+	p.releaseAttempt(id)
+	d, err := p.Plan(ctx, 0)
+	if err != nil || d.Launch || !d.Held || !strings.Contains(d.Reason, "may end any moment") {
+		t.Fatalf("just-freed slot behind a busy hint: %+v %v, want held for a brief wait", d, err)
+	}
+
+	// The hint gone, the free slot is ready room: nothing to launch for.
+	p.loaded(t, func(st *poolState) { st.note("i-0").BusyUntil = time.Time{} })
+	if d, _ := p.Plan(ctx, 0); d.Launch {
+		t.Fatalf("free slot, no hint: %+v, want no launch", d)
+	}
+
+	// Still bounded: past briefWaitFor the same state launches.
+	p = fullFleet(t, 1, 16*time.Second, time.Time{}, time.Time{})
+	p.Observe("i-0", OutBusy, time.Time{})
+	p.loaded(t, func(st *poolState) {
+		for aid := range st.sched().Attempts {
+			id = aid
+			break
+		}
+	})
+	p.releaseAttempt(id)
+	if d, _ := p.Plan(ctx, 0); !d.Launch {
+		t.Fatalf("after the brief wait: %+v, want a launch", d)
+	}
+
+	// A busy hint with no release of this machine's behind it (another
+	// machine's jobs fill the VM) is no reason to hold.
+	p = fullFleet(t, 1, 8*time.Second, time.Time{}, time.Time{})
+	p.Observe("i-0", OutBusy, time.Time{})
+	p.loaded(t, func(st *poolState) {
+		s := st.sched()
+		for aid := range s.Attempts {
+			delete(s.Attempts, aid)
+		}
+	})
+	if d, _ := p.Plan(ctx, 0); !d.Launch || d.Held {
+		t.Fatalf("busy hint without a release: %+v, want a launch", d)
+	}
+
+	// Nor is a failed probe's cooldown, which also sets the hint.
+	p = fullFleet(t, 1, 8*time.Second, time.Time{}, time.Time{})
+	p.loaded(t, func(st *poolState) {
+		for aid := range st.sched().Attempts {
+			id = aid
+			break
+		}
+	})
+	p.releaseAttempt(id)
+	p.Observe("i-0", OutUnreachable, time.Now().Add(-time.Hour))
+	if d, _ := p.Plan(ctx, 0); d.Held && strings.Contains(d.Reason, "may end any moment") {
+		t.Fatalf("failed probe after a release: %+v, want no brief wait", d)
+	}
+}
+
 // Slots freeing hold nothing on a VM that won't take the waiting job, nor
 // from a job not known to hold its slot.
 func TestHoldIgnoresUnservingVMs(t *testing.T) {
