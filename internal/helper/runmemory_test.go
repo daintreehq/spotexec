@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -392,7 +393,8 @@ func TestLateSamplerKeepsOffAnotherJobsPermit(t *testing.T) {
 		t.Fatal(err)
 	}
 	cid := filepath.Join(t.TempDir(), "c.cid")
-	stop := a.watchMemory(cid, a.runIdx)
+	stop := sync.OnceValue(a.watchMemory(cid, a.runIdx))
+	defer stop()
 	a.releaseRun()
 	b.runMem.ReserveMB = 2222
 	if _, err := b.takeRun(); err != nil || b.runIdx != 1 {
@@ -400,8 +402,12 @@ func TestLateSamplerKeepsOffAnotherJobsPermit(t *testing.T) {
 	}
 	id := strings.Repeat("c", 64)
 	setCgroup(t, filepath.Join(pool, id), 100, 0)
-	os.WriteFile(cid, []byte(id), 0o644)
-	stop() // samples once more: finds the cgroup now
+	if err := os.WriteFile(cid, []byte(id), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if peak := stop(); peak != 100 { // samples once more: finds the cgroup now
+		t.Fatalf("the sampler never found its cgroup (peak %d)", peak)
+	}
 	var r runMemRecord
 	if err := readJSON(b.layout.RunMem(1), &r); err != nil || r.ReserveMB != 2222 || r.Cgroup != "" {
 		t.Fatalf("b's record %+v (%v)", r, err)
