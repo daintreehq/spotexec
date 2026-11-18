@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -185,7 +186,11 @@ const unknownPosition = 1 << 20
 // State returns the ticket's position among live tickets (and refreshes
 // the ticket's heartbeat). One process at a time scans the queue, under
 // queue.lock, and publishes what it saw; everyone else answers from that.
-func (q *Queue) State(t *Ticket) QueueState {
+func (q *Queue) State(t *Ticket) QueueState { return q.StateCtx(context.Background(), t) }
+
+// StateCtx is State, but stops waiting for queue.lock when ctx ends (an
+// acquire out of queue time, #295), answering that its place can't be told.
+func (q *Queue) StateCtx(ctx context.Context, t *Ticket) QueueState {
 	t.Touch()
 	name := filepath.Base(t.path)
 	asked := time.Now()
@@ -219,7 +224,11 @@ func (q *Queue) State(t *Ticket) QueueState {
 			// stopped. Can't tell where we are: don't probe this round.
 			return QueueState{Position: unknownPosition}
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return QueueState{Position: unknownPosition} // out of time: not placed on a guess
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 	defer func() { _ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN) }()
 	if st, ok := q.cached(name, asked, &looked); ok {

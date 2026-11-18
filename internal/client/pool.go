@@ -720,10 +720,17 @@ const (
 // region when it shows the client can't reach the region (or ends that
 // hold when the VM answered).
 func (p *Pool) Observe(id string, o Outcome, launchedAt time.Time) {
+	p.ObserveCtx(context.Background(), id, o, launchedAt)
+}
+
+// ObserveCtx is Observe, but gives up waiting for the ledger's lock (and
+// the observation) when ctx ends: an acquire out of queue time doesn't
+// wait on a stopped process holding it (#295).
+func (p *Pool) ObserveCtx(ctx context.Context, id string, o Outcome, launchedAt time.Time) {
 	if o == outSkipped {
 		return
 	}
-	_ = p.with(func(st *poolState) error {
+	_ = p.withCtx(ctx, func(st *poolState) error {
 		n := st.note(id)
 		now := time.Now()
 		switch o {

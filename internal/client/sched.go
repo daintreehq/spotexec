@@ -700,7 +700,14 @@ func (p *Pool) markSentCtx(ctx context.Context, id string) error {
 
 // commitAttempt records the slot the helper granted.
 func (p *Pool) commitAttempt(id string, acq protocol.Acquired, expect time.Time) {
-	_ = p.with(func(st *poolState) error {
+	_ = p.commitAttemptCtx(context.Background(), id, acq, expect)
+}
+
+// commitAttemptCtx is commitAttempt, but gives up waiting for the ledger's
+// lock when ctx ends (an acquire out of queue time, #295): an error from
+// it with ctx ended means nothing was recorded.
+func (p *Pool) commitAttemptCtx(ctx context.Context, id string, acq protocol.Acquired, expect time.Time) error {
+	return p.withCtx(ctx, func(st *poolState) error {
 		s := st.sched()
 		a := s.Attempts[id]
 		if a == nil {

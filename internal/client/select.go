@@ -330,7 +330,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 			w.Touch()
 		}
 		if ticket != nil {
-			qs = q.State(ticket)
+			qs = q.StateCtx(actx, ticket)
 			mayProbe = qs.Position < max(1, window) && (!qs.ExclusiveHead || qs.Position == 0)
 			if req.Base.Exclusive {
 				mayProbe = qs.Position == 0 // a whole machine: only from the head
@@ -402,12 +402,12 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 					// One whose jobs only prepare is asked again below.
 					over := out == OutBusy && !req.Base.Exclusive && protocol.Overflowable(holders, slotsOf(m.r))
 					if !(out == OutBusy && req.Base.Exclusive) {
-						m.pool.Observe(in.ID, out, in.LaunchedAt)
+						m.pool.ObserveCtx(actx, in.ID, out, in.LaunchedAt)
 					} else {
 						// An exclusive probe finding a partly busy instance must
 						// not hide its free slots from everyone else; it still
 						// answered.
-						m.pool.Observe(in.ID, outContact, in.LaunchedAt)
+						m.pool.ObserveCtx(actx, in.ID, outContact, in.LaunchedAt)
 					}
 					if lease != nil {
 						if m.shadow != nil {
@@ -689,7 +689,7 @@ func probeOverflow(ctx context.Context, req AcquireRequest, members []*member, o
 			if out == OutUnreachable && (ctx.Err() != nil || !time.Now().Before(deadline)) {
 				out = outSkipped // a cancelled probe proves nothing about the VM
 			}
-			m.pool.Observe(c.Instance.ID, out, c.Instance.LaunchedAt)
+			m.pool.ObserveCtx(ctx, c.Instance.ID, out, c.Instance.LaunchedAt)
 			if lease != nil {
 				return lease
 			}
@@ -835,8 +835,19 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 	}
 	if aid != "" {
 		switch {
+		case lease != nil && m.pool.commitAttemptCtx(ctx, aid, lease.Acq, time.Time{}) != nil && ctx.Err() != nil:
+			// Out of queue time waiting for the ledger (#295): the slot is
+			// given back unused, as one granted late, and its attempt goes
+			// at this process's next transaction on the fleet.
+			if lease.Sess != nil {
+				lease.Sess.Close()
+			}
+			lease, late = nil, true
+			m.pool.retryLater(aid)
+			if c.claim.Reclaim != "" {
+				m.pool.reclaimed(in.ID, c.claim.Reclaim) // the helper cancelled its drain all the same
+			}
 		case lease != nil:
-			m.pool.commitAttempt(aid, lease.Acq, time.Time{})
 			lease.ledger = &ledgerRef{pool: m.pool, id: aid}
 			if c.claim.Reclaim != "" {
 				m.pool.reclaimed(in.ID, c.claim.Reclaim) // the helper cancelled its drain
