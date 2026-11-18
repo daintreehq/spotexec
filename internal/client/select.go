@@ -545,6 +545,7 @@ func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
 				status = fmt.Sprintf("%s: %v", m.r.Name, err)
 				continue
 			}
+			planned(m.r.Name)
 			for _, id := range d.Reap {
 				if !m.pool.commitReap(id) {
 					continue // a run reserved it meanwhile
@@ -754,6 +755,11 @@ func (m *member) probeStatic(ctx context.Context, req AcquireRequest) (*Lease, [
 	}
 	return lease, holders, err
 }
+
+// planned is called once a queue round has planned the named fleet, before
+// it plans the next one (tests substitute it, to run other waiters between
+// the two).
+var planned = func(runner string) {}
 
 // helperInstalled reports whether this machine installed the helper on t
 // (tests substitute it).

@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -332,6 +333,37 @@ func TestReadyCoverReachesLowerPriorityFleets(t *testing.T) {
 			hold(st.sched(), "i-h1", wt, time.Now())
 		}
 	})
+	_, reps := multipartRun(t, pool, fleets)
+	launched(t, reps, fleets)
+}
+
+// #303: parts that register on both fleets after one part planned the
+// preferred fleet, and before it plans the next, are covered by the
+// preferred fleet's ready VMs too: the next fleet launches nothing for
+// them.
+func TestReadyCoverHoldsAsPartsRegisterMidRound(t *testing.T) {
+	pool, fleets := fakeFleetsOf(t, map[string][]string{"broken": {"b1", "b2"}, "healthy": {"h1"}}, 4)
+	full := NewPool(pool[1], fleets["healthy"])
+	full.loaded(t, func(st *poolState) {
+		allReady(st, time.Now())
+		full.views(st, time.Now())
+		for _, wt := range []string{"a", "b", "c", "d"} {
+			hold(st.sched(), "i-h1", wt, time.Now())
+		}
+	})
+	// The first part to plan the preferred fleet waits, before planning
+	// the next, until the other two parts have registered on it.
+	var first atomic.Bool
+	old := planned
+	planned = func(runner string) {
+		if runner != "broken" || !first.CompareAndSwap(false, true) {
+			return
+		}
+		for end := time.Now().Add(5 * time.Second); full.waiterDemand() < 2 && time.Now().Before(end); {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	t.Cleanup(func() { planned = old })
 	_, reps := multipartRun(t, pool, fleets)
 	launched(t, reps, fleets)
 }
