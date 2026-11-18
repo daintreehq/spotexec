@@ -887,6 +887,8 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 		return nil, nil, OutBootFailed
 	case isRefusal(err):
 		return nil, nil, outRefused // an answer, if not one this side knows
+	case errors.Is(err, errReservationLost):
+		return nil, nil, outSkipped // revoked before anything was sent (#295)
 	}
 	return nil, nil, OutUnreachable
 }

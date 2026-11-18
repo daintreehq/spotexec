@@ -683,13 +683,18 @@ func (p *Pool) markSent(id string) error {
 	return p.markSentCtx(context.Background(), id)
 }
 
+// errReservationLost: the ledger no longer holds the attempt (boot cleanup
+// revoked it to end the VM), so nothing is sent: it says nothing of
+// whether the VM can be reached.
+var errReservationLost = errors.New("reservation lost")
+
 // markSentCtx is markSent, but gives up waiting for the ledger's lock when
 // ctx ends.
 func (p *Pool) markSentCtx(ctx context.Context, id string) error {
 	return p.withCtx(ctx, func(st *poolState) error {
 		a := st.sched().Attempts[id]
 		if a == nil {
-			return errors.New("reservation lost")
+			return errReservationLost
 		}
 		if a.State == attReserved {
 			a.State, a.SentAt = attSent, time.Now()

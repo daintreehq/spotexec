@@ -1182,7 +1182,10 @@ func (p *Pool) Reset(m DownMark) {
 		}
 		// What the ledger knows of those VMs stays too: a run already
 		// placed on one still protects it (fenceBooting).
-		old, sched, notes := st.sched(), &schedState{Version: schedVersion}, map[string]*note{}
+		old, notes := st.sched(), map[string]*note{}
+		// Seq stays with them: a kept VM's Joined must stay below any VM
+		// that joins later.
+		sched := &schedState{Version: schedVersion, Seq: old.Seq}
 		for id, a := range old.Attempts {
 			if vms[a.VM] {
 				if sched.Attempts == nil {

@@ -211,9 +211,10 @@ func TestResetKeepsRunsOnVMsDownDidNotSee(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	seq := p.state(t).Seq
 	p.Reset(mark)
-	if !p.state(t).protected(in.ID) {
-		t.Fatalf("the run on %s was forgotten by the reset", in.ID)
+	if s := p.state(t); !s.protected(in.ID) || s.Seq != seq || s.VMs[in.ID] == nil {
+		t.Fatalf("the reset forgot what the ledger knew of %s: protected %v, seq %d (was %d), vm %v", in.ID, s.protected(in.ID), s.Seq, seq, s.VMs[in.ID])
 	}
 	if p.fenceBooting(in.ID) {
 		t.Fatal("boot cleanup may end a VM a run is using")

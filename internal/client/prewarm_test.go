@@ -248,8 +248,8 @@ func TestProvisionFencesABootFailureBeforeEndingIt(t *testing.T) {
 		if listed(t, f) != 0 {
 			t.Fatal("left running for a reservation that never reached it: nothing would end it")
 		}
-		if err := p.markSent(aid); err == nil {
-			t.Fatal("the revoked reservation still sent its request")
+		if err := p.markSent(aid); !errors.Is(err, errReservationLost) {
+			t.Fatalf("the revoked reservation's send: %v, want it refused as lost (not a reachability failure)", err)
 		}
 	})
 	t.Run("nothing placed on it", func(t *testing.T) {
