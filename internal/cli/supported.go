@@ -77,6 +77,9 @@ func supported(ctx context.Context, dir string) error {
 		return err
 	}
 	if l.cfg.Project.Path == "" {
+		if l.ws.GitErr != nil {
+			return l.ws.GitErr
+		}
 		return fmt.Errorf("%s has no .spotexec.toml here or above it, up to the repository root; `spotexec init` opts a project in", filepath.Join(l.ws.Root, l.ws.Cwd))
 	}
 	// The sync mode a plain sx uses: SPOTEXEC_SYNC beats the project's, and

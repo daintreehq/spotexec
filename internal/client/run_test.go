@@ -526,6 +526,36 @@ func TestRunRefusesHome(t *testing.T) {
 	}
 }
 
+// sx inside a checkout Git can't read, with no .spotexec.toml in it,
+// reports Git's error rather than syncing a project above the checkout or
+// blaming a missing .spotexec.toml.
+func TestRunReportsUnreadableCheckout(t *testing.T) {
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(parent))
+	repo := filepath.Join(parent, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for p, c := range map[string]string{".spotexec.toml": "version = 1\n", "repo/.git": "garbage\n"} {
+		if err := os.WriteFile(filepath.Join(parent, filepath.FromSlash(p)), []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ws, err := Resolve(filepath.Join(repo, "src"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Root != repo || ws.Git || ws.Marked || ws.GitErr == nil {
+		t.Fatalf("Resolve = root %s git %v marked %v gitErr %v; want the unmarked checkout with Git's error", ws.Root, ws.Git, ws.Marked, ws.GitErr)
+	}
+	if _, err = Run(context.Background(), nil, ws, Options{Sync: "auto", Writeback: "always"}); err == nil || !strings.Contains(err.Error(), "invalid gitfile format") {
+		t.Fatalf("want Git's error, got %v", err)
+	}
+}
+
 // Lockfile patterns match only what is synced to the slot: never an
 // excluded file, a dependency tree, or a symlink (whose target the runner
 // may not have, or which could point outside the worktree).

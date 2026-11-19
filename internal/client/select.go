@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -132,6 +133,11 @@ var tryAcquireFn = tryAcquire
 //  4. only tickets near the head of the queue probe for slots, every
 //     1.2-2.5s, until one frees up or queue_timeout passes.
 func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
+	// Without a private SSH control directory no VM can be reached: fail
+	// before probing (which would read every VM as silent) or launching.
+	if err := transport.CheckControlDir(); err != nil {
+		return nil, err
+	}
 	queue := req.QueueTimeout
 	if queue <= 0 {
 		queue = 10 * time.Minute
@@ -707,6 +713,9 @@ func probeOverflow(ctx context.Context, req AcquireRequest, members []*member, o
 
 // fatalErr is why m can't serve, with how to fix it.
 func (m *member) fatalErr() error {
+	if transport.IsSetupError(m.fatal) {
+		return fmt.Errorf("%s: %w", m.r.Name, m.fatal)
+	}
 	return fmt.Errorf("%s: %w (fix bootstrap_script, then `spotexec down %s`)", m.r.Name, m.fatal, m.r.Name)
 }
 
@@ -931,6 +940,11 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 		return nil, nil, outRefused // an answer, if not one this side knows
 	case errors.Is(err, errReservationLost):
 		return nil, nil, outSkipped // revoked before anything was sent (#295)
+	case transport.IsSetupError(err):
+		// This machine can't connect to any VM: a local fault, which proves
+		// nothing about this one.
+		m.fatal = err
+		return nil, nil, outSkipped
 	}
 	return nil, nil, OutUnreachable
 }
@@ -1228,6 +1242,8 @@ func WaitReady(ctx context.Context, r *config.Runner, t provider.Target, rep ui.
 				tail, _ := c.Run(ctx, "tail -n 20 /var/log/spotexec-bootstrap.log 2>/dev/null", nil)
 				return &bootstrapError{fmt.Sprintf("%s: bootstrap_script exited %s; last log lines:\n%s", r.Name, s, strings.TrimSpace(string(tail)))}
 			}
+		} else if transport.IsSetupError(err) {
+			return err // local: waiting won't fix it
 		} else {
 			last = err
 			rep.Status("%s: waiting for SSH at %s %s", r.Name, t.Host, ui.Dur(time.Since(start)))
@@ -1324,15 +1340,44 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 		return nil, err
 	}
 	lease.InstanceID, lease.Instance = lr.InstanceID, listed
-	if lease.Acq.Slot != lr.Slot {
+	if err := checkSameSlot(lease.Acq, lr, ws, r.Name, syncing); err != nil {
 		lease.Close()
-		return nil, fmt.Errorf("slot %d on %s is in use by another run; try again shortly", lr.Slot, r.Name)
-	}
-	if !syncing && lease.Acq.PrevWorktreeKey != ws.WorktreeKey {
-		lease.Close()
-		return nil, fmt.Errorf("slot %d on %s now holds another worktree's files; run `sx --same-slot <command>` (which syncs) instead", lr.Slot, r.Name)
+		return nil, err
 	}
 	return lease, nil
+}
+
+// checkSameSlot refuses a re-acquired slot that isn't the one lr ran in:
+// another slot number or, unless the caller is about to sync, a slot that
+// holds another worktree's files or belongs to another RepoID. The RepoID
+// differs after an upgrade that changed how it is derived, and a sync
+// interrupted there may already have claimed the new namespace's slot.
+func checkSameSlot(acq protocol.Acquired, lr *LastRun, ws *Workspace, runner string, syncing bool) error {
+	if acq.Slot != lr.Slot {
+		return fmt.Errorf("slot %d on %s is in use by another run; try again shortly", lr.Slot, runner)
+	}
+	if syncing {
+		return nil
+	}
+	if id := remoteRepoID(lr.RemoteWS); id != "" && id != ws.RepoID {
+		return fmt.Errorf("the last run on %s used repo id %s, and this worktree's is now %s; run `sx --same-slot <command>` (which syncs) instead", runner, id, ws.RepoID)
+	}
+	if acq.PrevWorktreeKey != ws.WorktreeKey {
+		return fmt.Errorf("slot %d on %s now holds another worktree's files; run `sx --same-slot <command>` (which syncs) instead", lr.Slot, runner)
+	}
+	return nil
+}
+
+// remoteRepoID is the RepoID in a helper workspace path
+// ({root}/repos/{id}/slots/slot-NN/workspace), or "" for any other shape.
+// Only that segment counts: the root may resolve differently between runs.
+func remoteRepoID(ws string) string {
+	slots := path.Dir(path.Dir(ws))
+	repo := path.Dir(slots)
+	if ws == "" || path.Base(slots) != "slots" || path.Base(path.Dir(repo)) != "repos" {
+		return ""
+	}
+	return path.Base(repo)
 }
 
 // PullDisplay is AcquireSlot's display for `spotexec pull`, which only

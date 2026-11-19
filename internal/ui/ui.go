@@ -92,16 +92,12 @@ type jsonReporter struct {
 }
 
 func (j *jsonReporter) Event(name string, fields map[string]any) {
-	m := map[string]any{"event": name}
-	for k, v := range fields {
-		m[k] = v
-	}
-	b, _ := json.Marshal(orderedEvent(name, m))
+	b := eventLine(name, fields)
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.w.Write(append(b, '\n'))
+	j.w.Write(b)
 	if j.extra != nil {
-		j.extra.Write(append(b, '\n'))
+		j.extra.Write(b)
 	}
 }
 
@@ -114,22 +110,33 @@ func (j *jsonReporter) Warn(code, format string, args ...any) {
 	j.Event("warning", map[string]any{"code": code, "message": fmt.Sprintf(format, args...)})
 }
 
-// orderedEvent puts "event" first for readability.
+// EventsFormat is the format version of the NDJSON events, which every
+// event carries as format_version. Within a version, fields are only
+// added: renaming, removing or retyping one bumps it.
+const EventsFormat = 1
+
+// eventLine is one NDJSON event line: "event" and "format_version" first,
+// then the fields in key order. A field named either is dropped, so no
+// caller can misstate the event or its format.
+func eventLine(name string, fields map[string]any) []byte {
+	b, _ := json.Marshal(ordered{name, fields})
+	return append(b, '\n')
+}
+
 type ordered struct {
 	name string
 	m    map[string]any
 }
-
-func orderedEvent(name string, m map[string]any) ordered { return ordered{name, m} }
 
 func (o ordered) MarshalJSON() ([]byte, error) {
 	var b bytes.Buffer
 	b.WriteString(`{"event":`)
 	n, _ := json.Marshal(o.name)
 	b.Write(n)
+	fmt.Fprintf(&b, `,"format_version":%d`, EventsFormat)
 	keys := make([]string, 0, len(o.m))
 	for k := range o.m {
-		if k != "event" {
+		if k != "event" && k != "format_version" {
 			keys = append(keys, k)
 		}
 	}
@@ -181,13 +188,9 @@ const (
 
 func (p *prettyReporter) Event(name string, fields map[string]any) {
 	if p.extra != nil {
-		m := map[string]any{"event": name}
-		for k, v := range fields {
-			m[k] = v
-		}
-		b, _ := json.Marshal(orderedEvent(name, m))
+		b := eventLine(name, fields)
 		p.mu.Lock()
-		p.extra.Write(append(b, '\n'))
+		p.extra.Write(b)
 		p.mu.Unlock()
 	}
 }
@@ -257,8 +260,7 @@ func (p *prettyReporter) Warn(code, format string, args ...any) {
 		p.mu.Lock()
 	}
 	if p.extra != nil {
-		b, _ := json.Marshal(map[string]any{"event": "warning", "code": code, "message": fmt.Sprintf(format, args...)})
-		p.extra.Write(append(b, '\n'))
+		p.extra.Write(eventLine("warning", map[string]any{"code": code, "message": fmt.Sprintf(format, args...)}))
 	}
 }
 
@@ -421,13 +423,9 @@ func cleanLine(s string) string {
 
 func (p *plainReporter) Event(name string, fields map[string]any) {
 	if p.extra != nil {
-		m := map[string]any{"event": name}
-		for k, v := range fields {
-			m[k] = v
-		}
-		b, _ := json.Marshal(orderedEvent(name, m))
+		b := eventLine(name, fields)
 		p.mu.Lock()
-		p.extra.Write(append(b, '\n'))
+		p.extra.Write(b)
 		p.mu.Unlock()
 	}
 }
@@ -479,8 +477,7 @@ func (p *plainReporter) Warn(code, format string, args ...any) {
 	defer p.mu.Unlock()
 	fmt.Fprintf(p.w, "sx: warning: %s\n", msg)
 	if p.extra != nil {
-		b, _ := json.Marshal(map[string]any{"event": "warning", "code": code, "message": msg})
-		p.extra.Write(append(b, '\n'))
+		p.extra.Write(eventLine("warning", map[string]any{"code": code, "message": msg}))
 	}
 }
 

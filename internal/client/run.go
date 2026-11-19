@@ -412,6 +412,9 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		if config.NeverProject(ws.Root) {
 			return Result{}, infra(fmt.Errorf("spotexec never syncs %s: it is your home directory, / or a credential directory (~/.aws, ~/.ssh); cd into a project, or pass --sync none", ws.Root))
 		}
+		if ws.GitErr != nil {
+			return Result{}, infra(ws.GitErr)
+		}
 		return Result{}, infra(fmt.Errorf("%s is not in a Git repository and has no .spotexec.toml, so spotexec won't sync it; run `spotexec init` there to mark it as a project, or pass --sync none", ws.Root))
 	}
 	defer KeepAwake()()
@@ -1839,6 +1842,32 @@ func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 	return protocol.Entry{Path: name, ID: id, Mode: emode, Size: size}, nil
 }
 
+// depsEnv is what the dependency install sees from the project: env_allow
+// copied from this environment, then [env]. It is part of the dependency key.
+// Invalid UTF-8 is replaced as the wire's JSON replaces it, so the key signed
+// here is the one the runner computes from what it receives.
+func depsEnv(p *config.Project) map[string]string {
+	env := map[string]string{}
+	for _, k := range p.EnvAllow {
+		if v, ok := os.LookupEnv(k); ok {
+			env[wireString(k)] = wireString(v)
+		}
+	}
+	for k, v := range p.Env {
+		env[wireString(k)] = wireString(v)
+	}
+	return env
+}
+
+// wireString is s as encoding/json delivers it: each invalid UTF-8 byte
+// becomes U+FFFD.
+func wireString(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return string([]rune(s))
+}
+
 func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string, m *manifest.Manifest) (protocol.DepsResult, error) {
 	if len(p.Deps.Lockfiles) == 0 {
 		return protocol.DepsResult{}, errors.New("deps.install is set but deps.lockfiles is empty")
@@ -1857,15 +1886,7 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	}
 	o.Rep.Status("%s · checking dependency cache", label)
 	t := time.Now()
-	env := map[string]string{}
-	for _, k := range p.EnvAllow {
-		if v, ok := os.LookupEnv(k); ok {
-			env[k] = v
-		}
-	}
-	for k, v := range p.Env {
-		env[k] = v
-	}
+	env := depsEnv(p)
 	req := protocol.Deps{
 		Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Hydrate: p.Deps.Hydrate,
 		Setup: r.RemotePathSetup, Env: env, TimeoutMS: p.Deps.Timeout.Milliseconds(),
@@ -1882,7 +1903,7 @@ func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *co
 	// The cache lives in the instance's own region (multi-region fleets).
 	var resign func(context.Context) (string, string, error)
 	if dc := depsCacheFor(ctx, o, r, lease.Provider, lease.InstanceID); dc != nil {
-		key, err := depskey.Key(ws.Root, depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Image: image, Toolchain: req.Toolchain, OS: s.Hello.OS, Arch: s.Hello.Arch})
+		key, err := depskey.Key(ws.Root, depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, Image: image, Toolchain: req.Toolchain, OS: s.Hello.OS, Arch: s.Hello.Arch, Env: env})
 		if err != nil {
 			o.Rep.Warn("DEPS_CACHE", "shared dependency cache unavailable: computing its key: %v", err)
 		} else {

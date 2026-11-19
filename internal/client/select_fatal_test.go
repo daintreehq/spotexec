@@ -331,3 +331,28 @@ func TestBootOnlyWaitsForBarredRunnersBusyVM(t *testing.T) {
 		t.Fatalf("error = %v, want a queue timeout", err)
 	}
 }
+
+// #320: with no private SSH control directory, this machine can reach no
+// VM. That is a local fault: the run fails at once with it, rather than
+// reading the VMs as silent, queueing, or launching ones it couldn't reach.
+func TestLocalSSHSetupFailureFailsAtOnce(t *testing.T) {
+	pool := fleetsOf(t, map[string][]string{"broken": {"a1", "a2"}})
+	setup := &transport.SetupError{Err: fmt.Errorf("/tmp/sx-cm-501 is not owned by this user")}
+	h := scriptHelpers(t, func(AcquireRequest, string, int) (*Lease, error) { return nil, setup })
+	rep := &recRep{}
+	start := time.Now()
+	_, err := Acquire(context.Background(), AcquireRequest{Pool: pool, QueueTimeout: time.Minute, Rep: rep})
+	WaitLaunches(5 * time.Second)
+	if !transport.IsSetupError(err) || strings.Contains(err.Error(), "bootstrap_script") {
+		t.Fatalf("error = %v, want the local setup error", err)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Fatalf("took %s to fail", took)
+	}
+	if slices.Contains(rep.events, "queued") || slices.Contains(rep.events, "scale_out") {
+		t.Fatalf("queued or launched before failing: %v", rep.events)
+	}
+	if n := h.count("a1") + h.count("a2"); n != 1 {
+		t.Fatalf("probed %d VMs; want one", n)
+	}
+}

@@ -20,6 +20,14 @@ type teardownImage struct {
 	snap string
 }
 
+// fakeObjVersion is a noncurrent object version or a delete marker.
+type fakeObjVersion struct {
+	key, id string
+	marker  bool // a delete marker
+	locked  bool // under Object Lock retention: DeleteObjects refuses it
+	sticky  bool // DeleteObjects reports it deleted but it stays
+}
+
 type fakeSG struct {
 	id, name, desc string
 	tags           map[string]string
@@ -31,13 +39,17 @@ type fakeCloud struct {
 	images    map[string][]teardownImage
 	snapshots map[string]map[string]map[string]string // region -> snapshot -> tags
 	sgs       map[string][]fakeSG
-	repos     map[string][]string        // region -> repository names
-	buckets   map[string]map[string]bool // bucket -> objects
-	failRepo  map[string]bool            // DeleteRepository fails
-	busySG    map[string]int             // DependencyViolation this many times
-	deleted   []string                   // "kind id", in order
-	s3owner   []string                   // x-amz-expected-bucket-owner seen
-	listedIn  []string                   // the region each ListBuckets call was signed for
+	repos     map[string][]string         // region -> repository names
+	buckets   map[string]map[string]bool  // bucket -> current objects (version "null")
+	versions  map[string][]fakeObjVersion // bucket -> noncurrent versions and delete markers
+	versioned map[string]bool             // deleting a key without a version leaves a delete marker
+	failRepo  map[string]bool             // DeleteRepository fails
+	busySG    map[string]int              // DependencyViolation this many times
+	deleted   []string                    // "kind id", in order
+	s3ops     []string                    // "list <bucket> <entries>", "delete <bucket> <n>", "drop <bucket>"
+	reupload  map[string]int              // "bucket/key" -> times a machine uploads it again right after a delete
+	s3owner   []string                    // x-amz-expected-bucket-owner seen
+	listedIn  []string                    // the region each ListBuckets call was signed for
 }
 
 func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, service string, body []byte) bool {
@@ -72,14 +84,59 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 				fmt.Fprintf(w, `<ContinuationToken>from-%d</ContinuationToken>`, start+2)
 			}
 			fmt.Fprint(w, `</ListAllMyBucketsResult>`)
-		case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
-			fmt.Fprint(w, `<ListBucketResult>`)
+		case r.Method == http.MethodGet && r.URL.Query().Has("versions"):
+			// Every version and delete marker, two per page by
+			// key-marker/version-id-marker, to exercise paging.
+			all := c.versions[bucket][:len(c.versions[bucket]):len(c.versions[bucket])]
 			for k := range c.buckets[bucket] {
-				fmt.Fprint(w, `<Contents><Key>`)
-				xml.EscapeText(w, []byte(k))
-				fmt.Fprint(w, `</Key></Contents>`)
+				all = append(all, fakeObjVersion{key: k, id: "null"})
 			}
-			fmt.Fprint(w, `</ListBucketResult>`)
+			sort.Slice(all, func(i, j int) bool {
+				return all[i].key < all[j].key || all[i].key == all[j].key && all[i].id < all[j].id
+			})
+			km, vm := r.URL.Query().Get("key-marker"), r.URL.Query().Get("version-id-marker")
+			if km != "" {
+				c.s3ops = append(c.s3ops, "list-from-marker "+bucket)
+			}
+			if vm != "" && km == "" {
+				w.WriteHeader(400)
+				fmt.Fprint(w, `<Error><Code>InvalidArgument</Code></Error>`)
+				return true
+			}
+			var page []fakeObjVersion
+			for _, v := range all {
+				if km != "" && (v.key < km || v.key == km && (vm == "" || v.id <= vm)) {
+					continue
+				}
+				page = append(page, v)
+			}
+			more := len(page) > 2
+			if more {
+				page = page[:2]
+			}
+			c.s3ops = append(c.s3ops, fmt.Sprintf("list %s %d", bucket, len(page)))
+			fmt.Fprint(w, `<ListVersionsResult>`)
+			fmt.Fprintf(w, `<IsTruncated>%v</IsTruncated>`, more)
+			for _, v := range page {
+				el := "Version"
+				if v.marker {
+					el = "DeleteMarker"
+				}
+				fmt.Fprintf(w, `<%s><Key>`, el)
+				xml.EscapeText(w, []byte(v.key))
+				fmt.Fprint(w, `</Key><VersionId>`)
+				xml.EscapeText(w, []byte(v.id))
+				fmt.Fprintf(w, `</VersionId></%s>`, el)
+			}
+			if more {
+				last := page[len(page)-1]
+				fmt.Fprint(w, `<NextKeyMarker>`)
+				xml.EscapeText(w, []byte(last.key))
+				fmt.Fprint(w, `</NextKeyMarker><NextVersionIdMarker>`)
+				xml.EscapeText(w, []byte(last.id))
+				fmt.Fprint(w, `</NextVersionIdMarker>`)
+			}
+			fmt.Fprint(w, `</ListVersionsResult>`)
 		case r.Method == http.MethodPost && r.URL.Query().Has("delete"):
 			if sum := md5.Sum(body); r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(sum[:]) {
 				w.WriteHeader(400)
@@ -87,15 +144,57 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 				return true
 			}
 			var d struct {
-				Keys []string `xml:"Object>Key"`
+				Objects []struct {
+					Key       string `xml:"Key"`
+					VersionID string `xml:"VersionId"`
+				} `xml:"Object"`
 			}
 			xml.Unmarshal(body, &d)
-			for _, k := range d.Keys {
-				delete(c.buckets[bucket], k)
+			c.s3ops = append(c.s3ops, fmt.Sprintf("delete %s %d", bucket, len(d.Objects)))
+			fmt.Fprint(w, `<DeleteResult>`)
+			for _, o := range d.Objects {
+				switch o.VersionID {
+				case "":
+					// Without a version, a versioned bucket keeps the
+					// data and adds a delete marker.
+					if c.versioned[bucket] {
+						if c.buckets[bucket][o.Key] {
+							c.versions[bucket] = append(c.versions[bucket], fakeObjVersion{key: o.Key, id: "old-" + o.Key})
+						}
+						c.versions[bucket] = append(c.versions[bucket], fakeObjVersion{key: o.Key, id: fmt.Sprintf("dm-%d", len(c.versions[bucket])), marker: true})
+					}
+					delete(c.buckets[bucket], o.Key)
+				case "null":
+					if c.reupload[bucket+"/"+o.Key] > 0 {
+						c.reupload[bucket+"/"+o.Key]--
+						continue
+					}
+					delete(c.buckets[bucket], o.Key)
+				default:
+					vs := c.versions[bucket]
+					for i, v := range vs {
+						if v.key != o.Key || v.id != o.VersionID {
+							continue
+						}
+						if v.locked {
+							fmt.Fprint(w, `<Error><Key>`)
+							xml.EscapeText(w, []byte(o.Key))
+							fmt.Fprint(w, `</Key><VersionId>`)
+							xml.EscapeText(w, []byte(o.VersionID))
+							fmt.Fprint(w, `</VersionId><Code>AccessDenied</Code><Message>Access Denied because object protected by object lock.</Message></Error>`)
+							break
+						}
+						if !v.sticky {
+							c.versions[bucket] = append(vs[:i:i], vs[i+1:]...)
+						}
+						break
+					}
+				}
 			}
-			fmt.Fprint(w, `<DeleteResult/>`)
+			fmt.Fprint(w, `</DeleteResult>`)
 		case r.Method == http.MethodDelete:
-			if len(c.buckets[bucket]) > 0 {
+			c.s3ops = append(c.s3ops, "drop "+bucket)
+			if len(c.buckets[bucket]) > 0 || len(c.versions[bucket]) > 0 {
 				w.WriteHeader(409)
 				fmt.Fprint(w, `<Error><Code>BucketNotEmpty</Code></Error>`)
 				return true
@@ -139,6 +238,10 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 	tagged := func(tags map[string]string) bool { return tags[tagOwner] != "" }
 	switch v.Get("Action") {
 	case "DescribeRegions":
+		if strings.HasPrefix(region, "us-gov-") {
+			fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo><item><regionName>us-gov-east-1</regionName></item><item><regionName>us-gov-west-1</regionName></item></regionInfo></DescribeRegionsResponse>`)
+			break
+		}
 		fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo><item><regionName>us-west-2</regionName></item><item><regionName>us-east-2</regionName><optInStatus>opt-in-not-required</optInStatus></item><item><regionName>ap-east-1</regionName><optInStatus>not-opted-in</optInStatus></item></regionInfo></DescribeRegionsResponse>`)
 	case "DescribeImages":
 		if v.Get("Owner.1") != "self" || v.Get("Filter.1.Value.1") != tagOwner {
@@ -273,8 +376,11 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 			"spotexec-cache-111111111111-backup":    {"x": true}, // not a region: not spotexec's name
 			"my-own-cache":                          {"x": true},
 		},
-		failRepo: map[string]bool{},
-		busySG:   map[string]int{"sg-west": 1},
+		versions:  map[string][]fakeObjVersion{},
+		versioned: map[string]bool{},
+		reupload:  map[string]int{},
+		failRepo:  map[string]bool{},
+		busySG:    map[string]int{"sg-west": 1},
 	}
 	c.extra = c.serve
 	c.install(t)
@@ -354,10 +460,12 @@ func TestTeardown(t *testing.T) {
 func TestTeardownGovCloud(t *testing.T) {
 	c := newFakeCloud(t)
 	c.instances["AK-admin"] = map[string][]fakeAcctInstance{"us-gov-east-1": c.instances["AK-admin"]["us-east-2"]}
+	c.late = nil
 	c.buckets["spotexec-cache-111111111111-us-gov-east-1"] = map[string]bool{}
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-gov-east-1"})
-	if err != nil || p.Err() != nil {
-		t.Fatalf("%v %v", err, p.Err())
+	t.Setenv("AWS_REGION", "us-gov-east-1") // the whole account, found from the session's region
+	p, err := PlanTeardown(context.Background(), "admin", nil)
+	if err != nil || p.Err() != nil || p.Regional || strings.Join(p.Regions, ",") != "us-gov-east-1,us-gov-west-1" {
+		t.Fatalf("%v %v %+v", err, p.Err(), p)
 	}
 	var got []string
 	for _, it := range p.Items {
@@ -371,6 +479,9 @@ func TestTeardownGovCloud(t *testing.T) {
 	}
 	if err := p.Apply(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
+	}
+	if c.users["spotexec-mac"] != nil || !strings.Contains(strings.Join(c.signed, ","), "iam DeleteUser us-gov-west-1") {
+		t.Fatalf("IAM user not removed through GovCloud's IAM: %v", c.signed)
 	}
 	// IAM is GovCloud's one endpoint; STS may also be asked regionally.
 	for _, s := range c.signed {
@@ -399,7 +510,7 @@ func TestTeardownGovCloud(t *testing.T) {
 func TestTeardownFailures(t *testing.T) {
 	c := newFakeCloud(t)
 	c.failRepo["spotexec/app"] = true
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, err := PlanTeardown(context.Background(), "admin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,16 +521,161 @@ func TestTeardownFailures(t *testing.T) {
 	if c.users["spotexec-mac"] != nil {
 		t.Fatal("the other resources should still be removed")
 	}
-	if c.buckets["spotexec-cache-111111111111-us-west-2"] == nil {
-		t.Fatal("--region us-east-2 deleted a us-west-2 bucket")
-	}
 	c.failRepo["spotexec/app"] = false
-	p, _ = PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, _ = PlanTeardown(context.Background(), "admin", nil)
 	if len(p.Items) != 1 || p.Items[0].ID != "spotexec/app" {
 		t.Fatalf("second plan %+v", p.Items)
 	}
 	if err := p.Apply(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A versioned cache bucket keeps every version and delete marker, so
+// emptying it means deleting each by its version ID: one whose only
+// entries are historical, and one with a live object too.
+func TestTeardownVersionedBucket(t *testing.T) {
+	c := newFakeCloud(t)
+	east, west := "spotexec-cache-111111111111-us-east-2", "spotexec-cache-111111111111-us-west-2"
+	c.versioned[east], c.versioned[west] = true, true
+	c.buckets[east] = map[string]bool{}
+	c.versions[east] = []fakeObjVersion{
+		{key: "repo/a.tar", id: "3/L4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY"},
+		{key: "repo/a.tar", id: "dm-a", marker: true},
+		{key: "repo/b & c.tar", id: "v<1>&"},
+		{key: "repo/b & c.tar", id: "dm-b", marker: true},
+		{key: "repo/c.tar", id: "v2"},
+		{key: "repo/c.tar", id: "v3"},
+		{key: "repo/c.tar", id: "dm-c", marker: true},
+		{key: "repo/z.tar", id: "dm-z1", marker: true}, // only markers left: a marker-only last page
+		{key: "repo/z.tar", id: "dm-z2", marker: true},
+	}
+	c.versions[west] = []fakeObjVersion{{key: "repo/w.tar", id: "v0"}}
+	p, err := PlanTeardown(context.Background(), "admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Apply(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []string{east, west} {
+		if _, ok := c.buckets[b]; ok || len(c.versions[b]) > 0 {
+			t.Fatalf("%s left: objects %v, versions %v", b, c.buckets[b], c.versions[b])
+		}
+	}
+	for _, o := range c.s3owner {
+		if o != "111111111111" {
+			t.Fatalf("S3 call without the expected owner: %v", c.s3owner)
+		}
+	}
+	// Every listing starts from the beginning, and the bucket goes only
+	// after one comes back empty.
+	for i, op := range c.s3ops {
+		if strings.HasPrefix(op, "list-from-marker ") || strings.HasPrefix(op, "drop ") && (i == 0 || c.s3ops[i-1] != "list "+strings.TrimPrefix(op, "drop ")+" 0") {
+			t.Fatalf("S3 calls: %v", c.s3ops)
+		}
+	}
+}
+
+// A version Object Lock retains is reported by key, version and reason,
+// the marker hiding it stays, the bucket is kept, and a re-run finishes
+// once the lock lapses.
+func TestTeardownLockedVersion(t *testing.T) {
+	c := newFakeCloud(t)
+	b := "spotexec-cache-111111111111-us-east-2"
+	c.versioned[b] = true
+	c.versions[b] = []fakeObjVersion{
+		{key: "repo/held.tar", id: "v-held", locked: true},
+		{key: "repo/held.tar", id: "dm-held", marker: true}, // hides v-held, and must keep hiding it
+		{key: "repo/old.tar", id: "v-old"},
+	}
+	p, err := PlanTeardown(context.Background(), "admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "S3 bucket "+b) || !strings.Contains(err.Error(), "repo/held.tar version v-held: Access Denied because object protected by object lock. (AccessDenied)") {
+		t.Fatalf("err = %v", err)
+	}
+	for _, op := range c.s3ops {
+		if op == "drop "+b {
+			t.Fatalf("DeleteBucket tried on a bucket that isn't empty: %v", c.s3ops)
+		}
+	}
+	var left []string
+	for _, v := range c.versions[b] {
+		left = append(left, v.id)
+	}
+	sort.Strings(left)
+	if len(c.buckets[b]) > 0 || strings.Join(left, ",") != "dm-held,v-held,v-old" {
+		t.Fatalf("bucket left with %v %v", c.buckets[b], c.versions[b])
+	}
+	for i := range c.versions[b] {
+		c.versions[b][i].locked = false
+	}
+	p, _ = PlanTeardown(context.Background(), "admin", nil)
+	if err := p.Apply(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.buckets[b]; ok || len(c.versions[b]) > 0 {
+		t.Fatalf("bucket left: %v %v", c.buckets[b], c.versions[b])
+	}
+}
+
+// A version still listed after S3 said it was deleted stops the drain
+// with a diagnostic instead of deleting it over and over.
+func TestTeardownStaleVersion(t *testing.T) {
+	c := newFakeCloud(t)
+	b := "spotexec-cache-111111111111-us-east-2"
+	c.versioned[b] = true
+	c.buckets[b] = map[string]bool{}
+	c.versions[b] = []fakeObjVersion{{key: "repo/stuck.tar", id: "v1", sticky: true}}
+	p, err := PlanTeardown(context.Background(), "admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "repo/stuck.tar version v1 is still listed after it was deleted") {
+		t.Fatalf("err = %v", err)
+	}
+	var ops []string
+	for _, op := range c.s3ops {
+		if strings.HasSuffix(op, b) || strings.Contains(op, b+" ") {
+			ops = append(ops, op)
+		}
+	}
+	if strings.Join(ops, ",") != "list "+b+" 1,delete "+b+" 1,list "+b+" 1" {
+		t.Fatalf("S3 calls: %v", ops)
+	}
+}
+
+// A machine still uploading puts an unversioned object back under version
+// "null": a few re-uploads are deleted again, an endless stream is
+// reported rather than chased.
+func TestTeardownReupload(t *testing.T) {
+	c := newFakeCloud(t)
+	b := "spotexec-cache-111111111111-us-east-2"
+	c.reupload[b+"/repo/a.tar"] = 3
+	p, err := PlanTeardown(context.Background(), "admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Apply(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.buckets[b]; ok {
+		t.Fatalf("bucket left: %v", c.buckets[b])
+	}
+
+	c = newFakeCloud(t)
+	c.reupload[b+"/repo/a.tar"] = 1000
+	p, _ = PlanTeardown(context.Background(), "admin", nil)
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "repo/a.tar keep being uploaded again") {
+		t.Fatalf("err = %v", err)
+	}
+	if c.reupload[b+"/repo/a.tar"] < 800 {
+		t.Fatalf("chased the re-uploads %d times", 1000-c.reupload[b+"/repo/a.tar"])
 	}
 }
 
@@ -457,7 +713,7 @@ func TestS3URL(t *testing.T) {
 func TestTeardownStuckInstances(t *testing.T) {
 	c := newFakeCloud(t)
 	c.stuck = true
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, err := PlanTeardown(context.Background(), "admin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +727,7 @@ func TestTeardownStuckInstances(t *testing.T) {
 	c.mu.Lock()
 	c.stuck = false
 	c.mu.Unlock()
-	p, _ = PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, _ = PlanTeardown(context.Background(), "admin", nil)
 	if err := p.Apply(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +759,7 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 		c := newFakeCloud(t)
 		c.users["spotexec-other"] = map[string]string{}
 		c.keys["AKOTHER"] = [2]string{"spotexec-other", "Active"}
-		p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+		p, err := PlanTeardown(context.Background(), "admin", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -527,7 +783,7 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 		delete(c.users, "spotexec-other")
 		delete(c.keys, "AKOTHER")
 		c.mu.Unlock()
-		p, _ = PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+		p, _ = PlanTeardown(context.Background(), "admin", nil)
 		c.mu.Lock()
 		c.repos["us-east-2"] = append(c.repos["us-east-2"], "spotexec/newer")
 		c.mu.Unlock()
@@ -535,4 +791,132 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+	t.Run("user added to the account", func(t *testing.T) {
+		// The leftover check of an account-wide plan still looks at IAM,
+		// though the plan's regions are now spelled out.
+		c := newFakeCloud(t)
+		p, err := PlanTeardown(context.Background(), "admin", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.mu.Lock()
+		c.users["spotexec-new"] = map[string]string{}
+		c.keys["AKNEW"] = [2]string{"spotexec-new", "Active"}
+		c.mu.Unlock()
+		if err := p.Apply(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "appeared meanwhile") || !strings.Contains(err.Error(), "IAM user spotexec-new") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("launch into a region with no spotexec VMs", func(t *testing.T) {
+		// A regional teardown leaves the keys on: a VM launched right after a
+		// plan that listed none is still terminated before its group goes.
+		c := newFakeCloud(t)
+		c.late = nil
+		c.instances["AK-admin"]["us-east-2"] = c.instances["AK-admin"]["us-east-2"][2:] // only i-prod
+		p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, it := range p.Items {
+			if it.Kind == KindInstance {
+				t.Fatalf("plan lists %s", it.ID)
+			}
+		}
+		c.mu.Lock()
+		c.instances["AK-admin"]["us-east-2"] = append(c.instances["AK-admin"]["us-east-2"], fakeAcctInstance{"i-new", "pending", map[string]string{tagRunner: "aws", tagOwner: "m-1"}})
+		c.mu.Unlock()
+		if err := p.Apply(context.Background(), t.Logf); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(strings.Join(c.terminated, ","), "i-new") || len(c.sgs["us-east-2"]) != 1 {
+			t.Fatalf("terminated %v, groups %v", c.terminated, c.sgs)
+		}
+	})
+}
+
+// iamCalls lists the IAM requests the fake has seen.
+func iamCalls(c *fakeCloud) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var calls []string
+	for _, s := range c.signed {
+		if strings.HasPrefix(s, "iam ") {
+			calls = append(calls, s)
+		}
+	}
+	return calls
+}
+
+// A teardown limited to some regions leaves the account-wide IAM users and
+// their keys alone: a machine still running in another region keeps its
+// credentials, and nothing outside the regions is touched.
+func TestTeardownRegionKeepsIAM(t *testing.T) {
+	c := newFakeCloud(t)
+	c.instances["AK-admin"]["us-west-2"] = []fakeAcctInstance{{"i-west", "running", map[string]string{tagRunner: "aws", tagOwner: "m-1", tagHost: "mac"}}}
+	c.instances["AK-admin"]["eu-west-1"] = []fakeAcctInstance{{"i-eu", "running", map[string]string{tagRunner: "aws", tagOwner: "m-1", tagHost: "mac"}}}
+	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2", "eu-west-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Err() != nil || !p.Regional || strings.Join(p.Regions, ",") != "eu-west-1,us-east-2" {
+		t.Fatalf("plan %+v: %v", p, p.Err())
+	}
+	for _, it := range p.Items {
+		if it.Kind == KindIAMUser || it.Region == "" {
+			t.Fatalf("a regional plan lists account-wide %s %s", it.Kind, it.ID)
+		}
+	}
+	// Apply leaves IAM alone even when a user is in the plan.
+	p.Items = append(p.Items, TeardownItem{Kind: KindIAMUser, ID: "spotexec-mac"})
+	if err := p.Apply(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if c.users["spotexec-mac"] == nil || c.keys["AKMAC"] != [2]string{"spotexec-mac", "Active"} {
+		t.Fatalf("the machine's IAM user or key was touched: %v %v", c.users, c.keys)
+	}
+	term := strings.Join(c.terminated, ",")
+	if strings.Contains(term, "i-west") || !strings.Contains(term, "i-run") || !strings.Contains(term, "i-eu") {
+		t.Fatalf("terminated %v", c.terminated)
+	}
+	if c.buckets["spotexec-cache-111111111111-us-west-2"] == nil || len(c.sgs["us-west-2"]) != 1 {
+		t.Fatalf("us-west-2 touched: buckets %v, groups %v", c.buckets, c.sgs)
+	}
+	if calls := iamCalls(c); len(calls) != 0 {
+		t.Fatalf("IAM called: %v", calls)
+	}
+
+	// The leftover check stays in the plan's regions, and off IAM.
+	p, err = PlanTeardown(context.Background(), "admin", []string{"us-east-2", "eu-west-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.repos["us-east-2"] = append(c.repos["us-east-2"], "spotexec/newer")
+	c.repos["us-west-2"] = append(c.repos["us-west-2"], "spotexec/west")
+	c.mu.Unlock()
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "appeared meanwhile") || !strings.Contains(err.Error(), "spotexec/newer") || strings.Contains(err.Error(), "spotexec/west") || strings.Contains(err.Error(), "IAM") {
+		t.Fatalf("err = %v", err)
+	}
+	if calls := iamCalls(c); len(calls) != 0 {
+		t.Fatalf("IAM called: %v", calls)
+	}
+}
+
+// A regional teardown whose VMs won't terminate keeps its security groups,
+// and still never touches a key.
+func TestTeardownRegionStuck(t *testing.T) {
+	c := newFakeCloud(t)
+	c.stuck = true
+	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "still not terminated") || !strings.Contains(err.Error(), "security group(s) kept") {
+		t.Fatalf("err = %v", err)
+	}
+	if c.users["spotexec-mac"] == nil || c.keys["AKMAC"][1] != "Active" || len(c.sgs["us-east-2"]) != 3 {
+		t.Fatalf("users %v, keys %v, groups %v", c.users, c.keys, c.sgs)
+	}
 }

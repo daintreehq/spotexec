@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,6 +32,11 @@ import (
 // BuiltinExcludes are never synced from untracked/non-Git sources. Tracked
 // files are always synced unless the user excludes them explicitly.
 //
+// .env* keeps local dotenv files (.env, .env.local, .envrc) off the runner
+// before any project config exists, in any case: on a case-insensitive
+// filesystem a tool opening .env reads .ENV. A template Git tracks
+// (.env.example) syncs like any tracked file.
+//
 // .git matches files too (a linked worktree's .git is a file holding a
 // local path). target is anchored: only a top-level Rust/Maven build dir is
 // assumed to be output; a source directory named "target" elsewhere is not.
@@ -39,7 +45,7 @@ import (
 var BuiltinExcludes = []string{
 	".git", "node_modules/", ".venv/", "venv/", "__pycache__/", ".next/", ".turbo/",
 	"/target/", ".DS_Store", ".pytest_cache/", ".mypy_cache/", ".gradle/",
-	".spotexec-tmp-*",
+	".spotexec-tmp-*", ".[Ee][Nn][Vv]*",
 }
 
 // NeverSync is never synced from untracked/non-Git sources, whatever the
@@ -127,9 +133,32 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 	builtin.all = config.NeverProject(o.Root)
 	m.spot = builtin
 
-	useGit := o.Source != "directory" && isGitWorktree(ctx, o.Root)
-	if o.Source == "git" && !useGit {
-		return nil, fmt.Errorf("%s is not a git worktree but sync.source = \"git\"", o.Root)
+	var useGit bool
+	if o.Source != "directory" {
+		var gitErr error
+		useGit, gitErr = isGitWorktree(ctx, o.Root)
+		if !useGit {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if o.Source == "git" {
+				if gitErr != nil {
+					return nil, fmt.Errorf("%s is not a git worktree but sync.source = \"git\": %w", o.Root, gitErr)
+				}
+				return nil, fmt.Errorf("%s is not a git worktree but sync.source = \"git\"", o.Root)
+			}
+			// A checkout Git failed to inspect (dubious ownership, a broken
+			// gitfile, no git binary), or one it doesn't treat as a work
+			// tree, is not a plain directory: walking it would drop
+			// .git/info/exclude and the global excludes, and sync a
+			// different set of files than Git would.
+			if where := gitCheckout(o.Root); where != "" {
+				if gitErr == nil {
+					gitErr = errors.New("git does not treat it as a work tree")
+				}
+				return nil, unreadableCheckout(where, gitErr)
+			}
+		}
 	}
 	m.Git = useGit
 
@@ -192,9 +221,9 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 			cands = append(cands, cand{path: p})
 		}
 	} else {
-		gitignore := ignore.New()
-		_ = gitignore.AddFile(filepath.Join(o.Root, ".gitignore"))
-		dirMatcher := orMatch{builtin, gitignore}
+		// Every .gitignore applies where it is declared, as in Git, and one
+		// that can't be read fails the walk rather than sync what it lists.
+		gitignore := ignore.NewTree(o.Root, ".gitignore")
 		err := filepath.WalkDir(o.Root, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -203,14 +232,21 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 				return nil
 			}
 			rel := filepath.ToSlash(must(filepath.Rel(o.Root, p)))
-			if d.IsDir() {
-				if dirMatcher.Match(rel, true) || user.Match(rel, true) {
+			isDir := d.IsDir()
+			ex := builtin.Match(rel, isDir) || user.Match(rel, isDir)
+			if !ex {
+				if ex, err = gitignore.Match(rel, isDir); err != nil {
+					return err
+				}
+			}
+			if isDir {
+				if ex {
 					m.Excluded["ignored-dir"]++
 					return filepath.SkipDir
 				}
 				return nil
 			}
-			if dirMatcher.Match(rel, false) || user.Match(rel, false) {
+			if ex {
 				m.Excluded["ignored"]++
 				return nil
 			}
@@ -474,7 +510,7 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 	// $XDG_CONFIG_HOME/git/attributes) applies to every repository. Git
 	// reads a relative core.attributesFile from the worktree root.
 	if out, err := exec.Command("git", "-C", root, "config", "--path", "--get", "core.attributesFile").Output(); err == nil {
-		f := strings.TrimSpace(string(out))
+		f := GitPath(out)
 		if !filepath.IsAbs(f) {
 			f = filepath.Join(root, f)
 		}
@@ -491,7 +527,7 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 		}
 	}
 	if gd, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output(); err == nil {
-		d := strings.TrimSpace(string(gd))
+		d := GitPath(gd)
 		if !filepath.IsAbs(d) {
 			d = filepath.Join(root, d)
 		}
@@ -512,9 +548,118 @@ func gitHome() string {
 	return h
 }
 
-func isGitWorktree(ctx context.Context, root string) bool {
+// isGitWorktree reports whether root is inside a Git work tree, with git's
+// error when git couldn't say.
+func isGitWorktree(ctx context.Context, root string) (bool, error) {
 	out, err := git(ctx, root, "rev-parse", "--is-inside-work-tree")
-	return err == nil && strings.TrimSpace(string(out)) == "true"
+	return err == nil && strings.TrimSpace(string(out)) == "true", err
+}
+
+// checkoutAbove is the nearest directory at or above dir holding a .git
+// entry (a directory, or a linked worktree's gitfile), or "". It stops
+// where Git's own discovery does, so a repository Git is told not to look
+// for doesn't count: never climbing into a GIT_CEILING_DIRECTORIES entry,
+// nor onto another filesystem unless GIT_DISCOVERY_ACROSS_FILESYSTEM is
+// set.
+func checkoutAbove(dir string) string {
+	ceiling := gitCeilings()
+	across := gitBool(os.Getenv("GIT_DISCOVERY_ACROSS_FILESYSTEM"))
+	dev, haveDev := device(dir)
+	for d := dir; ; {
+		if _, err := os.Lstat(filepath.Join(d, ".git")); err == nil {
+			return d
+		}
+		up := filepath.Dir(d)
+		if up == d || ceiling[up] {
+			return ""
+		}
+		if !across && haveDev {
+			if u, ok := device(up); ok && u != dev {
+				return ""
+			}
+		}
+		d = up
+	}
+}
+
+// gitCeilings is GIT_CEILING_DIRECTORIES as Git reads it: absolute entries
+// only, each resolved to its real path (and dropped if it doesn't
+// resolve) until an empty entry, after which entries are kept as written.
+func gitCeilings() map[string]bool {
+	ceiling := map[string]bool{}
+	asWritten := false
+	for _, c := range filepath.SplitList(os.Getenv("GIT_CEILING_DIRECTORIES")) {
+		switch {
+		case c == "":
+			asWritten = true
+		case !filepath.IsAbs(c):
+		case asWritten:
+			// Git compares these byte for byte, dropping only a trailing
+			// slash: "/work/repo/." names nothing.
+			if len(c) > 1 {
+				c = strings.TrimSuffix(c, string(filepath.Separator))
+			}
+			ceiling[c] = true
+		default:
+			if r, err := filepath.EvalSymlinks(c); err == nil {
+				if r, err = filepath.Abs(r); err == nil {
+					ceiling[r] = true
+				}
+			}
+		}
+	}
+	return ceiling
+}
+
+// gitBool reads a boolean environment variable as Git does: a word, or an
+// integer (decimal, 0x hex or 0 octal, with an optional k, m or g unit)
+// that is non-zero. A value Git would reject counts as true, so the marker
+// search errs toward finding the checkout.
+func gitBool(v string) bool {
+	switch strings.ToLower(v) {
+	case "true", "yes", "on":
+		return true
+	case "", "false", "no", "off":
+		return false
+	}
+	num := strings.TrimLeft(v, " \t\n\v\f\r")
+	if n := len(num); n > 0 && strings.ContainsRune("kmgKMG", rune(num[n-1])) {
+		num = num[:n-1]
+	}
+	sign := ""
+	if num != "" && (num[0] == '-' || num[0] == '+') {
+		sign, num = num[:1], num[1:]
+	}
+	base := 10
+	switch {
+	case len(num) > 2 && (num[:2] == "0x" || num[:2] == "0X"):
+		base, num = 16, num[2:]
+	case len(num) > 1 && num[0] == '0':
+		base, num = 8, num[1:]
+	}
+	n, err := strconv.ParseInt(sign+num, base, 64)
+	return err != nil || n != 0
+}
+
+// gitCheckout names the Git checkout git was pointed at from dir: $GIT_DIR
+// when set (Git then skips discovery), else the nearest .git at or above
+// dir. "" means dir is a plain directory as far as Git is concerned.
+func gitCheckout(dir string) string {
+	if g, ok := os.LookupEnv("GIT_DIR"); ok {
+		return "GIT_DIR=" + g
+	}
+	if d := checkoutAbove(dir); d != "" {
+		return filepath.Join(d, ".git")
+	}
+	return ""
+}
+
+// unreadableCheckout is the error for the Git checkout at gitDir that git
+// failed to inspect (dubious ownership, a broken gitfile, no git binary):
+// it is not a plain directory, so automatic sync refuses it rather than
+// walking it, which would drop .git/info/exclude and the global excludes.
+func unreadableCheckout(gitDir string, gitErr error) error {
+	return fmt.Errorf("git could not read the checkout at %s (%w); fix Git there, or set sync.source = \"directory\" in .spotexec.toml to sync it as a plain directory", gitDir, gitErr)
 }
 
 func git(ctx context.Context, dir string, args ...string) ([]byte, error) {
@@ -528,7 +673,7 @@ func gitEnv(ctx context.Context, dir string, env []string, args ...string) ([]by
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return out, nil
 }
@@ -543,21 +688,35 @@ func must(s string, err error) string {
 // Root resolves the worktree root containing dir: the Git toplevel when inside
 // a repository, else the directory holding .spotexec.toml (never the home
 // directory or /, see config.NeverProject), else dir itself.
-func Root(dir string) (string, bool) {
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
-	if err == nil {
-		r := strings.TrimSpace(string(out))
+//
+// When git fails but dir is inside a checkout (a .git entry at or above
+// it), the search for .spotexec.toml stops at the checkout, so a broken
+// checkout never widens to a project above it: the root is the nearest
+// .spotexec.toml within the checkout, else the checkout itself, and the
+// error says why Git can't be used there.
+func Root(dir string) (string, bool, error) {
+	out, gitErr := git(context.Background(), dir, "rev-parse", "--show-toplevel")
+	if gitErr == nil {
+		r := GitPath(out)
 		if rr, err := filepath.EvalSymlinks(r); err == nil {
 			r = rr
 		}
-		return r, true
+		return r, true, nil
+	}
+	checkout := checkoutAbove(dir)
+	var unreadable error
+	if where := gitCheckout(dir); where != "" {
+		unreadable = unreadableCheckout(where, gitErr)
 	}
 	for d := dir; ; d = filepath.Dir(d) {
 		if _, err := os.Stat(filepath.Join(d, ".spotexec.toml")); err == nil && !config.NeverProject(d) {
-			return d, false
+			return d, false, unreadable
+		}
+		if d == checkout {
+			return d, false, unreadable
 		}
 		if d == filepath.Dir(d) {
-			return dir, false
+			return dir, false, unreadable
 		}
 	}
 }
@@ -569,7 +728,19 @@ func GitDir(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return GitPath(out), nil
+}
+
+// GitPath is the path in a git command's one-line output: only the record
+// terminator comes off, since a path may itself begin or end in spaces (a
+// trimmed "checkout " names the sibling "checkout"). Git for Windows may end
+// the line in CRLF, and no Windows path holds a carriage return.
+func GitPath(out []byte) string {
+	s := strings.TrimSuffix(string(out), "\n")
+	if runtime.GOOS == "windows" {
+		s = strings.TrimSuffix(s, "\r")
+	}
+	return s
 }
 
 // CheckIgnored filters paths through git check-ignore (exact Git semantics),
@@ -592,10 +763,18 @@ func (m *Manifest) CheckIgnored(ctx context.Context, paths []string) (map[string
 		builtin = newSpotExcluder(nil)
 	}
 	if !m.Git {
-		gitignore := ignore.New()
-		_ = gitignore.AddFile(filepath.Join(m.Root, ".gitignore"))
+		// The walk's rules, read from the worktree as it is now (as git
+		// check-ignore reads it).
+		gitignore := ignore.NewTree(m.Root, ".gitignore")
 		for _, p := range rest {
-			if builtin.Match(p, false) || gitignore.Match(p, false) {
+			ex := builtin.Match(p, false)
+			if !ex {
+				var err error
+				if ex, err = gitignore.Match(p, false); err != nil {
+					return nil, err
+				}
+			}
+			if ex {
 				ign[p] = true
 			}
 		}
@@ -693,16 +872,4 @@ func inSpotexecDir(r string) bool {
 func isNestedRepo(dir string) bool {
 	_, err := os.Lstat(filepath.Join(dir, ".git"))
 	return err == nil
-}
-
-// orMatch excludes what any of its matchers excludes.
-type orMatch []interface{ Match(string, bool) bool }
-
-func (o orMatch) Match(p string, isDir bool) bool {
-	for _, m := range o {
-		if m.Match(p, isDir) {
-			return true
-		}
-	}
-	return false
 }

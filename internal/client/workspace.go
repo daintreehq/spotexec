@@ -36,6 +36,9 @@ type Workspace struct {
 	// spotexec was started in, which must not be synced wholesale (it may
 	// be $HOME, holding ~/.aws and ~/.ssh).
 	Marked bool
+	// GitErr: Root is (inside) a Git checkout that git could not read, so
+	// it isn't a plain directory either; automatic sync is refused.
+	GitErr error
 }
 
 var nonAlnum = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
@@ -49,29 +52,27 @@ func Resolve(dir string) (*Workspace, error) {
 	if r, err := filepath.EvalSymlinks(abs); err == nil {
 		abs = r
 	}
-	root, isGit := manifest.Root(abs)
-	w := &Workspace{Root: root, Git: isGit}
+	root, isGit, gitErr := manifest.Root(abs)
+	w := &Workspace{Root: root, Git: isGit, GitErr: gitErr}
 	if _, err := os.Stat(filepath.Join(root, ".spotexec.toml")); (err == nil || isGit) && !config.NeverProject(root) {
 		w.Marked = true
 	}
-	rel, err := filepath.Rel(root, abs)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		rel = "."
-	}
-	w.Cwd = filepath.ToSlash(rel)
+	w.Cwd = cwdIn(root, abs)
 	ident := root
 	name := filepath.Base(root)
 	if isGit {
 		w.GitDir, _ = manifest.GitDir(root)
 		w.CommonGitDir = commonGitDir(root, w.GitDir)
 		if out, err := exec.Command("git", "-C", root, "config", "--get", "remote.origin.url").Output(); err == nil {
-			if u := normalizeRemote(strings.TrimSpace(string(out))); u != "" {
+			if u := normalizeRemote(manifest.GitPath(out)); u != "" {
 				ident = u
-				name = filepath.Base(u)
+				// Lowercase as before: only the hash tells case-distinct
+				// paths apart, so a lowercase remote keeps its RepoID.
+				name = strings.ToLower(filepath.Base(u))
 			}
 		} else if out, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output(); err == nil {
 			// No origin: worktrees of one repo share the common git dir.
-			cd := strings.TrimSpace(string(out))
+			cd := manifest.GitPath(out)
 			if !filepath.IsAbs(cd) {
 				cd = filepath.Join(root, cd)
 			}
@@ -95,19 +96,32 @@ func Resolve(dir string) (*Workspace, error) {
 	return w, nil
 }
 
+// cwdIn is abs relative to root, slash-separated, or "." when abs lies
+// outside root. Only a whole ".." component escapes: "..build" is an
+// ordinary directory inside the worktree (#324).
+func cwdIn(root, abs string) string {
+	rel, err := filepath.Rel(root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "."
+	}
+	return filepath.ToSlash(rel)
+}
+
 // commonGitDir is the repository's common git dir for the worktree at root,
 // or gitDir when git can't say.
 func commonGitDir(root, gitDir string) string {
 	// --path-format=absolute (git 2.31+) gives the canonical path; older git
-	// echoes the unknown option back, and prints the dir relative to root.
+	// echoes the unknown option back as its own first line, and prints the
+	// dir relative to root. An absolute dir never starts with the option, but
+	// may hold a newline, so only the echo means old git.
 	out, err := exec.Command("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
-	if err != nil || strings.Contains(strings.TrimSpace(string(out)), "\n") {
+	if err != nil || strings.HasPrefix(string(out), "--path-format=absolute") {
 		out, err = exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output()
 	}
 	if err != nil {
 		return gitDir
 	}
-	d := strings.TrimSpace(string(out))
+	d := manifest.GitPath(out)
 	if d == "" {
 		return gitDir
 	}
@@ -118,17 +132,53 @@ func commonGitDir(root, gitDir string) string {
 }
 
 // normalizeRemote strips scheme, credentials and .git so https and ssh
-// remotes of the same repository map to one ID.
+// remotes of the same repository map to one ID ("host/path"). Only the
+// host is case-folded: hosting can be case-sensitive, so the path keeps
+// its case, and any "@" in it. Local paths come back unchanged.
 func normalizeRemote(u string) string {
+	// HTTP never sends a fragment, so it names nothing; elsewhere "#" is
+	// part of the path.
+	if l := strings.ToLower(u); strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://") {
+		u, _, _ = strings.Cut(u, "#")
+	}
 	u = strings.TrimSuffix(strings.TrimSuffix(u, "/"), ".git")
+	var host, p string
 	if i := strings.Index(u, "://"); i >= 0 {
-		u = u[i+3:]
+		// scheme://[userinfo@]host[:port]/path
+		host = u[i+3:]
+		if j := strings.IndexByte(host, '/'); j >= 0 {
+			host, p = host[:j], host[j:]
+		}
+	} else if i := scpColon(u); i >= 0 {
+		// [user@]host:path
+		host, p = u[:i], "/"+u[i+1:]
+	} else {
+		return u
 	}
-	if i := strings.LastIndex(u, "@"); i >= 0 {
-		u = u[i+1:]
+	if j := strings.LastIndexByte(host, '@'); j >= 0 {
+		host = host[j+1:]
 	}
-	u = strings.Replace(u, ":", "/", 1)
-	return strings.ToLower(u)
+	return strings.ToLower(host) + p
+}
+
+// scpColon is the index of the colon ending the host of an scp-like
+// remote ([user@]host:path, host possibly a bracketed IPv6 address), or -1
+// when u is a local path: no colon before its first slash.
+func scpColon(u string) int {
+	head := u
+	if j := strings.IndexByte(u, '/'); j >= 0 {
+		head = u[:j]
+	}
+	from := 0
+	if k := strings.IndexByte(head, '['); k >= 0 && (k == 0 || head[k-1] == '@') {
+		if e := strings.IndexByte(head[k:], ']'); e >= 0 {
+			from = k + e
+		}
+	}
+	if i := strings.IndexByte(head[from:], ':'); i >= 0 {
+		return from + i
+	}
+	return -1
 }
 
 // LastRun records where this worktree last ran (for exec/pull).

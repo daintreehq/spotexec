@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,14 +37,43 @@ const dialTimeout = time.Minute
 
 // Client runs commands on one target.
 type Client struct {
-	T        provider.Target
-	ctlPath  string
+	T       provider.Target
+	ctlPath string
+	// ctlErr is why there is no private directory for the control socket.
+	// Every call that would hand ctlPath to ssh fails with it instead.
+	ctlErr   error
 	WorkRoot string // remote work root (may start with ~/)
 }
 
-// New builds a client for a target.
+// SetupErr is why the client can't connect from this machine at all (a
+// *SetupError), or nil.
+func (c *Client) SetupErr() error { return c.ctlErr }
+
+// setup re-checks the client's control directory before its path goes to
+// ssh: one checked when the client was made may since have been cleaned
+// away, and its name taken by another user. One cleaned away is made anew.
+func (c *Client) setup() error {
+	if c.ctlErr != nil {
+		return c.ctlErr
+	}
+	if err := privateDir(filepath.Dir(c.ctlPath)); err != nil {
+		return &SetupError{err}
+	}
+	return nil
+}
+
+// New builds a client for a target. Without a private directory for its
+// control socket the client can't connect: its calls return that error.
 func New(t provider.Target, workRoot string) *Client {
-	return &Client{T: t, ctlPath: filepath.Join(controlDir(), connID(t)), WorkRoot: workRoot}
+	c := &Client{T: t, WorkRoot: workRoot}
+	dir, err := controlDir()
+	if err != nil {
+		// ctlPath still names the connection (helper markers key on it),
+		// but nothing hands it to ssh.
+		dir, c.ctlErr = "unavailable", err
+	}
+	c.ctlPath = filepath.Join(dir, connID(t))
+	return c
 }
 
 // connID identifies a target's effective connection settings: it names the
@@ -69,46 +99,234 @@ func connID(t provider.Target) string {
 // controlDir is re-checked on every call: a long-running process (the
 // daemon) must survive the directory being cleaned away, and in shared /tmp
 // it must still be ours (a reaper may delete it and another user recreate
-// it).
+// it). It never returns a directory it couldn't make private: a socket path
+// anyone else can reach would let them stand in for the master.
 var (
 	ctlMu  sync.Mutex
 	ctlDir string
+	// ctlShared says ctlDir is in shared tmpRoot, where another user may
+	// get to the name first.
+	ctlShared bool
+	// tmpRoot is where the short fallback lives (a variable for tests).
+	tmpRoot = "/tmp"
 )
 
-func controlDir() string {
+func controlDir() (string, error) {
 	ctlMu.Lock()
 	defer ctlMu.Unlock()
+	shared := filepath.Join(tmpRoot, fmt.Sprintf("sx-cm-%d", os.Getuid()))
 	if ctlDir == "" {
 		home, _ := os.UserHomeDir()
-		if d := filepath.Join(home, ".cache", "spotexec", "cm"); home != "" && len(d)+17+17 <= 100 {
-			ctlDir = d
+		// OpenSSH expands %-tokens and ${VAR} in ControlPath: a home with
+		// either would name another directory than the one checked here.
+		if d := filepath.Join(home, ".cache", "spotexec", "cm"); home != "" && len(d)+17+17 <= 100 && !strings.ContainsAny(d, "%$") {
+			ctlDir, ctlShared = d, false
 		} else {
-			ctlDir = filepath.Join("/tmp", fmt.Sprintf("sx-cm-%d", os.Getuid()))
+			ctlDir, ctlShared = shared, true
 		}
 	}
-	if !strings.HasPrefix(ctlDir, "/tmp/") {
-		_ = os.MkdirAll(ctlDir, 0o700)
-		return ctlDir
+	var herr error
+	if !ctlShared {
+		herr = os.MkdirAll(filepath.Dir(ctlDir), 0o700)
+		if herr == nil {
+			herr = privateDir(ctlDir)
+		}
+		if herr == nil {
+			return ctlDir, nil
+		}
+		// A home that can't hold a private directory (under a group-writable
+		// /home, say): the short one in tmp serves as well.
+		ctlDir, ctlShared = shared, true
 	}
-	if privateDir(ctlDir) {
-		return ctlDir
+	perr := privateDir(ctlDir)
+	if perr == nil {
+		return ctlDir, nil
 	}
-	if d, err := os.MkdirTemp("/tmp", "sx-cm-"); err == nil {
-		ctlDir = d
+	d, err := os.MkdirTemp(tmpRoot, "sx-cm-")
+	if err == nil {
+		err = privateDir(d) // the umask may have taken the owner's bits
 	}
-	return ctlDir
+	if err != nil {
+		if herr != nil {
+			perr = fmt.Errorf("%v; %v", herr, perr)
+			ctlDir = "" // the home may recover: try it first again
+		}
+		return "", &SetupError{fmt.Errorf("%v, and no private alternative: %w", perr, err)}
+	}
+	ctlDir = d
+	return ctlDir, nil
+}
+
+// SetupError means this machine has no private directory for SSH control
+// sockets, so no connection can be set up from it. It says nothing about
+// any target: the cause is local.
+type SetupError struct{ Err error }
+
+func (e *SetupError) Error() string { return "ssh control directory: " + e.Err.Error() }
+func (e *SetupError) Unwrap() error { return e.Err }
+
+// IsSetupError reports whether err is (or wraps) a SetupError.
+func IsSetupError(err error) bool {
+	var se *SetupError
+	return errors.As(err, &se)
+}
+
+// CheckControlDir reports whether this machine can set up SSH connections
+// at all: callers about to launch VMs check it first, rather than launch
+// ones they could never reach.
+func CheckControlDir() error {
+	_, err := controlDir()
+	return err
 }
 
 // privateDir makes sure dir exists, is a real directory (not a symlink),
-// owned by us, mode 0700.
-func privateDir(dir string) bool {
-	_ = os.Mkdir(dir, 0o700)
+// owned by us, mode 0700, and that no other user can put anything in its
+// place or in it. One others could write to is refused, not fixed, as is
+// one holding anything of theirs: a socket they left there would stand in
+// for the master.
+func privateDir(dir string) error {
+	if err := safeAncestors(dir); err != nil {
+		return err
+	}
+	created := true
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		created = false
+	}
 	fi, err := os.Lstat(dir)
-	if err != nil || !fi.IsDir() {
-		return false
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
-	return ok && int(st.Uid) == os.Getuid() && os.Chmod(dir, 0o700) == nil
+	if !ok || int(st.Uid) != os.Getuid() {
+		return fmt.Errorf("%s is not owned by this user", dir)
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s is writable by other users (remove it, and spotexec makes a private one)", dir)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	// Once ours and private, nobody else can add to it: one scan per
+	// directory per process is enough, and a new one needs none. (Lock
+	// files pile up per VM, and a client is made per VM per daemon round.)
+	// Keyed by inode and mtime: anything added to it since changes the time,
+	// even if its mode was opened and closed again meanwhile.
+	key := scanKey{uint64(st.Ino), fi.ModTime()}
+	if k, _ := scannedDirs.Load(dir); created || k == key {
+		scannedDirs.Store(dir, key)
+		return nil
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		efi, err := e.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // gone meanwhile
+		}
+		if err != nil {
+			return err // one we can't even look at isn't known to be ours
+		}
+		if est, ok := efi.Sys().(*syscall.Stat_t); !ok || !trustedUID(est.Uid) {
+			return fmt.Errorf("%s holds %s, which is another user's (remove it, and spotexec makes a private one)", dir, e.Name())
+		}
+	}
+	scannedDirs.Store(dir, key)
+	return nil
+}
+
+// scannedDirs maps the private directories privateDir has found holding
+// nothing of another user's to how they were then (a scanKey).
+var scannedDirs sync.Map
+
+type scanKey struct {
+	ino   uint64
+	mtime time.Time
+}
+
+func trustedUID(uid uint32) bool { return uid == 0 || int(uid) == os.Getuid() }
+
+// safeAncestors checks that no other user can swap dir for one of theirs by
+// changing a directory on the way to it.
+func safeAncestors(dir string) error {
+	_, err := safePath(filepath.Dir(dir), 0)
+	return err
+}
+
+// safePath checks every directory from the root to p as the kernel walks
+// it, following each symlink through every directory on its way: each is
+// owned by root or us, and one others may write to is sticky (as /tmp is),
+// so they can't move our entries in it. A symlink's own mode means nothing,
+// but its owner does. It returns p's real path.
+func safePath(p string, depth int) (string, error) {
+	if depth > 32 {
+		return "", fmt.Errorf("%s: too many symlinks", p)
+	}
+	if !filepath.IsAbs(p) {
+		return "", fmt.Errorf("%s is not an absolute path", p)
+	}
+	cur := "/"
+	if err := safeDir(cur); err != nil {
+		return "", err
+	}
+	for _, name := range strings.Split(p, "/") {
+		switch name {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur) // cur is a real path: no symlink to undo
+			continue
+		}
+		next := filepath.Join(cur, name)
+		fi, err := os.Lstat(next)
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			if err := safeDir(next); err != nil {
+				return "", err
+			}
+			cur = next
+			continue
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || !trustedUID(st.Uid) {
+			return "", fmt.Errorf("%s is owned by another user", next)
+		}
+		t, err := os.Readlink(next)
+		if err != nil {
+			return "", err
+		}
+		if !strings.HasPrefix(t, "/") {
+			t = cur + "/" + t // not filepath.Join: ".." must follow what came before it
+		}
+		if cur, err = safePath(t, depth+1); err != nil {
+			return "", err
+		}
+	}
+	return cur, nil
+}
+
+// safeDir checks one directory on the way to the control directory.
+func safeDir(d string) error {
+	fi, err := os.Lstat(d)
+	if err != nil {
+		return err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || !trustedUID(st.Uid) {
+		return fmt.Errorf("%s is owned by another user", d)
+	}
+	if fi.Mode().Perm()&0o022 != 0 && fi.Mode()&fs.ModeSticky == 0 {
+		return fmt.Errorf("%s is writable by other users", d)
+	}
+	return nil
 }
 
 // baseArgs builds the ssh options. ssh uses the first value it sees for an
@@ -117,11 +335,15 @@ func privateDir(dir string) bool {
 // runner's ssh_options, and spotexec's tunable defaults last, so ssh_options
 // can change them.
 func (c *Client) baseArgs(master string) []string {
+	ctl := c.ctlPath
+	if c.ctlErr != nil {
+		ctl = "none" // never a path whose directory isn't private
+	}
 	a := []string{
 		"-T",
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=" + master,
-		"-o", "ControlPath=" + c.ctlPath,
+		"-o", "ControlPath=" + ctl,
 		"-o", "ControlPersist=" + ControlPersist,
 	}
 	if c.T.IdentityFile != "" {
@@ -182,6 +404,9 @@ func (c *Client) MasterAlive(ctx context.Context) bool {
 // masterPID asks the control master whether it is running, and its pid (0
 // if ssh didn't say).
 func (c *Client) masterPID(ctx context.Context) (int, bool) {
+	if c.setup() != nil {
+		return 0, false
+	}
 	ctx, cancel := context.WithTimeout(ctx, muxTimeout)
 	defer cancel()
 	var errb bytes.Buffer
@@ -199,6 +424,9 @@ func (c *Client) masterPID(ctx context.Context) (int, bool) {
 // lockMaster serializes starting and retiring this target's master across
 // processes. Without flock (some network filesystems) it goes unlocked.
 func (c *Client) lockMaster(ctx context.Context) (func(), error) {
+	if err := c.setup(); err != nil {
+		return nil, err
+	}
 	lf, err := os.OpenFile(c.ctlPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return func() {}, nil
@@ -233,6 +461,9 @@ func (c *Client) EnsureMaster(ctx context.Context) error {
 // file-backed stderr: a backgrounded master inheriting our pipes would
 // otherwise hold them open and hang every caller.
 func (c *Client) ensureMaster(ctx context.Context) (int, bool, error) {
+	if err := c.setup(); err != nil {
+		return 0, false, err
+	}
 	if pid, ok := c.masterPID(ctx); ok {
 		return pid, false, nil
 	}
@@ -270,6 +501,9 @@ func (c *Client) ensureMaster(ctx context.Context) (int, bool, error) {
 
 // CloseMaster stops the control master, ending every session on it.
 func (c *Client) CloseMaster() {
+	if c.setup() != nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), muxTimeout)
 	defer cancel()
 	_ = exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "exit", "--", c.T.Host).Run()
@@ -332,6 +566,9 @@ func (e *ConnError) Error() string {
 
 // Run executes remoteCmd and returns stdout. stdin may be nil.
 func (c *Client) Run(ctx context.Context, remoteCmd string, stdin io.Reader) ([]byte, error) {
+	if err := c.setup(); err != nil {
+		return nil, err
+	}
 	cmd := exec.CommandContext(ctx, "ssh", c.Args(remoteCmd)...)
 	cmd.Stdin = stdin
 	// A session on a master hands its descriptors to the master, so killing
@@ -462,7 +699,7 @@ func (c *Client) Reachable(ctx context.Context, d time.Duration) Reach {
 	rctx, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
 	own := *c
-	own.ctlPath = "none"
+	own.ctlPath, own.ctlErr = "none", nil
 	cmd := exec.CommandContext(rctx, "ssh", own.Args("true")...)
 	cmd.WaitDelay = 2 * time.Second
 	var errb bytes.Buffer
@@ -551,6 +788,9 @@ func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Durati
 	// The marker records the remote platform and the hash we installed; it
 	// is only trusted if this binary still embeds that exact helper, so an
 	// upgraded CLI reinstalls instead of driving a stale helper.
+	if err := c.setup(); err != nil {
+		return "", err // before the markers: their fast path must not hide it
+	}
 	if !force {
 		if hash, ok := c.installedHash(); ok {
 			return c.helperPath(hash), nil
@@ -641,6 +881,9 @@ var ErrHelperNotInstalled = errors.New("helper not installed on this runner")
 // this machine already installed this exact helper on the target: it never
 // uploads or reinstalls one, which would touch an ephemeral VM's idle clock.
 func (c *Client) HelperCmdInstalled(ctx context.Context, args ...string) ([]byte, error) {
+	if err := c.setup(); err != nil {
+		return nil, err
+	}
 	hash, ok := c.installedHash()
 	if !ok {
 		return nil, ErrHelperNotInstalled

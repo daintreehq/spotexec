@@ -186,3 +186,84 @@ func TestKeyPatternStable(t *testing.T) {
 		t.Fatal("a newly matched file must change the key")
 	}
 }
+
+// #315: the install's environment keys the cache, by name and value, in
+// any map order; an empty one leaves the key as it was.
+func TestKeyEnv(t *testing.T) {
+	root := writeTree(t, map[string]string{"package-lock.json": "{\"lockfileVersion\":3}\n", "packages/a/package.json": "{}\n"})
+	key := func(env map[string]string) string {
+		t.Helper()
+		s := spec("package-lock.json", "packages/a/package.json")
+		s.Env = env
+		k, err := Key(root, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	if k := key(map[string]string{}); k != "b059f7e99e985bf0cb4367e0" {
+		t.Fatalf("an empty env changed the key: %s", k)
+	}
+	prod := key(map[string]string{"NODE_ENV": "production"})
+	if prod == key(nil) {
+		t.Fatal("an env didn't change the key")
+	}
+	if key(map[string]string{"NODE_ENV": "development"}) == prod {
+		t.Fatal("a changed value kept the key")
+	}
+	if key(map[string]string{"NODE_ENVX": "production"}) == prod {
+		t.Fatal("a changed name kept the key")
+	}
+	if key(map[string]string{"A": "BC"}) == key(map[string]string{"AB": "C"}) {
+		t.Fatal("name and value boundaries collide")
+	}
+	if key(map[string]string{"A": "", "B": ""}) == key(map[string]string{"A": "B"}) {
+		t.Fatal("entry boundaries collide")
+	}
+	if key(map[string]string{"A": "1\x00B", "C": ""}) == key(map[string]string{"A": "", "B": "1\x00C"}) {
+		t.Fatal("value boundaries collide")
+	}
+	// Go randomizes map iteration: many maps built in different orders
+	// must all give one key.
+	names := []string{"NODE_ENV", "TZ", "NODE_OPTIONS", "A", "Z", "M", "npm_config_production"}
+	want := ""
+	for i := range 50 {
+		env := map[string]string{}
+		for j := range names {
+			n := names[(i+j)%len(names)]
+			env[n] = "v-" + n
+		}
+		if k := key(env); want == "" {
+			want = k
+		} else if k != want {
+			t.Fatalf("map order changed the key: %s, want %s", k, want)
+		}
+	}
+	// Only a hash of the values reaches the key.
+	if k := key(map[string]string{"TOKEN": "s3cr3t"}); strings.Contains(k, "s3cr3t") || len(k) != 24 {
+		t.Fatalf("key %q", k)
+	}
+}
+
+// The env section can't be spelled by the lockfile sections after it: an
+// env of A and B (empty) against no env and lockfiles that would frame the
+// same bytes under a length-prefixed encoding written inline.
+func TestKeyEnvSectionIsFramed(t *testing.T) {
+	root := writeTree(t, map[string]string{"2": "", "env": "1\x00", "A0": "B", "0": "0\x00"})
+	base := Spec{Install: "i", OS: "linux", Arch: "amd64"}
+	withEnv := base
+	withEnv.Env, withEnv.Lockfiles = map[string]string{"A": "", "B": ""}, []string{"2"}
+	noEnv := base
+	noEnv.Lockfiles = []string{"env", "A0", "0"}
+	a, err := Key(root, withEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Key(root, noEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatal("an env collides with lockfiles")
+	}
+}

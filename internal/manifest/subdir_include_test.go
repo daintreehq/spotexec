@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -102,6 +103,7 @@ func TestUnstagedGitattributesDisablesIndexIDs(t *testing.T) {
 		name, attrs, gitignore string
 		config                 string // core.attributesFile; ~ is the temp home
 		xdg                    bool   // XDG_CONFIG_HOME set
+		gitDir                 string // a separate git dir in the temp home
 	}{
 		{name: "untracked", attrs: ".gitattributes", xdg: true},
 		{name: "ancestor", attrs: "sub/.gitattributes", xdg: true},
@@ -110,8 +112,14 @@ func TestUnstagedGitattributesDisablesIndexIDs(t *testing.T) {
 		{name: "home", attrs: "~/.config/git/attributes"},
 		{name: "configured", attrs: "~/attrs", config: "~/attrs", xdg: true},
 		{name: "configured-relative", attrs: "conf/attrs", config: "conf/attrs", xdg: true},
+		// A name ending in a space is that file, not its trimmed sibling.
+		{name: "configured-trailing-space", attrs: "conf/attrs ", config: "conf/attrs ", xdg: true},
+		{name: "common-dir-trailing-space", attrs: "~/meta /info/attributes", xdg: true, gitDir: "meta "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if runtime.GOOS == "windows" && strings.HasSuffix(tc.name, "-trailing-space") {
+				t.Skip("Windows paths cannot end in a space")
+			}
 			root, home := t.TempDir(), t.TempDir()
 			xdg := filepath.Join(home, "xdg")
 			// Only this test's git configuration applies.
@@ -132,7 +140,11 @@ func TestUnstagedGitattributesDisablesIndexIDs(t *testing.T) {
 				}
 				return filepath.Join(root, filepath.FromSlash(p))
 			}
-			gitIn(t, root, "init", "-q")
+			if tc.gitDir != "" {
+				gitIn(t, root, "init", "-q", "--separate-git-dir", filepath.Join(home, tc.gitDir))
+			} else {
+				gitIn(t, root, "init", "-q")
+			}
 			gitIn(t, root, "config", "core.autocrlf", "false")
 			gitIn(t, root, "config", "filter.up.clean", "tr a-z A-Z")
 			gitIn(t, root, "config", "filter.up.smudge", "cat")

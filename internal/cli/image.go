@@ -228,6 +228,10 @@ func runBake(r *config.Runner, a *provider.AWSSpot, pulls []string) (err error) 
 	}
 	defer unlockBake()
 	a.SweepBuildersLocked(ctx, logf)
+	// Don't launch a builder this machine could never connect to.
+	if err := transport.CheckControlDir(); err != nil {
+		return err
+	}
 	logf("launching on-demand builder")
 	in, err := a.BakeLaunch(ctx, logf, pulls)
 	if err != nil {

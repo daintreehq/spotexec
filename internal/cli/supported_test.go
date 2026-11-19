@@ -56,7 +56,7 @@ func outsideGit(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(d))
-	if _, isGit := manifest.Root(d); isGit {
+	if _, isGit, _ := manifest.Root(d); isGit {
 		t.Fatalf("%s is inside a Git worktree", d)
 	}
 	if config.NeverProject(d) {
@@ -423,5 +423,22 @@ func TestSupportedCommand(t *testing.T) {
 	t.Chdir(yes)
 	if code, out, stderr := run("supported"); code != 0 || out != "true\n" || stderr != "" {
 		t.Errorf("supported in yes = %d %q %q, want 0 \"true\\n\" and no stderr", code, out, stderr)
+	}
+}
+
+// Inside a checkout Git can't read, with a project marker only above it,
+// supported reports Git's error: it neither offloads to the parent
+// project nor blames a missing .spotexec.toml.
+func TestSupportedUnreadableCheckout(t *testing.T) {
+	supportedEnv(t, sshRunner)
+	t.Setenv("LC_ALL", "C")
+	parent := outsideGit(t)
+	putFile(t, filepath.Join(parent, ".spotexec.toml"), "version = 1\n")
+	repo := filepath.Join(parent, "repo")
+	putFile(t, filepath.Join(repo, ".git"), "garbage\n")
+	putFile(t, filepath.Join(repo, "src", "a.txt"), "a")
+	err := supported(context.Background(), filepath.Join(repo, "src"))
+	if err == nil || !strings.Contains(err.Error(), "invalid gitfile format") || strings.Contains(err.Error(), "no .spotexec.toml") {
+		t.Fatalf("supported = %v; want Git's error", err)
 	}
 }

@@ -131,7 +131,7 @@ func cmdDaemon() *cobra.Command {
 				st, err = nil, errors.New("no current status") // a previous daemon's
 			}
 			if asJSON {
-				return json.NewEncoder(os.Stdout).Encode(map[string]any{"running": pid != 0, "pid": pid, "status": st})
+				return json.NewEncoder(os.Stdout).Encode(map[string]any{"format_version": daemonStatusFormat, "running": pid != 0, "pid": pid, "status": st})
 			}
 			if pid == 0 {
 				fmt.Println("spotexec daemon: not running (start it with `spotexec daemon start`)")

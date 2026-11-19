@@ -35,7 +35,7 @@ less than a day ago is pruned.`,
 				if runs == nil {
 					runs = []client.KeptRun{}
 				}
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"runs": runs})
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"format_version": backupsFormat, "runs": runs})
 			}
 			printKept(cmd.OutOrStdout(), runs, time.Now())
 			return nil

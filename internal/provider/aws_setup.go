@@ -61,7 +61,7 @@ const SpotexecPolicy = `{
     { "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
       "Condition": { "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } } },
     { "Effect": "Allow", "Action": [
-        "s3:CreateBucket", "s3:PutLifecycleConfiguration", "s3:ListBucket",
+        "s3:CreateBucket", "s3:*LifecycleConfiguration", "s3:ListBucket",
         "s3:GetObject", "s3:PutObject"
       ], "Resource": "arn:aws:s3:::spotexec-cache-*" },
     { "Effect": "Allow", "Action": [

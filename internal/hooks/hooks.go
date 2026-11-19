@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/manifest"
 )
 
 // DefaultPatterns match command segments worth offloading.
@@ -1115,7 +1116,7 @@ func CdsInside(command, dir string) bool { return cdsInside(command, dir) }
 func cdsInside(command, dir string) bool {
 	root := dir
 	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
-		root = strings.TrimSpace(string(out))
+		root = manifest.GitPath(out)
 	}
 	if r, err := filepath.EvalSymlinks(root); err == nil {
 		root = r
@@ -1202,7 +1203,7 @@ func project(dir string) (*config.Project, bool) {
 // gitRoot is the worktree containing dir, or dir outside git.
 func gitRoot(dir string) string {
 	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
-		return strings.TrimSpace(string(out))
+		return manifest.GitPath(out)
 	}
 	return dir
 }
@@ -1339,11 +1340,9 @@ func HasLegacyClaude(settingsPath string) bool { return hasForm(settingsPath, ho
 // path than hookCmd is updated to hookCmd's. It reports whether the file
 // changed.
 func InstallClaude(settingsPath, hookCmd string) (bool, error) {
-	settings := map[string]any{}
-	if b, err := os.ReadFile(settingsPath); err == nil && len(strings.TrimSpace(string(b))) > 0 {
-		if err := json.Unmarshal(b, &settings); err != nil {
-			return false, fmt.Errorf("%s is not valid JSON: %w", settingsPath, err)
-		}
+	target, snapshot, settings, err := loadClaudeSettings(settingsPath)
+	if err != nil {
+		return false, err
 	}
 	hooks, _ := settings["hooks"].(map[string]any)
 	if hooks == nil {
@@ -1456,28 +1455,20 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 	}
 	hooks["PreToolUse"] = pre
 	settings["hooks"] = hooks
-	b, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
+	if err := saveClaudeSettings(target, snapshot, settings); err != nil {
 		return false, err
 	}
-	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
-		return false, err
-	}
-	return true, os.WriteFile(settingsPath, append(b, '\n'), 0o644)
+	return true, nil
 }
 
 // UninstallClaude removes spotexec hook entries. A chained hook goes back to
 // the hook it chained (RTK's), which stays installed.
 func UninstallClaude(settingsPath string) (bool, error) {
-	b, err := os.ReadFile(settingsPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
+	target, snapshot, settings, err := loadClaudeSettings(settingsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil // a dangling link: nothing to remove
 	}
-	settings := map[string]any{}
-	if err := json.Unmarshal(b, &settings); err != nil {
+	if err != nil {
 		return false, err
 	}
 	hooks, _ := settings["hooks"].(map[string]any)
@@ -1516,8 +1507,170 @@ func UninstallClaude(settingsPath string) (bool, error) {
 	if len(hooks) == 0 {
 		delete(settings, "hooks")
 	}
-	out, _ := json.MarshalIndent(settings, "", "  ")
-	return true, os.WriteFile(settingsPath, append(out, '\n'), 0o644)
+	if err := saveClaudeSettings(target, snapshot, settings); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// loadClaudeSettings reads a Claude Code settings file for a change, and
+// returns the file to replace: settingsPath, or the file it links to (a
+// dotfiles symlink, say), resolved once so the change lands where it was
+// read. A missing or blank file is an empty document. Any other read error,
+// a dangling link (wrapping os.ErrNotExist), or a document whose top level,
+// hooks, or hooks.PreToolUse isn't the shape Claude Code reads is an error
+// before anything changes: rewriting what couldn't be read would lose the
+// user's settings. Numbers are kept as written. The returned snapshot is the
+// target as read (nil when it didn't exist), for saveClaudeSettings to check
+// it hasn't changed since.
+func loadClaudeSettings(settingsPath string) (target string, snapshot os.FileInfo, settings map[string]any, err error) {
+	target, err = filepath.EvalSymlinks(settingsPath)
+	if err != nil {
+		if _, lerr := os.Lstat(settingsPath); !errors.Is(lerr, os.ErrNotExist) {
+			return "", nil, nil, fmt.Errorf("%s: %w", settingsPath, err)
+		}
+		target = settingsPath // a new file
+	}
+	snapshot, err = os.Stat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return target, nil, map[string]any{}, nil
+	}
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if !snapshot.Mode().IsRegular() { // not a FIFO to block on, nor a device
+		return "", nil, nil, fmt.Errorf("%s is not a regular file", settingsPath)
+	}
+	f, err := os.Open(target)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	defer f.Close()
+	// The snapshot describes the file read, not whatever the path held
+	// a moment before.
+	if snapshot, err = f.Stat(); err != nil {
+		return "", nil, nil, err
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return target, snapshot, map[string]any{}, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var doc any
+	if err := dec.Decode(&doc); err != nil {
+		return "", nil, nil, fmt.Errorf("%s is not valid JSON: %w", settingsPath, err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return "", nil, nil, fmt.Errorf("%s is not valid JSON: data after the top-level value", settingsPath)
+	}
+	settings, ok := doc.(map[string]any)
+	if !ok {
+		return "", nil, nil, fmt.Errorf("%s is not a JSON object", settingsPath)
+	}
+	if h, has := settings["hooks"]; has {
+		hm, ok := h.(map[string]any)
+		if !ok {
+			return "", nil, nil, fmt.Errorf("%s: \"hooks\" is not a JSON object", settingsPath)
+		}
+		if pre, has := hm["PreToolUse"]; has {
+			if _, ok := pre.([]any); !ok {
+				return "", nil, nil, fmt.Errorf("%s: \"hooks.PreToolUse\" is not a JSON array", settingsPath)
+			}
+		}
+	}
+	return target, snapshot, settings, nil
+}
+
+// renameFile replaces a settings file; a test makes it fail. beforeReplace
+// runs just before the check that the file hasn't changed; a test changes it.
+var (
+	renameFile    = os.Rename
+	beforeReplace = func() {}
+)
+
+// saveClaudeSettings replaces target, the file loadClaudeSettings returned,
+// whole: the new document goes to a temporary file beside it, which is
+// renamed over it only once fully written, so an interrupted write never
+// leaves partial JSON. An existing file must be writable, as it had to be
+// when it was rewritten in place, and keeps its permissions; a new one is
+// created 0644 less the umask. If the target changed after it was read (an
+// editor saved it, say), nothing is replaced: the save would undo that
+// change.
+func saveClaudeSettings(target string, snapshot os.FileInfo, settings map[string]any) error {
+	b, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	mode, existed := os.FileMode(0o644), false
+	if fi, err := os.Stat(target); err == nil {
+		mode, existed = fi.Mode().Perm(), true
+		// Renaming over a read-only file would get around its permissions.
+		f, err := os.OpenFile(target, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		f.Close()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := createSettingsTemp(dir, mode)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // a no-op once renamed
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if existed {
+		if err := tmp.Chmod(mode); err != nil {
+			tmp.Close()
+			return err
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	beforeReplace()
+	if now, err := os.Stat(target); !sameSettings(target, snapshot, now, err) {
+		return fmt.Errorf("%s changed while it was being updated; run the command again", target)
+	}
+	return renameFile(tmp.Name(), target)
+}
+
+// sameSettings reports whether a settings file is still the one read: both
+// absent, or the same file with the same size and modification time.
+func sameSettings(name string, was, now os.FileInfo, err error) bool {
+	if was == nil {
+		_, err := os.Lstat(name) // a link made meanwhile isn't absent
+		return errors.Is(err, os.ErrNotExist)
+	}
+	return err == nil && os.SameFile(was, now) && was.Size() == now.Size() && was.ModTime().Equal(now.ModTime())
+}
+
+// createSettingsTemp creates a new hidden file in dir with mode less the
+// umask (os.CreateTemp would always make it 0600).
+func createSettingsTemp(dir string, mode os.FileMode) (*os.File, error) {
+	for i := 0; ; i++ {
+		name := filepath.Join(dir, fmt.Sprintf(".spotexec-%d-%d.tmp", os.Getpid(), time.Now().UnixNano()))
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if err == nil || !errors.Is(err, os.ErrExist) || i == 9 {
+			return f, err
+		}
+	}
 }
 
 // AgentsSnippet is guidance for harnesses without hooks.

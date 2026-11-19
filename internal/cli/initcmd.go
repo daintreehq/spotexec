@@ -223,7 +223,7 @@ func detectProject(root string) (string, []string) {
 	var notes []string
 	b.WriteString("# spotexec project config (commit this). Runners live in ~/.config/spotexec/config.toml.\n")
 	b.WriteString("version = 1\ntimeout = \"5m\"\nenv_allow = [\"NODE_OPTIONS\", \"TZ\"]\n\n")
-	b.WriteString("[sync]\nmode = \"auto\"          # write back files the command changed (prettier --write, vitest -u, codegen)\nwriteback = \"always\"\nexclude = [\".env*\", \"*.pem\", \"*.key\"]\npull_artifacts = []     # e.g. [\"coverage/\"]\n\n")
+	b.WriteString("[sync]\nmode = \"auto\"          # write back files the command changed (prettier --write, vitest -u, codegen)\nwriteback = \"always\"\nexclude = [\".env*\", \"!.env.example\", \"*.pem\", \"*.key\"]  # local secrets; a committed .env.example template still syncs\npull_artifacts = []     # e.g. [\"coverage/\"]\n\n")
 
 	// The same package manager the project container installs.
 	pkg := readPackageJSON(root)
@@ -778,7 +778,10 @@ func cmdHook() *cobra.Command {
 			if asJSON {
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
-				return enc.Encode(res)
+				return enc.Encode(struct {
+					FormatVersion int `json:"format_version"`
+					hooks.Discovery
+				}{discoverFormat, res})
 			}
 			printDiscovery(os.Stdout, res, days, limit)
 			return nil

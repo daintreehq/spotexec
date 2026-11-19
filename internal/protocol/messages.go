@@ -78,6 +78,9 @@ const (
 	// build's output.
 	CodeImageBuildFailed = "IMAGE_BUILD_FAILED"
 	CodeShutdown         = "RUNNER_SHUTTING_DOWN" // the VM began shutting down under the request
+	// CodeWorkRoot: Hello's work root isn't private to the runner user and
+	// the helper can't make it so. Reinstalling the helper doesn't help.
+	CodeWorkRoot = "WORK_ROOT_NOT_PRIVATE"
 )
 
 // BootTailMark ends a BOOTSTRAP_FAILED message's own words: the last lines

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -561,7 +562,7 @@ func cmdStatus() *cobra.Command {
 					if res.Instances == nil {
 						res.Instances = []provider.AccountInstance{}
 					}
-					if err := json.NewEncoder(os.Stdout).Encode(accountStatus{AccountSearch: res, SpotQuotas: quotas}); err != nil {
+					if err := json.NewEncoder(os.Stdout).Encode(newAccountStatus(res, quotas)); err != nil {
 						return err
 					}
 					return res.Err()
@@ -577,7 +578,7 @@ func cmdStatus() *cobra.Command {
 			}
 			sts := gatherStatus(cmd.Context(), rs, newFleetPricer())
 			if asJSON {
-				return json.NewEncoder(os.Stdout).Encode(sts)
+				return writeStatusJSON(os.Stdout, sts)
 			}
 			printStatus(os.Stdout, sts, cfg)
 			if pid := daemon.Running(); pid != 0 {
@@ -589,6 +590,18 @@ func cmdStatus() *cobra.Command {
 	c.Flags().BoolVar(&asJSON, "json", false, "JSON output")
 	c.Flags().BoolVarP(&everyone, "all-machines", "A", false, "every spotexec VM (bake builders and stopped VMs too), whichever machine launched it, in the regions and profiles your AWS runners use, and each region's Spot quota use")
 	return c
+}
+
+// writeStatusJSON is `status --json`: the runners' rows under a format
+// version.
+func writeStatusJSON(w io.Writer, sts []runnerStatus) error {
+	if sts == nil {
+		sts = []runnerStatus{}
+	}
+	return json.NewEncoder(w).Encode(struct {
+		FormatVersion int            `json:"format_version"`
+		Runners       []runnerStatus `json:"runners"`
+	}{statusFormat, sts})
 }
 
 func cmdMonitor() *cobra.Command {
@@ -712,6 +725,10 @@ func cmdUp() *cobra.Command {
 			}
 			p, err := provider.New(r)
 			if err != nil {
+				return err
+			}
+			// Don't launch VMs this machine could never connect to.
+			if err := transport.CheckControlDir(); err != nil {
 				return err
 			}
 			rep, _ := ui.New(ui.ModeAuto, os.Stderr, "")
@@ -1257,7 +1274,8 @@ func cmdSyncPlan() *cobra.Command {
 			}
 			if asJSON {
 				out := map[string]any{
-					"root": m.Root, "git": m.Git, "files": len(m.Entries), "bytes": m.Bytes,
+					"format_version": syncPlanFormat,
+					"root":           m.Root, "git": m.Git, "files": len(m.Entries), "bytes": m.Bytes,
 					"fingerprint": m.Fingerprint, "excluded": m.Excluded, "repo_id": l.ws.RepoID,
 				}
 				if p.Deps.Install != "" {

@@ -67,7 +67,7 @@ func ProjectKeys(p *config.Project, ws *Workspace, m *manifest.Manifest, noDeps 
 	if len(lockfiles) == 0 {
 		return pj, first
 	}
-	spec := depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, OS: goos, Arch: arch}
+	spec := depskey.Spec{Lockfiles: lockfiles, Install: p.Deps.Install, CacheDirs: p.Deps.CacheDirs, OS: goos, Arch: arch, Env: depsEnv(p)}
 	switch {
 	case !c.Enabled():
 		spec.Toolchain = toolchainFor(r, nil)

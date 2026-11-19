@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -198,20 +199,161 @@ func (a *AWSSpot) ensureBucket(ctx context.Context) (string, string, error) {
 	return bucket, acct, nil
 }
 
-// setCacheRule applies the cache bucket's 14-day expiry rule, returning
-// S3's status (0: no answer). It gets its own timeout, so a region that is
-// slow to reach doesn't spend the signing's budget on it.
+// cacheRule is spotexec's lifecycle rule for its cache bucket: archives
+// expire after 14 days, abandoned uploads after one.
+const cacheRule = `<Rule><ID>` + cacheRuleID + `</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>14</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>`
+
+const cacheRuleID = "spotexec-expire"
+
+// setCacheRule adds the cache bucket's expiry rule to its lifecycle
+// configuration, returning S3's status (0: no definite answer; 404: the
+// bucket is gone). S3 replaces the whole configuration on every PUT, so the
+// current one is read first and the rule added to it (#318): an
+// administrator's rules survive. A configuration that already holds a rule
+// by this ID (edited, or even disabled) is left as it is. Anything but a
+// definite read sends nothing, and the rule is tried again next time. It
+// gets its own timeout, so a region that is slow to reach doesn't spend the
+// signing's budget on it.
 func (a *AWSSpot) setCacheRule(ctx context.Context, bucket, acct string) int {
 	ctx, cancel := context.WithTimeout(ctx, cacheRuleTimeout)
 	defer cancel()
-	lifecycle := []byte(`<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>spotexec-expire</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>14</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>`)
-	sum := md5.Sum(lifecycle)
-	hdr := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:]), "x-amz-expected-bucket-owner": acct}
-	st, _, err := a.s3Settled(ctx, http.MethodPut, bucket, "?lifecycle", lifecycle, hdr)
-	if err != nil {
+	owner := map[string]string{"x-amz-expected-bucket-owner": acct}
+	// A change aborted by another one (parts setting the bucket up at once)
+	// reads the configuration again, so a rule added meanwhile is kept.
+	st, b, err := settleAborted(ctx, func() (int, []byte, error) {
+		st, hdr, b, err := a.s3Do(ctx, http.MethodGet, bucket, "?lifecycle", nil, owner)
+		if err != nil {
+			return 0, nil, err
+		}
+		var lifecycle []byte
+		switch {
+		case st == http.StatusOK:
+			var has bool
+			if lifecycle, has, err = withCacheRule(b); err != nil {
+				return 0, nil, nil // not a configuration it can safely extend
+			}
+			if has {
+				return http.StatusOK, nil, nil
+			}
+		case st == http.StatusNotFound && s3ErrorCode(b) == "NoSuchLifecycleConfiguration":
+			lifecycle = []byte(`<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` + cacheRule + `</LifecycleConfiguration>`)
+		case st/100 == 2:
+			return 0, nil, nil // no configuration read
+		default:
+			return st, b, nil // 404 NoSuchBucket, 403 (a key without s3:GetLifecycleConfiguration), 5xx...
+		}
+		sum := md5.Sum(lifecycle)
+		put := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:]), "x-amz-expected-bucket-owner": acct}
+		// Omitted, S3 resets the configuration's default to its own.
+		if v := hdr.Get("x-amz-transition-default-minimum-object-size"); v != "" {
+			put["x-amz-transition-default-minimum-object-size"] = v
+		}
+		return a.s3(ctx, http.MethodPut, bucket, "?lifecycle", lifecycle, put)
+	})
+	if err != nil || st == http.StatusNotFound && s3ErrorCode(b) != "NoSuchBucket" {
 		return 0
 	}
 	return st
+}
+
+// s3ErrorCode is the Code of S3's error document b ("" when b isn't
+// exactly one, read to its end).
+func s3ErrorCode(b []byte) string {
+	var e struct {
+		XMLName xml.Name `xml:"Error"`
+		Code    []string `xml:"Code"`
+	}
+	d := xml.NewDecoder(bytes.NewReader(b))
+	if d.Decode(&e) != nil || len(e.Code) != 1 {
+		return ""
+	}
+	for {
+		tok, err := d.Token()
+		if err == io.EOF {
+			return e.Code[0]
+		}
+		if err != nil {
+			return ""
+		}
+		switch t := tok.(type) {
+		case xml.Comment:
+		case xml.CharData:
+			if len(bytes.TrimSpace(t)) > 0 {
+				return ""
+			}
+		default:
+			return ""
+		}
+	}
+}
+
+// s3LifecycleRules is how many rules a bucket's lifecycle configuration
+// may hold.
+const s3LifecycleRules = 1000
+
+// withCacheRule returns the lifecycle configuration cfg (as S3 returned it)
+// with spotexec's rule added before its closing tag, every other byte kept;
+// has: cfg already holds a rule by that ID, and nothing is added. A
+// document that doesn't parse completely as one LifecycleConfiguration
+// with an unprefixed closing tag, or that has no room for another rule, is
+// an error: a truncated read is never written back.
+func withCacheRule(cfg []byte) (out []byte, has bool, err error) {
+	d := xml.NewDecoder(bytes.NewReader(cfg))
+	var path []string
+	var id strings.Builder
+	end, rules := int64(-1), 0
+	for {
+		at := d.InputOffset()
+		tok, err := d.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if len(path) == 0 && (t.Name.Local != "LifecycleConfiguration" || end >= 0) {
+				return nil, false, fmt.Errorf("unexpected lifecycle element %s", t.Name.Local)
+			}
+			path = append(path, t.Name.Local)
+			if len(path) == 2 && t.Name.Local == "Rule" {
+				rules++
+			}
+			if len(path) == 3 && path[1] == "Rule" && t.Name.Local == "ID" {
+				id.Reset()
+			}
+		case xml.EndElement:
+			if len(path) == 3 && path[1] == "Rule" && path[2] == "ID" && id.String() == cacheRuleID {
+				has = true
+			}
+			path = path[:len(path)-1]
+			if len(path) == 0 {
+				end = at
+			}
+		case xml.CharData:
+			if len(path) == 3 && path[1] == "Rule" && path[2] == "ID" {
+				id.Write(t)
+			}
+			if len(path) == 0 && len(bytes.TrimSpace(t)) > 0 {
+				return nil, false, fmt.Errorf("text outside the lifecycle configuration")
+			}
+		}
+	}
+	// A self-closing or prefixed root would put the rule outside it, or in
+	// no namespace.
+	if end < 0 || len(path) != 0 || !bytes.HasPrefix(cfg[end:], []byte("</LifecycleConfiguration>")) {
+		return nil, false, fmt.Errorf("incomplete lifecycle configuration")
+	}
+	if has {
+		return nil, true, nil
+	}
+	if rules >= s3LifecycleRules {
+		return nil, false, fmt.Errorf("the lifecycle configuration already holds %d rules", rules)
+	}
+	out = make([]byte, 0, len(cfg)+len(cacheRule))
+	out = append(append(append(out, cfg[:end]...), cacheRule...), cfg[end:]...)
+	return out, false, nil
 }
 
 // cacheBucket names the region's cache bucket and the account that must
@@ -266,9 +408,15 @@ var s3OperationAbortedDelay = 500 * time.Millisecond
 // the cache bucket at once (on a machine that hasn't set it up yet) would
 // otherwise lose the shared cache for every part but one.
 func (a *AWSSpot) s3Settled(ctx context.Context, method, bucket, sub string, body []byte, extra map[string]string) (int, []byte, error) {
+	return settleAborted(ctx, func() (int, []byte, error) { return a.s3(ctx, method, bucket, sub, body, extra) })
+}
+
+// settleAborted runs op until S3 stops answering 409 OperationAborted, at
+// most six times, waiting longer before each retry.
+func settleAborted(ctx context.Context, op func() (int, []byte, error)) (int, []byte, error) {
 	delay := s3OperationAbortedDelay
 	for attempt := 1; ; attempt++ {
-		st, b, err := a.s3(ctx, method, bucket, sub, body, extra)
+		st, b, err := op()
 		if err != nil || st != http.StatusConflict || !bytes.Contains(b, []byte("OperationAborted")) || attempt == 6 {
 			return st, b, err
 		}
@@ -292,9 +440,15 @@ func firstLineOf(b []byte) string {
 // s3 performs a signed S3 REST call on bucket (virtual-hosted style).
 // sub is the path+query after the bucket host (e.g. "" or "?lifecycle").
 func (a *AWSSpot) s3(ctx context.Context, method, bucket, sub string, body []byte, extra map[string]string) (int, []byte, error) {
+	st, _, b, err := a.s3Do(ctx, method, bucket, sub, body, extra)
+	return st, b, err
+}
+
+// s3Do is s3, also returning the response's headers.
+func (a *AWSSpot) s3Do(ctx context.Context, method, bucket, sub string, body []byte, extra map[string]string) (int, http.Header, []byte, error) {
 	creds, err := a.api.creds.get(ctx)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	u := "https://" + bucket + ".s3." + a.r.Region + ".amazonaws.com/" + strings.TrimPrefix(sub, "/")
 	if e, ok := a.api.endpoints["s3"]; ok { // tests: path style
@@ -302,7 +456,7 @@ func (a *AWSSpot) s3(ctx context.Context, method, bucket, sub string, body []byt
 	}
 	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	for k, v := range extra {
 		req.Header.Set(k, v)
@@ -311,14 +465,19 @@ func (a *AWSSpot) s3(ctx context.Context, method, bucket, sub string, body []byt
 	signV4(req, body, creds, a.r.Region, "s3", time.Now())
 	resp, err := a.api.http.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	return resp.StatusCode, b, nil
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	if len(b) > 1<<20 {
+		return 0, nil, nil, fmt.Errorf("S3's answer to %s %s is over 1 MiB", method, sub)
+	}
+	return resp.StatusCode, resp.Header, b, nil
 }
 
-// presignS3 builds a SigV4 query-string-authenticated URL (UNSIGNED-PAYLOAD).
 func presignS3Host(c awsCreds, region, host, key, method string, ttl time.Duration, now time.Time) string {
 	return presignS3Owner(c, region, host, key, method, ttl, now, "")
 }
