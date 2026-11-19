@@ -412,6 +412,9 @@ func Run(ctx context.Context, cfg *config.Config, ws *Workspace, o Options) (Res
 		if config.NeverProject(ws.Root) {
 			return Result{}, infra(fmt.Errorf("spotexec never syncs %s: it is your home directory, / or a credential directory (~/.aws, ~/.ssh); cd into a project, or pass --sync none", ws.Root))
 		}
+		if ws.GitErr != nil {
+			return Result{}, infra(ws.GitErr)
+		}
 		return Result{}, infra(fmt.Errorf("%s is not in a Git repository and has no .spotexec.toml, so spotexec won't sync it; run `spotexec init` there to mark it as a project, or pass --sync none", ws.Root))
 	}
 	defer KeepAwake()()

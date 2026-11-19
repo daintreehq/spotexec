@@ -56,7 +56,7 @@ func outsideGit(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(d))
-	if _, isGit := manifest.Root(d); isGit {
+	if _, isGit, _ := manifest.Root(d); isGit {
 		t.Fatalf("%s is inside a Git worktree", d)
 	}
 	if config.NeverProject(d) {

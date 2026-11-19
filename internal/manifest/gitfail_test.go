@@ -90,3 +90,52 @@ func writeFile(t *testing.T, p, s string) {
 		t.Fatal(err)
 	}
 }
+
+// From inside a checkout Git can't read, Root never widens to a project
+// above it: the root is the nearest .spotexec.toml within the checkout,
+// else the checkout itself, with Git's error.
+func TestRootStopsAtUnreadableCheckout(t *testing.T) {
+	isolateGit(t)
+	parent := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(parent))
+	repo := filepath.Join(parent, "repo")
+	writeTree(t, parent, ".spotexec.toml", "repo/sub/deep/x.txt")
+	writeFile(t, filepath.Join(repo, ".git"), "garbage\n")
+	deep := filepath.Join(repo, "sub", "deep")
+
+	r, isGit, err := Root(deep)
+	if r != repo || isGit || err == nil || !strings.Contains(err.Error(), "invalid gitfile format") {
+		t.Fatalf("Root = %s, %v, %v; want the checkout and Git's error", r, isGit, err)
+	}
+	writeTree(t, repo, "sub/.spotexec.toml")
+	sub := filepath.Join(repo, "sub")
+	if r, isGit, err = Root(deep); r != sub || isGit || err == nil {
+		t.Fatalf("Root = %s, %v, %v; want the project inside the checkout and Git's error", r, isGit, err)
+	}
+	// Outside the checkout nothing changes.
+	if r, _, err = Root(parent); r != parent || err != nil {
+		t.Fatalf("Root(parent) = %s, %v", r, err)
+	}
+}
+
+// A repository Git is told to ignore (GIT_CEILING_DIRECTORIES) doesn't make
+// a project below it an unreadable checkout: it walks as a plain directory.
+func TestCeilingHidesOuterRepository(t *testing.T) {
+	isolateGit(t)
+	outer := t.TempDir()
+	gitIn(t, outer, "init", "-q")
+	sub := filepath.Join(outer, "sub")
+	writeTree(t, sub, ".spotexec.toml", "a.txt")
+	t.Setenv("GIT_CEILING_DIRECTORIES", outer)
+	r, isGit, err := Root(sub)
+	if r != sub || isGit || err != nil {
+		t.Fatalf("Root = %s, %v, %v; want the plain project", r, isGit, err)
+	}
+	m, err := Build(context.Background(), Options{Root: sub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Git || paths(m) != ".spotexec.toml a.txt" {
+		t.Errorf("Build = git %v, %q", m.Git, paths(m))
+	}
+}

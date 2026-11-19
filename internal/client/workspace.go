@@ -36,6 +36,9 @@ type Workspace struct {
 	// spotexec was started in, which must not be synced wholesale (it may
 	// be $HOME, holding ~/.aws and ~/.ssh).
 	Marked bool
+	// GitErr: Root is (inside) a Git checkout that git could not read, so
+	// it isn't a plain directory either; automatic sync is refused.
+	GitErr error
 }
 
 var nonAlnum = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
@@ -49,8 +52,8 @@ func Resolve(dir string) (*Workspace, error) {
 	if r, err := filepath.EvalSymlinks(abs); err == nil {
 		abs = r
 	}
-	root, isGit := manifest.Root(abs)
-	w := &Workspace{Root: root, Git: isGit}
+	root, isGit, gitErr := manifest.Root(abs)
+	w := &Workspace{Root: root, Git: isGit, GitErr: gitErr}
 	if _, err := os.Stat(filepath.Join(root, ".spotexec.toml")); (err == nil || isGit) && !config.NeverProject(root) {
 		w.Marked = true
 	}

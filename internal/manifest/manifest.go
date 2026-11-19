@@ -144,8 +144,11 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 		// would drop .git/info/exclude and the global excludes, and sync
 		// a different set of files than Git would.
 		if gitErr != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if dir := checkoutAbove(o.Root); dir != "" {
-				return nil, fmt.Errorf("%s holds a Git checkout (%s) that git could not read: %w; fix Git there, or set sync.source = \"directory\" in .spotexec.toml to sync it as a plain directory", o.Root, filepath.Join(dir, ".git"), gitErr)
+				return nil, unreadableCheckout(dir, gitErr)
 			}
 		}
 	}
@@ -545,16 +548,38 @@ func isGitWorktree(ctx context.Context, root string) (bool, error) {
 }
 
 // checkoutAbove is the nearest directory at or above dir holding a .git
-// entry (a directory, or a linked worktree's gitfile), or "".
+// entry (a directory, or a linked worktree's gitfile), or "". Like Git's
+// own discovery it never climbs into a GIT_CEILING_DIRECTORIES entry, so a
+// repository hidden that way doesn't count.
 func checkoutAbove(dir string) string {
-	for d := dir; ; d = filepath.Dir(d) {
+	ceiling := map[string]bool{}
+	for _, c := range filepath.SplitList(os.Getenv("GIT_CEILING_DIRECTORIES")) {
+		if c == "" || !filepath.IsAbs(c) {
+			continue
+		}
+		ceiling[filepath.Clean(c)] = true
+		if r, err := filepath.EvalSymlinks(c); err == nil {
+			ceiling[r] = true
+		}
+	}
+	for d := dir; ; {
 		if _, err := os.Lstat(filepath.Join(d, ".git")); err == nil {
 			return d
 		}
-		if d == filepath.Dir(d) {
+		up := filepath.Dir(d)
+		if up == d || ceiling[up] {
 			return ""
 		}
+		d = up
 	}
+}
+
+// unreadableCheckout is the error for the Git checkout at dir that git
+// failed to inspect (dubious ownership, a broken gitfile, no git binary):
+// it is not a plain directory, so automatic sync refuses it rather than
+// walking it, which would drop .git/info/exclude and the global excludes.
+func unreadableCheckout(dir string, gitErr error) error {
+	return fmt.Errorf("%s is a Git checkout that git could not read (%w); fix Git there, or set sync.source = \"directory\" in its .spotexec.toml to sync it as a plain directory", dir, gitErr)
 }
 
 func git(ctx context.Context, dir string, args ...string) ([]byte, error) {
@@ -583,21 +608,35 @@ func must(s string, err error) string {
 // Root resolves the worktree root containing dir: the Git toplevel when inside
 // a repository, else the directory holding .spotexec.toml (never the home
 // directory or /, see config.NeverProject), else dir itself.
-func Root(dir string) (string, bool) {
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
-	if err == nil {
+//
+// When git fails but dir is inside a checkout (a .git entry at or above
+// it), the search for .spotexec.toml stops at the checkout, so a broken
+// checkout never widens to a project above it: the root is the nearest
+// .spotexec.toml within the checkout, else the checkout itself, and the
+// error says why Git can't be used there.
+func Root(dir string) (string, bool, error) {
+	out, gitErr := git(context.Background(), dir, "rev-parse", "--show-toplevel")
+	if gitErr == nil {
 		r := GitPath(out)
 		if rr, err := filepath.EvalSymlinks(r); err == nil {
 			r = rr
 		}
-		return r, true
+		return r, true, nil
+	}
+	checkout := checkoutAbove(dir)
+	var unreadable error
+	if checkout != "" {
+		unreadable = unreadableCheckout(checkout, gitErr)
 	}
 	for d := dir; ; d = filepath.Dir(d) {
 		if _, err := os.Stat(filepath.Join(d, ".spotexec.toml")); err == nil && !config.NeverProject(d) {
-			return d, false
+			return d, false, unreadable
+		}
+		if d == checkout {
+			return d, false, unreadable
 		}
 		if d == filepath.Dir(d) {
-			return dir, false
+			return dir, false, unreadable
 		}
 	}
 }
