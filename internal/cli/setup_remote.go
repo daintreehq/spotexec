@@ -335,6 +335,15 @@ type installed struct {
 
 const localBin = `"$HOME/.local/bin/spotexec"`
 
+// publishStaged ends an install script that staged a checked spotexec in
+// "$t", a directory inside "$d": the binary and a fresh sx link are each
+// renamed into place, so a concurrent setup never sees either missing or
+// half written. Moving them into "$d/" by name replaces an sx that links to
+// a directory instead of descending into it; a real directory there is
+// refused before anything is replaced.
+const publishStaged = `if [ -d "$d/sx" ] && [ ! -L "$d/sx" ]; then echo "$d/sx is a directory, not spotexec's link" >&2; exit 1; fi; ` +
+	`ln -s spotexec "$t/sx"; mv -f "$t/spotexec" "$d/"; mv -f "$t/sx" "$d/"`
+
 // selfBinary opens the running spotexec, which --install copy sends over,
 // and gives its size.
 var selfBinary = func() (io.ReadCloser, int64, error) {
@@ -460,7 +469,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 			`[ "${s%% *}" = `+shq(sum)+` ] || { echo "the download doesn't match the release's checksum (got ${s%% *})" >&2; exit 1; }; `+
 			`tar -xzf "$t/a.tar.gz" -C "$t" spotexec; `+
 			`v=$("$t/spotexec" version 2>&1) && [ "$v" = `+shq("spotexec "+want)+` ] || { echo "the downloaded spotexec doesn't run: $v" >&2; exit 1; }; `+
-			`mv -f "$t/spotexec" "$d/spotexec"; ln -sf spotexec "$d/sx"`, nil); err != nil {
+			publishStaged, nil); err != nil {
 			return installed{}, fmt.Errorf("installing %s: %w", url, err)
 		}
 		return installed{bin: localBin, dir: "$HOME/.local/bin", how: "release " + tag + " in ~/.local/bin", want: want}, nil
@@ -468,16 +477,23 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 		if i.os != runtime.GOOS || i.arch != runtime.GOARCH {
 			return installed{}, fmt.Errorf("--install copy needs the same platform (this is %s/%s, that is %s/%s)", runtime.GOOS, runtime.GOARCH, i.os, i.arch)
 		}
-		f, _, err := selfBinary()
+		f, size, err := selfBinary()
 		if err != nil {
 			return installed{}, err
 		}
 		defer f.Close()
 		r.printf("  copying this spotexec (%s) into ~/.local/bin…\n", Version)
-		if _, err := r.run(ctx, `set -e; mkdir -p "$HOME/.local/bin"; cat > "$HOME/.local/bin/.spotexec.tmp"; `+
-			`chmod 755 "$HOME/.local/bin/.spotexec.tmp"; mv "$HOME/.local/bin/.spotexec.tmp" "$HOME/.local/bin/spotexec"; `+
-			`ln -sf spotexec "$HOME/.local/bin/sx"`, f); err != nil {
-			return installed{}, err
+		// Staged in a directory of its own next to the old one, so setups
+		// running at the same time never write the same file, and moved
+		// into place only once the whole copy arrived and runs.
+		n := strconv.FormatInt(size, 10)
+		if _, err := r.run(ctx, `set -e; d="$HOME/.local/bin"; mkdir -p "$d"; t=$(mktemp -d "$d/.spotexec-install.XXXXXX"); trap 'rm -rf "$t"' EXIT; `+
+			`cat > "$t/spotexec"; `+
+			`n=$(wc -c < "$t/spotexec"); [ $n -eq `+n+` ] || { echo "the copy arrived incomplete ($n of `+n+` bytes)" >&2; exit 1; }; `+
+			`chmod 755 "$t/spotexec"; `+
+			`v=$("$t/spotexec" version 2>&1) && [ "$v" = `+shq("spotexec "+Version)+` ] || { echo "the copied spotexec doesn't run: $v" >&2; exit 1; }; `+
+			publishStaged, f); err != nil {
+			return installed{}, fmt.Errorf("copying spotexec there: %w", err)
 		}
 		return installed{bin: localBin, dir: "$HOME/.local/bin", how: "copied from this machine into ~/.local/bin", want: Version}, nil
 	case "none":

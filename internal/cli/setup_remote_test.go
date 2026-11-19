@@ -1092,10 +1092,22 @@ func TestRemoteInstallCopyConcurrent(t *testing.T) {
 	f := newFakeHost(t, t.TempDir())
 	f.localInstalled("0.1.0")
 	bin := filepath.Join(f.home, ".local", "bin")
+	// An sx that links to a directory is replaced, not descended into.
+	other := filepath.Join(f.dir, "other")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(bin, "sx")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, filepath.Join(bin, "sx")); err != nil {
+		t.Fatal(err)
+	}
 	stub := strings.Replace(fakeSpotexec, "VERSION", Version, 1)
 	a := stub + "# installer A\n"
 	b := stub + "# installer B, which has a longer body\n"
 	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.CloseWithError(errors.New("test over")) })
 	copyFrom(t, sizedReader{pr, len(a)}, strings.NewReader(b))
 	i, err := f.setup().probe(context.Background())
 	if err != nil {
@@ -1133,6 +1145,35 @@ func TestRemoteInstallCopyConcurrent(t *testing.T) {
 	}
 	if v := versionAt(t, filepath.Join(bin, "sx")); v != Version {
 		t.Fatalf("sx runs as %q", v)
+	}
+	if left := hiddenEntries(t, bin); len(left) > 0 {
+		t.Fatalf("left %v", left)
+	}
+	if es, _ := os.ReadDir(other); len(es) > 0 {
+		t.Fatalf("wrote into the directory sx linked to: %v", es)
+	}
+}
+
+// A real directory where the sx link goes stops the install before the
+// old spotexec is replaced.
+func TestRemoteInstallCopySxDirectory(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	f.localInstalled("0.1.0")
+	bin := filepath.Join(f.home, ".local", "bin")
+	if err := os.Remove(filepath.Join(bin, "sx")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(bin, "sx"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	copyFrom(t, strings.NewReader(strings.Replace(fakeSpotexec, "VERSION", Version, 1)))
+	r := f.setup()
+	r.install = "copy"
+	if _, err := f.install(r); err == nil || !strings.Contains(err.Error(), "is a directory") {
+		t.Fatalf("err = %v", err)
+	}
+	if v := versionAt(t, filepath.Join(bin, "spotexec")); v != "0.1.0" {
+		t.Fatalf("~/.local/bin has %q", v)
 	}
 	if left := hiddenEntries(t, bin); len(left) > 0 {
 		t.Fatalf("left %v", left)
