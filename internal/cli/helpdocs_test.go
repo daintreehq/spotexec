@@ -61,7 +61,12 @@ func TestEveryDocIsAPageOrAContributorDoc(t *testing.T) {
 // Every shipped page opens through spotexec help, with no Markdown link left
 // for a terminal reader to follow.
 func TestEveryPageOpensAsPlainText(t *testing.T) {
-	mdLink := regexp.MustCompile(`\]\([^)]*\)|[A-Za-z_-]+\.md\b`)
+	entries, _ := docs.Files.ReadDir(".")
+	var files []string
+	for _, e := range entries {
+		files = append(files, regexp.QuoteMeta(e.Name()))
+	}
+	mdLink := regexp.MustCompile(`\]\([^)]*\)|\b(` + strings.Join(files, "|") + `)\b`)
 	for _, p := range docPages {
 		code, out, stderr := helpOut(t, "spotexec", "help", p.name)
 		if code != 0 || stderr != "" {
