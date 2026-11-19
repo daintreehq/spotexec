@@ -528,11 +528,19 @@ func deleteIAMUser(ctx context.Context, admin *awsClient, user string, log func(
 }
 
 // deleteBucket empties a cache bucket and deletes it, asserting at every
-// step that the account owns it.
+// step that the account owns it. It lists versions rather than keys and
+// deletes each by its version ID: on a bucket someone turned versioning on
+// for, deleting a key only adds a delete marker, and S3 won't delete a
+// bucket while any version or marker is left. An unversioned bucket lists
+// each object once, as version "null". Each batch deletes everything its
+// listing returned, so the next listing starts from the beginning again and
+// the bucket goes only once a listing comes back empty.
 func deleteBucket(ctx context.Context, c *awsClient, bucket, region, account string) error {
 	owner := map[string]string{"x-amz-expected-bucket-owner": account}
-	q := url.Values{"list-type": {"2"}, "max-keys": {"1000"}}
-	for page := 0; page < 100000; page++ {
+	var last map[s3Version]bool // what the previous batch deleted
+	reuploads := 0
+	for batch := 0; ; batch++ {
+		q := url.Values{"versions": {""}, "max-keys": {"1000"}}
 		st, b, err := s3Call(ctx, c, region, http.MethodGet, bucket, "/", q, nil, owner)
 		if err != nil {
 			return err
@@ -541,50 +549,50 @@ func deleteBucket(ctx context.Context, c *awsClient, bucket, region, account str
 			return nil
 		}
 		if st != 200 {
-			return fmt.Errorf("listing objects: HTTP %d: %s", st, firstLineOf(b))
+			return fmt.Errorf("listing object versions: HTTP %d: %s", st, firstLineOf(b))
 		}
 		var v struct {
-			Keys []string `xml:"Contents>Key"`
-			Next string   `xml:"NextContinuationToken"`
+			Versions []s3Version `xml:"Version"`
+			Markers  []s3Version `xml:"DeleteMarker"`
 		}
 		if err := xml.Unmarshal(b, &v); err != nil {
-			return err
+			return fmt.Errorf("listing object versions: %w", err)
 		}
-		if len(v.Keys) > 0 {
-			var body bytes.Buffer
-			body.WriteString(`<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Quiet>true</Quiet>`)
-			for _, k := range v.Keys {
-				body.WriteString("<Object><Key>")
-				_ = xml.EscapeText(&body, []byte(k))
-				body.WriteString("</Key></Object>")
-			}
-			body.WriteString("</Delete>")
-			sum := md5.Sum(body.Bytes())
-			hdr := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:]), "Content-Type": "application/xml"}
-			for k, val := range owner {
-				hdr[k] = val
-			}
-			st, b, err := s3Call(ctx, c, region, http.MethodPost, bucket, "/", url.Values{"delete": {""}}, body.Bytes(), hdr)
-			if err != nil {
-				return err
-			}
-			if st != 200 {
-				return fmt.Errorf("deleting objects: HTTP %d: %s", st, firstLineOf(b))
-			}
-			var res struct {
-				Errors []struct {
-					Key  string `xml:"Key"`
-					Code string `xml:"Code"`
-				} `xml:"Error"`
-			}
-			if xml.Unmarshal(b, &res) == nil && len(res.Errors) > 0 {
-				return fmt.Errorf("couldn't delete %d object(s), e.g. %s (%s)", len(res.Errors), res.Errors[0].Key, res.Errors[0].Code)
-			}
-		}
-		if v.Next == "" {
+		if len(v.Versions)+len(v.Markers) == 0 {
 			break
 		}
-		q.Set("continuation-token", v.Next)
+		if batch == 100000 {
+			return errors.New("still not empty after 100000 batches of deletes")
+		}
+		for _, e := range append(v.Versions, v.Markers...) {
+			if e.VersionID == "" {
+				// A key-only delete would just add a delete marker.
+				return fmt.Errorf("listing object versions: %s has no version ID", e.Key)
+			}
+			if !last[e] {
+				continue
+			}
+			// A machine still uploading can put a "null" version back
+			// under the same ID, a few times; anything else listed again
+			// means the deletes aren't taking.
+			if e.VersionID != "null" {
+				return fmt.Errorf("%s version %s is still listed after it was deleted", e.Key, e.VersionID)
+			}
+			if reuploads++; reuploads > 100 {
+				return fmt.Errorf("objects such as %s keep being uploaded again as they're deleted: stop the machines using the cache and re-run", e.Key)
+			}
+		}
+		// Data first: a marker goes only once the versions it may hide
+		// are gone, so one S3 won't delete (Object Lock) stays hidden.
+		for _, part := range [][]s3Version{v.Versions, v.Markers} {
+			if err := deleteVersions(ctx, c, bucket, region, owner, part); err != nil {
+				return err
+			}
+		}
+		last = make(map[s3Version]bool, len(v.Versions)+len(v.Markers))
+		for _, e := range append(v.Versions, v.Markers...) {
+			last[e] = true
+		}
 	}
 	st, b, err := s3Call(ctx, c, region, http.MethodDelete, bucket, "/", nil, nil, owner)
 	if err != nil {
@@ -592,6 +600,61 @@ func deleteBucket(ctx context.Context, c *awsClient, bucket, region, account str
 	}
 	if st/100 != 2 && st != 404 {
 		return fmt.Errorf("HTTP %d: %s", st, firstLineOf(b))
+	}
+	return nil
+}
+
+// s3Version is an object version or delete marker in a ListObjectVersions
+// result.
+type s3Version struct {
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId"`
+}
+
+// deleteVersions deletes up to 1000 object versions in one DeleteObjects
+// call, failing on any S3 refuses.
+func deleteVersions(ctx context.Context, c *awsClient, bucket, region string, owner map[string]string, vs []s3Version) error {
+	if len(vs) == 0 {
+		return nil
+	}
+	var body bytes.Buffer
+	body.WriteString(`<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Quiet>true</Quiet>`)
+	for _, e := range vs {
+		body.WriteString("<Object><Key>")
+		_ = xml.EscapeText(&body, []byte(e.Key))
+		body.WriteString("</Key><VersionId>")
+		_ = xml.EscapeText(&body, []byte(e.VersionID))
+		body.WriteString("</VersionId></Object>")
+	}
+	body.WriteString("</Delete>")
+	sum := md5.Sum(body.Bytes())
+	hdr := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:]), "Content-Type": "application/xml"}
+	for k, val := range owner {
+		hdr[k] = val
+	}
+	st, b, err := s3Call(ctx, c, region, http.MethodPost, bucket, "/", url.Values{"delete": {""}}, body.Bytes(), hdr)
+	if err != nil {
+		return err
+	}
+	if st != 200 {
+		return fmt.Errorf("deleting object versions: HTTP %d: %s", st, firstLineOf(b))
+	}
+	var res struct {
+		Errors []struct {
+			Key       string `xml:"Key"`
+			VersionID string `xml:"VersionId"`
+			Code      string `xml:"Code"`
+			Message   string `xml:"Message"`
+		} `xml:"Error"`
+	}
+	if err := xml.Unmarshal(b, &res); err != nil {
+		return fmt.Errorf("deleting object versions: %w", err)
+	}
+	if len(res.Errors) > 0 {
+		// Object Lock retention, a legal hold or MFA delete: the bucket
+		// can't be emptied until it's lifted.
+		e := res.Errors[0]
+		return fmt.Errorf("couldn't delete %d object version(s), e.g. %s version %s: %s (%s)", len(res.Errors), e.Key, e.VersionID, e.Message, e.Code)
 	}
 	return nil
 }
