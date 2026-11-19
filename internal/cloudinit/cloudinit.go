@@ -203,10 +203,35 @@ WantedBy=timers.target
 UNIT
 systemctl daemon-reload
 systemctl enable --now spotexec-watchdog.timer
-# Independent backstop in case the timer unit is ever broken.
-# No default dependencies, and SIGTERM ignored: shutdown must not stop the
-# timer before it fires, nor kill the forced poweroff that backs it up.
-systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependencies=no --timer-property=DefaultDependencies=no /bin/sh -c 'trap "" TERM HUP; touch /var/tmp/spotexec/draining; {{.SelfDestruct}}; sleep 120; poweroff -f' >/dev/null 2>&1 || true
+{{- /*
+  An independent backstop in case the timer unit is ever broken. No
+  default dependencies, and SIGTERM ignored: shutdown must not stop the
+  timer before it fires, nor kill the forced poweroff that backs it up.
+*/}}
+systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependencies=no --timer-property=DefaultDependencies=no /bin/sh -c 'trap "" TERM HUP; touch /var/tmp/spotexec/draining; {{.SelfDestruct}}; sleep 120; poweroff -f' >/dev/null 2>&1 || ML=0
+{{- /*
+  A VM is never ready without both shutdown timers scheduled (#321): a
+  custom image whose systemd can't run them would bill until someone
+  noticed. Checked once armed, so a broken one ends before the bootstrap
+  runs, and again before ready is written. An elapsed max-lifetime timer
+  ("active", but spent) doesn't count, nor one this boot didn't create
+  (systemd-run failed: a unit of that name was already there). The failure is recorded as a
+  failed boot (a non-zero ready, the bootstrap's own status if it had
+  one), then the VM ends itself as the watchdog would.
+*/}}
+sx_timers() {
+  local u; [ "${ML:-1}" = 1 ] || return 1; for u in watchdog maxlife; do case "$(systemctl show -p SubState spotexec-$u.timer 2>/dev/null)" in SubState=waiting|SubState=running) ;; *) return 1 ;; esac; done
+}
+sx_unarmed() {
+  echo "spotexec: the shutdown timers aren't running; shutting down" | tee -a /var/log/spotexec-bootstrap.log >&2
+  logger -t spotexec "shutdown timers not running" 2>/dev/null
+  [ "${status:-0}" != 0 ] || status=1
+  echo "$status" > "$D/ready"
+  {{.SelfDestruct}}
+  sleep 120; poweroff -f
+  exit 1
+}
+sx_timers || sx_unarmed
 
 {{- if .WorkVolumeBytes}}
 {{- /*
@@ -262,20 +287,22 @@ touch "$D/activity"; exec 7<&-
 
 # ---- 2. SSH access for the spotexec-managed key ----
 U={{.User}}
-# Public-key logins as the runner user only, whatever the image's sshd
-# defaults. sshd keeps the first value it reads, so these go in a drop-in
-# that sorts first (cloud-init's 50-cloud-init.conf may allow passwords), or
-# at the top of sshd_config if a setting before its Include (or no Include)
-# still wins. An sshd that rejects them (an explicit "AuthenticationMethods
-# any") is retried without AuthenticationMethods, then left as the image had
-# it: the key is never locked out. What may still allow more (Match blocks,
-# other AllowUsers) is logged. A root runner user may log in with its key.
-# Many agents may connect at once; the default MaxStartups (10:30:100) would
-# drop some handshakes. Every run from one machine shares its ControlMaster
-# connection, so MaxSessions (default 10 channels per connection) must allow
-# all slots plus status probes and helper uploads. ClientAlive: a vanished
-# client (laptop asleep) is dropped in ~90s, so its session stops holding
-# the lifecycle lock and the idle clock can run.
+{{- /*
+  Public-key logins as the runner user only, whatever the image's sshd
+  defaults. sshd keeps the first value it reads, so these go in a drop-in
+  that sorts first (cloud-init's 50-cloud-init.conf may allow passwords), or
+  at the top of sshd_config if a setting before its Include (or no Include)
+  still wins. An sshd that rejects them (an explicit "AuthenticationMethods
+  any") is retried without AuthenticationMethods, then left as the image had
+  it: the key is never locked out. What may still allow more (Match blocks,
+  other AllowUsers) is logged. A root runner user may log in with its key.
+  Many agents may connect at once; the default MaxStartups (10:30:100) would
+  drop some handshakes. Every run from one machine shares its ControlMaster
+  connection, so MaxSessions (default 10 channels per connection) must allow
+  all slots plus status probes and helper uploads. ClientAlive: a vanished
+  client (laptop asleep) is dropped in ~90s, so its session stops holding
+  the lifecycle lock and the idle clock can run.
+*/}}
 C=/etc/ssh/sshd_config F=/etc/ssh/sshd_config.d/00-spotexec.conf S=/usr/sbin/sshd L=/var/log/spotexec-bootstrap.log
 R=no RT=no; [ "$U" = root ] && R=prohibit-password RT=without-password
 printf '%s\n' 'AuthenticationMethods publickey' 'PubkeyAuthentication yes' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'ChallengeResponseAuthentication no' 'HostbasedAuthentication no' 'GSSAPIAuthentication no' 'PermitEmptyPasswords no' "PermitRootLogin $R" "AllowUsers $U" 'MaxStartups 100:30:200' 'MaxSessions 256' 'ClientAliveInterval 30' 'ClientAliveCountMax 3' > "$D/sshd.conf"
@@ -367,6 +394,7 @@ echo "spotexec: first-boot setup finished (exit $status)" >>"$B"
 chmod 0640 /var/log/spotexec-bootstrap.log 2>/dev/null || true
 touch "$D/activity"
 exec 8<&-
+sx_timers || sx_unarmed
 echo "$status" > "$D/ready"
 `))
 
