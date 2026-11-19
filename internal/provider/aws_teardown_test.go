@@ -45,6 +45,7 @@ type fakeCloud struct {
 	failRepo  map[string]bool             // DeleteRepository fails
 	busySG    map[string]int              // DependencyViolation this many times
 	deleted   []string                    // "kind id", in order
+	dropTried []string                    // every DeleteBucket call, successful or not
 	s3owner   []string                    // x-amz-expected-bucket-owner seen
 	listedIn  []string                    // the region each ListBuckets call was signed for
 }
@@ -179,6 +180,7 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 			}
 			fmt.Fprint(w, `</DeleteResult>`)
 		case r.Method == http.MethodDelete:
+			c.dropTried = append(c.dropTried, bucket)
 			if len(c.buckets[bucket]) > 0 || len(c.versions[bucket]) > 0 {
 				w.WriteHeader(409)
 				fmt.Fprint(w, `<Error><Code>BucketNotEmpty</Code></Error>`)
@@ -529,6 +531,8 @@ func TestTeardownVersionedBucket(t *testing.T) {
 		{key: "repo/b & c.tar", id: "v<1>&"},
 		{key: "repo/b & c.tar", id: "dm-b", marker: true},
 		{key: "repo/c.tar", id: "v2"},
+		{key: "repo/c.tar", id: "v3"},
+		{key: "repo/c.tar", id: "dm-c", marker: true},
 	}
 	c.versions[west] = []fakeObjVersion{{key: "repo/w.tar", id: "v0"}}
 	p, err := PlanTeardown(context.Background(), "admin", nil)
@@ -562,8 +566,13 @@ func TestTeardownLockedVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = p.Apply(context.Background(), t.Logf)
-	if err == nil || !strings.Contains(err.Error(), "S3 bucket "+b) || !strings.Contains(err.Error(), "repo/held.tar version v-held") || !strings.Contains(err.Error(), "object lock") {
+	if err == nil || !strings.Contains(err.Error(), "S3 bucket "+b) || !strings.Contains(err.Error(), "repo/held.tar version v-held: Access Denied because object protected by object lock. (AccessDenied)") {
 		t.Fatalf("err = %v", err)
+	}
+	for _, d := range c.dropTried {
+		if d == b {
+			t.Fatalf("DeleteBucket tried on a bucket that isn't empty: %v", c.dropTried)
+		}
 	}
 	if len(c.buckets[b]) > 0 || len(c.versions[b]) != 1 || c.versions[b][0].id != "v-held" {
 		t.Fatalf("bucket left with %v %v", c.buckets[b], c.versions[b])
