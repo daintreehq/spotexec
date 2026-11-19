@@ -200,6 +200,11 @@ func checkPolicyScopes(t *testing.T, region string) {
 		{"s3:CreateBucket", bucket, true},
 		{"s3:ListBucket", bucket, true},
 		{"s3:PutLifecycleConfiguration", bucket, true},
+		{"s3:GetLifecycleConfiguration", bucket, true}, // read first, to keep other rules (#318)
+		{"s3:GetLifecycleConfiguration", pre + "s3:::my-team-cache", false},
+		{"s3:GetLifecycleConfiguration", pre + "s3:::spotexec-logs", false},
+		{"s3:PutLifecycleConfiguration", pre + "s3:::spotexec-logs", false},
+		{"s3:PutBucketPolicy", bucket, false},
 		{"s3:GetObject", bucket + "/repo/key.tar", true},
 		{"s3:PutObject", bucket + "/repo/key.tar", true},
 		{"s3:GetObject", pre + "s3:::my-team-cache/repo/key.tar", false},

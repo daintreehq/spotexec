@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
@@ -42,7 +45,12 @@ func fakeCacheBucketAWS(t *testing.T, lifecycle func(attempt int) (int, string))
 			nhead++
 			mu.Unlock()
 			return resp(200, "")
+		case r.Method == http.MethodGet && r.URL.RawQuery == "lifecycle":
+			return resp(404, noLifecycle)
 		case r.Method == http.MethodPut && r.URL.RawQuery == "lifecycle":
+			if b, _ := io.ReadAll(r.Body); string(b) != `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`+wantCacheRule+`</LifecycleConfiguration>` {
+				t.Errorf("lifecycle PUT %s: want spotexec's rule alone, there being no configuration", b)
+			}
 			mu.Lock()
 			nput++
 			n := nput
@@ -60,6 +68,11 @@ func fakeCacheBucketAWS(t *testing.T, lifecycle func(attempt int) (int, string))
 	}
 	return a, func() int { mu.Lock(); defer mu.Unlock(); return nput }, func() int { mu.Lock(); defer mu.Unlock(); return nhead }
 }
+
+// wantCacheRule is spotexec's rule, spelled out apart from the code's own.
+const wantCacheRule = `<Rule><ID>spotexec-expire</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>14</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>`
+
+const noLifecycle = `<Error><Code>NoSuchLifecycleConfiguration</Code><Message>The lifecycle configuration does not exist</Message></Error>`
 
 const s3OperationAborted = `<Error><Code>OperationAborted</Code><Message>A conflicting conditional operation is currently in progress against this resource. Please try again.</Message></Error>`
 
@@ -243,8 +256,8 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 	const identity = `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`
 	for _, tc := range []struct {
 		name         string
-		sts, head    string // "ok", "fail", "hang" or "503"
-		rule         string
+		sts, head    string   // "ok", "fail", "hang" or "503"
+		rule, write  string   // the rule's read and its write ("" = ok)
 		heads, rules int      // calls made by two lookups
 		stsAsked     []string // STS regions asked, in order
 		budget       time.Duration
@@ -258,6 +271,7 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 		// timeout.
 		{name: "expiry rule fails", sts: "ok", head: "ok", rule: "fail", heads: 1, rules: 2},
 		{name: "expiry rule hangs", sts: "ok", head: "ok", rule: "hang", heads: 1, rules: 2},
+		{name: "expiry rule's write hangs", sts: "ok", head: "ok", rule: "ok", write: "hang", heads: 1, rules: 2},
 		// The account comes from the partition's home region, after the
 		// runner's own region gets its bounded turn.
 		{name: "regional STS hangs", sts: "hang", head: "ok", rule: "ok", heads: 1, rules: 1, stsAsked: []string{"ap-south-1", "us-east-1"}},
@@ -310,9 +324,14 @@ func TestCacheURLsSurviveAnUnreachableRegion(t *testing.T) {
 				case r.Method == http.MethodHead:
 					heads.Add(1)
 					return act(tc.head)
-				case r.Method == http.MethodPut && r.URL.RawQuery == "lifecycle":
+				case r.Method == http.MethodGet && r.URL.RawQuery == "lifecycle":
 					rules.Add(1)
+					if tc.rule == "ok" {
+						return resp(404, noLifecycle)
+					}
 					return act(tc.rule)
+				case r.Method == http.MethodPut && r.URL.RawQuery == "lifecycle":
+					return act(tc.write)
 				}
 				t.Errorf("unexpected request %s %s", r.Method, r.URL)
 				return resp(500, "")
@@ -419,7 +438,7 @@ func TestEnsureBucketForgetsADeletedBucket(t *testing.T) {
 				return resp(200, "")
 			}
 			return resp(404, "") // deleted
-		case r.Method == http.MethodPut && r.URL.RawQuery == "lifecycle":
+		case r.Method == http.MethodGet && r.URL.RawQuery == "lifecycle":
 			rules++
 			switch rules {
 			case 1:
@@ -427,6 +446,8 @@ func TestEnsureBucketForgetsADeletedBucket(t *testing.T) {
 			case 2:
 				return resp(404, `<Error><Code>NoSuchBucket</Code></Error>`)
 			}
+			return resp(404, noLifecycle)
+		case r.Method == http.MethodPut && r.URL.RawQuery == "lifecycle":
 			return resp(200, "")
 		case r.Method == http.MethodPut:
 			creates++
@@ -449,5 +470,260 @@ func TestEnsureBucketForgetsADeletedBucket(t *testing.T) {
 		if got := [3]int{heads, creates, rules}; got != want {
 			t.Fatalf("after lookup %d: checks, creations, rules = %v, want %v", i+1, got, want)
 		}
+	}
+}
+
+// fakeLifecycleAWS serves an existing automatic cache bucket, handing each
+// lifecycle read to get and each write (its body and headers) to put; both
+// count from 1. A read's body that starts with readErr is sent up to the
+// marker, and then fails. It returns the writes' bodies so far, and the
+// reads and bucket checks counted.
+func fakeLifecycleAWS(t *testing.T, get func(n int) (int, http.Header, string), put func(n int, body string, h http.Header) (int, string)) (a *AWSSpot, puts func() []string, gets, heads func() int) {
+	t.Helper()
+	old := s3OperationAbortedDelay
+	s3OperationAbortedDelay = time.Millisecond
+	t.Cleanup(func() { s3OperationAbortedDelay = old })
+	var mu sync.Mutex
+	var bodies []string
+	ngets, nheads := 0, 0
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		resp := func(st int, h http.Header, body string) (*http.Response, error) {
+			if h == nil {
+				h = http.Header{}
+			}
+			var rd io.Reader = strings.NewReader(body)
+			if sent, ok := strings.CutPrefix(body, readErr); ok {
+				rd = io.MultiReader(strings.NewReader(sent), iotest.ErrReader(errors.New("connection reset")))
+			}
+			return &http.Response{StatusCode: st, Header: h, Body: io.NopCloser(rd), Request: r}, nil
+		}
+		if r.URL.Host != "sts.us-east-2.amazonaws.com" && r.Header.Get("x-amz-expected-bucket-owner") != "123456789012" {
+			t.Errorf("%s %s doesn't assert the bucket's owner", r.Method, r.URL)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.HasPrefix(r.URL.Host, "sts."):
+			return resp(200, nil, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`)
+		case r.Method == http.MethodHead:
+			nheads++
+			return resp(200, nil, "")
+		case r.Method == http.MethodGet && r.URL.RawQuery == "lifecycle":
+			ngets++
+			return resp(get(ngets))
+		case r.Method == http.MethodPut && r.URL.RawQuery == "lifecycle":
+			b, _ := io.ReadAll(r.Body)
+			sum := md5.Sum(b)
+			if r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(sum[:]) {
+				t.Errorf("lifecycle PUT's Content-MD5 doesn't match its body")
+			}
+			bodies = append(bodies, string(b))
+			st, body := put(len(bodies), string(b), r.Header)
+			return resp(st, nil, body)
+		}
+		t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		return resp(500, nil, "")
+	})
+	a = &AWSSpot{
+		r: &config.Runner{Name: "aws", Region: "us-east-2", Profile: "p"},
+		api: &awsClient{region: "us-east-2", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "s"}},
+			http: &http.Client{Transport: rt}},
+		dir: t.TempDir(),
+	}
+	locked := func(n *int) func() int { return func() int { mu.Lock(); defer mu.Unlock(); return *n } }
+	return a, func() []string { mu.Lock(); defer mu.Unlock(); return slices.Clone(bodies) }, locked(&ngets), locked(&nheads)
+}
+
+const readErr = "\x00read-error:"
+
+const adminRule = `<Rule><ID>admin-noncurrent</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays></NoncurrentVersionExpiration></Rule>`
+
+func lifecycleOf(rules ...string) string {
+	return `<?xml version="1.0" encoding="UTF-8"?>` + "\n" + `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` + strings.Join(rules, "") + `</LifecycleConfiguration>`
+}
+
+// An administrator's lifecycle rules on an existing automatic bucket survive
+// spotexec adding its expiry rule from a machine that hasn't set it up (#318):
+// S3 replaces the whole configuration on every PUT. The configuration's
+// transition default goes back as it came.
+func TestEnsureBucketKeepsOtherLifecycleRules(t *testing.T) {
+	h := http.Header{}
+	h.Set("x-amz-transition-default-minimum-object-size", "varies_by_storage_class")
+	a, puts, _, _ := fakeLifecycleAWS(t, func(int) (int, http.Header, string) { return 200, h, lifecycleOf(adminRule) },
+		func(_ int, _ string, h http.Header) (int, string) {
+			if got := h.Get("x-amz-transition-default-minimum-object-size"); got != "varies_by_storage_class" {
+				t.Errorf("transition default = %q, want it kept", got)
+			}
+			return 200, ""
+		})
+	for range 2 {
+		if _, _, err := a.ensureBucket(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := puts(); len(got) != 1 || got[0] != lifecycleOf(adminRule, wantCacheRule) {
+		t.Fatalf("lifecycle PUTs %q: want one, keeping the administrator's rule and adding spotexec's", got)
+	}
+}
+
+// A configuration that already holds spotexec's rule, however it has been
+// edited since, is left alone and remembered as set.
+func TestEnsureBucketKeepsAnEditedCacheRule(t *testing.T) {
+	edited := `<Rule><ID>spotexec-expire</ID><Filter><Prefix></Prefix></Filter><Status>Disabled</Status><Expiration><Days>60</Days></Expiration></Rule>`
+	a, puts, gets, _ := fakeLifecycleAWS(t, func(int) (int, http.Header, string) { return 200, nil, lifecycleOf(edited, adminRule) },
+		func(int, string, http.Header) (int, string) { return 200, "" })
+	for range 2 {
+		if _, _, err := a.ensureBucket(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if gets() != 1 || len(puts()) != 0 {
+		t.Fatalf("lifecycle reads %d, writes %q: want one read and nothing written", gets(), puts())
+	}
+}
+
+// A key whose policy predates s3:GetLifecycleConfiguration can't read the
+// configuration, so it writes nothing, and tries again on each lookup until
+// `spotexec setup` refreshes the policy. A configuration that doesn't read
+// completely, or that S3 refuses with the rule added, is never replaced by
+// spotexec's rule alone. Only a bucket S3 says is gone is checked again.
+func TestEnsureBucketWritesNothingItCouldNotRead(t *testing.T) {
+	merged, alone := lifecycleOf(adminRule, wantCacheRule), `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`+wantCacheRule+`</LifecycleConfiguration>`
+	// Each fails twice, then reads cleanly.
+	twice := func(fail func() (int, string), then string) func(n int) (int, http.Header, string) {
+		return func(n int) (int, http.Header, string) {
+			if n < 3 {
+				st, b := fail()
+				return st, nil, b
+			}
+			if then == "" {
+				return 404, nil, noLifecycle
+			}
+			return 200, nil, then
+		}
+	}
+	cfg := lifecycleOf(adminRule)
+	for _, tc := range []struct {
+		name  string
+		get   func(n int) (int, http.Header, string)
+		put   int    // status of each write
+		body  string // what each write must send
+		puts  [4]int // writes after each lookup
+		heads int    // bucket checks in all
+	}{
+		{"denied", twice(func() (int, string) { return 403, `<Error><Code>AccessDenied</Code></Error>` }, ""), 200, alone, [4]int{0, 0, 1, 1}, 1},
+		{"truncated", twice(func() (int, string) { return 200, cfg[:len(cfg)-10] }, cfg), 200, merged, [4]int{0, 0, 1, 1}, 1},
+		{"read fails", twice(func() (int, string) { return 200, readErr + cfg }, cfg), 200, merged, [4]int{0, 0, 1, 1}, 1},
+		{"error code in a comment", twice(func() (int, string) {
+			return 404, `<Error><Code>InternalError</Code><!-- <Code>NoSuchLifecycleConfiguration</Code> --></Error>`
+		}, ""), 200, alone, [4]int{0, 0, 1, 1}, 1},
+		{"error with more after it", twice(func() (int, string) { return 404, noLifecycle + `<` }, ""), 200, alone, [4]int{0, 0, 1, 1}, 1},
+		{"no answer", twice(func() (int, string) { return 404, "" }, ""), 200, alone, [4]int{0, 0, 1, 1}, 1},
+		{"bucket gone", twice(func() (int, string) { return 404, `<Error><Code>NoSuchBucket</Code></Error>` }, ""), 200, alone, [4]int{0, 0, 1, 1}, 3},
+		{"empty success", twice(func() (int, string) { return 204, "" }, cfg), 200, merged, [4]int{0, 0, 1, 1}, 1},
+		{"merge refused", func(int) (int, http.Header, string) { return 200, nil, cfg }, 400, merged, [4]int{1, 2, 3, 4}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, puts, _, heads := fakeLifecycleAWS(t, tc.get, func(int, string, http.Header) (int, string) {
+				return tc.put, `<Error><Code>InvalidRequest</Code></Error>`
+			})
+			for i := range 4 {
+				if _, _, err := a.ensureBucket(context.Background()); err != nil {
+					t.Fatalf("lookup %d: %v", i+1, err)
+				}
+				if got := len(puts()); got != tc.puts[i] {
+					t.Fatalf("after lookup %d: %d lifecycle writes, want %d", i+1, got, tc.puts[i])
+				}
+			}
+			for _, b := range puts() {
+				if b != tc.body {
+					t.Fatalf("wrote %q, want %q", b, tc.body)
+				}
+			}
+			if heads() != tc.heads {
+				t.Fatalf("bucket checks %d, want %d", heads(), tc.heads)
+			}
+		})
+	}
+}
+
+// When S3 aborts the write for a concurrent change, the configuration is
+// read again, so a rule added meanwhile is kept too.
+func TestEnsureBucketRereadsAfterAnAbortedWrite(t *testing.T) {
+	added := `<Rule><ID>admin-new</ID><Filter><Prefix>tmp/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>`
+	a, puts, _, _ := fakeLifecycleAWS(t, func(n int) (int, http.Header, string) {
+		if n == 1 {
+			return 200, nil, lifecycleOf(adminRule)
+		}
+		return 200, nil, lifecycleOf(adminRule, added)
+	}, func(n int, _ string, _ http.Header) (int, string) {
+		if n == 1 {
+			return http.StatusConflict, s3OperationAborted
+		}
+		return 200, ""
+	})
+	if _, _, err := a.ensureBucket(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := puts(); !slices.Equal(got, []string{lifecycleOf(adminRule, wantCacheRule), lifecycleOf(adminRule, added, wantCacheRule)}) {
+		t.Fatalf("lifecycle PUTs %q: want each to keep the rules read just before it", got)
+	}
+}
+
+// A bucket deleted between the read and the write is checked (and created)
+// again on the next lookup.
+func TestEnsureBucketForgetsABucketGoneMidWrite(t *testing.T) {
+	a, puts, _, heads := fakeLifecycleAWS(t, func(int) (int, http.Header, string) { return 200, nil, lifecycleOf(adminRule) },
+		func(n int, _ string, _ http.Header) (int, string) {
+			if n == 1 {
+				return 404, `<Error><Code>NoSuchBucket</Code></Error>`
+			}
+			return 200, ""
+		})
+	for range 3 {
+		if _, _, err := a.ensureBucket(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(puts()) != 2 || heads() != 2 {
+		t.Fatalf("lifecycle writes %d, bucket checks %d; want 2 and 2", len(puts()), heads())
+	}
+}
+
+func TestWithCacheRule(t *testing.T) {
+	var full strings.Builder
+	for range 1000 { // S3's limit
+		full.WriteString(adminRule)
+	}
+	for _, tc := range []struct {
+		name, in, want string
+		has, err       bool
+	}{
+		{name: "empty", in: `<LifecycleConfiguration></LifecycleConfiguration>`, want: `<LifecycleConfiguration>` + wantCacheRule + `</LifecycleConfiguration>`},
+		{name: "bytes kept", in: "<?xml version=\"1.0\"?>\n<LifecycleConfiguration xmlns=\"x\">\n  " + adminRule + "<!-- note -->\n</LifecycleConfiguration>\n",
+			want: "<?xml version=\"1.0\"?>\n<LifecycleConfiguration xmlns=\"x\">\n  " + adminRule + "<!-- note -->\n" + wantCacheRule + "</LifecycleConfiguration>\n"},
+		{name: "has", in: lifecycleOf(wantCacheRule, adminRule), has: true},
+		{name: "has, later", in: lifecycleOf(adminRule, wantCacheRule), has: true},
+		{name: "has, split by a comment", in: `<LifecycleConfiguration><Rule><ID>spotexec<!-- x -->-expire</ID></Rule></LifecycleConfiguration>`, has: true},
+		// Only a rule's own, whole ID counts.
+		{name: "ID elsewhere", in: `<LifecycleConfiguration><Rule><ID>a</ID><Filter><Prefix>spotexec-expire</Prefix></Filter></Rule></LifecycleConfiguration>`,
+			want: `<LifecycleConfiguration><Rule><ID>a</ID><Filter><Prefix>spotexec-expire</Prefix></Filter></Rule>` + wantCacheRule + `</LifecycleConfiguration>`},
+		{name: "longer ID", in: `<LifecycleConfiguration><Rule><ID>spotexec-expire<![CDATA[-old]]></ID></Rule></LifecycleConfiguration>`,
+			want: `<LifecycleConfiguration><Rule><ID>spotexec-expire<![CDATA[-old]]></ID></Rule>` + wantCacheRule + `</LifecycleConfiguration>`},
+		{name: "truncated", in: `<LifecycleConfiguration><Rule><ID>a</ID>`, err: true},
+		{name: "empty body", in: ``, err: true},
+		{name: "other document", in: `<Error><Code>AccessDenied</Code></Error>`, err: true},
+		{name: "two roots", in: `<LifecycleConfiguration></LifecycleConfiguration><LifecycleConfiguration></LifecycleConfiguration>`, err: true},
+		{name: "text after", in: `<LifecycleConfiguration></LifecycleConfiguration>junk`, err: true},
+		{name: "self-closing", in: `<LifecycleConfiguration/>`, err: true},
+		{name: "prefixed", in: `<s3:LifecycleConfiguration xmlns:s3="http://s3.amazonaws.com/doc/2006-03-01/"></s3:LifecycleConfiguration>`, err: true},
+		{name: "full", in: `<LifecycleConfiguration>` + full.String() + `</LifecycleConfiguration>`, err: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, has, err := withCacheRule([]byte(tc.in))
+			if (err != nil) != tc.err || has != tc.has || string(out) != tc.want {
+				t.Fatalf("withCacheRule = %q, %v, %v; want %q, %v, error %v", out, has, err, tc.want, tc.has, tc.err)
+			}
+		})
 	}
 }
