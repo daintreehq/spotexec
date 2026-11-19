@@ -156,6 +156,9 @@ func (c *Client) openHelper(ctx context.Context, fresh bool, pid int) (*Session,
 }
 
 func (c *Client) open(ctx context.Context, path string, handshake time.Duration, master int) (*Session, error) {
+	if c.ctlErr != nil {
+		return nil, c.ctlErr
+	}
 	cmd := exec.Command("ssh", c.Args("exec "+path+" rpc")...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

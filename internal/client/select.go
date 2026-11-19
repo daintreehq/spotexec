@@ -132,6 +132,11 @@ var tryAcquireFn = tryAcquire
 //  4. only tickets near the head of the queue probe for slots, every
 //     1.2-2.5s, until one frees up or queue_timeout passes.
 func Acquire(ctx context.Context, req AcquireRequest) (*Lease, error) {
+	// Without a private SSH control directory no VM can be reached: fail
+	// before probing (which would read every VM as silent) or launching.
+	if err := transport.CheckControlDir(); err != nil {
+		return nil, err
+	}
 	queue := req.QueueTimeout
 	if queue <= 0 {
 		queue = 10 * time.Minute
@@ -707,6 +712,9 @@ func probeOverflow(ctx context.Context, req AcquireRequest, members []*member, o
 
 // fatalErr is why m can't serve, with how to fix it.
 func (m *member) fatalErr() error {
+	if transport.IsSetupError(m.fatal) {
+		return fmt.Errorf("%s: %w", m.r.Name, m.fatal)
+	}
 	return fmt.Errorf("%s: %w (fix bootstrap_script, then `spotexec down %s`)", m.r.Name, m.fatal, m.r.Name)
 }
 
@@ -931,6 +939,11 @@ func (m *member) probeInstance(ctx context.Context, req AcquireRequest, c candid
 		return nil, nil, outRefused // an answer, if not one this side knows
 	case errors.Is(err, errReservationLost):
 		return nil, nil, outSkipped // revoked before anything was sent (#295)
+	case transport.IsSetupError(err):
+		// This machine can't connect to any VM: a local fault, which proves
+		// nothing about this one.
+		m.fatal = err
+		return nil, nil, outSkipped
 	}
 	return nil, nil, OutUnreachable
 }
@@ -1228,6 +1241,8 @@ func WaitReady(ctx context.Context, r *config.Runner, t provider.Target, rep ui.
 				tail, _ := c.Run(ctx, "tail -n 20 /var/log/spotexec-bootstrap.log 2>/dev/null", nil)
 				return &bootstrapError{fmt.Sprintf("%s: bootstrap_script exited %s; last log lines:\n%s", r.Name, s, strings.TrimSpace(string(tail)))}
 			}
+		} else if transport.IsSetupError(err) {
+			return err // local: waiting won't fix it
 		} else {
 			last = err
 			rep.Status("%s: waiting for SSH at %s %s", r.Name, t.Host, ui.Dur(time.Since(start)))

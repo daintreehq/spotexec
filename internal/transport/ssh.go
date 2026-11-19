@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,14 +37,30 @@ const dialTimeout = time.Minute
 
 // Client runs commands on one target.
 type Client struct {
-	T        provider.Target
-	ctlPath  string
+	T       provider.Target
+	ctlPath string
+	// ctlErr is why there is no private directory for the control socket.
+	// Every call that would hand ctlPath to ssh fails with it instead.
+	ctlErr   error
 	WorkRoot string // remote work root (may start with ~/)
 }
 
-// New builds a client for a target.
+// SetupErr is why the client can't connect from this machine at all (a
+// *SetupError), or nil.
+func (c *Client) SetupErr() error { return c.ctlErr }
+
+// New builds a client for a target. Without a private directory for its
+// control socket the client can't connect: its calls return that error.
 func New(t provider.Target, workRoot string) *Client {
-	return &Client{T: t, ctlPath: filepath.Join(controlDir(), connID(t)), WorkRoot: workRoot}
+	c := &Client{T: t, WorkRoot: workRoot}
+	dir, err := controlDir()
+	if err != nil {
+		// ctlPath still names the connection (helper markers key on it),
+		// but nothing hands it to ssh.
+		dir, c.ctlErr = "unavailable", err
+	}
+	c.ctlPath = filepath.Join(dir, connID(t))
+	return c
 }
 
 // connID identifies a target's effective connection settings: it names the
@@ -69,46 +86,93 @@ func connID(t provider.Target) string {
 // controlDir is re-checked on every call: a long-running process (the
 // daemon) must survive the directory being cleaned away, and in shared /tmp
 // it must still be ours (a reaper may delete it and another user recreate
-// it).
+// it). It never returns a directory it couldn't make private: a socket path
+// anyone else can reach would let them stand in for the master.
 var (
 	ctlMu  sync.Mutex
 	ctlDir string
+	// ctlShared says ctlDir is in shared tmpRoot, where another user may
+	// get to the name first.
+	ctlShared bool
+	// tmpRoot is where the short fallback lives (a variable for tests).
+	tmpRoot = "/tmp"
 )
 
-func controlDir() string {
+func controlDir() (string, error) {
 	ctlMu.Lock()
 	defer ctlMu.Unlock()
 	if ctlDir == "" {
 		home, _ := os.UserHomeDir()
 		if d := filepath.Join(home, ".cache", "spotexec", "cm"); home != "" && len(d)+17+17 <= 100 {
-			ctlDir = d
+			ctlDir, ctlShared = d, false
 		} else {
-			ctlDir = filepath.Join("/tmp", fmt.Sprintf("sx-cm-%d", os.Getuid()))
+			ctlDir, ctlShared = filepath.Join(tmpRoot, fmt.Sprintf("sx-cm-%d", os.Getuid())), true
 		}
 	}
-	if !strings.HasPrefix(ctlDir, "/tmp/") {
-		_ = os.MkdirAll(ctlDir, 0o700)
-		return ctlDir
+	if !ctlShared {
+		if err := os.MkdirAll(filepath.Dir(ctlDir), 0o700); err != nil {
+			return "", &SetupError{err}
+		}
+		if err := privateDir(ctlDir); err != nil {
+			return "", &SetupError{err}
+		}
+		return ctlDir, nil
 	}
-	if privateDir(ctlDir) {
-		return ctlDir
+	perr := privateDir(ctlDir)
+	if perr == nil {
+		return ctlDir, nil
 	}
-	if d, err := os.MkdirTemp("/tmp", "sx-cm-"); err == nil {
-		ctlDir = d
+	d, err := os.MkdirTemp(tmpRoot, "sx-cm-")
+	if err == nil {
+		err = privateDir(d) // the umask may have taken the owner's bits
 	}
-	return ctlDir
+	if err != nil {
+		return "", &SetupError{fmt.Errorf("%v, and no private alternative: %w", perr, err)}
+	}
+	ctlDir = d
+	return ctlDir, nil
+}
+
+// SetupError means this machine has no private directory for SSH control
+// sockets, so no connection can be set up from it. It says nothing about
+// any target: the cause is local.
+type SetupError struct{ Err error }
+
+func (e *SetupError) Error() string { return "ssh control directory: " + e.Err.Error() }
+func (e *SetupError) Unwrap() error { return e.Err }
+
+// IsSetupError reports whether err is (or wraps) a SetupError.
+func IsSetupError(err error) bool {
+	var se *SetupError
+	return errors.As(err, &se)
+}
+
+// CheckControlDir reports whether this machine can set up SSH connections
+// at all: callers about to launch VMs check it first, rather than launch
+// ones they could never reach.
+func CheckControlDir() error {
+	_, err := controlDir()
+	return err
 }
 
 // privateDir makes sure dir exists, is a real directory (not a symlink),
 // owned by us, mode 0700.
-func privateDir(dir string) bool {
-	_ = os.Mkdir(dir, 0o700)
+func privateDir(dir string) error {
+	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
 	fi, err := os.Lstat(dir)
-	if err != nil || !fi.IsDir() {
-		return false
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
-	return ok && int(st.Uid) == os.Getuid() && os.Chmod(dir, 0o700) == nil
+	if !ok || int(st.Uid) != os.Getuid() {
+		return fmt.Errorf("%s is not owned by this user", dir)
+	}
+	return os.Chmod(dir, 0o700)
 }
 
 // baseArgs builds the ssh options. ssh uses the first value it sees for an
@@ -182,6 +246,9 @@ func (c *Client) MasterAlive(ctx context.Context) bool {
 // masterPID asks the control master whether it is running, and its pid (0
 // if ssh didn't say).
 func (c *Client) masterPID(ctx context.Context) (int, bool) {
+	if c.ctlErr != nil {
+		return 0, false
+	}
 	ctx, cancel := context.WithTimeout(ctx, muxTimeout)
 	defer cancel()
 	var errb bytes.Buffer
@@ -199,6 +266,9 @@ func (c *Client) masterPID(ctx context.Context) (int, bool) {
 // lockMaster serializes starting and retiring this target's master across
 // processes. Without flock (some network filesystems) it goes unlocked.
 func (c *Client) lockMaster(ctx context.Context) (func(), error) {
+	if c.ctlErr != nil {
+		return nil, c.ctlErr
+	}
 	lf, err := os.OpenFile(c.ctlPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return func() {}, nil
@@ -233,6 +303,9 @@ func (c *Client) EnsureMaster(ctx context.Context) error {
 // file-backed stderr: a backgrounded master inheriting our pipes would
 // otherwise hold them open and hang every caller.
 func (c *Client) ensureMaster(ctx context.Context) (int, bool, error) {
+	if c.ctlErr != nil {
+		return 0, false, c.ctlErr
+	}
 	if pid, ok := c.masterPID(ctx); ok {
 		return pid, false, nil
 	}
@@ -270,6 +343,9 @@ func (c *Client) ensureMaster(ctx context.Context) (int, bool, error) {
 
 // CloseMaster stops the control master, ending every session on it.
 func (c *Client) CloseMaster() {
+	if c.ctlErr != nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), muxTimeout)
 	defer cancel()
 	_ = exec.CommandContext(ctx, "ssh", "-o", "ControlPath="+c.ctlPath, "-O", "exit", "--", c.T.Host).Run()
@@ -332,6 +408,9 @@ func (e *ConnError) Error() string {
 
 // Run executes remoteCmd and returns stdout. stdin may be nil.
 func (c *Client) Run(ctx context.Context, remoteCmd string, stdin io.Reader) ([]byte, error) {
+	if c.ctlErr != nil {
+		return nil, c.ctlErr
+	}
 	cmd := exec.CommandContext(ctx, "ssh", c.Args(remoteCmd)...)
 	cmd.Stdin = stdin
 	// A session on a master hands its descriptors to the master, so killing
@@ -462,7 +541,7 @@ func (c *Client) Reachable(ctx context.Context, d time.Duration) Reach {
 	rctx, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
 	own := *c
-	own.ctlPath = "none"
+	own.ctlPath, own.ctlErr = "none", nil
 	cmd := exec.CommandContext(rctx, "ssh", own.Args("true")...)
 	cmd.WaitDelay = 2 * time.Second
 	var errb bytes.Buffer
@@ -551,6 +630,9 @@ func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Durati
 	// The marker records the remote platform and the hash we installed; it
 	// is only trusted if this binary still embeds that exact helper, so an
 	// upgraded CLI reinstalls instead of driving a stale helper.
+	if c.ctlErr != nil {
+		return "", c.ctlErr // before the markers: their fast path must not hide it
+	}
 	if !force {
 		if hash, ok := c.installedHash(); ok {
 			return c.helperPath(hash), nil
