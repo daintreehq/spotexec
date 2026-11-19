@@ -1537,10 +1537,20 @@ func loadClaudeSettings(settingsPath string) (target string, snapshot os.FileInf
 	if err != nil {
 		return "", nil, nil, err
 	}
-	if !snapshot.Mode().IsRegular() {
+	if !snapshot.Mode().IsRegular() { // not a FIFO to block on, nor a device
 		return "", nil, nil, fmt.Errorf("%s is not a regular file", settingsPath)
 	}
-	b, err := os.ReadFile(target)
+	f, err := os.Open(target)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	defer f.Close()
+	// The snapshot describes the file read, not whatever the path held
+	// a moment before.
+	if snapshot, err = f.Stat(); err != nil {
+		return "", nil, nil, err
+	}
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -1634,7 +1644,7 @@ func saveClaudeSettings(target string, snapshot os.FileInfo, settings map[string
 		return err
 	}
 	beforeReplace()
-	if now, err := os.Stat(target); !sameSettings(snapshot, now, err) {
+	if now, err := os.Stat(target); !sameSettings(target, snapshot, now, err) {
 		return fmt.Errorf("%s changed while it was being updated; run the command again", target)
 	}
 	return renameFile(tmp.Name(), target)
@@ -1642,8 +1652,9 @@ func saveClaudeSettings(target string, snapshot os.FileInfo, settings map[string
 
 // sameSettings reports whether a settings file is still the one read: both
 // absent, or the same file with the same size and modification time.
-func sameSettings(was, now os.FileInfo, err error) bool {
+func sameSettings(name string, was, now os.FileInfo, err error) bool {
 	if was == nil {
+		_, err := os.Lstat(name) // a link made meanwhile isn't absent
 		return errors.Is(err, os.ErrNotExist)
 	}
 	return err == nil && os.SameFile(was, now) && was.Size() == now.Size() && was.ModTime().Equal(now.ModTime())

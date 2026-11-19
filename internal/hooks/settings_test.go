@@ -71,6 +71,7 @@ func TestInstallRefusesNonObjectSettings(t *testing.T) {
 		`{"hooks":[]}`,
 		`{"hooks":{"PreToolUse":{}}}`,
 		`{"a":1} {"b":2}`,
+		`{"a":1} @`,
 		`{"hooks":`,
 		`{"hooks":null}`,
 		`{"hooks":{"PreToolUse":null}}`,
@@ -301,7 +302,7 @@ func TestInstallKeepsNumbersAsWritten(t *testing.T) {
 		t.Fatal(ok, err)
 	}
 	b, _ := os.ReadFile(p)
-	if !strings.Contains(string(b), `"big": 9007199254740993,`) || !strings.Contains(string(b), `"f": 1.50`) {
+	if !strings.Contains(string(b), `"big": 9007199254740993,`) || !strings.Contains(string(b), "\"f\": 1.50\n") {
 		t.Fatalf("numbers changed:\n%s", b)
 	}
 }
