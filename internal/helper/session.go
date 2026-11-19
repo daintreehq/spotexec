@@ -643,9 +643,9 @@ var chmodRoot = os.Chmod
 // can't be. Synced source and commands live under it, in directories other
 // users could otherwise read (0755), so a session never starts without it:
 // an existing shared directory the runner can write to but not chmod would
-// leave every slot open.
+// leave every slot open. The owner is checked first, so a helper running as
+// root never changes the mode of another user's directory.
 func privateRoot(root string) error {
-	chErr := chmodRoot(root, 0o700)
 	fi, err := os.Stat(root)
 	if err != nil {
 		return err
@@ -659,13 +659,20 @@ func privateRoot(root string) error {
 		why = "its owner can't be read"
 	case int(st.Uid) != os.Geteuid():
 		why = fmt.Sprintf("it is owned by uid %d, not the runner user (uid %d)", st.Uid, os.Geteuid())
-	case fi.Mode().Perm()&0o077 != 0:
+	case fi.Mode().Perm() != 0o700:
+		chErr := chmodRoot(root, 0o700)
+		if fi, err = os.Stat(root); err != nil {
+			return err
+		}
+		if fi.Mode().Perm()&0o077 == 0 {
+			return nil
+		}
 		why = fmt.Sprintf("its mode is %#o, open to other users", fi.Mode().Perm())
+		if chErr != nil {
+			why += fmt.Sprintf(", and making it 0700 failed (%v)", chErr)
+		}
 	default:
 		return nil
-	}
-	if chErr != nil {
-		why += fmt.Sprintf(", and making it 0700 failed (%v)", chErr)
 	}
 	return perr(protocol.CodeBadRequest, "work root %s can't be made private: %s; point work_root at a directory the runner user owns, or chmod 700 it", root, why)
 }

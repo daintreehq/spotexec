@@ -307,7 +307,7 @@ var ensurePool = func(root, driver string, limit int64) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if root != "" {
-		if err := os.MkdirAll(root, 0o755); err == nil {
+		if err := os.MkdirAll(root, 0o700); err == nil {
 			if l, err := lockExclusiveCtx(ctx, filepath.Join(root, "memory-pool.lock")); err == nil {
 				defer l.Unlock()
 			}

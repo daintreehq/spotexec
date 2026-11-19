@@ -57,8 +57,8 @@ func TestHelloRefusesRootItCannotMakePrivate(t *testing.T) {
 	if err := s.acquire(protocol.Acquire{RepoID: "r", MaxSlots: 1}); err == nil {
 		t.Fatal("a workspace was accepted after the refused hello")
 	}
-	if _, err := os.Stat(filepath.Join(root, "slots")); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("slots created under the refused root: %v", err)
+	if ents, err := os.ReadDir(root); err != nil || len(ents) != 0 {
+		t.Fatalf("refused root holds %v (%v)", ents, err)
 	}
 }
 
@@ -100,6 +100,10 @@ func TestHelloMakesOwnedRootPrivate(t *testing.T) {
 	if err := os.Symlink(open, link); err != nil {
 		t.Fatal(err)
 	}
+	canon, err := filepath.EvalSymlinks(open)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, root := range []string{open, filepath.Join(dir, "new", "root"), link} {
 		s, out := helloSession(t)
 		if err := s.hello(protocol.Hello{Proto: protocol.Version, WorkRoot: root}); err != nil {
@@ -109,6 +113,9 @@ func TestHelloMakesOwnedRootPrivate(t *testing.T) {
 		replies(t, out, protocol.TypeHelloOK, &ok)
 		if ok.WorkRoot != s.layout.Root || ok.Proto != protocol.Version {
 			t.Fatalf("hello on %s answered %+v", root, ok)
+		}
+		if root == link && s.layout.Root != canon {
+			t.Fatalf("root through a symlink is %q, want %q", s.layout.Root, canon)
 		}
 		fi, err := os.Stat(s.layout.Root)
 		if err != nil {
@@ -120,14 +127,17 @@ func TestHelloMakesOwnedRootPrivate(t *testing.T) {
 	}
 }
 
-// A root owned by another user is refused even when it is already 0700:
-// its owner can read everything under it.
+// A root owned by another user is refused, and a helper running as root
+// leaves its mode alone.
 func TestHelloRefusesRootOwnedByAnotherUser(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root to give the directory to another user")
 	}
 	root := filepath.Join(t.TempDir(), "theirs")
-	if err := os.Mkdir(root, 0o700); err != nil {
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chown(root, 65534, 65534); err != nil {
@@ -137,5 +147,8 @@ func TestHelloRefusesRootOwnedByAnotherUser(t *testing.T) {
 	err := s.hello(protocol.Hello{Proto: protocol.Version, WorkRoot: root})
 	if err == nil || !strings.Contains(err.Error(), "uid 65534") {
 		t.Fatalf("hello on a root owned by another user: %v", err)
+	}
+	if fi, err := os.Stat(root); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("another user's root was changed: %v %v", fi.Mode(), err)
 	}
 }
