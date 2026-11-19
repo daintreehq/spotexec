@@ -1364,7 +1364,7 @@ var errorCodes = map[string]bool{
 	protocol.CodeDraining: true, protocol.CodeBooting: true, protocol.CodeBootFailed: true,
 	protocol.CodeQueueTimeout: true, protocol.CodeBadRequest: true, protocol.CodeInternal: true,
 	protocol.CodeSyncFailed: true, protocol.CodeDepsFailed: true, protocol.CodeImageFailed: true,
-	protocol.CodeImageBuildFailed: true, protocol.CodeShutdown: true,
+	protocol.CodeImageBuildFailed: true, protocol.CodeShutdown: true, protocol.CodeWorkRoot: true,
 }
 
 // failExit is the exit code of a run that failed with err: 123 when the

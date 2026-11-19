@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -250,6 +251,28 @@ func TestHeartbeatingHelperIsNotSilent(t *testing.T) {
 	}
 	if s.Dead() {
 		t.Fatal("a heartbeating helper was cut off")
+	}
+}
+
+// A work root the helper can't make private is reported as is (#312): a
+// reinstall can't fix it, and a failed one would hide why. Other refusals
+// (an old helper's protocol mismatch) still get the reinstall.
+func TestWorkRootRefusalSkipsReinstall(t *testing.T) {
+	for _, tc := range []struct {
+		code  string
+		opens int
+	}{{protocol.CodeWorkRoot, 1}, {protocol.CodeBadRequest, 2}} {
+		e := newFakeEnv(t)
+		e.Set("hello-refused", tc.code)
+		_, err := e.c.Open(context.Background())
+		var re *RemoteError
+		if !errors.As(err, &re) || re.Code != tc.code {
+			t.Fatalf("%s: Open: %v", tc.code, err)
+		}
+		b, _ := os.ReadFile(filepath.Join(e.State, "hello-refusals"))
+		if len(b) != tc.opens {
+			t.Fatalf("%s: helper started %d times, want %d", tc.code, len(b), tc.opens)
+		}
 	}
 }
 
