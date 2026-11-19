@@ -1339,7 +1339,7 @@ func HasLegacyClaude(settingsPath string) bool { return hasForm(settingsPath, ho
 // path than hookCmd is updated to hookCmd's. It reports whether the file
 // changed.
 func InstallClaude(settingsPath, hookCmd string) (bool, error) {
-	target, settings, err := loadClaudeSettings(settingsPath)
+	target, snapshot, settings, err := loadClaudeSettings(settingsPath)
 	if err != nil {
 		return false, err
 	}
@@ -1454,7 +1454,7 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 	}
 	hooks["PreToolUse"] = pre
 	settings["hooks"] = hooks
-	if err := saveClaudeSettings(target, settings); err != nil {
+	if err := saveClaudeSettings(target, snapshot, settings); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1463,7 +1463,7 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 // UninstallClaude removes spotexec hook entries. A chained hook goes back to
 // the hook it chained (RTK's), which stays installed.
 func UninstallClaude(settingsPath string) (bool, error) {
-	target, settings, err := loadClaudeSettings(settingsPath)
+	target, snapshot, settings, err := loadClaudeSettings(settingsPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil // a dangling link: nothing to remove
 	}
@@ -1506,7 +1506,7 @@ func UninstallClaude(settingsPath string) (bool, error) {
 	if len(hooks) == 0 {
 		delete(settings, "hooks")
 	}
-	if err := saveClaudeSettings(target, settings); err != nil {
+	if err := saveClaudeSettings(target, snapshot, settings); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1519,59 +1519,77 @@ func UninstallClaude(settingsPath string) (bool, error) {
 // a dangling link (wrapping os.ErrNotExist), or a document whose top level,
 // hooks, or hooks.PreToolUse isn't the shape Claude Code reads is an error
 // before anything changes: rewriting what couldn't be read would lose the
-// user's settings. Numbers are kept as written.
-func loadClaudeSettings(settingsPath string) (target string, settings map[string]any, err error) {
+// user's settings. Numbers are kept as written. The returned snapshot is the
+// target as read (nil when it didn't exist), for saveClaudeSettings to check
+// it hasn't changed since.
+func loadClaudeSettings(settingsPath string) (target string, snapshot os.FileInfo, settings map[string]any, err error) {
 	target, err = filepath.EvalSymlinks(settingsPath)
 	if err != nil {
 		if _, lerr := os.Lstat(settingsPath); !errors.Is(lerr, os.ErrNotExist) {
-			return "", nil, fmt.Errorf("%s: %w", settingsPath, err)
+			return "", nil, nil, fmt.Errorf("%s: %w", settingsPath, err)
 		}
 		target = settingsPath // a new file
 	}
-	b, err := os.ReadFile(target)
-	if errors.Is(err, os.ErrNotExist) || err == nil && len(bytes.TrimSpace(b)) == 0 {
-		return target, map[string]any{}, nil
+	snapshot, err = os.Stat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return target, nil, map[string]any{}, nil
 	}
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
+	}
+	if !snapshot.Mode().IsRegular() {
+		return "", nil, nil, fmt.Errorf("%s is not a regular file", settingsPath)
+	}
+	b, err := os.ReadFile(target)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return target, snapshot, map[string]any{}, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.UseNumber()
 	var doc any
 	if err := dec.Decode(&doc); err != nil {
-		return "", nil, fmt.Errorf("%s is not valid JSON: %w", settingsPath, err)
+		return "", nil, nil, fmt.Errorf("%s is not valid JSON: %w", settingsPath, err)
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return "", nil, fmt.Errorf("%s is not valid JSON: data after the top-level value", settingsPath)
+		return "", nil, nil, fmt.Errorf("%s is not valid JSON: data after the top-level value", settingsPath)
 	}
 	settings, ok := doc.(map[string]any)
 	if !ok {
-		return "", nil, fmt.Errorf("%s is not a JSON object", settingsPath)
+		return "", nil, nil, fmt.Errorf("%s is not a JSON object", settingsPath)
 	}
 	if h, has := settings["hooks"]; has {
 		hm, ok := h.(map[string]any)
 		if !ok {
-			return "", nil, fmt.Errorf("%s: \"hooks\" is not a JSON object", settingsPath)
+			return "", nil, nil, fmt.Errorf("%s: \"hooks\" is not a JSON object", settingsPath)
 		}
 		if pre, has := hm["PreToolUse"]; has {
 			if _, ok := pre.([]any); !ok {
-				return "", nil, fmt.Errorf("%s: \"hooks.PreToolUse\" is not a JSON array", settingsPath)
+				return "", nil, nil, fmt.Errorf("%s: \"hooks.PreToolUse\" is not a JSON array", settingsPath)
 			}
 		}
 	}
-	return target, settings, nil
+	return target, snapshot, settings, nil
 }
 
-// renameFile replaces a settings file; a test makes it fail.
-var renameFile = os.Rename
+// renameFile replaces a settings file; a test makes it fail. beforeReplace
+// runs just before the check that the file hasn't changed; a test changes it.
+var (
+	renameFile    = os.Rename
+	beforeReplace = func() {}
+)
 
 // saveClaudeSettings replaces target, the file loadClaudeSettings returned,
 // whole: the new document goes to a temporary file beside it, which is
 // renamed over it only once fully written, so an interrupted write never
 // leaves partial JSON. An existing file must be writable, as it had to be
 // when it was rewritten in place, and keeps its permissions; a new one is
-// created 0644 less the umask.
-func saveClaudeSettings(target string, settings map[string]any) error {
+// created 0644 less the umask. If the target changed after it was read (an
+// editor saved it, say), nothing is replaced: the save would undo that
+// change.
+func saveClaudeSettings(target string, snapshot os.FileInfo, settings map[string]any) error {
 	b, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
@@ -1593,7 +1611,7 @@ func saveClaudeSettings(target string, settings map[string]any) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := createSettingsTemp(dir, filepath.Base(target), mode)
+	tmp, err := createSettingsTemp(dir, mode)
 	if err != nil {
 		return err
 	}
@@ -1615,14 +1633,27 @@ func saveClaudeSettings(target string, settings map[string]any) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	beforeReplace()
+	if now, err := os.Stat(target); !sameSettings(snapshot, now, err) {
+		return fmt.Errorf("%s changed while it was being updated; run the command again", target)
+	}
 	return renameFile(tmp.Name(), target)
+}
+
+// sameSettings reports whether a settings file is still the one read: both
+// absent, or the same file with the same size and modification time.
+func sameSettings(was, now os.FileInfo, err error) bool {
+	if was == nil {
+		return errors.Is(err, os.ErrNotExist)
+	}
+	return err == nil && os.SameFile(was, now) && was.Size() == now.Size() && was.ModTime().Equal(now.ModTime())
 }
 
 // createSettingsTemp creates a new hidden file in dir with mode less the
 // umask (os.CreateTemp would always make it 0600).
-func createSettingsTemp(dir, base string, mode os.FileMode) (*os.File, error) {
+func createSettingsTemp(dir string, mode os.FileMode) (*os.File, error) {
 	for i := 0; ; i++ {
-		name := filepath.Join(dir, fmt.Sprintf(".%s.spotexec-%d-%d", base, os.Getpid(), time.Now().UnixNano()))
+		name := filepath.Join(dir, fmt.Sprintf(".spotexec-%d-%d.tmp", os.Getpid(), time.Now().UnixNano()))
 		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 		if err == nil || !errors.Is(err, os.ErrExist) || i == 9 {
 			return f, err
