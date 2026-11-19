@@ -90,11 +90,11 @@ The command's output is never recorded, nor what other programs print (RTK's mes
 
 ## Format versions
 
-Every machine-readable output says which shape it is in, so a script can tell a format it doesn't know from a bug: a top-level `format_version` (an integer) on each NDJSON event and on the JSON of `status --json`, `status -A --json`, `daemon status --json`, `prices --json`, `sync-plan --json`, `backups --json`, `container regions --json` and `hook discover --json`. Run records carry theirs as `version`. Each output is versioned on its own, and all are at `1`.
+Every `--json` output and NDJSON event says which shape it is in, so a script can tell a format it doesn't know from a bug: a top-level `format_version` (an integer) on each event and on the JSON of `status --json`, `status -A --json`, `daemon status --json`, `prices --json`, `sync-plan --json`, `backups --json`, `container regions --json` and `hook discover --json`. Run records carry theirs as `version`. Each of these is versioned on its own, and all are at `1`. The Claude Code hook's replies follow Claude Code's own schema, and `spotexec supported` prints `true` or `false`.
 
 The rule a consumer can rely on: within a version, fields are only added, never renamed, removed or retyped. Anything else bumps that output's version, so read only the versions you know, ignore fields you don't, and treat a higher version as a format to upgrade for, not as data to guess at. For events this covers their names too: within a version new events and warning codes can appear, but none is renamed or removed. An events file appended to across upgrades can mix versions, and lines written before spotexec stamped them have none, so check each line. Human-readable output carries no such promise.
 
-`status --json` is an object, `{"format_version": 1, "runners": [...]}`, with one row per runner and per fleet VM; before format versions it was the bare list of rows, so a script that read `.[]` reads `.runners[]` now. Each row's `helper.holders[].client` has the `pid`, `worktree` and `run_id` of the `sx` holding that slot.
+`status --json` is an object, `{"format_version": 1, "runners": [...]}`, with one row per runner and per fleet VM (and per region a fleet's VMs couldn't be listed in); before format versions it was the bare list of rows, so a script that read `.[]` reads `.runners[]` now. A row whose runner answered has `helper`, and each of its `holders[]` has a `client` with the `pid` and `worktree` of the `sx` holding that slot and its `run_id`, which is empty for a `spotexec pull` and for a run that went back to its last slot (`--same-slot`, `spotexec exec`).
 
 ## Claude Code hook
 
