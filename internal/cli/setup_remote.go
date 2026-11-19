@@ -335,6 +335,47 @@ type installed struct {
 
 const localBin = `"$HOME/.local/bin/spotexec"`
 
+// stageDir makes "$t", a private directory inside "$d" (~/.local/bin),
+// removed when the script exits, so setups running at the same time never
+// write the same file.
+const stageDir = `d="$HOME/.local/bin"; mkdir -p "$d"; t=$(mktemp -d "$d/.spotexec-install.XXXXXX"); trap 'rm -rf "$t"' EXIT; `
+
+// moveStaged renames "$t/$1" into "$d/" by name, so it never descends into
+// a directory an old link there points at. BusyBox's mv looks through the
+// old entry first and gives up on a link that loops or leads nowhere, so on
+// failure the old entry goes and the move is tried once more.
+const moveStaged = `mvin() { mv -f "$t/$1" "$d/" 2>/dev/null || { rm -f "$d/$1"; mv -f "$t/$1" "$d/"; }; }; `
+
+// linkStaged renames a fresh sx link into "$d", so a concurrent setup never
+// sees it missing. A real directory named sx is left alone; the login shell
+// check then reports that sx isn't there.
+const linkStaged = moveStaged + sxStaged
+
+const sxStaged = `ln -s spotexec "$t/sx"; if [ ! -d "$d/sx" ] || [ -L "$d/sx" ]; then mvin sx; fi`
+
+// publishStaged ends an install script that staged a checked spotexec in
+// "$t": the binary and its sx link are each renamed into place.
+const publishStaged = moveStaged + `mvin spotexec; ` + sxStaged
+
+// selfBinary opens the running spotexec, which --install copy sends over,
+// and gives its size.
+var selfBinary = func() (io.ReadCloser, int64, error) {
+	p, err := os.Executable()
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, 0, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	return f, st.Size(), nil
+}
+
 // installSpotexec installs or upgrades spotexec.
 func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (installed, error) {
 	mode := r.install
@@ -413,7 +454,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 				return installed{bin: localBin, dir: "$HOME/.local/bin", how: "kept, newer than release " + tag, want: v}, nil
 			} else if ok && c == 0 {
 				// Only the sx link is put right, in case it went missing.
-				if _, err := r.run(ctx, `d="$HOME/.local/bin"; [ "$(readlink "$d/sx")" = spotexec ] || ln -sf spotexec "$d/sx"`, nil); err != nil {
+				if _, err := r.run(ctx, `set -e; [ "$(readlink "$HOME/.local/bin/sx")" != spotexec ] || exit 0; `+stageDir+linkStaged, nil); err != nil {
 					return installed{}, err
 				}
 				return installed{bin: localBin, dir: "$HOME/.local/bin", how: "release " + tag + " in ~/.local/bin, already installed", want: v}, nil
@@ -433,7 +474,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 		// Downloaded and unpacked next to the old one, which is replaced
 		// only once the archive matches the release's checksum and the new
 		// binary runs.
-		if _, err := r.run(ctx, `set -e; d="$HOME/.local/bin"; mkdir -p "$d"; t=$(mktemp -d "$d/.spotexec-install.XXXXXX"); trap 'rm -rf "$t"' EXIT; `+
+		if _, err := r.run(ctx, `set -e; `+stageDir+
 			`curl -fsSL -o "$t/a.tar.gz" `+shq(url)+`; `+
 			`if command -v sha256sum >/dev/null 2>&1; then s=$(sha256sum "$t/a.tar.gz"); `+
 			`elif command -v shasum >/dev/null 2>&1; then s=$(shasum -a 256 "$t/a.tar.gz"); `+
@@ -441,7 +482,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 			`[ "${s%% *}" = `+shq(sum)+` ] || { echo "the download doesn't match the release's checksum (got ${s%% *})" >&2; exit 1; }; `+
 			`tar -xzf "$t/a.tar.gz" -C "$t" spotexec; `+
 			`v=$("$t/spotexec" version 2>&1) && [ "$v" = `+shq("spotexec "+want)+` ] || { echo "the downloaded spotexec doesn't run: $v" >&2; exit 1; }; `+
-			`mv -f "$t/spotexec" "$d/spotexec"; ln -sf spotexec "$d/sx"`, nil); err != nil {
+			publishStaged, nil); err != nil {
 			return installed{}, fmt.Errorf("installing %s: %w", url, err)
 		}
 		return installed{bin: localBin, dir: "$HOME/.local/bin", how: "release " + tag + " in ~/.local/bin", want: want}, nil
@@ -449,20 +490,21 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 		if i.os != runtime.GOOS || i.arch != runtime.GOARCH {
 			return installed{}, fmt.Errorf("--install copy needs the same platform (this is %s/%s, that is %s/%s)", runtime.GOOS, runtime.GOARCH, i.os, i.arch)
 		}
-		self, err := os.Executable()
-		if err != nil {
-			return installed{}, err
-		}
-		f, err := os.Open(self)
+		f, size, err := selfBinary()
 		if err != nil {
 			return installed{}, err
 		}
 		defer f.Close()
 		r.printf("  copying this spotexec (%s) into ~/.local/bin…\n", Version)
-		if _, err := r.run(ctx, `set -e; mkdir -p "$HOME/.local/bin"; cat > "$HOME/.local/bin/.spotexec.tmp"; `+
-			`chmod 755 "$HOME/.local/bin/.spotexec.tmp"; mv "$HOME/.local/bin/.spotexec.tmp" "$HOME/.local/bin/spotexec"; `+
-			`ln -sf spotexec "$HOME/.local/bin/sx"`, f); err != nil {
-			return installed{}, err
+		// Staged in a directory of its own next to the old one, and moved
+		// into place only once the whole copy arrived and runs.
+		n := strconv.FormatInt(size, 10)
+		if _, err := r.run(ctx, `set -e; `+stageDir+`cat > "$t/spotexec"; `+
+			`n=$(wc -c < "$t/spotexec"); [ $n -eq `+n+` ] || { echo "the copy arrived with $n bytes, not this spotexec's `+n+`" >&2; exit 1; }; `+
+			`chmod 755 "$t/spotexec"; `+
+			`v=$("$t/spotexec" version 2>&1) && [ "$v" = `+shq("spotexec "+Version)+` ] || { echo "the copied spotexec doesn't run: $v" >&2; exit 1; }; `+
+			publishStaged, f); err != nil {
+			return installed{}, fmt.Errorf("copying spotexec there: %w", err)
 		}
 		return installed{bin: localBin, dir: "$HOME/.local/bin", how: "copied from this machine into ~/.local/bin", want: Version}, nil
 	case "none":

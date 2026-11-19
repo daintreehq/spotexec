@@ -13,7 +13,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/daintreehq/spotexec/internal/hooks"
 )
@@ -1052,4 +1054,308 @@ func TestRemoteSetupOldHookDefault(t *testing.T) {
 			t.Fatalf("hooks=%v: %v\n%s", c.hooks, err, f.out.String())
 		}
 	}
+}
+
+// copyFrom makes --install copy send each body in turn, once each.
+func copyFrom(t *testing.T, bodies ...io.Reader) {
+	t.Helper()
+	var mu sync.Mutex
+	old := selfBinary
+	selfBinary = func() (io.ReadCloser, int64, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(bodies) == 0 {
+			return nil, 0, errors.New("test: no more copies to send")
+		}
+		b := bodies[0]
+		bodies = bodies[1:]
+		n := int64(-1)
+		if l, ok := b.(interface{ Len() int }); ok {
+			n = int64(l.Len())
+		}
+		return io.NopCloser(b), n, nil
+	}
+	t.Cleanup(func() { selfBinary = old })
+}
+
+// sizedReader reports a size other than what it holds.
+type sizedReader struct {
+	io.Reader
+	n int
+}
+
+func (s sizedReader) Len() int { return s.n }
+
+// Two copy installs that overlap each stage their own copy: both succeed,
+// and ~/.local/bin ends with one complete spotexec and its sx link.
+func TestRemoteInstallCopyConcurrent(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	f.localInstalled("0.1.0")
+	bin := filepath.Join(f.home, ".local", "bin")
+	// An sx that links to a directory is replaced, not descended into.
+	other := filepath.Join(f.dir, "other")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(bin, "sx")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, filepath.Join(bin, "sx")); err != nil {
+		t.Fatal(err)
+	}
+	stub := strings.Replace(fakeSpotexec, "VERSION", Version, 1)
+	a := stub + "# installer A\n"
+	b := stub + "# installer B, which has a longer body\n"
+	pr, pw := io.Pipe()
+	copyFrom(t, sizedReader{pr, len(a)}, strings.NewReader(b))
+	i, err := f.setup().probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ra, rb := f.setup(), f.setup()
+	ra.install, rb.install = "copy", "copy"
+	ra.out, rb.out = io.Discard, io.Discard
+	done := make(chan error, 1)
+	go func() {
+		_, err := ra.installSpotexec(context.Background(), i)
+		// Writes to A's pipe fail once A is done, so the test never blocks.
+		pr.CloseWithError(fmt.Errorf("installer A returned: %v", err))
+		done <- err
+	}()
+	// A has finished, whatever happens, before the fake host goes.
+	var aErr error
+	joined := false
+	join := func() error {
+		if !joined {
+			pw.CloseWithError(errors.New("test over"))
+			aErr, joined = <-done, true
+		}
+		return aErr
+	}
+	t.Cleanup(func() { join() })
+	// A's copy is half written there when B runs from start to finish.
+	half := len(a) / 2
+	if _, err := io.WriteString(pw, a[:half]); err != nil {
+		t.Fatal(err)
+	}
+	waitForStaged(t, bin, half)
+	if in, err := rb.installSpotexec(context.Background(), i); err != nil || in.bin != localBin {
+		t.Fatalf("B: %+v %v", in, err)
+	}
+	// B's copy is in place while A is still sending.
+	if got := readFile(filepath.Join(bin, "spotexec")); got != b {
+		t.Fatalf("after B, ~/.local/bin/spotexec is\n%s", got)
+	}
+	if l, err := os.Readlink(filepath.Join(bin, "sx")); err != nil || l != "spotexec" {
+		t.Fatalf("after B, sx -> %q %v", l, err)
+	}
+	if _, err := io.WriteString(pw, a[half:]); err != nil {
+		t.Fatal(err)
+	}
+	pw.Close()
+	if err := join(); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	if got := readFile(filepath.Join(bin, "spotexec")); got != a {
+		t.Fatalf("~/.local/bin/spotexec is\n%s", got)
+	}
+	if l, err := os.Readlink(filepath.Join(bin, "sx")); err != nil || l != "spotexec" {
+		t.Fatalf("sx -> %q %v", l, err)
+	}
+	if v := versionAt(t, filepath.Join(bin, "sx")); v != Version {
+		t.Fatalf("sx runs as %q", v)
+	}
+	if left := hiddenEntries(t, bin); len(left) > 0 {
+		t.Fatalf("left %v", left)
+	}
+	if es, err := os.ReadDir(other); err != nil || len(es) > 0 {
+		t.Fatalf("the directory sx linked to now holds %v (%v)", es, err)
+	}
+}
+
+// A real directory where the sx link goes is left as it is: the new
+// spotexec is still installed, and nothing is written into the directory.
+func TestRemoteInstallCopySxDirectory(t *testing.T) {
+	f := newFakeHost(t, t.TempDir())
+	f.localInstalled("0.1.0")
+	bin := filepath.Join(f.home, ".local", "bin")
+	if err := os.Remove(filepath.Join(bin, "sx")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(bin, "sx"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "sx", "keep"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	copyFrom(t, strings.NewReader(strings.Replace(fakeSpotexec, "VERSION", Version, 1)))
+	r := f.setup()
+	r.install = "copy"
+	if _, err := f.install(r); err != nil {
+		t.Fatal(err)
+	}
+	if v := versionAt(t, filepath.Join(bin, "spotexec")); v != Version {
+		t.Fatalf("~/.local/bin has %q", v)
+	}
+	if es, err := os.ReadDir(filepath.Join(bin, "sx")); err != nil || len(es) != 1 || es[0].Name() != "keep" {
+		t.Fatalf("sx/ now holds %v (%v)", es, err)
+	}
+	if left := hiddenEntries(t, bin); len(left) > 0 {
+		t.Fatalf("left %v", left)
+	}
+}
+
+// A copy that arrives short, or doesn't run, replaces nothing and leaves
+// nothing behind.
+func TestRemoteInstallCopyBadCopyKeepsOld(t *testing.T) {
+	stub := strings.Replace(fakeSpotexec, "VERSION", Version, 1)
+	for name, c := range map[string]struct {
+		body io.Reader
+		err  string
+	}{
+		"short":     {sizedReader{strings.NewReader(stub), len(stub) + 10}, "not this spotexec's"},
+		"long":      {sizedReader{strings.NewReader(stub + "# extra\n"), len(stub)}, "not this spotexec's"},
+		"wrong":     {strings.NewReader(strings.Replace(fakeSpotexec, "VERSION", "0.0.1", 1)), "doesn't run"},
+		"failing":   {strings.NewReader(stub + "exit 1\n"), "doesn't run"},
+		"truncated": {sizedReader{strings.NewReader(stub[:20]), len(stub)}, "not this spotexec's"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeHost(t, t.TempDir())
+			f.localInstalled("0.1.0")
+			copyFrom(t, c.body)
+			r := f.setup()
+			r.install = "copy"
+			if _, err := f.install(r); err == nil || !strings.Contains(err.Error(), c.err) {
+				t.Fatalf("err = %v", err)
+			}
+			bin := filepath.Join(f.home, ".local", "bin")
+			if v := versionAt(t, filepath.Join(bin, "spotexec")); v != "0.1.0" {
+				t.Fatalf("~/.local/bin has %q", v)
+			}
+			if l, err := os.Readlink(filepath.Join(bin, "sx")); err != nil || l != "spotexec" {
+				t.Fatalf("sx -> %q %v", l, err)
+			}
+			if left := hiddenEntries(t, bin); len(left) > 0 {
+				t.Fatalf("left %v", left)
+			}
+		})
+	}
+}
+
+// fakeBusyBoxMv fails like BusyBox's mv, which looks through the entry it
+// replaces: a link there that loops or leads nowhere stops it.
+const fakeBusyBoxMv = `#!/bin/sh
+for last; do :; done
+for a; do case "$a" in -*) ;; *) src=$a; break ;; esac; done
+dest=$last; [ -d "$dest" ] && [ ! -L "$dest" ] && dest="$dest/$(basename "$src")"
+dest=${dest%/}
+if [ -L "$dest" ] && [ ! -e "$dest" ]; then echo "mv: can't stat '$dest': Too many levels of symbolic links" >&2; exit 1; fi
+exec /bin/mv "$@"
+`
+
+// Both release installs, a new download and an already current one, put
+// back an sx that links to a directory or to nothing without touching what
+// it pointed at, and leave a real directory named sx alone.
+func TestRemoteInstallReleaseRepairsSx(t *testing.T) {
+	for _, current := range []bool{false, true} {
+		for _, target := range []string{"dir", "loop", "realdir"} {
+			t.Run(fmt.Sprintf("current=%v/%s", current, target), func(t *testing.T) {
+				f := newFakeHost(t, t.TempDir())
+				_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+				f.write("stub/mv", fakeBusyBoxMv, 0o755)
+				withLatest(t, "v0.3.0")
+				f.release("0.3.0")
+				if current {
+					f.localInstalled("0.3.0")
+				} else {
+					f.localInstalled("0.2.0")
+				}
+				bin := filepath.Join(f.home, ".local", "bin")
+				sx := filepath.Join(bin, "sx")
+				other := filepath.Join(f.dir, "other")
+				if err := os.Mkdir(other, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				_ = os.Remove(sx)
+				to := other
+				if target == "loop" {
+					to = "sx"
+				}
+				if target == "realdir" {
+					if err := os.Mkdir(sx, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Symlink(to, sx); err != nil {
+					t.Fatal(err)
+				}
+				if in, err := f.install(f.setup()); err != nil || in.want != "0.3.0" {
+					t.Fatalf("%+v %v", in, err)
+				}
+				if v := versionAt(t, filepath.Join(bin, "spotexec")); v != "0.3.0" {
+					t.Fatalf("~/.local/bin has %q", v)
+				}
+				if target == "realdir" {
+					if es, err := os.ReadDir(sx); err != nil || len(es) > 0 {
+						t.Fatalf("sx/ now holds %v (%v)", es, err)
+					}
+					if left := hiddenEntries(t, bin); len(left) > 0 {
+						t.Fatalf("left %v", left)
+					}
+					return
+				}
+				if l, err := os.Readlink(sx); err != nil || l != "spotexec" {
+					t.Fatalf("sx -> %q %v", l, err)
+				}
+				if v := versionAt(t, sx); v != "0.3.0" {
+					t.Fatalf("sx runs as %q", v)
+				}
+				if es, err := os.ReadDir(other); err != nil || len(es) > 0 {
+					t.Fatalf("the directory sx linked to now holds %v (%v)", es, err)
+				}
+				if left := hiddenEntries(t, bin); len(left) > 0 {
+					t.Fatalf("left %v", left)
+				}
+				if current && fileExists(filepath.Join(f.dir, "curl.log")) {
+					t.Fatal("downloaded it again")
+				}
+			})
+		}
+	}
+}
+
+// waitForStaged waits until some hidden file under dir holds n bytes.
+func waitForStaged(t *testing.T, dir string, n int) {
+	t.Helper()
+	for end := time.Now().Add(10 * time.Second); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		found := false
+		_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+			rel, _ := filepath.Rel(dir, p)
+			if err == nil && d.Type().IsRegular() && strings.HasPrefix(rel, ".") {
+				if st, err := d.Info(); err == nil && st.Size() == int64(n) {
+					found = true
+				}
+			}
+			return nil
+		})
+		if found {
+			return
+		}
+	}
+	t.Fatalf("nothing staged under %s", dir)
+}
+
+// hiddenEntries lists what an install left in dir besides spotexec and sx.
+func hiddenEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	for _, e := range es {
+		if n := e.Name(); n != "spotexec" && n != "sx" {
+			left = append(left, n)
+		}
+	}
+	return left
 }
