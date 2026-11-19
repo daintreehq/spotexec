@@ -27,6 +27,11 @@ type rule struct {
 // Matcher holds ordered rules.
 type Matcher struct {
 	rules []rule
+	// git: a trailing ** matches only what is inside a directory, never the
+	// directory itself, as Git reads .gitignore files (Tree). Otherwise
+	// "dir/**" also excludes dir, as .spotexecignore and [sync].exclude
+	// always have.
+	git bool
 }
 
 // New builds a matcher from pattern lines.
@@ -68,6 +73,9 @@ func (m *Matcher) Add(lines ...string) {
 			continue
 		}
 		r.segs = strings.Split(l, "/")
+		for i, seg := range r.segs {
+			r.segs[i] = bracketNegation(seg)
+		}
 		if !r.anchored {
 			r.segs = append([]string{"**"}, r.segs...)
 		}
@@ -174,26 +182,26 @@ func (m *Matcher) decide(parts []string, isDir bool) (excluded, matched bool) {
 		if r.dirOnly && !isDir {
 			continue
 		}
-		if matchSegs(r.segs, parts) {
+		if matchSegs(r.segs, parts, m.git) {
 			excluded, matched = !r.negate, true
 		}
 	}
 	return excluded, matched
 }
 
-func matchSegs(pat, parts []string) bool {
+func matchSegs(pat, parts []string, git bool) bool {
 	if len(pat) == 0 {
 		return len(parts) == 0
 	}
 	if pat[0] == "**" {
-		// A trailing ** matches everything inside, never the directory
-		// itself: "dir/**" leaves dir to be entered, so a deeper rule can
-		// re-include a file in it.
-		if len(pat) == 1 {
+		// Read as Git does, a trailing ** matches everything inside,
+		// never the directory itself: "dir/**" leaves dir to be entered,
+		// so a deeper rule can re-include a file in it.
+		if git && len(pat) == 1 {
 			return len(parts) > 0
 		}
 		for i := 0; i <= len(parts); i++ {
-			if matchSegs(pat[1:], parts[i:]) {
+			if matchSegs(pat[1:], parts[i:], git) {
 				return true
 			}
 		}
@@ -206,5 +214,26 @@ func matchSegs(pat, parts []string) bool {
 	if err != nil || !ok {
 		return false
 	}
-	return matchSegs(pat[1:], parts[1:])
+	return matchSegs(pat[1:], parts[1:], git)
+}
+
+// bracketNegation rewrites Git's negated class "[!...]" as path.Match's
+// "[^...]" (path.Match reads "!" there as a member).
+func bracketNegation(seg string) string {
+	if !strings.Contains(seg, "[!") {
+		return seg
+	}
+	var b strings.Builder
+	for i := 0; i < len(seg); i++ {
+		b.WriteByte(seg[i])
+		switch {
+		case seg[i] == '\\' && i+1 < len(seg):
+			i++
+			b.WriteByte(seg[i])
+		case seg[i] == '[' && i+1 < len(seg) && seg[i+1] == '!':
+			b.WriteByte('^')
+			i++
+		}
+	}
+	return b.String()
 }

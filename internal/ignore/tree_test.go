@@ -21,25 +21,50 @@ func writeFiles(t *testing.T, root string, files map[string]string) {
 	}
 }
 
-// A trailing ** excludes what is inside a directory, not the directory,
-// so a deeper file's negation re-includes a file in it, as in Git.
+// In a .gitignore a trailing ** excludes what is inside a directory, not
+// the directory, so a deeper file's negation re-includes a file in it, as
+// in Git. .spotexecignore and [sync].exclude keep excluding the directory
+// itself, as they always have.
 func TestTrailingDoubleStar(t *testing.T) {
-	m := New("service/**", "!service/keep.txt")
-	for p, want := range map[string]bool{"service/a.txt": true, "service/keep.txt": false, "service/sub/x": true} {
-		if got := m.Match(p, false); got != want {
-			t.Errorf("Match(%q) = %v, want %v", p, got, want)
+	user := New("service/**", "!service/keep.txt", "private/**/")
+	for p, want := range map[string]bool{"service/a.txt": true, "service/keep.txt": true, "private/key.pem": true} {
+		if got := user.Match(p, false); got != want {
+			t.Errorf("user Match(%q) = %v, want %v", p, got, want)
 		}
 	}
-	if m.Match("service", true) {
-		t.Error("service/** excluded service itself")
+	if !user.Match("service", true) {
+		t.Error("user service/** no longer excludes service itself")
 	}
 
 	root := t.TempDir()
-	writeFiles(t, root, map[string]string{".gitignore": "service/**\n", "service/.gitignore": "!keep.txt\n"})
+	writeFiles(t, root, map[string]string{
+		".gitignore":         "service/**\nprivate/**/\n",
+		"service/.gitignore": "!keep.txt\n!sub/\n",
+	})
 	tr := NewTree(root, ".gitignore")
-	for p, want := range map[string]bool{"service/keep.txt": false, "service/a.txt": true, "service/sub/keep.txt": true} {
+	for p, want := range map[string]bool{
+		"service/keep.txt": false, "service/a.txt": true, "service/x/keep.txt": true,
+		"private/key.pem": false, "private/sub/key.pem": true,
+	} {
 		if got, err := tr.Match(p, false); err != nil || got != want {
 			t.Errorf("Tree.Match(%q) = %v, %v, want %v", p, got, err, want)
+		}
+	}
+	// Re-included as a directory, but its files are still inside service/**.
+	if got, err := tr.Match("service/sub", true); err != nil || got {
+		t.Errorf("Tree.Match(service/sub/) = %v, %v", got, err)
+	}
+	if got, err := tr.Match("service/sub/x", false); err != nil || !got {
+		t.Errorf("Tree.Match(service/sub/x) = %v, %v", got, err)
+	}
+}
+
+// Git's negated class [!...] means "not", as [^...] does.
+func TestBracketNegation(t *testing.T) {
+	m := New("keys/[!x].pem", "\\[!y].txt")
+	for p, want := range map[string]bool{"keys/a.pem": true, "keys/x.pem": false, "keys/!.pem": true, "keys/ab.pem": false, "[!y].txt": true, "a.txt": false} {
+		if got := m.Match(p, false); got != want {
+			t.Errorf("Match(%q) = %v, want %v", p, got, want)
 		}
 	}
 }
@@ -55,6 +80,12 @@ func TestTreeTrailingSlash(t *testing.T) {
 	}
 	if got, err := tr.Match("service/", false); err != nil || got {
 		t.Fatalf("Match(service/) = %v, %v", got, err)
+	}
+	// A trailing slash is the directory itself: an unreadable file inside
+	// it doesn't apply to it.
+	writeFiles(t, root, map[string]string{"open/.gitignore/x": ""})
+	if got, err := tr.Match("open/", false); err != nil || got {
+		t.Fatalf("Match(open/) = %v, %v", got, err)
 	}
 	// Below an excluded directory nothing is re-included, so its own
 	// file is never needed.
@@ -94,8 +125,11 @@ func TestTreeReadErrors(t *testing.T) {
 			writeFiles(t, root, map[string]string{"sub/a.txt": ""})
 			p := filepath.Join(root, "sub", ".gitignore")
 			make(t, p)
-			if _, err := NewTree(root, ".gitignore").Match("sub/a.txt", false); err == nil || !strings.Contains(err.Error(), p) {
-				t.Fatalf("Match error = %v, want one naming %s", err, p)
+			tr := NewTree(root, ".gitignore")
+			for range 2 { // never cached as "no file"
+				if _, err := tr.Match("sub/a.txt", false); err == nil || !strings.Contains(err.Error(), p) {
+					t.Fatalf("Match error = %v, want one naming %s", err, p)
+				}
 			}
 			if err := New().AddFile(p); err == nil || !strings.Contains(err.Error(), p) {
 				t.Fatalf("AddFile error = %v, want one naming %s", err, p)

@@ -90,6 +90,8 @@ func (t *Tree) load(dir []string) (*Matcher, error) {
 		}
 		if m = New(lines...); m.Empty() {
 			m = nil
+		} else {
+			m.git = true
 		}
 	}
 	t.dirs[key] = m
