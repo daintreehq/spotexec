@@ -425,3 +425,19 @@ func TestSupportedCommand(t *testing.T) {
 		t.Errorf("supported in yes = %d %q %q, want 0 \"true\\n\" and no stderr", code, out, stderr)
 	}
 }
+
+// Inside a checkout Git can't read, with a project marker only above it,
+// supported reports Git's error: it neither offloads to the parent
+// project nor blames a missing .spotexec.toml.
+func TestSupportedUnreadableCheckout(t *testing.T) {
+	supportedEnv(t, sshRunner)
+	parent := outsideGit(t)
+	putFile(t, filepath.Join(parent, ".spotexec.toml"), "version = 1\n")
+	repo := filepath.Join(parent, "repo")
+	putFile(t, filepath.Join(repo, ".git"), "garbage\n")
+	putFile(t, filepath.Join(repo, "src", "a.txt"), "a")
+	err := supported(context.Background(), filepath.Join(repo, "src"))
+	if err == nil || !strings.Contains(err.Error(), "invalid gitfile format") || strings.Contains(err.Error(), "no .spotexec.toml") {
+		t.Fatalf("supported = %v; want Git's error", err)
+	}
+}
