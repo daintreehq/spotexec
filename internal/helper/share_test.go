@@ -851,3 +851,32 @@ func TestDepsHitWithoutAReadyMarker(t *testing.T) {
 		t.Fatalf("not a hit: %+v", res)
 	}
 }
+
+// #315: the install sees [env] and env_allow, so a value it reads must key
+// the dependency cache. Changing only that value installs afresh, both in
+// the same slot (its fast path) and in a fresh slot on the same runner (the
+// per-key cache), and changing it back restores the first install.
+func TestDepsKeyedByInstallEnv(t *testing.T) {
+	s, _ := depsSession(t)
+	install := func(mode string) string {
+		t.Helper()
+		d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p vendor && echo \"$MODE\" > vendor/mode", CacheDirs: []string{"vendor"}, Env: map[string]string{"MODE": mode, "OTHER": "x"}}
+		if err := s.deps(d); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(filepath.Join(s.workspace, "vendor", "mode"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	if got := install("production"); got != "production" {
+		t.Fatalf("first install: %q", got)
+	}
+	if got := install("development"); got != "development" {
+		t.Fatalf("a changed MODE reused the slot's install: %q", got)
+	}
+	if got := install("production"); got != "production" {
+		t.Fatalf("changing MODE back: %q", got)
+	}
+}

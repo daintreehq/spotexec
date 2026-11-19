@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -273,4 +274,45 @@ func speedState(t *testing.T, r *config.Runner) map[string]map[string][]speedRun
 		t.Fatal(err)
 	}
 	return st.Speed
+}
+
+// #315: the install sees env_allow and [env], so the key a launch looks
+// for carries them as the run's does, [env] winning over env_allow.
+func TestPlacementProjectKeyFollowsInstallEnv(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package-lock.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SX_TEST_315_ALLOWED", "local")
+	ws := &Workspace{Root: root, RepoID: "repo1"}
+	r := &config.Runner{Name: "aws", Type: config.TypeAWSSpot, Regions: []string{"all"}, Region: "us-east-1", Arch: "arm64", User: "ubuntu", BootstrapScript: "true"}
+	p := &config.Project{
+		EnvAllow: []string{"SX_TEST_315_ALLOWED", "SX_TEST_315_UNSET"},
+		Env:      map[string]string{"NODE_ENV": "production"},
+		Deps:     config.Deps{Install: "npm ci", Lockfiles: []string{"package-lock.json"}, CacheDirs: []string{"node_modules"}},
+	}
+	m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := depsEnv(p), map[string]string{"SX_TEST_315_ALLOWED": "local", "NODE_ENV": "production"}; !maps.Equal(got, want) {
+		t.Fatalf("install env %v, want %v", got, want)
+	}
+	spec := depskey.Spec{Lockfiles: []string{"package-lock.json"}, Install: "npm ci", CacheDirs: []string{"node_modules"}, OS: "linux", Arch: "arm64", Toolchain: toolchainFor(r, nil), Env: depsEnv(p)}
+	want, err := depskey.Key(root, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prod := PlacementProject(p, ws, m, false, r).DepsKey
+	if prod != want {
+		t.Fatalf("key %s, want %s", prod, want)
+	}
+	p.Env["NODE_ENV"] = "development"
+	if dev := PlacementProject(p, ws, m, false, r).DepsKey; dev == prod {
+		t.Fatal("a changed [env] value kept the key")
+	}
+	p.Env = map[string]string{"SX_TEST_315_ALLOWED": "fixed"}
+	if got := depsEnv(p)["SX_TEST_315_ALLOWED"]; got != "fixed" {
+		t.Fatalf("[env] over env_allow: %q", got)
+	}
 }
