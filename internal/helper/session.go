@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -635,6 +636,40 @@ func ExpandRoot(p string) (string, error) {
 	return filepath.Abs(p)
 }
 
+// chmodRoot is os.Chmod, swapped out by tests.
+var chmodRoot = os.Chmod
+
+// privateRoot makes the work root private to the runner user, or says why it
+// can't be. Synced source and commands live under it, in directories other
+// users could otherwise read (0755), so a session never starts without it:
+// an existing shared directory the runner can write to but not chmod would
+// leave every slot open.
+func privateRoot(root string) error {
+	chErr := chmodRoot(root, 0o700)
+	fi, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
+	var why string
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	switch {
+	case !fi.IsDir():
+		why = "it is not a directory"
+	case !ok:
+		why = "its owner can't be read"
+	case int(st.Uid) != os.Geteuid():
+		why = fmt.Sprintf("it is owned by uid %d, not the runner user (uid %d)", st.Uid, os.Geteuid())
+	case fi.Mode().Perm()&0o077 != 0:
+		why = fmt.Sprintf("its mode is %#o, open to other users", fi.Mode().Perm())
+	default:
+		return nil
+	}
+	if chErr != nil {
+		why += fmt.Sprintf(", and making it 0700 failed (%v)", chErr)
+	}
+	return perr(protocol.CodeBadRequest, "work root %s can't be made private: %s; point work_root at a directory the runner user owns, or chmod 700 it", root, why)
+}
+
 func (s *Session) hello(h protocol.Hello) error {
 	if h.Proto != protocol.Version {
 		return perr(protocol.CodeBadRequest, "protocol mismatch: client %d, helper %d", h.Proto, protocol.Version)
@@ -643,15 +678,16 @@ func (s *Session) hello(h protocol.Hello) error {
 	if err != nil {
 		return err
 	}
-	// Private to the runner user: synced source and commands live here.
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return err
 	}
-	_ = os.Chmod(root, 0o700)
 	// Resolved, so process cleanup (which matches /proc/<pid>/cwd, always a
 	// resolved path) and output path rewriting see the same paths.
 	if r, err := filepath.EvalSymlinks(root); err == nil {
 		root = r
+	}
+	if err := privateRoot(root); err != nil {
+		return err
 	}
 	s.layout = Layout{Root: root}
 	return s.c.Send(protocol.TypeHelloOK, protocol.HelloOK{
