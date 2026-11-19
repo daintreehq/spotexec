@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -173,6 +174,59 @@ func TestPrivateDirModes(t *testing.T) {
 		} else if ok {
 			mustPrivate(t, d)
 		}
+	}
+}
+
+// A home whose ancestor others could rename lets them swap the control
+// directory for theirs after it was checked: refused.
+func TestControlDirRefusesReplaceableAncestor(t *testing.T) {
+	top := shortDir(t)
+	home := filepath.Join(top, "h")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	useCtlDirs(t, home, t.TempDir())
+	if err := os.Chmod(top, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := controlDir(); err == nil || d != "" {
+		t.Fatalf("controlDir = %q, %v; want an error", d, err)
+	}
+	// Sticky, as /tmp is: others can't move our entries.
+	if err := os.Chmod(top, 0o777|fs.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controlDir(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A directory of ours holding another user's entry (left from when it was
+// writable) is replaced: their socket could stand in for a master. Only root
+// can make another user's file to test with.
+func TestControlDirRefusesForeignEntry(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root to own a file as another user")
+	}
+	tmp := t.TempDir()
+	useCtlDirs(t, longHome(t), tmp)
+	preferred := filepath.Join(tmp, fmt.Sprintf("sx-cm-%d", os.Getuid()))
+	if err := os.Mkdir(preferred, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(preferred, "0123456789abcdef")
+	if err := os.WriteFile(f, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Lchown(f, 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	d, err := controlDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d == preferred {
+		t.Fatalf("controlDir kept %s, which holds another user's entry", d)
 	}
 }
 

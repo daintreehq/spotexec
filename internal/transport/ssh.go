@@ -156,9 +156,14 @@ func CheckControlDir() error {
 }
 
 // privateDir makes sure dir exists, is a real directory (not a symlink),
-// owned by us, mode 0700. One others could write to is refused, not fixed:
-// they may already have left a socket of theirs in it.
+// owned by us, mode 0700, and that no other user can put anything in its
+// place or in it. One others could write to is refused, not fixed, as is
+// one holding anything of theirs: a socket they left there would stand in
+// for the master.
 func privateDir(dir string) error {
+	if err := safeAncestors(dir); err != nil {
+		return err
+	}
 	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return err
 	}
@@ -176,7 +181,53 @@ func privateDir(dir string) error {
 	if fi.Mode().Perm()&0o022 != 0 {
 		return fmt.Errorf("%s is writable by other users (remove it, and spotexec makes a private one)", dir)
 	}
-	return os.Chmod(dir, 0o700)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		efi, err := e.Info()
+		if err != nil {
+			continue // gone meanwhile
+		}
+		if est, ok := efi.Sys().(*syscall.Stat_t); !ok || int(est.Uid) != os.Getuid() {
+			return fmt.Errorf("%s holds %s, which is another user's (remove it, and spotexec makes a private one)", dir, e.Name())
+		}
+	}
+	return nil
+}
+
+// safeAncestors checks that no other user can swap dir for one of theirs by
+// renaming an ancestor: each, along the path as given and as resolved, is
+// owned by root or us, and one others may write to is sticky (as /tmp is),
+// so they can't move our entries in it. A symlink's own mode means nothing.
+func safeAncestors(dir string) error {
+	paths := []string{filepath.Clean(dir)}
+	if r, err := filepath.EvalSymlinks(filepath.Dir(dir)); err == nil {
+		paths = append(paths, filepath.Join(r, filepath.Base(dir)))
+	}
+	for _, p := range paths {
+		for a := filepath.Dir(p); ; a = filepath.Dir(a) {
+			fi, err := os.Lstat(a)
+			if err != nil {
+				return err
+			}
+			st, ok := fi.Sys().(*syscall.Stat_t)
+			if !ok || (st.Uid != 0 && int(st.Uid) != os.Getuid()) {
+				return fmt.Errorf("%s is owned by another user", a)
+			}
+			if fi.Mode()&fs.ModeSymlink == 0 && fi.Mode().Perm()&0o022 != 0 && fi.Mode()&fs.ModeSticky == 0 {
+				return fmt.Errorf("%s is writable by other users", a)
+			}
+			if a == filepath.Dir(a) {
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // baseArgs builds the ssh options. ssh uses the first value it sees for an
