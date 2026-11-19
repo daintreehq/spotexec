@@ -197,9 +197,9 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 			cands = append(cands, cand{path: p})
 		}
 	} else {
-		gitignore := ignore.New()
-		_ = gitignore.AddFile(filepath.Join(o.Root, ".gitignore"))
-		dirMatcher := orMatch{builtin, gitignore}
+		// Every .gitignore applies where it is declared, as in Git, and one
+		// that can't be read fails the walk rather than sync what it lists.
+		gitignore := ignore.NewTree(o.Root, ".gitignore")
 		err := filepath.WalkDir(o.Root, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -208,14 +208,21 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 				return nil
 			}
 			rel := filepath.ToSlash(must(filepath.Rel(o.Root, p)))
-			if d.IsDir() {
-				if dirMatcher.Match(rel, true) || user.Match(rel, true) {
+			isDir := d.IsDir()
+			ex := builtin.Match(rel, isDir) || user.Match(rel, isDir)
+			if !ex {
+				if ex, err = gitignore.Match(rel, isDir); err != nil {
+					return err
+				}
+			}
+			if isDir {
+				if ex {
 					m.Excluded["ignored-dir"]++
 					return filepath.SkipDir
 				}
 				return nil
 			}
-			if dirMatcher.Match(rel, false) || user.Match(rel, false) {
+			if ex {
 				m.Excluded["ignored"]++
 				return nil
 			}
@@ -609,10 +616,18 @@ func (m *Manifest) CheckIgnored(ctx context.Context, paths []string) (map[string
 		builtin = newSpotExcluder(nil)
 	}
 	if !m.Git {
-		gitignore := ignore.New()
-		_ = gitignore.AddFile(filepath.Join(m.Root, ".gitignore"))
+		// The walk's rules, read from the worktree as it is now (as git
+		// check-ignore reads it).
+		gitignore := ignore.NewTree(m.Root, ".gitignore")
 		for _, p := range rest {
-			if builtin.Match(p, false) || gitignore.Match(p, false) {
+			ex := builtin.Match(p, false)
+			if !ex {
+				var err error
+				if ex, err = gitignore.Match(p, false); err != nil {
+					return nil, err
+				}
+			}
+			if ex {
 				ign[p] = true
 			}
 		}
@@ -710,16 +725,4 @@ func inSpotexecDir(r string) bool {
 func isNestedRepo(dir string) bool {
 	_, err := os.Lstat(filepath.Join(dir, ".git"))
 	return err == nil
-}
-
-// orMatch excludes what any of its matchers excludes.
-type orMatch []interface{ Match(string, bool) bool }
-
-func (o orMatch) Match(p string, isDir bool) bool {
-	for _, m := range o {
-		if m.Match(p, isDir) {
-			return true
-		}
-	}
-	return false
 }

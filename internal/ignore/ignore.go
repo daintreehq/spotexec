@@ -8,9 +8,13 @@ package ignore
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"strings"
+	"syscall"
 )
 
 type rule struct {
@@ -23,6 +27,11 @@ type rule struct {
 // Matcher holds ordered rules.
 type Matcher struct {
 	rules []rule
+	// git: a trailing ** matches only what is inside a directory, never the
+	// directory itself, as Git reads .gitignore files (Tree). Otherwise
+	// "dir/**" also excludes dir, as .spotexecignore and [sync].exclude
+	// always have.
+	git bool
 }
 
 // New builds a matcher from pattern lines.
@@ -71,21 +80,61 @@ func (m *Matcher) Add(lines ...string) {
 	}
 }
 
-// AddFile appends the patterns of a file if it exists.
+// AddFile appends the patterns of a file if it exists. A file that exists
+// but can't be read whole (a directory in its place, no permission, a read
+// error) is an error naming it.
 func (m *Matcher) AddFile(p string) error {
-	f, err := os.Open(p)
+	lines, err := readLines(p, false)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return err
 	}
+	m.Add(lines...)
+	return nil
+}
+
+// readLines returns the lines of the file at p: none when there is no such
+// file (or a file stands where a directory on its path would be), and an
+// error naming p when one exists but can't be read completely. With
+// noFollow a symlink at p counts as no file, as Git skips a symlinked
+// .gitignore.
+func readLines(p string, noFollow bool) ([]string, error) {
+	// Nonblocking, so a FIFO in its place fails the regular-file check
+	// instead of hanging the scan.
+	flags := os.O_RDONLY | syscall.O_NONBLOCK
+	if noFollow {
+		flags |= syscall.O_NOFOLLOW
+	}
+	f, err := os.OpenFile(p, flags, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || noFollow && errors.Is(err, syscall.ELOOP) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cannot read ignore file %s: %w", p, unwrapPath(err))
+	}
 	defer f.Close()
+	if fi, err := f.Stat(); err != nil {
+		return nil, fmt.Errorf("cannot read ignore file %s: %w", p, unwrapPath(err))
+	} else if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("cannot read ignore file %s: not a regular file (%s)", p, fi.Mode().Type())
+	}
+	var lines []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		m.Add(sc.Text())
+		lines = append(lines, sc.Text())
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("cannot read ignore file %s: %w", p, unwrapPath(err))
+	}
+	return lines, nil
+}
+
+// unwrapPath drops the path a *fs.PathError repeats.
+func unwrapPath(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	return err
 }
 
 // Empty reports whether the matcher has no rules.
@@ -125,25 +174,37 @@ func (m *Matcher) MatchBelow(rel string, isDir bool, skip int) bool {
 }
 
 func (m *Matcher) matchOne(parts []string, isDir bool) bool {
-	ex := false
+	ex, _ := m.decide(parts, isDir)
+	return ex
+}
+
+// decide applies the rules to the path itself (not its parents): matched
+// reports whether any rule matched, excluded what the last one says.
+func (m *Matcher) decide(parts []string, isDir bool) (excluded, matched bool) {
 	for _, r := range m.rules {
 		if r.dirOnly && !isDir {
 			continue
 		}
-		if matchSegs(r.segs, parts) {
-			ex = !r.negate
+		if matchSegs(r.segs, parts, m.git) {
+			excluded, matched = !r.negate, true
 		}
 	}
-	return ex
+	return excluded, matched
 }
 
-func matchSegs(pat, parts []string) bool {
+func matchSegs(pat, parts []string, git bool) bool {
 	if len(pat) == 0 {
 		return len(parts) == 0
 	}
 	if pat[0] == "**" {
+		// Read as Git does, a trailing ** matches everything inside,
+		// never the directory itself: "dir/**" leaves dir to be entered,
+		// so a deeper rule can re-include a file in it.
+		if git && len(pat) == 1 {
+			return len(parts) > 0
+		}
 		for i := 0; i <= len(parts); i++ {
-			if matchSegs(pat[1:], parts[i:]) {
+			if matchSegs(pat[1:], parts[i:], git) {
 				return true
 			}
 		}
@@ -156,5 +217,5 @@ func matchSegs(pat, parts []string) bool {
 	if err != nil || !ok {
 		return false
 	}
-	return matchSegs(pat[1:], parts[1:])
+	return matchSegs(pat[1:], parts[1:], git)
 }
