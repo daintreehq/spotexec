@@ -451,3 +451,43 @@ func TestEnsureBucketForgetsADeletedBucket(t *testing.T) {
 		}
 	}
 }
+
+// An administrator's lifecycle rules on an existing automatic bucket survive
+// spotexec adding its expiry rule from a machine that hasn't set it up (#318):
+// S3 replaces the whole configuration on every PUT.
+func TestEnsureBucketKeepsOtherLifecycleRules(t *testing.T) {
+	const admin = `<Rule><ID>admin-noncurrent</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays></NoncurrentVersionExpiration></Rule>`
+	existing := `<?xml version="1.0" encoding="UTF-8"?>` + "\n" + `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` + admin + `</LifecycleConfiguration>`
+	var puts []string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		resp := func(st int, body string) (*http.Response, error) {
+			return &http.Response{StatusCode: st, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+		}
+		switch {
+		case strings.HasPrefix(r.URL.Host, "sts."):
+			return resp(200, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`)
+		case r.Method == http.MethodHead:
+			return resp(200, "")
+		case r.Method == http.MethodGet && r.URL.RawQuery == "lifecycle":
+			return resp(200, existing)
+		case r.Method == http.MethodPut && r.URL.RawQuery == "lifecycle":
+			b, _ := io.ReadAll(r.Body)
+			puts = append(puts, string(b))
+			return resp(200, "")
+		}
+		t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		return resp(500, "")
+	})
+	a := &AWSSpot{
+		r: &config.Runner{Name: "aws", Region: "us-east-2", Profile: "p"},
+		api: &awsClient{region: "us-east-2", creds: &awsCredResolver{fixed: &awsCreds{AccessKeyID: "AKID", SecretAccessKey: "s"}},
+			http: &http.Client{Transport: rt}},
+		dir: t.TempDir(),
+	}
+	if _, _, err := a.ensureBucket(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(puts) != 1 || !strings.Contains(puts[0], admin) || !strings.Contains(puts[0], "<ID>spotexec-expire</ID>") {
+		t.Fatalf("lifecycle PUTs %q: want one, keeping the administrator's rule and adding spotexec's", puts)
+	}
+}
