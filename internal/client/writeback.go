@@ -1416,7 +1416,7 @@ func applyPull(ctx context.Context, ws *Workspace, root string, patterns []strin
 	var gitDirs []string
 	for _, arg := range []string{"--git-dir", "--git-common-dir"} {
 		if out, err := exec.CommandContext(ctx, "git", "-C", ws.Root, "rev-parse", arg).Output(); err == nil {
-			d := strings.TrimSpace(string(out))
+			d := manifest.GitPath(out)
 			if !filepath.IsAbs(d) {
 				d = filepath.Join(ws.Root, d)
 			}

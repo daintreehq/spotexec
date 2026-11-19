@@ -61,7 +61,7 @@ func Resolve(dir string) (*Workspace, error) {
 		w.GitDir, _ = manifest.GitDir(root)
 		w.CommonGitDir = commonGitDir(root, w.GitDir)
 		if out, err := exec.Command("git", "-C", root, "config", "--get", "remote.origin.url").Output(); err == nil {
-			if u := normalizeRemote(strings.TrimSpace(string(out))); u != "" {
+			if u := normalizeRemote(manifest.GitPath(out)); u != "" {
 				ident = u
 				// Lowercase as before: only the hash tells case-distinct
 				// paths apart, so a lowercase remote keeps its RepoID.
@@ -69,7 +69,7 @@ func Resolve(dir string) (*Workspace, error) {
 			}
 		} else if out, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output(); err == nil {
 			// No origin: worktrees of one repo share the common git dir.
-			cd := strings.TrimSpace(string(out))
+			cd := manifest.GitPath(out)
 			if !filepath.IsAbs(cd) {
 				cd = filepath.Join(root, cd)
 			}
@@ -108,15 +108,17 @@ func cwdIn(root, abs string) string {
 // or gitDir when git can't say.
 func commonGitDir(root, gitDir string) string {
 	// --path-format=absolute (git 2.31+) gives the canonical path; older git
-	// echoes the unknown option back, and prints the dir relative to root.
+	// echoes the unknown option back as its own first line, and prints the
+	// dir relative to root. An absolute dir never starts with the option, but
+	// may hold a newline, so only the echo means old git.
 	out, err := exec.Command("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
-	if err != nil || strings.Contains(strings.TrimSpace(string(out)), "\n") {
+	if err != nil || strings.HasPrefix(string(out), "--path-format=absolute") {
 		out, err = exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output()
 	}
 	if err != nil {
 		return gitDir
 	}
-	d := strings.TrimSpace(string(out))
+	d := manifest.GitPath(out)
 	if d == "" {
 		return gitDir
 	}
