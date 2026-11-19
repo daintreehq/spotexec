@@ -611,7 +611,14 @@ func (r *mdRenderer) inline(s string) string {
 		case strings.HasPrefix(s[k:], "**") && (k+2 < len(s) && !isSpace(s[k+2]) || k > 0 && !isSpace(s[k-1])):
 			// A bold delimiter, paired below across code spans and links
 			// (**`max_instances = 8`, as a ceiling.**).
-			text.WriteByte(boldMark)
+			var m byte
+			if k+2 < len(s) && !isSpace(s[k+2]) {
+				m |= boldOpen
+			}
+			if k > 0 && !isSpace(s[k-1]) {
+				m |= boldClose
+			}
+			text.WriteByte(m)
 			k += 2
 		default:
 			text.WriteByte(s[k])
@@ -619,17 +626,40 @@ func (r *mdRenderer) inline(s string) string {
 		}
 	}
 	flush()
-	out := b.String()
-	if strings.Count(out, string(boldMark))%2 == 1 {
-		// An unpaired one was literal (**/*.go).
-		i := strings.LastIndexByte(out, boldMark)
-		out = out[:i] + "**" + out[i+1:]
+	// Pair each closing delimiter with the last opening one; the rest were
+	// literal (**/*.go).
+	out := []byte(b.String())
+	var open []int
+	paired := map[int]bool{}
+	for i, c := range out {
+		if c == 0 || c > boldOpen|boldClose {
+			continue
+		}
+		if c&boldClose != 0 && len(open) > 0 {
+			paired[open[len(open)-1]], paired[i] = true, true
+			open = open[:len(open)-1]
+		} else if c&boldOpen != 0 {
+			open = append(open, i)
+		}
 	}
-	return strings.ReplaceAll(out, string(boldMark), "")
+	var res strings.Builder
+	for i, c := range out {
+		switch {
+		case c == 0 || c > boldOpen|boldClose:
+			res.WriteByte(c)
+		case !paired[i]:
+			res.WriteString("**")
+		}
+	}
+	return res.String()
 }
 
-// boldMark stands in for a ** delimiter until inline pairs them.
-const boldMark = '\x01'
+// boldOpen and boldClose stand in for a ** delimiter that can open or close
+// bold text until inline pairs them.
+const (
+	boldOpen  byte = 1
+	boldClose byte = 2
+)
 
 func isSpace(c byte) bool { return c == ' ' || c == '\t' }
 

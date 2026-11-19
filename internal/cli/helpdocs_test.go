@@ -286,7 +286,7 @@ func TestRenderMarkdown(t *testing.T) {
 func TestRenderMarkdownEdgeCases(t *testing.T) {
 	src := "# T\n\n## C#\n\n" +
 		"- **`max_instances = 8`, as a ceiling.** Past it, **[setup](setup.md)** waits.\n" +
-		"- `**/*.go` and **/*.go stay, \\*literal\\* too.\n\n" +
+		"- `**/*.go` and **/*.go stay, \\*literal\\* too, and **/*.go then **bold**.\n\n" +
 		"[manual](https://example.org/docs/setup.md), and docs/POOL.md in prose.\n\n" +
 		"```sh\ncat docs/setup.md   # see docs/POOL.md\n```\n\n" +
 		"| File | Holds | Committed? |\n| --- | --- | --- |\n| `" + strings.Repeat("x", 60) + "` | Your hardware | Never |\n\n" +
@@ -295,7 +295,7 @@ func TestRenderMarkdownEdgeCases(t *testing.T) {
 	for _, want := range []string{
 		"C#\n--",
 		"- `max_instances = 8`, as a ceiling. Past it, setup (spotexec help setup) waits.",
-		"- `**/*.go` and **/*.go stay, *literal* too.",
+		"- `**/*.go` and **/*.go stay, *literal* too, and **/*.go then bold.",
 		"manual (https://example.org/docs/setup.md), and spotexec help pool in prose.",
 		"    cat docs/setup.md   # see spotexec help pool\n",
 		"File · Holds · Committed?\n",
