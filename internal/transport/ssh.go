@@ -174,7 +174,7 @@ func privateDir(dir string) error {
 		return fmt.Errorf("%s is not owned by this user", dir)
 	}
 	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%s is writable by other users", dir)
+		return fmt.Errorf("%s is writable by other users (remove it, and spotexec makes a private one)", dir)
 	}
 	return os.Chmod(dir, 0o700)
 }

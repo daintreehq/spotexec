@@ -105,8 +105,10 @@ func TestControlDirFailsWhenPreferredAndFallbackFail(t *testing.T) {
 	if _, err := c.HelperCmdInstalled(ctx, "status"); !errors.Is(err, c.ctlErr) {
 		t.Fatalf("HelperCmdInstalled: %v, want the setup error", err)
 	}
-	if i := optIndex(c.Args("true"), "ControlPath=none"); i < 0 {
-		t.Fatalf("argv hands ssh an unverified control path: %v", c.Args("true"))
+	for _, a := range c.Args("true") {
+		if strings.HasPrefix(a, "ControlPath=") && a != "ControlPath=none" {
+			t.Fatalf("argv hands ssh an unverified control path: %v", c.Args("true"))
+		}
 	}
 	c.CloseMaster()
 }
@@ -153,6 +155,25 @@ func TestControlDirRefusesWritableTmpDir(t *testing.T) {
 		t.Fatalf("controlDir kept %s, which others could write to", d)
 	}
 	mustPrivate(t, d)
+}
+
+// Only the owner may write to a control directory: group or other write
+// access is refused, read access is just removed.
+func TestPrivateDirModes(t *testing.T) {
+	for mode, ok := range map[os.FileMode]bool{0o700: true, 0o755: true, 0o770: false, 0o707: false, 0o777: false} {
+		d := filepath.Join(t.TempDir(), "cm")
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(d, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := privateDir(d); (err == nil) != ok {
+			t.Errorf("mode %o: privateDir = %v, want ok=%v", mode, err, ok)
+		} else if ok {
+			mustPrivate(t, d)
+		}
+	}
 }
 
 // The home directory's control directory must exist and be private too: a
