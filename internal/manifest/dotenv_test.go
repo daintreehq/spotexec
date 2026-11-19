@@ -6,11 +6,15 @@ import (
 	"testing"
 )
 
-// isolateGit keeps the machine's Git config (a global excludesFile listing
-// .env) from hiding the files these tests need spotexec itself to exclude.
+// isolateGit keeps the machine's Git config and ignore files (a global
+// excludesFile, or ~/.config/git/ignore, listing .env) from hiding the
+// files these tests need spotexec itself to exclude.
 func isolateGit(t *testing.T) {
 	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "core.excludesFile")
+	t.Setenv("GIT_CONFIG_VALUE_0", os.DevNull)
 }
 
 // Untracked dotenv files never sync by default, before any project config
@@ -26,7 +30,7 @@ func TestDotenvExcludedByDefault(t *testing.T) {
 		gitIn(t, root, "init", "-q")
 		gitIn(t, root, "add", "-A")
 		gitIn(t, root, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "init")
-		writeTree(t, root, ".env", ".env.local", "pkg/.env.test", ".envrc", ".envs/local/db", "src/new.txt")
+		writeTree(t, root, ".env", ".env.local", "pkg/.env.test", ".envrc", ".envs/local/db", "src/.ENV", "src/new.txt")
 		m, err := Build(ctx, Options{Root: root})
 		if err != nil {
 			t.Fatal(err)
@@ -37,14 +41,14 @@ func TestDotenvExcludedByDefault(t *testing.T) {
 		if got, want := paths(m), ".env.example src/a.txt src/new.txt"; got != want {
 			t.Errorf("synced %q, want %q", got, want)
 		}
-		if n := m.Excluded["builtin"]; n != 5 {
-			t.Errorf("builtin excluded %d files, want 5 (%v)", n, m.Excluded)
+		if n := m.Excluded["builtin"]; n != 6 {
+			t.Errorf("builtin excluded %d files, want 6 (%v)", n, m.Excluded)
 		}
 	})
 
 	// Outside Git nothing is tracked, so no dotenv file syncs, the
-	// template included: a non-Git directory, and a Git root walked with
-	// sync.source = "directory".
+	// template included: a non-Git directory (detected, not configured),
+	// and a Git root walked with sync.source = "directory".
 	for _, gitRoot := range []bool{false, true} {
 		name := "non-git directory"
 		if gitRoot {
@@ -53,14 +57,19 @@ func TestDotenvExcludedByDefault(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
 			writeTree(t, root, "src/a.txt", ".env.example")
+			source := ""
 			if gitRoot {
 				gitIn(t, root, "init", "-q")
 				gitIn(t, root, "add", "-A")
+				source = "directory"
 			}
-			writeTree(t, root, ".env", "pkg/.env.local", ".envs/local/db")
-			m, err := Build(ctx, Options{Root: root, Source: "directory"})
+			writeTree(t, root, ".env", "pkg/.env.local", ".envs/local/db", "src/.Env")
+			m, err := Build(ctx, Options{Root: root, Source: source})
 			if err != nil {
 				t.Fatal(err)
+			}
+			if m.Git {
+				t.Fatal("walked as git")
 			}
 			if got, want := paths(m), "src/a.txt"; got != want {
 				t.Errorf("synced %q, want %q", got, want)

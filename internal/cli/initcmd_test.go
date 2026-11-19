@@ -415,6 +415,9 @@ func TestInitScaffoldDotenvPolicy(t *testing.T) {
 	t.Setenv("SPOTEXEC_CONFIG", filepath.Join(t.TempDir(), "config.toml"))
 	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "core.excludesFile")
+	t.Setenv("GIT_CONFIG_VALUE_0", os.DevNull)
 	dir := gitRepo(t, map[string]string{"README.md": "hi", ".env.example": "EXAMPLE=placeholder\n", ".env.test": "TEST=placeholder\n"})
 	git := func(args ...string) {
 		if out, err := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"}, args...)...).CombinedOutput(); err != nil {
@@ -423,8 +426,11 @@ func TestInitScaffoldDotenvPolicy(t *testing.T) {
 	}
 	git("add", "-A")
 	git("commit", "-qm", "init")
+	git("ls-files", "--error-unmatch", ".env.example", ".env.test") // both tracked
 	for _, f := range []string{".env", ".env.local"} {
-		os.WriteFile(filepath.Join(dir, f), []byte("LOCAL=placeholder\n"), 0o644)
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("LOCAL=placeholder\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	runInit(t, dir, "--no-container")
 	p, err := config.LoadProject(filepath.Join(dir, ".spotexec.toml"))

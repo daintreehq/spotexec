@@ -32,8 +32,9 @@ import (
 // files are always synced unless the user excludes them explicitly.
 //
 // .env* keeps local dotenv files (.env, .env.local, .envrc) off the runner
-// before any project config exists; a template Git tracks (.env.example)
-// syncs like any tracked file.
+// before any project config exists, in any case: on a case-insensitive
+// filesystem a tool opening .env reads .ENV. A template Git tracks
+// (.env.example) syncs like any tracked file.
 //
 // .git matches files too (a linked worktree's .git is a file holding a
 // local path). target is anchored: only a top-level Rust/Maven build dir is
@@ -43,7 +44,7 @@ import (
 var BuiltinExcludes = []string{
 	".git", "node_modules/", ".venv/", "venv/", "__pycache__/", ".next/", ".turbo/",
 	"/target/", ".DS_Store", ".pytest_cache/", ".mypy_cache/", ".gradle/",
-	".spotexec-tmp-*", ".env*",
+	".spotexec-tmp-*", ".[Ee][Nn][Vv]*",
 }
 
 // NeverSync is never synced from untracked/non-Git sources, whatever the

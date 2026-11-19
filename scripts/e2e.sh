@@ -81,12 +81,14 @@ dotenv_fixtures() {
   printf 'LOCAL=placeholder\n' > .env.local
   [ "$(git status --porcelain --untracked-files=all -- .env .env.local)" = $'?? .env\n?? .env.local' ]
 }
-# Passes only when the run succeeds and the runner shows the local files
-# absent and the committed template present.
-DOTENV_PROBE='for f in .env .env.local; do test ! -e $f && test ! -L $f || exit 1; done; grep -qx EXAMPLE=placeholder .env.example && echo dotenv-absent'
+# A remote command that succeeds, and prints its marker, only when none of
+# the named files is on the runner and the committed template is.
+dotenv_probe() { echo "for f in $*; do test ! -e \$f && test ! -L \$f || exit 1; done; grep -qx EXAMPLE=placeholder .env.example && echo dotenv-absent"; }
+DOTENV_PROBE=$(dotenv_probe .env .env.local)
 check_dotenv() {
   local label=$1; shift
-  if dotenv_fixtures && run "$@" && grep -qx dotenv-absent "$WORK/last.out"; then ok "$label"; else bad "$label"; tail -5 "$WORK/last.err"; fi
+  rm -f "$WORK/last.out" "$WORK/last.err"
+  if dotenv_fixtures && run "$@" && grep -qx dotenv-absent "$WORK/last.out"; then ok "$label"; else bad "$label"; tail -5 "$WORK/last.err" 2>/dev/null || true; fi
 }
 
 echo "== sync and exec"
@@ -98,13 +100,18 @@ check "symlinks preserved" "grep -qx a.txt $WORK/last.out"
 check "slot env injected" "grep -q slot=1 $WORK/last.out"
 check "remote paths rewritten to local" "grep -qF \"$REPO\" $WORK/last.out"
 
+# Its own repository, so its own slots. A committed .env.test, which the
+# built-in excludes would sync, shows the scaffold's exclude at work.
 echo "== scaffolded project: dotenv"
-mkdir "$WORK/scaffold" && cd "$WORK/scaffold"
+mkdir "$WORK/scaffold"
+cd "$WORK/scaffold"
 git init -q && git config user.email t@t && git config user.name t && git config core.excludesFile /dev/null
 printf 'EXAMPLE=placeholder\n' > .env.example
+printf 'TEST=placeholder\n' > .env.test
 git add -A && git commit -qm init
 "$SX" init --no-container >/dev/null
-check_dotenv "scaffolded project keeps local .env files off the runner, syncs a committed template" "$DOTENV_PROBE"
+check "init writes the project config" "test -f .spotexec.toml"
+check_dotenv "scaffolded project keeps local and committed .env files off the runner, syncs the template" "$(dotenv_probe .env .env.local .env.test)"
 rm -f .env .env.local
 cd "$REPO"
 
