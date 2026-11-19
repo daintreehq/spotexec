@@ -536,3 +536,37 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 		}
 	})
 }
+
+// A teardown limited to some regions leaves the account-wide IAM users and
+// their keys alone: a machine still running in another region keeps its
+// credentials, and nothing outside the regions is touched.
+func TestTeardownRegionKeepsIAM(t *testing.T) {
+	c := newFakeCloud(t)
+	c.instances["AK-admin"]["us-west-2"] = []fakeAcctInstance{{"i-west", "running", map[string]string{tagRunner: "aws", tagOwner: "m-1", tagHost: "mac"}}}
+	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	if err != nil || p.Err() != nil {
+		t.Fatalf("%v %v", err, p.Err())
+	}
+	for _, it := range p.Items {
+		if it.Kind == KindIAMUser || it.Region == "" {
+			t.Fatalf("a regional plan lists account-wide %s %s", it.Kind, it.ID)
+		}
+	}
+	if err := p.Apply(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if c.users["spotexec-mac"] == nil || c.keys["AKMAC"] != [2]string{"spotexec-mac", "Active"} {
+		t.Fatalf("the machine's IAM user or key was touched: %v %v", c.users, c.keys)
+	}
+	if strings.Contains(strings.Join(c.terminated, ","), "i-west") || !strings.Contains(strings.Join(c.terminated, ","), "i-run") {
+		t.Fatalf("terminated %v", c.terminated)
+	}
+	if c.buckets["spotexec-cache-111111111111-us-west-2"] == nil || len(c.sgs["us-west-2"]) != 1 {
+		t.Fatalf("us-west-2 touched: buckets %v, groups %v", c.buckets, c.sgs)
+	}
+	for _, s := range c.log {
+		if strings.HasPrefix(s, "UpdateAccessKey") || strings.HasPrefix(s, "DeleteAccessKey") || strings.HasPrefix(s, "DeleteUser") {
+			t.Fatalf("IAM mutated: %v", c.log)
+		}
+	}
+}

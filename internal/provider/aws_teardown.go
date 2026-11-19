@@ -38,9 +38,13 @@ type TeardownItem struct {
 
 // TeardownPlan is every spotexec resource found in an account.
 type TeardownPlan struct {
-	Account  string         `json:"account"`
-	AdminARN string         `json:"admin_arn"`
-	Regions  []string       `json:"regions"`
+	Account  string   `json:"account"`
+	AdminARN string   `json:"admin_arn"`
+	Regions  []string `json:"regions"`
+	// Regional is a teardown limited to the regions named. It leaves the
+	// account-wide IAM users and their keys alone: a machine may still be
+	// running in a region outside it.
+	Regional bool           `json:"regional,omitempty"`
 	Items    []TeardownItem `json:"items"`
 	Failed   []string       `json:"failed,omitempty"` // what couldn't be listed
 
@@ -59,8 +63,13 @@ var (
 // snapshots, spotexec's security groups, spotexec/* ECR repositories,
 // spotexec-cache-<account>-* S3 buckets and the IAM users under /spotexec/.
 // Only resources carrying spotexec's tags, or its exact names, are
-// included. regions defaults to every region enabled in the account.
+// included. regions defaults to every region enabled in the account; naming
+// regions makes the plan Regional, which keeps the IAM users.
 func PlanTeardown(ctx context.Context, adminProfile string, regions []string) (*TeardownPlan, error) {
+	return planTeardown(ctx, adminProfile, regions, len(regions) > 0)
+}
+
+func planTeardown(ctx context.Context, adminProfile string, regions []string, regional bool) (*TeardownPlan, error) {
 	home, err := AccountRegion(adminProfile, regions)
 	if err != nil {
 		return nil, err
@@ -73,7 +82,7 @@ func PlanTeardown(ctx context.Context, adminProfile string, regions []string) (*
 	if strings.Contains(arn, ":user"+iamUserPath) {
 		return nil, fmt.Errorf("signed in as %s, a spotexec machine user, which can't remove spotexec: sign in as an administrator (or pass --admin-profile)", arn)
 	}
-	p := &TeardownPlan{Account: acct, AdminARN: arn, adminProfile: adminProfile, home: home}
+	p := &TeardownPlan{Account: acct, AdminARN: arn, Regional: regional, adminProfile: adminProfile, home: home}
 	if len(regions) == 0 {
 		b, err := admin.ec2(ctx, "DescribeRegions", nil)
 		if err != nil {
@@ -117,6 +126,9 @@ func PlanTeardown(ctx context.Context, adminProfile string, regions []string) (*
 	}
 	if err := p.listBuckets(ctx, admin); err != nil {
 		failed("S3 buckets", err)
+	}
+	if regional {
+		return p, nil
 	}
 	if err := p.listUsers(ctx, admin); err != nil {
 		failed("IAM users", err)
@@ -417,7 +429,7 @@ func (p *TeardownPlan) Apply(ctx context.Context, log func(string, ...any)) erro
 	// Anything a machine created while the plan was on screen is still
 	// there: say so rather than claim the account is clean.
 	if len(errs) == 0 {
-		if again, err := PlanTeardown(ctx, p.adminProfile, p.Regions); err != nil {
+		if again, err := planTeardown(ctx, p.adminProfile, p.Regions, p.Regional); err != nil {
 			errs = append(errs, "checking for leftovers: "+err.Error())
 		} else if err := again.Err(); err != nil {
 			errs = append(errs, "checking for leftovers: "+err.Error())

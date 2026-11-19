@@ -40,6 +40,9 @@ It searches every region enabled in the account (or those given with
 --region), lists what it found and asks before deleting anything. It then
 deactivates every machine's key, terminates every spotexec VM (including any
 launched meanwhile) and waits until they're gone before removing the rest.
+With --region, only those regions are cleaned up: the IAM users are
+account-wide, so they and their keys are kept for machines still running
+elsewhere.
 Only resources with spotexec's tags or its exact names are touched. Anything
 it couldn't list or delete is reported, and the exit status is then
 non-zero; running it again picks up where it left off.
@@ -65,7 +68,11 @@ func teardownAccount(ctx context.Context, adminProfile string, regions []string,
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Account %s (signed in as %s), %d region(s).\n", p.Account, p.AdminARN, len(p.Regions))
+	if p.Regional {
+		fmt.Printf("Account %s (signed in as %s), only %s: the account-wide IAM users and their keys are kept.\n", p.Account, p.AdminARN, strings.Join(p.Regions, ", "))
+	} else {
+		fmt.Printf("Account %s (signed in as %s), %d region(s).\n", p.Account, p.AdminARN, len(p.Regions))
+	}
 	for _, f := range p.Failed {
 		fmt.Fprintf(os.Stderr, "warning: couldn't list %s\n", f)
 	}
@@ -100,6 +107,11 @@ func teardownAccount(ctx context.Context, adminProfile string, regions []string,
 	err = applyTeardown(ctx, p, func(f string, a ...any) { fmt.Printf("  "+f+"\n", a...) })
 	if err = errors.Join(err, p.Err()); err != nil {
 		return fmt.Errorf("%w\nre-run `spotexec teardown` to retry", err)
+	}
+	if p.Regional {
+		fmt.Printf("✓ removed what spotexec created in %s.\n", strings.Join(p.Regions, ", "))
+		fmt.Println("  The IAM users and their keys are account-wide and were kept; run `spotexec teardown` without --region to remove them.")
+		return nil
 	}
 	fmt.Println("✓ removed everything spotexec created in the account.")
 	fmt.Println("  Locally, you can delete ~/.config/spotexec and the [spotexec] sections of ~/.aws/credentials and ~/.aws/config.")
