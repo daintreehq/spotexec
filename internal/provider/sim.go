@@ -64,7 +64,10 @@ trap 'exit 0' TERM INT
 sleep "${BOOT_DELAY:-0}"
 /usr/sbin/sshd -e 2>/var/log/sshd.log
 mkdir -p /tmp/fakebin
-for b in systemctl systemd-run; do printf '#!/bin/sh\nexit 0\n' > /tmp/fakebin/$b; chmod +x /tmp/fakebin/$b; done
+printf '#!/bin/sh\nexit 0\n' > /tmp/fakebin/systemd-run
+# The user-data checks the shutdown timers are scheduled before it reports ready.
+printf '#!/bin/sh\n[ "$1" = show ] && echo SubState=waiting\nexit 0\n' > /tmp/fakebin/systemctl
+chmod +x /tmp/fakebin/systemctl /tmp/fakebin/systemd-run
 printf '%s' "$USER_DATA_B64" | base64 -d > /tmp/user-data.sh
 # Like cloud-init, user-data runs while the watchdog timer is already ticking.
 PATH=/tmp/fakebin:$PATH bash /tmp/user-data.sh >/var/log/spotexec-userdata.log 2>&1 &

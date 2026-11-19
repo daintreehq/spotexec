@@ -605,3 +605,95 @@ chown() { echo "chown $*" >> "$C"; }
 		})
 	}
 }
+
+// A VM whose shutdown timers aren't scheduled would bill until someone
+// noticed: it must never report ready, and ends itself instead (#321).
+// Runs the timer setup and the final ready write of the rendered script,
+// with a stand-in bootstrap between them and systemd stubbed.
+func TestRenderRequiresShutdownTimers(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("no bash")
+	}
+	s, err := Render(Options{User: "ubuntu", PublicKey: "ssh-ed25519 AAAA test", SelfDestruct: "echo DESTROYED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := strings.Index(s, "systemctl daemon-reload\n")
+	j := strings.Index(s, "# ---- 2. SSH")
+	k := strings.Index(s, `echo "spotexec: first-boot setup finished`)
+	if i < 0 || j < i || k < j {
+		t.Fatal("user-data has no timer setup before its ready write")
+	}
+	arm, finish := s[i:j], s[k:]
+	for _, tc := range []struct {
+		name         string
+		boot, later  map[string]string // timer SubStates, from boot and once the bootstrap ran ("dead": won't start)
+		status       int               // the bootstrap's exit status
+		ready        string            // "" when the VM must end itself
+		bootstrapRan bool
+	}{
+		{name: "both timers scheduled", ready: "0", bootstrapRan: true},
+		{name: "watchdog mid-run", boot: map[string]string{"watchdog": "running"}, ready: "0", bootstrapRan: true},
+		{name: "failed bootstrap keeps its status", status: 3, ready: "3", bootstrapRan: true},
+		{name: "watchdog timer won't start", boot: map[string]string{"watchdog": "dead"}},
+		{name: "max-lifetime timer won't start", boot: map[string]string{"maxlife": "dead"}},
+		{name: "no systemd timers at all", boot: map[string]string{"watchdog": "dead", "maxlife": "dead"}},
+		{name: "watchdog timer failed", boot: map[string]string{"watchdog": "failed"}},
+		{name: "watchdog timer stopped by the bootstrap", later: map[string]string{"watchdog": "dead"}, bootstrapRan: true},
+		{name: "max lifetime spent during the bootstrap", later: map[string]string{"maxlife": "elapsed"}, bootstrapRan: true},
+		{name: "failed bootstrap without timers keeps its status", later: map[string]string{"maxlife": "dead"}, status: 3, bootstrapRan: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			d, bin, log := filepath.Join(dir, "state"), filepath.Join(dir, "bin"), filepath.Join(dir, "bootstrap.log")
+			os.MkdirAll(d, 0o755)
+			os.MkdirAll(bin, 0o755)
+			set := func(m map[string]string) string {
+				var b strings.Builder
+				for u, st := range m {
+					fmt.Fprintf(&b, "echo %s > %s\n", st, strconv.Quote(filepath.Join(dir, u)))
+				}
+				return b.String()
+			}
+			// Each timer's SubState is in a file named for it (default
+			// "waiting"); a "dead" one also fails to start.
+			stub := "#!/bin/sh\nfor u in watchdog maxlife; do case \"$*\" in *spotexec-$u*) s=$(cat \"" + dir + "/$u\" 2>/dev/null || echo waiting) ;; esac; done\n" +
+				"case \"$1\" in show) echo \"SubState=${s:-dead}\" ;; *) [ \"${s:-}\" != dead ] ;; esac\n"
+			for _, b := range []string{"systemctl", "systemd-run"} {
+				os.WriteFile(filepath.Join(bin, b), []byte(stub), 0o755)
+			}
+			os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\n"), 0o755)
+			bootstrap := fmt.Sprintf("status=%d\nB=%s\ntouch %s\n", tc.status, strconv.Quote(log), strconv.Quote(filepath.Join(dir, "bootstrap-ran"))) + set(tc.later)
+			script := set(tc.boot) + "D=" + strconv.Quote(d) + "\n" + arm + bootstrap + finish
+			script = strings.NewReplacer("/var/tmp/spotexec", d, "/var/log/spotexec-bootstrap.log", log, "sleep 120; poweroff -f", ":").Replace(script)
+			cmd := exec.Command("bash", "-c", "set -u\n"+script)
+			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+			out, err := cmd.CombinedOutput()
+			b, rerr := os.ReadFile(filepath.Join(d, "ready"))
+			ready := strings.TrimSpace(string(b))
+			destroyed := strings.Contains(string(out), "DESTROYED")
+			if _, serr := os.Stat(filepath.Join(dir, "bootstrap-ran")); (serr == nil) != tc.bootstrapRan {
+				t.Errorf("bootstrap ran: %v, want %v", serr == nil, tc.bootstrapRan)
+			}
+			if tc.ready != "" {
+				if err != nil || destroyed || ready != tc.ready {
+					t.Fatalf("scheduled timers: err %v, ready %q (%v), want %q: %s", err, ready, rerr, tc.ready, out)
+				}
+				return
+			}
+			if err == nil || !destroyed {
+				t.Fatalf("boot went on without its shutdown timers: %v: %s", err, out)
+			}
+			want := "1"
+			if tc.status != 0 {
+				want = strconv.Itoa(tc.status)
+			}
+			if ready != want {
+				t.Fatalf("ready %q (%v), want the failed boot recorded as %q: %s", ready, rerr, want, out)
+			}
+			if lb, _ := os.ReadFile(log); !strings.Contains(string(lb), "shutdown timers aren't running") {
+				t.Errorf("bootstrap log doesn't say why: %q", lb)
+			}
+		})
+	}
+}
