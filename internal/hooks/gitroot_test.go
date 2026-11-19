@@ -14,6 +14,8 @@ func TestGitRootKeepsTrailingSpace(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows paths cannot end in a space")
 	}
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	parent := t.TempDir()
 	if r, err := filepath.EvalSymlinks(parent); err == nil {
 		parent = r
@@ -39,5 +41,13 @@ func TestGitRootKeepsTrailingSpace(t *testing.T) {
 	}
 	if cdsInside("cd '"+filepath.Join(parent, "checkout")+"' && go test ./...", spaced) {
 		t.Error("cd into the sibling checkout counted as staying inside")
+	}
+	// A bare repository named ".git " has no main checkout.
+	bare := filepath.Join(parent, "bare", ".git ")
+	if out, err := exec.Command("git", "init", "-q", "--bare", bare).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v %s", err, out)
+	}
+	if got := mainCheckout(bare); got != "" {
+		t.Errorf("mainCheckout(bare %q) = %q, want none", bare, got)
 	}
 }

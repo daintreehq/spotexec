@@ -37,6 +37,8 @@ func TestRootKeepsTrailingSpace(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows paths cannot end in a space")
 	}
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	parent := t.TempDir()
 	if r, err := filepath.EvalSymlinks(parent); err == nil {
 		parent = r

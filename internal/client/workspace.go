@@ -65,7 +65,7 @@ func Resolve(dir string) (*Workspace, error) {
 		w.GitDir, _ = manifest.GitDir(root)
 		w.CommonGitDir = commonGitDir(root, w.GitDir)
 		if out, err := exec.Command("git", "-C", root, "config", "--get", "remote.origin.url").Output(); err == nil {
-			if u := normalizeRemote(strings.TrimSpace(string(out))); u != "" {
+			if u := normalizeRemote(manifest.GitPath(out)); u != "" {
 				ident = u
 				// Lowercase as before: only the hash tells case-distinct
 				// paths apart, so a lowercase remote keeps its RepoID.
