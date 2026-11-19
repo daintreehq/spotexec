@@ -6,11 +6,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/client"
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/manifest"
 )
 
 func resolveIn(t *testing.T, dir string) *client.Workspace {
@@ -403,5 +405,42 @@ func TestWorkspaceNodeModulesSkipsBackslash(t *testing.T) {
 	dirs, skipped := workspaceNodeModules([]string{`packages/\*`, "apps/*"})
 	if strings.Join(dirs, " ") != "node_modules apps/*/node_modules" || len(skipped) != 1 || !strings.Contains(skipped[0], "packages") {
 		t.Errorf("dirs %v, skipped %v", dirs, skipped)
+	}
+}
+
+// The scaffold keeps every local dotenv file off the runner, tracked or
+// not, and lets a committed .env.example template sync, as it does before
+// init.
+func TestInitScaffoldDotenvPolicy(t *testing.T) {
+	t.Setenv("SPOTEXEC_CONFIG", filepath.Join(t.TempDir(), "config.toml"))
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	dir := gitRepo(t, map[string]string{"README.md": "hi", ".env.example": "EXAMPLE=placeholder\n", ".env.test": "TEST=placeholder\n"})
+	git := func(args ...string) {
+		if out, err := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	git("add", "-A")
+	git("commit", "-qm", "init")
+	for _, f := range []string{".env", ".env.local"} {
+		os.WriteFile(filepath.Join(dir, f), []byte("LOCAL=placeholder\n"), 0o644)
+	}
+	runInit(t, dir, "--no-container")
+	p, err := config.LoadProject(filepath.Join(dir, ".spotexec.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := manifest.Build(context.Background(), client.ManifestOptions(dir, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range m.Entries {
+		got = append(got, e.Path)
+	}
+	sort.Strings(got)
+	if s := strings.Join(got, " "); s != ".env.example .spotexec.toml README.md" {
+		t.Errorf("scaffolded project syncs %q, want .env.example .spotexec.toml README.md", s)
 	}
 }
