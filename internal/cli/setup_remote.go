@@ -340,19 +340,22 @@ const localBin = `"$HOME/.local/bin/spotexec"`
 // write the same file.
 const stageDir = `d="$HOME/.local/bin"; mkdir -p "$d"; t=$(mktemp -d "$d/.spotexec-install.XXXXXX"); trap 'rm -rf "$t"' EXIT; `
 
-// linkStaged stages a fresh sx link in "$t" for the caller to rename into
-// "$d/", so a concurrent setup never sees it missing. Moving it into "$d/"
-// by name replaces an sx that links to a directory instead of descending
-// into it. A real directory there is refused before anything is replaced,
-// and a link to nothing is removed first, since BusyBox's mv can't replace
-// one that loops.
-const linkStaged = `if [ -d "$d/sx" ] && [ ! -L "$d/sx" ]; then echo "$d/sx is a directory, not spotexec's link" >&2; exit 1; fi; ` +
-	`for f in spotexec sx; do if [ -L "$d/$f" ] && [ ! -e "$d/$f" ]; then rm -f "$d/$f"; fi; done; ` +
-	`ln -s spotexec "$t/sx"; `
+// moveStaged renames "$t/$1" into "$d/" by name, so it never descends into
+// a directory an old link there points at. BusyBox's mv looks through the
+// old entry first and gives up on a link that loops or leads nowhere, so on
+// failure the old entry goes and the move is tried once more.
+const moveStaged = `mvin() { mv -f "$t/$1" "$d/" 2>/dev/null || { rm -f "$d/$1"; mv -f "$t/$1" "$d/"; }; }; `
+
+// linkStaged renames a fresh sx link into "$d", so a concurrent setup never
+// sees it missing. A real directory named sx is left alone; the login shell
+// check then reports that sx isn't there.
+const linkStaged = moveStaged + sxStaged
+
+const sxStaged = `ln -s spotexec "$t/sx"; if [ ! -d "$d/sx" ] || [ -L "$d/sx" ]; then mvin sx; fi`
 
 // publishStaged ends an install script that staged a checked spotexec in
 // "$t": the binary and its sx link are each renamed into place.
-const publishStaged = linkStaged + `mv -f "$t/spotexec" "$d/"; mv -f "$t/sx" "$d/"`
+const publishStaged = moveStaged + `mvin spotexec; ` + sxStaged
 
 // selfBinary opens the running spotexec, which --install copy sends over,
 // and gives its size.
@@ -451,7 +454,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 				return installed{bin: localBin, dir: "$HOME/.local/bin", how: "kept, newer than release " + tag, want: v}, nil
 			} else if ok && c == 0 {
 				// Only the sx link is put right, in case it went missing.
-				if _, err := r.run(ctx, `set -e; [ "$(readlink "$HOME/.local/bin/sx")" != spotexec ] || exit 0; `+stageDir+linkStaged+`mv -f "$t/sx" "$d/"`, nil); err != nil {
+				if _, err := r.run(ctx, `set -e; [ "$(readlink "$HOME/.local/bin/sx")" != spotexec ] || exit 0; `+stageDir+linkStaged, nil); err != nil {
 					return installed{}, err
 				}
 				return installed{bin: localBin, dir: "$HOME/.local/bin", how: "release " + tag + " in ~/.local/bin, already installed", want: v}, nil

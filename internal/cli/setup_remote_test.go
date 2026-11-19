@@ -1173,8 +1173,8 @@ func TestRemoteInstallCopyConcurrent(t *testing.T) {
 	}
 }
 
-// A real directory where the sx link goes stops the install before the
-// old spotexec is replaced.
+// A real directory where the sx link goes is left as it is: the new
+// spotexec is still installed, and nothing is written into the directory.
 func TestRemoteInstallCopySxDirectory(t *testing.T) {
 	f := newFakeHost(t, t.TempDir())
 	f.localInstalled("0.1.0")
@@ -1191,14 +1191,17 @@ func TestRemoteInstallCopySxDirectory(t *testing.T) {
 	copyFrom(t, strings.NewReader(strings.Replace(fakeSpotexec, "VERSION", Version, 1)))
 	r := f.setup()
 	r.install = "copy"
-	if _, err := f.install(r); err == nil || !strings.Contains(err.Error(), "is a directory") {
-		t.Fatalf("err = %v", err)
+	if _, err := f.install(r); err != nil {
+		t.Fatal(err)
 	}
-	if v := versionAt(t, filepath.Join(bin, "spotexec")); v != "0.1.0" {
+	if v := versionAt(t, filepath.Join(bin, "spotexec")); v != Version {
 		t.Fatalf("~/.local/bin has %q", v)
 	}
 	if es, err := os.ReadDir(filepath.Join(bin, "sx")); err != nil || len(es) != 1 || es[0].Name() != "keep" {
 		t.Fatalf("sx/ now holds %v (%v)", es, err)
+	}
+	if left := hiddenEntries(t, bin); len(left) > 0 {
+		t.Fatalf("left %v", left)
 	}
 }
 
@@ -1239,15 +1242,27 @@ func TestRemoteInstallCopyBadCopyKeepsOld(t *testing.T) {
 	}
 }
 
+// fakeBusyBoxMv fails like BusyBox's mv, which looks through the entry it
+// replaces: a link there that loops or leads nowhere stops it.
+const fakeBusyBoxMv = `#!/bin/sh
+for last; do :; done
+for a; do case "$a" in -*) ;; *) src=$a; break ;; esac; done
+dest=$last; [ -d "$dest" ] && [ ! -L "$dest" ] && dest="$dest/$(basename "$src")"
+dest=${dest%/}
+if [ -L "$dest" ] && [ ! -e "$dest" ]; then echo "mv: can't stat '$dest': Too many levels of symbolic links" >&2; exit 1; fi
+exec /bin/mv "$@"
+`
+
 // Both release installs, a new download and an already current one, put
 // back an sx that links to a directory or to nothing without touching what
-// it pointed at.
+// it pointed at, and leave a real directory named sx alone.
 func TestRemoteInstallReleaseRepairsSx(t *testing.T) {
 	for _, current := range []bool{false, true} {
-		for _, target := range []string{"dir", "loop"} {
+		for _, target := range []string{"dir", "loop", "realdir"} {
 			t.Run(fmt.Sprintf("current=%v/%s", current, target), func(t *testing.T) {
 				f := newFakeHost(t, t.TempDir())
 				_ = os.Remove(filepath.Join(f.dir, "stub", "brew"))
+				f.write("stub/mv", fakeBusyBoxMv, 0o755)
 				withLatest(t, "v0.3.0")
 				f.release("0.3.0")
 				if current {
@@ -1266,11 +1281,27 @@ func TestRemoteInstallReleaseRepairsSx(t *testing.T) {
 				if target == "loop" {
 					to = "sx"
 				}
-				if err := os.Symlink(to, sx); err != nil {
+				if target == "realdir" {
+					if err := os.Mkdir(sx, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Symlink(to, sx); err != nil {
 					t.Fatal(err)
 				}
 				if in, err := f.install(f.setup()); err != nil || in.want != "0.3.0" {
 					t.Fatalf("%+v %v", in, err)
+				}
+				if v := versionAt(t, filepath.Join(bin, "spotexec")); v != "0.3.0" {
+					t.Fatalf("~/.local/bin has %q", v)
+				}
+				if target == "realdir" {
+					if es, err := os.ReadDir(sx); err != nil || len(es) > 0 {
+						t.Fatalf("sx/ now holds %v (%v)", es, err)
+					}
+					if left := hiddenEntries(t, bin); len(left) > 0 {
+						t.Fatalf("left %v", left)
+					}
+					return
 				}
 				if l, err := os.Readlink(sx); err != nil || l != "spotexec" {
 					t.Fatalf("sx -> %q %v", l, err)
