@@ -62,8 +62,8 @@ func TestGitFailureRefusesAutomaticWalk(t *testing.T) {
 		{"ownership refusal", func(t *testing.T, root string) {
 			gitIn(t, root, "init", "-q")
 			t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
-			if f := gitFatal(t, root); !strings.Contains(f, "dubious ownership") {
-				t.Skipf("this git doesn't simulate an ownership refusal: %s", f)
+			if out, _ := exec.Command("git", "-C", root, "rev-parse").CombinedOutput(); !strings.Contains(string(out), "dubious ownership") {
+				t.Skipf("this git doesn't simulate an ownership refusal: %s", out)
 			}
 		}, nil},
 		{"not a work tree", func(t *testing.T, root string) {
@@ -133,8 +133,10 @@ func TestGitFailureCanceled(t *testing.T) {
 	gitIn(t, root, "init", "-q")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := Build(ctx, Options{Root: root}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Build err = %v; want context.Canceled", err)
+	for _, source := range []string{"", "git"} {
+		if _, err := Build(ctx, Options{Root: root, Source: source}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Build(source %q) err = %v; want context.Canceled", source, err)
+		}
 	}
 }
 
@@ -234,5 +236,33 @@ func TestCeilingHidesOuterRepository(t *testing.T) {
 	writeFile(t, filepath.Join(outer, ".git", "HEAD"), "garbage\n")
 	if _, _, err := Root(sub); err == nil {
 		t.Fatalf("Root with an as-written ceiling: want the checkout's error")
+	}
+}
+
+func TestGitBool(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "0": false, "false": false, "Off": false, "0x0": false, "0k": false,
+		"1": true, "yes": true, "TRUE": true, "0x1": true, "1k": true, "2": true, "bogus": true} {
+		if got := gitBool(v); got != want {
+			t.Errorf("gitBool(%q) = %v, want %v", v, got, want)
+		}
+	}
+}
+
+// Git takes ceilings after an empty entry byte for byte (bar a trailing
+// slash), so a spelling it can't match doesn't hide the checkout.
+func TestAsWrittenCeilingIsNotCleaned(t *testing.T) {
+	isolateGit(t)
+	repo := plainRoot(t)
+	writeFile(t, filepath.Join(repo, ".git"), "garbage\n")
+	sub := filepath.Join(repo, "sub")
+	writeTree(t, sub, ".spotexec.toml", "a.txt")
+	sep := string(filepath.ListSeparator)
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(repo)+sep+sep+repo+string(filepath.Separator)+".")
+	if checkoutAbove(sub) != repo {
+		t.Fatalf("checkoutAbove = %q; want the checkout Git still reaches", checkoutAbove(sub))
+	}
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(repo)+sep+sep+repo+string(filepath.Separator))
+	if d := checkoutAbove(sub); d != "" {
+		t.Fatalf("checkoutAbove = %q; want the ceiling, trailing slash and all, to hide it", d)
 	}
 }

@@ -594,7 +594,12 @@ func gitCeilings() map[string]bool {
 			asWritten = true
 		case !filepath.IsAbs(c):
 		case asWritten:
-			ceiling[filepath.Clean(c)] = true
+			// Git compares these byte for byte, dropping only a trailing
+			// slash: "/work/repo/." names nothing.
+			if len(c) > 1 {
+				c = strings.TrimSuffix(c, string(filepath.Separator))
+			}
+			ceiling[c] = true
 		default:
 			if r, err := filepath.EvalSymlinks(c); err == nil {
 				if r, err = filepath.Abs(r); err == nil {
@@ -606,26 +611,33 @@ func gitCeilings() map[string]bool {
 	return ceiling
 }
 
-// gitBool reads a boolean environment variable as Git does.
+// gitBool reads a boolean environment variable as Git does: a word, or an
+// integer (any base, with an optional k, m or g unit) that is non-zero. A
+// value Git would reject counts as true, so the marker search errs toward
+// finding the checkout.
 func gitBool(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "true", "yes", "on":
 		return true
+	case "", "false", "no", "off":
+		return false
 	}
-	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-		return n != 0
-	}
-	return false
+	n, err := strconv.ParseInt(strings.TrimRight(v, "kmg"), 0, 64)
+	return err != nil || n != 0
 }
 
-// gitCheckout names the Git checkout git was pointed at from dir: the
-// nearest .git at or above it, else $GIT_DIR when set. "" means dir is a
-// plain directory as far as Git is concerned.
+// gitCheckout names the Git checkout git was pointed at from dir: $GIT_DIR
+// when set (Git then skips discovery), else the nearest .git at or above
+// dir. "" means dir is a plain directory as far as Git is concerned.
 func gitCheckout(dir string) string {
+	if g := os.Getenv("GIT_DIR"); g != "" {
+		return "GIT_DIR=" + g
+	}
 	if d := checkoutAbove(dir); d != "" {
 		return filepath.Join(d, ".git")
 	}
-	return os.Getenv("GIT_DIR")
+	return ""
 }
 
 // unreadableCheckout is the error for the Git checkout at gitDir that git
