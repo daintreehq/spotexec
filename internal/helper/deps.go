@@ -434,9 +434,10 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 // holdsCachedDirs reports whether the slot still has every directory the
 // install produced, as the cache's ready marker records them (glob matches
 // included): a command may have removed one since. A pattern that matched
-// nothing at install time is not in the marker, so it stays optional. A
-// missing marker can't say what is required, and leaves the hit to the
-// slot's state as before.
+// nothing at install time is not in the marker, so it stays optional, and
+// so is an entry the cache doesn't hold as a directory: hydrating could
+// never restore it. A missing marker can't say what is required, and
+// leaves the hit to the slot's state as before.
 func (s *Session) holdsCachedDirs(cacheRoot string, patterns []string) (bool, error) {
 	b, err := os.ReadFile(filepath.Join(cacheRoot, ".ready"))
 	if os.IsNotExist(err) {
@@ -448,6 +449,11 @@ func (s *Session) holdsCachedDirs(cacheRoot string, patterns []string) (bool, er
 	for _, rel := range readyEntries(b) {
 		if !matchesCacheDirs(rel, patterns) || synced(rel) {
 			continue // hydrate refuses or skips these too
+		}
+		if src, err := fsid.SafeJoin(cacheRoot, rel); err != nil {
+			continue
+		} else if fi, err := os.Lstat(src); err != nil || !fi.IsDir() {
+			continue
 		}
 		p, err := fsid.SafeJoin(s.workspace, rel)
 		if err != nil {
