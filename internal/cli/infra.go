@@ -714,6 +714,10 @@ func cmdUp() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Don't launch VMs this machine could never connect to.
+			if err := transport.CheckControlDir(); err != nil {
+				return err
+			}
 			rep, _ := ui.New(ui.ModeAuto, os.Stderr, "")
 			ctx, _, stop := signals()
 			defer stop()
