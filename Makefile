@@ -20,16 +20,28 @@ build: helpers
 	ln -sf spotexec bin/sx
 
 # Cross-compile the remote helper for every supported runner platform and
-# gzip it into the embed directory picked up by the main binary.
+# gzip it into the embed directory picked up by the main binary. Each helper
+# is built and compressed in a hidden staging directory (go:embed skips it),
+# its stream is tested, and only then is it renamed into place, so a failed
+# build or compressor fails the target and leaves the last good helper alone.
 helpers:
-	@mkdir -p $(EMBED_DIR)
-	@for t in $(HELPER_TARGETS); do \
+	@embed_dir=$(call shq,$(EMBED_DIR)); \
+	case "$$embed_dir" in -*) embed_dir=./$$embed_dir ;; esac; \
+	mkdir -p "$$embed_dir" || exit 1; \
+	tmp=; \
+	trap 'if [ -n "$$tmp" ]; then rm -rf "$$tmp"; fi' 0; \
+	trap 'exit 1' HUP INT TERM; \
+	tmp=$$(mktemp -d "$$embed_dir/.tmp-helper.XXXXXXXX") || exit 1; \
+	for t in $(HELPER_TARGETS); do \
 		os=$${t%/*}; arch=$${t#*/}; \
-		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags '$(LDFLAGS)' -o $(EMBED_DIR)/.tmp-helper ./cmd/spotexec-helper || exit 1; \
-		gzip -9 -n -c $(EMBED_DIR)/.tmp-helper > $(EMBED_DIR)/spotexec-helper-$$os-$$arch.gz; \
-		echo "helper $$os/$$arch"; \
+		out="$$embed_dir/spotexec-helper-$$os-$$arch.gz"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags '$(LDFLAGS)' -o "$$tmp/helper" ./cmd/spotexec-helper || exit 1; \
+		gzip -9 -n -c "$$tmp/helper" > "$$tmp/helper.gz" || { printf 'helper %s: gzip failed\n' "$$t" >&2; exit 1; }; \
+		gzip -t "$$tmp/helper.gz" || { printf 'helper %s: gzip wrote a corrupt stream\n' "$$t" >&2; exit 1; }; \
+		[ ! -d "$$out" ] || { printf '%s is a directory\n' "$$out" >&2; exit 1; }; \
+		mv -f "$$tmp/helper.gz" "$$out" || exit 1; \
+		printf 'helper %s\n' "$$t"; \
 	done
-	@rm -f $(EMBED_DIR)/.tmp-helper
 
 # Shell completion scripts for spotexec and sx, shipped in the release
 # archives, the Homebrew formula and the Linux packages.
@@ -59,4 +71,4 @@ e2e: build
 	./scripts/e2e-daemon.sh
 
 clean:
-	rm -rf bin/spotexec bin/sx completions $(EMBED_DIR)/spotexec-helper-*.gz
+	rm -rf bin/spotexec bin/sx completions $(EMBED_DIR)/spotexec-helper-*.gz $(EMBED_DIR)/.tmp-helper*
