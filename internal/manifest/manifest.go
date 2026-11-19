@@ -612,18 +612,32 @@ func gitCeilings() map[string]bool {
 }
 
 // gitBool reads a boolean environment variable as Git does: a word, or an
-// integer (any base, with an optional k, m or g unit) that is non-zero. A
-// value Git would reject counts as true, so the marker search errs toward
-// finding the checkout.
+// integer (decimal, 0x hex or 0 octal, with an optional k, m or g unit)
+// that is non-zero. A value Git would reject counts as true, so the marker
+// search errs toward finding the checkout.
 func gitBool(v string) bool {
-	v = strings.ToLower(strings.TrimSpace(v))
-	switch v {
+	switch strings.ToLower(v) {
 	case "true", "yes", "on":
 		return true
 	case "", "false", "no", "off":
 		return false
 	}
-	n, err := strconv.ParseInt(strings.TrimRight(v, "kmg"), 0, 64)
+	num := strings.TrimLeft(v, " \t\n\v\f\r")
+	if n := len(num); n > 0 && strings.ContainsRune("kmgKMG", rune(num[n-1])) {
+		num = num[:n-1]
+	}
+	sign := ""
+	if num != "" && (num[0] == '-' || num[0] == '+') {
+		sign, num = num[:1], num[1:]
+	}
+	base := 10
+	switch {
+	case len(num) > 2 && (num[:2] == "0x" || num[:2] == "0X"):
+		base, num = 16, num[2:]
+	case len(num) > 1 && num[0] == '0':
+		base, num = 8, num[1:]
+	}
+	n, err := strconv.ParseInt(sign+num, base, 64)
 	return err != nil || n != 0
 }
 
@@ -631,7 +645,7 @@ func gitBool(v string) bool {
 // when set (Git then skips discovery), else the nearest .git at or above
 // dir. "" means dir is a plain directory as far as Git is concerned.
 func gitCheckout(dir string) string {
-	if g := os.Getenv("GIT_DIR"); g != "" {
+	if g, ok := os.LookupEnv("GIT_DIR"); ok {
 		return "GIT_DIR=" + g
 	}
 	if d := checkoutAbove(dir); d != "" {

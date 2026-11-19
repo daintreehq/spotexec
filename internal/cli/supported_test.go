@@ -431,6 +431,7 @@ func TestSupportedCommand(t *testing.T) {
 // project nor blames a missing .spotexec.toml.
 func TestSupportedUnreadableCheckout(t *testing.T) {
 	supportedEnv(t, sshRunner)
+	t.Setenv("LC_ALL", "C")
 	parent := outsideGit(t)
 	putFile(t, filepath.Join(parent, ".spotexec.toml"), "version = 1\n")
 	repo := filepath.Join(parent, "repo")

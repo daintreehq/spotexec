@@ -241,7 +241,8 @@ func TestCeilingHidesOuterRepository(t *testing.T) {
 
 func TestGitBool(t *testing.T) {
 	for v, want := range map[string]bool{"": false, "0": false, "false": false, "Off": false, "0x0": false, "0k": false,
-		"1": true, "yes": true, "TRUE": true, "0x1": true, "1k": true, "2": true, "bogus": true} {
+		"1": true, "yes": true, "TRUE": true, "0x1": true, "1k": true, "2": true, "bogus": true,
+		"0kk": true, "0_0": true, "false ": true, "0b0": true, "0o0": true, "00": false, "0xb": true, "-0": false, " 0m": false, "0g": false} {
 		if got := gitBool(v); got != want {
 			t.Errorf("gitBool(%q) = %v, want %v", v, got, want)
 		}
