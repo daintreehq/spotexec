@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -743,5 +744,38 @@ func TestDepsRehydratesAMissingCacheDirOnAHit(t *testing.T) {
 	replies(t, out, protocol.TypeDepsResult, &res)
 	if res.Built || res.Hydrated {
 		t.Fatalf("a complete slot was not a hit: %+v", res)
+	}
+}
+
+// A ready marker's lines are taken as they are, so a last glob match whose
+// name ends in a space is still the directory the install produced.
+func TestReadyEntriesKeepsTrailingSpaces(t *testing.T) {
+	got := readyEntries([]byte("packages/a\n\npackages/z \n"))
+	if want := []string{"packages/a", "packages/z "}; !slices.Equal(got, want) {
+		t.Fatalf("entries %q, want %q", got, want)
+	}
+}
+
+// A cache whose marker is gone can't say what the slot needs: a same-key
+// slot that still holds its dependencies keeps its hit, as before #314.
+func TestDepsHitWithoutAReadyMarker(t *testing.T) {
+	s, out := depsSession(t)
+	d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p vendor && touch vendor/installed", CacheDirs: []string{"vendor"}}
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	var res protocol.DepsResult
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if err := os.Remove(filepath.Join(s.layout.Deps(s.repoID), res.Key, ".ready")); err != nil {
+		t.Fatal(err)
+	}
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if res.Built || res.Hydrated {
+		t.Fatalf("not a hit: %+v", res)
 	}
 }
