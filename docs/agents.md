@@ -45,14 +45,14 @@ Each `sx` may land on a different VM. When an agent needs the machine it just us
 
 ## Machine-readable events
 
-With `--json`, `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1`, lifecycle events go to stderr as NDJSON instead; `--events-file PATH` appends them to a file in any mode:
+With `--json`, `SPOTEXEC_JSON=1` or `SPOTEXEC_AGENT=1`, lifecycle events go to stderr as NDJSON instead; `--events-file PATH` appends them to a file in any mode. Every event carries its [`format_version`](#format-versions), right after its name:
 
 ```json
-{"event":"slot_acquired","runner":"aws","slot":3,"connect_ms":13,"waited_ms":0}
-{"event":"sync_in","mode":"fingerprint_hit","files":0,"bytes":0,"duration_ms":0}
-{"event":"sync_out","mutated_files":["src/index.ts"],"conflicts":[],"duration_ms":31}
-{"event":"conflict","path":"src/app.ts","local":"/repo/src/app.ts","remote":"/repo/.git/spotexec/conflicts/20260101-120000-ab12cd34ef56/src/app.ts","deleted":false,"diff":"git diff --no-index -- /repo/src/app.ts /repo/.git/spotexec/conflicts/20260101-120000-ab12cd34ef56/src/app.ts","run_id":"20260101-120000-ab12cd34ef56"}
-{"event":"result","exit_code":0,"duration_ms":4120,"timed_out":false}
+{"event":"slot_acquired","format_version":1,"runner":"aws","slot":3,"connect_ms":13,"waited_ms":0}
+{"event":"sync_in","format_version":1,"mode":"fingerprint_hit","files":0,"bytes":0,"duration_ms":0}
+{"event":"sync_out","format_version":1,"mutated_files":["src/index.ts"],"conflicts":[],"duration_ms":31}
+{"event":"conflict","format_version":1,"path":"src/app.ts","local":"/repo/src/app.ts","remote":"/repo/.git/spotexec/conflicts/20260101-120000-ab12cd34ef56/src/app.ts","deleted":false,"diff":"git diff --no-index -- /repo/src/app.ts /repo/.git/spotexec/conflicts/20260101-120000-ab12cd34ef56/src/app.ts","run_id":"20260101-120000-ab12cd34ef56"}
+{"event":"result","format_version":1,"exit_code":0,"duration_ms":4120,"timed_out":false}
 ```
 
 A parallel or sharded task ends with a `result` event for the whole run, which (unlike each part's own `result`) lists its `parts` in task order, each with its `task`, `label`, `status` (`passed`, `failed`, `stopped` or `interrupted`), `exit_code` and `duration_ms`, its `shard` and `shards` when sharded, and where it ran: `runner` and `slot`, or `"local": true`.
@@ -87,6 +87,14 @@ A record has the run's `started_at` and `ended_at`, `duration_ms`, `exit_code`, 
 - `launches`, the VMs its demand launched or tried to: each `launch_id`, `runner`, `status` (`requested`, `launched`, `running` or `failed`), the `demand` and live `instances` when it was asked for, the `instance_id`, `region`, `zone`, `instance_type` and `placement` it got, its `error`, and `log`, the provider's messages, which name the options it skipped before the one it launched.
 
 The command's output is never recorded, nor what other programs print (RTK's messages, a failed `bootstrap_script`'s log); warnings, errors and messages are cut to 1 KB, and each list is capped, per part and for the whole record (`*_dropped` counts what was left out). For example, `jq -r 'select(any(.parts[]; .error.reason == "RUNNER_UNRESPONSIVE")) | .started_at' ~/.local/state/spotexec/logs/runs/*.json` lists the runs that ended that way.
+
+## Format versions
+
+Every machine-readable output says which shape it is in, so a script can tell a format it doesn't know from a bug: a top-level `format_version` (an integer) on each NDJSON event and on the JSON of `status --json`, `status -A --json`, `daemon status --json`, `prices --json`, `sync-plan --json`, `backups --json`, `container regions --json` and `hook discover --json`. Run records carry theirs as `version`. Each output is versioned on its own, and all are at `1`.
+
+The rule a consumer can rely on: within a version, fields are only added, never renamed, removed or retyped. Anything else bumps that output's version, so read only the versions you know, ignore fields you don't, and treat a higher version as a format to upgrade for, not as data to guess at. For events this covers their names too: within a version new events and warning codes can appear, but none is renamed or removed. An events file appended to across upgrades can mix versions, and lines written before spotexec stamped them have none, so check each line. Human-readable output carries no such promise.
+
+`status --json` is an object, `{"format_version": 1, "runners": [...]}`, with one row per runner and per fleet VM; before format versions it was the bare list of rows, so a script that read `.[]` reads `.runners[]` now. Each row's `helper.holders[].client` has the `pid`, `worktree` and `run_id` of the `sx` holding that slot.
 
 ## Claude Code hook
 

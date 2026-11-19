@@ -158,7 +158,7 @@ func TestContainerRegionsJSON(t *testing.T) {
 	if ap.Image.State != "unknown" || ap.Deps.State != "unknown" || ap.KeptError != "DescribeImages: AccessDeniedException" || ap.Image.Why != "BatchGetImage: ThrottlingException" || ap.Kept == nil {
 		t.Errorf("ap-south-1: %+v", ap)
 	}
-	if !strings.Contains(b.String(), `"kept": []`) || !strings.Contains(b.String(), `"pushed_at": "2026-11-11T12:00:00Z"`) || strings.Contains(b.String(), "regions_error") {
+	if !strings.Contains(b.String(), `"format_version": 1,`) || !strings.Contains(b.String(), `"kept": []`) || !strings.Contains(b.String(), `"pushed_at": "2026-11-11T12:00:00Z"`) || strings.Contains(b.String(), "regions_error") {
 		t.Errorf("json keys: %s", b.String())
 	}
 

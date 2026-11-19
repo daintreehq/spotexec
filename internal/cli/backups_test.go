@@ -144,7 +144,7 @@ func TestBackupsJSONWhenEmpty(t *testing.T) {
 	if err := c.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(out.String()); got != `{"runs":[]}` {
+	if got := strings.TrimSpace(out.String()); got != `{"format_version":1,"runs":[]}` {
 		t.Errorf("got %s", got)
 	}
 }

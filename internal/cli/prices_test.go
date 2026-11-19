@@ -178,7 +178,7 @@ func TestPricesJSONRunCost(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The parts' keys, as scripts read them.
-	if out := b.String(); !strings.Contains(out, `"cold_parts": {`) || !strings.Contains(out, `"dependencies": {`) || !strings.Contains(out, `"cold_deps_minutes": 2`) ||
+	if out := b.String(); !strings.Contains(out, `"format_version": 1,`) || !strings.Contains(out, `"cold_parts": {`) || !strings.Contains(out, `"dependencies": {`) || !strings.Contains(out, `"cold_deps_minutes": 2`) ||
 		!strings.Contains(out, `"cold_deps_estimate": {`) || !strings.Contains(out, `"source": "default"`) {
 		t.Fatalf("json keys: %s", out)
 	}

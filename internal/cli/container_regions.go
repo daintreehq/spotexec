@@ -145,7 +145,7 @@ func (v regionsView) writeJSON(w io.Writer) error {
 		}
 		rows = append(rows, rw)
 	}
-	out := map[string]any{"runner": v.runner, "project": v.project, "repo_id": v.repoID, "platform": v.platform, "regions": rows}
+	out := map[string]any{"format_version": regionsFormat, "runner": v.runner, "project": v.project, "repo_id": v.repoID, "platform": v.platform, "regions": rows}
 	if v.dockerfile != "" {
 		out["dockerfile"], out["image_tag"] = v.dockerfile, v.pj.ImageTag
 	}

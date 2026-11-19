@@ -46,13 +46,16 @@ func TestPrintSpotQuotas(t *testing.T) {
 }
 
 func TestAccountStatusJSON(t *testing.T) {
-	b, err := json.Marshal(accountStatus{
-		AccountSearch: &provider.AccountSearch{Instances: []provider.AccountInstance{{ID: "i-1", Region: "us-east-2"}}},
-		SpotQuotas: []regionQuota{{Region: "us-east-2", Usage: provider.QuotaUsage{Region: "us-east-2", Quota: 16, Used: 8, Mine: 8}},
+	b, err := json.Marshal(newAccountStatus(
+		&provider.AccountSearch{Instances: []provider.AccountInstance{{ID: "i-1", Region: "us-east-2"}}},
+		[]regionQuota{{Region: "us-east-2", Usage: provider.QuotaUsage{Region: "us-east-2", Quota: 16, Used: 8, Mine: 8}},
 			{Region: "eu-west-1", Usage: provider.QuotaUsage{Quota: -1}, Error: "AccessDenied", Err: errors.New("AccessDenied")}},
-	})
+	))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(b), `{"format_version":1,`) {
+		t.Errorf("JSON doesn't open with its format version:\n%s", b)
 	}
 	for _, w := range []string{`"instances":[{"id":"i-1"`, `"spot_quotas":[{"region":"us-east-2","usage":{"region":"us-east-2","quota":16,"used":8,"mine":8,"other":0}}`, `"error":"AccessDenied"`} {
 		if !strings.Contains(string(b), w) {

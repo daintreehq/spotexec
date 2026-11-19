@@ -15,7 +15,7 @@ spotexec pull <glob>... [--dest DIR] [--json] copy gitignored files from the las
 spotexec pull --held [<glob>...]             copy the new files a write-back held in the last slot
 spotexec backups [--json]                    list kept write-back backups and conflict copies, newest first
 spotexec backups clear ([<run-id>...] [--older-than AGE] | --all) [--dry-run]  delete them
-spotexec status [runner...] [--json] [-A]    runners, instances, slot holders, idle timers (-A: every machine's VMs and builders, Spot quota use; with --json, {"instances", "searched", "failed", "spot_quotas"})
+spotexec status [runner...] [--json] [-A]    runners, instances, slot holders, idle timers (--json: {"format_version", "runners"}; -A: every machine's VMs and builders, Spot quota use; with --json, {"format_version", "instances", "searched", "failed", "spot_quotas"})
 spotexec monitor [runner...] [--interval 2s] live load and burn-rate dashboard
 spotexec up [runner] [--count N]             pre-warm fleet VMs (waits until ready)
 spotexec down [runner...] [--all]            terminate fleet VMs (and leftover bake builders)

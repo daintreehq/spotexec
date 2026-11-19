@@ -11,11 +11,12 @@ import (
 // Every NDJSON event says which format it is in, whichever reporter wrote
 // it: the JSON stream and every mode's events file, warnings included.
 func TestEveryEventCarriesFormatVersion(t *testing.T) {
-	var jsonOut, jsonExtra, prettyExtra, plainExtra bytes.Buffer
+	var jsonOut, jsonExtra, prettyExtra, plainExtra, quietExtra bytes.Buffer
 	reporters := map[string]Reporter{
 		"json":   &jsonReporter{w: &jsonOut, extra: &jsonExtra},
 		"pretty": &prettyReporter{w: io.Discard, extra: &prettyExtra},
 		"plain":  &plainReporter{w: io.Discard, extra: &plainExtra},
+		"quiet":  &quietReporter{&plainReporter{w: io.Discard, extra: &quietExtra}},
 	}
 	for _, r := range reporters {
 		r.Event("slot_acquired", map[string]any{"runner": "aws", "slot": 3})
@@ -23,7 +24,7 @@ func TestEveryEventCarriesFormatVersion(t *testing.T) {
 	}
 	for name, buf := range map[string]*bytes.Buffer{
 		"json stream": &jsonOut, "json events file": &jsonExtra,
-		"pretty events file": &prettyExtra, "plain events file": &plainExtra,
+		"pretty events file": &prettyExtra, "plain events file": &plainExtra, "quiet events file": &quietExtra,
 	} {
 		lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
 		if len(lines) != 2 {
