@@ -79,7 +79,7 @@ func TestEveryPageOpensAsPlainText(t *testing.T) {
 			t.Errorf("spotexec help %s doesn't start with its title %q: %.80q", p.name, title, out)
 		}
 		for i, line := range strings.Split(out, "\n") {
-			if m := mdLink.FindString(line); m != "" && !strings.Contains(line, "docs/development.md in the spotexec source repository") {
+			if m := mdLink.FindString(strings.ReplaceAll(line, "(docs/development.md in the spotexec source repository)", "")); m != "" {
 				t.Errorf("spotexec help %s, line %d: %q is a repository link: %q", p.name, i+1, m, line)
 			}
 		}
@@ -107,10 +107,9 @@ func TestDocLinksResolve(t *testing.T) {
 				continue
 			}
 			// Link text may hold code; a code span outside one is no link.
-			for _, g := range inlineLink.FindAllStringSubmatch(line, -1) {
-				target := g[1]
-				before, _, _ := strings.Cut(line, g[0])
-				if strings.Contains(target, "://") || strings.Count(before, "`")%2 == 1 {
+			for _, at := range inlineLink.FindAllStringSubmatchIndex(line, -1) {
+				target := line[at[2]:at[3]]
+				if strings.Contains(target, "://") || strings.Count(line[:at[0]], "`")%2 == 1 {
 					continue // a web page, or link-like text in code
 				}
 				file, anchor, _ := strings.Cut(target, "#")
@@ -202,9 +201,10 @@ func TestHelpPointsAtTheDocumentation(t *testing.T) {
 		{"spotexec", []string{"--help"}},
 		{"spotexec", []string{}},
 		{"sx", []string{"-h"}},
+		{"sx", []string{"--help"}},
 	} {
-		_, out, _ := helpOut(t, c.name, c.args...)
-		if !strings.Contains(out, "spotexec help") {
+		code, out, _ := helpOut(t, c.name, c.args...)
+		if code != 0 || !strings.Contains(out, "The full documentation") || !strings.Contains(out, "spotexec help") {
 			t.Errorf("%s %v doesn't mention spotexec help:\n%s", c.name, c.args, out)
 		}
 	}
@@ -227,8 +227,14 @@ func TestHelpCompletesPagesAndCommands(t *testing.T) {
 			t.Errorf("spotexec help completion lacks %q:\n%s", want, out)
 		}
 	}
-	if strings.Count(out, "\nsetup\t")+strings.Count("\n"+out[:min(len(out), 6)], "\nsetup\t") > 1 {
-		t.Errorf("setup completes twice:\n%s", out)
+	setups := 0
+	for _, line := range strings.Split(out, "\n") {
+		if name, _, _ := strings.Cut(line, "\t"); name == "setup" {
+			setups++
+		}
+	}
+	if setups != 1 {
+		t.Errorf("setup completes %d times, not once as the page:\n%s", setups, out)
 	}
 	_, out, _ = helpOut(t, "spotexec", "__complete", "help", "container", "")
 	if !strings.Contains(out, "build\t") || strings.Contains(out, "running\t") {
@@ -273,6 +279,34 @@ func TestRenderMarkdown(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("rendered page lacks %q:\n%s", want, got)
 		}
+	}
+}
+
+// What Codex found the first renderer getting wrong.
+func TestRenderMarkdownEdgeCases(t *testing.T) {
+	src := "# T\n\n## C#\n\n" +
+		"- **`max_instances = 8`, as a ceiling.** Past it, **[setup](setup.md)** waits.\n" +
+		"- `**/*.go` and **/*.go stay, \\*literal\\* too.\n\n" +
+		"[manual](https://example.org/docs/setup.md), and docs/POOL.md in prose.\n\n" +
+		"```sh\ncat docs/setup.md   # see docs/POOL.md\n```\n\n" +
+		"| File | Holds | Committed? |\n| --- | --- | --- |\n| `" + strings.Repeat("x", 60) + "` | Your hardware | Never |\n\n" +
+		"| Status | Value |\n| --- | --- |\n| - | - |\n"
+	got := renderMarkdown("x.md", src, 80)
+	for _, want := range []string{
+		"C#\n--",
+		"- `max_instances = 8`, as a ceiling. Past it, setup (spotexec help setup) waits.",
+		"- `**/*.go` and **/*.go stay, *literal* too.",
+		"manual (https://example.org/docs/setup.md), and spotexec help pool in prose.",
+		"    cat docs/setup.md   # see spotexec help pool\n",
+		"File · Holds · Committed?\n",
+		"Status  Value\n------  -----\n-       -\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("rendered page lacks %q:\n%s", want, got)
+		}
+	}
+	if hs := docHeadings("# T\r\n## Setup\r\n"); len(hs) != 2 || hs[1].text != "Setup" || hs[1].slug != "setup" {
+		t.Errorf("CRLF headings: %+v", hs)
 	}
 }
 

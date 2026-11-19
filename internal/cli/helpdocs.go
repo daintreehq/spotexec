@@ -182,12 +182,13 @@ type docHeading struct {
 }
 
 var (
-	atxHeadingRe = regexp.MustCompile(`^ {0,3}(#{1,6})[ \t]+(.*?)[ \t#]*$`)
+	atxHeadingRe = regexp.MustCompile(`^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$`)
 	listItemRe   = regexp.MustCompile(`^( *)([-*+]|\d+[.)])[ \t]+(.*)$`)
 	tableSepRe   = regexp.MustCompile(`^:?-+:?$`)
 	linkRe       = regexp.MustCompile(`^\[((?:[^\]\x60]|\x60[^\x60]*\x60)*)\]\(([^)\s]*)\)`)
 	italicRe     = regexp.MustCompile(`(^|[\s(])\*([^*\s](?:[^*]*[^*\s])?)\*`)
-	docsPathRe   = regexp.MustCompile(`docs/([A-Za-z0-9_-]+\.md)`)
+	codeComment  = regexp.MustCompile(`(^|[ \t])(#|//) `)
+	docsPathRe   = regexp.MustCompile(`(^|[^\w/.-])docs/([A-Za-z0-9_-]+\.md)`)
 )
 
 // fenceOf reports a code fence's marker and indent, or "" for a line that
@@ -209,7 +210,7 @@ func docHeadings(src string) []docHeading {
 	var hs []docHeading
 	seen := map[string]int{}
 	fence := ""
-	for _, line := range strings.Split(src, "\n") {
+	for _, line := range strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n") {
 		if m, _ := fenceOf(line); m != "" {
 			switch {
 			case fence == "":
@@ -233,7 +234,7 @@ func docHeadings(src string) []docHeading {
 		} else {
 			seen[slug] = 1
 		}
-		hs = append(hs, docHeading{level: len(g[1]), text: plainHeading(g[2]), slug: slug})
+		hs = append(hs, docHeading{level: len(g[1]), text: strings.ReplaceAll(g[2], "**", ""), slug: slug})
 	}
 	return hs
 }
@@ -427,8 +428,12 @@ func (r *mdRenderer) code(lines []string, i int) int {
 			i++
 			break
 		}
-		strip := min(indent, indentOf(l))
-		r.emit(pad + r.docPaths(l[strip:]))
+		l = l[min(indent, indentOf(l)):]
+		// Only a comment names a page; a command's paths stay as written.
+		if c := codeComment.FindStringIndex(l); c != nil {
+			l = l[:c[0]] + r.docPaths(l[c[0]:])
+		}
+		r.emit(pad + l)
 	}
 	r.blank()
 	return i
@@ -438,9 +443,9 @@ func (r *mdRenderer) code(lines []string, i int) int {
 // block per row when it doesn't.
 func (r *mdRenderer) table(rows []string, indent int) {
 	var cells [][]string
-	for _, row := range rows {
+	for n, row := range rows {
 		cs := splitTableRow(row)
-		sep := len(cs) > 0
+		sep := n == 1 // the delimiter row, under the header
 		for _, c := range cs {
 			if !tableSepRe.MatchString(strings.TrimSpace(c)) {
 				sep = false
@@ -502,14 +507,13 @@ func (r *mdRenderer) table(rows []string, indent int) {
 		return
 	}
 	header := cells[0]
-	if cols == 2 {
-		// Wider tables label each value with its column instead.
-		var named []string
-		for _, h := range header {
-			if h != "" {
-				named = append(named, h)
-			}
+	var named []string
+	for _, h := range header {
+		if h != "" {
+			named = append(named, h)
 		}
+	}
+	if len(named) > 0 {
 		r.emit(wrapText(strings.Join(named, " · "), r.width, ind, ind)...)
 		r.blank()
 	}
@@ -560,8 +564,9 @@ func splitTableRow(row string) []string {
 // way it's opened.
 func (r *mdRenderer) docPaths(s string) string {
 	return docsPathRe.ReplaceAllStringFunc(s, func(m string) string {
-		if p, ok := docPageByFile(strings.TrimPrefix(m, "docs/")); ok {
-			return "spotexec help " + p.name
+		g := docsPathRe.FindStringSubmatch(m)
+		if p, ok := docPageByFile(g[2]); ok {
+			return g[1] + "spotexec help " + p.name
 		}
 		return m
 	})
@@ -573,13 +578,12 @@ func (r *mdRenderer) inline(s string) string {
 	s = strings.ReplaceAll(s, "&nbsp;", " ")
 	var b, text strings.Builder
 	flush := func() {
-		t := strings.ReplaceAll(text.String(), "**", "")
-		b.WriteString(italicRe.ReplaceAllString(t, "$1$2"))
+		b.WriteString(r.docPaths(italicRe.ReplaceAllString(text.String(), "$1$2")))
 		text.Reset()
 	}
 	for k := 0; k < len(s); {
-		switch s[k] {
-		case '`':
+		switch {
+		case s[k] == '`':
 			n := len(s[k:]) - len(strings.TrimLeft(s[k:], "`"))
 			end := strings.Index(s[k+n:], s[k:k+n])
 			if end < 0 {
@@ -588,9 +592,9 @@ func (r *mdRenderer) inline(s string) string {
 				continue
 			}
 			flush()
-			b.WriteString(r.docPaths(s[k : k+n+end+n]))
+			b.WriteString(s[k : k+n+end+n])
 			k += n + end + n
-		case '[':
+		case s[k] == '[':
 			g := linkRe.FindStringSubmatch(s[k:])
 			if g == nil {
 				text.WriteByte('[')
@@ -600,22 +604,34 @@ func (r *mdRenderer) inline(s string) string {
 			flush()
 			b.WriteString(r.link(r.inline(g[1]), g[2]))
 			k += len(g[0])
-		case '\\':
-			if k+1 < len(s) && strings.ContainsRune("\\`*_[]()#|<>", rune(s[k+1])) {
-				text.WriteByte(s[k+1])
-				k += 2
-				continue
-			}
-			text.WriteByte('\\')
-			k++
+		case s[k] == '\\' && k+1 < len(s) && strings.ContainsRune("\\`*_[]()#|<>", rune(s[k+1])):
+			flush()
+			b.WriteByte(s[k+1]) // literal: no emphasis, code or link
+			k += 2
+		case strings.HasPrefix(s[k:], "**") && (k+2 < len(s) && !isSpace(s[k+2]) || k > 0 && !isSpace(s[k-1])):
+			// A bold delimiter, paired below across code spans and links
+			// (**`max_instances = 8`, as a ceiling.**).
+			text.WriteByte(boldMark)
+			k += 2
 		default:
 			text.WriteByte(s[k])
 			k++
 		}
 	}
 	flush()
-	return r.docPaths(b.String())
+	out := b.String()
+	if strings.Count(out, string(boldMark))%2 == 1 {
+		// An unpaired one was literal (**/*.go).
+		i := strings.LastIndexByte(out, boldMark)
+		out = out[:i] + "**" + out[i+1:]
+	}
+	return strings.ReplaceAll(out, string(boldMark), "")
 }
+
+// boldMark stands in for a ** delimiter until inline pairs them.
+const boldMark = '\x01'
+
+func isSpace(c byte) bool { return c == ' ' || c == '\t' }
 
 // link renders a link's text and, for a reader with only a terminal, where
 // it leads: another page as spotexec help <page> and its section, a section
@@ -656,7 +672,7 @@ func (r *mdRenderer) link(text, target string) string {
 
 // sameText reports link text that already names the heading it leads to.
 func sameText(text, heading string) bool {
-	return strings.EqualFold(strings.ReplaceAll(text, "`", ""), heading)
+	return strings.EqualFold(strings.ReplaceAll(text, "`", ""), strings.ReplaceAll(heading, "`", ""))
 }
 
 // wrapText fills words into lines of at most width columns, the first
