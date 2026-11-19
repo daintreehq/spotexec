@@ -557,10 +557,11 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
-	t.Run("launch into a region with nothing running", func(t *testing.T) {
-		// A regional teardown leaves the keys on: a VM launched after a plan
-		// that listed none is still terminated before its group goes.
+	t.Run("launch into a region with no spotexec VMs", func(t *testing.T) {
+		// A regional teardown leaves the keys on: a VM launched right after a
+		// plan that listed none is still terminated before its group goes.
 		c := newFakeCloud(t)
+		c.late = nil
 		c.instances["AK-admin"]["us-east-2"] = c.instances["AK-admin"]["us-east-2"][2:] // only i-prod
 		p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
 		if err != nil {
@@ -571,13 +572,29 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 				t.Fatalf("plan lists %s", it.ID)
 			}
 		}
+		c.mu.Lock()
+		c.instances["AK-admin"]["us-east-2"] = append(c.instances["AK-admin"]["us-east-2"], fakeAcctInstance{"i-new", "pending", map[string]string{tagRunner: "aws", tagOwner: "m-1"}})
+		c.mu.Unlock()
 		if err := p.Apply(context.Background(), t.Logf); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(strings.Join(c.terminated, ","), "i-late") || len(c.sgs["us-east-2"]) != 1 {
+		if !strings.Contains(strings.Join(c.terminated, ","), "i-new") || len(c.sgs["us-east-2"]) != 1 {
 			t.Fatalf("terminated %v, groups %v", c.terminated, c.sgs)
 		}
 	})
+}
+
+// iamCalls lists the IAM requests the fake has seen.
+func iamCalls(c *fakeCloud) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var calls []string
+	for _, s := range c.signed {
+		if strings.HasPrefix(s, "iam ") {
+			calls = append(calls, s)
+		}
+	}
+	return calls
 }
 
 // A teardown limited to some regions leaves the account-wide IAM users and
@@ -586,30 +603,70 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 func TestTeardownRegionKeepsIAM(t *testing.T) {
 	c := newFakeCloud(t)
 	c.instances["AK-admin"]["us-west-2"] = []fakeAcctInstance{{"i-west", "running", map[string]string{tagRunner: "aws", tagOwner: "m-1", tagHost: "mac"}}}
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
-	if err != nil || p.Err() != nil {
-		t.Fatalf("%v %v", err, p.Err())
+	c.instances["AK-admin"]["eu-west-1"] = []fakeAcctInstance{{"i-eu", "running", map[string]string{tagRunner: "aws", tagOwner: "m-1", tagHost: "mac"}}}
+	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2", "eu-west-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Err() != nil || !p.Regional || strings.Join(p.Regions, ",") != "eu-west-1,us-east-2" {
+		t.Fatalf("plan %+v: %v", p, p.Err())
 	}
 	for _, it := range p.Items {
 		if it.Kind == KindIAMUser || it.Region == "" {
 			t.Fatalf("a regional plan lists account-wide %s %s", it.Kind, it.ID)
 		}
 	}
+	// Apply leaves IAM alone even when a user is in the plan.
+	p.Items = append(p.Items, TeardownItem{Kind: KindIAMUser, ID: "spotexec-mac"})
 	if err := p.Apply(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
 	}
 	if c.users["spotexec-mac"] == nil || c.keys["AKMAC"] != [2]string{"spotexec-mac", "Active"} {
 		t.Fatalf("the machine's IAM user or key was touched: %v %v", c.users, c.keys)
 	}
-	if strings.Contains(strings.Join(c.terminated, ","), "i-west") || !strings.Contains(strings.Join(c.terminated, ","), "i-run") {
+	term := strings.Join(c.terminated, ",")
+	if strings.Contains(term, "i-west") || !strings.Contains(term, "i-run") || !strings.Contains(term, "i-eu") {
 		t.Fatalf("terminated %v", c.terminated)
 	}
 	if c.buckets["spotexec-cache-111111111111-us-west-2"] == nil || len(c.sgs["us-west-2"]) != 1 {
 		t.Fatalf("us-west-2 touched: buckets %v, groups %v", c.buckets, c.sgs)
 	}
-	for _, s := range c.log {
-		if strings.HasPrefix(s, "UpdateAccessKey") || strings.HasPrefix(s, "DeleteAccessKey") || strings.HasPrefix(s, "DeleteUser") {
-			t.Fatalf("IAM mutated: %v", c.log)
-		}
+	if calls := iamCalls(c); len(calls) != 0 {
+		t.Fatalf("IAM called: %v", calls)
+	}
+
+	// The leftover check stays in the plan's regions, and off IAM.
+	p, err = PlanTeardown(context.Background(), "admin", []string{"us-east-2", "eu-west-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.repos["us-east-2"] = append(c.repos["us-east-2"], "spotexec/newer")
+	c.repos["us-west-2"] = append(c.repos["us-west-2"], "spotexec/west")
+	c.mu.Unlock()
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "appeared meanwhile") || !strings.Contains(err.Error(), "spotexec/newer") || strings.Contains(err.Error(), "spotexec/west") || strings.Contains(err.Error(), "IAM") {
+		t.Fatalf("err = %v", err)
+	}
+	if calls := iamCalls(c); len(calls) != 0 {
+		t.Fatalf("IAM called: %v", calls)
+	}
+}
+
+// A regional teardown whose VMs won't terminate keeps its security groups,
+// and still never touches a key.
+func TestTeardownRegionStuck(t *testing.T) {
+	c := newFakeCloud(t)
+	c.stuck = true
+	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "still not terminated") || !strings.Contains(err.Error(), "security group(s) kept") {
+		t.Fatalf("err = %v", err)
+	}
+	if c.users["spotexec-mac"] == nil || c.keys["AKMAC"][1] != "Active" || len(c.sgs["us-east-2"]) != 3 {
+		t.Fatalf("users %v, keys %v, groups %v", c.users, c.keys, c.sgs)
 	}
 }
