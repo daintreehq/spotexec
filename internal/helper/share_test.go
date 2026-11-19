@@ -695,3 +695,53 @@ func TestDepsRehydratesOlderSlotsOfUnknownOrigin(t *testing.T) {
 		t.Fatalf("saved state %+v", st)
 	}
 }
+
+// #314: a same-key hit restores a cached directory the slot lost (here a
+// glob match recorded in the ready marker) from the intact cache, while a
+// pattern the install never produced stays optional and keeps the hit.
+func TestDepsRehydratesAMissingCacheDirOnAHit(t *testing.T) {
+	s, out := depsSession(t)
+	d := protocol.Deps{
+		Lockfiles: []string{"deps.lock"},
+		Install:   "mkdir -p vendor packages/a/node_modules && echo v > vendor/installed && echo a > packages/a/node_modules/installed",
+		CacheDirs: []string{"vendor", "packages/*/node_modules", "optional"},
+	}
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	var res protocol.DepsResult
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if !res.Built {
+		t.Fatalf("first run: %+v", res)
+	}
+	// A command removes one cached output; the other survives.
+	if err := os.RemoveAll(filepath.Join(s.workspace, "packages", "a", "node_modules")); err != nil {
+		t.Fatal(err)
+	}
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if res.Built || !res.Hydrated {
+		t.Fatalf("not hydrated from the cache: %+v", res)
+	}
+	if b, err := os.ReadFile(filepath.Join(s.workspace, "packages", "a", "node_modules", "installed")); err != nil || string(b) != "a\n" {
+		t.Fatalf("restored %q, %v", b, err)
+	}
+	if st := loadSlotState(s.slotDir); st.DepsKey != res.Key {
+		t.Fatalf("saved state %+v", st)
+	}
+	// Everything the install produced is there: a plain hit, though
+	// "optional" was never produced.
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if res.Built || res.Hydrated {
+		t.Fatalf("a complete slot was not a hit: %+v", res)
+	}
+}

@@ -141,7 +141,7 @@ func (s *Session) deps(d protocol.Deps) error {
 	dirs := expandCacheDirs(s.workspace, d.CacheDirs)
 	unknownOrigin := s.state.VenvsRelocated && s.state.VenvRelocation < venvRelocation && len(cacheOrigins(cacheRoot)) == 0 &&
 		slices.ContainsFunc(dirs, func(rel string) bool { return len(venvsAt(filepath.Join(s.workspace, filepath.FromSlash(rel)))) > 0 })
-	if s.state.DepsKey == key && len(dirs) > 0 && !unknownOrigin {
+	if s.state.DepsKey == key && len(dirs) > 0 && !unknownOrigin && s.holdsCachedDirs(cacheRoot, d.CacheDirs) {
 		if s.state.VenvRelocation < venvRelocation {
 			// Hydrated by an older helper, which copied venvs as they were
 			// or left their symlinks pointing into another slot.
@@ -425,6 +425,33 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 		method = m
 	}
 	return method, nil
+}
+
+// holdsCachedDirs reports whether the slot still has every directory the
+// install produced, as the cache's ready marker records them (glob matches
+// included): a command may have removed one since. A pattern that matched
+// nothing at install time is not in the marker, so it stays optional. An
+// unreadable marker can't say what is required, and leaves the hit to the
+// slot's state as before.
+func (s *Session) holdsCachedDirs(cacheRoot string, patterns []string) bool {
+	b, err := os.ReadFile(filepath.Join(cacheRoot, ".ready"))
+	if err != nil {
+		return true
+	}
+	synced := s.syncedIndex()
+	for _, rel := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if rel == "" || !matchesCacheDirs(rel, patterns) || synced(rel) {
+			continue // hydrate would skip or refuse these too
+		}
+		p, err := fsid.SafeJoin(s.workspace, rel)
+		if err != nil {
+			return false // reached through a symlink: hydrate replaces it
+		}
+		if fi, err := os.Lstat(p); err != nil || !fi.IsDir() {
+			return false
+		}
+	}
+	return true
 }
 
 func matchesCacheDirs(rel string, patterns []string) bool {
