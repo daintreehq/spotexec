@@ -34,7 +34,12 @@ func NewTree(root, name string) *Tree {
 // Match reports whether the slash-separated relative path is excluded. It
 // fails, naming the file, when an ignore file that applies to the path
 // exists but can't be read completely.
+//
+// A trailing slash asks about rel as a directory.
 func (t *Tree) Match(rel string, isDir bool) (bool, error) {
+	if strings.HasSuffix(rel, "/") {
+		rel, isDir = strings.TrimRight(rel, "/"), true
+	}
 	parts := strings.Split(rel, "/")
 	for i := 1; i <= len(parts); i++ {
 		if ex, err := t.matchOne(parts[:i], i < len(parts) || isDir); ex || err != nil {

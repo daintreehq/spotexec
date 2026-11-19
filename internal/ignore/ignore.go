@@ -91,7 +91,9 @@ func (m *Matcher) AddFile(p string) error {
 // file (or a file stands where a directory on its path would be), and an
 // error naming p when one exists but can't be read completely.
 func readLines(p string) ([]string, error) {
-	f, err := os.Open(p)
+	// Nonblocking, so a FIFO in its place fails the regular-file check
+	// instead of hanging the scan.
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 			return nil, nil
@@ -184,6 +186,12 @@ func matchSegs(pat, parts []string) bool {
 		return len(parts) == 0
 	}
 	if pat[0] == "**" {
+		// A trailing ** matches everything inside, never the directory
+		// itself: "dir/**" leaves dir to be entered, so a deeper rule can
+		// re-include a file in it.
+		if len(pat) == 1 {
+			return len(parts) > 0
+		}
 		for i := 0; i <= len(parts); i++ {
 			if matchSegs(pat[1:], parts[i:]) {
 				return true
