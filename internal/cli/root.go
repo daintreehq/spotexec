@@ -30,6 +30,9 @@ Usage:
 
 sx -h lists the run flags and this project's tasks. spotexec <command> runs a
 command too, unless it is named like one of the commands below.
+
+The full documentation ships with spotexec: spotexec help lists its pages, and
+spotexec help <page> prints one (spotexec help running, spotexec help agents).
 `
 
 // subcommands that take precedence over the shorthand form.
@@ -183,6 +186,7 @@ func newRoot() *cobra.Command {
 		cmdUp(), cmdDown(), cmdDoctor(), cmdUnlock(), cmdPrune(), cmdBackups(), cmdInit(), cmdHook(),
 		cmdTasks(), cmdVersion(), cmdCloudInit(), cmdSim(), cmdImage(), cmdPrices(), cmdDaemon(), cmdContainer(), cmdSetup(), cmdTeardown(), cmdSupported(),
 	)
+	root.SetHelpCommand(cmdHelp(root))
 	root.SetVersionTemplate("spotexec {{.Version}}\n") // as `spotexec version` and `sx --version`
 	addSxCompletion(root)
 	return root
@@ -340,7 +344,7 @@ Flags:
 %s
 Exit codes are the command's own; 124 is a timeout and 125 means spotexec
 itself failed. Set up and manage runners with spotexec (setup, init, status,
-doctor, down, …); see spotexec -h.
+doctor, down, …); see spotexec -h. The full documentation: spotexec help.
 `, fs.FlagUsages())
 	if l, err := load(dir); err == nil && len(l.cfg.Project.Tasks) > 0 {
 		names := make([]string, 0, len(l.cfg.Project.Tasks))

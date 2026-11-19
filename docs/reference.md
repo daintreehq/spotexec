@@ -43,6 +43,8 @@ spotexec hook discover [--days N] [--limit N] [--json]  heavy commands from past
 spotexec cloud-init [runner]                 print the first-boot user-data
 spotexec completion bash|zsh|fish|powershell shell completion script
 spotexec completion sx bash|zsh|fish|powershell   the same for sx (flags and task names)
+spotexec help [<page>]                       list the documentation pages, or print one (help setup is the page; setup --help the command)
+spotexec help <command>                      a command's help, as spotexec <command> --help
 spotexec version
 ```
 
