@@ -27,10 +27,11 @@ type rule struct {
 // Matcher holds ordered rules.
 type Matcher struct {
 	rules []rule
-	// git: a trailing ** matches only what is inside a directory, never the
-	// directory itself, as Git reads .gitignore files (Tree). Otherwise
-	// "dir/**" also excludes dir, as .spotexecignore and [sync].exclude
-	// always have.
+	// git: patterns read as Git reads .gitignore files (Tree): a trailing
+	// ** matches only what is inside a directory, never the directory
+	// itself, and "[!...]" is a negated class. Otherwise "dir/**" also
+	// excludes dir and "!" is a class member, as .spotexecignore and
+	// [sync].exclude always have.
 	git bool
 }
 
@@ -73,8 +74,10 @@ func (m *Matcher) Add(lines ...string) {
 			continue
 		}
 		r.segs = strings.Split(l, "/")
-		for i, seg := range r.segs {
-			r.segs[i] = bracketNegation(seg)
+		if m.git {
+			for i, seg := range r.segs {
+				r.segs[i] = bracketNegation(seg)
+			}
 		}
 		if !r.anchored {
 			r.segs = append([]string{"**"}, r.segs...)
@@ -87,7 +90,7 @@ func (m *Matcher) Add(lines ...string) {
 // but can't be read whole (a directory in its place, no permission, a read
 // error) is an error naming it.
 func (m *Matcher) AddFile(p string) error {
-	lines, err := readLines(p)
+	lines, err := readLines(p, false)
 	if err != nil {
 		return err
 	}
@@ -97,13 +100,19 @@ func (m *Matcher) AddFile(p string) error {
 
 // readLines returns the lines of the file at p: none when there is no such
 // file (or a file stands where a directory on its path would be), and an
-// error naming p when one exists but can't be read completely.
-func readLines(p string) ([]string, error) {
+// error naming p when one exists but can't be read completely. With
+// noFollow a symlink at p counts as no file, as Git skips a symlinked
+// .gitignore.
+func readLines(p string, noFollow bool) ([]string, error) {
 	// Nonblocking, so a FIFO in its place fails the regular-file check
 	// instead of hanging the scan.
-	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	flags := os.O_RDONLY | syscall.O_NONBLOCK
+	if noFollow {
+		flags |= syscall.O_NOFOLLOW
+	}
+	f, err := os.OpenFile(p, flags, 0)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || noFollow && errors.Is(err, syscall.ELOOP) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("cannot read ignore file %s: %w", p, unwrapPath(err))
@@ -218,22 +227,38 @@ func matchSegs(pat, parts []string, git bool) bool {
 }
 
 // bracketNegation rewrites Git's negated class "[!...]" as path.Match's
-// "[^...]" (path.Match reads "!" there as a member).
+// "[^...]" (path.Match reads "!" there as a member). Only a "!" right after
+// a class's opening bracket negates it: in "[[!]" both are members.
 func bracketNegation(seg string) string {
 	if !strings.Contains(seg, "[!") {
 		return seg
 	}
 	var b strings.Builder
+	inClass := false
 	for i := 0; i < len(seg); i++ {
-		b.WriteByte(seg[i])
+		c := seg[i]
 		switch {
-		case seg[i] == '\\' && i+1 < len(seg):
+		case c == '\\' && i+1 < len(seg):
+			b.WriteByte(c)
 			i++
-			b.WriteByte(seg[i])
-		case seg[i] == '[' && i+1 < len(seg) && seg[i+1] == '!':
-			b.WriteByte('^')
-			i++
+			c = seg[i]
+		case !inClass && c == '[':
+			inClass = true
+			b.WriteByte(c)
+			if i+1 < len(seg) && seg[i+1] == '!' {
+				b.WriteByte('^')
+				i++
+			}
+			// A "]" first in the class is a member, not its end.
+			if i+1 < len(seg) && seg[i+1] == ']' {
+				b.WriteByte(']')
+				i++
+			}
+			continue
+		case inClass && c == ']':
+			inClass = false
 		}
+		b.WriteByte(c)
 	}
 	return b.String()
 }

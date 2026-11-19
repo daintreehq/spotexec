@@ -67,6 +67,7 @@ func (t *Tree) matchOne(parts []string, isDir bool) (bool, error) {
 }
 
 // load returns the matcher of dir's ignore file, nil when there is none.
+// Its patterns are read as Git reads them (see Matcher.git).
 // A directory reached through a symlink (or not a directory here) has none:
 // what lies beyond a symlink is not the project's.
 func (t *Tree) load(dir []string) (*Matcher, error) {
@@ -84,14 +85,15 @@ func (t *Tree) load(dir []string) (*Matcher, error) {
 	case err != nil:
 		// Through a symlink, past a file, or a name no worktree holds.
 	default:
-		lines, err := readLines(full)
+		// A symlinked .gitignore is skipped, as Git skips it, except at
+		// the root, where spotexec has always followed one.
+		lines, err := readLines(full, key != "")
 		if err != nil {
 			return nil, err
 		}
-		if m = New(lines...); m.Empty() {
+		m = &Matcher{git: true}
+		if m.Add(lines...); m.Empty() {
 			m = nil
-		} else {
-			m.git = true
 		}
 	}
 	t.dirs[key] = m

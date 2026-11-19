@@ -59,12 +59,26 @@ func TestTrailingDoubleStar(t *testing.T) {
 	}
 }
 
-// Git's negated class [!...] means "not", as [^...] does.
+// In a .gitignore, Git's negated class [!...] means "not", as [^...]
+// does; only a "!" first in a class negates it. .spotexecignore and
+// [sync].exclude keep reading "!" as a member.
 func TestBracketNegation(t *testing.T) {
-	m := New("keys/[!x].pem", "\\[!y].txt")
-	for p, want := range map[string]bool{"keys/a.pem": true, "keys/x.pem": false, "keys/!.pem": true, "keys/ab.pem": false, "[!y].txt": true, "a.txt": false} {
+	m := &Matcher{git: true}
+	m.Add("keys/[!x].pem", "\\[!y].txt", "lit/[[!].pem", "dir[!a]/*.key")
+	for p, want := range map[string]bool{
+		"keys/a.pem": true, "keys/x.pem": false, "keys/!.pem": true, "keys/ab.pem": false,
+		"[!y].txt": true, "a.txt": false,
+		"lit/!.pem": true, "lit/[.pem": true, "lit/a.pem": false,
+		"dirb/k.key": true, "dira/k.key": false,
+	} {
 		if got := m.Match(p, false); got != want {
 			t.Errorf("Match(%q) = %v, want %v", p, got, want)
+		}
+	}
+	user := New("keys/[!x].pem")
+	for p, want := range map[string]bool{"keys/x.pem": true, "keys/!.pem": true, "keys/a.pem": false} {
+		if got := user.Match(p, false); got != want {
+			t.Errorf("user Match(%q) = %v, want %v", p, got, want)
 		}
 	}
 }
@@ -139,26 +153,38 @@ func TestTreeReadErrors(t *testing.T) {
 }
 
 // What lies beyond a symlinked directory is not the project's: its ignore
-// files are not read. A symlinked ignore file itself is followed, and a
-// dangling one is absent.
+// files are not read. A symlinked .gitignore below the root is skipped, as
+// Git skips it; the root's is followed, as spotexec always has; a dangling
+// one is absent.
 func TestTreeSymlinks(t *testing.T) {
 	root, outside := t.TempDir(), t.TempDir()
-	writeFiles(t, outside, map[string]string{".gitignore": "*.txt\n", "rules": "*.log\n"})
-	writeFiles(t, root, map[string]string{"real/a.log": ""})
-	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(outside, "rules"), filepath.Join(root, "real", ".gitignore")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(outside, "missing"), filepath.Join(root, ".gitignore")); err != nil {
-		t.Fatal(err)
+	writeFiles(t, outside, map[string]string{".gitignore": "*.txt\n", "a.txt": "", "rules": "*.log\n", "rootrules": "*.tmp\n"})
+	writeFiles(t, root, map[string]string{"real/a.log": "", "real/b.tmp": ""})
+	for link, target := range map[string]string{
+		"link":            outside,
+		"real/.gitignore": filepath.Join(outside, "rules"),
+		".gitignore":      filepath.Join(outside, "rootrules"),
+		"gone/.gitignore": filepath.Join(outside, "missing"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, link)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(root, link)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	tr := NewTree(root, ".gitignore")
-	if got, err := tr.Match("link/a.txt", false); err != nil || got {
-		t.Errorf("Match(link/a.txt) = %v, %v", got, err)
+	for p, want := range map[string]bool{"link/a.txt": false, "real/a.log": false, "real/b.tmp": true, "gone/x": false} {
+		if got, err := tr.Match(p, false); err != nil || got != want {
+			t.Errorf("Match(%q) = %v, %v, want %v", p, got, err, want)
+		}
 	}
-	if got, err := tr.Match("real/a.log", false); err != nil || !got {
-		t.Errorf("Match(real/a.log) = %v, %v", got, err)
+
+	dangling := t.TempDir()
+	if err := os.Symlink(filepath.Join(outside, "missing"), filepath.Join(dangling, ".gitignore")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := NewTree(dangling, ".gitignore").Match("x.txt", false); err != nil || got {
+		t.Errorf("dangling root: %v, %v", got, err)
 	}
 }
