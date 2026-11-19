@@ -56,8 +56,6 @@ func (c *Client) setup() error {
 	if c.ctlErr != nil {
 		return c.ctlErr
 	}
-	ctlMu.Lock()
-	defer ctlMu.Unlock()
 	if err := privateDir(filepath.Dir(c.ctlPath)); err != nil {
 		return &SetupError{err}
 	}
@@ -151,6 +149,7 @@ func controlDir() (string, error) {
 	if err != nil {
 		if herr != nil {
 			perr = fmt.Errorf("%v; %v", herr, perr)
+			ctlDir = "" // the home may recover: try it first again
 		}
 		return "", &SetupError{fmt.Errorf("%v, and no private alternative: %w", perr, err)}
 	}
@@ -184,7 +183,7 @@ func CheckControlDir() error {
 // owned by us, mode 0700, and that no other user can put anything in its
 // place or in it. One others could write to is refused, not fixed, as is
 // one holding anything of theirs: a socket they left there would stand in
-// for the master. Callers hold ctlMu.
+// for the master.
 func privateDir(dir string) error {
 	if err := safeAncestors(dir); err != nil {
 		return err
@@ -216,9 +215,11 @@ func privateDir(dir string) error {
 	// Once ours and private, nobody else can add to it: one scan per
 	// directory per process is enough, and a new one needs none. (Lock
 	// files pile up per VM, and a client is made per VM per daemon round.)
-	ino := uint64(st.Ino)
-	if created || scannedDirs[dir] == ino {
-		scannedDirs[dir] = ino
+	// Keyed by inode and mtime: anything added to it since changes the time,
+	// even if its mode was opened and closed again meanwhile.
+	key := scanKey{uint64(st.Ino), fi.ModTime()}
+	if k, _ := scannedDirs.Load(dir); created || k == key {
+		scannedDirs.Store(dir, key)
 		return nil
 	}
 	ents, err := os.ReadDir(dir)
@@ -237,13 +238,18 @@ func privateDir(dir string) error {
 			return fmt.Errorf("%s holds %s, which is another user's (remove it, and spotexec makes a private one)", dir, e.Name())
 		}
 	}
-	scannedDirs[dir] = ino
+	scannedDirs.Store(dir, key)
 	return nil
 }
 
-// scannedDirs are the private directories (by inode) privateDir has found
-// holding nothing of another user's. Guarded by ctlMu.
-var scannedDirs = map[string]uint64{}
+// scannedDirs maps the private directories privateDir has found holding
+// nothing of another user's to how they were then (a scanKey).
+var scannedDirs sync.Map
+
+type scanKey struct {
+	ino   uint64
+	mtime time.Time
+}
 
 func trustedUID(uid uint32) bool { return uid == 0 || int(uid) == os.Getuid() }
 
