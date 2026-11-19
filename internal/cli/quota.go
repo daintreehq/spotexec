@@ -23,8 +23,13 @@ type regionQuota struct {
 
 // accountStatus is `status -A --json`.
 type accountStatus struct {
+	FormatVersion int `json:"format_version"`
 	*provider.AccountSearch
 	SpotQuotas []regionQuota `json:"spot_quotas"`
+}
+
+func newAccountStatus(res *provider.AccountSearch, quotas []regionQuota) accountStatus {
+	return accountStatus{FormatVersion: accountStatusFormat, AccountSearch: res, SpotQuotas: quotas}
 }
 
 // spotQuotas reads the Spot vCPU quota and its live use in every region

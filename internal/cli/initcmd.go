@@ -778,7 +778,10 @@ func cmdHook() *cobra.Command {
 			if asJSON {
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
-				return enc.Encode(res)
+				return enc.Encode(struct {
+					FormatVersion int `json:"format_version"`
+					hooks.Discovery
+				}{discoverFormat, res})
 			}
 			printDiscovery(os.Stdout, res, days, limit)
 			return nil

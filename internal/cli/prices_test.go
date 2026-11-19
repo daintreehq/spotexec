@@ -166,9 +166,10 @@ func TestPricesJSONRunCost(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got struct {
-		Order  string                 `json:"launch_order"`
-		Model  *provider.RunCostModel `json:"run_cost_model"`
-		Prices []struct {
+		FormatVersion *int                   `json:"format_version"`
+		Order         string                 `json:"launch_order"`
+		Model         *provider.RunCostModel `json:"run_cost_model"`
+		Prices        []struct {
 			provider.SpotPrice
 			Next    bool
 			RunCost *provider.RunCost `json:"run_cost"`
@@ -178,6 +179,9 @@ func TestPricesJSONRunCost(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The parts' keys, as scripts read them.
+	if got.FormatVersion == nil || *got.FormatVersion != 1 {
+		t.Fatalf("no top-level format_version: %s", b.String())
+	}
 	if out := b.String(); !strings.Contains(out, `"cold_parts": {`) || !strings.Contains(out, `"dependencies": {`) || !strings.Contains(out, `"cold_deps_minutes": 2`) ||
 		!strings.Contains(out, `"cold_deps_estimate": {`) || !strings.Contains(out, `"source": "default"`) {
 		t.Fatalf("json keys: %s", out)

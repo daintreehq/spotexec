@@ -99,6 +99,7 @@ func TestHookDiscoverReports(t *testing.T) {
 	}
 	out = captureStdout(t, func() { code = MainAs("spotexec", []string{"hook", "discover", "--json"}) })
 	var res struct {
+		FormatVersion                         int `json:"format_version"`
 		Sessions, Commands, Offloaded, Direct int
 		Missed                                []struct {
 			Command, Reason string
@@ -112,7 +113,7 @@ func TestHookDiscoverReports(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &res); err != nil || code != 0 {
 		t.Fatalf("--json: %v %d %s", err, code, out)
 	}
-	if res.Sessions != 1 || res.Commands != 6 || res.Offloaded != 2 || res.Direct != 1 || len(res.Missed) != 1 ||
+	if res.FormatVersion != 1 || res.Sessions != 1 || res.Commands != 6 || res.Offloaded != 2 || res.Direct != 1 || len(res.Missed) != 1 ||
 		res.Missed[0].Command != "pnpm test > log" || res.Missed[0].Count != 2 || !strings.Contains(res.Missed[0].Reason, "shell syntax in `pnpm test > log`") ||
 		len(res.Reasons) != 1 || res.Reasons[0].Count != 2 {
 		t.Fatalf("--json: %+v", res)

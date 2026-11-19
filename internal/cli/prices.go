@@ -147,7 +147,7 @@ func (v pricesView) writeJSON(w io.Writer) error {
 		}
 		rows = append(rows, rw)
 	}
-	out := map[string]any{"runner": v.r.Name, "fetched_at": v.t.At, "regions": v.t.Regions, "unpriced": v.t.Unpriced,
+	out := map[string]any{"format_version": pricesFormat, "runner": v.r.Name, "fetched_at": v.t.At, "regions": v.t.Regions, "unpriced": v.t.Unpriced,
 		"launch_order": v.k.Order, "prices": rows}
 	if v.k.Model != nil {
 		out["run_cost_model"] = v.k.Model

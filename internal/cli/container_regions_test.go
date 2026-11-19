@@ -117,13 +117,14 @@ func TestContainerRegionsJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got struct {
-		Project    string `json:"project"`
-		RepoID     string `json:"repo_id"`
-		Dockerfile string `json:"dockerfile"`
-		Runner     string `json:"runner"`
-		Tag        string `json:"image_tag"`
-		Platform   string `json:"platform"`
-		Regions    []struct {
+		FormatVersion *int   `json:"format_version"`
+		Project       string `json:"project"`
+		RepoID        string `json:"repo_id"`
+		Dockerfile    string `json:"dockerfile"`
+		Runner        string `json:"runner"`
+		Tag           string `json:"image_tag"`
+		Platform      string `json:"platform"`
+		Regions       []struct {
 			Region string `json:"region"`
 			Image  struct {
 				State    string     `json:"state"`
@@ -157,6 +158,9 @@ func TestContainerRegionsJSON(t *testing.T) {
 	}
 	if ap.Image.State != "unknown" || ap.Deps.State != "unknown" || ap.KeptError != "DescribeImages: AccessDeniedException" || ap.Image.Why != "BatchGetImage: ThrottlingException" || ap.Kept == nil {
 		t.Errorf("ap-south-1: %+v", ap)
+	}
+	if got.FormatVersion == nil || *got.FormatVersion != 1 {
+		t.Errorf("no top-level format_version: %s", b.String())
 	}
 	if !strings.Contains(b.String(), `"kept": []`) || !strings.Contains(b.String(), `"pushed_at": "2026-11-11T12:00:00Z"`) || strings.Contains(b.String(), "regions_error") {
 		t.Errorf("json keys: %s", b.String())
