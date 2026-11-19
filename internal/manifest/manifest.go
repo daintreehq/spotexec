@@ -479,7 +479,7 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 	// $XDG_CONFIG_HOME/git/attributes) applies to every repository. Git
 	// reads a relative core.attributesFile from the worktree root.
 	if out, err := exec.Command("git", "-C", root, "config", "--path", "--get", "core.attributesFile").Output(); err == nil {
-		f := strings.TrimSpace(string(out))
+		f := GitPath(out)
 		if !filepath.IsAbs(f) {
 			f = filepath.Join(root, f)
 		}

@@ -101,9 +101,11 @@ func Resolve(dir string) (*Workspace, error) {
 // or gitDir when git can't say.
 func commonGitDir(root, gitDir string) string {
 	// --path-format=absolute (git 2.31+) gives the canonical path; older git
-	// echoes the unknown option back, and prints the dir relative to root.
+	// echoes the unknown option back as its own first line, and prints the
+	// dir relative to root. An absolute dir never starts with the option, but
+	// may hold a newline, so only the echo means old git.
 	out, err := exec.Command("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
-	if err != nil || strings.Contains(manifest.GitPath(out), "\n") {
+	if err != nil || strings.HasPrefix(string(out), "--path-format=absolute") {
 		out, err = exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output()
 	}
 	if err != nil {

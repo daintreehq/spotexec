@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 )
 
@@ -22,9 +21,13 @@ func TestGitPathKeepsSpaces(t *testing.T) {
 			t.Errorf("GitPath(%q) = %q, want %q", in, got, want)
 		}
 	}
-	crlf := GitPath([]byte(`C:\w\checkout` + "\r\n"))
-	if want := `C:\w\checkout`; runtime.GOOS == "windows" && crlf != want {
-		t.Errorf("GitPath(CRLF) = %q, want %q", crlf, want)
+	// A carriage return is part of a POSIX name; Windows names never hold one.
+	want := "/w/checkout\r"
+	if runtime.GOOS == "windows" {
+		want = "/w/checkout"
+	}
+	if got := GitPath([]byte("/w/checkout\r\n")); got != want {
+		t.Errorf("GitPath(CRLF) = %q, want %q", got, want)
 	}
 }
 
@@ -54,7 +57,7 @@ func TestRootKeepsTrailingSpace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(gd, spaced+string(filepath.Separator)) {
-		t.Errorf("GitDir = %q, want it inside %q", gd, spaced)
+	if want := filepath.Join(spaced, ".git"); gd != want {
+		t.Errorf("GitDir = %q, want %q", gd, want)
 	}
 }
