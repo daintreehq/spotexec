@@ -9,6 +9,8 @@
 //   - wedged-<pid>: the master with that pid has a dead connection (the
 //     laptop slept): `-O check` still succeeds, but sessions through it hang;
 //   - uname-fails: `uname` fails at once;
+//   - hello-refused: the helper answers the handshake with an error whose
+//     code is the file's content, and counts it in hello-refusals;
 //   - upload-hangs: the helper upload never finishes;
 //   - rpc-silent: after the handshake the helper goes silent, reading and
 //     writing nothing (a wedged helper or half-open channel);
@@ -200,6 +202,14 @@ func rpc() int {
 	conn := protocol.NewConn(in, os.Stdout)
 	if _, err := conn.ReadFrame(); err != nil {
 		return 1
+	}
+	if code, err := os.ReadFile(filepath.Join(st, "hello-refused")); err == nil {
+		// Refuse the handshake with this code, counting each refusal.
+		f, _ := os.OpenFile(filepath.Join(st, "hello-refusals"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		_, _ = f.WriteString("x")
+		f.Close()
+		_ = conn.Send(protocol.TypeError, protocol.ErrorMsg{Code: string(code), Message: "refused"})
+		return 0
 	}
 	if err := conn.Send(protocol.TypeHelloOK, protocol.HelloOK{Proto: protocol.Version, OS: "linux", Arch: "amd64", CPUs: 4}); err != nil {
 		return 1

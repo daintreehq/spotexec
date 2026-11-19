@@ -143,6 +143,10 @@ func (c *Client) openHelper(ctx context.Context, fresh bool, pid int) (*Session,
 		return nil, err
 	}
 	s, err := c.open(ctx, path, hs, pid)
+	var re *RemoteError
+	if errors.As(err, &re) && re.Code == protocol.CodeWorkRoot {
+		return nil, err // the work root, not the helper: a reinstall would only hide why
+	}
 	if err != nil && !IsConnError(err) && ctx.Err() == nil {
 		// Stale marker (helper removed remotely, or work_root wiped): reinstall.
 		c.ForgetHelper()

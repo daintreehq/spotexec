@@ -9,12 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/protocol"
@@ -635,23 +637,98 @@ func ExpandRoot(p string) (string, error) {
 	return filepath.Abs(p)
 }
 
+// chmodRoot is (*os.File).Chmod, swapped out by tests.
+var chmodRoot = (*os.File).Chmod
+
+// privateRoot makes the work root private to the runner user, or says why it
+// can't be. Synced source and commands live under it, in directories other
+// users could otherwise read (0755), so a session never starts without it:
+// an existing shared directory the runner can write to but not chmod would
+// leave every slot open. The owner is checked before the mode is changed, so
+// a helper running as root never changes another user's directory, and all
+// of it goes through one open directory, so a path swapped in between can't
+// be changed or approved in its place.
+func privateRoot(root string) error {
+	refuse := func(why string) error {
+		return perr(protocol.CodeWorkRoot, "work root %s can't be made private: %s; point work_root at a directory of its own that the runner user owns, or chmod 700 it", root, why)
+	}
+	open := func() (*os.File, error) {
+		return os.OpenFile(root, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	}
+	f, err := open()
+	if errors.Is(err, fs.ErrPermission) && os.Geteuid() != 0 {
+		// A root of its own it can't read (0300, say): fix the mode by name
+		// first. Only its own directory's can change, and the owner is
+		// checked on what opens.
+		if os.Chmod(root, 0o700) == nil {
+			f, err = open()
+		}
+	}
+	if err != nil {
+		return refuse(fmt.Sprintf("opening it failed (%v)", err))
+	}
+	defer f.Close()
+	// check is the root's mode, or why its owner rules it out.
+	check := func() (fs.FileMode, string) {
+		fi, err := f.Stat()
+		if err != nil {
+			return 0, fmt.Sprintf("reading its owner failed (%v)", err)
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		switch {
+		case !fi.IsDir():
+			return 0, "it is not a directory"
+		case !ok:
+			return 0, "its owner can't be read"
+		case int(st.Uid) != os.Geteuid():
+			return 0, fmt.Sprintf("it is owned by uid %d, not the runner user (uid %d)", st.Uid, os.Geteuid())
+		}
+		return fi.Mode().Perm(), ""
+	}
+	mode, why := check()
+	if why != "" {
+		return refuse(why)
+	}
+	if mode == 0o700 {
+		return nil
+	}
+	chErr := chmodRoot(f, 0o700)
+	if mode, why = check(); why != "" {
+		return refuse(why)
+	}
+	if mode == 0o700 {
+		return nil
+	}
+	why = fmt.Sprintf("its mode is %#o, not 0700", mode)
+	if chErr != nil {
+		why += fmt.Sprintf(", and changing it failed (%v)", chErr)
+	}
+	return refuse(why)
+}
+
 func (s *Session) hello(h protocol.Hello) error {
 	if h.Proto != protocol.Version {
 		return perr(protocol.CodeBadRequest, "protocol mismatch: client %d, helper %d", h.Proto, protocol.Version)
+	}
+	if s.layout.Root != "" {
+		// Its locks and workspace live under the first root: a second
+		// would split them.
+		return perr(protocol.CodeBadRequest, "hello already received")
 	}
 	root, err := ExpandRoot(h.WorkRoot)
 	if err != nil {
 		return err
 	}
-	// Private to the runner user: synced source and commands live here.
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return err
 	}
-	_ = os.Chmod(root, 0o700)
 	// Resolved, so process cleanup (which matches /proc/<pid>/cwd, always a
 	// resolved path) and output path rewriting see the same paths.
 	if r, err := filepath.EvalSymlinks(root); err == nil {
 		root = r
+	}
+	if err := privateRoot(root); err != nil {
+		return err
 	}
 	s.layout = Layout{Root: root}
 	return s.c.Send(protocol.TypeHelloOK, protocol.HelloOK{
