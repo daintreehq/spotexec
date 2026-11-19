@@ -24,6 +24,7 @@ var malformedSSORegions = []string{
 	"evil.example?",
 	"US-EAST-1",
 	"us-east-1:8443",
+	"us-" + strings.Repeat("a", 60) + "-1", // well-formed, but too long for a DNS label
 }
 
 // noNetwork fails the test if any request leaves the process through the
@@ -83,6 +84,9 @@ func TestConfigCredentialsRejectsMalformedSSORegion(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), `profile "dev"`) || !strings.Contains(err.Error(), "sso_region") {
 				t.Errorf("region %q (sso-session %v): want a profile-specific sso_region error, got %v", region, viaSession, err)
 			}
+			if locks, _ := filepath.Glob(filepath.Join(dir, ".aws", "sso", "cache", "*.spotexec-lock")); len(locks) > 0 {
+				t.Errorf("region %q: rejected before the token cache, but a lock was created: %v", region, locks)
+			}
 		}
 	}
 }
@@ -113,6 +117,16 @@ func TestSSOEndpointAcceptsRegions(t *testing.T) {
 		u, err := ssoEndpoint("oidc", region, "/token", "dev")
 		if err != nil || u != "https://oidc."+region+".amazonaws.com/token" {
 			t.Errorf("region %q: got %q, %v", region, u, err)
+		}
+	}
+}
+
+// Partitions whose SSO endpoints are not under amazonaws.com get an explicit
+// unsupported error rather than a misleading "invalid" or a DNS failure.
+func TestSSOEndpointRejectsOtherPartitions(t *testing.T) {
+	for _, region := range []string{"cn-north-1", "cn-northwest-1", "eusc-de-east-1", "us-iso-east-1", "us-isob-east-1", "eu-isoe-west-1"} {
+		if _, err := ssoEndpoint("portal.sso", region, "/federation/credentials", "dev"); err == nil || !strings.Contains(err.Error(), "AWS CLI") {
+			t.Errorf("region %q: want an unsupported-partition error, got %v", region, err)
 		}
 	}
 }

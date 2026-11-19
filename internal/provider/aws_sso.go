@@ -202,7 +202,12 @@ func parseExpiry(s string) (time.Time, error) {
 // that is not a region name either fails to parse or moves the endpoint, and
 // the token sent to it, off AWS.
 func ssoEndpoint(service, region, path, profile string) (string, error) {
-	if !config.ValidRegion(region) {
+	// China, the European Sovereign Cloud and the isolated partitions serve
+	// these endpoints under other DNS suffixes; the AWS CLI v2 handles them.
+	if strings.HasPrefix(region, "cn-") || strings.HasPrefix(region, "eusc-") || strings.Contains(region, "-iso") {
+		return "", fmt.Errorf("profile %q: sso_region %q is outside the partitions spotexec resolves SSO for without the AWS CLI; install AWS CLI v2", profile, region)
+	}
+	if len(region) > 63 || !config.ValidRegion(region) {
 		return "", fmt.Errorf("profile %q: invalid sso_region %q", profile, region)
 	}
 	host := service + "." + region + ".amazonaws.com"
