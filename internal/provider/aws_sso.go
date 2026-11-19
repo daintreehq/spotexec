@@ -239,15 +239,18 @@ func ssoToken(ctx context.Context, cacheKey, region, profile string) (string, er
 	}
 	// Refresh tokens rotate: concurrent sx processes must not race. (The
 	// native path only runs without the AWS CLI installed.)
-	lf, err := os.OpenFile(path+".spotexec-lock", os.O_CREATE|os.O_RDWR, 0o600)
+	// The wait honors ctx: a stopped or hung process holding the lock must
+	// not block every later lookup past its deadline. (A nil ctx, which the
+	// request constructors below reject, waits as long as it takes.)
+	lockCtx := ctx
+	if lockCtx == nil {
+		lockCtx = context.Background()
+	}
+	unlock, err := waitLockFile(lockCtx, path+".spotexec-lock", syscall.LOCK_EX, nil)
 	if err != nil {
 		return "", fmt.Errorf("SSO cache lock: %w", err)
 	}
-	defer lf.Close()
-	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
-		return "", fmt.Errorf("SSO cache lock: %w", err)
-	}
-	defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+	defer unlock()
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("no cached SSO login; run `aws sso login --profile %s`", profile)

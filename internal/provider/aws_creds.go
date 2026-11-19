@@ -15,12 +15,16 @@ import (
 )
 
 // awsCredResolver resolves and caches credentials for one profile.
+// Resolution runs outside mu, one at a time: callers that find one under way
+// wait for it, or for their own ctx, and then use what it cached.
 type awsCredResolver struct {
-	profile string
-	fixed   *awsCreds // exactly these credentials, never re-resolved
-	envOnly bool      // only AWS_ACCESS_KEY_ID etc.; nothing else is consulted
-	mu      sync.Mutex
-	cached  *awsCreds
+	profile   string
+	fixed     *awsCreds // exactly these credentials, never re-resolved
+	envOnly   bool      // only AWS_ACCESS_KEY_ID etc.; nothing else is consulted
+	mu        sync.Mutex
+	cached    *awsCreds
+	resolving chan struct{} // closed when the resolution under way ends; nil when none is
+	gen       uint64        // bumped by invalidate
 }
 
 // CredentialError marks a failure to obtain credentials: retrying the API
@@ -45,28 +49,74 @@ func (r *awsCredResolver) get1(ctx context.Context) (awsCreds, error) {
 	if r.fixed != nil {
 		return *r.fixed, nil
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if c := r.cached; c != nil && (c.Expiration.IsZero() || time.Until(c.Expiration) > 5*time.Minute) {
-		return *c, nil
-	}
-	c, err := r.resolve(ctx)
-	if err != nil {
-		// Refresh failed (e.g. SSO session just expired) but the cached
-		// credentials are still valid for a while: keep using them.
-		if old := r.cached; old != nil && time.Until(old.Expiration) > 30*time.Second {
-			return *old, nil
+	for {
+		r.mu.Lock()
+		if c := r.cached; c != nil && (c.Expiration.IsZero() || time.Until(c.Expiration) > 5*time.Minute) {
+			r.mu.Unlock()
+			return *c, nil
 		}
-		return awsCreds{}, err
+		if busy := r.resolving; busy != nil {
+			r.mu.Unlock()
+			select {
+			case <-busy:
+				// It ended: use what it cached, or (if it failed or its
+				// result was invalidated) resolve under this caller's ctx.
+				continue
+			case <-ctx.Done():
+				return awsCreds{}, ctx.Err()
+			}
+		}
+		// Nothing usable and nothing under way: a caller that has given up
+		// doesn't start a resolution of its own.
+		if err := ctx.Err(); err != nil {
+			r.mu.Unlock()
+			return awsCreds{}, err
+		}
+		done := make(chan struct{})
+		r.resolving = done
+		gen := r.gen
+		r.mu.Unlock()
+		if c, again, err := r.lead(ctx, done, gen); !again {
+			return c, err
+		}
 	}
-	r.cached = &c
-	return c, nil
 }
 
-// invalidate drops cached credentials (after ExpiredToken).
+// lead resolves for everyone waiting on done. again reports that the result
+// was invalidated while it was being resolved: it may be the very
+// credentials that were rejected, so it is dropped and resolved anew.
+func (r *awsCredResolver) lead(ctx context.Context, done chan struct{}, gen uint64) (c awsCreds, again bool, err error) {
+	defer func() { // also on a panic, so waiters never hang
+		r.mu.Lock()
+		r.resolving = nil
+		r.mu.Unlock()
+		close(done)
+	}()
+	c, err = r.resolve(ctx)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err != nil {
+		// Refresh failed (e.g. SSO session just expired) but the cached
+		// credentials are still valid for a while: keep using them, unless
+		// it failed because this caller gave up.
+		if old := r.cached; old != nil && ctx.Err() == nil && time.Until(old.Expiration) > 30*time.Second {
+			return *old, false, nil
+		}
+		return awsCreds{}, false, err
+	}
+	if r.gen != gen {
+		return awsCreds{}, true, nil
+	}
+	r.cached = &c
+	return c, false, nil
+}
+
+// invalidate drops cached credentials (after ExpiredToken), and any
+// resolution under way, which may return the rejected ones.
 func (r *awsCredResolver) invalidate() {
 	r.mu.Lock()
 	r.cached = nil
+	r.gen++
 	r.mu.Unlock()
 }
 
