@@ -858,25 +858,37 @@ func TestDepsHitWithoutAReadyMarker(t *testing.T) {
 // per-key cache), and changing it back restores the first install.
 func TestDepsKeyedByInstallEnv(t *testing.T) {
 	s, _ := depsSession(t)
-	install := func(mode string) string {
+	install := func(mode string) (string, protocol.DepsResult) {
 		t.Helper()
+		out := &syncBuf{}
+		s.c = protocol.NewConn(strings.NewReader(""), out)
 		d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p vendor && echo \"$MODE\" > vendor/mode", CacheDirs: []string{"vendor"}, Env: map[string]string{"MODE": mode, "OTHER": "x"}}
 		if err := s.deps(d); err != nil {
 			t.Fatal(err)
 		}
+		var res protocol.DepsResult
+		replies(t, out, protocol.TypeDepsResult, &res)
 		b, err := os.ReadFile(filepath.Join(s.workspace, "vendor", "mode"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		return strings.TrimSpace(string(b))
+		return strings.TrimSpace(string(b)), res
 	}
-	if got := install("production"); got != "production" {
-		t.Fatalf("first install: %q", got)
+	got, prod := install("production")
+	if got != "production" || !prod.Built {
+		t.Fatalf("first install: %q %+v", got, prod)
 	}
-	if got := install("development"); got != "development" {
-		t.Fatalf("a changed MODE reused the slot's install: %q", got)
+	got, dev := install("development")
+	if got != "development" || !dev.Built || dev.Key == prod.Key {
+		t.Fatalf("a changed MODE reused the slot's install: %q %+v", got, dev)
 	}
-	if got := install("production"); got != "production" {
-		t.Fatalf("changing MODE back: %q", got)
+	// Back to the first value: its cache, not another install.
+	got, again := install("production")
+	if got != "production" || again.Built || !again.Hydrated || again.Key != prod.Key {
+		t.Fatalf("changing MODE back: %q %+v", got, again)
+	}
+	// The same environment again: the slot's fast path.
+	if got, same := install("production"); got != "production" || same.Built || same.Hydrated || same.Key != prod.Key {
+		t.Fatalf("unchanged MODE: %q %+v", got, same)
 	}
 }

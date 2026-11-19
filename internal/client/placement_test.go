@@ -311,6 +311,31 @@ func TestPlacementProjectKeyFollowsInstallEnv(t *testing.T) {
 	if dev := PlacementProject(p, ws, m, false, r).DepsKey; dev == prod {
 		t.Fatal("a changed [env] value kept the key")
 	}
+	p.Env["NODE_ENV"] = "production"
+	t.Setenv("SX_TEST_315_ALLOWED", "other")
+	if k := PlacementProject(p, ws, m, false, r).DepsKey; k == prod {
+		t.Fatal("a changed env_allow value kept the key")
+	}
+	t.Setenv("SX_TEST_315_ALLOWED", "local")
+	// In an image built from the Dockerfile, the key per image carries it too.
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.Container = config.Container{Dockerfile: "Dockerfile"}
+	if m, err = manifest.Build(context.Background(), ManifestOptions(root, p)); err != nil {
+		t.Fatal(err)
+	}
+	ctr := spec
+	ctr.Toolchain, ctr.Image = "container", "sha256:abc"
+	want, _ = depskey.Key(root, ctr)
+	keyFor := PlacementProject(p, ws, m, false, r).DepsKeyFor
+	if got, err := keyFor("sha256:abc"); err != nil || got != want {
+		t.Fatalf("key for image: %s %v, want %s", got, err, want)
+	}
+	p.Env["NODE_ENV"] = "development"
+	if got, _ := PlacementProject(p, ws, m, false, r).DepsKeyFor("sha256:abc"); got == want {
+		t.Fatal("a changed [env] value kept the image's key")
+	}
 	p.Env = map[string]string{"SX_TEST_315_ALLOWED": "fixed"}
 	if got := depsEnv(p)["SX_TEST_315_ALLOWED"]; got != "fixed" {
 		t.Fatalf("[env] over env_allow: %q", got)

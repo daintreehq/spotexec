@@ -97,6 +97,7 @@ docker = true
 With `[deps]` configured, each slot's `cache_dirs` are restored from a cache keyed by:
 - the contents of the `lockfiles` and the install command;
 - the cache dirs;
+- the install's environment from `env_allow` and `[env]` (as a hash: no value appears in the key), so an install that reads `NODE_ENV` gets a cache per value. A forwarded variable whose value changes from run to run, such as a rotating token, makes a new cache each time;
 - the runner's OS and architecture;
 - in a [project container](#project-containers), the image's immutable ID;
 - otherwise, the runner's configured AMI, bootstrap scripts and `remote_path_setup`.
