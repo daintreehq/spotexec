@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"path"
 	"strings"
 	"syscall"
@@ -98,13 +97,7 @@ func (m *Matcher) AddFile(p string) error {
 // noFollow a symlink at p counts as no file, as Git skips a symlinked
 // .gitignore.
 func readLines(p string, noFollow bool) ([]string, error) {
-	// Nonblocking, so a FIFO in its place fails the regular-file check
-	// instead of hanging the scan.
-	flags := os.O_RDONLY | syscall.O_NONBLOCK
-	if noFollow {
-		flags |= syscall.O_NOFOLLOW
-	}
-	f, err := os.OpenFile(p, flags, 0)
+	f, err := openIgnoreFile(p, noFollow)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || noFollow && errors.Is(err, syscall.ELOOP) {
 			return nil, nil
