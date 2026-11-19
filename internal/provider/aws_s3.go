@@ -206,13 +206,13 @@ const cacheRule = `<Rule><ID>` + cacheRuleID + `</ID><Filter><Prefix></Prefix></
 const cacheRuleID = "spotexec-expire"
 
 // setCacheRule adds the cache bucket's expiry rule to its lifecycle
-// configuration, returning S3's status (0: no answer; 404: the bucket is
-// gone). S3 replaces the whole configuration on every PUT, so the current
-// one is read first and the rule added to it (#318): an administrator's
-// rules survive. A configuration that already holds a rule by this ID
-// (edited, or even disabled) is left as it is. Anything but a definite
-// read sends nothing, and the rule is tried again next time. It gets its
-// own timeout, so a region that is slow to reach doesn't spend the
+// configuration, returning S3's status (0: no definite answer; 404: the
+// bucket is gone). S3 replaces the whole configuration on every PUT, so the
+// current one is read first and the rule added to it (#318): an
+// administrator's rules survive. A configuration that already holds a rule
+// by this ID (edited, or even disabled) is left as it is. Anything but a
+// definite read sends nothing, and the rule is tried again next time. It
+// gets its own timeout, so a region that is slow to reach doesn't spend the
 // signing's budget on it.
 func (a *AWSSpot) setCacheRule(ctx context.Context, bucket, acct string) int {
 	ctx, cancel := context.WithTimeout(ctx, cacheRuleTimeout)
@@ -220,7 +220,7 @@ func (a *AWSSpot) setCacheRule(ctx context.Context, bucket, acct string) int {
 	owner := map[string]string{"x-amz-expected-bucket-owner": acct}
 	// A change aborted by another one (parts setting the bucket up at once)
 	// reads the configuration again, so a rule added meanwhile is kept.
-	st, _, _ := settleAborted(ctx, func() (int, []byte, error) {
+	st, b, err := settleAborted(ctx, func() (int, []byte, error) {
 		st, hdr, b, err := a.s3Do(ctx, http.MethodGet, bucket, "?lifecycle", nil, owner)
 		if err != nil {
 			return 0, nil, err
@@ -230,13 +230,15 @@ func (a *AWSSpot) setCacheRule(ctx context.Context, bucket, acct string) int {
 		case st == http.StatusOK:
 			var has bool
 			if lifecycle, has, err = withCacheRule(b); err != nil {
-				return 0, nil, nil // not a configuration we can extend safely
+				return 0, nil, nil // not a configuration it can safely extend
 			}
 			if has {
 				return http.StatusOK, nil, nil
 			}
-		case st == http.StatusNotFound && bytes.Contains(b, []byte("<Code>NoSuchLifecycleConfiguration</Code>")):
+		case st == http.StatusNotFound && s3ErrorCode(b) == "NoSuchLifecycleConfiguration":
 			lifecycle = []byte(`<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` + cacheRule + `</LifecycleConfiguration>`)
+		case st/100 == 2:
+			return 0, nil, nil // no configuration read
 		default:
 			return st, b, nil // 404 NoSuchBucket, 403 (a key without s3:GetLifecycleConfiguration), 5xx...
 		}
@@ -248,18 +250,39 @@ func (a *AWSSpot) setCacheRule(ctx context.Context, bucket, acct string) int {
 		}
 		return a.s3(ctx, http.MethodPut, bucket, "?lifecycle", lifecycle, put)
 	})
+	if err != nil || st == http.StatusNotFound && s3ErrorCode(b) != "NoSuchBucket" {
+		return 0
+	}
 	return st
 }
+
+// s3ErrorCode is the Code of S3's error document b ("" when b isn't one).
+func s3ErrorCode(b []byte) string {
+	var e struct {
+		XMLName xml.Name `xml:"Error"`
+		Code    string   `xml:"Code"`
+	}
+	if xml.Unmarshal(b, &e) != nil {
+		return ""
+	}
+	return e.Code
+}
+
+// s3LifecycleRules is how many rules a bucket's lifecycle configuration
+// may hold.
+const s3LifecycleRules = 1000
 
 // withCacheRule returns the lifecycle configuration cfg (as S3 returned it)
 // with spotexec's rule added before its closing tag, every other byte kept;
 // has: cfg already holds a rule by that ID, and nothing is added. A
-// document that doesn't parse completely as a LifecycleConfiguration is an
-// error, so a truncated read is never written back.
+// document that doesn't parse completely as one LifecycleConfiguration
+// with an unprefixed closing tag, or that has no room for another rule, is
+// an error: a truncated read is never written back.
 func withCacheRule(cfg []byte) (out []byte, has bool, err error) {
 	d := xml.NewDecoder(bytes.NewReader(cfg))
 	var path []string
-	end := int64(-1)
+	var id strings.Builder
+	end, rules := int64(-1), 0
 	for {
 		at := d.InputOffset()
 		tok, err := d.Token()
@@ -275,22 +298,39 @@ func withCacheRule(cfg []byte) (out []byte, has bool, err error) {
 				return nil, false, fmt.Errorf("unexpected lifecycle element %s", t.Name.Local)
 			}
 			path = append(path, t.Name.Local)
+			if len(path) == 2 && t.Name.Local == "Rule" {
+				rules++
+			}
+			if len(path) == 3 && path[1] == "Rule" && t.Name.Local == "ID" {
+				id.Reset()
+			}
 		case xml.EndElement:
+			if len(path) == 3 && path[1] == "Rule" && path[2] == "ID" && id.String() == cacheRuleID {
+				has = true
+			}
 			path = path[:len(path)-1]
 			if len(path) == 0 {
 				end = at
 			}
 		case xml.CharData:
-			if len(path) == 3 && path[1] == "Rule" && path[2] == "ID" && strings.TrimSpace(string(t)) == cacheRuleID {
-				has = true
+			if len(path) == 3 && path[1] == "Rule" && path[2] == "ID" {
+				id.Write(t)
+			}
+			if len(path) == 0 && len(bytes.TrimSpace(t)) > 0 {
+				return nil, false, fmt.Errorf("text outside the lifecycle configuration")
 			}
 		}
 	}
-	if end < 0 || len(path) != 0 {
+	// A self-closing or prefixed root would put the rule outside it, or in
+	// no namespace.
+	if end < 0 || len(path) != 0 || !bytes.HasPrefix(cfg[end:], []byte("</LifecycleConfiguration>")) {
 		return nil, false, fmt.Errorf("incomplete lifecycle configuration")
 	}
 	if has {
 		return nil, true, nil
+	}
+	if rules >= s3LifecycleRules {
+		return nil, false, fmt.Errorf("the lifecycle configuration already holds %d rules", rules)
 	}
 	out = make([]byte, 0, len(cfg)+len(cacheRule))
 	out = append(append(append(out, cfg[:end]...), cacheRule...), cfg[end:]...)
@@ -409,7 +449,13 @@ func (a *AWSSpot) s3Do(ctx context.Context, method, bucket, sub string, body []b
 		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	if len(b) > 1<<20 {
+		return 0, nil, nil, fmt.Errorf("S3's answer to %s %s is over 1 MiB", method, sub)
+	}
 	return resp.StatusCode, resp.Header, b, nil
 }
 
