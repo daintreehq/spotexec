@@ -335,14 +335,24 @@ type installed struct {
 
 const localBin = `"$HOME/.local/bin/spotexec"`
 
+// stageDir makes "$t", a private directory inside "$d" (~/.local/bin),
+// removed when the script exits, so setups running at the same time never
+// write the same file.
+const stageDir = `d="$HOME/.local/bin"; mkdir -p "$d"; t=$(mktemp -d "$d/.spotexec-install.XXXXXX"); trap 'rm -rf "$t"' EXIT; `
+
+// linkStaged stages a fresh sx link in "$t" for the caller to rename into
+// "$d/", so a concurrent setup never sees it missing. Moving it into "$d/"
+// by name replaces an sx that links to a directory instead of descending
+// into it. A real directory there is refused before anything is replaced,
+// and a link to nothing is removed first, since BusyBox's mv can't replace
+// one that loops.
+const linkStaged = `if [ -d "$d/sx" ] && [ ! -L "$d/sx" ]; then echo "$d/sx is a directory, not spotexec's link" >&2; exit 1; fi; ` +
+	`for f in spotexec sx; do if [ -L "$d/$f" ] && [ ! -e "$d/$f" ]; then rm -f "$d/$f"; fi; done; ` +
+	`ln -s spotexec "$t/sx"; `
+
 // publishStaged ends an install script that staged a checked spotexec in
-// "$t", a directory inside "$d": the binary and a fresh sx link are each
-// renamed into place, so a concurrent setup never sees either missing or
-// half written. Moving them into "$d/" by name replaces an sx that links to
-// a directory instead of descending into it; a real directory there is
-// refused before anything is replaced.
-const publishStaged = `if [ -d "$d/sx" ] && [ ! -L "$d/sx" ]; then echo "$d/sx is a directory, not spotexec's link" >&2; exit 1; fi; ` +
-	`ln -s spotexec "$t/sx"; mv -f "$t/spotexec" "$d/"; mv -f "$t/sx" "$d/"`
+// "$t": the binary and its sx link are each renamed into place.
+const publishStaged = linkStaged + `mv -f "$t/spotexec" "$d/"; mv -f "$t/sx" "$d/"`
 
 // selfBinary opens the running spotexec, which --install copy sends over,
 // and gives its size.
@@ -441,7 +451,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 				return installed{bin: localBin, dir: "$HOME/.local/bin", how: "kept, newer than release " + tag, want: v}, nil
 			} else if ok && c == 0 {
 				// Only the sx link is put right, in case it went missing.
-				if _, err := r.run(ctx, `d="$HOME/.local/bin"; [ "$(readlink "$d/sx")" = spotexec ] || ln -sf spotexec "$d/sx"`, nil); err != nil {
+				if _, err := r.run(ctx, `set -e; [ "$(readlink "$HOME/.local/bin/sx")" != spotexec ] || exit 0; `+stageDir+linkStaged+`mv -f "$t/sx" "$d/"`, nil); err != nil {
 					return installed{}, err
 				}
 				return installed{bin: localBin, dir: "$HOME/.local/bin", how: "release " + tag + " in ~/.local/bin, already installed", want: v}, nil
@@ -461,7 +471,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 		// Downloaded and unpacked next to the old one, which is replaced
 		// only once the archive matches the release's checksum and the new
 		// binary runs.
-		if _, err := r.run(ctx, `set -e; d="$HOME/.local/bin"; mkdir -p "$d"; t=$(mktemp -d "$d/.spotexec-install.XXXXXX"); trap 'rm -rf "$t"' EXIT; `+
+		if _, err := r.run(ctx, `set -e; `+stageDir+
 			`curl -fsSL -o "$t/a.tar.gz" `+shq(url)+`; `+
 			`if command -v sha256sum >/dev/null 2>&1; then s=$(sha256sum "$t/a.tar.gz"); `+
 			`elif command -v shasum >/dev/null 2>&1; then s=$(shasum -a 256 "$t/a.tar.gz"); `+
@@ -483,13 +493,11 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 		}
 		defer f.Close()
 		r.printf("  copying this spotexec (%s) into ~/.local/bin…\n", Version)
-		// Staged in a directory of its own next to the old one, so setups
-		// running at the same time never write the same file, and moved
+		// Staged in a directory of its own next to the old one, and moved
 		// into place only once the whole copy arrived and runs.
 		n := strconv.FormatInt(size, 10)
-		if _, err := r.run(ctx, `set -e; d="$HOME/.local/bin"; mkdir -p "$d"; t=$(mktemp -d "$d/.spotexec-install.XXXXXX"); trap 'rm -rf "$t"' EXIT; `+
-			`cat > "$t/spotexec"; `+
-			`n=$(wc -c < "$t/spotexec"); [ $n -eq `+n+` ] || { echo "the copy arrived incomplete ($n of `+n+` bytes)" >&2; exit 1; }; `+
+		if _, err := r.run(ctx, `set -e; `+stageDir+`cat > "$t/spotexec"; `+
+			`n=$(wc -c < "$t/spotexec"); [ $n -eq `+n+` ] || { echo "the copy arrived with $n bytes, not this spotexec's `+n+`" >&2; exit 1; }; `+
 			`chmod 755 "$t/spotexec"; `+
 			`v=$("$t/spotexec" version 2>&1) && [ "$v" = `+shq("spotexec "+Version)+` ] || { echo "the copied spotexec doesn't run: $v" >&2; exit 1; }; `+
 			publishStaged, f); err != nil {
