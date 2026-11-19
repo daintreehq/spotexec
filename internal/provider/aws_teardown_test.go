@@ -139,6 +139,10 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 	tagged := func(tags map[string]string) bool { return tags[tagOwner] != "" }
 	switch v.Get("Action") {
 	case "DescribeRegions":
+		if strings.HasPrefix(region, "us-gov-") {
+			fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo><item><regionName>us-gov-east-1</regionName></item><item><regionName>us-gov-west-1</regionName></item></regionInfo></DescribeRegionsResponse>`)
+			break
+		}
 		fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo><item><regionName>us-west-2</regionName></item><item><regionName>us-east-2</regionName><optInStatus>opt-in-not-required</optInStatus></item><item><regionName>ap-east-1</regionName><optInStatus>not-opted-in</optInStatus></item></regionInfo></DescribeRegionsResponse>`)
 	case "DescribeImages":
 		if v.Get("Owner.1") != "self" || v.Get("Filter.1.Value.1") != tagOwner {
@@ -354,10 +358,12 @@ func TestTeardown(t *testing.T) {
 func TestTeardownGovCloud(t *testing.T) {
 	c := newFakeCloud(t)
 	c.instances["AK-admin"] = map[string][]fakeAcctInstance{"us-gov-east-1": c.instances["AK-admin"]["us-east-2"]}
+	c.late = nil
 	c.buckets["spotexec-cache-111111111111-us-gov-east-1"] = map[string]bool{}
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-gov-east-1"})
-	if err != nil || p.Err() != nil {
-		t.Fatalf("%v %v", err, p.Err())
+	t.Setenv("AWS_REGION", "us-gov-east-1") // the whole account, found from the session's region
+	p, err := PlanTeardown(context.Background(), "admin", nil)
+	if err != nil || p.Err() != nil || p.Regional || strings.Join(p.Regions, ",") != "us-gov-east-1,us-gov-west-1" {
+		t.Fatalf("%v %v %+v", err, p.Err(), p)
 	}
 	var got []string
 	for _, it := range p.Items {
@@ -371,6 +377,9 @@ func TestTeardownGovCloud(t *testing.T) {
 	}
 	if err := p.Apply(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
+	}
+	if c.users["spotexec-mac"] != nil || !strings.Contains(strings.Join(c.signed, ","), "iam DeleteUser us-gov-west-1") {
+		t.Fatalf("IAM user not removed through GovCloud's IAM: %v", c.signed)
 	}
 	// IAM is GovCloud's one endpoint; STS may also be asked regionally.
 	for _, s := range c.signed {
@@ -399,7 +408,7 @@ func TestTeardownGovCloud(t *testing.T) {
 func TestTeardownFailures(t *testing.T) {
 	c := newFakeCloud(t)
 	c.failRepo["spotexec/app"] = true
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, err := PlanTeardown(context.Background(), "admin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,11 +419,8 @@ func TestTeardownFailures(t *testing.T) {
 	if c.users["spotexec-mac"] != nil {
 		t.Fatal("the other resources should still be removed")
 	}
-	if c.buckets["spotexec-cache-111111111111-us-west-2"] == nil {
-		t.Fatal("--region us-east-2 deleted a us-west-2 bucket")
-	}
 	c.failRepo["spotexec/app"] = false
-	p, _ = PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, _ = PlanTeardown(context.Background(), "admin", nil)
 	if len(p.Items) != 1 || p.Items[0].ID != "spotexec/app" {
 		t.Fatalf("second plan %+v", p.Items)
 	}
@@ -457,7 +463,7 @@ func TestS3URL(t *testing.T) {
 func TestTeardownStuckInstances(t *testing.T) {
 	c := newFakeCloud(t)
 	c.stuck = true
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, err := PlanTeardown(context.Background(), "admin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +477,7 @@ func TestTeardownStuckInstances(t *testing.T) {
 	c.mu.Lock()
 	c.stuck = false
 	c.mu.Unlock()
-	p, _ = PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, _ = PlanTeardown(context.Background(), "admin", nil)
 	if err := p.Apply(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +509,7 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 		c := newFakeCloud(t)
 		c.users["spotexec-other"] = map[string]string{}
 		c.keys["AKOTHER"] = [2]string{"spotexec-other", "Active"}
-		p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+		p, err := PlanTeardown(context.Background(), "admin", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -527,7 +533,7 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 		delete(c.users, "spotexec-other")
 		delete(c.keys, "AKOTHER")
 		c.mu.Unlock()
-		p, _ = PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+		p, _ = PlanTeardown(context.Background(), "admin", nil)
 		c.mu.Lock()
 		c.repos["us-east-2"] = append(c.repos["us-east-2"], "spotexec/newer")
 		c.mu.Unlock()
@@ -535,4 +541,132 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+	t.Run("user added to the account", func(t *testing.T) {
+		// The leftover check of an account-wide plan still looks at IAM,
+		// though the plan's regions are now spelled out.
+		c := newFakeCloud(t)
+		p, err := PlanTeardown(context.Background(), "admin", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.mu.Lock()
+		c.users["spotexec-new"] = map[string]string{}
+		c.keys["AKNEW"] = [2]string{"spotexec-new", "Active"}
+		c.mu.Unlock()
+		if err := p.Apply(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "appeared meanwhile") || !strings.Contains(err.Error(), "IAM user spotexec-new") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("launch into a region with no spotexec VMs", func(t *testing.T) {
+		// A regional teardown leaves the keys on: a VM launched right after a
+		// plan that listed none is still terminated before its group goes.
+		c := newFakeCloud(t)
+		c.late = nil
+		c.instances["AK-admin"]["us-east-2"] = c.instances["AK-admin"]["us-east-2"][2:] // only i-prod
+		p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, it := range p.Items {
+			if it.Kind == KindInstance {
+				t.Fatalf("plan lists %s", it.ID)
+			}
+		}
+		c.mu.Lock()
+		c.instances["AK-admin"]["us-east-2"] = append(c.instances["AK-admin"]["us-east-2"], fakeAcctInstance{"i-new", "pending", map[string]string{tagRunner: "aws", tagOwner: "m-1"}})
+		c.mu.Unlock()
+		if err := p.Apply(context.Background(), t.Logf); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(strings.Join(c.terminated, ","), "i-new") || len(c.sgs["us-east-2"]) != 1 {
+			t.Fatalf("terminated %v, groups %v", c.terminated, c.sgs)
+		}
+	})
+}
+
+// iamCalls lists the IAM requests the fake has seen.
+func iamCalls(c *fakeCloud) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var calls []string
+	for _, s := range c.signed {
+		if strings.HasPrefix(s, "iam ") {
+			calls = append(calls, s)
+		}
+	}
+	return calls
+}
+
+// A teardown limited to some regions leaves the account-wide IAM users and
+// their keys alone: a machine still running in another region keeps its
+// credentials, and nothing outside the regions is touched.
+func TestTeardownRegionKeepsIAM(t *testing.T) {
+	c := newFakeCloud(t)
+	c.instances["AK-admin"]["us-west-2"] = []fakeAcctInstance{{"i-west", "running", map[string]string{tagRunner: "aws", tagOwner: "m-1", tagHost: "mac"}}}
+	c.instances["AK-admin"]["eu-west-1"] = []fakeAcctInstance{{"i-eu", "running", map[string]string{tagRunner: "aws", tagOwner: "m-1", tagHost: "mac"}}}
+	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2", "eu-west-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Err() != nil || !p.Regional || strings.Join(p.Regions, ",") != "eu-west-1,us-east-2" {
+		t.Fatalf("plan %+v: %v", p, p.Err())
+	}
+	for _, it := range p.Items {
+		if it.Kind == KindIAMUser || it.Region == "" {
+			t.Fatalf("a regional plan lists account-wide %s %s", it.Kind, it.ID)
+		}
+	}
+	// Apply leaves IAM alone even when a user is in the plan.
+	p.Items = append(p.Items, TeardownItem{Kind: KindIAMUser, ID: "spotexec-mac"})
+	if err := p.Apply(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if c.users["spotexec-mac"] == nil || c.keys["AKMAC"] != [2]string{"spotexec-mac", "Active"} {
+		t.Fatalf("the machine's IAM user or key was touched: %v %v", c.users, c.keys)
+	}
+	term := strings.Join(c.terminated, ",")
+	if strings.Contains(term, "i-west") || !strings.Contains(term, "i-run") || !strings.Contains(term, "i-eu") {
+		t.Fatalf("terminated %v", c.terminated)
+	}
+	if c.buckets["spotexec-cache-111111111111-us-west-2"] == nil || len(c.sgs["us-west-2"]) != 1 {
+		t.Fatalf("us-west-2 touched: buckets %v, groups %v", c.buckets, c.sgs)
+	}
+	if calls := iamCalls(c); len(calls) != 0 {
+		t.Fatalf("IAM called: %v", calls)
+	}
+
+	// The leftover check stays in the plan's regions, and off IAM.
+	p, err = PlanTeardown(context.Background(), "admin", []string{"us-east-2", "eu-west-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.repos["us-east-2"] = append(c.repos["us-east-2"], "spotexec/newer")
+	c.repos["us-west-2"] = append(c.repos["us-west-2"], "spotexec/west")
+	c.mu.Unlock()
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "appeared meanwhile") || !strings.Contains(err.Error(), "spotexec/newer") || strings.Contains(err.Error(), "spotexec/west") || strings.Contains(err.Error(), "IAM") {
+		t.Fatalf("err = %v", err)
+	}
+	if calls := iamCalls(c); len(calls) != 0 {
+		t.Fatalf("IAM called: %v", calls)
+	}
+}
+
+// A regional teardown whose VMs won't terminate keeps its security groups,
+// and still never touches a key.
+func TestTeardownRegionStuck(t *testing.T) {
+	c := newFakeCloud(t)
+	c.stuck = true
+	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "still not terminated") || !strings.Contains(err.Error(), "security group(s) kept") {
+		t.Fatalf("err = %v", err)
+	}
+	if c.users["spotexec-mac"] == nil || c.keys["AKMAC"][1] != "Active" || len(c.sgs["us-east-2"]) != 3 {
+		t.Fatalf("users %v, keys %v, groups %v", c.users, c.keys, c.sgs)
+	}
 }
