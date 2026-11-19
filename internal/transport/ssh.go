@@ -156,7 +156,8 @@ func CheckControlDir() error {
 }
 
 // privateDir makes sure dir exists, is a real directory (not a symlink),
-// owned by us, mode 0700.
+// owned by us, mode 0700. One others could write to is refused, not fixed:
+// they may already have left a socket of theirs in it.
 func privateDir(dir string) error {
 	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return err
@@ -172,6 +173,9 @@ func privateDir(dir string) error {
 	if !ok || int(st.Uid) != os.Getuid() {
 		return fmt.Errorf("%s is not owned by this user", dir)
 	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s is writable by other users", dir)
+	}
 	return os.Chmod(dir, 0o700)
 }
 
@@ -181,11 +185,15 @@ func privateDir(dir string) error {
 // runner's ssh_options, and spotexec's tunable defaults last, so ssh_options
 // can change them.
 func (c *Client) baseArgs(master string) []string {
+	ctl := c.ctlPath
+	if c.ctlErr != nil {
+		ctl = "none" // never a path whose directory isn't private
+	}
 	a := []string{
 		"-T",
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=" + master,
-		"-o", "ControlPath=" + c.ctlPath,
+		"-o", "ControlPath=" + ctl,
 		"-o", "ControlPersist=" + ControlPersist,
 	}
 	if c.T.IdentityFile != "" {
@@ -723,6 +731,9 @@ var ErrHelperNotInstalled = errors.New("helper not installed on this runner")
 // this machine already installed this exact helper on the target: it never
 // uploads or reinstalls one, which would touch an ephemeral VM's idle clock.
 func (c *Client) HelperCmdInstalled(ctx context.Context, args ...string) ([]byte, error) {
+	if c.ctlErr != nil {
+		return nil, c.ctlErr
+	}
 	hash, ok := c.installedHash()
 	if !ok {
 		return nil, ErrHelperNotInstalled

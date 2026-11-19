@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/daintreehq/spotexec/internal/provider"
@@ -101,6 +102,12 @@ func TestControlDirFailsWhenPreferredAndFallbackFail(t *testing.T) {
 	if c.MasterAlive(ctx) {
 		t.Fatal("MasterAlive without a control directory")
 	}
+	if _, err := c.HelperCmdInstalled(ctx, "status"); !errors.Is(err, c.ctlErr) {
+		t.Fatalf("HelperCmdInstalled: %v, want the setup error", err)
+	}
+	if i := optIndex(c.Args("true"), "ControlPath=none"); i < 0 {
+		t.Fatalf("argv hands ssh an unverified control path: %v", c.Args("true"))
+	}
 	c.CloseMaster()
 }
 
@@ -119,6 +126,31 @@ func TestControlDirReplacesForeignTmpDir(t *testing.T) {
 	}
 	if d == preferred || filepath.Dir(d) != tmp {
 		t.Fatalf("controlDir = %s, want a new directory in %s", d, tmp)
+	}
+	mustPrivate(t, d)
+}
+
+// A directory of ours that others can write to may already hold a socket
+// of theirs: it is replaced, not made private in place. A fallback the
+// umask left without the owner's bits is made usable before use.
+func TestControlDirRefusesWritableTmpDir(t *testing.T) {
+	tmp := t.TempDir()
+	useCtlDirs(t, longHome(t), tmp)
+	preferred := filepath.Join(tmp, fmt.Sprintf("sx-cm-%d", os.Getuid()))
+	if err := os.Mkdir(preferred, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(preferred, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	old := syscall.Umask(0o700)
+	d, err := controlDir()
+	syscall.Umask(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d == preferred {
+		t.Fatalf("controlDir kept %s, which others could write to", d)
 	}
 	mustPrivate(t, d)
 }

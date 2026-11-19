@@ -78,6 +78,11 @@ func (p *Pool) Prewarm(ctx context.Context, id string, log provider.Logger, read
 		}
 		return in, nil
 	}
+	if transport.IsSetupError(err) {
+		// This machine can't connect to it: a local fault, which says
+		// nothing about the VM or the fleet's setup.
+		return in, fmt.Errorf("%w (%s was left running; it ends itself after idle_timeout)", err, in.ID)
+	}
 	bg := context.WithoutCancel(ctx)
 	if !errors.Is(err, ErrBootstrapFailed) && finished != nil && in.Target.Host != "" {
 		fctx, cancel := context.WithTimeout(bg, 15*time.Second)

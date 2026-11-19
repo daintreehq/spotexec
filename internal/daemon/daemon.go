@@ -821,6 +821,10 @@ func (d *Daemon) manage(ctx context.Context, fl *fleet) FleetStatus {
 	}
 	if time.Since(fl.paused) < time.Hour {
 		st.LastError = "warm launches paused after repeated unhealthy instances"
+	} else if err := transport.CheckControlDir(); r.MinInstances > 0 && err != nil {
+		// No VM could be reached from here: launching would only buy VMs
+		// that idle out unused, over and over.
+		st.LastError = "warm launches held: " + err.Error()
 	} else if r.MinInstances > 0 {
 		if ids, err := fl.pool.EnsureMin(ctx, r.MinInstances); err == nil {
 			for _, id := range ids {
