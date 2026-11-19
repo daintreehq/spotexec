@@ -24,8 +24,11 @@ build: helpers
 # is built and compressed in a hidden staging directory (go:embed skips it),
 # its stream is tested, and only then is it renamed into place, so a failed
 # build or compressor fails the target and leaves the last good helper alone.
+# GZIP in the environment is gzip's own options (-d would decompress), so
+# it is dropped.
 helpers:
-	@embed_dir=$(call shq,$(EMBED_DIR)); \
+	@unset GZIP; \
+	embed_dir=$(call shq,$(EMBED_DIR)); \
 	case "$$embed_dir" in -*) embed_dir=./$$embed_dir ;; esac; \
 	mkdir -p "$$embed_dir" || exit 1; \
 	tmp=; \
@@ -37,7 +40,7 @@ helpers:
 		out="$$embed_dir/spotexec-helper-$$os-$$arch.gz"; \
 		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags '$(LDFLAGS)' -o "$$tmp/helper" ./cmd/spotexec-helper || exit 1; \
 		gzip -9 -n -c "$$tmp/helper" > "$$tmp/helper.gz" || { printf 'helper %s: gzip failed\n' "$$t" >&2; exit 1; }; \
-		gzip -t "$$tmp/helper.gz" || { printf 'helper %s: gzip wrote a corrupt stream\n' "$$t" >&2; exit 1; }; \
+		[ "$$(od -An -tx1 -N2 "$$tmp/helper.gz" | tr -d ' \n')" = 1f8b ] && gzip -t "$$tmp/helper.gz" || { printf 'helper %s: gzip wrote a corrupt stream\n' "$$t" >&2; exit 1; }; \
 		[ ! -d "$$out" ] || { printf '%s is a directory\n' "$$out" >&2; exit 1; }; \
 		mv -f "$$tmp/helper.gz" "$$out" || exit 1; \
 		printf 'helper %s\n' "$$t"; \
@@ -71,4 +74,5 @@ e2e: build
 	./scripts/e2e-daemon.sh
 
 clean:
-	rm -rf bin/spotexec bin/sx completions $(EMBED_DIR)/spotexec-helper-*.gz $(EMBED_DIR)/.tmp-helper*
+	rm -rf bin/spotexec bin/sx completions
+	d=$(call shq,$(EMBED_DIR)); [ -n "$$d" ] && rm -rf -- "$$d"/spotexec-helper-*.gz "$$d"/.tmp-helper*
