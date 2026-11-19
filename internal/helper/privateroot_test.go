@@ -111,12 +111,31 @@ func TestHelloChecksTheModeNotTheChmod(t *testing.T) {
 func TestHelloRequires0700(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "readonly")
 	openDir(t, root, 0o500)
-	stubChmod(t, func(f *os.File, _ fs.FileMode) error {
+	calls := stubChmod(t, func(f *os.File, _ fs.FileMode) error {
 		return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM}
 	})
 	s, _ := helloSession(t)
 	if msg := refused(t, s.hello(protocol.Hello{Proto: protocol.Version, WorkRoot: root})); !strings.Contains(msg, "0500") {
 		t.Fatalf("error %q doesn't give the mode", msg)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("chmod calls %q: refused without trying to repair it", *calls)
+	}
+}
+
+// A root of its own the runner can't read (0300) is still repaired.
+func TestHelloRepairsUnreadableRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any directory")
+	}
+	root := filepath.Join(t.TempDir(), "unreadable")
+	openDir(t, root, 0o300)
+	s, _ := helloSession(t)
+	if err := s.hello(protocol.Hello{Proto: protocol.Version, WorkRoot: root}); err != nil {
+		t.Fatalf("hello on a 0300 root: %v", err)
+	}
+	if fi, err := os.Stat(root); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("root left at %v (%v)", fi.Mode(), err)
 	}
 }
 
@@ -176,13 +195,18 @@ func TestHelloOnlyOnce(t *testing.T) {
 	if err := s.hello(protocol.Hello{Proto: protocol.Version, WorkRoot: first}); err != nil {
 		t.Fatal(err)
 	}
-	err := s.hello(protocol.Hello{Proto: protocol.Version, WorkRoot: t.TempDir()})
+	second := filepath.Join(t.TempDir(), "second")
+	openDir(t, second, 0o755)
+	err := s.hello(protocol.Hello{Proto: protocol.Version, WorkRoot: second})
 	var pe *protoError
 	if !errors.As(err, &pe) || pe.code != protocol.CodeBadRequest {
 		t.Fatalf("second hello: %v", err)
 	}
 	if want, _ := filepath.EvalSymlinks(first); s.layout.Root != want {
 		t.Fatalf("root moved to %q", s.layout.Root)
+	}
+	if fi, err := os.Stat(second); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("the refused second root was changed: %v %v", fi.Mode(), err)
 	}
 }
 

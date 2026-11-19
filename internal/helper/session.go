@@ -652,7 +652,18 @@ func privateRoot(root string) error {
 	refuse := func(why string) error {
 		return perr(protocol.CodeWorkRoot, "work root %s can't be made private: %s; point work_root at a directory of its own that the runner user owns, or chmod 700 it", root, why)
 	}
-	f, err := os.OpenFile(root, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	open := func() (*os.File, error) {
+		return os.OpenFile(root, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	}
+	f, err := open()
+	if errors.Is(err, fs.ErrPermission) && os.Geteuid() != 0 {
+		// A root of its own it can't read (0300, say): fix the mode by name
+		// first. Only its own directory's can change, and the owner is
+		// checked on what opens.
+		if os.Chmod(root, 0o700) == nil {
+			f, err = open()
+		}
+	}
 	if err != nil {
 		return refuse(fmt.Sprintf("opening it failed (%v)", err))
 	}
