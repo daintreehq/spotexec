@@ -37,6 +37,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/daintreehq/spotexec/internal/manifest"
 )
 
 // Verdict is the hook's reading of the user's permission rules.
@@ -139,7 +141,7 @@ func mainCheckout(dir string) string {
 	if err != nil {
 		return ""
 	}
-	common := strings.TrimSpace(string(out))
+	common := manifest.GitPath(out)
 	if filepath.Base(common) != ".git" {
 		return "" // a bare repository
 	}

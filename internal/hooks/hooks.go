@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/daintreehq/spotexec/internal/config"
+	"github.com/daintreehq/spotexec/internal/manifest"
 )
 
 // DefaultPatterns match command segments worth offloading.
@@ -1115,7 +1116,7 @@ func CdsInside(command, dir string) bool { return cdsInside(command, dir) }
 func cdsInside(command, dir string) bool {
 	root := dir
 	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
-		root = strings.TrimSpace(string(out))
+		root = manifest.GitPath(out)
 	}
 	if r, err := filepath.EvalSymlinks(root); err == nil {
 		root = r
@@ -1202,7 +1203,7 @@ func project(dir string) (*config.Project, bool) {
 // gitRoot is the worktree containing dir, or dir outside git.
 func gitRoot(dir string) string {
 	if out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
-		return strings.TrimSpace(string(out))
+		return manifest.GitPath(out)
 	}
 	return dir
 }

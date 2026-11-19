@@ -73,7 +73,7 @@ func Resolve(dir string) (*Workspace, error) {
 			}
 		} else if out, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output(); err == nil {
 			// No origin: worktrees of one repo share the common git dir.
-			cd := strings.TrimSpace(string(out))
+			cd := manifest.GitPath(out)
 			if !filepath.IsAbs(cd) {
 				cd = filepath.Join(root, cd)
 			}
@@ -103,13 +103,13 @@ func commonGitDir(root, gitDir string) string {
 	// --path-format=absolute (git 2.31+) gives the canonical path; older git
 	// echoes the unknown option back, and prints the dir relative to root.
 	out, err := exec.Command("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
-	if err != nil || strings.Contains(strings.TrimSpace(string(out)), "\n") {
+	if err != nil || strings.Contains(manifest.GitPath(out), "\n") {
 		out, err = exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output()
 	}
 	if err != nil {
 		return gitDir
 	}
-	d := strings.TrimSpace(string(out))
+	d := manifest.GitPath(out)
 	if d == "" {
 		return gitDir
 	}

@@ -496,7 +496,7 @@ func hasWorktreeFilters(root string, staged map[string]stageEntry) bool {
 		}
 	}
 	if gd, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output(); err == nil {
-		d := strings.TrimSpace(string(gd))
+		d := GitPath(gd)
 		if !filepath.IsAbs(d) {
 			d = filepath.Join(root, d)
 		}
@@ -551,7 +551,7 @@ func must(s string, err error) string {
 func Root(dir string) (string, bool) {
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
 	if err == nil {
-		r := strings.TrimSpace(string(out))
+		r := GitPath(out)
 		if rr, err := filepath.EvalSymlinks(r); err == nil {
 			r = rr
 		}
@@ -574,7 +574,19 @@ func GitDir(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return GitPath(out), nil
+}
+
+// GitPath is the path in a git command's one-line output: only the record
+// terminator comes off, since a path may itself begin or end in spaces (a
+// trimmed "checkout " names the sibling "checkout"). Git for Windows may end
+// the line in CRLF, and no Windows path holds a carriage return.
+func GitPath(out []byte) string {
+	s := strings.TrimSuffix(string(out), "\n")
+	if runtime.GOOS == "windows" {
+		s = strings.TrimSuffix(s, "\r")
+	}
+	return s
 }
 
 // CheckIgnored filters paths through git check-ignore (exact Git semantics),
