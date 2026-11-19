@@ -52,19 +52,10 @@ func Key(root string, s Spec) (string, error) {
 		fmt.Fprintf(h, "toolchain\x00%s\x00", s.Toolchain)
 	}
 	if len(s.Env) > 0 {
-		// Sorted and length-prefixed: map order never changes the key, and
-		// no two environments hash alike. Left out when empty, so a project
-		// without one keeps its existing caches.
-		names := make([]string, 0, len(s.Env))
-		for k := range s.Env {
-			names = append(names, k)
-		}
-		slices.Sort(names)
-		fmt.Fprintf(h, "env\x00%d\x00", len(names))
-		for _, k := range names {
-			v := s.Env[k]
-			fmt.Fprintf(h, "%d\x00%s%d\x00%s", len(k), k, len(v), v)
-		}
+		// Left out when empty, so a project without one keeps its existing
+		// caches. Its own fixed-width digest: the lockfile sections after it
+		// can never spell the same bytes.
+		fmt.Fprintf(h, "env\x00%s\x00", envDigest(s.Env))
 	}
 	for _, lf := range s.Lockfiles {
 		rel, err := fsid.CleanRel(lf)
@@ -79,4 +70,21 @@ func Key(root string, s Spec) (string, error) {
 		h.Write(b)
 	}
 	return hex.EncodeToString(h.Sum(nil))[:24], nil
+}
+
+// envDigest hashes env sorted and length-prefixed: map order never changes
+// it, and no two environments hash alike.
+func envDigest(env map[string]string) string {
+	names := make([]string, 0, len(env))
+	for k := range env {
+		names = append(names, k)
+	}
+	slices.Sort(names)
+	h := sha256.New()
+	fmt.Fprintf(h, "%d\x00", len(names))
+	for _, k := range names {
+		v := env[k]
+		fmt.Fprintf(h, "%d\x00%s%d\x00%s", len(k), k, len(v), v)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

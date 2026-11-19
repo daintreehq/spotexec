@@ -852,17 +852,18 @@ func TestDepsHitWithoutAReadyMarker(t *testing.T) {
 	}
 }
 
-// #315: the install sees [env] and env_allow, so a value it reads must key
-// the dependency cache. Changing only that value installs afresh, both in
-// the same slot (its fast path) and in a fresh slot on the same runner (the
-// per-key cache), and changing it back restores the first install.
+// #315: the install sees [env] and env_allow, so every value it gets must
+// key the dependency cache. Changing only one installs afresh instead of
+// keeping the slot's install (its fast path), and changing it back hydrates
+// the first install from the runner's per-key cache.
 func TestDepsKeyedByInstallEnv(t *testing.T) {
 	s, _ := depsSession(t)
+	other := "x"
 	install := func(mode string) (string, protocol.DepsResult) {
 		t.Helper()
 		out := &syncBuf{}
 		s.c = protocol.NewConn(strings.NewReader(""), out)
-		d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p vendor && echo \"$MODE\" > vendor/mode", CacheDirs: []string{"vendor"}, Env: map[string]string{"MODE": mode, "OTHER": "x"}}
+		d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p vendor && echo \"$MODE\" > vendor/mode", CacheDirs: []string{"vendor"}, Env: map[string]string{"MODE": mode, "OTHER": other}}
 		if err := s.deps(d); err != nil {
 			t.Fatal(err)
 		}
@@ -890,5 +891,10 @@ func TestDepsKeyedByInstallEnv(t *testing.T) {
 	// The same environment again: the slot's fast path.
 	if got, same := install("production"); got != "production" || same.Built || same.Hydrated || same.Key != prod.Key {
 		t.Fatalf("unchanged MODE: %q %+v", got, same)
+	}
+	// A value the install doesn't visibly use keys it all the same.
+	other = "y"
+	if _, res := install("production"); !res.Built || res.Key == prod.Key {
+		t.Fatalf("a changed OTHER reused the install: %+v", res)
 	}
 }

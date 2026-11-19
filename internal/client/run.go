@@ -1841,17 +1841,28 @@ func addLocalTar(tw *tar.Writer, full, name string) (protocol.Entry, error) {
 
 // depsEnv is what the dependency install sees from the project: env_allow
 // copied from this environment, then [env]. It is part of the dependency key.
+// Invalid UTF-8 is replaced as the wire's JSON replaces it, so the key signed
+// here is the one the runner computes from what it receives.
 func depsEnv(p *config.Project) map[string]string {
 	env := map[string]string{}
 	for _, k := range p.EnvAllow {
 		if v, ok := os.LookupEnv(k); ok {
-			env[k] = v
+			env[wireString(k)] = wireString(v)
 		}
 	}
 	for k, v := range p.Env {
-		env[k] = v
+		env[wireString(k)] = wireString(v)
 	}
 	return env
+}
+
+// wireString is s as encoding/json delivers it: each invalid UTF-8 byte
+// becomes U+FFFD.
+func wireString(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return string([]rune(s))
 }
 
 func runDeps(ctx context.Context, s *transport.Session, p *config.Project, r *config.Runner, o Options, label string, ws *Workspace, lease *Lease, crun *protocol.ContainerRun, imageID string, m *manifest.Manifest) (protocol.DepsResult, error) {

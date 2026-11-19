@@ -220,6 +220,9 @@ func TestKeyEnv(t *testing.T) {
 	if key(map[string]string{"A": "", "B": ""}) == key(map[string]string{"A": "B"}) {
 		t.Fatal("entry boundaries collide")
 	}
+	if key(map[string]string{"A": "1\x00B", "C": ""}) == key(map[string]string{"A": "", "B": "1\x00C"}) {
+		t.Fatal("value boundaries collide")
+	}
 	// Go randomizes map iteration: many maps built in different orders
 	// must all give one key.
 	names := []string{"NODE_ENV", "TZ", "NODE_OPTIONS", "A", "Z", "M", "npm_config_production"}
@@ -239,5 +242,28 @@ func TestKeyEnv(t *testing.T) {
 	// Only a hash of the values reaches the key.
 	if k := key(map[string]string{"TOKEN": "s3cr3t"}); strings.Contains(k, "s3cr3t") || len(k) != 24 {
 		t.Fatalf("key %q", k)
+	}
+}
+
+// The env section can't be spelled by the lockfile sections after it: an
+// env of A and B (empty) against no env and lockfiles that would frame the
+// same bytes under a length-prefixed encoding written inline.
+func TestKeyEnvSectionIsFramed(t *testing.T) {
+	root := writeTree(t, map[string]string{"2": "", "env": "1\x00", "A0": "B", "0": "0\x00"})
+	base := Spec{Install: "i", OS: "linux", Arch: "amd64"}
+	withEnv := base
+	withEnv.Env, withEnv.Lockfiles = map[string]string{"A": "", "B": ""}, []string{"2"}
+	noEnv := base
+	noEnv.Lockfiles = []string{"env", "A0", "0"}
+	a, err := Key(root, withEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Key(root, noEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatal("an env collides with lockfiles")
 	}
 }

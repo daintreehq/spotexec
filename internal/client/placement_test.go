@@ -340,4 +340,29 @@ func TestPlacementProjectKeyFollowsInstallEnv(t *testing.T) {
 	if got := depsEnv(p)["SX_TEST_315_ALLOWED"]; got != "fixed" {
 		t.Fatalf("[env] over env_allow: %q", got)
 	}
+	// Set but empty is forwarded, unlike unset.
+	p.Env = nil
+	t.Setenv("SX_TEST_315_UNSET", "")
+	if v, ok := depsEnv(p)["SX_TEST_315_UNSET"]; !ok || v != "" {
+		t.Fatalf("empty env_allow value: %q %v", v, ok)
+	}
+}
+
+// The key the client signs is the one the runner computes from what it
+// receives: JSON replaces invalid UTF-8, so depsEnv does the same.
+func TestDepsEnvSurvivesTheWire(t *testing.T) {
+	t.Setenv("SX_TEST_315_BYTES", "a\xff\xfeb")
+	p := &config.Project{EnvAllow: []string{"SX_TEST_315_BYTES"}, Env: map[string]string{"K\xff": "v\xc3"}}
+	env := depsEnv(p)
+	b, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(got, env) {
+		t.Fatalf("sent %q, received %q", env, got)
+	}
 }
