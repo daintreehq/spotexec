@@ -25,6 +25,7 @@ type fakeObjVersion struct {
 	key, id string
 	marker  bool // a delete marker
 	locked  bool // under Object Lock retention: DeleteObjects refuses it
+	sticky  bool // DeleteObjects reports it deleted but it stays
 }
 
 type fakeSG struct {
@@ -45,7 +46,7 @@ type fakeCloud struct {
 	failRepo  map[string]bool             // DeleteRepository fails
 	busySG    map[string]int              // DependencyViolation this many times
 	deleted   []string                    // "kind id", in order
-	dropTried []string                    // every DeleteBucket call, successful or not
+	s3ops     []string                    // "list <bucket> <entries>", "delete <bucket> <n>", "drop <bucket>"
 	s3owner   []string                    // x-amz-expected-bucket-owner seen
 	listedIn  []string                    // the region each ListBuckets call was signed for
 }
@@ -93,6 +94,9 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 				return all[i].key < all[j].key || all[i].key == all[j].key && all[i].id < all[j].id
 			})
 			km, vm := r.URL.Query().Get("key-marker"), r.URL.Query().Get("version-id-marker")
+			if km != "" {
+				c.s3ops = append(c.s3ops, "list-from-marker "+bucket)
+			}
 			if vm != "" && km == "" {
 				w.WriteHeader(400)
 				fmt.Fprint(w, `<Error><Code>InvalidArgument</Code></Error>`)
@@ -109,6 +113,7 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 			if more {
 				page = page[:2]
 			}
+			c.s3ops = append(c.s3ops, fmt.Sprintf("list %s %d", bucket, len(page)))
 			fmt.Fprint(w, `<ListVersionsResult>`)
 			fmt.Fprintf(w, `<IsTruncated>%v</IsTruncated>`, more)
 			for _, v := range page {
@@ -144,6 +149,7 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 				} `xml:"Object"`
 			}
 			xml.Unmarshal(body, &d)
+			c.s3ops = append(c.s3ops, fmt.Sprintf("delete %s %d", bucket, len(d.Objects)))
 			fmt.Fprint(w, `<DeleteResult>`)
 			for _, o := range d.Objects {
 				switch o.VersionID {
@@ -173,14 +179,16 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 							fmt.Fprint(w, `</VersionId><Code>AccessDenied</Code><Message>Access Denied because object protected by object lock.</Message></Error>`)
 							break
 						}
-						c.versions[bucket] = append(vs[:i:i], vs[i+1:]...)
+						if !v.sticky {
+							c.versions[bucket] = append(vs[:i:i], vs[i+1:]...)
+						}
 						break
 					}
 				}
 			}
 			fmt.Fprint(w, `</DeleteResult>`)
 		case r.Method == http.MethodDelete:
-			c.dropTried = append(c.dropTried, bucket)
+			c.s3ops = append(c.s3ops, "drop "+bucket)
 			if len(c.buckets[bucket]) > 0 || len(c.versions[bucket]) > 0 {
 				w.WriteHeader(409)
 				fmt.Fprint(w, `<Error><Code>BucketNotEmpty</Code></Error>`)
@@ -533,6 +541,8 @@ func TestTeardownVersionedBucket(t *testing.T) {
 		{key: "repo/c.tar", id: "v2"},
 		{key: "repo/c.tar", id: "v3"},
 		{key: "repo/c.tar", id: "dm-c", marker: true},
+		{key: "repo/z.tar", id: "dm-z1", marker: true}, // only markers left: a marker-only last page
+		{key: "repo/z.tar", id: "dm-z2", marker: true},
 	}
 	c.versions[west] = []fakeObjVersion{{key: "repo/w.tar", id: "v0"}}
 	p, err := PlanTeardown(context.Background(), "admin", nil)
@@ -552,15 +562,27 @@ func TestTeardownVersionedBucket(t *testing.T) {
 			t.Fatalf("S3 call without the expected owner: %v", c.s3owner)
 		}
 	}
+	// Every listing starts from the beginning, and the bucket goes only
+	// after one comes back empty.
+	for i, op := range c.s3ops {
+		if strings.HasPrefix(op, "list-from-marker ") || op == "drop "+east && (i == 0 || c.s3ops[i-1] != "list "+east+" 0") {
+			t.Fatalf("S3 calls: %v", c.s3ops)
+		}
+	}
 }
 
-// A version Object Lock retains is reported by key and version, the rest
-// of the bucket is emptied, and a re-run finishes once the lock lapses.
+// A version Object Lock retains is reported by key, version and reason,
+// the marker hiding it stays, the bucket is kept, and a re-run finishes
+// once the lock lapses.
 func TestTeardownLockedVersion(t *testing.T) {
 	c := newFakeCloud(t)
 	b := "spotexec-cache-111111111111-us-east-2"
 	c.versioned[b] = true
-	c.versions[b] = []fakeObjVersion{{key: "repo/held.tar", id: "v-held", locked: true}, {key: "repo/old.tar", id: "v-old"}}
+	c.versions[b] = []fakeObjVersion{
+		{key: "repo/held.tar", id: "v-held", locked: true},
+		{key: "repo/held.tar", id: "dm-held", marker: true}, // hides v-held, and must keep hiding it
+		{key: "repo/old.tar", id: "v-old"},
+	}
 	p, err := PlanTeardown(context.Background(), "admin", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -569,21 +591,55 @@ func TestTeardownLockedVersion(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "S3 bucket "+b) || !strings.Contains(err.Error(), "repo/held.tar version v-held: Access Denied because object protected by object lock. (AccessDenied)") {
 		t.Fatalf("err = %v", err)
 	}
-	for _, d := range c.dropTried {
-		if d == b {
-			t.Fatalf("DeleteBucket tried on a bucket that isn't empty: %v", c.dropTried)
+	for _, op := range c.s3ops {
+		if op == "drop "+b {
+			t.Fatalf("DeleteBucket tried on a bucket that isn't empty: %v", c.s3ops)
 		}
 	}
-	if len(c.buckets[b]) > 0 || len(c.versions[b]) != 1 || c.versions[b][0].id != "v-held" {
+	var left []string
+	for _, v := range c.versions[b] {
+		left = append(left, v.id)
+	}
+	sort.Strings(left)
+	if len(c.buckets[b]) > 0 || strings.Join(left, ",") != "dm-held,v-held,v-old" {
 		t.Fatalf("bucket left with %v %v", c.buckets[b], c.versions[b])
 	}
-	c.versions[b][0].locked = false
+	for i := range c.versions[b] {
+		c.versions[b][i].locked = false
+	}
 	p, _ = PlanTeardown(context.Background(), "admin", nil)
 	if err := p.Apply(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := c.buckets[b]; ok || len(c.versions[b]) > 0 {
 		t.Fatalf("bucket left: %v %v", c.buckets[b], c.versions[b])
+	}
+}
+
+// A version still listed after S3 said it was deleted stops the drain
+// with a diagnostic instead of deleting it over and over.
+func TestTeardownStaleVersion(t *testing.T) {
+	c := newFakeCloud(t)
+	b := "spotexec-cache-111111111111-us-east-2"
+	c.versioned[b] = true
+	c.buckets[b] = map[string]bool{}
+	c.versions[b] = []fakeObjVersion{{key: "repo/stuck.tar", id: "v1", sticky: true}}
+	p, err := PlanTeardown(context.Background(), "admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "repo/stuck.tar version v1 is still listed after it was deleted") {
+		t.Fatalf("err = %v", err)
+	}
+	var ops []string
+	for _, op := range c.s3ops {
+		if strings.HasSuffix(op, b) || strings.Contains(op, b+" ") {
+			ops = append(ops, op)
+		}
+	}
+	if strings.Join(ops, ",") != "list "+b+" 1,delete "+b+" 1,list "+b+" 1" {
+		t.Fatalf("S3 calls: %v", ops)
 	}
 }
 
