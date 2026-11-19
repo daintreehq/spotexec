@@ -67,7 +67,7 @@ func (t *Tree) matchOne(parts []string, isDir bool) (bool, error) {
 }
 
 // load returns the matcher of dir's ignore file, nil when there is none.
-// Its patterns are read as Git reads them (see Matcher.git).
+// Its trailing ** is read as Git reads it (see Matcher.git).
 // A directory reached through a symlink (or not a directory here) has none:
 // what lies beyond a symlink is not the project's.
 func (t *Tree) load(dir []string) (*Matcher, error) {

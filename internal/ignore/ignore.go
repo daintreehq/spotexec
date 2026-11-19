@@ -27,11 +27,10 @@ type rule struct {
 // Matcher holds ordered rules.
 type Matcher struct {
 	rules []rule
-	// git: patterns read as Git reads .gitignore files (Tree): a trailing
-	// ** matches only what is inside a directory, never the directory
-	// itself, and "[!...]" is a negated class. Otherwise "dir/**" also
-	// excludes dir and "!" is a class member, as .spotexecignore and
-	// [sync].exclude always have.
+	// git: a trailing ** matches only what is inside a directory, never the
+	// directory itself, as Git reads .gitignore files (Tree). Otherwise
+	// "dir/**" also excludes dir, as .spotexecignore and [sync].exclude
+	// always have.
 	git bool
 }
 
@@ -74,11 +73,6 @@ func (m *Matcher) Add(lines ...string) {
 			continue
 		}
 		r.segs = strings.Split(l, "/")
-		if m.git {
-			for i, seg := range r.segs {
-				r.segs[i] = bracketNegation(seg)
-			}
-		}
 		if !r.anchored {
 			r.segs = append([]string{"**"}, r.segs...)
 		}
@@ -224,41 +218,4 @@ func matchSegs(pat, parts []string, git bool) bool {
 		return false
 	}
 	return matchSegs(pat[1:], parts[1:], git)
-}
-
-// bracketNegation rewrites Git's negated class "[!...]" as path.Match's
-// "[^...]" (path.Match reads "!" there as a member). Only a "!" right after
-// a class's opening bracket negates it: in "[[!]" both are members.
-func bracketNegation(seg string) string {
-	if !strings.Contains(seg, "[!") {
-		return seg
-	}
-	var b strings.Builder
-	inClass := false
-	for i := 0; i < len(seg); i++ {
-		c := seg[i]
-		switch {
-		case c == '\\' && i+1 < len(seg):
-			b.WriteByte(c)
-			i++
-			c = seg[i]
-		case !inClass && c == '[':
-			inClass = true
-			b.WriteByte(c)
-			if i+1 < len(seg) && seg[i+1] == '!' {
-				b.WriteByte('^')
-				i++
-			}
-			// A "]" first in the class is a member, not its end.
-			if i+1 < len(seg) && seg[i+1] == ']' {
-				b.WriteByte(']')
-				i++
-			}
-			continue
-		case inClass && c == ']':
-			inClass = false
-		}
-		b.WriteByte(c)
-	}
-	return b.String()
 }

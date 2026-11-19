@@ -59,30 +59,6 @@ func TestTrailingDoubleStar(t *testing.T) {
 	}
 }
 
-// In a .gitignore, Git's negated class [!...] means "not", as [^...]
-// does; only a "!" first in a class negates it. .spotexecignore and
-// [sync].exclude keep reading "!" as a member.
-func TestBracketNegation(t *testing.T) {
-	m := &Matcher{git: true}
-	m.Add("keys/[!x].pem", "\\[!y].txt", "lit/[[!].pem", "dir[!a]/*.key")
-	for p, want := range map[string]bool{
-		"keys/a.pem": true, "keys/x.pem": false, "keys/!.pem": true, "keys/ab.pem": false,
-		"[!y].txt": true, "a.txt": false,
-		"lit/!.pem": true, "lit/[.pem": true, "lit/a.pem": false,
-		"dirb/k.key": true, "dira/k.key": false,
-	} {
-		if got := m.Match(p, false); got != want {
-			t.Errorf("Match(%q) = %v, want %v", p, got, want)
-		}
-	}
-	user := New("keys/[!x].pem")
-	for p, want := range map[string]bool{"keys/x.pem": true, "keys/!.pem": true, "keys/a.pem": false} {
-		if got := user.Match(p, false); got != want {
-			t.Errorf("user Match(%q) = %v, want %v", p, got, want)
-		}
-	}
-}
-
 // A trailing slash asks about a directory, and only the ignore files above
 // it apply: one inside it that can't be read doesn't matter.
 func TestTreeTrailingSlash(t *testing.T) {
