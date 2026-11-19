@@ -1324,15 +1324,29 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 		return nil, err
 	}
 	lease.InstanceID, lease.Instance = lr.InstanceID, listed
-	if lease.Acq.Slot != lr.Slot {
+	if err := checkSameSlot(lease.Acq, lr, ws, r.Name, syncing); err != nil {
 		lease.Close()
-		return nil, fmt.Errorf("slot %d on %s is in use by another run; try again shortly", lr.Slot, r.Name)
-	}
-	if !syncing && lease.Acq.PrevWorktreeKey != ws.WorktreeKey {
-		lease.Close()
-		return nil, fmt.Errorf("slot %d on %s now holds another worktree's files; run `sx --same-slot <command>` (which syncs) instead", lr.Slot, r.Name)
+		return nil, err
 	}
 	return lease, nil
+}
+
+// checkSameSlot refuses a re-acquired slot that isn't the one lr ran in:
+// another slot number, or, unless the caller is about to sync, a slot that
+// holds another worktree's files or sits at another path. The path differs
+// when the RepoID did (an upgrade that changed how it is derived), and a
+// sync interrupted there may already have claimed the new slot.
+func checkSameSlot(acq protocol.Acquired, lr *LastRun, ws *Workspace, runner string, syncing bool) error {
+	if acq.Slot != lr.Slot {
+		return fmt.Errorf("slot %d on %s is in use by another run; try again shortly", lr.Slot, runner)
+	}
+	if syncing {
+		return nil
+	}
+	if acq.PrevWorktreeKey != ws.WorktreeKey || lr.RemoteWS != "" && acq.Workspace != lr.RemoteWS {
+		return fmt.Errorf("slot %d on %s now holds another worktree's files; run `sx --same-slot <command>` (which syncs) instead", lr.Slot, runner)
+	}
+	return nil
 }
 
 // PullDisplay is AcquireSlot's display for `spotexec pull`, which only

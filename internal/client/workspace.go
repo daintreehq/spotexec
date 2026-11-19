@@ -124,6 +124,11 @@ func commonGitDir(root, gitDir string) string {
 // host is case-folded: hosting can be case-sensitive, so the path keeps
 // its case, and any "@" in it. Local paths come back unchanged.
 func normalizeRemote(u string) string {
+	// HTTP never sends a fragment, so it names nothing; elsewhere "#" is
+	// part of the path.
+	if l := strings.ToLower(u); strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://") {
+		u, _, _ = strings.Cut(u, "#")
+	}
 	u = strings.TrimSuffix(strings.TrimSuffix(u, "/"), ".git")
 	var host, p string
 	if i := strings.Index(u, "://"); i >= 0 {

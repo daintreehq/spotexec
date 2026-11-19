@@ -4,6 +4,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
 func TestNormalizeRemote(t *testing.T) {
@@ -37,6 +39,10 @@ func TestNormalizeRemote(t *testing.T) {
 		{"host:~user/repo", "host/~user/repo"},
 		{"ssh://host/~user/repo", "host/~user/repo"},
 		{"host:/srv/repo", "host//srv/repo"},
+		// HTTP drops a fragment; scp keeps "#" as part of the path.
+		{"https://host/org/app.git#preview", "host/org/app"},
+		{"HTTP://host/org/app#preview", "host/org/app"},
+		{"git@host:org/app#preview", "host/org/app#preview"},
 		// Local paths keep their case and any "@".
 		{"file:///Srv/A@B.git", "/Srv/A@B"},
 		{"/Srv/A@B.git", "/Srv/A@B"},
@@ -79,5 +85,32 @@ func TestResolveRepoIDKeepsPathCase(t *testing.T) {
 	}
 	if same := id("https://Example.invalid/team/app"); same != lower {
 		t.Fatalf("equivalent https remote got RepoID %s, want %s", same, lower)
+	}
+}
+
+// A last run recorded under another RepoID (an earlier version's
+// derivation) never lets exec or pull into the new namespace's slot, even
+// once an interrupted sync has claimed it for this worktree.
+func TestCheckSameSlotRefusesMovedWorkspace(t *testing.T) {
+	ws := &Workspace{RepoID: "app-11111111", WorktreeKey: "wt"}
+	lr := &LastRun{Slot: 1, RemoteWS: "/w/repos/app-00000000/slots/slot-01/workspace"}
+	acq := protocol.Acquired{Slot: 1, PrevWorktreeKey: "wt", Workspace: "/w/repos/app-11111111/slots/slot-01/workspace"}
+	if err := checkSameSlot(acq, lr, ws, "r", false); err == nil {
+		t.Fatal("exec/pull accepted a slot at another path")
+	}
+	if err := checkSameSlot(acq, lr, ws, "r", true); err != nil {
+		t.Fatalf("a syncing run refused: %v", err)
+	}
+	lr.RemoteWS = acq.Workspace
+	if err := checkSameSlot(acq, lr, ws, "r", false); err != nil {
+		t.Fatalf("the same slot refused: %v", err)
+	}
+	acq.PrevWorktreeKey = "other"
+	if err := checkSameSlot(acq, lr, ws, "r", false); err == nil {
+		t.Fatal("exec/pull accepted another worktree's slot")
+	}
+	acq.Slot = 2
+	if err := checkSameSlot(acq, lr, ws, "r", true); err == nil {
+		t.Fatal("accepted another slot number")
 	}
 }
