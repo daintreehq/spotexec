@@ -335,6 +335,25 @@ type installed struct {
 
 const localBin = `"$HOME/.local/bin/spotexec"`
 
+// selfBinary opens the running spotexec, which --install copy sends over,
+// and gives its size.
+var selfBinary = func() (io.ReadCloser, int64, error) {
+	p, err := os.Executable()
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, 0, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	return f, st.Size(), nil
+}
+
 // installSpotexec installs or upgrades spotexec.
 func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (installed, error) {
 	mode := r.install
@@ -449,11 +468,7 @@ func (r *remoteSetup) installSpotexec(ctx context.Context, i remoteInfo) (instal
 		if i.os != runtime.GOOS || i.arch != runtime.GOARCH {
 			return installed{}, fmt.Errorf("--install copy needs the same platform (this is %s/%s, that is %s/%s)", runtime.GOOS, runtime.GOARCH, i.os, i.arch)
 		}
-		self, err := os.Executable()
-		if err != nil {
-			return installed{}, err
-		}
-		f, err := os.Open(self)
+		f, _, err := selfBinary()
 		if err != nil {
 			return installed{}, err
 		}
