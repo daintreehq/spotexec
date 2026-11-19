@@ -62,24 +62,58 @@ done
 REPO="$WORK/repo"
 mkdir -p "$REPO/src" && cd "$REPO" && REPO=$(pwd -P)
 git init -q && git config user.email t@t && git config user.name t
+git config core.excludesFile /dev/null
 printf 'a\n' > src/a.txt
 printf 'b\n' > src/b.txt
 printf 'node_modules/\ndist/\ncoverage/\n' > .gitignore
 ln -s a.txt src/link
+printf 'EXAMPLE=placeholder\n' > .env.example
 git add -A && git commit -qm init
 printf 'untracked\n' > src/new.txt
-printf 'SECRET=1\n' > .env
 
 ev() { grep -E "$1" "$WORK/last.err" || true; }
 run() { "$SX" --json "$@" >"$WORK/last.out" 2>"$WORK/last.err"; }
 
+# Untracked local dotenv files (harmless placeholders) that Git itself
+# doesn't ignore, so only spotexec's own excludes can keep them local.
+dotenv_fixtures() {
+  printf 'LOCAL=placeholder\n' > .env
+  printf 'LOCAL=placeholder\n' > .env.local
+  [ "$(git status --porcelain --untracked-files=all -- .env .env.local)" = $'?? .env\n?? .env.local' ]
+}
+# A remote command that succeeds, and prints its marker, only when none of
+# the named files is on the runner and the committed template is.
+dotenv_probe() { echo "for f in $*; do test ! -e \$f && test ! -L \$f || exit 1; done; grep -qx EXAMPLE=placeholder .env.example && echo dotenv-absent"; }
+DOTENV_PROBE=$(dotenv_probe .env .env.local)
+check_dotenv() {
+  local label=$1; shift
+  rm -f "$WORK/last.out" "$WORK/last.err"
+  if dotenv_fixtures && run "$@" && grep -qx dotenv-absent "$WORK/last.out"; then ok "$label"; else bad "$label"; tail -5 "$WORK/last.err" 2>/dev/null || true; fi
+}
+
 echo "== sync and exec"
-run 'cat src/new.txt; test ! -e .env && echo noenv; readlink src/link; echo slot=$SPOTEXEC_SLOT; pwd' || true
+check_dotenv "fresh checkout keeps local .env files off the runner, syncs a committed template" \
+  "$DOTENV_PROBE"' && cat src/new.txt && readlink src/link && echo slot=$SPOTEXEC_SLOT && pwd'
+rm -f .env .env.local
 check "untracked files synced" "grep -q untracked $WORK/last.out"
-check ".env* excluded by default" "grep -q noenv $WORK/last.out || ! grep -q 'SECRET' $WORK/last.out"
 check "symlinks preserved" "grep -qx a.txt $WORK/last.out"
 check "slot env injected" "grep -q slot=1 $WORK/last.out"
 check "remote paths rewritten to local" "grep -qF \"$REPO\" $WORK/last.out"
+
+# Its own repository, so its own slots. A committed .env.test, which the
+# built-in excludes would sync, shows the scaffold's exclude at work.
+echo "== scaffolded project: dotenv"
+mkdir "$WORK/scaffold"
+cd "$WORK/scaffold"
+git init -q && git config user.email t@t && git config user.name t && git config core.excludesFile /dev/null
+printf 'EXAMPLE=placeholder\n' > .env.example
+printf 'TEST=placeholder\n' > .env.test
+git add -A && git commit -qm init
+"$SX" init --no-container >/dev/null
+check "init writes the project config" "test -f .spotexec.toml"
+check_dotenv "scaffolded project keeps local and committed .env files off the runner, syncs the template" "$(dotenv_probe .env .env.local .env.test)"
+rm -f .env .env.local
+cd "$REPO"
 
 echo "== non-POSIX login shells (fish, tcsh)"
 for u in fishy cshy; do

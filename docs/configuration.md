@@ -153,7 +153,7 @@ pool = ["aws"]                 # overrides default_pool for this repo
 [sync]
 mode = "auto"                  # auto: write back · in: discard changes · none: don't sync
 writeback = "always"           # always | on-success | never (eslint --fix exits 1 but still fixes)
-exclude = [".env*", "*.pem"]   # on top of .gitignore and .spotexecignore
+exclude = [".env*", "!.env.example", "*.pem"]   # on top of .gitignore and .spotexecignore
 pull_artifacts = ["coverage/"] # gitignored outputs copied back after every run
 writeback_max_files = 1000     # a write-back bringing back more files than this warns (0: no limit)
 writeback_max_bytes = "100MB"  # ...or more bytes than this (a number of bytes, or KB/MB/GB; 0: no limit)
@@ -189,6 +189,8 @@ fail_fast = false
 when_load_above = 0.6          # agents offload only when the laptop is busy
 transparent_prefixes = ["direnv exec ."]  # wrappers the hook looks past (they run on the runner too)
 ```
+
+What syncs: every file Git tracks, and the untracked files it doesn't ignore, minus `sync.exclude`, `.spotexecignore` and `deps.cache_dirs` (outside Git, every file the root `.gitignore` doesn't ignore). Built-in excludes keep some untracked files local too, before any project config exists: dependency and build directories such as `node_modules/` and `.venv/`, and local dotenv files (`.env*` in any case: `.env`, `.env.local`, `.envrc`, `.ENV`). A dotenv template Git tracks, such as `.env.example`, syncs like any tracked file; outside Git, or with `source = "directory"`, no dotenv file syncs unless `[container]` names it as a build input. `spotexec init` writes `exclude = [".env*", "!.env.example", ...]`, which keeps tracked dotenv files such as `.env.test` local too and still syncs a committed `.env.example`. `spotexec sync-plan` counts what each of these rules leaves out.
 
 `git_seed` gives the slot a minimal `.git` before the command runs (off by default), so tools that ask Git about the checkout, such as a build stamping the commit SHA or a test recording `git status`, answer as they do locally. See [Git on the runner](running.md#git-on-the-runner) for what it holds and what it can't do.
 
