@@ -106,7 +106,7 @@ The policy is attached inline, and an IAM user's inline policies are limited to 
     { "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*",
       "Condition": { "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } } },
     { "Effect": "Allow", "Action": [
-        "s3:CreateBucket", "s3:PutLifecycleConfiguration", "s3:ListBucket",
+        "s3:CreateBucket", "s3:*LifecycleConfiguration", "s3:ListBucket",
         "s3:GetObject", "s3:PutObject"
       ], "Resource": "arn:aws:s3:::spotexec-cache-*" },
     { "Effect": "Allow", "Action": [
@@ -393,7 +393,7 @@ If `up` fails, the error says why: a credential problem names the login command 
 | Spot instances tagged `spotexec-runner` / `spotexec-owner` | On demand | They terminate themselves; `spotexec down <runner>` (or `--all` for every fleet) terminates this machine's now, `spotexec down -A` every machine's. |
 | On-demand `image bake` builders tagged `spotexec-bake-runner` / `spotexec-owner` | `spotexec image bake` | Terminated when the bake ends. One left behind (stopped, or older than four hours) is terminated by `spotexec down <runner>` or the pool manager; `spotexec down -A` terminates any machine's builders at once. |
 | Security group `spotexec-ssh` (`spotexec-ssh-<hash>` for a custom `ssh_cidr`, one per VPC), tagged `spotexec-owner` | First launch without `security_group_ids` | `spotexec teardown` (below). |
-| S3 bucket `spotexec-cache-<account>-<region>` | First run with `[deps]` (unless `cache_bucket = "off"`) | Objects expire after 14 days; `spotexec teardown` deletes the bucket. |
+| S3 bucket `spotexec-cache-<account>-<region>` | First run with `[deps]` (unless `cache_bucket = "off"`) | Objects expire after 14 days (a lifecycle rule added beside any rules the bucket already has); `spotexec teardown` deletes the bucket. |
 | ECR repositories `spotexec/<repo-id>` | First Dockerfile build | Keeps the newest 3 builds per region, expiring older ones and their untagged entries; `spotexec teardown` deletes the repositories. |
 | AMIs and snapshots | `spotexec image bake` | `spotexec image clear`, or `spotexec teardown`. |
 
