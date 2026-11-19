@@ -407,7 +407,7 @@ mkdir -p "$ROOT/.e2e-render" && cp "$WORK/render.go" "$ROOT/.e2e-render/main.go"
 docker cp "$WORK/userdata.sh" "$NAME:/tmp/userdata.sh"
 # An image drop-in that sorts first by default and allows passwords and root.
 docker exec "$NAME" bash -c 'printf "PasswordAuthentication yes\nPermitRootLogin yes\nKbdInteractiveAuthentication yes\n" > /etc/ssh/sshd_config.d/50-cloud-init.conf'
-docker exec "$NAME" bash -c 'mkdir -p /tmp/fakebin && for b in systemctl systemd-run; do printf "#!/bin/sh\nexit 0\n" > /tmp/fakebin/$b; chmod +x /tmp/fakebin/$b; done; PATH=/tmp/fakebin:$PATH bash /tmp/userdata.sh >/dev/null 2>&1; cat /var/tmp/spotexec/ready'
+docker exec "$NAME" bash -c 'mkdir -p /tmp/fakebin && for b in systemctl systemd-run; do printf "#!/bin/sh\nexit 0\n" > /tmp/fakebin/$b; chmod +x /tmp/fakebin/$b; done; printf "#!/bin/sh\n[ \"\$1\" = show ] && echo SubState=waiting\nexit 0\n" > /tmp/fakebin/systemctl; PATH=/tmp/fakebin:$PATH bash /tmp/userdata.sh >/dev/null 2>&1; cat /var/tmp/spotexec/ready'
 sshd_eff() { docker exec "$NAME" /usr/sbin/sshd -T -C user=dev,host=localhost,addr=127.0.0.1 2>&1; }
 key_only() { sshd_eff | grep -cxE 'authenticationmethods publickey|passwordauthentication no|kbdinteractiveauthentication no|permitrootlogin no|allowusers dev' | grep -qx 5; }
 check "sshd takes key logins as the runner user only, over the image's drop-in" "key_only && docker exec $NAME test -f /etc/ssh/sshd_config.d/00-spotexec.conf"

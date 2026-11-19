@@ -208,18 +208,19 @@ systemctl enable --now spotexec-watchdog.timer
   default dependencies, and SIGTERM ignored: shutdown must not stop the
   timer before it fires, nor kill the forced poweroff that backs it up.
 */}}
-systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependencies=no --timer-property=DefaultDependencies=no /bin/sh -c 'trap "" TERM HUP; touch /var/tmp/spotexec/draining; {{.SelfDestruct}}; sleep 120; poweroff -f' >/dev/null 2>&1 || true
+systemd-run --unit=spotexec-maxlife --on-active={{.MaxSecs}} -p DefaultDependencies=no --timer-property=DefaultDependencies=no /bin/sh -c 'trap "" TERM HUP; touch /var/tmp/spotexec/draining; {{.SelfDestruct}}; sleep 120; poweroff -f' >/dev/null 2>&1 || ML=0
 {{- /*
   A VM is never ready without both shutdown timers scheduled (#321): a
   custom image whose systemd can't run them would bill until someone
   noticed. Checked once armed, so a broken one ends before the bootstrap
   runs, and again before ready is written. An elapsed max-lifetime timer
-  ("active", but spent) doesn't count. The failure is recorded as a
+  ("active", but spent) doesn't count, nor one this boot didn't create
+  (systemd-run failed: a unit of that name was already there). The failure is recorded as a
   failed boot (a non-zero ready, the bootstrap's own status if it had
   one), then the VM ends itself as the watchdog would.
 */}}
 sx_timers() {
-  local u; for u in watchdog maxlife; do case "$(systemctl show -p SubState spotexec-$u.timer 2>/dev/null)" in SubState=waiting|SubState=running) ;; *) return 1 ;; esac; done
+  local u; [ "${ML:-1}" = 1 ] || return 1; for u in watchdog maxlife; do case "$(systemctl show -p SubState spotexec-$u.timer 2>/dev/null)" in SubState=waiting|SubState=running) ;; *) return 1 ;; esac; done
 }
 sx_unarmed() {
   echo "spotexec: the shutdown timers aren't running; shutting down" | tee -a /var/log/spotexec-bootstrap.log >&2

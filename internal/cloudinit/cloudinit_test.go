@@ -627,7 +627,7 @@ func TestRenderRequiresShutdownTimers(t *testing.T) {
 	arm, finish := s[i:j], s[k:]
 	for _, tc := range []struct {
 		name         string
-		boot, later  map[string]string // timer SubStates, from boot and once the bootstrap ran ("dead": won't start)
+		boot, later  map[string]string // timer SubStates, from boot and once the bootstrap ran (see the stub)
 		status       int               // the bootstrap's exit status
 		ready        string            // "" when the VM must end itself
 		bootstrapRan bool
@@ -639,6 +639,10 @@ func TestRenderRequiresShutdownTimers(t *testing.T) {
 		{name: "max-lifetime timer won't start", boot: map[string]string{"maxlife": "dead"}},
 		{name: "no systemd timers at all", boot: map[string]string{"watchdog": "dead", "maxlife": "dead"}},
 		{name: "watchdog timer failed", boot: map[string]string{"watchdog": "failed"}},
+		{name: "watchdog timer elapsed", boot: map[string]string{"watchdog": "elapsed"}},
+		{name: "no state reported", boot: map[string]string{"watchdog": "none"}},
+		{name: "empty state reported", boot: map[string]string{"maxlife": "blank"}},
+		{name: "max-lifetime unit left from the image", boot: map[string]string{"maxlife": "stale"}},
 		{name: "watchdog timer stopped by the bootstrap", later: map[string]string{"watchdog": "dead"}, bootstrapRan: true},
 		{name: "max lifetime spent during the bootstrap", later: map[string]string{"maxlife": "elapsed"}, bootstrapRan: true},
 		{name: "failed bootstrap without timers keeps its status", later: map[string]string{"maxlife": "dead"}, status: 3, bootstrapRan: true},
@@ -656,9 +660,11 @@ func TestRenderRequiresShutdownTimers(t *testing.T) {
 				return b.String()
 			}
 			// Each timer's SubState is in a file named for it (default
-			// "waiting"); a "dead" one also fails to start.
-			stub := "#!/bin/sh\nfor u in watchdog maxlife; do case \"$*\" in *spotexec-$u*) s=$(cat \"" + dir + "/$u\" 2>/dev/null || echo waiting) ;; esac; done\n" +
-				"case \"$1\" in show) echo \"SubState=${s:-dead}\" ;; *) [ \"${s:-}\" != dead ] ;; esac\n"
+			// "waiting"). A "dead" one won't start; a "stale" one won't
+			// either (its name is taken) but looks scheduled; "none" and
+			// "blank" report no state.
+			stub := "#!/bin/sh\necho \"$*\" >> \"" + dir + "/calls\"\ns=\nfor u in watchdog maxlife; do case \"$* \" in *\" spotexec-$u.timer \"*|*\"--unit=spotexec-$u \"*) s=$(cat \"" + dir + "/$u\" 2>/dev/null || echo waiting) ;; esac; done\n" +
+				"case \"$1:$s\" in show:none) ;; show:blank) echo SubState= ;; show:stale) echo SubState=waiting ;; show:*) echo \"SubState=${s:-dead}\" ;; *:dead|*:stale) exit 1 ;; esac\nexit 0\n"
 			for _, b := range []string{"systemctl", "systemd-run"} {
 				os.WriteFile(filepath.Join(bin, b), []byte(stub), 0o755)
 			}
@@ -678,6 +684,12 @@ func TestRenderRequiresShutdownTimers(t *testing.T) {
 			if tc.ready != "" {
 				if err != nil || destroyed || ready != tc.ready {
 					t.Fatalf("scheduled timers: err %v, ready %q (%v), want %q: %s", err, ready, rerr, tc.ready, out)
+				}
+				calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+				for _, want := range []string{"enable --now spotexec-watchdog.timer\n", "--unit=spotexec-maxlife ", "show -p SubState spotexec-watchdog.timer\n", "show -p SubState spotexec-maxlife.timer\n"} {
+					if !strings.Contains(string(calls), want) {
+						t.Errorf("no call %q in:\n%s", want, calls)
+					}
 				}
 				return
 			}
