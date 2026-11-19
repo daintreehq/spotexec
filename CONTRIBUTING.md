@@ -37,18 +37,17 @@ git push origin v0.2.0
 git checkout develop && git merge main && git push origin develop   # keep develop in step
 ```
 
-CI and the Release workflow run only on Linux. They cross-compile the macOS binaries and check which Go release built them, but never run them, and the race tests never run on macOS there. So before tagging, run these on a Mac, from the commit on `main` you are about to tag:
+CI and the Release workflow run only on Linux. They cross-compile the macOS binaries and require each to be built by the exact Go patch on go.mod's `go` line, but never run them, and the race tests never run on macOS there. So before tagging, run these on a Mac, from the commit on `main` you are about to tag:
 
 ```sh
 export GOTOOLCHAIN=go$(go list -m -f '{{.GoVersion}}')   # see below
 make build && go vet ./... && go test -race ./...     # the race tests against the darwin code paths
-HOMEBREW_TAP_DEPLOY_KEY= goreleaser release --snapshot --clean --skip=publish
-SMOKE_PACKAGES=0 ./scripts/smoke-release.sh           # unpacks and runs the darwin archive for this Mac
+goreleaser release --snapshot --clean --skip=publish && SMOKE_PACKAGES=0 ./scripts/smoke-release.sh   # runs the darwin archive for this Mac
 ```
 
-The smoke script tests the archive for the Mac's own architecture (`darwin_arm64` on Apple silicon), so the other darwin archive is only cross-compiled and version-checked. `SMOKE_PACKAGES=0` skips the Linux package installs, which CI already covers.
+Run them from the default, case-insensitive volume: the tests for names that differ only in case (`internal/client/collision_test.go`) skip on a case-sensitive filesystem, so they skip on Linux CI and run only here. The smoke script tests the archive for the Mac's own architecture (`darwin_arm64` on Apple silicon), so the other darwin archive is only cross-compiled and version-checked. `SMOKE_PACKAGES=0` skips the Linux package installs, which CI already covers.
 
-CI also builds a snapshot of the release on every push and pull request and smoke-tests what users install on Linux (the Linux archive, `sx`, completions and the Linux packages). To do the same locally: `export GOTOOLCHAIN=go$(go list -m -f '{{.GoVersion}}') && HOMEBREW_TAP_DEPLOY_KEY= goreleaser release --snapshot --clean --skip=publish && ./scripts/smoke-release.sh` (the empty `HOMEBREW_TAP_DEPLOY_KEY` stands in for the secret the Homebrew section reads; a snapshot never pushes the tap). On a Mac that smoke-tests the darwin archive rather than the Linux one. The `GOTOOLCHAIN` pin matters when your default Go is newer: every binary must be built by exactly the Go release on go.mod's `go` line ([scripts/check-go-version.sh](scripts/check-go-version.sh)), the patch CI scans with govulncheck, so moving to a new Go patch means raising that line. CI and the Release workflow pin GoReleaser to one version (in both workflow files) so an upgrade can't change a release unannounced; bump it in both places together.
+CI also builds a snapshot of the release on every push and pull request and smoke-tests what users install on Linux (the Linux archive, `sx`, completions and the Linux packages). To do the same locally: `export GOTOOLCHAIN=go$(go list -m -f '{{.GoVersion}}') && goreleaser release --snapshot --clean --skip=publish && ./scripts/smoke-release.sh`. On a Mac that smoke-tests the darwin archive rather than the Linux one. The `GOTOOLCHAIN` pin matters when your default Go is newer: every binary must be built by exactly the Go release on go.mod's `go` line ([scripts/check-go-version.sh](scripts/check-go-version.sh)), the patch CI scans with govulncheck, so moving to a new Go patch means raising that line. CI and the Release workflow pin GoReleaser to one version (in both workflow files) so an upgrade can't change a release unannounced; bump it in both places together.
 
 The tag starts the [Release workflow](.github/workflows/release.yml). It refuses a tag that isn't on `main`, builds the embedded helpers, runs vet and the race tests on Linux, and then runs [GoReleaser](.goreleaser.yaml), which:
 - builds `spotexec` for macOS and Linux (amd64, arm64) with the remote helpers embedded;
