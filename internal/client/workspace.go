@@ -67,7 +67,9 @@ func Resolve(dir string) (*Workspace, error) {
 		if out, err := exec.Command("git", "-C", root, "config", "--get", "remote.origin.url").Output(); err == nil {
 			if u := normalizeRemote(strings.TrimSpace(string(out))); u != "" {
 				ident = u
-				name = filepath.Base(u)
+				// Lowercase as before: only the hash tells case-distinct
+				// paths apart, so a lowercase remote keeps its RepoID.
+				name = strings.ToLower(filepath.Base(u))
 			}
 		} else if out, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output(); err == nil {
 			// No origin: worktrees of one repo share the common git dir.
@@ -118,17 +120,53 @@ func commonGitDir(root, gitDir string) string {
 }
 
 // normalizeRemote strips scheme, credentials and .git so https and ssh
-// remotes of the same repository map to one ID.
+// remotes of the same repository map to one ID ("host/path"). Only the
+// host is case-folded: hosting can be case-sensitive, so the path keeps
+// its case, and any "@" in it. Local paths come back unchanged.
 func normalizeRemote(u string) string {
+	// HTTP never sends a fragment, so it names nothing; elsewhere "#" is
+	// part of the path.
+	if l := strings.ToLower(u); strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://") {
+		u, _, _ = strings.Cut(u, "#")
+	}
 	u = strings.TrimSuffix(strings.TrimSuffix(u, "/"), ".git")
+	var host, p string
 	if i := strings.Index(u, "://"); i >= 0 {
-		u = u[i+3:]
+		// scheme://[userinfo@]host[:port]/path
+		host = u[i+3:]
+		if j := strings.IndexByte(host, '/'); j >= 0 {
+			host, p = host[:j], host[j:]
+		}
+	} else if i := scpColon(u); i >= 0 {
+		// [user@]host:path
+		host, p = u[:i], "/"+u[i+1:]
+	} else {
+		return u
 	}
-	if i := strings.LastIndex(u, "@"); i >= 0 {
-		u = u[i+1:]
+	if j := strings.LastIndexByte(host, '@'); j >= 0 {
+		host = host[j+1:]
 	}
-	u = strings.Replace(u, ":", "/", 1)
-	return strings.ToLower(u)
+	return strings.ToLower(host) + p
+}
+
+// scpColon is the index of the colon ending the host of an scp-like
+// remote ([user@]host:path, host possibly a bracketed IPv6 address), or -1
+// when u is a local path: no colon before its first slash.
+func scpColon(u string) int {
+	head := u
+	if j := strings.IndexByte(u, '/'); j >= 0 {
+		head = u[:j]
+	}
+	from := 0
+	if k := strings.IndexByte(head, '['); k >= 0 && (k == 0 || head[k-1] == '@') {
+		if e := strings.IndexByte(head[k:], ']'); e >= 0 {
+			from = k + e
+		}
+	}
+	if i := strings.IndexByte(head[from:], ':'); i >= 0 {
+		return from + i
+	}
+	return -1
 }
 
 // LastRun records where this worktree last ran (for exec/pull).

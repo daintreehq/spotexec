@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -1324,15 +1325,44 @@ func AcquireSlot(ctx context.Context, cfg *config.Config, ws *Workspace, r *conf
 		return nil, err
 	}
 	lease.InstanceID, lease.Instance = lr.InstanceID, listed
-	if lease.Acq.Slot != lr.Slot {
+	if err := checkSameSlot(lease.Acq, lr, ws, r.Name, syncing); err != nil {
 		lease.Close()
-		return nil, fmt.Errorf("slot %d on %s is in use by another run; try again shortly", lr.Slot, r.Name)
-	}
-	if !syncing && lease.Acq.PrevWorktreeKey != ws.WorktreeKey {
-		lease.Close()
-		return nil, fmt.Errorf("slot %d on %s now holds another worktree's files; run `sx --same-slot <command>` (which syncs) instead", lr.Slot, r.Name)
+		return nil, err
 	}
 	return lease, nil
+}
+
+// checkSameSlot refuses a re-acquired slot that isn't the one lr ran in:
+// another slot number or, unless the caller is about to sync, a slot that
+// holds another worktree's files or belongs to another RepoID. The RepoID
+// differs after an upgrade that changed how it is derived, and a sync
+// interrupted there may already have claimed the new namespace's slot.
+func checkSameSlot(acq protocol.Acquired, lr *LastRun, ws *Workspace, runner string, syncing bool) error {
+	if acq.Slot != lr.Slot {
+		return fmt.Errorf("slot %d on %s is in use by another run; try again shortly", lr.Slot, runner)
+	}
+	if syncing {
+		return nil
+	}
+	if id := remoteRepoID(lr.RemoteWS); id != "" && id != ws.RepoID {
+		return fmt.Errorf("the last run on %s used repo id %s, and this worktree's is now %s; run `sx --same-slot <command>` (which syncs) instead", runner, id, ws.RepoID)
+	}
+	if acq.PrevWorktreeKey != ws.WorktreeKey {
+		return fmt.Errorf("slot %d on %s now holds another worktree's files; run `sx --same-slot <command>` (which syncs) instead", lr.Slot, runner)
+	}
+	return nil
+}
+
+// remoteRepoID is the RepoID in a helper workspace path
+// ({root}/repos/{id}/slots/slot-NN/workspace), or "" for any other shape.
+// Only that segment counts: the root may resolve differently between runs.
+func remoteRepoID(ws string) string {
+	slots := path.Dir(path.Dir(ws))
+	repo := path.Dir(slots)
+	if ws == "" || path.Base(slots) != "slots" || path.Base(path.Dir(repo)) != "repos" {
+		return ""
+	}
+	return path.Base(repo)
 }
 
 // PullDisplay is AcquireSlot's display for `spotexec pull`, which only
