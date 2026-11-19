@@ -48,12 +48,13 @@ if command -v zsh >/dev/null; then
 fi
 
 echo "== Go release in every archive"
-# The binary each archive ships, for every platform, not just this one.
-for a in "$DIST"/spotexec_"${VERSION}"_*.tar.gz; do
-  p=$(basename "$a" .tar.gz)
+# The binary each archive ships, for every platform (.goreleaser.yaml), not
+# just this one; a missing archive fails too.
+for t in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+  p="spotexec_${VERSION}_$t"
   mkdir -p "$WORK/$p"
   check "$p built with go.mod's Go" \
-    "tar -xzf '$a' -C '$WORK/$p' spotexec && '$ROOT/scripts/check-go-version.sh' '$WORK/$p/spotexec'"
+    "tar -xzf '$DIST/$p.tar.gz' -C '$WORK/$p' spotexec && '$ROOT/scripts/check-go-version.sh' '$WORK/$p/spotexec'"
 done
 
 echo "== sx is run-only"

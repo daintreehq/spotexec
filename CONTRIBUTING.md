@@ -36,7 +36,7 @@ git push origin v0.2.0
 git checkout develop && git merge main && git push origin develop   # keep develop in step
 ```
 
-CI also builds a snapshot of the release on every push and pull request and smoke-tests what users install (the archive, `sx`, completions and the Linux packages). To do the same locally: `goreleaser release --snapshot --clean --skip=publish && ./scripts/smoke-release.sh`. CI and the Release workflow pin GoReleaser to one version (in both workflow files) so an upgrade can't change a release unannounced; bump it in both places together.
+CI also builds a snapshot of the release on every push and pull request and smoke-tests what users install (the archive, `sx`, completions and the Linux packages). To do the same locally: `export GOTOOLCHAIN=go$(go list -m -f '{{.GoVersion}}') && goreleaser release --snapshot --clean --skip=publish && ./scripts/smoke-release.sh`. The `GOTOOLCHAIN` pin matters when your default Go is newer: every binary must be built by exactly the Go release on go.mod's `go` line ([scripts/check-go-version.sh](scripts/check-go-version.sh)), the patch CI scans with govulncheck, so moving to a new Go patch means raising that line. CI and the Release workflow pin GoReleaser to one version (in both workflow files) so an upgrade can't change a release unannounced; bump it in both places together.
 
 The tag starts the [Release workflow](.github/workflows/release.yml). It refuses a tag that isn't on `main`, builds the embedded helpers, runs vet and the race tests, and then runs [GoReleaser](.goreleaser.yaml), which:
 - builds `spotexec` for macOS and Linux (amd64, arm64) with the remote helpers embedded;

@@ -29,12 +29,15 @@ for f in "$@"; do
   elif [ ! -f "$f" ]; then
     echo "$f: no such file" >&2; fail=1; continue
   fi
-  # `go version FILE` prints "FILE: goX.Y.Z", and nothing for a non-Go file.
-  out=$(go version "$bin" 2>&1) || true
-  got=${out##*: }
-  if [ "$got" = "$WANT" ]; then
-    echo "$f: $got"
+  # `go version FILE` prints "FILE: goX.Y.Z" on its first stdout line (more
+  # lines follow under GOFLAGS=-m) and nothing for a non-Go file. Diagnostics
+  # go to stderr, so a path that ends in a version can't pass for one.
+  out=$(go version "$bin" 2>/dev/null) || out=
+  line=${out%%$'\n'*}
+  if [ "$line" = "$bin: $WANT" ]; then
+    echo "$f: $WANT"
   else
+    got=${line#"$bin: "}
     echo "$f: built with ${got:-no Go version (not a Go binary)}, want $WANT (go.mod)" >&2
     fail=1
   fi
