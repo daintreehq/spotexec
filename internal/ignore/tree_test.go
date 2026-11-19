@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 )
 
@@ -94,7 +93,7 @@ func TestTreeTrailingSlash(t *testing.T) {
 func TestTreeReadErrors(t *testing.T) {
 	cases := map[string]func(t *testing.T, p string){
 		"fifo": func(t *testing.T, p string) {
-			if err := syscall.Mkfifo(p, 0o644); err != nil {
+			if err := mkfifo(p); err != nil {
 				t.Skip(err)
 			}
 		},
