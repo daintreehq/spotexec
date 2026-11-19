@@ -178,26 +178,111 @@ func TestPrivateDirModes(t *testing.T) {
 }
 
 // A home whose ancestor others could rename lets them swap the control
-// directory for theirs after it was checked: refused.
+// directory for theirs after it was checked: the short one in tmp is used
+// instead. A sticky ancestor (as /tmp is) is fine.
 func TestControlDirRefusesReplaceableAncestor(t *testing.T) {
 	top := shortDir(t)
 	home := filepath.Join(top, "h")
 	if err := os.Mkdir(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	useCtlDirs(t, home, t.TempDir())
+	tmp := t.TempDir()
+	useCtlDirs(t, home, tmp)
 	if err := os.Chmod(top, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	if d, err := controlDir(); err == nil || d != "" {
-		t.Fatalf("controlDir = %q, %v; want an error", d, err)
-	}
-	// Sticky, as /tmp is: others can't move our entries.
+	t.Cleanup(func() { os.Chmod(top, 0o700) })
+	wantIn(t, tmp)
+	useCtlDirs(t, home, tmp)
 	if err := os.Chmod(top, 0o777|fs.ModeSticky); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlDir(); err != nil {
+	wantIn(t, filepath.Join(home, ".cache", "spotexec"))
+}
+
+// A symlink on the way may lead through a directory that is on neither
+// the path as written nor the path it resolves to: that one is checked too.
+func TestControlDirChecksDirsBetweenSymlinks(t *testing.T) {
+	top := shortDir(t)
+	real := filepath.Join(top, "r")
+	open := filepath.Join(top, "w") // others may rename what's in here
+	for _, d := range []string{real, open} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(real, filepath.Join(open, "l2")); err != nil {
 		t.Fatal(err)
+	}
+	home := filepath.Join(top, "l1")
+	if err := os.Symlink(filepath.Join(open, "l2"), home); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(open, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(open, 0o700) })
+	tmp := t.TempDir()
+	useCtlDirs(t, home, tmp)
+	wantIn(t, tmp)
+}
+
+// OpenSSH expands %-tokens and ${VAR} in a ControlPath: a home holding
+// either isn't used, since ssh would read another path than the one checked.
+func TestControlDirSkipsExpandingHome(t *testing.T) {
+	for _, name := range []string{"a%h", "b${X}"} {
+		home := filepath.Join(shortDir(t), name)
+		if err := os.Mkdir(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		tmp := t.TempDir()
+		useCtlDirs(t, home, tmp)
+		wantIn(t, tmp)
+	}
+}
+
+// wantIn checks controlDir gives a private directory inside parent.
+func wantIn(t *testing.T, parent string) {
+	t.Helper()
+	d, err := controlDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(d) != parent && d != filepath.Join(parent, "cm") {
+		t.Fatalf("controlDir = %s, want one in %s", d, parent)
+	}
+	mustPrivate(t, d)
+}
+
+// A client re-checks its directory before each use: one cleaned away is
+// made anew, and one whose name is now something else's is refused.
+func TestClientRechecksControlDir(t *testing.T) {
+	tmp := t.TempDir()
+	useCtlDirs(t, longHome(t), tmp)
+	t.Setenv("PATH", t.TempDir()) // no ssh: nothing gets that far
+	c := New(provider.Target{Host: "box"}, "")
+	if c.ctlErr != nil {
+		t.Fatal(c.ctlErr)
+	}
+	dir := filepath.Dir(c.ctlPath)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Run(context.Background(), "true", nil); IsSetupError(err) {
+		t.Fatalf("Run after cleanup: %v", err)
+	}
+	mustPrivate(t, dir)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Run(context.Background(), "true", nil); !IsSetupError(err) {
+		t.Fatalf("Run with the name taken: %v, want a setup error", err)
+	}
+	if c.MasterAlive(context.Background()) {
+		t.Fatal("MasterAlive with the name taken")
 	}
 }
 
@@ -230,42 +315,52 @@ func TestControlDirRefusesForeignEntry(t *testing.T) {
 	}
 }
 
-// The home directory's control directory must exist and be private too: a
-// failure to make it, or a symlink in its place, is an error, not a path.
+// The home directory's control directory must be private too. A failure
+// to make it, or a symlink in its place, falls back to the short one in
+// tmp, never to the home path unchecked.
 func TestControlDirHomeMustBePrivate(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		home := shortDir(t)
 		useCtlDirs(t, home, t.TempDir())
-		d, err := controlDir()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if d != filepath.Join(home, ".cache", "spotexec", "cm") {
-			t.Fatalf("controlDir = %s, want the home directory's", d)
-		}
-		mustPrivate(t, d)
+		wantIn(t, filepath.Join(home, ".cache", "spotexec"))
 	})
 	t.Run("cannot create", func(t *testing.T) {
 		home := shortDir(t)
-		useCtlDirs(t, home, t.TempDir())
+		tmp := t.TempDir()
+		useCtlDirs(t, home, tmp)
 		if err := os.WriteFile(filepath.Join(home, ".cache"), nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if d, err := controlDir(); err == nil || d != "" {
-			t.Fatalf("controlDir = %q, %v; want an error", d, err)
-		}
+		wantIn(t, tmp)
 	})
 	t.Run("symlink", func(t *testing.T) {
 		home := shortDir(t)
-		useCtlDirs(t, home, t.TempDir())
+		tmp := t.TempDir()
+		useCtlDirs(t, home, tmp)
 		if err := os.MkdirAll(filepath.Join(home, ".cache", "spotexec"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(t.TempDir(), filepath.Join(home, ".cache", "spotexec", "cm")); err != nil {
 			t.Fatal(err)
 		}
-		if d, err := controlDir(); err == nil || d != "" {
-			t.Fatalf("controlDir = %q, %v; want an error", d, err)
+		wantIn(t, tmp)
+	})
+	t.Run("both fail", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("root ignores directory permissions")
+		}
+		home := shortDir(t)
+		tmp := t.TempDir()
+		useCtlDirs(t, home, tmp)
+		if err := os.WriteFile(filepath.Join(home, ".cache"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(tmp, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(tmp, 0o700) })
+		if d, err := controlDir(); !IsSetupError(err) || d != "" {
+			t.Fatalf("controlDir = %q, %v; want a setup error", d, err)
 		}
 	})
 }

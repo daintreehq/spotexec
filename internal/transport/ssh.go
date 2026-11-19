@@ -49,6 +49,21 @@ type Client struct {
 // *SetupError), or nil.
 func (c *Client) SetupErr() error { return c.ctlErr }
 
+// setup re-checks the client's control directory before its path goes to
+// ssh: one checked when the client was made may since have been cleaned
+// away, and its name taken by another user. One cleaned away is made anew.
+func (c *Client) setup() error {
+	if c.ctlErr != nil {
+		return c.ctlErr
+	}
+	ctlMu.Lock()
+	defer ctlMu.Unlock()
+	if err := privateDir(filepath.Dir(c.ctlPath)); err != nil {
+		return &SetupError{err}
+	}
+	return nil
+}
+
 // New builds a client for a target. Without a private directory for its
 // control socket the client can't connect: its calls return that error.
 func New(t provider.Target, workRoot string) *Client {
@@ -101,22 +116,29 @@ var (
 func controlDir() (string, error) {
 	ctlMu.Lock()
 	defer ctlMu.Unlock()
+	shared := filepath.Join(tmpRoot, fmt.Sprintf("sx-cm-%d", os.Getuid()))
 	if ctlDir == "" {
 		home, _ := os.UserHomeDir()
-		if d := filepath.Join(home, ".cache", "spotexec", "cm"); home != "" && len(d)+17+17 <= 100 {
+		// OpenSSH expands %-tokens and ${VAR} in ControlPath: a home with
+		// either would name another directory than the one checked here.
+		if d := filepath.Join(home, ".cache", "spotexec", "cm"); home != "" && len(d)+17+17 <= 100 && !strings.ContainsAny(d, "%$") {
 			ctlDir, ctlShared = d, false
 		} else {
-			ctlDir, ctlShared = filepath.Join(tmpRoot, fmt.Sprintf("sx-cm-%d", os.Getuid())), true
+			ctlDir, ctlShared = shared, true
 		}
 	}
+	var herr error
 	if !ctlShared {
-		if err := os.MkdirAll(filepath.Dir(ctlDir), 0o700); err != nil {
-			return "", &SetupError{err}
+		herr = os.MkdirAll(filepath.Dir(ctlDir), 0o700)
+		if herr == nil {
+			herr = privateDir(ctlDir)
 		}
-		if err := privateDir(ctlDir); err != nil {
-			return "", &SetupError{err}
+		if herr == nil {
+			return ctlDir, nil
 		}
-		return ctlDir, nil
+		// A home that can't hold a private directory (under a group-writable
+		// /home, say): the short one in tmp serves as well.
+		ctlDir, ctlShared = shared, true
 	}
 	perr := privateDir(ctlDir)
 	if perr == nil {
@@ -127,6 +149,9 @@ func controlDir() (string, error) {
 		err = privateDir(d) // the umask may have taken the owner's bits
 	}
 	if err != nil {
+		if herr != nil {
+			perr = fmt.Errorf("%v; %v", herr, perr)
+		}
 		return "", &SetupError{fmt.Errorf("%v, and no private alternative: %w", perr, err)}
 	}
 	ctlDir = d
@@ -159,13 +184,17 @@ func CheckControlDir() error {
 // owned by us, mode 0700, and that no other user can put anything in its
 // place or in it. One others could write to is refused, not fixed, as is
 // one holding anything of theirs: a socket they left there would stand in
-// for the master.
+// for the master. Callers hold ctlMu.
 func privateDir(dir string) error {
 	if err := safeAncestors(dir); err != nil {
 		return err
 	}
-	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-		return err
+	created := true
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		created = false
 	}
 	fi, err := os.Lstat(dir)
 	if err != nil {
@@ -184,48 +213,112 @@ func privateDir(dir string) error {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return err
 	}
+	// Once ours and private, nobody else can add to it: one scan per
+	// directory per process is enough, and a new one needs none. (Lock
+	// files pile up per VM, and a client is made per VM per daemon round.)
+	ino := uint64(st.Ino)
+	if created || scannedDirs[dir] == ino {
+		scannedDirs[dir] = ino
+		return nil
+	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
 	for _, e := range ents {
 		efi, err := e.Info()
-		if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
 			continue // gone meanwhile
 		}
-		if est, ok := efi.Sys().(*syscall.Stat_t); !ok || int(est.Uid) != os.Getuid() {
+		if err != nil {
+			return err // one we can't even look at isn't known to be ours
+		}
+		if est, ok := efi.Sys().(*syscall.Stat_t); !ok || !trustedUID(est.Uid) {
 			return fmt.Errorf("%s holds %s, which is another user's (remove it, and spotexec makes a private one)", dir, e.Name())
 		}
 	}
+	scannedDirs[dir] = ino
 	return nil
 }
 
+// scannedDirs are the private directories (by inode) privateDir has found
+// holding nothing of another user's. Guarded by ctlMu.
+var scannedDirs = map[string]uint64{}
+
+func trustedUID(uid uint32) bool { return uid == 0 || int(uid) == os.Getuid() }
+
 // safeAncestors checks that no other user can swap dir for one of theirs by
-// renaming an ancestor: each, along the path as given and as resolved, is
-// owned by root or us, and one others may write to is sticky (as /tmp is),
-// so they can't move our entries in it. A symlink's own mode means nothing.
+// changing a directory on the way to it.
 func safeAncestors(dir string) error {
-	paths := []string{filepath.Clean(dir)}
-	if r, err := filepath.EvalSymlinks(filepath.Dir(dir)); err == nil {
-		paths = append(paths, filepath.Join(r, filepath.Base(dir)))
+	_, err := safePath(filepath.Dir(dir), 0)
+	return err
+}
+
+// safePath checks every directory from the root to p as the kernel walks
+// it, following each symlink through every directory on its way: each is
+// owned by root or us, and one others may write to is sticky (as /tmp is),
+// so they can't move our entries in it. A symlink's own mode means nothing,
+// but its owner does. It returns p's real path.
+func safePath(p string, depth int) (string, error) {
+	if depth > 32 {
+		return "", fmt.Errorf("%s: too many symlinks", p)
 	}
-	for _, p := range paths {
-		for a := filepath.Dir(p); ; a = filepath.Dir(a) {
-			fi, err := os.Lstat(a)
-			if err != nil {
-				return err
-			}
-			st, ok := fi.Sys().(*syscall.Stat_t)
-			if !ok || (st.Uid != 0 && int(st.Uid) != os.Getuid()) {
-				return fmt.Errorf("%s is owned by another user", a)
-			}
-			if fi.Mode()&fs.ModeSymlink == 0 && fi.Mode().Perm()&0o022 != 0 && fi.Mode()&fs.ModeSticky == 0 {
-				return fmt.Errorf("%s is writable by other users", a)
-			}
-			if a == filepath.Dir(a) {
-				break
-			}
+	if !filepath.IsAbs(p) {
+		return "", fmt.Errorf("%s is not an absolute path", p)
+	}
+	cur := "/"
+	if err := safeDir(cur); err != nil {
+		return "", err
+	}
+	for _, name := range strings.Split(p, "/") {
+		switch name {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur) // cur is a real path: no symlink to undo
+			continue
 		}
+		next := filepath.Join(cur, name)
+		fi, err := os.Lstat(next)
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			if err := safeDir(next); err != nil {
+				return "", err
+			}
+			cur = next
+			continue
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || !trustedUID(st.Uid) {
+			return "", fmt.Errorf("%s is owned by another user", next)
+		}
+		t, err := os.Readlink(next)
+		if err != nil {
+			return "", err
+		}
+		if !strings.HasPrefix(t, "/") {
+			t = cur + "/" + t // not filepath.Join: ".." must follow what came before it
+		}
+		if cur, err = safePath(t, depth+1); err != nil {
+			return "", err
+		}
+	}
+	return cur, nil
+}
+
+// safeDir checks one directory on the way to the control directory.
+func safeDir(d string) error {
+	fi, err := os.Lstat(d)
+	if err != nil {
+		return err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || !trustedUID(st.Uid) {
+		return fmt.Errorf("%s is owned by another user", d)
+	}
+	if fi.Mode().Perm()&0o022 != 0 && fi.Mode()&fs.ModeSticky == 0 {
+		return fmt.Errorf("%s is writable by other users", d)
 	}
 	return nil
 }
@@ -305,7 +398,7 @@ func (c *Client) MasterAlive(ctx context.Context) bool {
 // masterPID asks the control master whether it is running, and its pid (0
 // if ssh didn't say).
 func (c *Client) masterPID(ctx context.Context) (int, bool) {
-	if c.ctlErr != nil {
+	if c.setup() != nil {
 		return 0, false
 	}
 	ctx, cancel := context.WithTimeout(ctx, muxTimeout)
@@ -325,8 +418,8 @@ func (c *Client) masterPID(ctx context.Context) (int, bool) {
 // lockMaster serializes starting and retiring this target's master across
 // processes. Without flock (some network filesystems) it goes unlocked.
 func (c *Client) lockMaster(ctx context.Context) (func(), error) {
-	if c.ctlErr != nil {
-		return nil, c.ctlErr
+	if err := c.setup(); err != nil {
+		return nil, err
 	}
 	lf, err := os.OpenFile(c.ctlPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -362,8 +455,8 @@ func (c *Client) EnsureMaster(ctx context.Context) error {
 // file-backed stderr: a backgrounded master inheriting our pipes would
 // otherwise hold them open and hang every caller.
 func (c *Client) ensureMaster(ctx context.Context) (int, bool, error) {
-	if c.ctlErr != nil {
-		return 0, false, c.ctlErr
+	if err := c.setup(); err != nil {
+		return 0, false, err
 	}
 	if pid, ok := c.masterPID(ctx); ok {
 		return pid, false, nil
@@ -402,7 +495,7 @@ func (c *Client) ensureMaster(ctx context.Context) (int, bool, error) {
 
 // CloseMaster stops the control master, ending every session on it.
 func (c *Client) CloseMaster() {
-	if c.ctlErr != nil {
+	if c.setup() != nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), muxTimeout)
@@ -467,8 +560,8 @@ func (e *ConnError) Error() string {
 
 // Run executes remoteCmd and returns stdout. stdin may be nil.
 func (c *Client) Run(ctx context.Context, remoteCmd string, stdin io.Reader) ([]byte, error) {
-	if c.ctlErr != nil {
-		return nil, c.ctlErr
+	if err := c.setup(); err != nil {
+		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, "ssh", c.Args(remoteCmd)...)
 	cmd.Stdin = stdin
@@ -689,8 +782,8 @@ func (c *Client) ensureHelper(ctx context.Context, force bool, probe time.Durati
 	// The marker records the remote platform and the hash we installed; it
 	// is only trusted if this binary still embeds that exact helper, so an
 	// upgraded CLI reinstalls instead of driving a stale helper.
-	if c.ctlErr != nil {
-		return "", c.ctlErr // before the markers: their fast path must not hide it
+	if err := c.setup(); err != nil {
+		return "", err // before the markers: their fast path must not hide it
 	}
 	if !force {
 		if hash, ok := c.installedHash(); ok {
@@ -782,8 +875,8 @@ var ErrHelperNotInstalled = errors.New("helper not installed on this runner")
 // this machine already installed this exact helper on the target: it never
 // uploads or reinstalls one, which would touch an ephemeral VM's idle clock.
 func (c *Client) HelperCmdInstalled(ctx context.Context, args ...string) ([]byte, error) {
-	if c.ctlErr != nil {
-		return nil, c.ctlErr
+	if err := c.setup(); err != nil {
+		return nil, err
 	}
 	hash, ok := c.installedHash()
 	if !ok {
