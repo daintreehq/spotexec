@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -45,10 +46,10 @@ func TestInstallRefusesUnreadableSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ok, err := InstallClaude(p, "spotexec hook claude"); err == nil || ok {
-		t.Fatalf("install over an unreadable file: changed %v, err %v", ok, err)
+		t.Errorf("install over an unreadable file: changed %v, err %v", ok, err)
 	}
 	if ok, err := UninstallClaude(p); err == nil || ok {
-		t.Fatalf("uninstall over an unreadable file: changed %v, err %v", ok, err)
+		t.Errorf("uninstall over an unreadable file: changed %v, err %v", ok, err)
 	}
 	if err := os.Chmod(p, 0o600); err != nil {
 		t.Fatal(err)
@@ -63,6 +64,7 @@ func TestInstallRefusesNonObjectSettings(t *testing.T) {
 		`"x"`,
 		`{"hooks":[]}`,
 		`{"hooks":{"PreToolUse":{}}}`,
+		`{"a":1} {"b":2}`,
 	} {
 		p := filepath.Join(t.TempDir(), "settings.json")
 		if err := os.WriteFile(p, []byte(doc), 0o644); err != nil {
@@ -162,4 +164,66 @@ func TestUninstallBlankSettings(t *testing.T) {
 		t.Fatalf("uninstall from a blank file: changed %v, err %v", ok, err)
 	}
 	unchanged(t, p, "  \n")
+}
+
+func TestInstallRefusesReadOnlySettings(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only file")
+	}
+	p := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(p, []byte(sentinelSettings), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err == nil || ok {
+		t.Fatalf("install over a read-only file: changed %v, err %v", ok, err)
+	}
+	unchanged(t, p, sentinelSettings)
+	noTemps(t, p)
+}
+
+func TestInstallRefusesDanglingSettingsLink(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.Symlink("missing.json", p); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err == nil || ok {
+		t.Errorf("install through a dangling link: changed %v, err %v", ok, err)
+	}
+	if ok, err := UninstallClaude(p); err != nil || ok {
+		t.Errorf("uninstall through a dangling link: changed %v, err %v", ok, err)
+	}
+	if fi, err := os.Lstat(p); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the dangling link was replaced: %v", err)
+	}
+	noTemps(t, p)
+}
+
+func TestInstallKeepsNumbersAsWritten(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(p, []byte(`{"big":9007199254740993,"f":1.50}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	if ok, err := UninstallClaude(p); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	b, _ := os.ReadFile(p)
+	if !strings.Contains(string(b), "9007199254740993") || !strings.Contains(string(b), "1.50") {
+		t.Fatalf("numbers changed:\n%s", b)
+	}
+}
+
+func TestInstallNewSettingsHonoursUmask(t *testing.T) {
+	old := syscall.Umask(0o027)
+	t.Cleanup(func() { syscall.Umask(old) })
+	p := filepath.Join(t.TempDir(), ".claude", "settings.json")
+	if ok, err := InstallClaude(p, "spotexec hook claude"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != 0o640 {
+		t.Fatalf("new settings mode: %v %v", fi.Mode(), err)
+	}
+	noTemps(t, p)
 }

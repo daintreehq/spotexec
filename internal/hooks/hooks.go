@@ -1339,7 +1339,7 @@ func HasLegacyClaude(settingsPath string) bool { return hasForm(settingsPath, ho
 // path than hookCmd is updated to hookCmd's. It reports whether the file
 // changed.
 func InstallClaude(settingsPath, hookCmd string) (bool, error) {
-	settings, _, err := loadClaudeSettings(settingsPath)
+	target, settings, err := loadClaudeSettings(settingsPath)
 	if err != nil {
 		return false, err
 	}
@@ -1454,7 +1454,7 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 	}
 	hooks["PreToolUse"] = pre
 	settings["hooks"] = hooks
-	if err := saveClaudeSettings(settingsPath, settings); err != nil {
+	if err := saveClaudeSettings(target, settings); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1463,8 +1463,11 @@ func InstallClaude(settingsPath, hookCmd string) (bool, error) {
 // UninstallClaude removes spotexec hook entries. A chained hook goes back to
 // the hook it chained (RTK's), which stays installed.
 func UninstallClaude(settingsPath string) (bool, error) {
-	settings, exists, err := loadClaudeSettings(settingsPath)
-	if err != nil || !exists {
+	target, settings, err := loadClaudeSettings(settingsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil // a dangling link: nothing to remove
+	}
+	if err != nil {
 		return false, err
 	}
 	hooks, _ := settings["hooks"].(map[string]any)
@@ -1503,83 +1506,94 @@ func UninstallClaude(settingsPath string) (bool, error) {
 	if len(hooks) == 0 {
 		delete(settings, "hooks")
 	}
-	if err := saveClaudeSettings(settingsPath, settings); err != nil {
+	if err := saveClaudeSettings(target, settings); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-// loadClaudeSettings reads a Claude Code settings file for a change. A missing or
-// blank file is an empty document, and exists reports which. Any other read
-// error, or a document whose top level, hooks, or hooks.PreToolUse isn't the
-// shape Claude Code reads, is an error before anything changes: rewriting
-// what couldn't be read would lose the user's settings.
-func loadClaudeSettings(settingsPath string) (settings map[string]any, exists bool, err error) {
-	b, err := os.ReadFile(settingsPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return map[string]any{}, false, nil
+// loadClaudeSettings reads a Claude Code settings file for a change, and
+// returns the file to replace: settingsPath, or the file it links to (a
+// dotfiles symlink, say), resolved once so the change lands where it was
+// read. A missing or blank file is an empty document. Any other read error,
+// a dangling link (wrapping os.ErrNotExist), or a document whose top level,
+// hooks, or hooks.PreToolUse isn't the shape Claude Code reads is an error
+// before anything changes: rewriting what couldn't be read would lose the
+// user's settings. Numbers are kept as written.
+func loadClaudeSettings(settingsPath string) (target string, settings map[string]any, err error) {
+	target, err = filepath.EvalSymlinks(settingsPath)
+	if err != nil {
+		if _, lerr := os.Lstat(settingsPath); !errors.Is(lerr, os.ErrNotExist) {
+			return "", nil, fmt.Errorf("%s: %w", settingsPath, err)
+		}
+		target = settingsPath // a new file
+	}
+	b, err := os.ReadFile(target)
+	if errors.Is(err, os.ErrNotExist) || err == nil && len(bytes.TrimSpace(b)) == 0 {
+		return target, map[string]any{}, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return "", nil, err
 	}
-	if len(bytes.TrimSpace(b)) == 0 {
-		return map[string]any{}, false, nil
-	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
 	var doc any
-	if err := json.Unmarshal(b, &doc); err != nil {
-		return nil, true, fmt.Errorf("%s is not valid JSON: %w", settingsPath, err)
+	if err := dec.Decode(&doc); err != nil {
+		return "", nil, fmt.Errorf("%s is not valid JSON: %w", settingsPath, err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return "", nil, fmt.Errorf("%s is not valid JSON: data after the top-level value", settingsPath)
 	}
 	settings, ok := doc.(map[string]any)
 	if !ok {
-		return nil, true, fmt.Errorf("%s is not a JSON object", settingsPath)
+		return "", nil, fmt.Errorf("%s is not a JSON object", settingsPath)
 	}
 	if h, has := settings["hooks"]; has {
 		hm, ok := h.(map[string]any)
 		if !ok {
-			return nil, true, fmt.Errorf("%s: \"hooks\" is not a JSON object", settingsPath)
+			return "", nil, fmt.Errorf("%s: \"hooks\" is not a JSON object", settingsPath)
 		}
 		if pre, has := hm["PreToolUse"]; has {
 			if _, ok := pre.([]any); !ok {
-				return nil, true, fmt.Errorf("%s: \"hooks.PreToolUse\" is not a JSON array", settingsPath)
+				return "", nil, fmt.Errorf("%s: \"hooks.PreToolUse\" is not a JSON array", settingsPath)
 			}
 		}
 	}
-	return settings, true, nil
+	return target, settings, nil
 }
 
 // renameFile replaces a settings file; a test makes it fail.
 var renameFile = os.Rename
 
-// saveClaudeSettings replaces a Claude Code settings file whole: the new document
-// goes to a temporary file beside it, which is renamed over it only once
-// fully written, so an interrupted write never leaves partial JSON. The file
-// keeps its permissions, and a symlinked settings file (dotfiles, say) stays
-// a symlink, with its target replaced.
-func saveClaudeSettings(settingsPath string, settings map[string]any) error {
+// saveClaudeSettings replaces target, the file loadClaudeSettings returned,
+// whole: the new document goes to a temporary file beside it, which is
+// renamed over it only once fully written, so an interrupted write never
+// leaves partial JSON. An existing file must be writable, as it had to be
+// when it was rewritten in place, and keeps its permissions; a new one is
+// created 0644 less the umask.
+func saveClaudeSettings(target string, settings map[string]any) error {
 	b, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
-	path := settingsPath
-	if p, err := filepath.EvalSymlinks(settingsPath); err == nil {
-		path = p
-	} else if _, lerr := os.Lstat(settingsPath); !errors.Is(lerr, os.ErrNotExist) {
-		// A dangling or looping link, or one that can't be followed:
-		// replacing it would cut the user's link.
-		return fmt.Errorf("%s: %w", settingsPath, err)
-	}
-	mode := os.FileMode(0o644)
-	if fi, err := os.Stat(path); err == nil {
-		mode = fi.Mode().Perm()
+	mode, existed := os.FileMode(0o644), false
+	if fi, err := os.Stat(target); err == nil {
+		mode, existed = fi.Mode().Perm(), true
+		// Renaming over a read-only file would get around its permissions.
+		f, err := os.OpenFile(target, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		f.Close()
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	dir := filepath.Dir(path)
+	dir := filepath.Dir(target)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".spotexec-*")
+	tmp, err := createSettingsTemp(dir, filepath.Base(target), mode)
 	if err != nil {
 		return err
 	}
@@ -1588,9 +1602,11 @@ func saveClaudeSettings(settingsPath string, settings map[string]any) error {
 		tmp.Close()
 		return err
 	}
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return err
+	if existed {
+		if err := tmp.Chmod(mode); err != nil {
+			tmp.Close()
+			return err
+		}
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
@@ -1599,7 +1615,19 @@ func saveClaudeSettings(settingsPath string, settings map[string]any) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return renameFile(tmp.Name(), path)
+	return renameFile(tmp.Name(), target)
+}
+
+// createSettingsTemp creates a new hidden file in dir with mode less the
+// umask (os.CreateTemp would always make it 0600).
+func createSettingsTemp(dir, base string, mode os.FileMode) (*os.File, error) {
+	for i := 0; ; i++ {
+		name := filepath.Join(dir, fmt.Sprintf(".%s.spotexec-%d-%d", base, os.Getpid(), time.Now().UnixNano()))
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if err == nil || !errors.Is(err, os.ErrExist) || i == 9 {
+			return f, err
+		}
+	}
 }
 
 // AgentsSnippet is guidance for harnesses without hooks.
