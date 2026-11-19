@@ -17,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/daintreehq/spotexec/internal/config"
 )
 
 // Credential sources that work without the AWS CLI, read from
@@ -141,12 +143,19 @@ func configCredentials(ctx context.Context, profile string) (awsCreds, error) {
 	if region == "" || cacheKey == "" || startURL == "" {
 		return awsCreds{}, fmt.Errorf("profile %q: incomplete SSO configuration", profile)
 	}
+	endpoint, err := ssoEndpoint("portal.sso", region, "/federation/credentials", profile)
+	if err != nil {
+		return awsCreds{}, fmt.Errorf("%w (in %s)", err, cfg)
+	}
 	tok, err := ssoToken(ctx, cacheKey, region, profile)
 	if err != nil {
 		return awsCreds{}, err
 	}
 	q := url.Values{"account_id": {account}, "role_name": {role}}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://portal.sso."+region+".amazonaws.com/federation/credentials?"+q.Encode(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
+	if err != nil {
+		return awsCreds{}, fmt.Errorf("profile %q: SSO GetRoleCredentials request: %w", profile, err)
+	}
 	req.Header.Set("x-amz-sso_bearer_token", tok)
 	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 	if err != nil {
@@ -188,10 +197,29 @@ func parseExpiry(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339, s)
 }
 
+// ssoEndpoint builds https://{service}.{region}.amazonaws.com{path} from an
+// sso_region read from ~/.aws/config, which nothing else validates: a value
+// that is not a region name either fails to parse or moves the endpoint, and
+// the token sent to it, off AWS.
+func ssoEndpoint(service, region, path, profile string) (string, error) {
+	if !config.ValidRegion(region) {
+		return "", fmt.Errorf("profile %q: invalid sso_region %q", profile, region)
+	}
+	host := service + "." + region + ".amazonaws.com"
+	if u, err := url.Parse("https://" + host + path); err != nil || u.Host != host || u.Path != path {
+		return "", fmt.Errorf("profile %q: sso_region %q does not form a valid SSO endpoint", profile, region)
+	}
+	return "https://" + host + path, nil
+}
+
 // ssoToken returns a valid SSO access token from the CLI's cache,
 // refreshing it with the cached refresh token when it has expired (the
 // refresh token rotates, so the cache file is rewritten under a lock).
 func ssoToken(ctx context.Context, cacheKey, region, profile string) (string, error) {
+	endpoint, err := ssoEndpoint("oidc", region, "/token", profile)
+	if err != nil {
+		return "", err
+	}
 	home, err := awsHome()
 	if err != nil {
 		return "", err
@@ -234,7 +262,10 @@ func ssoToken(ctx context.Context, cacheKey, region, profile string) (string, er
 	}
 	body, _ := json.Marshal(map[string]string{"clientId": str("clientId"), "clientSecret": str("clientSecret"),
 		"grantType": "refresh_token", "refreshToken": str("refreshToken")})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://oidc."+region+".amazonaws.com/token", strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return "", fmt.Errorf("profile %q: SSO token refresh request: %w", profile, err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 	if err != nil {
