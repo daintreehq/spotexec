@@ -256,16 +256,35 @@ func (a *AWSSpot) setCacheRule(ctx context.Context, bucket, acct string) int {
 	return st
 }
 
-// s3ErrorCode is the Code of S3's error document b ("" when b isn't one).
+// s3ErrorCode is the Code of S3's error document b ("" when b isn't
+// exactly one, read to its end).
 func s3ErrorCode(b []byte) string {
 	var e struct {
 		XMLName xml.Name `xml:"Error"`
-		Code    string   `xml:"Code"`
+		Code    []string `xml:"Code"`
 	}
-	if xml.Unmarshal(b, &e) != nil {
+	d := xml.NewDecoder(bytes.NewReader(b))
+	if d.Decode(&e) != nil || len(e.Code) != 1 {
 		return ""
 	}
-	return e.Code
+	for {
+		tok, err := d.Token()
+		if err == io.EOF {
+			return e.Code[0]
+		}
+		if err != nil {
+			return ""
+		}
+		switch t := tok.(type) {
+		case xml.Comment:
+		case xml.CharData:
+			if len(bytes.TrimSpace(t)) > 0 {
+				return ""
+			}
+		default:
+			return ""
+		}
+	}
 }
 
 // s3LifecycleRules is how many rules a bucket's lifecycle configuration

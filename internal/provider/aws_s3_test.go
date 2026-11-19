@@ -614,6 +614,10 @@ func TestEnsureBucketWritesNothingItCouldNotRead(t *testing.T) {
 		{"denied", twice(func() (int, string) { return 403, `<Error><Code>AccessDenied</Code></Error>` }, ""), 200, alone, [4]int{0, 0, 1, 1}, 1},
 		{"truncated", twice(func() (int, string) { return 200, cfg[:len(cfg)-10] }, cfg), 200, merged, [4]int{0, 0, 1, 1}, 1},
 		{"read fails", twice(func() (int, string) { return 200, readErr + cfg }, cfg), 200, merged, [4]int{0, 0, 1, 1}, 1},
+		{"error code in a comment", twice(func() (int, string) {
+			return 404, `<Error><Code>InternalError</Code><!-- <Code>NoSuchLifecycleConfiguration</Code> --></Error>`
+		}, ""), 200, alone, [4]int{0, 0, 1, 1}, 1},
+		{"error with more after it", twice(func() (int, string) { return 404, noLifecycle + `<` }, ""), 200, alone, [4]int{0, 0, 1, 1}, 1},
 		{"no answer", twice(func() (int, string) { return 404, "" }, ""), 200, alone, [4]int{0, 0, 1, 1}, 1},
 		{"bucket gone", twice(func() (int, string) { return 404, `<Error><Code>NoSuchBucket</Code></Error>` }, ""), 200, alone, [4]int{0, 0, 1, 1}, 3},
 		{"empty success", twice(func() (int, string) { return 204, "" }, cfg), 200, merged, [4]int{0, 0, 1, 1}, 1},
@@ -688,7 +692,7 @@ func TestEnsureBucketForgetsABucketGoneMidWrite(t *testing.T) {
 
 func TestWithCacheRule(t *testing.T) {
 	var full strings.Builder
-	for range s3LifecycleRules {
+	for range 1000 { // S3's limit
 		full.WriteString(adminRule)
 	}
 	for _, tc := range []struct {
@@ -699,6 +703,7 @@ func TestWithCacheRule(t *testing.T) {
 		{name: "bytes kept", in: "<?xml version=\"1.0\"?>\n<LifecycleConfiguration xmlns=\"x\">\n  " + adminRule + "<!-- note -->\n</LifecycleConfiguration>\n",
 			want: "<?xml version=\"1.0\"?>\n<LifecycleConfiguration xmlns=\"x\">\n  " + adminRule + "<!-- note -->\n" + wantCacheRule + "</LifecycleConfiguration>\n"},
 		{name: "has", in: lifecycleOf(wantCacheRule, adminRule), has: true},
+		{name: "has, later", in: lifecycleOf(adminRule, wantCacheRule), has: true},
 		{name: "has, split by a comment", in: `<LifecycleConfiguration><Rule><ID>spotexec<!-- x -->-expire</ID></Rule></LifecycleConfiguration>`, has: true},
 		// Only a rule's own, whole ID counts.
 		{name: "ID elsewhere", in: `<LifecycleConfiguration><Rule><ID>a</ID><Filter><Prefix>spotexec-expire</Prefix></Filter></Rule></LifecycleConfiguration>`,
