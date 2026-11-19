@@ -8,6 +8,7 @@
 set -euo pipefail
 
 DIST=$(cd "${1:-dist}" && pwd)
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VERSION=$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' "$DIST/metadata.json")
 [ -n "$VERSION" ] || { echo "no version in $DIST/metadata.json" >&2; exit 1; }
 OS=$(go env GOOS)
@@ -45,6 +46,15 @@ check "bash loads the sx completion" "bash -c 'source \"$B/completions/sx.bash\"
 if command -v zsh >/dev/null; then
   check "zsh parses the sx completion" "zsh -n '$B/completions/sx.zsh'"
 fi
+
+echo "== Go release in every archive"
+# The binary each archive ships, for every platform, not just this one.
+for a in "$DIST"/spotexec_"${VERSION}"_*.tar.gz; do
+  p=$(basename "$a" .tar.gz)
+  mkdir -p "$WORK/$p"
+  check "$p built with go.mod's Go" \
+    "tar -xzf '$a' -C '$WORK/$p' spotexec && '$ROOT/scripts/check-go-version.sh' '$WORK/$p/spotexec'"
+done
 
 echo "== sx is run-only"
 # No runners, so anything sx treats as a command fails with 125.
