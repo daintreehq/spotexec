@@ -322,7 +322,7 @@ func (p *TeardownPlan) listUsers(ctx context.Context, admin *awsClient) error {
 // are deleted, and the IAM users last. It carries on past failures and
 // returns an error naming everything it couldn't delete. While instances
 // remain, the security groups and IAM users are kept, so a re-run can
-// still find and finish them.
+// still find and finish them. A Regional plan touches no IAM user or key.
 func (p *TeardownPlan) Apply(ctx context.Context, log func(string, ...any)) error {
 	admin := accountClient(p.homeRegion(), accountResolver(p.adminProfile))
 	// The session may have changed accounts while the plan was on screen.
@@ -342,6 +342,10 @@ func (p *TeardownPlan) Apply(ctx context.Context, log func(string, ...any)) erro
 	byKind := map[string][]TeardownItem{}
 	for _, it := range p.Items {
 		byKind[it.Kind] = append(byKind[it.Kind], it)
+	}
+	if p.Regional {
+		// Account-wide: machines in other regions still use them.
+		delete(byKind, KindIAMUser)
 	}
 	client := func(region string) *awsClient { return accountClient(region, admin.creds) }
 
@@ -364,7 +368,9 @@ func (p *TeardownPlan) Apply(ctx context.Context, log func(string, ...any)) erro
 	// the plan was made, and wait until they're confirmed gone (security
 	// groups can't go before them).
 	instancesGone := true
-	if len(byKind[KindInstance]) > 0 || len(byKind[KindIAMUser]) > 0 {
+	// A regional teardown leaves the keys on, so a machine may launch into
+	// its regions at any time: always sweep them.
+	if len(byKind[KindInstance]) > 0 || len(byKind[KindIAMUser]) > 0 || p.Regional {
 		if err := stopMachineVMs(ctx, p.adminProfile, "", p.Regions, log); err != nil {
 			errs = append(errs, "instances: "+err.Error())
 			instancesGone = false

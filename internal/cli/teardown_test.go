@@ -78,13 +78,43 @@ func TestTeardownCommand(t *testing.T) {
 			t.Fatalf("err %v, output:\n%s", err, out)
 		}
 	})
+	t.Run("regional dry run", func(t *testing.T) {
+		p := plan()
+		p.Regional = true
+		fakeTeardown(t, p, nil)
+		out := captureStdout(t, func() {
+			if err := teardownAccount(context.Background(), "", []string{"us-east-2"}, false, true); err != nil {
+				t.Error(err)
+			}
+		})
+		if !strings.Contains(out, "only us-east-2: the account-wide IAM users and their keys are kept") {
+			t.Fatalf("output:\n%s", out)
+		}
+	})
+	t.Run("--region without a region", func(t *testing.T) {
+		// An empty list would mean the whole account, IAM users included.
+		for _, flag := range []string{"--region=", "--region=us-east-2,"} {
+			planned := false
+			oldPlan := planTeardown
+			planTeardown = func(context.Context, string, []string) (*provider.TeardownPlan, error) {
+				planned = true
+				return plan(), nil
+			}
+			var code int
+			captureStdout(t, func() { code = MainAs("spotexec", []string{"teardown", flag, "--yes"}) })
+			planTeardown = oldPlan
+			if code == 0 || planned {
+				t.Fatalf("%s: exit %d, planned %v", flag, code, planned)
+			}
+		}
+	})
 	t.Run("failures exit non-zero", func(t *testing.T) {
 		p := plan()
 		p.Failed = []string{"S3 buckets: AccessDenied"}
 		applied := fakeTeardown(t, p, errors.New("couldn't remove 1 resource(s): IAM user spotexec-mac: AccessDenied"))
 		var err error
 		captureStdout(t, func() { err = teardownAccount(context.Background(), "", nil, true, false) })
-		if err == nil || !strings.Contains(err.Error(), "IAM user spotexec-mac") || !strings.Contains(err.Error(), "S3 buckets") || *applied != 1 {
+		if err == nil || !strings.Contains(err.Error(), "IAM user spotexec-mac") || !strings.Contains(err.Error(), "S3 buckets") || !strings.Contains(err.Error(), "run the same command again") || *applied != 1 {
 			t.Fatalf("err %v", err)
 		}
 	})

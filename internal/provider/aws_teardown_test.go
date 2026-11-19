@@ -139,6 +139,10 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 	tagged := func(tags map[string]string) bool { return tags[tagOwner] != "" }
 	switch v.Get("Action") {
 	case "DescribeRegions":
+		if strings.HasPrefix(region, "us-gov-") {
+			fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo><item><regionName>us-gov-east-1</regionName></item><item><regionName>us-gov-west-1</regionName></item></regionInfo></DescribeRegionsResponse>`)
+			break
+		}
 		fmt.Fprint(w, `<DescribeRegionsResponse><regionInfo><item><regionName>us-west-2</regionName></item><item><regionName>us-east-2</regionName><optInStatus>opt-in-not-required</optInStatus></item><item><regionName>ap-east-1</regionName><optInStatus>not-opted-in</optInStatus></item></regionInfo></DescribeRegionsResponse>`)
 	case "DescribeImages":
 		if v.Get("Owner.1") != "self" || v.Get("Filter.1.Value.1") != tagOwner {
@@ -354,10 +358,12 @@ func TestTeardown(t *testing.T) {
 func TestTeardownGovCloud(t *testing.T) {
 	c := newFakeCloud(t)
 	c.instances["AK-admin"] = map[string][]fakeAcctInstance{"us-gov-east-1": c.instances["AK-admin"]["us-east-2"]}
+	c.late = nil
 	c.buckets["spotexec-cache-111111111111-us-gov-east-1"] = map[string]bool{}
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-gov-east-1"})
-	if err != nil || p.Err() != nil {
-		t.Fatalf("%v %v", err, p.Err())
+	t.Setenv("AWS_REGION", "us-gov-east-1") // the whole account, found from the session's region
+	p, err := PlanTeardown(context.Background(), "admin", nil)
+	if err != nil || p.Err() != nil || p.Regional || strings.Join(p.Regions, ",") != "us-gov-east-1,us-gov-west-1" {
+		t.Fatalf("%v %v %+v", err, p.Err(), p)
 	}
 	var got []string
 	for _, it := range p.Items {
@@ -371,6 +377,9 @@ func TestTeardownGovCloud(t *testing.T) {
 	}
 	if err := p.Apply(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
+	}
+	if c.users["spotexec-mac"] != nil || !strings.Contains(strings.Join(c.signed, ","), "iam DeleteUser us-gov-west-1") {
+		t.Fatalf("IAM user not removed through GovCloud's IAM: %v", c.signed)
 	}
 	// IAM is GovCloud's one endpoint; STS may also be asked regionally.
 	for _, s := range c.signed {
@@ -399,7 +408,7 @@ func TestTeardownGovCloud(t *testing.T) {
 func TestTeardownFailures(t *testing.T) {
 	c := newFakeCloud(t)
 	c.failRepo["spotexec/app"] = true
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, err := PlanTeardown(context.Background(), "admin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,11 +419,8 @@ func TestTeardownFailures(t *testing.T) {
 	if c.users["spotexec-mac"] != nil {
 		t.Fatal("the other resources should still be removed")
 	}
-	if c.buckets["spotexec-cache-111111111111-us-west-2"] == nil {
-		t.Fatal("--region us-east-2 deleted a us-west-2 bucket")
-	}
 	c.failRepo["spotexec/app"] = false
-	p, _ = PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, _ = PlanTeardown(context.Background(), "admin", nil)
 	if len(p.Items) != 1 || p.Items[0].ID != "spotexec/app" {
 		t.Fatalf("second plan %+v", p.Items)
 	}
@@ -457,7 +463,7 @@ func TestS3URL(t *testing.T) {
 func TestTeardownStuckInstances(t *testing.T) {
 	c := newFakeCloud(t)
 	c.stuck = true
-	p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, err := PlanTeardown(context.Background(), "admin", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +477,7 @@ func TestTeardownStuckInstances(t *testing.T) {
 	c.mu.Lock()
 	c.stuck = false
 	c.mu.Unlock()
-	p, _ = PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+	p, _ = PlanTeardown(context.Background(), "admin", nil)
 	if err := p.Apply(context.Background(), t.Logf); err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +509,7 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 		c := newFakeCloud(t)
 		c.users["spotexec-other"] = map[string]string{}
 		c.keys["AKOTHER"] = [2]string{"spotexec-other", "Active"}
-		p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+		p, err := PlanTeardown(context.Background(), "admin", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -527,12 +533,49 @@ func TestTeardownChangedUnderneath(t *testing.T) {
 		delete(c.users, "spotexec-other")
 		delete(c.keys, "AKOTHER")
 		c.mu.Unlock()
-		p, _ = PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+		p, _ = PlanTeardown(context.Background(), "admin", nil)
 		c.mu.Lock()
 		c.repos["us-east-2"] = append(c.repos["us-east-2"], "spotexec/newer")
 		c.mu.Unlock()
 		if err := p.Apply(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "appeared meanwhile") || !strings.Contains(err.Error(), "spotexec/newer") {
 			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("user added to the account", func(t *testing.T) {
+		// The leftover check of an account-wide plan still looks at IAM,
+		// though the plan's regions are now spelled out.
+		c := newFakeCloud(t)
+		p, err := PlanTeardown(context.Background(), "admin", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.mu.Lock()
+		c.users["spotexec-new"] = map[string]string{}
+		c.keys["AKNEW"] = [2]string{"spotexec-new", "Active"}
+		c.mu.Unlock()
+		if err := p.Apply(context.Background(), t.Logf); err == nil || !strings.Contains(err.Error(), "appeared meanwhile") || !strings.Contains(err.Error(), "IAM user spotexec-new") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("launch into a region with nothing running", func(t *testing.T) {
+		// A regional teardown leaves the keys on: a VM launched after a plan
+		// that listed none is still terminated before its group goes.
+		c := newFakeCloud(t)
+		c.instances["AK-admin"]["us-east-2"] = c.instances["AK-admin"]["us-east-2"][2:] // only i-prod
+		p, err := PlanTeardown(context.Background(), "admin", []string{"us-east-2"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, it := range p.Items {
+			if it.Kind == KindInstance {
+				t.Fatalf("plan lists %s", it.ID)
+			}
+		}
+		if err := p.Apply(context.Background(), t.Logf); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(strings.Join(c.terminated, ","), "i-late") || len(c.sgs["us-east-2"]) != 1 {
+			t.Fatalf("terminated %v, groups %v", c.terminated, c.sgs)
 		}
 	})
 }
