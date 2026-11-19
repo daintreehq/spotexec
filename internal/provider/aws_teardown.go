@@ -538,6 +538,7 @@ func deleteIAMUser(ctx context.Context, admin *awsClient, user string, log func(
 func deleteBucket(ctx context.Context, c *awsClient, bucket, region, account string) error {
 	owner := map[string]string{"x-amz-expected-bucket-owner": account}
 	var last map[s3Version]bool // what the previous batch deleted
+	reuploads := 0
 	for batch := 0; ; batch++ {
 		q := url.Values{"versions": {""}, "max-keys": {"1000"}}
 		st, b, err := s3Call(ctx, c, region, http.MethodGet, bucket, "/", q, nil, owner)
@@ -568,11 +569,17 @@ func deleteBucket(ctx context.Context, c *awsClient, bucket, region, account str
 				// A key-only delete would just add a delete marker.
 				return fmt.Errorf("listing object versions: %s has no version ID", e.Key)
 			}
+			if !last[e] {
+				continue
+			}
 			// A machine still uploading can put a "null" version back
-			// under the same ID; anything else listed again means the
-			// deletes aren't taking.
-			if last[e] && e.VersionID != "null" {
+			// under the same ID, a few times; anything else listed again
+			// means the deletes aren't taking.
+			if e.VersionID != "null" {
 				return fmt.Errorf("%s version %s is still listed after it was deleted", e.Key, e.VersionID)
+			}
+			if reuploads++; reuploads > 100 {
+				return fmt.Errorf("objects such as %s keep being uploaded again as they're deleted: stop the machines using the cache and re-run", e.Key)
 			}
 		}
 		// Data first: a marker goes only once the versions it may hide

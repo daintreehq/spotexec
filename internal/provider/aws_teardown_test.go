@@ -47,6 +47,7 @@ type fakeCloud struct {
 	busySG    map[string]int              // DependencyViolation this many times
 	deleted   []string                    // "kind id", in order
 	s3ops     []string                    // "list <bucket> <entries>", "delete <bucket> <n>", "drop <bucket>"
+	reupload  map[string]int              // "bucket/key" -> times a machine uploads it again right after a delete
 	s3owner   []string                    // x-amz-expected-bucket-owner seen
 	listedIn  []string                    // the region each ListBuckets call was signed for
 }
@@ -164,6 +165,10 @@ func (c *fakeCloud) serve(w http.ResponseWriter, r *http.Request, key, region, s
 					}
 					delete(c.buckets[bucket], o.Key)
 				case "null":
+					if c.reupload[bucket+"/"+o.Key] > 0 {
+						c.reupload[bucket+"/"+o.Key]--
+						continue
+					}
 					delete(c.buckets[bucket], o.Key)
 				default:
 					vs := c.versions[bucket]
@@ -373,6 +378,7 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 		},
 		versions:  map[string][]fakeObjVersion{},
 		versioned: map[string]bool{},
+		reupload:  map[string]int{},
 		failRepo:  map[string]bool{},
 		busySG:    map[string]int{"sg-west": 1},
 	}
@@ -565,7 +571,7 @@ func TestTeardownVersionedBucket(t *testing.T) {
 	// Every listing starts from the beginning, and the bucket goes only
 	// after one comes back empty.
 	for i, op := range c.s3ops {
-		if strings.HasPrefix(op, "list-from-marker ") || op == "drop "+east && (i == 0 || c.s3ops[i-1] != "list "+east+" 0") {
+		if strings.HasPrefix(op, "list-from-marker ") || strings.HasPrefix(op, "drop ") && (i == 0 || c.s3ops[i-1] != "list "+strings.TrimPrefix(op, "drop ")+" 0") {
 			t.Fatalf("S3 calls: %v", c.s3ops)
 		}
 	}
@@ -640,6 +646,36 @@ func TestTeardownStaleVersion(t *testing.T) {
 	}
 	if strings.Join(ops, ",") != "list "+b+" 1,delete "+b+" 1,list "+b+" 1" {
 		t.Fatalf("S3 calls: %v", ops)
+	}
+}
+
+// A machine still uploading puts an unversioned object back under version
+// "null": a few re-uploads are deleted again, an endless stream is
+// reported rather than chased.
+func TestTeardownReupload(t *testing.T) {
+	c := newFakeCloud(t)
+	b := "spotexec-cache-111111111111-us-east-2"
+	c.reupload[b+"/repo/a.tar"] = 3
+	p, err := PlanTeardown(context.Background(), "admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Apply(context.Background(), t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.buckets[b]; ok {
+		t.Fatalf("bucket left: %v", c.buckets[b])
+	}
+
+	c = newFakeCloud(t)
+	c.reupload[b+"/repo/a.tar"] = 1000
+	p, _ = PlanTeardown(context.Background(), "admin", nil)
+	err = p.Apply(context.Background(), t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "repo/a.tar keep being uploaded again") {
+		t.Fatalf("err = %v", err)
+	}
+	if c.reupload[b+"/repo/a.tar"] < 800 {
+		t.Fatalf("chased the re-uploads %d times", 1000-c.reupload[b+"/repo/a.tar"])
 	}
 }
 
