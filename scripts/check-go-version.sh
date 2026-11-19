@@ -8,6 +8,8 @@
 #
 # A BINARY ending in .gz (an embedded helper) is checked decompressed.
 set -euo pipefail
+# gzip reads options from GZIP; -f would pass a file that isn't gzip through.
+unset GZIP
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WANT=go$(sed -n 's/^go[[:space:]]\{1,\}\([0-9][^[:space:]]*\).*/\1/p' "$ROOT/go.mod")

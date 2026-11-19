@@ -13,7 +13,12 @@ import (
 	"sync"
 )
 
-//go:embed all:dist
+// Hidden entries are left out: `make helpers` stages each helper in a hidden
+// directory under dist, so a build running meanwhile, or after an
+// interrupted one, never embeds a partial file. `keep` holds the directory
+// in a clean checkout.
+//
+//go:embed dist
 var dist embed.FS
 
 // Name is the embedded file name for an OS/arch pair.

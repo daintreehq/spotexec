@@ -74,6 +74,7 @@ AGENTS.local.md
 /dist/
 /completions/
 internal/helperbin/dist/*.gz
+internal/helperbin/dist/.tmp-helper*
 
 # Local scratch (tooling state, check results)
 /.tmp/
