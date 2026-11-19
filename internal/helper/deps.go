@@ -20,14 +20,14 @@ import (
 	"github.com/daintreehq/spotexec/internal/protocol"
 )
 
-// depsKey hashes lockfile contents + install command + platform (the same
-// function the client uses to sign cache URLs).
+// depsKey hashes lockfile contents + install command + platform + the
+// install's [env] (the same function the client uses to sign cache URLs).
 func depsKey(ws string, d protocol.Deps) (string, error) {
 	image := d.ImageID
 	if image == "" && d.Container != nil {
 		image = d.Container.Image
 	}
-	return depskey.Key(ws, depskey.Spec{Lockfiles: d.Lockfiles, Install: d.Install, CacheDirs: d.CacheDirs, Image: image, Toolchain: d.Toolchain, OS: runtime.GOOS, Arch: runtime.GOARCH})
+	return depskey.Key(ws, depskey.Spec{Lockfiles: d.Lockfiles, Install: d.Install, CacheDirs: d.CacheDirs, Image: image, Toolchain: d.Toolchain, OS: runtime.GOOS, Arch: runtime.GOARCH, Env: d.Env})
 }
 
 // expandCacheDirs resolves cache_dirs globs (e.g. "packages/*/node_modules")

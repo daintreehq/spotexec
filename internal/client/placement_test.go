@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -273,4 +274,95 @@ func speedState(t *testing.T, r *config.Runner) map[string]map[string][]speedRun
 		t.Fatal(err)
 	}
 	return st.Speed
+}
+
+// #315: the install sees env_allow and [env], so the key a launch looks
+// for carries them as the run's does, [env] winning over env_allow.
+func TestPlacementProjectKeyFollowsInstallEnv(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package-lock.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SX_TEST_315_ALLOWED", "local")
+	ws := &Workspace{Root: root, RepoID: "repo1"}
+	r := &config.Runner{Name: "aws", Type: config.TypeAWSSpot, Regions: []string{"all"}, Region: "us-east-1", Arch: "arm64", User: "ubuntu", BootstrapScript: "true"}
+	p := &config.Project{
+		EnvAllow: []string{"SX_TEST_315_ALLOWED", "SX_TEST_315_UNSET"},
+		Env:      map[string]string{"NODE_ENV": "production"},
+		Deps:     config.Deps{Install: "npm ci", Lockfiles: []string{"package-lock.json"}, CacheDirs: []string{"node_modules"}},
+	}
+	m, err := manifest.Build(context.Background(), ManifestOptions(root, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := depsEnv(p), map[string]string{"SX_TEST_315_ALLOWED": "local", "NODE_ENV": "production"}; !maps.Equal(got, want) {
+		t.Fatalf("install env %v, want %v", got, want)
+	}
+	spec := depskey.Spec{Lockfiles: []string{"package-lock.json"}, Install: "npm ci", CacheDirs: []string{"node_modules"}, OS: "linux", Arch: "arm64", Toolchain: toolchainFor(r, nil), Env: depsEnv(p)}
+	want, err := depskey.Key(root, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prod := PlacementProject(p, ws, m, false, r).DepsKey
+	if prod != want {
+		t.Fatalf("key %s, want %s", prod, want)
+	}
+	p.Env["NODE_ENV"] = "development"
+	if dev := PlacementProject(p, ws, m, false, r).DepsKey; dev == prod {
+		t.Fatal("a changed [env] value kept the key")
+	}
+	p.Env["NODE_ENV"] = "production"
+	t.Setenv("SX_TEST_315_ALLOWED", "other")
+	if k := PlacementProject(p, ws, m, false, r).DepsKey; k == prod {
+		t.Fatal("a changed env_allow value kept the key")
+	}
+	t.Setenv("SX_TEST_315_ALLOWED", "local")
+	// In an image built from the Dockerfile, the key per image carries it too.
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.Container = config.Container{Dockerfile: "Dockerfile"}
+	if m, err = manifest.Build(context.Background(), ManifestOptions(root, p)); err != nil {
+		t.Fatal(err)
+	}
+	ctr := spec
+	ctr.Toolchain, ctr.Image = "container", "sha256:abc"
+	want, _ = depskey.Key(root, ctr)
+	keyFor := PlacementProject(p, ws, m, false, r).DepsKeyFor
+	if got, err := keyFor("sha256:abc"); err != nil || got != want {
+		t.Fatalf("key for image: %s %v, want %s", got, err, want)
+	}
+	p.Env["NODE_ENV"] = "development"
+	if got, _ := PlacementProject(p, ws, m, false, r).DepsKeyFor("sha256:abc"); got == want {
+		t.Fatal("a changed [env] value kept the image's key")
+	}
+	p.Env = map[string]string{"SX_TEST_315_ALLOWED": "fixed"}
+	if got := depsEnv(p)["SX_TEST_315_ALLOWED"]; got != "fixed" {
+		t.Fatalf("[env] over env_allow: %q", got)
+	}
+	// Set but empty is forwarded, unlike unset.
+	p.Env = nil
+	t.Setenv("SX_TEST_315_UNSET", "")
+	if v, ok := depsEnv(p)["SX_TEST_315_UNSET"]; !ok || v != "" {
+		t.Fatalf("empty env_allow value: %q %v", v, ok)
+	}
+}
+
+// The key the client signs is the one the runner computes from what it
+// receives: JSON replaces invalid UTF-8, so depsEnv does the same.
+func TestDepsEnvSurvivesTheWire(t *testing.T) {
+	t.Setenv("SX_TEST_315_BYTES", "a\xff\xfeb")
+	p := &config.Project{EnvAllow: []string{"SX_TEST_315_BYTES"}, Env: map[string]string{"K\xff": "v\xc3"}}
+	env := depsEnv(p)
+	b, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(got, env) {
+		t.Fatalf("sent %q, received %q", env, got)
+	}
 }

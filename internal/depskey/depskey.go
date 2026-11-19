@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/daintreehq/spotexec/internal/fsid"
@@ -22,6 +23,10 @@ type Spec struct {
 	Image     string // container image the install runs in ("" = host)
 	Toolchain string // fingerprint of the runner's environment (AMI, bootstrap, PATH setup)
 	OS, Arch  string // runner platform (Go names)
+	// Env is what the install sees from [env] and env_allow: an install
+	// that reads NODE_ENV (say) builds another dependency set for each
+	// value. Only its hash reaches the key.
+	Env map[string]string
 }
 
 // Toolchain fingerprints what a runner's dependency install depends on
@@ -36,7 +41,7 @@ func Toolchain(parts ...string) string {
 }
 
 // Key hashes lockfile contents (read under root) with the install command,
-// cache dirs, image and platform.
+// cache dirs, image, platform and install environment.
 func Key(root string, s Spec) (string, error) {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s/%s\x00%s\x00%s\x00", s.OS, s.Arch, s.Install, strings.Join(s.CacheDirs, ","))
@@ -45,6 +50,12 @@ func Key(root string, s Spec) (string, error) {
 	}
 	if s.Toolchain != "" {
 		fmt.Fprintf(h, "toolchain\x00%s\x00", s.Toolchain)
+	}
+	if len(s.Env) > 0 {
+		// Left out when empty, so a project without one keeps its existing
+		// caches. Its own fixed-width digest: the lockfile sections after it
+		// can never spell the same bytes.
+		fmt.Fprintf(h, "env\x00%s\x00", envDigest(s.Env))
 	}
 	for _, lf := range s.Lockfiles {
 		rel, err := fsid.CleanRel(lf)
@@ -59,4 +70,21 @@ func Key(root string, s Spec) (string, error) {
 		h.Write(b)
 	}
 	return hex.EncodeToString(h.Sum(nil))[:24], nil
+}
+
+// envDigest hashes env sorted and length-prefixed: map order never changes
+// it, and no two environments hash alike.
+func envDigest(env map[string]string) string {
+	names := make([]string, 0, len(env))
+	for k := range env {
+		names = append(names, k)
+	}
+	slices.Sort(names)
+	h := sha256.New()
+	fmt.Fprintf(h, "%d\x00", len(names))
+	for _, k := range names {
+		v := env[k]
+		fmt.Fprintf(h, "%d\x00%s%d\x00%s", len(k), k, len(v), v)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
