@@ -176,6 +176,8 @@ func TestCwdIn(t *testing.T) {
 		{"/w/other", "."},
 		{"/w/repo2", "."},
 		{"/elsewhere/..x", "."},
+		// filepath.Rel fails on a relative path against an absolute root.
+		{"..build", "."},
 	} {
 		if got := cwdIn(root, filepath.FromSlash(c.abs)); got != c.want {
 			t.Errorf("cwdIn(%s) = %q, want %q", c.abs, got, c.want)
