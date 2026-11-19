@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -97,6 +98,7 @@ func TestCredResolverWaiterHonorsContext(t *testing.T) {
 	waitInFlight(t, r)
 	second := make(chan result, 1)
 	go func() { c, err := r.get(context.Background()); second <- result{c, err} }()
+	time.Sleep(joinDelay) // let it join the flight before the lock is released
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -121,16 +123,34 @@ func TestCredResolverWaiterHonorsContext(t *testing.T) {
 	}
 }
 
+// joinDelay is how long a test gives a started caller to reach its wait.
+const joinDelay = 100 * time.Millisecond
+
+// recv waits up to d for a value on ch.
+func recv[T any](t *testing.T, ch <-chan T, d time.Duration, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(d):
+		t.Fatalf("%s: nothing after %v", what, d)
+		panic("unreachable")
+	}
+}
+
 // waitInFlight waits until r has a resolution under way.
 func waitInFlight(t *testing.T, r *awsCredResolver) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		r.mu.Lock()
-		busy := r.resolving != nil
-		r.mu.Unlock()
-		if busy {
-			return
+		// TryLock: a resolver that holds mu while resolving fails here
+		// instead of hanging the package.
+		if r.mu.TryLock() {
+			busy := r.resolving != nil
+			r.mu.Unlock()
+			if busy {
+				return
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -146,21 +166,28 @@ func TestSSOTokenRefreshSerialized(t *testing.T) {
 	var posts atomic.Int32
 	stubNetwork(t, func(r *http.Request) (*http.Response, error) {
 		posts.Add(1)
-		time.Sleep(50 * time.Millisecond) // hold the lock while the other waits
 		return jsonResponse(`{"accessToken":"new","expiresIn":3600,"refreshToken":"rotated"}`), nil
 	})
+	// Both start while another holder has the lock, so both have read
+	// nothing yet when it is released: without the lock they would both
+	// refresh the expired token.
+	release := holdSSOLock(t, home, "corp")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	errs := make(chan error, 2)
 	for range 2 {
 		go func() {
-			tok, err := ssoToken(context.Background(), "corp", "us-west-2", "dev")
+			tok, err := ssoToken(ctx, "corp", "us-west-2", "dev")
 			if err == nil && tok != "new" {
 				err = errors.New("token " + tok)
 			}
 			errs <- err
 		}()
 	}
+	time.Sleep(joinDelay)
+	release()
 	for range 2 {
-		if err := <-errs; err != nil {
+		if err := recv(t, errs, 15*time.Second, "refresh"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -205,12 +232,13 @@ func TestCredResolverWaiterOutlivesCancelledLeader(t *testing.T) {
 		}
 		waiter <- err
 	}()
+	time.Sleep(joinDelay) // let the waiter join the leader's flight
 	cancelLeader()
-	if err := waitReturn(t, 2*time.Second, func() error { return <-leader }); !errors.Is(err, context.Canceled) {
+	if err := recv(t, leader, 2*time.Second, "leader"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("leader: %v, want its cancellation", err)
 	}
 	release()
-	if err := waitReturn(t, 5*time.Second, func() error { return <-waiter }); err != nil {
+	if err := recv(t, waiter, 5*time.Second, "waiter"); err != nil {
 		t.Fatalf("waiter: %v", err)
 	}
 	if n := calls.Load(); n != 1 {
@@ -223,6 +251,13 @@ func TestCredResolverWaiterOutlivesCancelledLeader(t *testing.T) {
 func TestCredResolverInvalidateDropsInFlightResult(t *testing.T) {
 	nativeSSOResolver(t)
 	entered, gate := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
 	var calls atomic.Int32
 	stubNetwork(t, func(r *http.Request) (*http.Response, error) {
 		if calls.Add(1) == 1 {
@@ -235,13 +270,107 @@ func TestCredResolverInvalidateDropsInFlightResult(t *testing.T) {
 	r := &awsCredResolver{profile: "dev"}
 	got := make(chan awsCreds, 1)
 	go func() { c, _ := r.get(context.Background()); got <- c }()
-	<-entered
-	r.invalidate()
+	recv(t, entered, 2*time.Second, "first lookup")
+	waitReturn(t, 2*time.Second, func() struct{} { r.invalidate(); return struct{}{} })
 	close(gate)
-	if c := waitReturn(t, 5*time.Second, func() awsCreds { return <-got }); c.AccessKeyID != "AKNEW" {
+	if c := recv(t, got, 5*time.Second, "lookup"); c.AccessKeyID != "AKNEW" {
 		t.Fatalf("got %q, want the credentials resolved after the invalidation", c.AccessKeyID)
 	}
 	if c, err := r.get(context.Background()); err != nil || c.AccessKeyID != "AKNEW" {
 		t.Fatalf("cached: %q %v", c.AccessKeyID, err)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Errorf("%d role credential lookups, want 2: the dropped one and the one cached", n)
+	}
+}
+
+// A panic while resolving still ends the flight: a caller waiting on it
+// wakes up and resolves for itself.
+func TestCredResolverPanicWakesWaiters(t *testing.T) {
+	nativeSSOResolver(t)
+	entered, gate := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
+	var calls atomic.Int32
+	stubNetwork(t, func(r *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-gate
+			panic("resolver blew up")
+		}
+		return roleCreds("AKIDSSO"), nil
+	})
+	r := &awsCredResolver{profile: "dev"}
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_, _ = r.get(context.Background())
+	}()
+	recv(t, entered, 2*time.Second, "first lookup")
+	waiter := make(chan error, 1)
+	go func() {
+		c, err := r.get(context.Background())
+		if err == nil && c.AccessKeyID != "AKIDSSO" {
+			err = errors.New("got " + c.AccessKeyID)
+		}
+		waiter <- err
+	}()
+	time.Sleep(joinDelay) // let the waiter join the flight
+	close(gate)
+	if p := recv(t, panicked, 2*time.Second, "leader"); p == nil {
+		t.Fatal("the first lookup didn't panic")
+	}
+	if err := recv(t, waiter, 5*time.Second, "waiter"); err != nil {
+		t.Fatalf("waiter: %v", err)
+	}
+}
+
+// A lock file that can't be opened fails the lookup at once, naming the
+// lock, rather than polling until the deadline.
+func TestSSOTokenLockOpenError(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeSSOCache(t, home, "corp", freshToken("tok"))
+	noNetwork(t)
+	if err := os.Mkdir(ssoCachePath(home, "corp")+".spotexec-lock", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := ssoToken(ctx, "corp", "us-west-2", "dev")
+	if err == nil || !strings.Contains(err.Error(), "SSO cache lock") || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the lock's open error", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("took %v", d)
+	}
+}
+
+// A caller whose own deadline ends the refresh gets that error, not cached
+// credentials kept as a fallback for ordinary refresh failures.
+func TestCredResolverCancelledSkipsStaleFallback(t *testing.T) {
+	home, key := nativeSSOResolver(t)
+	noNetwork(t)
+	holdSSOLock(t, home, key)
+	r := &awsCredResolver{profile: "dev", cached: &awsCreds{AccessKeyID: "AKOLD", SecretAccessKey: "s", Expiration: time.Now().Add(2 * time.Minute)}}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	var c awsCreds
+	err := waitReturn(t, 2*time.Second, func() (err error) { c, err = r.get(ctx); return err })
+	if !errors.Is(err, context.DeadlineExceeded) || c.AccessKeyID != "" {
+		t.Fatalf("got %q, %v; want the caller's deadline, not the stale fallback", c.AccessKeyID, err)
+	}
+	// A failure that isn't the caller's own still falls back.
+	if err := os.Remove(ssoCachePath(home, key)); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := r.get(context.Background()); err != nil || c.AccessKeyID != "AKOLD" {
+		t.Fatalf("got %q, %v; want the still-valid cached credentials", c.AccessKeyID, err)
 	}
 }

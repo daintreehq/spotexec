@@ -66,6 +66,12 @@ func (r *awsCredResolver) get1(ctx context.Context) (awsCreds, error) {
 				return awsCreds{}, ctx.Err()
 			}
 		}
+		// Nothing usable and nothing under way: a caller that has given up
+		// doesn't start a resolution of its own.
+		if err := ctx.Err(); err != nil {
+			r.mu.Unlock()
+			return awsCreds{}, err
+		}
 		done := make(chan struct{})
 		r.resolving = done
 		gen := r.gen
@@ -91,8 +97,9 @@ func (r *awsCredResolver) lead(ctx context.Context, done chan struct{}, gen uint
 	defer r.mu.Unlock()
 	if err != nil {
 		// Refresh failed (e.g. SSO session just expired) but the cached
-		// credentials are still valid for a while: keep using them.
-		if old := r.cached; old != nil && time.Until(old.Expiration) > 30*time.Second {
+		// credentials are still valid for a while: keep using them, unless
+		// it failed because this caller gave up.
+		if old := r.cached; old != nil && ctx.Err() == nil && time.Until(old.Expiration) > 30*time.Second {
 			return *old, false, nil
 		}
 		return awsCreds{}, false, err
