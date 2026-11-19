@@ -250,11 +250,11 @@ func TestRootIgnoresHomeMarker(t *testing.T) {
 	t.Setenv("HOME", home)
 	writeTree(t, home, ".spotexec.toml", "sub/x.txt", "proj/.spotexec.toml")
 	sub := filepath.Join(home, "sub")
-	if r, git := Root(sub); git || r != sub {
+	if r, git, _ := Root(sub); git || r != sub {
 		t.Errorf("Root(sub) = %s, %v; want sub itself", r, git)
 	}
 	proj := filepath.Join(home, "proj")
-	if r, _ := Root(filepath.Join(proj)); r != proj {
+	if r, _, _ := Root(filepath.Join(proj)); r != proj {
 		t.Errorf("Root(proj) = %s", r)
 	}
 }

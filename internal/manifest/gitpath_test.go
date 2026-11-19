@@ -51,8 +51,8 @@ func TestRootKeepsTrailingSpace(t *testing.T) {
 	}
 	spaced := filepath.Join(parent, "checkout ")
 	for _, dir := range []string{spaced, filepath.Join(spaced, "sub")} {
-		if r, git := Root(dir); r != spaced || !git {
-			t.Errorf("Root(%q) = %q, %v; want %q", dir, r, git, spaced)
+		if r, git, err := Root(dir); r != spaced || !git || err != nil {
+			t.Errorf("Root(%q) = %q, %v, %v; want %q", dir, r, git, err, spaced)
 		}
 	}
 	gd, err := GitDir(spaced)
