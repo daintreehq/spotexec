@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -693,5 +694,160 @@ func TestDepsRehydratesOlderSlotsOfUnknownOrigin(t *testing.T) {
 	}
 	if st := loadSlotState(s.slotDir); st.VenvRelocation != venvRelocation || st.DepsKey != res.Key {
 		t.Fatalf("saved state %+v", st)
+	}
+}
+
+// #314: a same-key hit restores a cached directory the slot lost (here a
+// glob match recorded in the ready marker) from the intact cache, while a
+// pattern the install never produced stays optional and keeps the hit.
+func TestDepsRehydratesAMissingCacheDirOnAHit(t *testing.T) {
+	s, out := depsSession(t)
+	d := protocol.Deps{
+		Lockfiles: []string{"deps.lock"},
+		Install:   "mkdir -p vendor packages/a/node_modules && echo v > vendor/installed && echo a > packages/a/node_modules/installed",
+		CacheDirs: []string{"vendor", "packages/*/node_modules", "optional"},
+	}
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	var res protocol.DepsResult
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if !res.Built {
+		t.Fatalf("first run: %+v", res)
+	}
+	// A command removes one cached output; the other survives.
+	if err := os.RemoveAll(filepath.Join(s.workspace, "packages", "a", "node_modules")); err != nil {
+		t.Fatal(err)
+	}
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if res.Built || !res.Hydrated {
+		t.Fatalf("not hydrated from the cache: %+v", res)
+	}
+	if b, err := os.ReadFile(filepath.Join(s.workspace, "packages", "a", "node_modules", "installed")); err != nil || string(b) != "a\n" {
+		t.Fatalf("restored %q, %v", b, err)
+	}
+	if st := loadSlotState(s.slotDir); st.DepsKey != res.Key {
+		t.Fatalf("saved state %+v", st)
+	}
+	// Everything the install produced is there: a plain hit, though
+	// "optional" was never produced.
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if res.Built || res.Hydrated {
+		t.Fatalf("a complete slot was not a hit: %+v", res)
+	}
+	// A marker entry the cache doesn't hold (no install produced it as a
+	// directory) can't be restored, so it doesn't spoil the hit.
+	ready := filepath.Join(s.layout.Deps(s.repoID), res.Key, ".ready")
+	b, err := os.ReadFile(ready)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ready, append(b, "\npackages/ghost/node_modules"...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if res.Built || res.Hydrated {
+		t.Fatalf("a phantom marker entry spoiled the hit: %+v", res)
+	}
+	if err := os.WriteFile(ready, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A symlink in place of a cached directory is not that directory.
+	vendor := filepath.Join(s.workspace, "vendor")
+	if err := os.RemoveAll(vendor); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), vendor); err != nil {
+		t.Fatal(err)
+	}
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if !res.Hydrated {
+		t.Fatalf("a symlinked cache dir was a hit: %+v", res)
+	}
+	if fi, err := os.Lstat(vendor); err != nil || !fi.IsDir() {
+		t.Fatalf("vendor not restored as a directory: %v, %v", fi, err)
+	}
+}
+
+// Hydrating keeps a recorded directory name's trailing space, so a slot
+// that lost "packages/z " gets it back from the cache.
+func TestDepsRehydratesANameEndingInASpace(t *testing.T) {
+	s, out := depsSession(t)
+	d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: `mkdir -p "packages/z " && echo z > "packages/z /installed"`, CacheDirs: []string{"packages/*"}}
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	var res protocol.DepsResult
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if err := os.RemoveAll(filepath.Join(s.workspace, "packages", "z ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(s.workspace, "packages", "other"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if !res.Hydrated {
+		t.Fatalf("not hydrated: %+v", res)
+	}
+	if b, err := os.ReadFile(filepath.Join(s.workspace, "packages", "z ", "installed")); err != nil || string(b) != "z\n" {
+		t.Fatalf("restored %q, %v", b, err)
+	}
+}
+
+// A ready marker's lines are taken as they are, so a last glob match whose
+// name ends in a space is still the directory the install produced.
+func TestReadyEntriesKeepsTrailingSpaces(t *testing.T) {
+	got := readyEntries([]byte("packages/a\n\npackages/z \n"))
+	if want := []string{"packages/a", "packages/z "}; !slices.Equal(got, want) {
+		t.Fatalf("entries %q, want %q", got, want)
+	}
+}
+
+// A cache whose marker is gone can't say what the slot needs: a same-key
+// slot that still holds its dependencies keeps its hit, as before #314.
+func TestDepsHitWithoutAReadyMarker(t *testing.T) {
+	s, out := depsSession(t)
+	d := protocol.Deps{Lockfiles: []string{"deps.lock"}, Install: "mkdir -p vendor && touch vendor/installed", CacheDirs: []string{"vendor"}}
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	var res protocol.DepsResult
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if err := os.Remove(filepath.Join(s.layout.Deps(s.repoID), res.Key, ".ready")); err != nil {
+		t.Fatal(err)
+	}
+	out.b.Reset()
+	if err := s.deps(d); err != nil {
+		t.Fatal(err)
+	}
+	res = protocol.DepsResult{}
+	replies(t, out, protocol.TypeDepsResult, &res)
+	if res.Built || res.Hydrated {
+		t.Fatalf("not a hit: %+v", res)
 	}
 }

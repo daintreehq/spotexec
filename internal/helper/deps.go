@@ -141,7 +141,14 @@ func (s *Session) deps(d protocol.Deps) error {
 	dirs := expandCacheDirs(s.workspace, d.CacheDirs)
 	unknownOrigin := s.state.VenvsRelocated && s.state.VenvRelocation < venvRelocation && len(cacheOrigins(cacheRoot)) == 0 &&
 		slices.ContainsFunc(dirs, func(rel string) bool { return len(venvsAt(filepath.Join(s.workspace, filepath.FromSlash(rel)))) > 0 })
-	if s.state.DepsKey == key && len(dirs) > 0 && !unknownOrigin {
+	hit := s.state.DepsKey == key && len(dirs) > 0 && !unknownOrigin
+	if hit {
+		// A slot that lost a directory since is hydrated again.
+		if hit, err = s.holdsCachedDirs(cacheRoot, d.CacheDirs); err != nil {
+			return perr(protocol.CodeDepsFailed, "reading dependency cache %s: %v", key, err)
+		}
+	}
+	if hit {
 		if s.state.VenvRelocation < venvRelocation {
 			// Hydrated by an older helper, which copied venvs as they were
 			// or left their symlinks pointing into another slot.
@@ -386,10 +393,7 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 	origins := cacheOrigins(cacheRoot)
 	method := "none"
 	synced := s.syncedIndex()
-	for _, rel := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-		if rel == "" {
-			continue
-		}
+	for _, rel := range readyEntries(b) {
 		// The marker may come from a shared archive: only ever touch paths
 		// that match the configured cache_dirs, and never through symlinks.
 		if !matchesCacheDirs(rel, d.CacheDirs) {
@@ -425,6 +429,53 @@ func (s *Session) hydrate(d protocol.Deps, cacheRoot string) (string, error) {
 		method = m
 	}
 	return method, nil
+}
+
+// holdsCachedDirs reports whether the slot still has every directory the
+// install produced, as the cache's ready marker records them (glob matches
+// included): a command may have removed one since. A pattern that matched
+// nothing at install time is not in the marker, so it stays optional, and
+// so is an entry the cache doesn't hold as a directory: hydrating could
+// never restore it. A missing marker can't say what is required, and
+// leaves the hit to the slot's state as before.
+func (s *Session) holdsCachedDirs(cacheRoot string, patterns []string) (bool, error) {
+	b, err := os.ReadFile(filepath.Join(cacheRoot, ".ready"))
+	if os.IsNotExist(err) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	synced := s.syncedIndex()
+	for _, rel := range readyEntries(b) {
+		if !matchesCacheDirs(rel, patterns) || synced(rel) {
+			continue // hydrate refuses or skips these too
+		}
+		if src, err := fsid.SafeJoin(cacheRoot, rel); err != nil {
+			continue
+		} else if fi, err := os.Lstat(src); err != nil || !fi.IsDir() {
+			continue
+		}
+		p, err := fsid.SafeJoin(s.workspace, rel)
+		if err != nil {
+			return false, nil // reached through a symlink: hydrate replaces it
+		}
+		if fi, err := os.Lstat(p); err != nil || !fi.IsDir() {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// readyEntries lists the directories a ready marker records, one per line.
+// Lines are taken as they are: a directory name may end in a space.
+func readyEntries(b []byte) []string {
+	var out []string
+	for _, rel := range strings.Split(string(b), "\n") {
+		if rel != "" {
+			out = append(out, rel)
+		}
+	}
+	return out
 }
 
 func matchesCacheDirs(rel string, patterns []string) bool {
