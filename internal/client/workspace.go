@@ -54,11 +54,7 @@ func Resolve(dir string) (*Workspace, error) {
 	if _, err := os.Stat(filepath.Join(root, ".spotexec.toml")); (err == nil || isGit) && !config.NeverProject(root) {
 		w.Marked = true
 	}
-	rel, err := filepath.Rel(root, abs)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		rel = "."
-	}
-	w.Cwd = filepath.ToSlash(rel)
+	w.Cwd = cwdIn(root, abs)
 	ident := root
 	name := filepath.Base(root)
 	if isGit {
@@ -95,6 +91,17 @@ func Resolve(dir string) (*Workspace, error) {
 	k := sha256.Sum256([]byte(host + "\x00" + root))
 	w.WorktreeKey = hex.EncodeToString(k[:])[:8]
 	return w, nil
+}
+
+// cwdIn is abs relative to root, slash-separated, or "." when abs lies
+// outside root. Only a whole ".." component escapes: "..build" is an
+// ordinary directory inside the worktree (#324).
+func cwdIn(root, abs string) string {
+	rel, err := filepath.Rel(root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "."
+	}
+	return filepath.ToSlash(rel)
 }
 
 // commonGitDir is the repository's common git dir for the worktree at root,

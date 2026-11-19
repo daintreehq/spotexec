@@ -1,7 +1,9 @@
 package client
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -134,6 +136,51 @@ func TestRemoteRepoID(t *testing.T) {
 	} {
 		if got := remoteRepoID(c.in); got != c.want {
 			t.Errorf("remoteRepoID(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// A subdirectory whose name merely starts with ".." is inside the worktree,
+// so Resolve keeps it as the working directory (#324).
+func TestResolveKeepsDoubleDotPrefixedCwd(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	for _, rel := range []string{"..build/subdir", "...", "..a/..b", "..build"} {
+		dir := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		w, err := Resolve(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.Cwd != rel {
+			t.Errorf("Resolve(%s).Cwd = %q, want %q", rel, w.Cwd, rel)
+		}
+	}
+}
+
+// Only a whole ".." component leaves the root; names that merely start
+// with ".." stay inside it.
+func TestCwdIn(t *testing.T) {
+	root := filepath.FromSlash("/w/repo")
+	for _, c := range []struct{ abs, want string }{
+		{"/w/repo", "."},
+		{"/w/repo/a/b", "a/b"},
+		{"/w/repo/..build", "..build"},
+		{"/w/repo/..build/subdir", "..build/subdir"},
+		{"/w/repo/...", "..."},
+		{"/w", "."},
+		{"/w/other", "."},
+		{"/w/repo2", "."},
+		{"/elsewhere/..x", "."},
+		// filepath.Rel fails on a relative path against an absolute root.
+		{"..build", "."},
+	} {
+		if got := cwdIn(root, filepath.FromSlash(c.abs)); got != c.want {
+			t.Errorf("cwdIn(%s) = %q, want %q", c.abs, got, c.want)
 		}
 	}
 }
