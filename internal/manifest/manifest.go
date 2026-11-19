@@ -132,9 +132,22 @@ func Build(ctx context.Context, o Options) (*Manifest, error) {
 	builtin.all = config.NeverProject(o.Root)
 	m.spot = builtin
 
-	useGit := o.Source != "directory" && isGitWorktree(ctx, o.Root)
-	if o.Source == "git" && !useGit {
-		return nil, fmt.Errorf("%s is not a git worktree but sync.source = \"git\"", o.Root)
+	var useGit bool
+	if o.Source != "directory" {
+		var gitErr error
+		useGit, gitErr = isGitWorktree(ctx, o.Root)
+		if o.Source == "git" && !useGit {
+			return nil, fmt.Errorf("%s is not a git worktree but sync.source = \"git\"", o.Root)
+		}
+		// A checkout Git failed to inspect (dubious ownership, a broken
+		// gitfile, no git binary) is not a plain directory: walking it
+		// would drop .git/info/exclude and the global excludes, and sync
+		// a different set of files than Git would.
+		if gitErr != nil {
+			if dir := checkoutAbove(o.Root); dir != "" {
+				return nil, fmt.Errorf("%s holds a Git checkout (%s) that git could not read: %w; fix Git there, or set sync.source = \"directory\" in .spotexec.toml to sync it as a plain directory", o.Root, filepath.Join(dir, ".git"), gitErr)
+			}
+		}
 	}
 	m.Git = useGit
 
@@ -524,9 +537,24 @@ func gitHome() string {
 	return h
 }
 
-func isGitWorktree(ctx context.Context, root string) bool {
+// isGitWorktree reports whether root is inside a Git work tree, with git's
+// error when git couldn't say.
+func isGitWorktree(ctx context.Context, root string) (bool, error) {
 	out, err := git(ctx, root, "rev-parse", "--is-inside-work-tree")
-	return err == nil && strings.TrimSpace(string(out)) == "true"
+	return err == nil && strings.TrimSpace(string(out)) == "true", err
+}
+
+// checkoutAbove is the nearest directory at or above dir holding a .git
+// entry (a directory, or a linked worktree's gitfile), or "".
+func checkoutAbove(dir string) string {
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Lstat(filepath.Join(d, ".git")); err == nil {
+			return d
+		}
+		if d == filepath.Dir(d) {
+			return ""
+		}
+	}
 }
 
 func git(ctx context.Context, dir string, args ...string) ([]byte, error) {
